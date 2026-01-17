@@ -1,6 +1,9 @@
 import os
 import time
 from datetime import datetime, timezone
+import os, time
+print("=== BOT STARTED ===", flush=True)
+print("POLL_SECONDS =", os.getenv("POLL_SECONDS"), "SERIES_TICKER =", os.getenv("SERIES_TICKER"), flush=True)
 
 # =====================
 # CONFIG (from Render env vars)
