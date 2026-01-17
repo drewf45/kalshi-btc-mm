@@ -59,7 +59,25 @@ def main():
         except Exception as e:
             print("❌ ERROR:", e)
             time.sleep(5)
+def get_order_book(market_ticker):
+    r = requests.get(
+        f"{BASE_URL}/markets/{market_ticker}/orderbook",
+        headers=HEADERS,
+        timeout=10
+    )
+    r.raise_for_status()
+    return r.json()
 
+
+def print_top_of_book(ob):
+    yes_bids = ob.get("yes", {}).get("bids", [])
+    no_bids = ob.get("no", {}).get("bids", [])
+
+    top_yes = yes_bids[0] if yes_bids else None
+    top_no = no_bids[0] if no_bids else None
+
+    print("Top YES bid:", top_yes)
+    print("Top NO bid:", top_no)
 if __name__ == "__main__":
     main()
     import os
