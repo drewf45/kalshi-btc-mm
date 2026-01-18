@@ -2,328 +2,192 @@ import os
 import time
 import json
 import base64
+import hmac
+import hashlib
 import requests
-from datetime import datetime, timezone
-from typing import Dict, Optional
+import datetime
+import smtplib
+from email.message import EmailMessage
+from typing import Optional
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-
-# =========================
+# ======================
 # CONFIG
-# =========================
-API_BASE = "https://api.kalshi.com/trade-api/v2"
-
-SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()  # 15-min BTC series
+# ======================
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").lower() == "true"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15")
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS", "20"))
 
-ENABLE_TRADING = os.getenv("ENABLE_TRADING", "False").strip().lower() == "true"
+KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
+KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_BASE64")
 
-# Strategy / Risk
-IMBALANCE_THRESHOLD = float(os.getenv("IMBALANCE_THRESHOLD", "0.95"))  # 95% one-sided
-TRADE_RISK_PCT = float(os.getenv("TRADE_RISK_PCT", "0.01"))            # 1% per trade
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.20"))    # 20% daily stop
+EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_TLS = os.getenv("SMTP_TLS", "true").lower() == "true"
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
-# Kalshi creds (must exist for real trading)
-API_KEY_ID = (os.getenv("KALSHI_API_KEY_ID") or "").strip()
-PRIVATE_KEY_PEM_B64 = (os.getenv("KALSHI_PRIVATE_KEY_PEM_BASE64") or "").strip()
+BASE_URL = "https://api.kalshi.com/trade-api/v2"
 
-# Optional: “force this ticker” to test
-MARKET_TICKER_OVERRIDE = (os.getenv("MARKET_TICKER_OVERRIDE") or "").strip()
+print("=== BOT STARTED ===")
+print(f"ENABLE_TRADING={ENABLE_TRADING}")
+print(f"POLL_SECONDS={POLL_SECONDS}")
+print(f"SERIES_PREFIX={SERIES_PREFIX}")
 
-
-# =========================
-# LOGGING
-# =========================
-def log(msg: str):
-    print(msg, flush=True)
-
-
-# =========================
-# TIME + MARKET
-# =========================
-def utc_now():
-    return datetime.now(timezone.utc)
-
-def current_15m_market_ticker() -> str:
-    """
-    15-minute BTC market ticker format:
-      KXBTC15M-18JAN261930  (NO seconds)
-    Uses UTC buckets so it matches Kalshi tickers.
-    """
-    now = utc_now().replace(second=0, microsecond=0)
-    minute_bucket = (now.minute // 15) * 15
-    bucket = now.replace(minute=minute_bucket)
-
-    # Format: DDMMMYYHHMM (uppercase)
-    stamp = bucket.strftime("%d%b%y%H%M").upper()
-    return f"{SERIES_PREFIX}-{stamp}"
-
-
-# =========================
-# RSA SIGNING (CORRECT)
-# =========================
-_cached_private_key = None
-
-def load_private_key():
-    global _cached_private_key
-
-    if _cached_private_key is not None:
-        return _cached_private_key
-
-    if not PRIVATE_KEY_PEM_B64:
-        return None
-
-    # Clean whitespace just in case Render stored with accidental spaces
-    b64_clean = "".join(PRIVATE_KEY_PEM_B64.split())
-
+# ======================
+# EMAIL
+# ======================
+def send_email(subject: str, body: str):
+    if not EMAIL_ENABLED:
+        return
     try:
-        pem_bytes = base64.b64decode(b64_clean)
-    except Exception as e:
-        log(f"ERROR: Could not base64-decode KALSHI_PRIVATE_KEY_PEM_BASE64: {e}")
-        return None
+        msg = EmailMessage()
+        msg["From"] = SMTP_USERNAME
+        msg["To"] = SMTP_USERNAME
+        msg["Subject"] = subject
+        msg.set_content(body)
 
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        if SMTP_TLS:
+            server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        print(f"EMAIL FAILED: {e}")
+
+# ======================
+# AUTH
+# ======================
+def load_private_key() -> Optional[bytes]:
+    if not KALSHI_PRIVATE_KEY_B64:
+        print("❌ Missing KALSHI_PRIVATE_KEY_PEM_BASE64")
+        return None
     try:
-        _cached_private_key = load_pem_private_key(pem_bytes, password=None)
-        return _cached_private_key
+        return base64.b64decode(KALSHI_PRIVATE_KEY_B64)
     except Exception as e:
-        log(f"ERROR: Could not parse RSA private key PEM: {e}")
+        print(f"❌ Private key decode failed: {e}")
         return None
 
+PRIVATE_KEY_BYTES = load_private_key()
 
-def kalshi_signature(method: str, path: str, body: str, ts: str) -> Optional[str]:
-    """
-    Kalshi v2 signing is RSA-SHA256 over:
-      timestamp + method + path + body
-    """
-    pk = load_private_key()
-    if pk is None:
-        return None
+def sign_request(timestamp: str, method: str, path: str, body: str = "") -> str:
+    msg = f"{timestamp}{method}{path}{body}".encode()
+    return hmac.new(PRIVATE_KEY_BYTES, msg, hashlib.sha256).hexdigest()
 
-    msg = (ts + method.upper() + path + body).encode("utf-8")
+def kalshi_request(method: str, path: str, body: dict = None):
+    if not KALSHI_API_KEY_ID or not PRIVATE_KEY_BYTES:
+        raise RuntimeError("Kalshi credentials missing")
 
-    sig = pk.sign(
-        msg,
-        padding.PKCS1v15(),
-        hashes.SHA256()
-    )
-    return base64.b64encode(sig).decode("utf-8")
+    ts = str(int(time.time() * 1000))
+    body_json = json.dumps(body) if body else ""
+    sig = sign_request(ts, method, path, body_json)
 
-
-def auth_headers(method: str, path: str, body: str) -> Optional[Dict[str, str]]:
-    if not API_KEY_ID:
-        return None
-
-    ts = str(int(time.time()))
-    sig = kalshi_signature(method, path, body, ts)
-    if not sig:
-        return None
-
-    return {
-        "KALSHI-ACCESS-KEY": API_KEY_ID,
+    headers = {
+        "Content-Type": "application/json",
+        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": sig,
         "KALSHI-ACCESS-TIMESTAMP": ts,
-        "Content-Type": "application/json",
     }
 
+    url = BASE_URL + path
+    resp = requests.request(method, url, headers=headers, data=body_json)
 
-# =========================
-# API WRAPPER
-# =========================
-def kalshi_request(method: str, path: str, payload=None):
-    body = json.dumps(payload) if payload is not None else ""
-
-    headers = auth_headers(method, path, body)
-    if headers is None:
-        raise RuntimeError("Kalshi credentials missing or invalid (cannot sign requests).")
-
-    url = API_BASE + path
-    resp = requests.request(method, url, headers=headers, data=body, timeout=20)
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"HTTP {resp.status_code} {resp.text}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
 
     return resp.json()
 
+# ======================
+# MARKET HELPERS
+# ======================
+def current_market_ticker():
+    now = datetime.datetime.utcnow().replace(second=0, microsecond=0)
+    minute = (now.minute // 15) * 15
+    market_time = now.replace(minute=minute)
+    return f"{SERIES_PREFIX}-{market_time.strftime('%d%b%y%H%M').upper()}"
 
-# =========================
-# ACCOUNT + MARKET DATA
-# =========================
-def fetch_balance() -> float:
+def get_orderbook(ticker):
+    return kalshi_request("GET", f"/markets/{ticker}/orderbook")
+
+def get_balance():
     data = kalshi_request("GET", "/portfolio/balance")
-    # balance endpoint typically returns {"balance": <number>}
-    bal = data.get("balance")
-    if bal is None:
-        raise RuntimeError(f"Unexpected balance payload: {data}")
-    return float(bal)
+    return float(data["available_cash"])
 
+# ======================
+# STRATEGY
+# ======================
+daily_start_balance = None
+daily_loss = 0.0
 
-def fetch_market(ticker: str) -> dict:
-    data = kalshi_request("GET", f"/markets/{ticker}")
-    m = data.get("market")
-    if m is None:
-        raise RuntimeError(f"Unexpected market payload: {data}")
-    return m
+def check_daily_limits(balance):
+    global daily_start_balance, daily_loss
+    if daily_start_balance is None:
+        daily_start_balance = balance
+        return True
 
+    daily_loss = max(0, daily_start_balance - balance)
+    loss_pct = (daily_loss / daily_start_balance) * 100
 
-def best_yes_no_asks(market: dict):
-    yes_asks = market.get("yes_asks") or []
-    no_asks = market.get("no_asks") or []
-    yes_price = yes_asks[0]["price"] if yes_asks else None
-    no_price = no_asks[0]["price"] if no_asks else None
-    return yes_price, no_price
-
-
-def market_imbalance(market: dict) -> Optional[float]:
-    """
-    Uses volume_yes / (volume_yes + volume_no)
-    If no volume yet -> None
-    """
-    vy = market.get("volume_yes", 0) or 0
-    vn = market.get("volume_no", 0) or 0
-    total = vy + vn
-    if total <= 0:
-        return None
-    return float(vy) / float(total)
-
-
-# =========================
-# ORDER PLACEMENT
-# =========================
-def place_order(ticker: str, side: str, price: int, qty: int):
-    if not ENABLE_TRADING:
-        log("READ-ONLY MODE: trade skipped")
-        return
-
-    payload = {
-        "ticker": ticker,
-        "side": side,      # "yes" or "no"
-        "type": "limit",
-        "price": int(price),
-        "quantity": int(qty),
-    }
-    kalshi_request("POST", "/orders", payload)
-    log(f"ORDER PLACED: {ticker} {side.upper()} qty={qty} price={price}")
-
-
-# =========================
-# MAIN LOOP
-# =========================
-daily_start_equity = None
-last_day = None
-
-def creds_healthcheck() -> bool:
-    """
-    Prints EXACTLY what’s missing and prevents the NoneType crash.
-    """
-    missing = []
-    if not API_KEY_ID:
-        missing.append("KALSHI_API_KEY_ID")
-    if not PRIVATE_KEY_PEM_B64:
-        missing.append("KALSHI_PRIVATE_KEY_PEM_BASE64")
-
-    if missing:
-        log("⚠️ WARNING: Kalshi credentials missing — running in READ-ONLY mode")
-        log("Missing env vars: " + ", ".join(missing))
-        return False
-
-    # Try load key once
-    pk = load_private_key()
-    if pk is None:
-        log("⚠️ WARNING: Private key failed to load — running in READ-ONLY mode")
+    if loss_pct >= MAX_DAILY_LOSS_PCT:
+        send_email("BOT STOPPED", f"Daily loss limit hit: {loss_pct:.2f}%")
+        print("🛑 Daily loss limit reached")
         return False
 
     return True
 
+def maybe_trade():
+    ticker = current_market_ticker()
+    print(f"CHECKING MARKET: {ticker}")
 
-def main():
-    global daily_start_equity, last_day, ENABLE_TRADING
+    book = get_orderbook(ticker)
+    yes = sum(o["quantity"] for o in book.get("yes", []))
+    no = sum(o["quantity"] for o in book.get("no", []))
 
-    log("=== BOT STARTED ===")
-    log(f"ENABLE_TRADING={ENABLE_TRADING}")
-    log(f"POLL_SECONDS={POLL_SECONDS}")
-    log(f"SERIES_PREFIX={SERIES_PREFIX}")
-    if MARKET_TICKER_OVERRIDE:
-        log(f"MARKET_TICKER_OVERRIDE={MARKET_TICKER_OVERRIDE}")
+    total = yes + no
+    if total == 0:
+        print("No liquidity yet")
+        return
 
-    creds_ok = creds_healthcheck()
+    dominance = max(yes, no) / total
+    side = "no" if yes > no else "yes"
 
-    # If creds not ok, force read-only (prevents “backwards” mistakes)
-    if not creds_ok:
-        ENABLE_TRADING = False
+    if dominance < 0.95:
+        print(f"Skips: dominance {dominance:.2%}")
+        return
 
-    while True:
-        try:
-            # Daily reset
-            today = utc_now().date()
-            if last_day != today:
-                last_day = today
-                if creds_ok:
-                    daily_start_equity = fetch_balance()
-                    log(f"New UTC trading day. Starting equity={daily_start_equity:.2f}")
-                else:
-                    daily_start_equity = None
-                    log("New UTC trading day. (read-only)")
+    balance = get_balance()
+    if not check_daily_limits(balance):
+        return
 
-            # Market
-            ticker = MARKET_TICKER_OVERRIDE or current_15m_market_ticker()
-            log(f"CHECKING MARKET: {ticker}")
+    stake = round(balance * 0.01, 2)
+    print(f"TRADE SIGNAL → {side.upper()} stake=${stake}")
 
-            # If creds missing, don’t call Kalshi endpoints (avoid spam)
-            if not creds_ok:
-                time.sleep(POLL_SECONDS)
-                continue
+    if not ENABLE_TRADING:
+        print("READ-ONLY MODE")
+        return
 
-            # Risk controls
-            balance = fetch_balance()
-            if daily_start_equity is not None:
-                daily_pnl = balance - daily_start_equity
-                if daily_pnl <= -daily_start_equity * MAX_DAILY_LOSS_PCT:
-                    log("DAILY LOSS LIMIT HIT — STOPPING TRADES FOR TODAY")
-                    time.sleep(POLL_SECONDS)
-                    continue
+    kalshi_request(
+        "POST",
+        "/orders",
+        {
+            "market_ticker": ticker,
+            "side": side,
+            "type": "market",
+            "quantity": stake,
+        },
+    )
 
-            market = fetch_market(ticker)
+    send_email("TRADE EXECUTED", f"{ticker} → {side.upper()} ${stake}")
 
-            imb = market_imbalance(market)
-            if imb is None:
-                log("No liquidity yet")
-                time.sleep(POLL_SECONDS)
-                continue
-
-            yes_price, no_price = best_yes_no_asks(market)
-
-            # 1% per trade sizing
-            # contracts ~$1 max payout, so qty approx = 1% equity in contracts
-            qty = max(1, int(balance * TRADE_RISK_PCT))
-
-            # Strategy:
-            # If 95%+ of volume is YES -> crowd is YES-heavy -> take NO
-            # If 95%+ is NO -> take YES
-            if imb >= IMBALANCE_THRESHOLD:
-                if no_price is None:
-                    log("Edge found (crowd YES-heavy) but no NO asks yet")
-                else:
-                    log(f"EDGE: YES-heavy ({imb:.3f}) -> BUY NO @ {no_price} qty={qty}")
-                    place_order(ticker, "no", no_price, qty)
-
-            elif imb <= (1.0 - IMBALANCE_THRESHOLD):
-                if yes_price is None:
-                    log("Edge found (crowd NO-heavy) but no YES asks yet")
-                else:
-                    log(f"EDGE: NO-heavy ({imb:.3f}) -> BUY YES @ {yes_price} qty={qty}")
-                    place_order(ticker, "yes", yes_price, qty)
-
-            else:
-                log(f"No edge (imbalance={imb:.3f})")
-
-        except Exception as e:
-            log(f"ERROR: {e}")
-
-        time.sleep(POLL_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
+# ======================
+# LOOP
+# ======================
+while True:
+    try:
+        maybe_trade()
+    except Exception as e:
+        print(f"ERROR: {e}")
+        send_email("BOT ERROR", str(e))
+    time.sleep(POLL_SECONDS)
