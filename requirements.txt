@@ -3,3 +3,6 @@ websockets
 python-dotenv
 requests
 cryptography
+requests==2.32.5
+python-dotenv==1.2.1
+cryptography==46.0.3
