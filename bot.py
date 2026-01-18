@@ -2,38 +2,49 @@ import os
 import time
 import json
 import base64
-import smtplib
+import hashlib
 import traceback
-from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
-
 import requests
+import smtplib
 
-# =======================
-# CONFIG
-# =======================
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+# =====================
+# ENV
+# =====================
 
-BET_DOLLARS = float(os.getenv("BET_DOLLARS", "1"))
+API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
+PEM_B64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_B64")
+
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "False").lower() == "true"
+BET_DOLLARS = float(os.getenv("BET_DOLLARS", "1"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "20"))
-
-POLL_SECONDS = 60
-MIN_PRICE = 5
-MAX_PRICE = 95
-
-SERIES_PREFIX = "KXBTC15M"
-
-# =======================
-# EMAIL
-# =======================
 
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 EMAIL_TO = os.getenv("EMAIL_TO")
+
+BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+SERIES_PREFIX = "KXBTC15M"
+POLL_SECONDS = 60
+
+# =====================
+# LOAD PRIVATE KEY
+# =====================
+
+private_key = serialization.load_pem_private_key(
+    base64.b64decode(PEM_B64),
+    password=None,
+)
+
+# =====================
+# EMAIL
+# =====================
 
 def send_email(subject, body):
     if not SMTP_HOST:
@@ -50,53 +61,54 @@ def send_email(subject, body):
             s.login(SMTP_USERNAME, SMTP_PASSWORD)
             s.send_message(msg)
     except Exception as e:
-        print("EMAIL FAILED:", e)
+        print("EMAIL ERROR:", e)
 
-# =======================
-# AUTH
-# =======================
+# =====================
+# KALSHI SIGNING
+# =====================
 
-API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-PEM_B64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_B64")
+def sign_request(method, path, body=""):
+    ts = str(int(time.time()))
+    body_hash = hashlib.sha256(body.encode()).hexdigest()
+    message = f"{ts}{method.upper()}{path}{body_hash}".encode()
 
-if not API_KEY_ID or not PEM_B64:
-    raise RuntimeError("Missing Kalshi API credentials")
+    signature = private_key.sign(
+        message,
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
 
-PRIVATE_KEY = base64.b64decode(PEM_B64).decode()
+    return {
+        "Kalshi-Access-Key": API_KEY_ID,
+        "Kalshi-Access-Timestamp": ts,
+        "Kalshi-Access-Signature": base64.b64encode(signature).decode(),
+        "Content-Type": "application/json",
+    }
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "Kalshi-Access-Key": API_KEY_ID,
-    "Kalshi-Access-Signature": PRIVATE_KEY,
-}
-
-# =======================
-# UTIL
-# =======================
+# =====================
+# TIME / MARKET
+# =====================
 
 def now_utc():
     return datetime.now(timezone.utc)
 
-def current_15m_bucket():
+def current_bucket():
     t = now_utc()
-    minute = (t.minute // 15) * 15
-    bucket = t.replace(minute=minute, second=0, microsecond=0)
-    return bucket
+    m = (t.minute // 15) * 15
+    return t.replace(minute=m, second=0, microsecond=0)
 
-def market_ticker_for_now():
-    bucket = current_15m_bucket()
-    return f"{SERIES_PREFIX}-{bucket.strftime('%d%b%y').upper()}{bucket.strftime('%H%M')}"
+def market_ticker():
+    b = current_bucket()
+    return f"{SERIES_PREFIX}-{b.strftime('%d%b%y').upper()}{b.strftime('%H%M')}"
 
-# =======================
+# =====================
 # API
-# =======================
+# =====================
 
 def get_orderbook(ticker):
-    r = requests.get(
-        f"{BASE_URL}/markets/{ticker}/orderbook",
-        headers=HEADERS,
-        timeout=10,
-    )
+    path = f"/markets/{ticker}/orderbook"
+    headers = sign_request("GET", path)
+    r = requests.get(BASE_URL + path, headers=headers, timeout=10)
     if r.status_code != 200:
         return None
     return r.json().get("orderbook")
@@ -104,107 +116,71 @@ def get_orderbook(ticker):
 def place_order(ticker, side, price):
     if not ENABLE_TRADING:
         print("DRY RUN — order skipped")
-        return True
+        return
 
-    payload = {
+    payload = json.dumps({
         "ticker": ticker,
         "side": side,
         "price": price,
         "quantity": BET_DOLLARS,
         "type": "limit",
-    }
+    })
 
-    r = requests.post(
-        f"{BASE_URL}/orders",
-        headers=HEADERS,
-        data=json.dumps(payload),
-        timeout=10,
-    )
+    path = "/orders"
+    headers = sign_request("POST", path, payload)
 
+    r = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
     if r.status_code != 200:
         raise RuntimeError(r.text)
 
-    return True
-
-# =======================
+# =====================
 # STRATEGY
-# =======================
+# =====================
 
-def choose_trade(orderbook):
-    yes = orderbook.get("yes", [])
-    no = orderbook.get("no", [])
-
-    if not yes or not no:
-        return None
-
-    best_yes = min(yes, key=lambda x: x["price"])
-    best_no = min(no, key=lambda x: x["price"])
-
-    if MIN_PRICE <= best_yes["price"] <= MAX_PRICE:
-        return ("yes", best_yes["price"])
-
-    if MIN_PRICE <= best_no["price"] <= MAX_PRICE:
-        return ("no", best_no["price"])
-
+def choose_trade(ob):
+    yes = ob.get("yes", [])
+    no = ob.get("no", [])
+    if yes:
+        return ("yes", yes[0]["price"])
+    if no:
+        return ("no", no[0]["price"])
     return None
 
-# =======================
-# MAIN LOOP
-# =======================
+# =====================
+# MAIN
+# =====================
 
 def main():
-    send_email("Kalshi bot started", "Bot is live and monitoring markets.")
-
-    print("=== BOT STARTED ===")
-    print("Trading enabled:", ENABLE_TRADING)
-
-    daily_loss = 0
-    last_trade_ticker = None
+    send_email("Kalshi bot started", "Bot is live.")
+    last_trade = None
 
     while True:
         try:
-            ticker = market_ticker_for_now()
-            print(f"[{now_utc().isoformat()}] Checking {ticker}")
+            ticker = market_ticker()
+            print("Checking", ticker)
 
             ob = get_orderbook(ticker)
-
             if not ob:
-                print("No orderbook yet")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            decision = choose_trade(ob)
-
-            if not decision:
-                print("No usable prices")
+            trade = choose_trade(ob)
+            if not trade or ticker == last_trade:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            side, price = decision
-
-            if ticker == last_trade_ticker:
-                print("Already traded this market")
-                time.sleep(POLL_SECONDS)
-                continue
-
-            print(f"PLACING {side.upper()} @ {price}")
+            side, price = trade
+            print("PLACING", side, price)
             place_order(ticker, side, price)
 
-            last_trade_ticker = ticker
-
-            send_email(
-                "Kalshi trade placed",
-                f"{ticker}\n{side.upper()} @ {price}",
-            )
+            last_trade = ticker
+            send_email("Trade placed", f"{ticker} {side} @ {price}")
 
         except Exception as e:
-            print("ERROR:", e)
             traceback.print_exc()
-            send_email("Kalshi bot error", str(e))
+            send_email("BOT ERROR", str(e))
 
         time.sleep(POLL_SECONDS)
-
-# =======================
 
 if __name__ == "__main__":
     main()
