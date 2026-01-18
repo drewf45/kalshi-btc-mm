@@ -3,7 +3,7 @@ import time
 import json
 import base64
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -22,53 +22,80 @@ log = logging.getLogger("kalshi-btc-15m")
 
 
 # -----------------------------
-# Config (Render env vars)
+# Timezones
 # -----------------------------
 ET = ZoneInfo("America/New_York")
 
-# MUST BE THIS for production per docs
-DEFAULT_PROD_BASE = "https://api.elections.kalshi.com"
-DEFAULT_DEMO_BASE = "https://demo-api.kalshi.co"
 
-KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", DEFAULT_PROD_BASE).strip()
+# -----------------------------
+# Config (Render env vars)
+# -----------------------------
+DEFAULT_PROD_BASE = "https://api.elections.kalshi.com"
+
+# If you set this wrong in Render, it WILL break you. We'll force-correct it.
+RAW_API_BASE = os.getenv("KALSHI_API_BASE", DEFAULT_PROD_BASE).strip()
 
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "").strip()
-# Put the PRIVATE KEY PEM into this env var as BASE64 (see steps below)
 KALSHI_PRIVATE_KEY_PEM_BASE64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_BASE64", "").strip()
 
 SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30").strip())
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").strip().lower() in ("1", "true", "yes")
 
-# Risk knobs (you mentioned these)
-EXTREME_THRESHOLD = float(os.getenv("EXTREME_THRESHOLD", "0.95"))
-BET_PCT_OF_LIQUIDITY = float(os.getenv("BET_PCT_OF_LIQUIDITY", "0.01"))
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.20"))
+# Optional override (if you ever want to force a known ticker)
+MARKET_TICKER_OVERRIDE = os.getenv("MARKET_TICKER_OVERRIDE", "").strip()
+
+# Strategy knobs (your preferences)
+EXTREME_THRESHOLD = float(os.getenv("EXTREME_THRESHOLD", "0.95"))  # 95% one-sided
+BET_PCT_OF_LIQUIDITY = float(os.getenv("BET_PCT_OF_LIQUIDITY", "0.01"))  # 1% per bet
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.20"))  # stop if -20% daily
+
 
 SESSION = requests.Session()
 SESSION.headers.update({"Content-Type": "application/json"})
 
 
 # -----------------------------
-# Helpers: Kalshi signing
-# Per docs: signature = base64(RSA-PSS-SHA256(timestamp + METHOD + path_without_query))
+# Force-correct the API base
+# (This is the exact issue shown in your log.)
+# -----------------------------
+def normalize_api_base(raw: str) -> str:
+    raw = (raw or "").strip().rstrip("/")
+    # If you point to these, you get DNS failures or "moved" errors (your logs show both).
+    bad_hosts = ("api.kalshi.com", "trading-api.kalshi.com", "api.elections.kalski.com")
+    if any(bad in raw for bad in bad_hosts):
+        log.warning(f"API_BASE was set to '{raw}' (known bad). Forcing to {DEFAULT_PROD_BASE}")
+        return DEFAULT_PROD_BASE
+    # If blank, also force.
+    if not raw:
+        log.warning(f"API_BASE was blank. Forcing to {DEFAULT_PROD_BASE}")
+        return DEFAULT_PROD_BASE
+    return raw
+
+
+KALSHI_API_BASE = normalize_api_base(RAW_API_BASE)
+
+
+# -----------------------------
+# Kalshi signing helpers
 # Headers:
 #   KALSHI-ACCESS-KEY
 #   KALSHI-ACCESS-TIMESTAMP (ms)
 #   KALSHI-ACCESS-SIGNATURE
+# Signature message:
+#   timestamp_ms + METHOD + path_without_query
 # -----------------------------
-def load_private_key_from_env() -> object:
+def load_private_key_from_env():
     if not KALSHI_PRIVATE_KEY_PEM_BASE64:
         raise RuntimeError(
             "Missing KALSHI_PRIVATE_KEY_PEM_BASE64. "
-            "You MUST download your Kalshi .key file when you create the API key, "
-            "then base64 it and paste into Render env vars."
+            "You must base64-encode your downloaded Kalshi private .key file and set it as an env var."
         )
     try:
         pem_bytes = base64.b64decode(KALSHI_PRIVATE_KEY_PEM_BASE64)
         return serialization.load_pem_private_key(pem_bytes, password=None)
     except Exception as e:
-        raise RuntimeError(f"Failed to load private key from base64 env var: {e}")
+        raise RuntimeError(f"Failed to load private key from KALSHI_PRIVATE_KEY_PEM_BASE64: {e}")
 
 
 def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
@@ -87,7 +114,7 @@ def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
 
 def kalshi_headers(private_key, method: str, path: str) -> dict:
     if not KALSHI_API_KEY_ID:
-        raise RuntimeError("Missing KALSHI_API_KEY_ID in env vars.")
+        raise RuntimeError("Missing KALSHI_API_KEY_ID env var.")
     ts = str(int(time.time() * 1000))
     sig = sign_request(private_key, ts, method, path)
     return {
@@ -108,43 +135,105 @@ def kalshi_get(private_key, path: str, timeout: int = 20) -> dict:
 
 
 # -----------------------------
-# Market ticker generation
-# Your market URLs look like: KXBTC15M-26JAN181815
-# Which is: DDMMMYYHHMM (ET) upper month.
-# We always "look ahead to the next 15 minutes"
+# Robust time parsing
 # -----------------------------
-def ceil_to_next_15(dt: datetime) -> datetime:
-    # dt is timezone-aware
-    minute = dt.minute
-    next_q = ((minute // 15) + 1) * 15
-    if next_q == 60:
-        return (dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    return dt.replace(minute=next_q, second=0, microsecond=0)
+def parse_iso_dt(s: str):
+    # Handles "Z" and offsets
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
-def format_kalshi_time(dt: datetime) -> str:
-    # DDMMMYYHHMM with upper month, e.g. 26JAN181815 (Jan 26 2018 18:15)
-    # Here YY is year % 100; Kalshi uses 2-digit year in many tickers.
-    day = f"{dt.day:02d}"
-    mon = dt.strftime("%b").upper()
-    yy = dt.strftime("%y")
-    hhmm = dt.strftime("%H%M")
-    return f"{day}{mon}{yy}{hhmm}"
+# -----------------------------
+# Find the NEXT 15m BTC market WITHOUT guessing the ticker string
+# This is the fix for your “wrong date / -30 / seconds” issues.
+# -----------------------------
+def list_open_markets(private_key, series_ticker: str, limit: int = 200) -> list:
+    # Kalshi list endpoint (v2)
+    # /trade-api/v2/markets?limit=200&status=open&series_ticker=KXBTC15M
+    path = f"/trade-api/v2/markets?limit={limit}&status=open&series_ticker={series_ticker}"
+    data = kalshi_get(private_key, path)
+    # Response shape may be { "markets": [...] } or { "data": [...] }
+    markets = data.get("markets") or data.get("data") or []
+    if not isinstance(markets, list):
+        return []
+    return markets
 
 
-def next_market_ticker(now_et: datetime) -> str:
-    nxt = ceil_to_next_15(now_et)
-    return f"{SERIES_PREFIX}-{format_kalshi_time(nxt)}"
+def pick_next_market(markets: list, now_et: datetime) -> dict | None:
+    """
+    Choose the soonest market that is relevant for the next 15m boundary.
+    Different API responses sometimes expose time fields differently.
+    We'll try common keys and pick the market with the smallest close/end time after now.
+    """
+    now_utc = now_et.astimezone(timezone.utc)
+
+    candidates = []
+    for m in markets:
+        # common keys seen across Kalshi APIs
+        # We try a bunch and accept the first parseable datetime.
+        time_fields = [
+            "close_time", "close_ts",
+            "end_time", "end_ts",
+            "settle_time", "settle_ts",
+            "expiration_time", "expiration_ts",
+        ]
+
+        dt = None
+        for k in time_fields:
+            v = m.get(k)
+            if isinstance(v, str):
+                dt = parse_iso_dt(v)
+                if dt:
+                    break
+        if not dt:
+            # some APIs use numeric timestamps (seconds or ms)
+            for k in time_fields:
+                v = m.get(k)
+                if isinstance(v, (int, float)):
+                    # guess ms vs seconds
+                    if v > 10_000_000_000:  # ms
+                        dt = datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+                    else:  # seconds
+                        dt = datetime.fromtimestamp(v, tz=timezone.utc)
+                    break
+
+        if not dt:
+            continue
+
+        # Only consider markets that haven't closed yet
+        if dt <= now_utc:
+            continue
+
+        candidates.append((dt, m))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def extract_ticker(market: dict) -> str | None:
+    # Some shapes: {"ticker": "..."} or {"market": {"ticker": "..."}}
+    if not market:
+        return None
+    if isinstance(market.get("ticker"), str):
+        return market["ticker"]
+    if isinstance(market.get("market"), dict) and isinstance(market["market"].get("ticker"), str):
+        return market["market"]["ticker"]
+    return None
 
 
 # -----------------------------
 # Main loop
 # -----------------------------
 def main():
-    # Hard safety: force correct prod base unless user intentionally overrides
-    if "api.elections.kalshi.com" not in KALSHI_API_BASE and "demo-api.kalshi.co" not in KALSHI_API_BASE:
-        log.warning(f"KALSHI_API_BASE looks unusual: {KALSHI_API_BASE}")
-
     private_key = load_private_key_from_env()
 
     log.info("=== BOT STARTED ===")
@@ -152,32 +241,63 @@ def main():
     log.info(f"POLL_SECONDS={POLL_SECONDS}")
     log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
     log.info(f"API_BASE={KALSHI_API_BASE}")
+    if MARKET_TICKER_OVERRIDE:
+        log.warning(f"MARKET_TICKER_OVERRIDE is set: {MARKET_TICKER_OVERRIDE} (this will force a single market)")
 
     while True:
+        start = time.time()
         try:
             now_et = datetime.now(ET)
-            ticker = next_market_ticker(now_et)
-            log.info(f"Heartbeat ET now={now_et.strftime('%Y-%m-%d %H:%M:%S %Z')} | nextTicker={ticker}")
 
-            # 1) Try direct fetch
-            path = f"/trade-api/v2/markets/{ticker}"
-            market = kalshi_get(private_key, path)
+            # 1) Decide which market ticker to use
+            if MARKET_TICKER_OVERRIDE:
+                ticker = MARKET_TICKER_OVERRIDE
+                log.info(f"Heartbeat ET now={now_et.strftime('%Y-%m-%d %H:%M:%S %Z')} | using OVERRIDE ticker={ticker}")
+                market = kalshi_get(private_key, f"/trade-api/v2/markets/{ticker}")
+                log.info("Market fetched OK (override).")
+            else:
+                log.info(f"Heartbeat ET now={now_et.strftime('%Y-%m-%d %H:%M:%S %Z')} | resolving NEXT open market from series {SERIES_PREFIX}")
+                markets = list_open_markets(private_key, SERIES_PREFIX, limit=200)
+                log.info(f"Open markets returned: {len(markets)}")
 
-            # Log a small, stable subset so logs don't explode
-            # (keys may differ, so we do safe extraction)
-            log.info("Market fetched OK")
-            log.info(f"market_ticker={market.get('market', {}).get('ticker') or market.get('ticker')}")
-            log.info(f"status={market.get('market', {}).get('status') or market.get('status')}")
-            log.info(f"yes_ask={market.get('market', {}).get('yes_ask') or market.get('yes_ask')} "
-                     f"yes_bid={market.get('market', {}).get('yes_bid') or market.get('yes_bid')}")
+                nxt = pick_next_market(markets, now_et)
+                if not nxt:
+                    log.warning("No open markets with a future close/end time were found. Will retry.")
+                    time.sleep(POLL_SECONDS)
+                    continue
 
-            # Trading logic intentionally not implemented here.
-            # You asked for: "buy/sell when 95% on one side" etc.
-            # Once the API is stable, we can add order placement safely.
+                ticker = extract_ticker(nxt)
+                if not ticker:
+                    log.warning("Next market found but ticker missing in payload. Will retry.")
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                log.info(f"Resolved next market ticker={ticker}")
+                market = kalshi_get(private_key, f"/trade-api/v2/markets/{ticker}")
+                log.info("Market fetched OK (resolved).")
+
+            # 2) Log a stable subset
+            mm = market.get("market") if isinstance(market.get("market"), dict) else market
+            yes_ask = mm.get("yes_ask")
+            yes_bid = mm.get("yes_bid")
+            no_ask = mm.get("no_ask")
+            no_bid = mm.get("no_bid")
+            status = mm.get("status")
+
+            log.info(f"market_ticker={mm.get('ticker')} status={status} yes_bid={yes_bid} yes_ask={yes_ask} no_bid={no_bid} no_ask={no_ask}")
+
+            # 3) Trading placeholder (we’ll add once your connectivity + auth are 100%)
+            if ENABLE_TRADING:
+                log.info("ENABLE_TRADING=True but order placement is not yet enabled in this file.")
+                # Next step (once stable): fetch orderbook and place 1-contract micro bets
+                # when one side dominance >= EXTREME_THRESHOLD.
 
         except Exception as e:
             log.error(f"LOOP ERROR: {repr(e)}")
 
+        # Hard guarantee: log cycle duration so you never feel like it “went silent”
+        elapsed = time.time() - start
+        log.info(f"Loop complete in {elapsed:.2f}s; sleeping {POLL_SECONDS}s")
         time.sleep(POLL_SECONDS)
 
 
