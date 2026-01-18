@@ -39,10 +39,11 @@ def request_public(method: str, path: str, params: Optional[Dict[str, Any]] = No
     return r.json()
 
 
-def get_open_market_ticker_for_series(series_ticker: str) -> str:
+def get_open_market_ticker_for_series(series_ticker: str) -> Optional[str]:
     """
     Find currently open markets for the series and pick the one closing soonest
     (usually the current 15-minute window).
+    Returns None if there are no open markets (happens briefly between windows).
     """
     data = request_public(
         "GET",
@@ -56,7 +57,7 @@ def get_open_market_ticker_for_series(series_ticker: str) -> str:
 
     markets = data.get("markets", [])
     if not markets:
-        raise RuntimeError(f"No open markets returned for series_ticker={series_ticker}")
+        return None
 
     markets_sorted = sorted(markets, key=lambda m: m.get("close_time") or "")
     return markets_sorted[0]["ticker"]
@@ -102,9 +103,17 @@ def main() -> None:
         try:
             now = time.time()
 
-            # Refresh market ticker only every ~12 minutes (avoids 429 rate limits)
+            # Refresh market ticker only every ~12 minutes OR if we don't have one yet
             if current_market is None or (now - market_last_refresh) > MARKET_REFRESH_SECONDS:
-                current_market = get_open_market_ticker_for_series(SERIES_TICKER)
+                new_market = get_open_market_ticker_for_series(SERIES_TICKER)
+
+                # Sometimes there is a brief gap between 15-min windows (no open market)
+                if new_market is None:
+                    print(f"[{now_utc()}] No open market yet — waiting", flush=True)
+                    time.sleep(30)
+                    continue
+
+                current_market = new_market
                 market_last_refresh = now
                 print(f"\n[{now_utc()}] refreshed market -> {current_market}", flush=True)
 
@@ -115,6 +124,15 @@ def main() -> None:
             print(f"[{now_utc()}] market={current_market}", flush=True)
             print(f"  best_yes_bid: {best_yes}", flush=True)
             print(f"  best_no_bid : {best_no}", flush=True)
+
+        except requests.HTTPError as e:
+            # Handle rate limits and transient errors gracefully
+            status = getattr(e.response, "status_code", None)
+            if status == 429:
+                print(f"[{now_utc()}] 429 rate-limited — backing off 60s", flush=True)
+                time.sleep(60)
+                continue
+            print(f"[{now_utc()}] HTTP ERROR: {e}", flush=True)
 
         except Exception as e:
             print(f"\n[{now_utc()}] ERROR: {e}", flush=True)
