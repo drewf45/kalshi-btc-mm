@@ -1,186 +1,202 @@
 import os
+import sys
 import time
-import json
 import base64
-import hashlib
-import traceback
+import json
 import requests
-import smtplib
+from datetime import datetime, timedelta, timezone
 
-from datetime import datetime, timezone
-from email.message import EmailMessage
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+# =========================
+# FORCE UNBUFFERED LOGGING
+# =========================
+os.environ["PYTHONUNBUFFERED"] = "1"
 
-# =====================
-# ENV
-# =====================
+def log(msg):
+    ts = datetime.now(timezone.utc).isoformat()
+    print(f"[{ts}] {msg}", flush=True)
+
+log("BOOT: starting bot.py")
+log(f"BOOT: python={sys.version}")
+
+# =========================
+# CONFIG
+# =========================
+BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-PEM_B64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_B64")
+PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_B64")
 
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "False").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
+
 BET_DOLLARS = float(os.getenv("BET_DOLLARS", "1"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "20"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M")
 
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-EMAIL_TO = os.getenv("EMAIL_TO")
+STARTUP_TEST_BET = os.getenv("STARTUP_TEST_BET", "False").lower() == "true"
 
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-SERIES_PREFIX = "KXBTC15M"
-POLL_SECONDS = 60
+# =========================
+# VALIDATION
+# =========================
+if not API_KEY_ID:
+    raise RuntimeError("Missing KALSHI_API_KEY_ID")
 
-# =====================
-# LOAD PRIVATE KEY
-# =====================
+if not PRIVATE_KEY_B64:
+    raise RuntimeError("Missing KALSHI_PRIVATE_KEY_PEM_B64")
 
-private_key = serialization.load_pem_private_key(
-    base64.b64decode(PEM_B64),
-    password=None,
-)
+PRIVATE_KEY_PEM = base64.b64decode(PRIVATE_KEY_B64).decode()
 
-# =====================
-# EMAIL
-# =====================
+log(f"CONFIG: ENABLE_TRADING={ENABLE_TRADING} DRY_RUN={DRY_RUN}")
+log(f"CONFIG: BET_DOLLARS=${BET_DOLLARS}")
+log(f"CONFIG: SERIES_PREFIX={SERIES_PREFIX}")
+log(f"CONFIG: POLL_SECONDS={POLL_SECONDS}")
 
-def send_email(subject, body):
-    if not SMTP_HOST:
-        return
-    try:
-        msg = EmailMessage()
-        msg["From"] = SMTP_USERNAME
-        msg["To"] = EMAIL_TO
-        msg["Subject"] = subject
-        msg.set_content(body)
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USERNAME, SMTP_PASSWORD)
-            s.send_message(msg)
-    except Exception as e:
-        print("EMAIL ERROR:", e)
-
-# =====================
-# KALSHI SIGNING
-# =====================
-
-def sign_request(method, path, body=""):
-    ts = str(int(time.time()))
-    body_hash = hashlib.sha256(body.encode()).hexdigest()
-    message = f"{ts}{method.upper()}{path}{body_hash}".encode()
-
-    signature = private_key.sign(
-        message,
-        padding.PKCS1v15(),
-        hashes.SHA256(),
-    )
-
+# =========================
+# AUTH HEADERS (SAFE)
+# =========================
+def auth_headers():
     return {
-        "Kalshi-Access-Key": API_KEY_ID,
-        "Kalshi-Access-Timestamp": ts,
-        "Kalshi-Access-Signature": base64.b64encode(signature).decode(),
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Kalshi-API-Key-Id": API_KEY_ID,
+        "Kalshi-API-Private-Key": PRIVATE_KEY_PEM.strip()
     }
 
-# =====================
-# TIME / MARKET
-# =====================
+# =========================
+# MARKET HELPERS
+# =========================
+def current_15m_market():
+    """
+    Compute the *current* 15-minute BTC Kalshi ticker.
+    NO SECONDS. Always future-aligned.
+    Example: KXBTC15M-26JAN181230
+    """
+    now = datetime.utcnow().replace(second=0, microsecond=0)
+    minute = (now.minute // 15) * 15
+    slot = now.replace(minute=minute)
 
-def now_utc():
-    return datetime.now(timezone.utc)
+    # If already inside the window, trade the NEXT one
+    if now >= slot:
+        slot += timedelta(minutes=15)
 
-def current_bucket():
-    t = now_utc()
-    m = (t.minute // 15) * 15
-    return t.replace(minute=m, second=0, microsecond=0)
+    ticker = (
+        f"{SERIES_PREFIX}-"
+        f"{slot.strftime('%d%b%y').upper()}"
+        f"{slot.strftime('%H%M')}"
+    )
 
-def market_ticker():
-    b = current_bucket()
-    return f"{SERIES_PREFIX}-{b.strftime('%d%b%y').upper()}{b.strftime('%H%M')}"
+    return ticker
 
-# =====================
-# API
-# =====================
-
+# =========================
+# ORDERBOOK
+# =========================
 def get_orderbook(ticker):
-    path = f"/markets/{ticker}/orderbook"
-    headers = sign_request("GET", path)
-    r = requests.get(BASE_URL + path, headers=headers, timeout=10)
+    url = f"{BASE_URL}/markets/{ticker}/orderbook"
+    r = requests.get(url, headers=auth_headers(), timeout=10)
     if r.status_code != 200:
         return None
-    return r.json().get("orderbook")
+    return r.json()
 
-def place_order(ticker, side, price):
-    if not ENABLE_TRADING:
-        print("DRY RUN — order skipped")
-        return
-
-    payload = json.dumps({
-        "ticker": ticker,
-        "side": side,
-        "price": price,
-        "quantity": BET_DOLLARS,
-        "type": "limit",
-    })
-
-    path = "/orders"
-    headers = sign_request("POST", path, payload)
-
-    r = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
-    if r.status_code != 200:
-        raise RuntimeError(r.text)
-
-# =====================
-# STRATEGY
-# =====================
-
-def choose_trade(ob):
+# =========================
+# SIMPLE STRATEGY (SAFE)
+# =========================
+def choose_side(ob):
+    """
+    Extremely conservative:
+    - Buy YES at <= $0.40
+    - Buy NO at <= $0.40
+    """
     yes = ob.get("yes", [])
     no = ob.get("no", [])
+
     if yes:
-        return ("yes", yes[0]["price"])
+        best_yes = min(yes, key=lambda x: x["price"])
+        if best_yes["price"] <= 40:
+            return ("yes", best_yes["price"])
+
     if no:
-        return ("no", no[0]["price"])
+        best_no = min(no, key=lambda x: x["price"])
+        if best_no["price"] <= 40:
+            return ("no", best_no["price"])
+
     return None
 
-# =====================
-# MAIN
-# =====================
+# =========================
+# PLACE ORDER
+# =========================
+def place_order(ticker, side, price):
+    contracts = int(BET_DOLLARS * 100 / price)
 
+    payload = {
+        "ticker": ticker,
+        "side": side,
+        "type": "limit",
+        "price": price,
+        "count": contracts
+    }
+
+    if DRY_RUN or not ENABLE_TRADING:
+        log(f"DRY_RUN: would place {payload}")
+        return
+
+    log(f"LIVE ORDER: {payload}")
+    r = requests.post(
+        f"{BASE_URL}/orders",
+        headers=auth_headers(),
+        json=payload,
+        timeout=10
+    )
+
+    log(f"ORDER RESPONSE: {r.status_code} {r.text}")
+
+# =========================
+# MAIN LOOP
+# =========================
 def main():
-    send_email("Kalshi bot started", "Bot is live.")
-    last_trade = None
+    log("BOOT: entered main()")
+
+    if STARTUP_TEST_BET:
+        log("STARTUP_TEST_BET enabled (will fire once when possible)")
+
+    startup_test_done = False
 
     while True:
         try:
-            ticker = market_ticker()
-            print("Checking", ticker)
+            ticker = current_15m_market()
+            log(f"CHECKING MARKET: {ticker}")
 
             ob = get_orderbook(ticker)
             if not ob:
+                log("No orderbook yet")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            trade = choose_trade(ob)
-            if not trade or ticker == last_trade:
+            decision = choose_side(ob)
+            if not decision:
+                log("No usable prices yet")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            side, price = trade
-            print("PLACING", side, price)
-            place_order(ticker, side, price)
+            side, price = decision
+            log(f"DECISION: {side.upper()} @ {price} cents")
 
-            last_trade = ticker
-            send_email("Trade placed", f"{ticker} {side} @ {price}")
+            if STARTUP_TEST_BET and not startup_test_done:
+                log("RUNNING STARTUP TEST BET")
+                place_order(ticker, side, price)
+                startup_test_done = True
+
+            elif ENABLE_TRADING:
+                place_order(ticker, side, price)
+            else:
+                log("Trading disabled; skipping order")
 
         except Exception as e:
-            traceback.print_exc()
-            send_email("BOT ERROR", str(e))
+            log(f"ERROR: {e}")
 
         time.sleep(POLL_SECONDS)
 
+# =========================
+# ENTRY
+# =========================
 if __name__ == "__main__":
     main()
