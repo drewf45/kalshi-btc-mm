@@ -1,479 +1,625 @@
+# bot.py
 import os
 import time
 import json
 import base64
 import logging
-import datetime as dt
+import ssl
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from urllib.parse import urlencode
 
 import requests
 
-# Crypto deps (installed via cryptography)
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# ---------------------------
+
+# ----------------------------
 # Logging
-# ---------------------------
+# ----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("kalshi-btc-mm")
 
 
-# ---------------------------
-# Config helpers
-# ---------------------------
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    return int(str(v).strip())
-
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    return float(str(v).strip())
-
-
-def first_env(*names: str) -> Optional[str]:
+# ----------------------------
+# Env helpers (supports your backwards env-var drift)
+# ----------------------------
+def getenv_any(*names: str, default=None):
     for n in names:
         v = os.getenv(n)
         if v is not None and str(v).strip() != "":
             return v
-    return None
+    return default
 
 
-def mask(s: str, keep: int = 6) -> str:
-    if not s:
-        return ""
-    s = str(s)
-    if len(s) <= keep:
-        return "*" * len(s)
-    return s[:keep] + "*" * (len(s) - keep)
+def to_bool(v, default=False):
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
-# ---------------------------
-# Email (Gmail App Password via SMTP)
-# ---------------------------
-def send_email(subject: str, body: str) -> None:
-    """
-    Uses STARTTLS on port 587 by default (correct for smtp.gmail.com:587).
-    If you want SSL on 465, set SMTP_PORT=465 and SMTP_USE_SSL=true.
-    """
-    import smtplib
-    import ssl
-    from email.mime.text import MIMEText
+def to_int(v, default=0):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
 
-    email_enabled = env_bool("EMAIL_ENABLED", False)
-    if not email_enabled:
+
+@dataclass
+class Config:
+    # Kalshi auth
+    api_base: str
+    api_key_id: str | None
+    private_key_pem_base64: str | None
+
+    # Strategy / runtime
+    enable_trading: bool
+    poll_seconds: int
+    series_prefix: str
+
+    # Risk
+    max_daily_loss_pct: float           # 0.20 means stop at -20%
+    bet_pct_of_liquidity: float         # 0.01 means 1% per trade
+    extreme_threshold: float            # 0.95 means 95%
+
+    # Email
+    email_enabled: bool
+    smtp_host: str
+    smtp_port: int
+    smtp_tls: bool
+    smtp_username: str | None
+    smtp_password: str | None
+    email_to: str | None
+
+
+def load_config() -> Config:
+    api_base = getenv_any("KALSHI_API_BASE", default="https://api.elections.kalshi.com").rstrip("/")
+    api_key_id = getenv_any("KALSHI_API_KEY_ID", "KALSHI_KEY_ID", default=None)
+
+    # IMPORTANT: allow several historical names you used
+    private_key_b64 = getenv_any(
+        "KALSHI_PRIVATE_KEY_PEM_BASE64",
+        "KALSHI_PRIVATE_KEY_PEM_Base64",
+        "KALSHI_PRIVATE_KEY_BASE64",
+        default=None
+    )
+
+    enable_trading = to_bool(getenv_any("ENABLE_TRADING", default="false"))
+    poll_seconds = to_int(getenv_any("POLL_SECONDS", "POLL_SECONDS=60", default="60"), default=60)
+
+    # You had both SERIES_PREFIX and a misspelled Series_PREFIC / Series_PREFIC.
+    series_prefix = getenv_any("SERIES_PREFIX", "Series_PREFIC", "SERIES_PREFIC", default="KXBTC15M")
+    series_prefix = str(series_prefix).strip().upper()
+
+    max_daily_loss_pct = float(getenv_any("MAX_DAILY_LOSS_PCT", "MAX_DAILY_LOSS", default="0.20"))
+    # If you set MAX_DAILY_LOSS=20 meaning "20%", convert it
+    if max_daily_loss_pct > 1.0:
+        max_daily_loss_pct = max_daily_loss_pct / 100.0
+
+    bet_pct_of_liquidity = float(getenv_any("BET_PCT_OF_LIQUIDITY", default="0.01"))
+    if bet_pct_of_liquidity > 1.0:
+        bet_pct_of_liquidity = bet_pct_of_liquidity / 100.0
+
+    extreme_threshold = float(getenv_any("EXTREME_THRESHOLD", default="0.95"))
+    if extreme_threshold > 1.0:
+        extreme_threshold = extreme_threshold / 100.0
+
+    email_enabled = to_bool(getenv_any("EMAIL_ENABLED", default="false"))
+    smtp_host = getenv_any("SMTP_HOST", default="smtp.gmail.com")
+    smtp_port = to_int(getenv_any("SMTP_PORT", default="587"), default=587)
+    smtp_tls = to_bool(getenv_any("SMTP_TLS", "STP_TLS", default="true"))  # you had STP_TLS typo once
+    smtp_username = getenv_any("SMTP_USERNAME", default=None)
+    smtp_password = getenv_any("SMTP_PASSWORD", default=None)
+    email_to = getenv_any("EMAIL_TO", default=smtp_username)
+
+    return Config(
+        api_base=api_base,
+        api_key_id=api_key_id,
+        private_key_pem_base64=private_key_b64,
+        enable_trading=enable_trading,
+        poll_seconds=poll_seconds,
+        series_prefix=series_prefix,
+        max_daily_loss_pct=max_daily_loss_pct,
+        bet_pct_of_liquidity=bet_pct_of_liquidity,
+        extreme_threshold=extreme_threshold,
+        email_enabled=email_enabled,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_tls=smtp_tls,
+        smtp_username=smtp_username,
+        smtp_password=smtp_password,
+        email_to=email_to,
+    )
+
+
+# ----------------------------
+# Email (Gmail STARTTLS correctly)
+# ----------------------------
+def send_email(cfg: Config, subject: str, body: str):
+    if not cfg.email_enabled:
+        return
+    if not cfg.smtp_username or not cfg.smtp_password or not cfg.email_to:
+        log.warning("EMAIL enabled but SMTP_USERNAME / SMTP_PASSWORD / EMAIL_TO missing")
         return
 
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
-    smtp_port = env_int("SMTP_PORT", 587)
-    smtp_user = (os.getenv("SMTP_USERNAME") or "").strip()
-    smtp_pass = (os.getenv("SMTP_PASSWORD") or "").strip()
-    smtp_to = (os.getenv("EMAIL_TO") or smtp_user).strip()
-    use_ssl = env_bool("SMTP_USE_SSL", False)  # for port 465 typically
-    use_tls = env_bool("SMTP_TLS", True)       # for port 587 typically
-
-    if not smtp_user or not smtp_pass or not smtp_to:
-        raise RuntimeError("Email enabled but SMTP_USERNAME/SMTP_PASSWORD/EMAIL_TO missing")
-
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = smtp_to
-
-    ctx = ssl.create_default_context()
-
-    if use_ssl:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx, timeout=30) as server:
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [smtp_to], msg.as_string())
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-            server.ehlo()
-            if use_tls:
-                server.starttls(context=ctx)
-                server.ehlo()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [smtp_to], msg.as_string())
-
-
-def safe_email(subject: str, body: str) -> None:
     try:
-        send_email(subject, body)
-        log.info("EMAIL SENT: %s", subject)
+        msg = EmailMessage()
+        msg["From"] = cfg.smtp_username
+        msg["To"] = cfg.email_to
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        import smtplib
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=15) as s:
+            s.ehlo()
+            if cfg.smtp_tls:
+                context = ssl.create_default_context()
+                s.starttls(context=context)
+                s.ehlo()
+            s.login(cfg.smtp_username, cfg.smtp_password)
+            s.send_message(msg)
+        log.info("Email sent: %s", subject)
     except Exception as e:
-        log.error("EMAIL FAILED: %r", e)
+        log.error("EMAIL FAILED: %s", repr(e))
 
 
-# ---------------------------
-# Kalshi Auth + Client (RSA-PSS)
-# ---------------------------
-@dataclass
-class KalshiCreds:
-    key_id: str
-    private_key_pem: bytes
-    api_base: str
-
-
+# ----------------------------
+# Kalshi client (signed requests)
+# ----------------------------
 class KalshiClient:
-    def __init__(self, creds: KalshiCreds):
-        self.creds = creds
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
         self.session = requests.Session()
-        self._priv = serialization.load_pem_private_key(creds.private_key_pem, password=None)
+        self.session.headers.update({"Content-Type": "application/json"})
 
-    def _timestamp_ms(self) -> str:
-        return str(int(time.time() * 1000))
+        self._private_key = None
+        self._has_creds = False
+        self._ticker_format = None  # discovered format for KXBTC15M tickers
 
-    def _sign(self, message: bytes) -> str:
-        sig = self._priv.sign(
-            message,
+        self._load_creds()
+
+    def _load_creds(self):
+        if not self.cfg.api_key_id or not self.cfg.private_key_pem_base64:
+            self._has_creds = False
+            return
+
+        try:
+            # Base64 decode safely (strip whitespace/newlines)
+            b64 = "".join(str(self.cfg.private_key_pem_base64).split())
+            pem_bytes = base64.b64decode(b64)
+
+            self._private_key = serialization.load_pem_private_key(
+                pem_bytes, password=None
+            )
+            self._has_creds = True
+        except Exception as e:
+            self._has_creds = False
+            log.error("Failed to load Kalshi private key: %s", repr(e))
+
+    @property
+    def can_auth(self) -> bool:
+        return self._has_creds
+
+    def _sign(self, ts_ms: str, method: str, path: str, query: dict | None, body: str) -> str:
+        """
+        Signature scheme: sign (timestamp + METHOD + path + ?query + body)
+        - timestamp is milliseconds string
+        - body must be exactly the string sent ('' for GET)
+        """
+        method = method.upper()
+        q = ""
+        if query:
+            q = "?" + urlencode(query)
+        msg = (ts_ms + method + path + q + body).encode("utf-8")
+        sig = self._private_key.sign(
+            msg,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
                 salt_length=padding.PSS.MAX_LENGTH,
             ),
             hashes.SHA256(),
         )
-        return base64.b64encode(sig).decode("ascii")
+        return base64.b64encode(sig).decode("utf-8")
 
-    def request(self, method: str, path: str, params: Optional[dict] = None, json_body: Optional[dict] = None) -> dict:
-        method_u = method.upper().strip()
+    def request(self, method: str, path: str, query: dict | None = None, json_body: dict | None = None):
+        if not self.can_auth:
+            raise RuntimeError("Kalshi credentials not loaded")
 
-        # Expect full paths like /trade-api/v2/...
-        if not path.startswith("/"):
-            path = "/" + path
-
-        url = self.creds.api_base.rstrip("/") + path
-        ts = self._timestamp_ms()
-
-        body_bytes = b""
+        url = self.cfg.api_base + path
+        ts_ms = str(int(time.time() * 1000))
+        body_str = ""
         if json_body is not None:
-            body_bytes = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            body_str = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
 
-        # Message format for signing varies by Kalshi version.
-        # This follows: timestamp + method + path + body (common in their v2 docs/examples)
-        msg = (ts + method_u + path).encode("utf-8") + body_bytes
-        sig = self._sign(msg)
+        sig = self._sign(ts_ms, method, path, query, body_str)
 
         headers = {
-            "Content-Type": "application/json",
-            "KALSHI-ACCESS-KEY": self.creds.key_id,
-            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-KEY": self.cfg.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
             "KALSHI-ACCESS-SIGNATURE": sig,
         }
 
-        resp = self.session.request(
-            method=method_u,
-            url=url,
-            params=params,
-            data=body_bytes if json_body is not None else None,
-            headers=headers,
-            timeout=30,
-        )
+        try:
+            resp = self.session.request(
+                method=method.upper(),
+                url=url,
+                params=query,
+                data=(body_str if json_body is not None else None),
+                headers=headers,
+                timeout=15,
+            )
+        except Exception as e:
+            raise RuntimeError(f"HTTP request failed: {repr(e)}")
 
         if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code} {resp.text[:500]}")
+            raise RuntimeError(f"HTTP {resp.status_code} {resp.text[:800]}")
 
-        if resp.text.strip() == "":
-            return {}
-        return resp.json()
+        # Defensive JSON parsing
+        if resp.text and resp.text.strip().startswith("{"):
+            return resp.json()
+        return resp.text
 
-    def get_markets(self, status: str = "open", limit: int = 200, cursor: Optional[str] = None) -> dict:
-        params = {"status": status, "limit": limit}
-        if cursor:
-            params["cursor"] = cursor
-        return self.request("GET", "/trade-api/v2/markets", params=params)
+    # ---- Endpoints we use (defensive)
+    def get_market(self, ticker: str) -> dict | None:
+        try:
+            return self.request("GET", f"/trade-api/v2/markets/{ticker}")
+        except Exception as e:
+            log.warning("Market fetch failed for %s: %s", ticker, str(e)[:300])
+            return None
 
-    def get_market(self, ticker: str) -> dict:
-        return self.request("GET", f"/trade-api/v2/markets/{ticker}")
+    def list_markets(self, series_ticker: str, limit: int = 100) -> dict | None:
+        """
+        We avoid filtering status=open because it caused 'no open markets found' failures.
+        We list by series_ticker and then filter locally if needed.
+        """
+        try:
+            return self.request("GET", "/trade-api/v2/markets", query={"series_ticker": series_ticker, "limit": limit})
+        except Exception as e:
+            log.warning("Markets list failed: %s", str(e)[:300])
+            return None
 
-    def get_balance(self) -> dict:
-        return self.request("GET", "/trade-api/v2/portfolio/balance")
+    def get_balance(self) -> float | None:
+        """
+        Return available cash/liquidity if possible.
+        This endpoint/shape varies; we parse defensively.
+        """
+        candidates = [
+            "/trade-api/v2/portfolio/balance",
+            "/trade-api/v2/portfolio",
+            "/trade-api/v2/balance",
+        ]
+        for path in candidates:
+            try:
+                j = self.request("GET", path)
+                # common patterns
+                if isinstance(j, dict):
+                    # Try nested
+                    for keypath in [
+                        ("balance", "available_cash"),
+                        ("balance", "cash"),
+                        ("balance", "available"),
+                        ("portfolio", "cash"),
+                        ("cash",),
+                        ("available_cash",),
+                        ("available",),
+                    ]:
+                        cur = j
+                        ok = True
+                        for k in keypath:
+                            if not isinstance(cur, dict) or k not in cur:
+                                ok = False
+                                break
+                            cur = cur[k]
+                        if ok:
+                            try:
+                                return float(cur)
+                            except Exception:
+                                pass
+                # If nothing worked, continue
+            except Exception:
+                continue
+        return None
 
-    def create_order(self, ticker: str, side: str, count: int, price: int) -> dict:
-        body = {
+    def place_order(self, ticker: str, side: str, action: str, count: int, price: int):
+        """
+        side: "yes" or "no"
+        action: "buy" or "sell"
+        price: integer cents 1..99 (Kalshi commonly uses cents)
+        """
+        payload = {
             "ticker": ticker,
-            "action": "buy",
-            "side": side,
+            "side": side.lower(),
+            "action": action.lower(),
             "count": int(count),
             "type": "limit",
             "price": int(price),
         }
-        return self.request("POST", "/trade-api/v2/portfolio/orders", json_body=body)
+        return self.request("POST", "/trade-api/v2/orders", json_body=payload)
 
 
-def load_kalshi_creds() -> Optional[KalshiCreds]:
-    key_id = first_env("KALSHI_API_KEY_ID", "KALSHI_KEY_ID")
-    key_b64 = first_env(
-        "KALSHI_PRIVATE_KEY_PEM_BASE64",
-        "KALSHI_PRIVATE_KEY_PEM_Base64",
-        "KALSHI_PRIVATE_KEY_BASE64",
-        "KALSHI_PRIVATE_KEY",
-    )
-    api_base = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
+# ----------------------------
+# Time/ticker logic (THE BIG FIX)
+# ----------------------------
+MONTH_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 
-    if not key_id or not key_b64:
+def ceil_to_next_15m(dt: datetime) -> datetime:
+    """
+    Always returns a time STRICTLY in the future aligned to 15-minute boundary.
+    """
+    dt = dt.replace(second=0, microsecond=0)
+    minute = dt.minute
+    # next multiple of 15 strictly ahead
+    next_min = ((minute // 15) + 1) * 15
+    if next_min >= 60:
+        dt = dt.replace(minute=0) + timedelta(hours=1)
+    else:
+        dt = dt.replace(minute=next_min)
+    return dt
+
+def fmt_ticker_variant(series_prefix: str, target_utc: datetime, variant: int) -> str:
+    """
+    Kalshi has shown BOTH in your logs:
+      Variant A: KXBTC15M-26JAN181700  (YYMMMDDHHMM)
+      Variant B: KXBTC15M-18JAN261700  (DDMMMYYHHMM)
+    We try both and pick the one that exists.
+    """
+    yy = target_utc.strftime("%y")          # 26
+    dd = target_utc.strftime("%d")          # 18
+    mon = MONTH_ABBR[target_utc.month - 1]  # JAN
+    hhmm = target_utc.strftime("%H%M")      # 1700
+
+    if variant == 1:
+        # YYMMMDDHHMM  -> 26JAN181700
+        suffix = f"{yy}{mon}{dd}{hhmm}"
+    else:
+        # DDMMMYYHHMM  -> 18JAN261700
+        suffix = f"{dd}{mon}{yy}{hhmm}"
+
+    return f"{series_prefix}-{suffix}"
+
+
+def discover_ticker_format(client: KalshiClient, series_prefix: str, target_utc: datetime) -> tuple[str | None, int | None]:
+    """
+    Try both ticker suffix orders; return the first that exists.
+    """
+    for variant in (1, 2):
+        t = fmt_ticker_variant(series_prefix, target_utc, variant)
+        j = client.get_market(t)
+        if isinstance(j, dict) and j:
+            return t, variant
+    return None, None
+
+
+# ----------------------------
+# Strategy
+# ----------------------------
+def extract_yes_prices(market_json: dict) -> tuple[int | None, int | None]:
+    """
+    We try to pull yes_bid/yes_ask in CENTS, defensively.
+    Different Kalshi responses can use different keys.
+    """
+    if not isinstance(market_json, dict):
+        return None, None
+
+    # Try typical keys
+    candidates = [
+        ("market", "yes_bid"),
+        ("market", "yes_ask"),
+        ("yes_bid",),
+        ("yes_ask",),
+        ("best_yes_bid",),
+        ("best_yes_ask",),
+        ("yes_bid",),
+        ("yes_ask",),
+    ]
+
+    # If nested object exists under "market"
+    m = market_json.get("market") if isinstance(market_json.get("market"), dict) else market_json
+
+    yes_bid = None
+    yes_ask = None
+
+    for key in ("yes_bid", "best_yes_bid", "bid_yes", "yesBid"):
+        if key in m:
+            try:
+                yes_bid = int(m[key])
+                break
+            except Exception:
+                pass
+
+    for key in ("yes_ask", "best_yes_ask", "ask_yes", "yesAsk"):
+        if key in m:
+            try:
+                yes_ask = int(m[key])
+                break
+            except Exception:
+                pass
+
+    return yes_bid, yes_ask
+
+
+def decide_trade(cfg: Config, yes_bid: int | None, yes_ask: int | None):
+    """
+    Trigger when market is extremely one-sided:
+      - YES ask >= 95 => buy NO (cheap) for micro-wins
+      - YES ask <= 5  => buy YES (cheap)
+    """
+    if yes_ask is None:
         return None
 
-    cleaned = "".join(str(key_b64).strip().split())
+    thr_hi = int(round(cfg.extreme_threshold * 100))      # 95
+    thr_lo = 100 - thr_hi                                # 5
 
-    pem_bytes = base64.b64decode(cleaned)
-    if b"BEGIN" not in pem_bytes:
-        raise RuntimeError("Decoded private key does not look like PEM. Re-check the base64.")
+    if yes_ask >= thr_hi:
+        # Crowd very YES -> we buy NO around <= 5c
+        target_side = "no"
+        # Price for NO in cents ~ 100 - YES_ask (approx)
+        limit_price = max(1, min(thr_lo, 100 - yes_ask))
+        return ("buy", target_side, limit_price)
 
-    return KalshiCreds(key_id=str(key_id).strip(), private_key_pem=pem_bytes, api_base=api_base)
+    if yes_ask <= thr_lo:
+        # Crowd very NO -> we buy YES around <= 5c
+        target_side = "yes"
+        limit_price = max(1, min(thr_lo, yes_ask))
+        return ("buy", target_side, limit_price)
 
-
-# ---------------------------
-# Strategy helpers
-# ---------------------------
-def cents(v: Any) -> Optional[int]:
-    if v is None:
-        return None
-    if isinstance(v, int):
-        return v
-    if isinstance(v, float):
-        if 0.0 <= v <= 1.0:
-            return int(round(v * 100))
-        return int(round(v))
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        f = float(s)
-        if 0.0 <= f <= 1.0:
-            return int(round(f * 100))
-        return int(round(f))
-    if isinstance(v, dict) and "price" in v:
-        return cents(v["price"])
     return None
 
 
-def pick_current_market(k: KalshiClient, prefix: str) -> Tuple[str, dict]:
-    best = None
-    best_close = None
-
-    cursor = None
-    for _ in range(5):
-        data = k.get_markets(status="open", limit=200, cursor=cursor)
-        markets = data.get("markets", []) or data.get("data", []) or []
-        cursor = data.get("cursor")
-
-        now_utc = dt.datetime.now(dt.timezone.utc)
-
-        for m in markets:
-            t = m.get("ticker")
-            if not isinstance(t, str) or not t.startswith(prefix + "-"):
-                continue
-
-            ct = m.get("close_time") or m.get("close_ts") or m.get("closeTime")
-            close_dt = None
-            if isinstance(ct, str):
-                try:
-                    close_dt = dt.datetime.fromisoformat(ct.replace("Z", "+00:00"))
-                except Exception:
-                    close_dt = None
-
-            if close_dt is None:
-                if best is None:
-                    best = t
-                    best_close = now_utc + dt.timedelta(hours=1)
-                continue
-
-            if close_dt <= now_utc:
-                continue
-
-            if best_close is None or close_dt < best_close:
-                best = t
-                best_close = close_dt
-
-        if not cursor:
-            break
-
-    if not best:
-        raise RuntimeError(f"No open markets found for prefix={prefix}")
-
-    return best, k.get_market(best)
-
-
-def get_available_cash_cents(balance: dict) -> int:
-    # Try a few likely shapes
-    if not isinstance(balance, dict):
+def calc_contract_count(cfg: Config, liquidity: float, limit_price_cents: int) -> int:
+    """
+    Max spend per trade = 1% of liquidity.
+    Each contract costs limit_price/100 dollars.
+    """
+    if liquidity <= 0:
         return 0
-    for key in ("available_cash", "balance", "cash_balance"):
-        v = balance.get(key)
-        if isinstance(v, int):
-            return v
-    cash = balance.get("cash")
-    if isinstance(cash, dict):
-        for key in ("available", "available_cash", "balance", "value"):
-            v = cash.get(key)
-            if isinstance(v, int):
-                return v
-    return 0
+    max_spend = liquidity * cfg.bet_pct_of_liquidity
+    price_dollars = max(limit_price_cents, 1) / 100.0
+    count = int(max_spend // price_dollars)
+    return max(1, count) if count > 0 else 0
 
 
-# ---------------------------
-# Main
-# ---------------------------
-@dataclass
-class DayRisk:
-    day: str
-    start_cash_cents: int
-    max_loss_cents: int
-    stopped: bool = False
-
-
-def utc_day() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-
-
+# ----------------------------
+# Main loop
+# ----------------------------
 def main():
-    enable_trading = env_bool("ENABLE_TRADING", False)
-    poll_seconds = env_int("POLL_SECONDS", 60)
-    prefix = (os.getenv("SERIES_PREFIX") or "KXBTC15M").strip()
-
-    extreme_pct = env_int("EXTREME_PCT", 95)          # trigger at 95%/5%
-    bet_pct = env_float("BET_PCT", 0.01)              # 1% of liquidity per bet
-    max_daily_loss_pct = env_float("MAX_DAILY_LOSS_PCT", 0.20)  # 20% of account per day
+    cfg = load_config()
 
     log.info("=== BOT STARTED ===")
-    log.info("ENABLE_TRADING=%s", enable_trading)
-    log.info("POLL_SECONDS=%s", poll_seconds)
-    log.info("SERIES_PREFIX=%s", prefix)
+    log.info("ENABLE_TRADING=%s", cfg.enable_trading)
+    log.info("POLL_SECONDS=%s", cfg.poll_seconds)
+    log.info("SERIES_PREFIX=%s", cfg.series_prefix)
+    log.info("API_BASE=%s", cfg.api_base)
+    log.info("EMAIL_ENABLED=%s", cfg.email_enabled)
 
-    creds = load_kalshi_creds()
-    if not creds:
-        log.warning("READ-ONLY: Missing Kalshi credentials. Need KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PEM_BASE64.")
-        enable_trading = False
-        k = None
-    else:
-        log.info("Kalshi key id detected: %s", mask(creds.key_id))
-        k = KalshiClient(creds)
+    client = KalshiClient(cfg)
 
-    risk: Optional[DayRisk] = None
+    if not client.can_auth:
+        log.warning("Kalshi credentials missing/invalid — running in READ-ONLY mode")
+        cfg.enable_trading = False
+
+    # Daily risk tracking (simple local tracker; resets at UTC day boundary)
+    current_utc_day = datetime.now(timezone.utc).date()
+    day_start_liquidity = None
+    max_loss_dollars = None
+    stopped_for_day = False
+
+    ticker_variant = None  # discovered format (1 or 2)
 
     while True:
-        try:
-            if not k:
-                log.info("READ-ONLY: no client. sleeping...")
-                time.sleep(poll_seconds)
-                continue
+        loop_start = time.time()
+        now_utc = datetime.now(timezone.utc)
 
-            # Reset risk each UTC day
-            day = utc_day()
-            if risk is None or risk.day != day:
-                bal = k.get_balance()
-                cash_cents = get_available_cash_cents(bal)
-                max_loss = int(cash_cents * max_daily_loss_pct)
-                risk = DayRisk(day=day, start_cash_cents=cash_cents, max_loss_cents=max_loss, stopped=False)
-                log.info("New UTC day: start_cash_cents=%s max_loss_cents=%s", cash_cents, max_loss)
+        # New UTC day reset
+        if now_utc.date() != current_utc_day:
+            current_utc_day = now_utc.date()
+            day_start_liquidity = None
+            max_loss_dollars = None
+            stopped_for_day = False
+            log.info("New UTC trading day, resetting daily stop.")
 
-            # Current cash
-            bal = k.get_balance()
-            cash_cents = get_available_cash_cents(bal)
-            if cash_cents <= 0:
-                log.info("No available cash yet.")
-                time.sleep(poll_seconds)
-                continue
+        # Always target NEXT 15m boundary (the key fix you asked for)
+        target_utc = ceil_to_next_15m(now_utc)
 
-            # Daily stop
-            if cash_cents < (risk.start_cash_cents - risk.max_loss_cents):
-                if not risk.stopped:
-                    risk.stopped = True
-                    msg = f"DAILY STOP HIT: start={risk.start_cash_cents} now={cash_cents} max_loss={risk.max_loss_cents}"
+        # Build ticker (try discovered variant first, else discover)
+        ticker = None
+        if ticker_variant in (1, 2):
+            ticker = fmt_ticker_variant(cfg.series_prefix, target_utc, ticker_variant)
+            m = client.get_market(ticker) if client.can_auth else None
+            if not m:
+                ticker_variant = None  # force rediscovery
+
+        if ticker_variant is None:
+            t, v = discover_ticker_format(client, cfg.series_prefix, target_utc) if client.can_auth else (None, None)
+            ticker = t
+            ticker_variant = v
+
+        if not ticker:
+            log.error("Could not resolve a valid ticker for next 15m boundary (%s).", target_utc.isoformat())
+            time.sleep(cfg.poll_seconds)
+            continue
+
+        log.info("CHECKING MARKET (next 15m): %s (UTC=%s)", ticker, target_utc.strftime("%Y-%m-%d %H:%M"))
+
+        market = client.get_market(ticker) if client.can_auth else None
+        if not market:
+            log.warning("Market not found yet (might not be listed yet). Will retry.")
+            time.sleep(cfg.poll_seconds)
+            continue
+
+        # Liquidity
+        liquidity = client.get_balance() if client.can_auth else None
+        if liquidity is None:
+            log.warning("No liquidity yet (balance unavailable).")
+        else:
+            if day_start_liquidity is None:
+                day_start_liquidity = liquidity
+                max_loss_dollars = day_start_liquidity * cfg.max_daily_loss_pct
+                log.info("Day start liquidity: %.2f | Daily stop loss ($): %.2f", day_start_liquidity, max_loss_dollars)
+
+            # crude daily stop (if liquidity drop exceeds max_loss)
+            if max_loss_dollars is not None and (day_start_liquidity - liquidity) >= max_loss_dollars:
+                if not stopped_for_day:
+                    stopped_for_day = True
+                    msg = f"Daily stop triggered. Start={day_start_liquidity:.2f} Now={liquidity:.2f} Loss={(day_start_liquidity-liquidity):.2f}"
                     log.error(msg)
-                    safe_email("Kalshi BTC bot: DAILY STOP HIT", msg)
-                time.sleep(poll_seconds)
-                continue
+                    send_email(cfg, "Kalshi bot: DAILY STOP TRIGGERED", msg)
 
-            # Pick the correct CURRENT open BTC 15m market
-            ticker, market = pick_current_market(k, prefix)
-            log.info("CHECKING MARKET: %s", ticker)
+        # Extract prices & decide
+        yes_bid, yes_ask = extract_yes_prices(market)
+        log.info("Prices (cents): yes_bid=%s yes_ask=%s", yes_bid, yes_ask)
 
-            # Pull prices (try common fields)
-            yes_ask = cents(market.get("yes_ask") or market.get("yesAsk"))
-            no_ask = cents(market.get("no_ask") or market.get("noAsk"))
-            yes_bid = cents(market.get("yes_bid") or market.get("yesBid"))
-            no_bid = cents(market.get("no_bid") or market.get("noBid"))
+        trade_plan = decide_trade(cfg, yes_bid, yes_ask)
 
-            if yes_ask is None or no_ask is None:
-                log.info("No usable prices yet. yes_ask=%s no_ask=%s", yes_ask, no_ask)
-                time.sleep(poll_seconds)
-                continue
+        if not trade_plan:
+            log.info("No signal (not extreme enough).")
+        else:
+            action, side, limit_price = trade_plan
+            log.info("Signal: %s %s @ %sc (extreme threshold=%.0f%%)",
+                     action.upper(), side.upper(), limit_price, cfg.extreme_threshold * 100)
 
-            # Extreme trigger logic:
-            # If YES is 95c+ -> market thinks YES is 95% likely -> bet NO
-            # If YES is 5c-  -> market thinks YES is 5% likely  -> bet YES
-            trigger_hi = extreme_pct
-            trigger_lo = 100 - extreme_pct
-
-            side = None
-            price = None
-
-            if yes_ask >= trigger_hi:
-                side = "no"
-                price = no_ask
-            elif yes_ask <= trigger_lo:
-                side = "yes"
-                price = yes_ask
+            if stopped_for_day:
+                log.warning("Stopped for day — not trading.")
+            elif not cfg.enable_trading:
+                log.warning("Trading disabled — would have placed: %s %s %s @ %sc", action, side, ticker, limit_price)
             else:
-                log.info("No signal. yes_ask=%sc yes_bid=%s no_ask=%s no_bid=%s", yes_ask, yes_bid, no_ask, no_bid)
-                time.sleep(poll_seconds)
-                continue
+                if liquidity is None:
+                    log.warning("Cannot size trade without liquidity. Skipping trade.")
+                else:
+                    count = calc_contract_count(cfg, liquidity, limit_price)
+                    if count <= 0:
+                        log.warning("Calculated contract count <= 0. Skipping.")
+                    else:
+                        try:
+                            resp = client.place_order(
+                                ticker=ticker,
+                                side=side,
+                                action=action,
+                                count=count,
+                                price=limit_price,
+                            )
+                            log.info("ORDER PLACED: %s", json.dumps(resp)[:800])
+                            send_email(
+                                cfg,
+                                f"Kalshi bot: order placed ({ticker})",
+                                f"Placed {action} {side} x{count} @ {limit_price}c\n\nResponse:\n{json.dumps(resp, indent=2)[:4000]}",
+                            )
+                        except Exception as e:
+                            err = str(e)
+                            log.error("ORDER FAILED: %s", err[:800])
+                            send_email(cfg, "Kalshi bot: ORDER FAILED", err[:4000])
 
-            # Bet sizing: 1% of cash
-            bet_cents = int(cash_cents * bet_pct)
-            if bet_cents < 25:
-                bet_cents = 25  # minimum tiny bet
-
-            cost_per_contract = max(1, int(price))
-            count = bet_cents // cost_per_contract
-            if count <= 0:
-                log.info("Bet too small for price. cash=%s bet=%s price=%s", cash_cents, bet_cents, price)
-                time.sleep(poll_seconds)
-                continue
-
-            log.info("SIGNAL: BUY %s | price=%sc | count=%s | bet_cents=%s | cash=%s", side.upper(), price, count, bet_cents, cash_cents)
-
-            if not enable_trading:
-                log.info("READ-ONLY: would place order now.")
-                time.sleep(poll_seconds)
-                continue
-
-            # Place order
-            try:
-                resp = k.create_order(ticker=ticker, side=side, count=count, price=price)
-                log.info("ORDER OK: %s", json.dumps(resp)[:800])
-                safe_email(
-                    "Kalshi BTC bot: ORDER PLACED",
-                    f"ticker={ticker}\nside={side}\nprice={price}\ncount={count}\nbet_cents={bet_cents}\ncash_cents={cash_cents}\n\nresp={json.dumps(resp)[:1500]}",
-                )
-            except Exception as e:
-                err = f"ORDER FAILED: {e!r}"
-                log.error(err)
-                safe_email("Kalshi BTC bot: ORDER FAILED", err)
-
-            time.sleep(poll_seconds)
-
-        except Exception as loop_err:
-            log.error("LOOP ERROR: %r", loop_err)
-            safe_email("Kalshi BTC bot: LOOP ERROR", repr(loop_err))
-            time.sleep(poll_seconds)
+        # Heartbeat timing (never silent)
+        elapsed = time.time() - loop_start
+        sleep_for = max(1, cfg.poll_seconds - int(elapsed))
+        log.info("Heartbeat: loop=%.2fs sleeping=%ss", elapsed, sleep_for)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
