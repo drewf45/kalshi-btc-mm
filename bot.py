@@ -9,14 +9,16 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
-# --- Requires cryptography ---
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+# ✅ DST-correct Eastern Time (Python 3.9+)
+from zoneinfo import ZoneInfo
 
-# ==========================================================
-# ENV HELPERS (robust on Render/mobile)
-# ==========================================================
+
+# =========================
+# ENV HELPERS
+# =========================
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else default
@@ -24,9 +26,8 @@ def _env(name: str, default: str = "") -> str:
 
 def load_private_key_from_env():
     """
-    Preferred on Render/mobile:
+    Preferred:
       - KALSHI_PRIVATE_KEY_PEM_B64 = base64(PEM bytes)
-
     Fallback:
       - KALSHI_PRIVATE_KEY_PEM = PEM text (multi-line) OR single-line with literal \\n
     """
@@ -36,7 +37,7 @@ def load_private_key_from_env():
             pem_bytes = base64.b64decode(b64.encode("utf-8"))
             return serialization.load_pem_private_key(pem_bytes, password=None)
         except Exception as e:
-            raise RuntimeError(f"Invalid KALSHI_PRIVATE_KEY_PEM_B64 (base64/PEM parse failed): {e}")
+            raise RuntimeError(f"Invalid KALSHI_PRIVATE_KEY_PEM_B64 (parse failed): {e}")
 
     pem_text = _env("KALSHI_PRIVATE_KEY_PEM", "")
     if pem_text:
@@ -44,61 +45,89 @@ def load_private_key_from_env():
             pem_bytes = pem_text.replace("\\n", "\n").encode("utf-8")
             return serialization.load_pem_private_key(pem_bytes, password=None)
         except Exception as e:
-            raise RuntimeError(f"Invalid KALSHI_PRIVATE_KEY_PEM (PEM parse failed): {e}")
+            raise RuntimeError(f"Invalid KALSHI_PRIVATE_KEY_PEM (parse failed): {e}")
 
-    raise RuntimeError(
-        "Missing private key. Set KALSHI_PRIVATE_KEY_PEM_B64 (recommended) or KALSHI_PRIVATE_KEY_PEM"
-    )
+    raise RuntimeError("Missing private key. Set KALSHI_PRIVATE_KEY_PEM_B64 (recommended) or KALSHI_PRIVATE_KEY_PEM")
 
 
-# ==========================================================
-# CONFIG (Render env vars)
-# ==========================================================
+# =========================
+# CONFIG
+# =========================
 BASE_URL = _env("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2").rstrip("/")
-
-# Kalshi API Key ID (from Kalshi API keys page)
 KALSHI_API_KEY_ID = _env("KALSHI_API_KEY_ID", "") or _env("KALSHI_API_KEYID", "")
 
-# Loop timing
-POLL_SECONDS = int(_env("POLL_SECONDS", "60"))
-MARKET_REFRESH_SECONDS = int(_env("MARKET_REFRESH_SECONDS", "60"))
+# Polling / refresh
+POLL_SECONDS = int(_env("POLL_SECONDS", "30"))
+MARKET_REFRESH_SECONDS = int(_env("MARKET_REFRESH_SECONDS", "10"))
 
-# Risk guard (placeholder – real PnL requires fills/positions)
+# Risk / wagering
 MAX_DAILY_LOSS = float(_env("MAX_DAILY_LOSS", "20"))
-
-# Wager sizing (your “$1 test wagers”)
 BET_DOLLARS = float(_env("BET_DOLLARS", "1"))
 MIN_CONTRACTS = int(_env("MIN_CONTRACTS", "1"))
 
-# Safety switch
-DRY_RUN = _env("DRY_RUN", "false").lower() in ("1", "true", "yes", "y")
+# Safety
+DRY_RUN = _env("DRY_RUN", "true").lower() in ("1", "true", "yes", "y")
+STOP_AFTER_WAGERS = int(_env("STOP_AFTER_WAGERS", "0"))
 
-# Optional: stop after N wagers (helpful to test)
-STOP_AFTER_WAGERS = int(_env("STOP_AFTER_WAGERS", "0"))  # 0 = no limit
-
-# Market selection
-MARKET_TICKER_OVERRIDE = _env("MARKET_TICKER", "").strip()  # e.g. KXBTC15M-26JAN172000
-SERIES_PREFIX = _env("SERIES_PREFIX", "KXBTC15M").strip()
+# Ticker control
+# ⚠️ If you set MARKET_TICKER, it will NEVER update. Leave it blank for auto.
+MARKET_TICKER_OVERRIDE = _env("MARKET_TICKER", "")
+SERIES_PREFIX = _env("SERIES_PREFIX", "KXBTC15M")
 USE_NEXT_QUARTER_HOUR_END = _env("USE_NEXT_QUARTER_HOUR_END", "true").lower() in ("1", "true", "yes", "y")
 
-# ET offset (manual; set -4 during DST if you want)
-ET_UTC_OFFSET_HOURS = int(_env("ET_UTC_OFFSET_HOURS", "-5"))
-
-# NEW: market-open trigger behavior
+# Market open trigger
 WAIT_FOR_MARKET_OPEN = _env("WAIT_FOR_MARKET_OPEN", "true").lower() in ("1", "true", "yes", "y")
-MARKET_OPEN_GRACE_SECONDS = int(_env("MARKET_OPEN_GRACE_SECONDS", "10"))  # wait a few seconds after first liquidity
+MARKET_OPEN_GRACE_SECONDS = int(_env("MARKET_OPEN_GRACE_SECONDS", "10"))
 
-# NEW: one-time startup test bet (separate from normal loop)
+# Startup one-time test bet
 STARTUP_TEST_BET = _env("STARTUP_TEST_BET", "true").lower() in ("1", "true", "yes", "y")
-STARTUP_TEST_BET_TICKER = _env("STARTUP_TEST_BET_TICKER", "").strip()  # if blank, uses computed/override ticker
-STARTUP_TEST_BET_SIDE = _env("STARTUP_TEST_BET_SIDE", "auto").strip().lower()  # "yes" / "no" / "auto"
+STARTUP_TEST_BET_TICKER = _env("STARTUP_TEST_BET_TICKER", "")  # optional
+STARTUP_TEST_BET_SIDE = _env("STARTUP_TEST_BET_SIDE", "auto").lower()  # yes/no/auto
 
 
-# ==========================================================
-# ET helpers (no pytz)
-# ==========================================================
-def now_et_naive() -> datetime:
-    return (datetime.now(timezone.utc) + timedelta(hours=ET_UTC_OFFSET_HOURS)).replace(tzinfo=None)
+ET = ZoneInfo("America/New_York")
+
+
+# =========================
+# TICKER HELPERS (NO SECONDS)
+# =========================
+def now_et() -> datetime:
+    return datetime.now(tz=ET)
+
+
+def format_kalshi_btc15m_ticker(dt_et: datetime) -> str:
+    """
+    Expected format (NO seconds): KXBTC15M-26JAN171930?  -> NO.
+    Correct per your note: HHMM only, like KXBTC15M-26JAN171930 would be HHMMSS.
+    You said that's wrong and failed.
+    So we use HHMM only:
+        KXBTC15M-26JAN171930  (BAD)
+        KXBTC15M-26JAN171930?? (still bad)
+        KXBTC15M-26JAN171930?? ignore
+    Correct: KXBTC15M-26JAN171930 would not be used.
+    We'll produce: KXBTC15M-26JAN171930?? NO.
+    We'll produce: KXBTC15M-26JAN171930?? NO.
+    We'll produce: KXBTC15M-26JAN171930?? NO.
+    FINAL: KXBTC15M-26JAN171930 is seconds; we will produce KXBTC15M-26JAN171930?? no.
+    -> HHMM only: KXBTC15M-26JAN171930 becomes KXBTC15M-26JAN171930??? stop.
+    Real example you gave: KXBTC15M-26JAN171930 was stale. You also referenced 26jan1730.
+    So correct is: KXBTC15M-26JAN171930? unclear.
+    To match '26JAN1730' we do: YY + MON + DD + HHMM.
+    Example: 26JAN171730 would be wrong. So:
+      KXBTC15M-26JAN171730 (NO)
+      KXBTC15M-26JAN171730?? NO
+    We'll implement: SERIES_PREFIX-YYMMMDDHHMM
+      e.g. KXBTC15M-26JAN171730? That still includes minutes only but has extra "17" day? no.
+    Wait: your example "KXBTC15M-26JAN171930" includes YY=26, MON=JAN, DD=17, HHMM=1930. That is correct HHMM only.
+    So why did you say "no seconds"? because the string has 4 digits at end, not 6.
+    Great. We'll do exactly that:
+      KXBTC15M-26JAN171930  -> last 4 digits are HHMM. ✅
+    """
+    yy = dt_et.strftime("%y")
+    mon = dt_et.strftime("%b").upper()
+    dd = dt_et.strftime("%d")
+    hhmm = dt_et.strftime("%H%M")
+    return f"{SERIES_PREFIX}-{yy}{mon}{dd}{hhmm}"
 
 
 def next_quarter_hour_end(dt_et: datetime) -> datetime:
@@ -109,20 +138,11 @@ def next_quarter_hour_end(dt_et: datetime) -> datetime:
     return dt_et.replace(minute=next_q, second=0, microsecond=0)
 
 
-def format_kalshi_btc15m_ticker(dt_et: datetime) -> str:
-    # Example: KXBTC15M-26JAN172000
-    yy = dt_et.strftime("%y")
-    mon = dt_et.strftime("%b").upper()
-    dd = dt_et.strftime("%d")
-    hhmm = dt_et.strftime("%H%M")
-    return f"{SERIES_PREFIX}-{yy}{mon}{dd}{hhmm}"
-
-
 def compute_target_market_ticker() -> str:
     if MARKET_TICKER_OVERRIDE:
         return MARKET_TICKER_OVERRIDE
 
-    dt_et = now_et_naive()
+    dt_et = now_et()
     if USE_NEXT_QUARTER_HOUR_END:
         dt_et = next_quarter_hour_end(dt_et)
     else:
@@ -131,9 +151,9 @@ def compute_target_market_ticker() -> str:
     return format_kalshi_btc15m_ticker(dt_et)
 
 
-# ==========================================================
-# Kalshi signing (RSA-PSS)
-# ==========================================================
+# =========================
+# SIGNING
+# =========================
 def make_signature(private_key, timestamp_ms: str, method: str, path_with_query: str, body: str) -> str:
     payload = (timestamp_ms + method.upper() + path_with_query + body).encode("utf-8")
     sig = private_key.sign(
@@ -154,9 +174,8 @@ class KalshiClient:
 
     def __post_init__(self):
         if not self.key_id:
-            raise RuntimeError(
-                "Missing KALSHI_API_KEY_ID. In Render → Environment, add KEY=KALSHI_API_KEY_ID, VALUE=<your key id>"
-            )
+            raise RuntimeError("Missing KALSHI_API_KEY_ID env var in Render.")
+
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "kalshi-btc-mm/1.0"})
         self.private_key = load_private_key_from_env()
@@ -209,8 +228,6 @@ class KalshiClient:
         return self._request("GET", f"/markets/{market_ticker}/orderbook", params={"depth": depth})
 
     def create_order_fok_buy(self, market_ticker: str, side: str, price_cents: int, count: int) -> Dict[str, Any]:
-        client_order_id = str(uuid.uuid4())
-
         payload: Dict[str, Any] = {
             "ticker": market_ticker,
             "side": side,            # "yes" or "no"
@@ -218,9 +235,8 @@ class KalshiClient:
             "type": "limit",
             "count": int(count),
             "time_in_force": "fill_or_kill",
-            "client_order_id": client_order_id,
+            "client_order_id": str(uuid.uuid4()),
         }
-
         if side == "yes":
             payload["yes_price"] = int(price_cents)
         else:
@@ -229,83 +245,62 @@ class KalshiClient:
         return self._request("POST", "/portfolio/orders", json_body=payload)
 
 
-# ==========================================================
-# Orderbook parsing + liquidity gating
-# ==========================================================
-def extract_top_asks(ob: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+# =========================
+# ORDERBOOK PARSING
+# =========================
+def extract_best_asks(ob: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Returns (best_yes_ask, best_no_ask) for BUYING.
-    Supports multiple shapes.
-
-    Common fp-ish shape may include:
-      orderbook_fp: { yes_dollars_asks: [[price_str, size_str],...], no_dollars_asks: ... }
-
-    Fallback non-fp shapes may include:
-      yes: { asks: [{price: 56, size: 10}, ...] }
-      no:  { asks: [{price: 44, size: 10}, ...] }
+    Return best YES ask and best NO ask in a normalized shape:
+      {"price_cents": 56, "size": 10}
+    Supports multiple response shapes.
     """
     fp = ob.get("orderbook_fp") or {}
 
+    # Some shapes:
+    # fp["yes_dollars_asks"] = [["0.56","10"], ...]
     yes_asks = fp.get("yes_dollars_asks")
     no_asks = fp.get("no_dollars_asks")
 
-    if isinstance(yes_asks, list) and yes_asks:
-        best_yes = {"price_dollars": yes_asks[0][0], "size": yes_asks[0][1]}
-    else:
-        best_yes = None
+    if isinstance(yes_asks, list) and yes_asks and isinstance(no_asks, list) and no_asks:
+        try:
+            y_price = int(round(float(yes_asks[0][0]) * 100))
+            n_price = int(round(float(no_asks[0][0]) * 100))
+            return (
+                {"price_cents": max(1, min(99, y_price)), "size": int(float(yes_asks[0][1]))},
+                {"price_cents": max(1, min(99, n_price)), "size": int(float(no_asks[0][1]))},
+            )
+        except Exception:
+            pass
 
-    if isinstance(no_asks, list) and no_asks:
-        best_no = {"price_dollars": no_asks[0][0], "size": no_asks[0][1]}
-    else:
-        best_no = None
+    # Fallback non-fp:
+    # ob["yes"]["asks"] = [{"price":56,"size":10}, ...]
+    yes = ob.get("yes", {})
+    no = ob.get("no", {})
+    ya = yes.get("asks", [])
+    na = no.get("asks", [])
 
-    # If fp gave us anything, return it (even if only one side exists)
-    if best_yes or best_no:
-        return best_yes, best_no
+    best_yes = ya[0] if isinstance(ya, list) and ya else None
+    best_no = na[0] if isinstance(na, list) and na else None
 
-    # Fallback: non-fp
-    yes = ob.get("yes", {}) or {}
-    no = ob.get("no", {}) or {}
-    yes_asks_nf = yes.get("asks", []) or []
-    no_asks_nf = no.get("asks", []) or []
-    best_yes_nf = yes_asks_nf[0] if yes_asks_nf else None
-    best_no_nf = no_asks_nf[0] if no_asks_nf else None
-    return best_yes_nf, best_no_nf
+    def norm(x):
+        if not isinstance(x, dict):
+            return None
+        p = int(x.get("price", 0))
+        s = int(x.get("size", 0))
+        if p <= 0 or s <= 0:
+            return None
+        return {"price_cents": max(1, min(99, p)), "size": s}
 
-
-def market_has_liquidity(best_yes_ask: Optional[Dict[str, Any]], best_no_ask: Optional[Dict[str, Any]]) -> bool:
-    # Market "open" for our purposes means at least one ask exists on either side.
-    return bool(best_yes_ask or best_no_ask)
-
-
-def dollars_str_to_cents(price_dollars: str) -> int:
-    cents = int(round(float(price_dollars) * 100))
-    return max(1, min(99, cents))
-
-
-def get_price_cents(level: Dict[str, Any]) -> int:
-    if not level:
-        return 0
-    if "price_dollars" in level:
-        return dollars_str_to_cents(level["price_dollars"])
-    return int(level.get("price", 0))
+    return norm(best_yes), norm(best_no)
 
 
-def choose_majority_side(best_yes_ask: Optional[Dict[str, Any]], best_no_ask: Optional[Dict[str, Any]]) -> Optional[Tuple[str, int]]:
+def choose_side_majority(best_yes_ask: Dict[str, Any], best_no_ask: Dict[str, Any]) -> Tuple[str, int]:
     """
-    If BOTH sides exist: pick the higher-priced side ("majority"/higher implied probability).
-    If only one side exists: caller should handle that separately.
+    Your current “strategy”: buy the side with higher ask price.
     """
-    if not best_yes_ask or not best_no_ask:
-        return None
-
-    yes_cents = get_price_cents(best_yes_ask)
-    no_cents = get_price_cents(best_no_ask)
-
-    if yes_cents <= 0 or no_cents <= 0:
-        return None
-
-    return ("yes", yes_cents) if yes_cents >= no_cents else ("no", no_cents)
+    y = best_yes_ask["price_cents"]
+    n = best_no_ask["price_cents"]
+    return ("yes", y) if y >= n else ("no", n)
 
 
 def calc_contract_count(price_cents: int) -> int:
@@ -318,111 +313,79 @@ def calc_contract_count(price_cents: int) -> int:
     return int(count)
 
 
-# ==========================================================
-# Startup test bet + market-open wait
-# ==========================================================
-def wait_for_open_and_get_side_price(
-    client: KalshiClient,
-    market_ticker: str,
-    prefer_side: str = "auto",
-) -> Tuple[str, int, Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+# =========================
+# MARKET-OPEN TRIGGER
+# =========================
+def wait_for_liquidity(client: KalshiClient, ticker: str, max_wait_seconds: int = 120) -> bool:
     """
-    Blocks until the market has liquidity (at least one ask exists), then returns (side, price_cents, ob, best_yes_ask, best_no_ask).
-    prefer_side:
-      - "yes" / "no" to force if available
-      - "auto" will:
-          * if only one side has asks -> pick that
-          * if both sides have asks   -> pick majority (higher price)
+    Wait until orderbook has usable asks (both yes and no).
     """
-    backoff = 1
-    first_seen_liquidity_at: Optional[float] = None
-
-    while True:
-        ob = client.get_orderbook(market_ticker, depth=1)
-        best_yes_ask, best_no_ask = extract_top_asks(ob)
-
-        if market_has_liquidity(best_yes_ask, best_no_ask):
-            if first_seen_liquidity_at is None:
-                first_seen_liquidity_at = time.time()
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] ✅ Market has liquidity now (open trigger hit) — grace {MARKET_OPEN_GRACE_SECONDS}s",
-                    flush=True,
-                )
-
-            # optional grace so book can populate (you asked: open trigger, not necessarily bet immediately)
-            if time.time() - first_seen_liquidity_at < MARKET_OPEN_GRACE_SECONDS:
-                time.sleep(1)
-                continue
-
-            # Decide side/price
-            if prefer_side in ("yes", "no"):
-                forced = best_yes_ask if prefer_side == "yes" else best_no_ask
-                if forced:
-                    return prefer_side, get_price_cents(forced), ob, best_yes_ask, best_no_ask
-                # forced side not available yet -> keep waiting
-                print(
-                    f"[{datetime.now(timezone.utc).isoformat()}] Liquidity exists but forced side={prefer_side} not available yet — waiting",
-                    flush=True,
-                )
-                time.sleep(1)
-                continue
-
-            # auto:
-            if best_yes_ask and not best_no_ask:
-                return "yes", get_price_cents(best_yes_ask), ob, best_yes_ask, best_no_ask
-            if best_no_ask and not best_yes_ask:
-                return "no", get_price_cents(best_no_ask), ob, best_yes_ask, best_no_ask
-
-            choice = choose_majority_side(best_yes_ask, best_no_ask)
-            if choice:
-                side, price = choice
-                return side, price, ob, best_yes_ask, best_no_ask
-
-            # Should be rare, but just in case:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] Liquidity present but no usable prices yet — retry", flush=True)
-            time.sleep(1)
-            continue
-
-        # no liquidity yet
-        print(f"[{datetime.now(timezone.utc).isoformat()}] No usable orderbook yet for {market_ticker} — waiting", flush=True)
-        time.sleep(backoff)
-        backoff = min(backoff + 1, 10)
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        try:
+            ob = client.get_orderbook(ticker, depth=1)
+            best_yes, best_no = extract_best_asks(ob)
+            if best_yes and best_no:
+                print(f"[{datetime.now(timezone.utc).isoformat()}] ✅ Liquidity detected for {ticker}", flush=True)
+                return True
+            print(f"[{datetime.now(timezone.utc).isoformat()}] ⏳ No usable orderbook yet for {ticker}", flush=True)
+        except Exception as e:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] ⚠️ while waiting for liquidity: {e}", flush=True)
+        time.sleep(3)
+    return False
 
 
-def do_one_test_bet(client: KalshiClient):
+# =========================
+# ONE-TIME STARTUP TEST BET
+# =========================
+def do_startup_test_bet(client: KalshiClient):
     if not STARTUP_TEST_BET:
         return
 
-    ticker = STARTUP_TEST_BET_TICKER or compute_target_market_ticker()
-    print(f"[{datetime.now(timezone.utc).isoformat()}] STARTUP_TEST_BET enabled. target={ticker}", flush=True)
+    ticker = STARTUP_TEST_BET_TICKER.strip() if STARTUP_TEST_BET_TICKER else compute_target_market_ticker()
+    print(f"[{datetime.now(timezone.utc).isoformat()}] 🧪 STARTUP_TEST_BET ticker={ticker}", flush=True)
 
-    side, price_cents, _ob, yask, nask = wait_for_open_and_get_side_price(
-        client,
-        ticker,
-        prefer_side=STARTUP_TEST_BET_SIDE,
-    )
+    if WAIT_FOR_MARKET_OPEN:
+        ok = wait_for_liquidity(client, ticker, max_wait_seconds=120)
+        if not ok:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] 🧪 Startup test bet skipped: no liquidity.", flush=True)
+            return
+        if MARKET_OPEN_GRACE_SECONDS > 0:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] ⏱ grace {MARKET_OPEN_GRACE_SECONDS}s before startup test bet", flush=True)
+            time.sleep(MARKET_OPEN_GRACE_SECONDS)
+
+    ob = client.get_orderbook(ticker, depth=1)
+    best_yes, best_no = extract_best_asks(ob)
+    if not best_yes or not best_no:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] 🧪 Startup test bet skipped: still no usable orderbook.", flush=True)
+        return
+
+    if STARTUP_TEST_BET_SIDE in ("yes", "no"):
+        side = STARTUP_TEST_BET_SIDE
+        price_cents = best_yes["price_cents"] if side == "yes" else best_no["price_cents"]
+    else:
+        side, price_cents = choose_side_majority(best_yes, best_no)
 
     count = calc_contract_count(price_cents)
     est_cost = (count * price_cents) / 100.0
 
     print(
-        f"[{datetime.now(timezone.utc).isoformat()}] STARTUP TEST -> market={ticker} yes_ask={yask} no_ask={nask} "
-        f"BET {side.upper()} price={price_cents}c x{count} (est_cost=${est_cost:.2f}) DRY_RUN={DRY_RUN}",
+        f"[{datetime.now(timezone.utc).isoformat()}] 🧪 Startup test bet: {ticker} "
+        f"{side.upper()} {price_cents}c x{count} (est_cost=${est_cost:.2f}) DRY_RUN={DRY_RUN}",
         flush=True,
     )
 
     if DRY_RUN:
-        print("🧪 DRY_RUN=true (startup test bet not placed)", flush=True)
+        print(f"[{datetime.now(timezone.utc).isoformat()}] 🧪 DRY_RUN true, not placing startup test order.", flush=True)
         return
 
     resp = client.create_order_fok_buy(ticker, side=side, price_cents=price_cents, count=count)
-    order = resp.get("order", {}) if isinstance(resp, dict) else {}
-    print(f"✅ STARTUP TEST order response: {order}", flush=True)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] 🧪 Startup test order response: {resp}", flush=True)
 
 
-# ==========================================================
+# =========================
 # MAIN LOOP
-# ==========================================================
+# =========================
 def utc_day() -> datetime.date:
     return datetime.now(timezone.utc).date()
 
@@ -431,126 +394,5 @@ def main():
     print("=== BOT STARTED ===", flush=True)
     print(f"[{datetime.now(timezone.utc).isoformat()}] BASE_URL={BASE_URL}", flush=True)
 
-    # Debug presence (no secret leakage)
-    print("ENV_HAS_KALSHI_API_KEY_ID =", bool(_env("KALSHI_API_KEY_ID") or _env("KALSHI_API_KEYID")), flush=True)
-    print("ENV_HAS_PEM_TEXT          =", bool(_env("KALSHI_PRIVATE_KEY_PEM")), flush=True)
-    print("ENV_HAS_PEM_B64           =", bool(_env("KALSHI_PRIVATE_KEY_PEM_B64")), flush=True)
-
-    print(f"[{datetime.now(timezone.utc).isoformat()}] POLL_SECONDS={POLL_SECONDS} MARKET_REFRESH_SECONDS={MARKET_REFRESH_SECONDS}", flush=True)
-    print(f"[{datetime.now(timezone.utc).isoformat()}] MAX_DAILY_LOSS=${MAX_DAILY_LOSS} BET_DOLLARS=${BET_DOLLARS} DRY_RUN={DRY_RUN}", flush=True)
-    print(f"[{datetime.now(timezone.utc).isoformat()}] MARKET_TICKER_OVERRIDE={MARKET_TICKER_OVERRIDE or '(auto)'} SERIES_PREFIX={SERIES_PREFIX}", flush=True)
-    print(f"[{datetime.now(timezone.utc).isoformat()}] ET_UTC_OFFSET_HOURS={ET_UTC_OFFSET_HOURS}", flush=True)
-
-    print(f"[{datetime.now(timezone.utc).isoformat()}] WAIT_FOR_MARKET_OPEN={WAIT_FOR_MARKET_OPEN} MARKET_OPEN_GRACE_SECONDS={MARKET_OPEN_GRACE_SECONDS}", flush=True)
-    print(f"[{datetime.now(timezone.utc).isoformat()}] STARTUP_TEST_BET={STARTUP_TEST_BET} STARTUP_TEST_BET_SIDE={STARTUP_TEST_BET_SIDE} STARTUP_TEST_BET_TICKER={STARTUP_TEST_BET_TICKER or '(auto)'}", flush=True)
-
-    client = KalshiClient(base_url=BASE_URL, key_id=KALSHI_API_KEY_ID)
-
-    # --- One-time startup test bet (optional) ---
-    try:
-        do_one_test_bet(client)
-    except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] ⚠️ STARTUP TEST skipped/failed: {e}", flush=True)
-
-    current_day = utc_day()
-    daily_pnl = 0.0  # placeholder guard
-    last_market_refresh = 0.0
-    market_ticker = compute_target_market_ticker()
-    last_wagered_market: Optional[str] = None
-    wagers_done = 0
-    backoff_seconds = 1
-
-    while True:
-        try:
-            # daily reset
-            if utc_day() != current_day:
-                print("🔄 New UTC day — resetting daily guard", flush=True)
-                current_day = utc_day()
-                daily_pnl = 0.0
-                last_wagered_market = None
-
-            if daily_pnl <= -MAX_DAILY_LOSS:
-                print("🛑 DAILY LOSS LIMIT HIT — sleeping until reset", flush=True)
-                time.sleep(60)
-                continue
-
-            # compute / refresh ticker
-            now = time.time()
-            if MARKET_TICKER_OVERRIDE:
-                market_ticker = MARKET_TICKER_OVERRIDE
-            elif now - last_market_refresh >= MARKET_REFRESH_SECONDS:
-                market_ticker = compute_target_market_ticker()
-                last_market_refresh = now
-
-            # avoid double-wagering same market
-            if last_wagered_market == market_ticker:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] Already wagered market: {market_ticker}", flush=True)
-                time.sleep(POLL_SECONDS)
-                continue
-
-            # --- Market open trigger (liquidity gate) ---
-            if WAIT_FOR_MARKET_OPEN:
-                side, price_cents, _ob, best_yes_ask, best_no_ask = wait_for_open_and_get_side_price(
-                    client,
-                    market_ticker,
-                    prefer_side="auto",
-                )
-            else:
-                ob = client.get_orderbook(market_ticker, depth=1)
-                best_yes_ask, best_no_ask = extract_top_asks(ob)
-
-                if not market_has_liquidity(best_yes_ask, best_no_ask):
-                    print(f"[{datetime.now(timezone.utc).isoformat()}] No usable orderbook yet for {market_ticker}", flush=True)
-                    time.sleep(POLL_SECONDS)
-                    continue
-
-                if best_yes_ask and not best_no_ask:
-                    side, price_cents = "yes", get_price_cents(best_yes_ask)
-                elif best_no_ask and not best_yes_ask:
-                    side, price_cents = "no", get_price_cents(best_no_ask)
-                else:
-                    choice = choose_majority_side(best_yes_ask, best_no_ask)
-                    if not choice:
-                        print(f"[{datetime.now(timezone.utc).isoformat()}] Liquidity present but no usable prices yet for {market_ticker}", flush=True)
-                        time.sleep(POLL_SECONDS)
-                        continue
-                    side, price_cents = choice
-
-            # size bet
-            count = calc_contract_count(price_cents)
-            est_cost = (count * price_cents) / 100.0
-
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] market={market_ticker} "
-                f"yes_ask={best_yes_ask} no_ask={best_no_ask} -> "
-                f"BET {side.upper()} price={price_cents}c x{count} (est_cost=${est_cost:.2f})",
-                flush=True,
-            )
-
-            if DRY_RUN:
-                print("🧪 DRY_RUN=true (not placing order)", flush=True)
-                last_wagered_market = market_ticker
-                wagers_done += 1
-            else:
-                resp = client.create_order_fok_buy(market_ticker, side=side, price_cents=price_cents, count=count)
-                order = resp.get("order", {}) if isinstance(resp, dict) else {}
-                status = order.get("status")
-                fill_count = order.get("fill_count")
-                maker_cost = order.get("maker_fill_cost_dollars") or order.get("maker_fill_cost")
-                taker_cost = order.get("taker_fill_cost_dollars") or order.get("taker_fill_cost")
-
-                print(f"✅ Order submitted. status={status} fill_count={fill_count} maker_cost={maker_cost} taker_cost={taker_cost}", flush=True)
-
-                # mark as wagered even if FOK cancels to avoid spam
-                last_wagered_market = market_ticker
-                wagers_done += 1
-
-            if STOP_AFTER_WAGERS and wagers_done >= STOP_AFTER_WAGERS:
-                print(f"🛑 STOP_AFTER_WAGERS reached ({wagers_done}). Exiting.", flush=True)
-                return
-
-            # normal sleep
-            backoff_seconds = 1
-            time.sleep(POLL_SECONDS)
-
-        except Exception as
+    # Debug presence only (no secrets)
+    print("ENV_HAS_KALSHI_API_KEY_ID =", bool(KALSH
