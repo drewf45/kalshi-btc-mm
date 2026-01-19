@@ -26,7 +26,6 @@ log = logging.getLogger("kalshi-bot")
 # Helpers
 # -----------------------------
 def now_utc_ts() -> int:
-    # CHANGED: Kalshi signature uses timestamp in milliseconds
     return int(time.time() * 1000)
 
 
@@ -66,12 +65,6 @@ def safe_json(obj: Any, max_len: int = 900) -> str:
 
 
 def load_rsa_private_key_from_env() -> Any:
-    """
-    Supports:
-      - KALSHI_PRIVATE_KEY (raw PEM starting with -----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----)
-      - KALSHI_PRIVATE_KEY_B64 (base64 of the PEM)
-      - KALSHI_PRIVATE_KEY (sometimes user puts base64 here) -> we detect and decode if PEM header absent
-    """
     pem_or_b64 = os.getenv("KALSHI_PRIVATE_KEY") or ""
     b64 = os.getenv("KALSHI_PRIVATE_KEY_B64") or ""
 
@@ -80,7 +73,6 @@ def load_rsa_private_key_from_env() -> Any:
         raise RuntimeError("Missing env var KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_B64")
 
     if "BEGIN" not in candidate:
-        # assume base64
         try:
             candidate_bytes = base64.b64decode(candidate)
             candidate = candidate_bytes.decode("utf-8")
@@ -109,17 +101,12 @@ class KalshiClient:
         self.subaccount = (subaccount or "").strip() or None
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
-
-        self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
+        self.api_prefix = None
 
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
-        """
-        CHANGED: Match the working bot signature payload:
-          message = f"{timestamp_ms}{METHOD}{path_no_query}"
-        (No body in the signed message.)
-        """
         path_no_query = path.split("?")[0]
         payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
+
         sig = self.private_key.sign(
             payload,
             padding.PSS(
@@ -134,7 +121,6 @@ class KalshiClient:
         ts = now_utc_ts()
         sig = self._sign(method, path, ts, body)
 
-        # ---- DEBUG SIGNING (safe) ----
         try:
             payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
@@ -145,7 +131,6 @@ class KalshiClient:
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
         except Exception as _e:
             log.info(f"[SIGNDBG] failed to compute debug hash: {_e}")
-        # -------------------------------
 
         h = {
             "KALSHI-ACCESS-KEY": self.key_id,
@@ -187,9 +172,6 @@ class KalshiClient:
         return r.status_code, parsed, text
 
     def discover_prefix(self) -> str:
-        """
-        Probe known prefixes and pick the one that returns 200 for /markets.
-        """
         candidates = ["/trade-api/v2", "/trade-api/v1"]
         for pref in candidates:
             code, body, _ = self.request("GET", f"{pref}/markets", params={"limit": 1})
@@ -242,9 +224,6 @@ class KalshiClient:
         return code, body
 
 
-# -----------------------------
-# Strategy helpers
-# -----------------------------
 def parse_best_ask(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
     ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
     yes = ob.get("yes") or []
@@ -287,9 +266,6 @@ def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return future[0][1]
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     log.info("=== BOT STARTED ===")
 
@@ -320,7 +296,6 @@ def main():
     log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
     log.info(f"SIZING base={BASE_QTY} scale_after_wins={SCALE_AFTER_WINS} mult={SIZE_MULT} cap={SIZE_CAP}")
 
-    # RSA auth requires KEY_ID + PRIVATE_KEY
     if not os.getenv("KALSHI_KEY_ID"):
         raise RuntimeError("Missing env var KALSHI_KEY_ID")
 
@@ -364,7 +339,6 @@ def main():
     )
     if best_ask is None:
         log.warning("[STRAT] No best ask found; cannot place order yet.")
-        log.info("Heartbeat: orderbook fetch attempt complete. Next step will be to identify best bid/ask and compute tiny-order plan.")
         return
 
     target_buy = BUY_PRICE_CENTS
@@ -379,7 +353,7 @@ def main():
 
     payload = {
         "ticker": MARKET_TICKER,
-        "side": "buy",
+        "side": side.lower(),  # <-- ONLY CHANGE: was "buy"
         "action": "buy",
         "type": "limit",
         "count": qty,
