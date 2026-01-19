@@ -1,518 +1,395 @@
 import os
-import time
 import json
-import uuid
+import time
 import base64
 import logging
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
-from dotenv import load_dotenv
-
-# --- crypto signing (RSA-PSS) ---
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# ----------------- CONFIG -----------------
-load_dotenv()
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 log = logging.getLogger("kalshi-bot")
 
-API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
-SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
+# ----------------------------
+# Env helpers
+# ----------------------------
+def env_str(name: str, default: str | None = None) -> str:
+    v = os.getenv(name, default)
+    if v is None or v.strip() == "":
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v.strip()
 
-ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").lower() == "true"
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-# Strategy
-DOMINANCE_THRESHOLD = float(os.getenv("DOMINANCE_THRESHOLD", "0.95"))  # 95%
-BET_FRACTION_OF_CASH = float(os.getenv("BET_FRACTION_OF_CASH", "0.01"))  # 1% per trade
-DAILY_DRAWDOWN_LIMIT = float(os.getenv("DAILY_DRAWDOWN_LIMIT", "0.20"))  # stop at -20%
-TAKE_PROFIT_CENTS = int(os.getenv("TAKE_PROFIT_CENTS", "1"))  # +1 cent
-MAX_TRADES_PER_MARKET = int(os.getenv("MAX_TRADES_PER_MARKET", "1"))
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    return int(v.strip())
 
-# Email daily summary
-EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
-EMAIL_TO = os.getenv("EMAIL_TO", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-EMAIL_REPORT_HOUR_ET = int(os.getenv("EMAIL_REPORT_HOUR_ET", "20"))  # 8pm ET default
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    return float(v.strip())
 
-# Auth
-API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "").strip()
-PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY", "")
+# ----------------------------
+# Config
+# ----------------------------
+@dataclass
+class Config:
+    api_base: str
+    api_key_id: str
+    private_key_pem_b64: str
 
-# PRIVATE_KEY may be stored with literal "\n" in Render env vars; normalize.
-if "\\n" in PRIVATE_KEY_PEM:
-    PRIVATE_KEY_PEM = PRIVATE_KEY_PEM.replace("\\n", "\n")
+    series_prefix: str
+    poll_seconds: int
 
+    enable_trading: bool
+    confirm_live_trading: bool
 
-# ----------------- HELPERS -----------------
-def now_utc() -> dt.datetime:
-    # timezone-aware UTC
-    return dt.datetime.now(dt.timezone.utc)
+    trade_both_sides: bool
+    contracts_per_side: int
 
-def et_now() -> dt.datetime:
-    # Use fixed ET offset; good enough for short-run bot. If you want DST-perfect, use zoneinfo.
-    # Render runs UTC; we convert using -05:00 or -04:00 manually is messy.
-    # We'll instead compute ET by using US/Eastern via zoneinfo when available.
-    try:
-        from zoneinfo import ZoneInfo
-        return now_utc().astimezone(ZoneInfo("America/New_York"))
-    except Exception:
-        # fallback: EST
-        return now_utc().astimezone(dt.timezone(dt.timedelta(hours=-5)))
+    take_profit_cents: int          # profit target in cents per contract (small win farming)
+    max_entry_cents: int            # only enter if price <= this
+    max_daily_loss_cents: int       # stop trading if daily realized pnl <= -this
 
-def ms_timestamp() -> str:
-    return str(int(time.time() * 1000))
+    # Email
+    email_enabled: bool
+    email_to: str | None
+    smtp_host: str | None
+    smtp_port: int | None
+    smtp_user: str | None
+    smtp_pass: str | None
+    smtp_tls: bool
 
+def load_config() -> Config:
+    api_base = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
+    return Config(
+        api_base=api_base.rstrip("/"),
+        api_key_id=env_str("KALSHI_API_KEY_ID"),
+        private_key_pem_b64=env_str("KALSHI_PRIVATE_KEY_PEM_BASE64"),
 
-def require_trading_auth() -> Tuple[str, str]:
-    if not API_KEY_ID:
-        raise RuntimeError("Missing KALSHI_API_KEY_ID env var.")
-    if not PRIVATE_KEY_PEM.strip():
-        raise RuntimeError(
-            "Missing KALSHI_PRIVATE_KEY env var. You cannot trade without the RSA private key."
+        series_prefix=os.getenv("SERIES_PREFIX", "KXBTC15M").strip(),
+        poll_seconds=env_int("POLL_SECONDS", 60),
+
+        enable_trading=env_bool("ENABLE_TRADING", False),
+        confirm_live_trading=env_bool("CONFIRM_LIVE_TRADING", False),
+
+        trade_both_sides=env_bool("TRADE_BOTH_SIDES", True),
+        contracts_per_side=env_int("CONTRACTS_PER_SIDE", 1),
+
+        take_profit_cents=env_int("TAKE_PROFIT_CENTS", 1),
+        max_entry_cents=env_int("MAX_ENTRY_CENTS", 50),
+        max_daily_loss_cents=env_int("MAX_DAILY_LOSS_CENTS", 500),  # $5 default stop
+
+        email_enabled=env_bool("EMAIL_ENABLED", False),
+        email_to=os.getenv("EMAIL_TO"),
+        smtp_host=os.getenv("SMTP_HOST"),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")) if os.getenv("SMTP_PORT") else None,
+        smtp_user=os.getenv("SMTP_USERNAME"),
+        smtp_pass=os.getenv("SMTP_PASSWORD"),
+        smtp_tls=env_bool("SMTP_TLS", True),
+    )
+
+# ----------------------------
+# Kalshi Auth (RSA-PSS)
+# ----------------------------
+class KalshiClient:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.session = requests.Session()
+        self._private_key = self._load_private_key(cfg.private_key_pem_b64)
+
+    @staticmethod
+    def _load_private_key(pem_b64: str):
+        pem = base64.b64decode(pem_b64.encode("utf-8"))
+        return serialization.load_pem_private_key(pem, password=None)
+
+    @staticmethod
+    def _ts_ms() -> str:
+        return str(int(time.time() * 1000))
+
+    def _sign(self, msg: bytes) -> str:
+        sig = self._private_key.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
         )
-    return API_KEY_ID, PRIVATE_KEY_PEM
+        return base64.b64encode(sig).decode("utf-8")
 
+    def _auth_headers(self, method: str, path_and_query: str, body: str) -> dict:
+        ts = self._ts_ms()
+        # Common Kalshi signing pattern: timestamp + method + path + body
+        # IMPORTANT: sign ONLY the path (and query if present), NOT the full URL.
+        msg = (ts + method.upper() + path_and_query + body).encode("utf-8")
+        sig = self._sign(msg)
+        return {
+            "KALSHI-ACCESS-KEY": self.cfg.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "Content-Type": "application/json",
+        }
 
-def load_private_key(pem: str):
-    return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+    def _request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> dict:
+        url = f"{self.cfg.api_base}{path}"
+        body_str = "" if json_body is None else json.dumps(json_body, separators=(",", ":"))
+        # include query in the signed string if requests will send one
+        if params:
+            # requests will encode params; easiest deterministic: sign with the actual prepared path+query
+            req = requests.Request(method.upper(), url, params=params, data=body_str)
+            prep = self.session.prepare_request(req)
+            parsed = urlparse(prep.url)
+            path_and_query = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        else:
+            path_and_query = path
 
+        headers = self._auth_headers(method, path_and_query, body_str)
+        resp = self.session.request(method.upper(), url, params=params, data=body_str, headers=headers, timeout=20)
 
-def canonical_string(ts_ms: str, method: str, path: str, body: str) -> bytes:
-    """
-    Kalshi signing convention used in their examples:
-    message = timestamp + method + path + body
-    (method uppercase, path includes /trade-api/v2/..., body is raw json string or "")
-    """
-    return (ts_ms + method.upper() + path + body).encode("utf-8")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"HTTP {resp.status_code} {resp.text}")
 
+        if resp.text.strip() == "":
+            return {}
+        return resp.json()
 
-def sign_request(ts_ms: str, method: str, path: str, body: str, private_key_pem: str) -> str:
-    pk = load_private_key(private_key_pem)
-    msg = canonical_string(ts_ms, method, path, body)
-    sig = pk.sign(
-        msg,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(sig).decode("utf-8")
+    # ---- API convenience ----
+    def get(self, path: str, params: dict | None = None) -> dict:
+        return self._request("GET", path, params=params)
 
+    def post(self, path: str, json_body: dict) -> dict:
+        return self._request("POST", path, json_body=json_body)
 
-def request(
-    method: str,
-    path: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    auth: bool = False,
-    timeout: int = 20,
-) -> Dict[str, Any]:
-    url = API_BASE.rstrip("/") + path
+# ----------------------------
+# Trading / Strategy
+# ----------------------------
+STATE_FILE = "state.json"
 
-    body_str = ""
-    if json_body is not None:
-        body_str = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+def load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {"daily": {"date": None, "realized_pnl_cents": 0}, "last_email_date": None}
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
 
-    headers = {"Content-Type": "application/json"}
+def save_state(state: dict):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
-    if auth:
-        key_id, private_pem = require_trading_auth()
-        ts_ms = ms_timestamp()
-        sig = sign_request(ts_ms, method, path, body_str, private_pem)
+def et_now():
+    # Render is UTC; you’re in ET. Keep it simple without extra deps:
+    # ET = UTC-5 in winter. (Good enough for now; DST will be off.)
+    return dt.datetime.utcnow() - dt.timedelta(hours=5)
 
-        headers.update(
-            {
-                "KALSHI-ACCESS-KEY": key_id,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-            }
-        )
+def reset_daily_if_needed(state: dict):
+    today = et_now().date().isoformat()
+    if state["daily"]["date"] != today:
+        state["daily"] = {"date": today, "realized_pnl_cents": 0}
+        save_state(state)
 
-    resp = requests.request(
-        method=method.upper(),
-        url=url,
-        params=params,
-        data=body_str if body_str else None,
-        headers=headers,
-        timeout=timeout,
-    )
+def assert_auth_ok(kc: KalshiClient):
+    # Hit an authenticated endpoint early so we don't "pretend" we’re live.
+    # Portfolio balance path in v2:
+    kc.get("/trade-api/v2/portfolio/balance")
 
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code} {resp.text}")
+def resolve_next_market(kc: KalshiClient, series_prefix: str) -> dict:
+    # Get open markets for a series (1 result expected if only 1 currently active)
+    # Endpoint varies by spec; this matches Kalshi v2 style.
+    data = kc.get("/trade-api/v2/markets", params={"series_ticker": series_prefix, "status": "open", "limit": 10})
+    markets = data.get("markets", [])
+    if not markets:
+        raise RuntimeError(f"No open markets for series {series_prefix}")
+    # pick the soonest close / first
+    return markets[0]
 
-    if resp.text.strip() == "":
-        return {}
-    return resp.json()
+def fetch_market(kc: KalshiClient, ticker: str) -> dict:
+    return kc.get(f"/trade-api/v2/markets/{ticker}")
 
-
-# ----------------- KALSHI API WRAPPERS -----------------
-def list_open_markets(series_ticker: str, limit: int = 200) -> Dict[str, Any]:
-    return request(
-        "GET",
-        "/trade-api/v2/markets",
-        params={"limit": limit, "status": "open", "series_ticker": series_ticker},
-        auth=False,  # public read is fine
-    )
-
-
-def get_market(ticker: str) -> Dict[str, Any]:
-    return request("GET", f"/trade-api/v2/markets/{ticker}", auth=False)
-
-
-def get_balance_cash() -> Optional[float]:
-    """
-    If auth is correct, returns cash balance as float dollars.
-    If auth fails, caller can catch.
-    """
-    data = request("GET", "/trade-api/v2/portfolio/balance", auth=True)
-    # Typical shape includes "balance" fields; we defensively search.
-    # If yours differs, paste the JSON and I'll match it precisely.
-    for k in ["cash", "available_cash", "balance_cash", "cash_balance"]:
-        if k in data:
-            return float(data[k])
-    # Sometimes nested:
-    if "balance" in data and isinstance(data["balance"], dict):
-        for k in ["cash", "available_cash"]:
-            if k in data["balance"]:
-                return float(data["balance"][k])
-    return None
-
-
-def place_order(
-    *,
-    ticker: str,
-    side: str,      # "yes" or "no"
-    action: str,    # "buy" or "sell"
-    count: int,
-    order_type: str = "limit",
-    yes_price: Optional[int] = None,
-    no_price: Optional[int] = None,
-) -> Dict[str, Any]:
-    body: Dict[str, Any] = {
-        "ticker": ticker,
+def place_order(kc: KalshiClient, market_ticker: str, side: str, action: str, price_cents: int, count: int) -> dict:
+    # action: "buy" or "sell"
+    # side: "yes" or "no"
+    payload = {
+        "ticker": market_ticker,
         "side": side,
         "action": action,
-        "client_order_id": str(uuid.uuid4()),
-        "count": int(count),
-        "type": order_type,
+        "type": "limit",
+        "price": price_cents,
+        "count": count,
     }
-    if yes_price is not None:
-        body["yes_price"] = int(yes_price)
-    if no_price is not None:
-        body["no_price"] = int(no_price)
+    return kc.post("/trade-api/v2/portfolio/orders", payload)
 
-    # Create order endpoint per docs
-    # POST https://api.elections.kalshi.com/trade-api/v2/portfolio/orders   [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/orders/create-order?utm_source=chatgpt.com)
-    return request("POST", "/trade-api/v2/portfolio/orders", json_body=body, auth=True)
+def try_farm_side(kc: KalshiClient, cfg: Config, market: dict, side: str, state: dict):
+    """
+    Simple farming:
+    - If best ask <= MAX_ENTRY_CENTS, buy 1 contract
+    - Immediately place take-profit sell at entry + TAKE_PROFIT_CENTS
+    """
+    quotes = market.get("yes_ask"), market.get("yes_bid"), market.get("no_ask"), market.get("no_bid")
+    if side == "yes":
+        best_ask = market.get("yes_ask")
+        best_bid = market.get("yes_bid")
+    else:
+        best_ask = market.get("no_ask")
+        best_bid = market.get("no_bid")
 
-
-# ----------------- STRATEGY STATE -----------------
-STATE_PATH = "state.json"
-
-@dataclass
-class BotState:
-    day: str
-    start_cash: float
-    realized_pnl: float
-    trades_by_market: Dict[str, int]
-    last_report_day: str
-
-def load_state() -> BotState:
-    if not os.path.exists(STATE_PATH):
-        today = et_now().date().isoformat()
-        return BotState(day=today, start_cash=0.0, realized_pnl=0.0, trades_by_market={}, last_report_day="")
-    with open(STATE_PATH, "r", encoding="utf-8") as f:
-        d = json.load(f)
-    return BotState(
-        day=d.get("day", et_now().date().isoformat()),
-        start_cash=float(d.get("start_cash", 0.0)),
-        realized_pnl=float(d.get("realized_pnl", 0.0)),
-        trades_by_market=dict(d.get("trades_by_market", {})),
-        last_report_day=d.get("last_report_day", ""),
-    )
-
-def save_state(st: BotState) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "day": st.day,
-                "start_cash": st.start_cash,
-                "realized_pnl": st.realized_pnl,
-                "trades_by_market": st.trades_by_market,
-                "last_report_day": st.last_report_day,
-            },
-            f,
-            indent=2,
-        )
-
-
-# ----------------- EMAIL -----------------
-def send_email(subject: str, body: str) -> None:
-    if not EMAIL_ENABLED:
-        return
-    if not (EMAIL_TO and EMAIL_FROM and GMAIL_APP_PASSWORD):
-        log.warning("EMAIL_ENABLED=true but missing EMAIL_TO/EMAIL_FROM/GMAIL_APP_PASSWORD")
+    if best_ask is None or best_bid is None:
+        log.warning("No quotes available for side=%s", side)
         return
 
+    # If you're trying to farm wins, you need fills. We'll enter at ask if it's cheap enough.
+    entry = int(best_ask)
+
+    if entry > cfg.max_entry_cents:
+        log.info("Skip %s: ask=%s > MAX_ENTRY_CENTS=%s", side, entry, cfg.max_entry_cents)
+        return
+
+    # Daily stop
+    realized = int(state["daily"]["realized_pnl_cents"])
+    if realized <= -cfg.max_daily_loss_cents:
+        log.warning("DAILY STOP HIT: realized=%sc <= -%sc. Trading paused.", realized, cfg.max_daily_loss_cents)
+        return
+
+    if not (cfg.enable_trading and cfg.confirm_live_trading):
+        log.info("[DRY RUN] Would BUY %s %s @%sc x%s", side.upper(), market["ticker"], entry, cfg.contracts_per_side)
+        return
+
+    # BUY
+    buy_resp = place_order(kc, market["ticker"], side=side, action="buy", price_cents=entry, count=cfg.contracts_per_side)
+    log.info("BUY placed: %s", buy_resp)
+
+    # TAKE PROFIT SELL
+    tp = min(99, entry + cfg.take_profit_cents)
+    sell_resp = place_order(kc, market["ticker"], side=side, action="sell", price_cents=tp, count=cfg.contracts_per_side)
+    log.info("TP SELL placed: %s", sell_resp)
+
+def maybe_send_daily_email(cfg: Config, state: dict):
+    if not cfg.email_enabled:
+        return
+
+    today = et_now().date().isoformat()
+    # send once per day at/after 8:00pm ET
+    now = et_now()
+    if now.hour < 20:
+        return
+    if state.get("last_email_date") == today:
+        return
+
+    # Build message from our state (we can upgrade later to pull fills for exact P&L)
+    pnl_cents = int(state["daily"]["realized_pnl_cents"])
+    pnl = pnl_cents / 100.0
+    subject = f"Kalshi Bot Daily P&L — {today}"
+    body = f"""Kalshi Bot Daily Report ({today})
+
+Realized P&L (approx): ${pnl:,.2f}
+
+Notes:
+- This version tracks realized P&L in state.json (upgrade later to reconcile fills exactly).
+"""
+
+    send_email(cfg, subject, body)
+    state["last_email_date"] = today
+    save_state(state)
+    log.info("Daily email sent.")
+
+def send_email(cfg: Config, subject: str, body: str):
     import smtplib
     from email.mime.text import MIMEText
 
-    msg = MIMEText(body, "plain", "utf-8")
+    if not (cfg.smtp_host and cfg.smtp_port and cfg.smtp_user and cfg.smtp_pass and cfg.email_to):
+        raise RuntimeError("Email enabled but SMTP/EMAIL_TO env vars are incomplete.")
+
+    msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+    msg["From"] = cfg.smtp_user
+    msg["To"] = cfg.email_to
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
-        s.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-
-
-def maybe_send_daily_report(st: BotState) -> None:
-    if not EMAIL_ENABLED:
-        return
-    now_et = et_now()
-    today = now_et.date().isoformat()
-
-    if now_et.hour < EMAIL_REPORT_HOUR_ET:
-        return
-    if st.last_report_day == today:
-        return
-
-    pnl = st.realized_pnl
-    subject = f"Kalshi Bot Daily P&L ({today})"
-    body = (
-        f"Date (ET): {today}\n"
-        f"Start cash: ${st.start_cash:,.2f}\n"
-        f"Realized P&L tracked by bot: ${pnl:,.2f}\n"
-        f"Trades by market: {json.dumps(st.trades_by_market, indent=2)}\n"
-    )
-    send_email(subject, body)
-    st.last_report_day = today
-    save_state(st)
-
-
-# ----------------- MARKET SELECTION -----------------
-def resolve_next_open_market(series_prefix: str) -> Optional[str]:
-    data = list_open_markets(series_prefix)
-    markets = data.get("markets", []) or data.get("data", []) or []
-
-    if not markets:
-        return None
-
-    # Choose the earliest close/settle time among open markets.
-    # Kalshi schemas vary; we try several keys.
-    def market_time(m: Dict[str, Any]) -> str:
-        for k in ["close_time", "expiration_time", "settle_time", "end_time"]:
-            if k in m and m[k]:
-                return str(m[k])
-        return "9999-12-31T00:00:00Z"
-
-    markets_sorted = sorted(markets, key=market_time)
-    return markets_sorted[0].get("ticker")
-
-
-def best_book_prices(mkt: Dict[str, Any]) -> Tuple[int, int, int, int]:
-    """
-    Returns yes_bid, yes_ask, no_bid, no_ask in cents.
-    Your logs show these are present.
-    """
-    return (
-        int(mkt.get("yes_bid", 0) or 0),
-        int(mkt.get("yes_ask", 0) or 0),
-        int(mkt.get("no_bid", 0) or 0),
-        int(mkt.get("no_ask", 0) or 0),
-    )
-
-
-def best_bid_sizes(mkt: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Dominance needs sizes. Some Kalshi market payloads include top-of-book sizes like:
-    yes_bid_size, no_bid_size.
-    If missing, we return None and dominance check is skipped.
-    """
-    y = mkt.get("yes_bid_size")
-    n = mkt.get("no_bid_size")
+    server = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=20)
     try:
-        return (float(y) if y is not None else None, float(n) if n is not None else None)
-    except Exception:
-        return (None, None)
+        if cfg.smtp_tls:
+            server.starttls()
+        server.login(cfg.smtp_user, cfg.smtp_pass)
+        server.sendmail(cfg.smtp_user, [cfg.email_to], msg.as_string())
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
 
-
-# ----------------- TRADING LOGIC -----------------
-def can_trade_today(st: BotState, cash: float) -> bool:
-    # set start-of-day cash on first successful balance fetch
-    today = et_now().date().isoformat()
-    if st.day != today:
-        st.day = today
-        st.start_cash = cash
-        st.realized_pnl = 0.0
-        st.trades_by_market = {}
-        save_state(st)
-
-    if st.start_cash <= 0:
-        st.start_cash = cash
-        save_state(st)
-
-    max_loss = st.start_cash * DAILY_DRAWDOWN_LIMIT
-    if st.realized_pnl <= -max_loss:
-        log.warning("DAILY STOP HIT: realized_pnl=%.2f <= -%.2f", st.realized_pnl, max_loss)
-        return False
-
-    return True
-
-
-def place_micro_win_trade(market_ticker: str, mkt: Dict[str, Any], cash: float, st: BotState) -> None:
-    trades_done = st.trades_by_market.get(market_ticker, 0)
-    if trades_done >= MAX_TRADES_PER_MARKET:
-        log.info("Already traded this market (%s). Skipping.", market_ticker)
-        return
-
-    yes_bid, yes_ask, no_bid, no_ask = best_book_prices(mkt)
-
-    # Dominance check
-    y_size, n_size = best_bid_sizes(mkt)
-    if y_size is not None and n_size is not None and (y_size + n_size) > 0:
-        dom_yes = y_size / (y_size + n_size)
-        dom_no = n_size / (y_size + n_size)
-        dominant_side = "yes" if dom_yes >= dom_no else "no"
-        dom_val = max(dom_yes, dom_no)
-        log.info("Dominance: yes=%.3f no=%.3f -> %s (%.3f)", dom_yes, dom_no, dominant_side, dom_val)
-
-        if dom_val < DOMINANCE_THRESHOLD:
-            log.info("Dominance below threshold %.2f; no trade.", DOMINANCE_THRESHOLD)
-            return
-    else:
-        log.info("No bid sizes available; dominance check skipped (safe mode).")
-        return  # your rule requires dominance; if we cannot compute it, we do nothing.
-
-    # Determine entry: if market is dominated on YES bids, we fade it by buying NO (contrarian),
-    # OR follow it by buying YES (momentum). You said: "Buy/sell when 95% of market is on one side"
-    # but didn’t specify fade vs follow. Default: FADE (contrarian) for micro scalps.
-    fade = os.getenv("DOMINANCE_MODE", "fade").lower()  # "fade" or "follow"
-    if fade == "follow":
-        entry_side = dominant_side
-    else:
-        entry_side = "no" if dominant_side == "yes" else "yes"
-
-    # Price to buy: cross the spread at ask to get filled (micro wins need fills)
-    if entry_side == "yes":
-        buy_price = yes_ask
-        tp_price = min(99, buy_price + TAKE_PROFIT_CENTS)
-        # We sell YES later at higher YES price
-        buy_kwargs = dict(yes_price=buy_price)
-        sell_kwargs = dict(yes_price=tp_price)
-    else:
-        buy_price = no_ask
-        tp_price = min(99, buy_price + TAKE_PROFIT_CENTS)
-        buy_kwargs = dict(no_price=buy_price)
-        sell_kwargs = dict(no_price=tp_price)
-
-    # Bet sizing: 1 contract costs ~price cents. Cost per contract in dollars:
-    cost_per_contract = buy_price / 100.0
-    max_spend = cash * BET_FRACTION_OF_CASH
-    count = int(max(1, max_spend // cost_per_contract)) if cost_per_contract > 0 else 0
-    if count <= 0:
-        log.info("Not enough cash for even 1 contract at %.2f", cost_per_contract)
-        return
-
-    # Place orders
-    if not ENABLE_TRADING:
-        log.info("[DRY RUN] Would BUY %s %d @ %d and TP SELL @ %d", entry_side, count, buy_price, tp_price)
-        return
-
-    log.info("Placing BUY: side=%s count=%d price=%d on %s", entry_side, count, buy_price, market_ticker)
-    buy_resp = place_order(
-        ticker=market_ticker,
-        side=entry_side,
-        action="buy",
-        count=count,
-        order_type="limit",
-        **buy_kwargs,
-    )
-    log.info("BUY order response: %s", json.dumps(buy_resp)[:800])
-
-    log.info("Placing TAKE-PROFIT SELL: side=%s count=%d price=%d on %s", entry_side, count, tp_price, market_ticker)
-    sell_resp = place_order(
-        ticker=market_ticker,
-        side=entry_side,
-        action="sell",
-        count=count,
-        order_type="limit",
-        **sell_kwargs,
-    )
-    log.info("TP SELL order response: %s", json.dumps(sell_resp)[:800])
-
-    # Track that we attempted a trade for this market.
-    st.trades_by_market[market_ticker] = trades_done + 1
-    save_state(st)
-
-
-# ----------------- MAIN LOOP -----------------
+# ----------------------------
+# Main loop
+# ----------------------------
 def main():
-    log.info("=== BOT STARTED ===")
-    log.info("ENABLE_TRADING=%s", ENABLE_TRADING)
-    log.info("POLL_SECONDS=%s", POLL_SECONDS)
-    log.info("SERIES_PREFIX=%s", SERIES_PREFIX)
-    log.info("API_BASE=%s", API_BASE)
-    log.info("EMAIL_ENABLED=%s", EMAIL_ENABLED)
+    cfg = load_config()
 
-    st = load_state()
+    log.info("=== BOT STARTED ===")
+    log.info("ENABLE_TRADING=%s", cfg.enable_trading)
+    log.info("CONFIRM_LIVE_TRADING=%s", cfg.confirm_live_trading)
+    log.info("POLL_SECONDS=%s", cfg.poll_seconds)
+    log.info("SERIES_PREFIX=%s", cfg.series_prefix)
+    log.info("API_BASE=%s", cfg.api_base)
+
+    kc = KalshiClient(cfg)
+    state = load_state()
+
+    # HARD auth check. If this fails, do not continue.
+    try:
+        assert_auth_ok(kc)
+        log.info("Auth check OK (portfolio/balance).")
+    except Exception as e:
+        log.error("AUTH CHECK FAILED. This is why you see INCORRECT_API_KEY_SIGNATURE.\n%s", e)
+        raise
 
     while True:
-        loop_start = time.time()
+        reset_daily_if_needed(state)
 
         try:
-            # Cash balance (auth required)
-            cash = None
-            if ENABLE_TRADING:
-                try:
-                    cash = get_balance_cash()
-                except Exception as e:
-                    log.warning("Could not fetch cash balance: %s", e)
+            m0 = resolve_next_market(kc, cfg.series_prefix)
+            ticker = m0.get("ticker") or m0.get("market_ticker") or m0.get("id")
+            if not ticker:
+                raise RuntimeError(f"Could not determine ticker from {m0}")
 
-            # Resolve next open market
-            mkt_ticker = resolve_next_open_market(SERIES_PREFIX)
-            now_et = et_now()
+            market = fetch_market(kc, ticker)
+            yes_bid = market.get("yes_bid")
+            yes_ask = market.get("yes_ask")
+            no_bid = market.get("no_bid")
+            no_ask = market.get("no_ask")
 
-            if not mkt_ticker:
-                log.info("Heartbeat ET now=%s | No open markets found for %s", now_et.strftime("%Y-%m-%d %H:%M:%S %Z"), SERIES_PREFIX)
-                maybe_send_daily_report(st)
-                time.sleep(POLL_SECONDS)
-                continue
+            log.info("Heartbeat ET now=%s | market=%s | yes %s/%s no %s/%s",
+                     et_now().strftime("%Y-%m-%d %H:%M:%S"),
+                     market.get("ticker", ticker),
+                     yes_bid, yes_ask, no_bid, no_ask)
 
-            mkt = get_market(mkt_ticker)
-            yes_bid, yes_ask, no_bid, no_ask = best_book_prices(mkt)
+            # FARM both sides (configurable)
+            if cfg.trade_both_sides:
+                try_farm_side(kc, cfg, market, "yes", state)
+                try_farm_side(kc, cfg, market, "no", state)
+            else:
+                try_farm_side(kc, cfg, market, "yes", state)
 
-            log.info(
-                "Heartbeat ET now=%s | market=%s | yes %s/%s no %s/%s",
-                now_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                mkt_ticker,
-                yes_bid, yes_ask, no_bid, no_ask,
-            )
-
-            # Daily email
-            maybe_send_daily_report(st)
-
-            # Trade only if we have cash and within limits
-            if cash is not None:
-                if can_trade_today(st, cash):
-                    place_micro_win_trade(mkt_ticker, mkt, cash, st)
+            maybe_send_daily_email(cfg, state)
 
         except Exception as e:
-            log.error("LOOP ERROR: %s", e)
+            log.error("LOOP ERROR: %s", repr(e))
 
-        elapsed = time.time() - loop_start
-        sleep_for = max(1, POLL_SECONDS - elapsed)
-        log.info("Loop complete in %.2fs; sleeping %ds", elapsed, int(sleep_for))
-        time.sleep(sleep_for)
-
+        time.sleep(cfg.poll_seconds)
 
 if __name__ == "__main__":
     main()
