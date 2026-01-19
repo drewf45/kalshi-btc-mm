@@ -36,10 +36,6 @@ def shape_of(x):
     return type(x).__name__
 
 def parse_iso_to_epoch(ts: str):
-    """
-    Accepts ISO strings like 2026-01-19T20:00:00Z or with offset.
-    Returns epoch seconds (float) or None.
-    """
     if not ts or not isinstance(ts, str):
         return None
     try:
@@ -51,6 +47,16 @@ def parse_iso_to_epoch(ts: str):
 
 def now_epoch():
     return time.time()
+
+def fmt_epoch(e: float):
+    return datetime.fromtimestamp(e, tz=timezone.utc).isoformat()
+
+def safe_preview(obj, limit=600):
+    try:
+        s = json.dumps(obj)
+    except Exception:
+        s = str(obj)
+    return s[:limit] + ("..." if len(s) > limit else "")
 
 class KalshiClient:
     def __init__(self, base: str, key_id: str, private_key_b64: str, subaccount=None):
@@ -149,7 +155,6 @@ class KalshiClient:
                 return p
         raise RuntimeError("Could not discover API prefix (all probes failed).")
 
-    # Proven endpoint from your logs:
     def list_series_markets(self, series_prefix: str, limit=200):
         path = f"{self.prefix}/markets?series_ticker={series_prefix}&limit={limit}"
         code, data = self.request("GET", path)
@@ -159,11 +164,23 @@ class KalshiClient:
             markets = data.get("markets") or []
         return code, markets
 
+    def get_orderbook(self, market_ticker: str):
+        # We try a couple common endpoint names; we’ll log which one works.
+        candidates = [
+            f"{self.prefix}/markets/{market_ticker}/orderbook",
+            f"{self.prefix}/markets/{market_ticker}/order-book",
+            f"{self.prefix}/markets/{market_ticker}",
+        ]
+        last = None
+        for path in candidates:
+            code, data = self.request("GET", path)
+            logging.info(f"[BOOK] GET {path} -> HTTP={code} shape={shape_of(data)}")
+            if code == 200:
+                return path, code, data
+            last = (path, code, data)
+        return last[0], last[1], last[2]
+
 def pick_next_closing_market(markets: list[dict], series_prefix: str):
-    """
-    Pick the market with the smallest close/expiration time that is still in the future.
-    We try multiple field names because API shapes vary.
-    """
     now = now_epoch()
     candidates = []
 
@@ -174,7 +191,6 @@ def pick_next_closing_market(markets: list[dict], series_prefix: str):
         if not isinstance(tkr, str) or not tkr.startswith(series_prefix + "-"):
             continue
 
-        # Try a bunch of likely time fields:
         time_fields = [
             "close_time", "close_ts", "close_time_ts",
             "expiration_time", "expiration_ts", "expires_at",
@@ -197,11 +213,10 @@ def pick_next_closing_market(markets: list[dict], series_prefix: str):
                     chosen_field = f
                     break
 
-        # If we still don't have a time, we can't rank it
         if close_epoch is None:
             continue
 
-        if close_epoch > now + 1:  # future
+        if close_epoch > now + 1:
             candidates.append((close_epoch, tkr, chosen_field))
 
     candidates.sort(key=lambda x: x[0])
@@ -216,8 +231,34 @@ def pick_next_closing_market(markets: list[dict], series_prefix: str):
         "seconds_to_close": int(close_epoch - now),
     }
 
-def fmt_epoch(e: float):
-    return datetime.fromtimestamp(e, tz=timezone.utc).isoformat()
+def extract_best_levels(orderbook_payload: dict):
+    """
+    Very defensive: different APIs return different shapes.
+    We'll try to pull any obvious bid/ask arrays and show top levels.
+    """
+    if not isinstance(orderbook_payload, dict):
+        return None
+
+    # common keys
+    for k in ["orderbook", "order_book", "book"]:
+        if k in orderbook_payload and isinstance(orderbook_payload[k], dict):
+            orderbook_payload = orderbook_payload[k]
+            break
+
+    bids = orderbook_payload.get("bids") if isinstance(orderbook_payload, dict) else None
+    asks = orderbook_payload.get("asks") if isinstance(orderbook_payload, dict) else None
+
+    # Sometimes YES/NO are separate
+    yes = orderbook_payload.get("yes") if isinstance(orderbook_payload, dict) else None
+    no = orderbook_payload.get("no") if isinstance(orderbook_payload, dict) else None
+
+    return {
+        "bids_preview": bids[:3] if isinstance(bids, list) else None,
+        "asks_preview": asks[:3] if isinstance(asks, list) else None,
+        "yes_preview": yes[:3] if isinstance(yes, list) else None,
+        "no_preview": no[:3] if isinstance(no, list) else None,
+        "top_keys": list(orderbook_payload.keys()) if isinstance(orderbook_payload, dict) else None,
+    }
 
 def main():
     logging.info("=== BOT STARTED ===")
@@ -232,13 +273,12 @@ def main():
     kc = KalshiClient(API_BASE, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_B64, subaccount=SUBACCOUNT)
     kc.discover_prefix()
 
-    code, markets = kc.list_series_markets(SERIES_PREFIX, limit=200)
+    _, markets = kc.list_series_markets(SERIES_PREFIX, limit=200)
     logging.info(f"[SERIES] Returned markets count={len(markets)}")
 
     chosen = pick_next_closing_market(markets, SERIES_PREFIX)
     if not chosen:
         logging.error("[SELECT] Could not pick next closing market (no usable close times found).")
-        # Debug: log a sample market keys so we can see time fields available
         if markets and isinstance(markets[0], dict):
             logging.info(f"[DEBUG] Sample market keys: {list(markets[0].keys())}")
         return
@@ -249,7 +289,15 @@ def main():
         f"seconds_to_close={chosen['seconds_to_close']})"
     )
 
-    logging.info("Heartbeat: selection working. Next step will be to fetch orderbook for this ticker.")
+    # === NEW: fetch orderbook / market detail ===
+    path_used, code, data = kc.get_orderbook(chosen["ticker"])
+    logging.info(f"[BOOK] Used endpoint: {path_used} HTTP={code}")
+    logging.info(f"[BOOK] Payload preview: {safe_preview(data)}")
+
+    levels = extract_best_levels(data if isinstance(data, dict) else {})
+    logging.info(f"[BOOK] Parsed top levels: {safe_preview(levels)}")
+
+    logging.info("Heartbeat: orderbook fetch attempt complete. Next step will be to identify best bid/ask and compute tiny-order plan.")
     while True:
         time.sleep(POLL_SECONDS)
 
