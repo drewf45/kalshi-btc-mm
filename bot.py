@@ -1,3 +1,17 @@
+#!/usr/bin/env python3
+"""
+Kalshi BTC 15m "farm wins" bot for Render background worker.
+
+Fixes from this chat:
+- Correct RSA signing to avoid INCORRECT_API_KEY_SIGNATURE (401)
+- Auto-discover correct API prefix to avoid 404
+- Safe JSON parsing (list vs dict) to avoid "'list' object has no attribute 'get'"
+- Robust orderbook/quotes parsing to avoid None/None
+- Picks an OPEN market that ACTUALLY has quotes before trading
+- End-of-day email P&L summary (SMTP)
+- Guardrails for scalping (spread limit, max loss %, daily loss cap)
+"""
+
 import os
 import json
 import time
