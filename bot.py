@@ -4,7 +4,7 @@ import json
 import base64
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -35,7 +35,11 @@ def shape_of(x):
         return f"list len={len(x)}"
     return type(x).__name__
 
-def parse_iso_ts(ts: str) -> float | None:
+def parse_iso_to_epoch(ts: str):
+    """
+    Accepts ISO strings like 2026-01-19T20:00:00Z or with offset.
+    Returns epoch seconds (float) or None.
+    """
     if not ts or not isinstance(ts, str):
         return None
     try:
@@ -44,6 +48,9 @@ def parse_iso_ts(ts: str) -> float | None:
         return datetime.fromisoformat(ts).timestamp()
     except Exception:
         return None
+
+def now_epoch():
+    return time.time()
 
 class KalshiClient:
     def __init__(self, base: str, key_id: str, private_key_b64: str, subaccount=None):
@@ -112,7 +119,7 @@ class KalshiClient:
             headers["KALSHI-SUBACCOUNT"] = self.subaccount
         return headers
 
-    def request(self, method: str, path: str, payload=None, timeout=15):
+    def request(self, method: str, path: str, payload=None, timeout=20):
         url = self.base + path
         body = None if payload is None else json.dumps(payload).encode()
         headers = self._headers(method, path, body)
@@ -142,42 +149,75 @@ class KalshiClient:
                 return p
         raise RuntimeError("Could not discover API prefix (all probes failed).")
 
-    # ---- Change #3: probe for the correct "series markets list" endpoint ----
-    def probe_series_market_listing(self, series_prefix: str):
-        """
-        Try likely endpoints that could list markets for a given series/event.
-        We log which endpoint (if any) returns tickers starting with series_prefix-.
-        """
-        candidates = [
-            f"{self.prefix}/markets?series_ticker={series_prefix}&limit=200",
-            f"{self.prefix}/markets?event_ticker={series_prefix}&limit=200",
-            f"{self.prefix}/series/{series_prefix}/markets?limit=200",
-            f"{self.prefix}/events/{series_prefix}/markets?limit=200",
-            f"{self.prefix}/markets?search={series_prefix}&limit=200",
+    # Proven endpoint from your logs:
+    def list_series_markets(self, series_prefix: str, limit=200):
+        path = f"{self.prefix}/markets?series_ticker={series_prefix}&limit={limit}"
+        code, data = self.request("GET", path)
+        logging.info(f"[SERIES] GET {path} -> HTTP={code} shape={shape_of(data)}")
+        markets = []
+        if isinstance(data, dict):
+            markets = data.get("markets") or []
+        return code, markets
+
+def pick_next_closing_market(markets: list[dict], series_prefix: str):
+    """
+    Pick the market with the smallest close/expiration time that is still in the future.
+    We try multiple field names because API shapes vary.
+    """
+    now = now_epoch()
+    candidates = []
+
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        tkr = m.get("ticker") or m.get("market_ticker")
+        if not isinstance(tkr, str) or not tkr.startswith(series_prefix + "-"):
+            continue
+
+        # Try a bunch of likely time fields:
+        time_fields = [
+            "close_time", "close_ts", "close_time_ts",
+            "expiration_time", "expiration_ts", "expires_at",
+            "end_time", "end_ts",
         ]
 
-        for path in candidates:
-            code, data = self.request("GET", path)
-            markets = []
-            if isinstance(data, dict):
-                markets = data.get("markets") or data.get("data") or []
-            logging.info(f"[PROBE] GET {path} -> HTTP={code} shape={shape_of(data)}")
+        close_epoch = None
+        chosen_field = None
 
-            found = []
-            if isinstance(markets, list):
-                for m in markets:
-                    tkr = None
-                    if isinstance(m, dict):
-                        tkr = m.get("ticker") or m.get("market_ticker")
-                    if isinstance(tkr, str) and tkr.startswith(series_prefix + "-"):
-                        found.append(tkr)
+        for f in time_fields:
+            v = m.get(f)
+            if isinstance(v, (int, float)):
+                close_epoch = float(v)
+                chosen_field = f
+                break
+            if isinstance(v, str):
+                pe = parse_iso_to_epoch(v)
+                if pe is not None:
+                    close_epoch = pe
+                    chosen_field = f
+                    break
 
-            if found:
-                logging.info(f"[PROBE] SUCCESS endpoint returned {len(found)} matching tickers. Example={found[0]}")
-                return path, found
+        # If we still don't have a time, we can't rank it
+        if close_epoch is None:
+            continue
 
-        logging.warning("[PROBE] No candidate series endpoints returned matching tickers.")
-        return None, []
+        if close_epoch > now + 1:  # future
+            candidates.append((close_epoch, tkr, chosen_field))
+
+    candidates.sort(key=lambda x: x[0])
+    if not candidates:
+        return None
+
+    close_epoch, tkr, field = candidates[0]
+    return {
+        "ticker": tkr,
+        "close_epoch": close_epoch,
+        "close_field": field,
+        "seconds_to_close": int(close_epoch - now),
+    }
+
+def fmt_epoch(e: float):
+    return datetime.fromtimestamp(e, tz=timezone.utc).isoformat()
 
 def main():
     logging.info("=== BOT STARTED ===")
@@ -192,13 +232,24 @@ def main():
     kc = KalshiClient(API_BASE, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_B64, subaccount=SUBACCOUNT)
     kc.discover_prefix()
 
-    # Change #3: probe correct listing endpoint
-    path, found = kc.probe_series_market_listing(SERIES_PREFIX)
-    if not found:
-        logging.error("Could not find BTC15M markets via probe. Exiting.")
+    code, markets = kc.list_series_markets(SERIES_PREFIX, limit=200)
+    logging.info(f"[SERIES] Returned markets count={len(markets)}")
+
+    chosen = pick_next_closing_market(markets, SERIES_PREFIX)
+    if not chosen:
+        logging.error("[SELECT] Could not pick next closing market (no usable close times found).")
+        # Debug: log a sample market keys so we can see time fields available
+        if markets and isinstance(markets[0], dict):
+            logging.info(f"[DEBUG] Sample market keys: {list(markets[0].keys())}")
         return
 
-    logging.info("Heartbeat: probe found BTC markets. Next step will be to select the next closing one.")
+    logging.info(
+        f"[SELECT] Next closing market: {chosen['ticker']} "
+        f"(field={chosen['close_field']} close_utc={fmt_epoch(chosen['close_epoch'])} "
+        f"seconds_to_close={chosen['seconds_to_close']})"
+    )
+
+    logging.info("Heartbeat: selection working. Next step will be to fetch orderbook for this ticker.")
     while True:
         time.sleep(POLL_SECONDS)
 
