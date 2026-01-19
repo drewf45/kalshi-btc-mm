@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import json
 import time
@@ -8,14 +7,63 @@ import datetime as dt
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
+
+# cryptography for Kalshi signing
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 
 # ----------------------------
 # Logging
 # ----------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("kalshi-bot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("btc15m-bot")
+
+
+# ----------------------------
+# Config (env)
+# ----------------------------
+load_dotenv()
+
+API_BASE = os.getenv("API_BASE", "https://api.elections.kalshi.com").rstrip("/")
+SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").lower() == "true"
+CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "false").lower() == "true"
+
+SUBACCOUNT = os.getenv("SUBACCOUNT", "").strip() or None
+
+# $ per side per cycle (your “$1 per trade”)
+USD_PER_SIDE = float(os.getenv("USD_PER_SIDE", "1.00"))
+MAX_CONTRACTS_PER_SIDE = int(os.getenv("MAX_CONTRACTS_PER_SIDE", "10"))  # safety cap
+
+# price to bid at (cents) – simple market-maker: place a bid on each side at best_bid or a configured cap
+MAX_BID_CENTS = int(os.getenv("MAX_BID_CENTS", "98"))  # never bid 99/100 by accident
+DEFAULT_BID_CENTS = int(os.getenv("DEFAULT_BID_CENTS", "45"))  # fallback bid if no book
+
+# How far ahead to look
+LOOKAHEAD_INTERVALS = int(os.getenv("LOOKAHEAD_INTERVALS", "4"))  # try next 4 intervals if needed
+
+# Debugging
+DEBUG_JSON = os.getenv("DEBUG_JSON", "true").lower() == "true"
+DEBUG_MAX_CHARS = int(os.getenv("DEBUG_MAX_CHARS", "4000"))  # keep Render logs readable
+
+
+# Credentials
+KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
+KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
+
+if not KALSHI_KEY_ID:
+    raise RuntimeError("Missing env var: KALSHI_KEY_ID")
+if not KALSHI_PRIVATE_KEY_B64:
+    raise RuntimeError("Missing env var: KALSHI_PRIVATE_KEY_B64")
+
 
 # ----------------------------
 # Helpers
@@ -26,573 +74,354 @@ def is_dict(x: Any) -> bool:
 def is_list(x: Any) -> bool:
     return isinstance(x, list)
 
-def first_item(x: Any) -> Any:
-    return x[0] if is_list(x) and x else None
-
-def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return v
-    return default
-
-def env_bool(*names: str, default: bool = False) -> bool:
-    v = env_first(*names)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
-
-def env_int(*names: str, default: int) -> int:
-    v = env_first(*names)
-    if v is None:
-        return default
+def jdump(obj: Any) -> str:
     try:
-        return int(str(v).strip())
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     except Exception:
-        return default
+        return str(obj)
 
-def env_float(*names: str, default: float) -> float:
-    v = env_first(*names)
-    if v is None:
-        return default
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
+def debug_dump(label: str, obj: Any) -> None:
+    if not DEBUG_JSON:
+        return
+    s = jdump(obj)
+    if len(s) > DEBUG_MAX_CHARS:
+        s = s[:DEBUG_MAX_CHARS] + "...<truncated>"
+    log.info(f"[DEBUG_JSON] {label}={s}")
 
-def now_et() -> dt.datetime:
-    return dt.datetime.now(dt.timezone(dt.timedelta(hours=-5)))
+def et_now() -> dt.datetime:
+    # ET = UTC-5 (ignoring DST). Your earlier code used UTC-5; keeping consistent with your logs.
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).astimezone(dt.timezone(dt.timedelta(hours=-5)))
 
-def usd_to_cents(u: float) -> int:
-    return int(round(float(u) * 100))
+def ceil_to_next_15m(t: dt.datetime) -> dt.datetime:
+    # Round UP to next 15-minute boundary
+    minute = t.minute
+    add = (15 - (minute % 15)) % 15
+    if add == 0:
+        add = 15
+    t2 = t + dt.timedelta(minutes=add)
+    return t2.replace(second=0, microsecond=0)
 
-def cents_to_usd(c: int) -> float:
-    return float(c) / 100.0
+def format_ticker_time(t: dt.datetime) -> str:
+    # matches "26JAN182245"
+    return t.strftime("%y%b%d%H%M").upper()
 
-def parse_json_safe(resp: requests.Response) -> Any:
-    try:
-        return resp.json()
-    except Exception:
-        return None
+def build_ticker(series_prefix: str, t: dt.datetime) -> str:
+    return f"{series_prefix}-{format_ticker_time(t)}"
 
-def summarize_shape(x: Any) -> str:
-    """Keys/types only; never logs secrets/values."""
-    if is_dict(x):
-        ks = sorted(list(x.keys()))
-        return f"dict keys={ks[:30]}{'...' if len(ks) > 30 else ''}"
-    if is_list(x):
-        return f"list len={len(x)} first={summarize_shape(first_item(x))}"
-    if x is None:
-        return "None"
-    return type(x).__name__
 
 # ----------------------------
-# Kalshi Client (RSA signing)
+# Kalshi signing + client
 # ----------------------------
+def load_private_key_from_b64(b64: str):
+    raw = base64.b64decode(b64)
+    # If PEM
+    if raw.startswith(b"-----BEGIN"):
+        return serialization.load_pem_private_key(raw, password=None)
+    # If raw Ed25519 seed (32 bytes) or expanded (64)
+    if len(raw) == 32:
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    if len(raw) == 64:
+        # some systems store 64 bytes (seed+pub); Ed25519PrivateKey expects 32 seed
+        return Ed25519PrivateKey.from_private_bytes(raw[:32])
+    raise ValueError(f"Unknown private key byte length: {len(raw)}")
+
+def sign_ed25519(priv: Ed25519PrivateKey, msg: bytes) -> str:
+    sig = priv.sign(msg)
+    return base64.b64encode(sig).decode("ascii")
+
+
 class KalshiClient:
-    def __init__(self, api_base: str, key_id: str, private_key_pem_b64: str, subaccount: Optional[str] = None):
+    def __init__(self, api_base: str, key_id: str, private_key_b64: str, subaccount: Optional[str] = None):
         self.api_base = api_base.rstrip("/")
         self.key_id = key_id
-        self.subaccount = subaccount
-
-        pem_bytes = base64.b64decode(private_key_pem_b64)
-        self.private_key = serialization.load_pem_private_key(pem_bytes, password=None)
-
+        self.priv = load_private_key_from_b64(private_key_b64)
         self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
-        self.api_prefix: Optional[str] = None
+        self.subaccount = subaccount
+        self.api_prefix = None  # discovered later
 
-    def _sign(self, method: str, path_with_query: str, body: str) -> Dict[str, str]:
-        ts = str(int(time.time()))
-        message = (ts + method.upper() + path_with_query + body).encode("utf-8")
+    def _headers(self, method: str, path: str, body: str) -> Dict[str, str]:
+        # Kalshi v2 signature scheme is: timestamp + method + path + body
+        ts = str(int(time.time() * 1000))  # ms
+        payload = (ts + method.upper() + path + body).encode("utf-8")
 
-        signature = self.private_key.sign(
-            message,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-            hashes.SHA256(),
-        )
-        sig_b64 = base64.b64encode(signature).decode("utf-8")
+        # Only support Ed25519PrivateKey in this simplified bot
+        if not isinstance(self.priv, Ed25519PrivateKey):
+            # if user has PEM non-ed25519, this will fail; logs will show it clearly
+            raise RuntimeError("Private key is not Ed25519. Re-export key as base64 Ed25519 bytes.")
 
-        headers = {
+        sig = sign_ed25519(self.priv, payload)
+
+        h = {
+            "Content-Type": "application/json",
             "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
             "KALSHI-ACCESS-TIMESTAMP": ts,
-            "KALSHI-ACCESS-SIGNATURE": sig_b64,
         }
         if self.subaccount:
-            headers["KALSHI-SUBACCOUNT"] = self.subaccount
-        return headers
+            h["KALSHI-SUBACCOUNT"] = self.subaccount
+        return h
 
-    def _url(self, path: str) -> str:
-        return f"{self.api_base}{path}"
+    def request(self, method: str, path: str, json_body: Optional[dict] = None, timeout: int = 20) -> Tuple[int, Any]:
+        body = "" if json_body is None else json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+        url = self.api_base + path
+        headers = self._headers(method, path, body)
 
-    def request(self, method: str, path: str, params: Optional[dict] = None, json_body: Optional[dict] = None) -> requests.Response:
-        body = "" if json_body is None else json.dumps(json_body, separators=(",", ":"))
-
-        if params:
-            parts = [f"{k}={params[k]}" for k in sorted(params.keys())]
-            qs = "&".join(parts)
-            path_for_sig = f"{path}?{qs}"
-        else:
-            path_for_sig = path
-
-        headers = self._sign(method, path_for_sig, body)
-        url = self._url(path)
-
-        return self.session.request(
-            method=method.upper(),
+        resp = self.session.request(
+            method=method,
             url=url,
-            params=params,
-            data=None if json_body is None else body,
+            data=body if body else None,
             headers=headers,
-            timeout=20,
+            timeout=timeout,
         )
-
-    def get(self, path: str, params: Optional[dict] = None) -> requests.Response:
-        return self.request("GET", path, params=params, json_body=None)
-
-    def post(self, path: str, json_body: dict) -> requests.Response:
-        return self.request("POST", path, params=None, json_body=json_body)
+        try:
+            data = resp.json()
+        except Exception:
+            data = resp.text
+        return resp.status_code, data
 
     def discover_prefix(self) -> str:
-        candidates = ["/trade-api/v2", "/trade-api/v1", "/trade-api", "/v2", "/v1", ""]
+        # Your logs show /trade-api/v2 works, but we auto-probe.
+        candidates = ["/trade-api/v2", "/trade-api/v1"]
+        for p in candidates:
+            code, data = self.request("GET", f"{p}/markets?limit=1")
+            if code == 200:
+                self.api_prefix = p
+                log.info(f"Discovered API prefix: {p} (probe {p}/markets?limit=1 -> 200)")
+                if DEBUG_JSON:
+                    debug_dump("probe_markets", data)
+                return p
+        raise RuntimeError("Could not discover working API prefix. Check API_BASE and credentials.")
+
+    # ---- API helpers (robust parsing) ----
+    def get_markets(self, series_prefix: str, limit: int = 200) -> Any:
+        p = self.api_prefix or self.discover_prefix()
+        # Some APIs support ?series_ticker=...; we also fallback to search if needed
+        code, data = self.request("GET", f"{p}/markets?limit={limit}")
+        if code != 200:
+            raise RuntimeError(f"GET markets failed HTTP {code}: {data}")
+        return data
+
+    def get_orderbook(self, ticker: str, depth: int = 1) -> Any:
+        p = self.api_prefix or self.discover_prefix()
+        code, data = self.request("GET", f"{p}/markets/{ticker}/orderbook?depth={depth}")
+        if code != 200:
+            raise RuntimeError(f"GET orderbook failed HTTP {code}: {data}")
+        return data
+
+    def get_balance(self) -> Any:
+        p = self.api_prefix or self.discover_prefix()
+        # Try a handful of common balance endpoints
+        endpoints = [
+            f"{p}/portfolio/balance",
+            f"{p}/portfolio/balances",
+            f"{p}/portfolio",
+            f"{p}/portfolio/summary",
+        ]
         last = None
-        for pref in candidates:
-            test_path = f"{pref}/markets"
-            r = self.get(test_path, params={"limit": 1})
-            last = r
-            if r.status_code == 200:
-                self.api_prefix = pref
-                log.info(f"Discovered API prefix: {pref or '/'} (probe {test_path}?limit=1 -> 200)")
-                return pref
-        raise RuntimeError(f"Could not discover API prefix. Last={last.status_code if last else 'NA'} {last.text[:200] if last else 'NA'}")
+        for ep in endpoints:
+            code, data = self.request("GET", ep)
+            if code == 200:
+                return data
+            last = (code, data, ep)
+        code, data, ep = last
+        raise RuntimeError(f"Balance endpoints failed; last {ep} HTTP {code}: {data}")
 
-    def p(self, suffix: str) -> str:
-        if self.api_prefix is None:
-            self.discover_prefix()
-        if not suffix.startswith("/"):
-            suffix = "/" + suffix
-        return f"{self.api_prefix}{suffix}"
+    def place_order(self, ticker: str, side: str, price_cents: int, count: int) -> Any:
+        """
+        side: 'yes' or 'no'
+        price_cents: 1..99
+        count: contracts
+        """
+        p = self.api_prefix or self.discover_prefix()
+        payload = {
+            "ticker": ticker,
+            "side": side.lower(),
+            "type": "limit",
+            "price": int(price_cents),
+            "count": int(count),
+        }
+        code, data = self.request("POST", f"{p}/orders", json_body=payload)
+        if code not in (200, 201):
+            raise RuntimeError(f"POST orders failed HTTP {code}: {data}")
+        return data
+
 
 # ----------------------------
-# Cash parsing (robust)
+# Parsing routines (type-safe)
 # ----------------------------
-def find_cash_recursively(node: Any) -> Optional[float]:
+def extract_markets_list(markets_resp: Any) -> List[dict]:
+    """
+    Handle market list shapes:
+    - dict with key 'markets' or 'data'
+    - list of market dicts
+    """
+    if is_list(markets_resp):
+        return [m for m in markets_resp if is_dict(m)]
+    if is_dict(markets_resp):
+        for k in ("markets", "data", "results"):
+            v = markets_resp.get(k)
+            if is_list(v):
+                return [m for m in v if is_dict(m)]
+    return []
+
+def market_matches_series(m: dict, series_prefix: str) -> bool:
+    t = str(m.get("ticker", ""))
+    return t.startswith(series_prefix + "-")
+
+def is_market_open(m: dict) -> bool:
+    # different APIs use different fields; be permissive
+    status = str(m.get("status", "")).lower()
+    if status in ("open", "active", "trading"):
+        return True
+    # some have "can_trade" bool
+    if m.get("can_trade") is True:
+        return True
+    return False
+
+def parse_best_bid_from_orderbook(orderbook_resp: Any, side: str) -> Optional[int]:
+    """
+    We want the best bid price for 'yes' or 'no'.
+
+    Orderbook shapes vary wildly. This function logs what it sees, and then tries:
+    - dict['orderbook'][side]['bids']
+    - dict[side]['bids']
+    - dict with 'yes_asks' etc (fallback)
+    Bids levels might be:
+    - list of dicts [{'price': 45, 'count': 12}, ...]
+    - list of lists [[45, 12], ...]
+    """
+    # Debug the raw shape
+    if DEBUG_JSON:
+        debug_dump(f"orderbook_raw_{side}", orderbook_resp)
+
+    ob = orderbook_resp
+    # unwrap common wrappers
+    if is_dict(ob) and "orderbook" in ob:
+        ob = ob["orderbook"]
+
+    # side node
+    node = None
+    if is_dict(ob):
+        if side in ob:
+            node = ob.get(side)
+        elif side.upper() in ob:
+            node = ob.get(side.upper())
     if node is None:
+        # sometimes orderbook is list like [{'side':'yes','bids':...}, ...]
+        if is_list(ob):
+            for item in ob:
+                if is_dict(item) and str(item.get("side", "")).lower() == side:
+                    node = item
+                    break
+
+    if node is None:
+        log.warning(f"No orderbook node found for side={side}.")
         return None
 
-    if is_list(node):
-        for item in node[:25]:
-            got = find_cash_recursively(item)
-            if got is not None:
-                return got
+    # bids list
+    bids = None
+    if is_dict(node):
+        bids = node.get("bids") or node.get("bid") or node.get("levels")
+    elif is_list(node):
+        # sometimes node itself is the bids array
+        bids = node
+
+    if not is_list(bids) or len(bids) == 0:
+        log.warning(f"No bids list found for side={side}. node_type={type(node).__name__}")
         return None
 
-    if not is_dict(node):
-        return None
+    best = bids[0]
 
-    # direct common keys (USD)
-    for k in ("cash", "available_cash", "cash_available", "cash_usd", "available_cash_usd"):
-        if k in node and node[k] is not None:
-            try:
-                return float(node[k])
-            except Exception:
-                pass
+    # dict form
+    if is_dict(best):
+        px = best.get("price") or best.get("p")
+        if isinstance(px, (int, float)):
+            return int(px)
 
-    # cents keys
-    for k in ("cash_cents", "available_cash_cents"):
-        if k in node and node[k] is not None:
-            try:
-                return cents_to_usd(int(node[k]))
-            except Exception:
-                pass
+    # list/tuple form: [price, count] or [price, ...]
+    if is_list(best) and len(best) >= 1 and isinstance(best[0], (int, float)):
+        return int(best[0])
 
-    # recurse children
-    for _, v in node.items():
-        got = find_cash_recursively(v)
-        if got is not None:
-            return got
+    log.warning(f"Unrecognized bids[0] shape for side={side}: {type(best).__name__}")
+    return None
+
+def parse_cash_usd(balance_resp: Any) -> Optional[float]:
+    """
+    Your logs show:
+      keys=['balance','portfolio_value','updated_ts']
+      and balance child shape: int
+
+    We'll interpret:
+      balance=int -> cents
+      balance=dict -> try balance['available_cash'] etc
+    """
+    if DEBUG_JSON:
+        debug_dump("balance_raw", balance_resp)
+
+    if is_dict(balance_resp):
+        bal = balance_resp.get("balance")
+        if isinstance(bal, int):
+            return bal / 100.0
+        if isinstance(bal, float):
+            return float(bal)
+        if is_dict(bal):
+            for k in ("cash", "available_cash", "available", "usd", "dollars"):
+                v = bal.get(k)
+                if isinstance(v, (int, float)):
+                    # if int, assume cents
+                    return (v / 100.0) if isinstance(v, int) else float(v)
+
+    # sometimes response is list of balances
+    if is_list(balance_resp):
+        for item in balance_resp:
+            if is_dict(item):
+                # try same logic on item
+                c = parse_cash_usd(item)
+                if c is not None:
+                    return c
 
     return None
 
-def auth_check(kc: KalshiClient) -> Optional[float]:
-    """
-    Returns cash if parseable, else None.
-    Your observed response: dict keys=['balance','portfolio_value','updated_ts']
-    """
-    paths = [
-        kc.p("/portfolio/balance"),
-        kc.p("/portfolio/balances"),
-        kc.p("/portfolio"),
-        kc.p("/account/balance"),
-        kc.p("/account"),
-    ]
-
-    last_err = None
-    for path in paths:
-        r = kc.get(path)
-        if r.status_code == 200:
-            data = parse_json_safe(r)
-
-            if is_dict(data) and "balance" in data:
-                cash = find_cash_recursively(data["balance"])
-                if cash is not None:
-                    return cash
-
-            cash = find_cash_recursively(data)
-            if cash is not None:
-                return cash
-
-            log.info(f"Auth check OK (endpoint 200), but cash not parseable. shape={summarize_shape(data)}")
-            if is_dict(data) and "balance" in data:
-                log.info(f"Balance child shape: {summarize_shape(data['balance'])}")
-            return None
-
-        last_err = f"HTTP {r.status_code} {r.text[:200]}"
-
-    raise RuntimeError(f"Auth check failed: {last_err}")
 
 # ----------------------------
-# Markets / Orderbook parsing
+# Trading logic
 # ----------------------------
-def list_markets(kc: KalshiClient, limit: int = 200) -> List[Dict[str, Any]]:
-    r = kc.get(kc.p("/markets"), params={"limit": limit})
-    if r.status_code != 200:
-        raise RuntimeError(f"markets fetch failed: HTTP {r.status_code} {r.text[:200]}")
-    data = parse_json_safe(r)
+def choose_target_tickers(series_prefix: str) -> List[str]:
+    now_et = et_now()
+    base = ceil_to_next_15m(now_et)
+    tickers = []
+    for i in range(LOOKAHEAD_INTERVALS):
+        t = base + dt.timedelta(minutes=15 * i)
+        tickers.append(build_ticker(series_prefix, t))
+    return tickers
 
-    markets = None
-    if is_dict(data):
-        markets = data.get("markets") or data.get("data") or data.get("results")
-    elif is_list(data):
-        markets = data
-
-    if not is_list(markets):
-        return []
-
-    return [m for m in markets if is_dict(m)]
-
-def list_openish_series_markets(kc: KalshiClient, series_prefix: str) -> List[Dict[str, Any]]:
-    allm = list_markets(kc, limit=200)
-
-    def status_ok(m: dict) -> bool:
-        s = (m.get("status") or m.get("market_status") or "").lower()
-        return s in ("open", "active", "trading", "listed", "")  # tolerate missing
-
-    out = []
-    for m in allm:
-        t = m.get("ticker") or ""
-        if t.startswith(series_prefix) and status_ok(m):
-            out.append(m)
-
-    out.sort(key=lambda x: (x.get("ticker") or ""), reverse=True)
-    return out
-
-def fetch_orderbook(kc: KalshiClient, ticker: str, depth: int = 1) -> Any:
-    paths = [
-        kc.p(f"/markets/{ticker}/orderbook"),
-        kc.p(f"/markets/{ticker}/order-book"),
-        kc.p(f"/markets/{ticker}/quotes"),
-    ]
-    for pth in paths:
-        r = kc.get(pth, params={"depth": depth})
-        if r.status_code == 200:
-            return parse_json_safe(r)
-    return None
-
-def parse_level(level: Any) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Supports:
-      - {"price": 51, "quantity": 10}
-      - {"p": 51, "q": 10}
-      - [51, 10]
-    """
-    if is_dict(level):
-        px = level.get("price", level.get("p"))
-        qty = level.get("quantity", level.get("qty", level.get("q")))
-        try:
-            px_i = int(px) if px is not None else None
-        except Exception:
-            px_i = None
-        try:
-            qty_i = int(qty) if qty is not None else None
-        except Exception:
-            qty_i = None
-        return px_i, qty_i
-
-    # ✅ THIS is the line that was broken in your deployed file.
-    if is_list(level) and len(level) >= 2:
-        try:
-            px_i = int(level[0])
-        except Exception:
-            px_i = None
-        try:
-            qty_i = int(level[1])
-        except Exception:
-            qty_i = None
-        return px_i, qty_i
-
-    return None, None
-
-def pick_side_node(ob: Any, side: str) -> Optional[dict]:
-    if ob is None:
-        return None
-    if is_list(ob):
-        ob = first_item(ob)
-    if not is_dict(ob):
-        return None
-
-    for wrapper in ("orderbook", "book", "data", "result"):
-        if wrapper in ob and is_dict(ob[wrapper]):
-            ob = ob[wrapper]
-            break
-
-    if side in ob and is_dict(ob[side]):
-        return ob[side]
-    if side.upper() in ob and is_dict(ob[side.upper()]):
-        return ob[side.upper()]
-
-    if "contracts" in ob and is_dict(ob["contracts"]):
-        c = ob["contracts"]
-        if side.upper() in c and is_dict(c[side.upper()]):
-            return c[side.upper()]
-        if side in c and is_dict(c[side]):
-            return c[side]
-
-    if side in ob and is_list(ob[side]):
-        x = first_item(ob[side])
-        return x if is_dict(x) else None
-
-    return None
-
-def best_bid_ask(ob_json: Any, side: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
-    s = pick_side_node(ob_json, side)
-    if not s:
-        return (None, None, None, None)
-
-    bids = s.get("bids") or s.get("bid") or []
-    asks = s.get("asks") or s.get("ask") or []
-
-    if not bids and "buy" in s:
-        bids = s.get("buy") or []
-    if not asks and "sell" in s:
-        asks = s.get("sell") or []
-
-    if not is_list(bids):
-        bids = []
-    if not is_list(asks):
-        asks = []
-
-    bid_px, bid_qty = (None, None)
-    ask_px, ask_qty = (None, None)
-
-    if bids:
-        bid_px, bid_qty = parse_level(bids[0])
-    if asks:
-        ask_px, ask_qty = parse_level(asks[0])
-
-    return (bid_px, bid_qty, ask_px, ask_qty)
-
-def market_has_quotes(kc: KalshiClient, ticker: str) -> bool:
-    ob = fetch_orderbook(kc, ticker, depth=1)
-    ybp, _, yap, _ = best_bid_ask(ob, "yes")
-    nbp, _, nap, _ = best_bid_ask(ob, "no")
-    return any(v is not None for v in (ybp, yap, nbp, nap))
-
-def pick_market_with_quotes(kc: KalshiClient, series_prefix: str) -> Optional[str]:
-    markets = list_openish_series_markets(kc, series_prefix)
-    if markets:
-        log.info(f"Found {len(markets)} markets for series {series_prefix}. Checking quotes...")
-
-    for m in markets[:50]:
-        t = m.get("ticker")
-        if not t:
-            continue
-        if market_has_quotes(kc, t):
-            return t
-
-    if markets:
-        sample = markets[0].get("ticker")
-        ob = fetch_orderbook(kc, sample, depth=1) if sample else None
-        log.warning(f"Could not detect quotes. Sample orderbook shape for {sample}: {summarize_shape(ob)}")
-
-    return None
-
-# ----------------------------
-# Orders
-# ----------------------------
-def place_order(kc: KalshiClient, ticker: str, side: str, action: str, price: int, quantity: int) -> Optional[dict]:
-    payload = {
-        "ticker": ticker,
-        "side": side,
-        "action": action,
-        "type": "limit",
-        "price": int(price),
-        "quantity": int(quantity),
-    }
-    r = kc.post(kc.p("/orders"), payload)
-    if r.status_code not in (200, 201):
-        log.warning(f"Order failed {ticker} {side} {action} px={price} qty={quantity}: HTTP {r.status_code} {r.text[:200]}")
-        return None
-    return parse_json_safe(r)
-
-# ----------------------------
-# State
-# ----------------------------
-STATE_PATH = "state.json"
-
-def load_state() -> dict:
-    try:
-        with open(STATE_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_state(st: dict):
-    try:
-        with open(STATE_PATH, "w") as f:
-            json.dump(st, f, indent=2, sort_keys=True)
-    except Exception as e:
-        log.warning(f"Could not save state: {e}")
-
-# ----------------------------
-# Config (env)
-# ----------------------------
-API_BASE = env_first("KALSHI_API_BASE", "KALSHI_BASE_URL", default="https://api.elections.kalshi.com")
-
-KALSHI_KEY_ID = env_first("KALSHI_KEY_ID", "KALSHI_API_KEY_ID", "KALSHI_ACCESS_KEY", default=None)
-KALSHI_PRIVATE_KEY_B64 = env_first("KALSHI_PRIVATE_KEY_B64", "KALSHI_PRIVATE_KEY_PEM_BASE64", "KALSHI_PRIVATE_KEY_BASE64", default=None)
-SUBACCOUNT = env_first("KALSHI_SUBACCOUNT", "SUBACCOUNT", default=None)
-
-SERIES_PREFIX = env_first("SERIES_PREFIX", default="KXBTC15M")
-POLL_SECONDS = env_int("POLL_SECONDS", default=60)
-
-ENABLE_TRADING = env_bool("ENABLE_TRADING", default=False)
-CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", "CONFIRM_LIVE", default=False)
-
-ORDER_USD_PER_SIDE = env_float("ORDER_USD_PER_SIDE", default=1.00)
-IMPROVE_TICKS = env_int("IMPROVE_TICKS", default=1)
-MAX_SPREAD_CENTS = env_int("MAX_SPREAD_CENTS", default=8)
-TAKE_PROFIT_CENTS = env_int("TAKE_PROFIT_CENTS", default=3)
-MAX_POSITION_MARKETS = env_int("MAX_POSITION_MARKETS", default=3)
-MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", default=10.0)
-
-def sanity_check_env():
-    if not KALSHI_KEY_ID:
-        raise RuntimeError("Missing env var: KALSHI_KEY_ID (or KALSHI_API_KEY_ID)")
-    if not KALSHI_PRIVATE_KEY_B64:
-        raise RuntimeError("Missing env var: KALSHI_PRIVATE_KEY_B64 (or KALSHI_PRIVATE_KEY_PEM_BASE64)")
-
-def compute_qty(limit_price_cents: int) -> int:
-    if limit_price_cents <= 0:
+def calc_contracts_for_usd(price_cents: int, usd_budget: float) -> int:
+    # Contract costs price_cents/100 dollars each
+    if price_cents <= 0:
         return 0
-    budget_cents = usd_to_cents(ORDER_USD_PER_SIDE)
-    return int(max(0, budget_cents // limit_price_cents))
+    per = price_cents / 100.0
+    n = int(usd_budget / per)
+    return max(0, n)
 
-def loop_once(kc: KalshiClient, state: dict):
-    today = now_et().date().isoformat()
+def clamp_price(px: Optional[int]) -> int:
+    if px is None:
+        return DEFAULT_BID_CENTS
+    px = int(px)
+    px = max(1, min(px, MAX_BID_CENTS))
+    return px
 
-    # Daily reset
-    if state.get("day") != today:
-        cash = auth_check(kc)  # may be None
-        state.clear()
-        state.update({
-            "day": today,
-            "starting_cash": cash,  # may be None
-            "daily_loss_limit_usd": None if cash is None else round(cash * (MAX_DAILY_LOSS_PCT / 100.0), 2),
-            "markets_traded": [],
-        })
-        save_state(state)
-
-    cash_now = auth_check(kc)  # may be None
-    start_cash = state.get("starting_cash", None)
-
-    if cash_now is None or start_cash is None:
-        log.warning("Cash is UNKNOWN from balance endpoint; skipping daily-loss enforcement (still trading).")
-    else:
-        loss = max(0.0, float(start_cash) - float(cash_now))
-        limit = float(state.get("daily_loss_limit_usd") or 0.0)
-        if limit > 0 and loss >= limit:
-            log.warning(f"Daily loss limit hit. start=${start_cash:.2f} now=${cash_now:.2f} loss=${loss:.2f}. Not trading.")
-            return
-
-    ticker = pick_market_with_quotes(kc, SERIES_PREFIX)
-    if not ticker:
-        log.warning(f"No open markets with quotes found for {SERIES_PREFIX}.")
-        return
-
-    traded = state.get("markets_traded", [])
-    if not is_list(traded):
-        traded = []
-
-    if ticker in traded:
-        return
-
-    ob = fetch_orderbook(kc, ticker, depth=1)
-    ybp, _, yap, _ = best_bid_ask(ob, "yes")
-    nbp, _, nap, _ = best_bid_ask(ob, "no")
-
-    log.info(
-        f"Heartbeat ET={now_et().strftime('%Y-%m-%d %H:%M:%S')} | market={ticker} | "
-        f"yes {ybp}/{yap} no {nbp}/{nap}"
-    )
-
-    def ok_book(bid_px, ask_px):
-        if bid_px is None or ask_px is None:
-            return False
-        if ask_px <= bid_px:
-            return False
-        if (ask_px - bid_px) > MAX_SPREAD_CENTS:
-            return False
-        return True
-
-    yes_ok = ok_book(ybp, yap)
-    no_ok = ok_book(nbp, nap)
-    if not yes_ok and not no_ok:
-        log.info("Both books fail spread checks or missing quotes. Skipping.")
-        return
-
-    if ENABLE_TRADING and not CONFIRM_LIVE_TRADING:
-        log.warning("ENABLE_TRADING=True but CONFIRM_LIVE_TRADING=False. Not placing orders.")
-        return
-
+def should_trade() -> bool:
     if not ENABLE_TRADING:
-        log.info("ENABLE_TRADING=False. Marking market as handled (no trades).")
-        traded.append(ticker)
-        state["markets_traded"] = traded[:MAX_POSITION_MARKETS]
-        save_state(state)
-        return
+        return False
+    if ENABLE_TRADING and not CONFIRM_LIVE_TRADING:
+        # extra safety: require explicit CONFIRM_LIVE_TRADING to be true
+        return False
+    return True
 
-    def buy_then_tp(side: str, bid_px: int, ask_px: int) -> bool:
-        buy_px = min(bid_px + IMPROVE_TICKS, ask_px - 1)
-        qty = compute_qty(buy_px)
-        if qty <= 0:
-            log.info(f"{side.upper()} budget too small for price {buy_px}c. Skipping.")
-            return False
 
-        o = place_order(kc, ticker, side=side, action="buy", price=buy_px, quantity=qty)
-        if not o:
-            return False
-        log.info(f"Placed BUY {side.upper()} {ticker} px={buy_px} qty={qty}")
-
-        sell_px = min(99, buy_px + TAKE_PROFIT_CENTS)
-        so = place_order(kc, ticker, side=side, action="sell", price=sell_px, quantity=qty)
-        if so:
-            log.info(f"Placed TP SELL {side.upper()} {ticker} px={sell_px} qty={qty}")
-        else:
-            log.warning(f"TP SELL failed for {side.upper()} {ticker}")
-        return True
-
-    placed_any = False
-    if yes_ok and ybp is not None and yap is not None:
-        placed_any = buy_then_tp("yes", ybp, yap) or placed_any
-    if no_ok and nbp is not None and nap is not None:
-        placed_any = buy_then_tp("no", nbp, nap) or placed_any
-
-    if placed_any:
-        traded.append(ticker)
-        state["markets_traded"] = traded[:MAX_POSITION_MARKETS]
-        save_state(state)
-
+# ----------------------------
+# Main loop
+# ----------------------------
 def main():
     log.info("=== BOT STARTED ===")
     log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
@@ -600,28 +429,105 @@ def main():
     log.info(f"POLL_SECONDS={POLL_SECONDS}")
     log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
     log.info(f"API_BASE={API_BASE}")
-    if SUBACCOUNT:
-        log.info(f"SUBACCOUNT={SUBACCOUNT}")
-
-    sanity_check_env()
+    log.info(f"SUBACCOUNT={SUBACCOUNT}")
 
     kc = KalshiClient(API_BASE, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_B64, subaccount=SUBACCOUNT)
     kc.discover_prefix()
 
-    cash = auth_check(kc)
+    # Balance check (debug prints the raw response so we can finalize parsing if needed)
+    bal_resp = kc.get_balance()
+    cash = parse_cash_usd(bal_resp)
     if cash is None:
-        log.info("Auth OK. cash=UNKNOWN (parser mismatch).")
+        log.warning("Auth OK (balance endpoint 200), but cash not parseable. Proceeding with cash=UNKNOWN.")
     else:
         log.info(f"Auth OK. cash=${cash:.2f}")
 
-    state = load_state()
-
     while True:
         try:
-            loop_once(kc, state)
+            now_et = et_now()
+            tickers = choose_target_tickers(SERIES_PREFIX)
+
+            # Pull markets list for sanity/debug, but we don’t rely on it exclusively
+            markets_resp = kc.get_markets(SERIES_PREFIX)
+            markets = extract_markets_list(markets_resp)
+
+            if DEBUG_JSON:
+                debug_dump("markets_raw", markets_resp)
+                # Also show a tiny sample of matched tickers
+                matched = [m.get("ticker") for m in markets if is_dict(m) and market_matches_series(m, SERIES_PREFIX)]
+                log.info(f"[DEBUG] matched_markets_count={len(matched)} sample={matched[:5]}")
+
+            chosen = None
+            for tk in tickers:
+                # If markets list contains it and it's open, prioritize it
+                m = next((x for x in markets if is_dict(x) and x.get("ticker") == tk), None)
+                if m is not None and is_market_open(m):
+                    chosen = tk
+                    break
+                # If not found / status unknown, we still try orderbook to see if quotes exist
+                if chosen is None:
+                    chosen = tk  # optimistic; we’ll validate via orderbook
+                    break
+
+            if not chosen:
+                log.warning("Could not choose any ticker; sleeping.")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Orderbook check
+            ob = kc.get_orderbook(chosen, depth=1)
+
+            yes_bid = parse_best_bid_from_orderbook(ob, "yes")
+            no_bid = parse_best_bid_from_orderbook(ob, "no")
+
+            yes_px = clamp_price(yes_bid)
+            no_px = clamp_price(no_bid)
+
+            log.info(
+                f"Heartbeat ET now={now_et.strftime('%Y-%m-%d %H:%M:%S %Z')} | "
+                f"market={chosen} | yes_bid={yes_bid} no_bid={no_bid} | "
+                f"placing yes@{yes_px} no@{no_px}"
+            )
+
+            # If there are no quotes at all (both None), we skip trading this cycle.
+            if yes_bid is None and no_bid is None:
+                log.warning(f"No quotes available for {chosen} (both sides).")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            if not should_trade():
+                log.warning("Trading disabled or not confirmed. Set ENABLE_TRADING=true and CONFIRM_LIVE_TRADING=true to trade.")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Compute contract counts from USD budget
+            yes_ct = calc_contracts_for_usd(yes_px, USD_PER_SIDE)
+            no_ct = calc_contracts_for_usd(no_px, USD_PER_SIDE)
+
+            yes_ct = min(yes_ct, MAX_CONTRACTS_PER_SIDE)
+            no_ct = min(no_ct, MAX_CONTRACTS_PER_SIDE)
+
+            if yes_ct <= 0 and no_ct <= 0:
+                log.warning("USD_PER_SIDE too small for current prices; not placing orders.")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Place both orders (market-making)
+            if yes_ct > 0:
+                resp_yes = kc.place_order(chosen, "yes", yes_px, yes_ct)
+                debug_dump("order_resp_yes", resp_yes)
+                log.info(f"Placed YES: ticker={chosen} price={yes_px} count={yes_ct}")
+
+            if no_ct > 0:
+                resp_no = kc.place_order(chosen, "no", no_px, no_ct)
+                debug_dump("order_resp_no", resp_no)
+                log.info(f"Placed NO: ticker={chosen} price={no_px} count={no_ct}")
+
         except Exception as e:
-            log.exception(f"Loop crashed: {repr(e)}")
+            log.error(f"Loop error: {repr(e)}")
+
         time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
