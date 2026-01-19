@@ -153,7 +153,16 @@ class KalshiClient:
         # ✅ CHANGED: build the exact path including query string before signing
         path_q = path
         if params:
-            qs = urlencode(params, doseq=True)
+            # ✅ ONLY CHANGE: canonicalize query params by sorting keys
+            items: List[Tuple[str, Any]] = []
+            for k in sorted(params.keys()):
+                v = params[k]
+                if isinstance(v, (list, tuple)):
+                    for vv in v:
+                        items.append((k, vv))
+                else:
+                    items.append((k, v))
+            qs = urlencode(items, doseq=True)
             path_q = f"{path}?{qs}"
 
         url = f"{self.api_base}{path_q}"
