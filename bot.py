@@ -204,9 +204,10 @@ class KalshiClient:
         NOTE: In your logs, POST /trade-api/v2/orders is returning 404.
         We are NOT fixing that in this step. This is just here so you can see the exact next failure.
         """
-        if not self.api_prefix:
+        if not self.api_prefix
+        :
             self.discover_prefix()
-        path = f"{self.api_prefix}/orders"
+        path = f"{self.api_prefix}/portfolio/orders"
         code, body, raw = self.request("POST", path, json_body=payload)
         if code != 200:
             log.error(f"HTTP POST {path} -> {code} {safe_json(body)}")
