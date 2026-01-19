@@ -126,7 +126,18 @@ class KalshiClient:
 
     def _headers(self, method: str, path: str, body: str) -> Dict[str, str]:
         ts = now_utc_ts()
-        sig = self._sign(method, path, ts, body)
+        sig = self._sign        # ---- DEBUG SIGNING (safe) ----
+        try:
+            payload_preview = f"{method.upper()} {path} ts={ts} body_len={len(body.encode('utf-8')) if body else 0}"
+            payload_hash = hashes.Hash(hashes.SHA256())
+            # recreate the exact signing payload used by _sign()
+            signing_payload = f"{method.upper()}{path}{body}{ts}".encode("utf-8")
+            payload_hash.update(signing_payload)
+            digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
+            log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
+        except Exception as _e:
+            log.info(f"[SIGNDBG] failed to compute debug hash: {_e}")
+        # -------------------------------(method, path, ts, body)
         h = {
             "KALSHI-ACCESS-KEY": self.key_id,
             "KALSHI-ACCESS-SIGNATURE": sig,
