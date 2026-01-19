@@ -150,10 +150,9 @@ class KalshiClient:
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, Any, str]:
-        # ✅ CHANGED: build the exact path including query string before signing
+        # build exact path including query string before signing
         path_q = path
         if params:
-            # ✅ ONLY CHANGE: canonicalize query params by sorting keys
             items: List[Tuple[str, Any]] = []
             for k in sorted(params.keys()):
                 v = params[k]
@@ -173,11 +172,14 @@ class KalshiClient:
             body_str = json.dumps(json_body, separators=(",", ":"))
             data = body_str
 
-        # ✅ CHANGED: sign the path WITH query (path_q)
-        headers = self._headers(method, path_q, body_str)
+        # ✅ ONLY CHANGE: for GET /portfolio/orders, sign WITHOUT the query string
+        sign_path = path_q
+        if method.upper() == "GET" and path.endswith("/portfolio/orders") and params:
+            sign_path = path  # sign only the base path
+
+        headers = self._headers(method, sign_path, body_str)
 
         try:
-            # ✅ CHANGED: do NOT pass params separately (already baked into path_q)
             r = self.session.request(method=method, url=url, params=None, data=data, headers=headers, timeout=20)
         except Exception as e:
             log.error(f"HTTP {method} {path_q} failed: {e}")
@@ -233,7 +235,6 @@ class KalshiClient:
             raise RuntimeError(f"Orderbook fetch failed HTTP={code} body={safe_json(body)}")
         return body
 
-    # --- MICRO CHANGE: pull resting orders so we don't stack duplicates ---
     def get_resting_orders(self, limit: int = 200) -> List[Dict[str, Any]]:
         if not self.api_prefix:
             self.discover_prefix()
@@ -247,7 +248,6 @@ class KalshiClient:
             raise RuntimeError(f"Resting orders fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
         orders = body.get("orders", []) if isinstance(body, dict) else []
         return orders
-    # ---------------------------------------------------------------
 
     def place_order(self, payload: Dict[str, Any]) -> Tuple[int, Any]:
         if not self.api_prefix:
@@ -261,9 +261,6 @@ class KalshiClient:
         return code, body
 
 
-# -----------------------------
-# Strategy helpers
-# -----------------------------
 def parse_best_ask(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
     ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
     yes = ob.get("yes") or []
@@ -306,9 +303,6 @@ def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return future[0][1]
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     log.info("=== BOT STARTED ===")
 
@@ -337,7 +331,7 @@ def main():
     log.info(f"API_BASE={API_BASE}")
     log.info(f"SUBACCOUNT={SUBACCOUNT if SUBACCOUNT else None}")
     log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
-    log.info(f"SIZING base={BASE_QTY} scale_after_wins={SCALE_AFTER_WINS} mult={SIZE_MULT} cap={SIZE_CAP}")
+    log.info(f"SIZING base={BASE_QTY} scale_after_wins=20 mult={SIZE_MULT} cap={SIZE_CAP}")
 
     if not os.getenv("KALSHI_KEY_ID"):
         raise RuntimeError("Missing env var KALSHI_KEY_ID")
@@ -367,7 +361,7 @@ def main():
     best = parse_best_ask(ob)
     log.info(f"[BEST] {safe_json(best)}")
 
-    side = FARM_SIDE  # "YES" or "NO"
+    side = FARM_SIDE
     target_buy = BUY_PRICE_CENTS
     qty = BASE_QTY
 
@@ -377,7 +371,6 @@ def main():
         log.warning("[ORDER] Trading disabled by env. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True to actually place.")
         return
 
-    # --- MICRO CHANGE: stop stacking duplicates ---
     try:
         existing = client.get_resting_orders(limit=200)
         side_key = "yes" if side == "YES" else "no"
@@ -395,7 +388,6 @@ def main():
             return
     except Exception as e:
         log.warning(f"[GUARD] Could not check existing orders (will proceed): {e}")
-    # ------------------------------------------------
 
     payload = {
         "ticker": MARKET_TICKER,
@@ -411,7 +403,6 @@ def main():
     code, body = client.place_order(payload)
     log.info(f"[HEARTBEAT] alive order_post_http={code} resp={safe_json(body)}")
 
-    # ✅ ONLY CHANGE: keep process alive so Render does not restart and re-run the bot
     while True:
         time.sleep(POLL_SECONDS)
 
