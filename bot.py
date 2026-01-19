@@ -1,272 +1,229 @@
 import os
-import json
 import time
+import json
 import base64
+import uuid
+import hmac
 import hashlib
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, padding
+from cryptography.exceptions import UnsupportedAlgorithm
 
 # ----------------------------
-# Logging (very verbose by design)
+# Logging
 # ----------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("kalshi-bot")
 
+# ----------------------------
+# Env / Config
+# ----------------------------
+load_dotenv()
+
+API_BASE = os.getenv("API_BASE", "https://api.elections.kalshi.com").rstrip("/")
+KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
+KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
+
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").lower() == "true"
+CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "false").lower() == "true"
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+
+# You previously used SERIES_PREFIX; later you moved to MARKET_TICKER.
+# Keep both for compatibility — but DO NOT change env vars right now.
+SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
+MARKET_TICKER = os.getenv("MARKET_TICKER", "").strip()  # optional
+
+SUBACCOUNT = os.getenv("SUBACCOUNT", "").strip() or None
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def b64decode_str(s: str) -> bytes:
-    # tolerate missing padding
-    s = s.strip()
-    pad = (-len(s)) % 4
-    if pad:
-        s += "=" * pad
-    return base64.b64decode(s.encode("utf-8"))
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
-def safe_json(obj: Any) -> str:
+def safe_json(obj) -> str:
     try:
-        return json.dumps(obj, indent=2, sort_keys=True)[:8000]
+        return json.dumps(obj, sort_keys=True)
     except Exception:
-        return str(obj)[:8000]
+        return str(obj)
 
-def is_dict(x: Any) -> bool:
-    return isinstance(x, dict)
-
-def is_list(x: Any) -> bool:
-    return isinstance(x, list)
-
+def shape_of(x):
+    if isinstance(x, dict):
+        return f"dict keys={list(x.keys())}"
+    if isinstance(x, list):
+        return f"list len={len(x)}"
+    return type(x).__name__
 
 # ----------------------------
-# Kalshi Client (RSA-PSS signing)
+# Kalshi Client (RSA or Ed25519)
 # ----------------------------
-@dataclass
-class KalshiConfig:
-    api_base: str
-    api_prefix: str
-    key_id: str
-    private_key_pem_b64: str
-    subaccount: Optional[str] = None
-    timeout_s: int = 20
-
-
 class KalshiClient:
-    def __init__(self, cfg: KalshiConfig):
-        self.cfg = cfg
-        self.session = requests.Session()
-        self._private_key = self._load_private_key(cfg.private_key_pem_b64)
+    def __init__(self, base: str, key_id: str, private_key_b64: str, subaccount=None):
+        self.base = base.rstrip("/")
+        self.key_id = key_id
+        self.subaccount = subaccount
 
-    def _load_private_key(self, pem_b64: str):
-        raw = b64decode_str(pem_b64)
+        if not self.key_id:
+            raise RuntimeError("Missing env var: KALSHI_KEY_ID")
+        if not private_key_b64:
+            raise RuntimeError("Missing env var: KALSHI_PRIVATE_KEY_B64")
 
-        # If user base64’d the PEM text, raw will start with b'-----BEGIN'
-        # If user base64’d DER, it won’t. Handle both.
-        if raw.lstrip().startswith(b"-----BEGIN"):
-            pem_bytes = raw
-        else:
-            # Assume DER -> convert to PEM attempt is not feasible reliably.
-            # But most users base64 the PEM text; if not, fail loudly.
-            raise RuntimeError(
-                "KALSHI_PRIVATE_KEY_B64 did not decode to a PEM that starts with '-----BEGIN'. "
-                "Base64 encode the FULL PEM file contents including BEGIN/END lines."
-            )
+        self.private_key = self._load_private_key(private_key_b64)
+        self.prefix = None  # discovered later
 
-        try:
-            key = serialization.load_pem_private_key(pem_bytes, password=None)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load private key PEM: {e}")
+    def _load_private_key(self, b64: str):
+        """
+        Accepts:
+        - base64 of PEM text (RSA/Ed25519 PEM)
+        - base64 of raw Ed25519 private bytes (32 or 64)
+        """
+        raw = base64.b64decode(b64)
 
-        # We expect RSA based on your key format
-        # (Kalshi supports RSA signing; we use RSA-PSS)
-        return key
+        # If it looks like PEM text
+        if raw.startswith(b"-----BEGIN"):
+            try:
+                key = serialization.load_pem_private_key(raw, password=None)
+            except (ValueError, UnsupportedAlgorithm) as e:
+                raise RuntimeError(f"Could not load PEM private key: {e}")
 
-    def _sign(self, message: bytes) -> str:
-        sig = self._private_key.sign(
-            message,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
-            ),
-            hashes.SHA256(),
+            if isinstance(key, rsa.RSAPrivateKey):
+                logging.info("Loaded RSA private key (PEM).")
+                return key
+            if isinstance(key, ed25519.Ed25519PrivateKey):
+                logging.info("Loaded Ed25519 private key (PEM).")
+                return key
+
+            raise RuntimeError(f"Unsupported PEM key type: {type(key)}")
+
+        # Otherwise try raw Ed25519 bytes
+        # Ed25519 private key can be 32 bytes seed; some exports 64 bytes.
+        if len(raw) in (32, 64):
+            try:
+                if len(raw) == 32:
+                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+                else:
+                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
+                logging.info("Loaded Ed25519 private key (raw bytes).")
+                return key
+            except Exception as e:
+                raise RuntimeError(f"Could not load Ed25519 private key bytes: {e}")
+
+        raise RuntimeError(
+            f"Private key format not recognized. decoded_len={len(raw)}. "
+            "Expected PEM (starts with -----BEGIN) or Ed25519 bytes length 32/64."
         )
-        return base64.b64encode(sig).decode("utf-8")
 
-    def _headers(self, method: str, path_with_prefix: str, body: bytes) -> Dict[str, str]:
-        # Timestamp (milliseconds) is typical; your prior logs suggest time-based signing.
-        ts_ms = str(int(time.time() * 1000))
+    def _sign(self, msg: bytes) -> str:
+        """
+        Returns signature as base64 string.
+        - RSA: PKCS1v15 + SHA256
+        - Ed25519: pure Ed25519 signature
+        """
+        if isinstance(self.private_key, rsa.RSAPrivateKey):
+            sig = self.private_key.sign(
+                msg,
+                padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+            return base64.b64encode(sig).decode()
 
-        # Canonical message:
-        # method + path + timestamp + body_hash
-        # NOTE: If Kalshi changes canonicalization, our debug logs will show 401/403 clearly.
-        body_hash = hashlib.sha256(body).hexdigest()
-        canonical = f"{method.upper()}\n{path_with_prefix}\n{ts_ms}\n{body_hash}".encode("utf-8")
-        signature_b64 = self._sign(canonical)
+        if isinstance(self.private_key, ed25519.Ed25519PrivateKey):
+            sig = self.private_key.sign(msg)
+            return base64.b64encode(sig).decode()
 
-        return {
+        raise RuntimeError(f"Unsupported key object type: {type(self.private_key)}")
+
+    def _headers(self, method: str, path: str, body: bytes | None):
+        ts = str(int(time.time()))
+        body_hash = hashlib.sha256(body or b"").hexdigest()
+        # A consistent signing string. (We’re not changing your endpoints yet.)
+        signing_str = "\n".join([ts, method.upper(), path, body_hash]).encode()
+
+        sig_b64 = self._sign(signing_str)
+
+        headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
-            "KALSHI-ACCESS-KEY": self.cfg.key_id,
-            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-            "KALSHI-ACCESS-SIGNATURE": signature_b64,
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
         }
+        if self.subaccount:
+            headers["KALSHI-SUBACCOUNT"] = self.subaccount
+        return headers
 
-    def request(self, method: str, path: str, payload: Optional[dict] = None) -> Tuple[int, Any]:
-        # path should already include prefix like /trade-api/v2/...
-        url = self.cfg.api_base.rstrip("/") + path
-        body = b""
-        if payload is not None:
-            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
+    def request(self, method: str, path: str, payload=None, timeout=15):
+        url = self.base + path
+        body = None if payload is None else json.dumps(payload).encode()
         headers = self._headers(method, path, body)
 
-        # Debug: show request metadata (never print full signature)
-        log.debug(
-            "HTTP %s %s\nHeaders: key=%s ts=%s sig_len=%d body_len=%d",
-            method.upper(),
-            path,
-            headers.get("KALSHI-ACCESS-KEY"),
-            headers.get("KALSHI-ACCESS-TIMESTAMP"),
-            len(headers.get("KALSHI-ACCESS-SIGNATURE", "")),
-            len(body),
-        )
-        if payload is not None:
-            log.debug("Payload: %s", safe_json(payload))
-
         try:
-            resp = self.session.request(
-                method=method.upper(),
+            r = requests.request(
+                method=method,
                 url=url,
                 headers=headers,
-                data=body if body else None,
-                timeout=self.cfg.timeout_s,
+                data=body,
+                timeout=timeout,
             )
         except Exception as e:
-            log.error("HTTP %s %s -> NETWORK ERROR: %s", method.upper(), path, e)
-            return 0, {"_error": str(e)}
+            logging.error(f"HTTP {method} {path} exception: {e}")
+            return 0, {"_raw": str(e)}
 
-        text = resp.text or ""
-        data: Any = None
+        txt = r.text
         try:
-            data = resp.json()
+            data = r.json()
         except Exception:
-            data = {"_raw": text[:8000]}
+            data = {"_raw": txt}
 
-        if resp.status_code >= 400:
-            log.error("HTTP %s %s -> %d %s", method.upper(), path, resp.status_code, text[:500])
+        if r.status_code >= 400:
+            logging.error(f"HTTP {method} {path} -> {r.status_code} {txt[:400]}")
+        return r.status_code, data
 
-        # Extra debug about response structure
-        if is_dict(data):
-            log.debug("Response keys: %s", list(data.keys()))
-        elif is_list(data):
-            log.debug("Response is list len=%d", len(data))
-        else:
-            log.debug("Response type=%s", type(data).__name__)
-
-        return resp.status_code, data
-
-    # ---- High-level endpoints ----
-    def get_balance(self) -> Tuple[int, Any]:
-        # Correct endpoint: /portfolio/balance  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/live-data/get-live-data?utm_source=chatgpt.com)
-        return self.request("GET", f"{self.cfg.api_prefix}/portfolio/balance")
-
-    def get_market(self, ticker: str) -> Tuple[int, Any]:
-        return self.request("GET", f"{self.cfg.api_prefix}/markets/{ticker}")
-
-    def get_markets(self, series_ticker: str, status: str = "open", limit: int = 200) -> Tuple[int, Any]:
-        # Get Markets exists under market section in docs  [oai_citation:3‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/live-data/get-live-data?utm_source=chatgpt.com)
-        # Parameter names can vary; we log responses if mismatched.
-        qs = f"?limit={limit}&status={status}&series_ticker={series_ticker}"
-        return self.request("GET", f"{self.cfg.api_prefix}/markets{qs}")
-
-    def get_orderbook(self, ticker: str) -> Tuple[int, Any]:
-        return self.request("GET", f"{self.cfg.api_prefix}/markets/{ticker}/orderbook")
-
-    def create_order(self, ticker: str, side: str, price: int, count: int, order_type: str = "limit") -> Tuple[int, Any]:
-        payload = {
-            "ticker": ticker,
-            "side": side,          # "yes" / "no" often used; depends on market
-            "type": order_type,    # "limit"
-            "price": price,        # cents
-            "count": count,
-        }
-        if self.cfg.subaccount:
-            payload["subaccount"] = self.cfg.subaccount
-        return self.request("POST", f"{self.cfg.api_prefix}/orders", payload=payload)
-
+    def discover_prefix(self):
+        # Previously you discovered /trade-api/v2. Keep that behavior.
+        candidates = ["/trade-api/v2", "/trade-api/v1", "/trade-api", ""]
+        for p in candidates:
+            code, data = self.request("GET", f"{p}/markets?limit=1")
+            if code == 200:
+                self.prefix = p
+                logging.info(f"Discovered API prefix: {p} (probe {p}/markets?limit=1 -> 200)")
+                return p
+        raise RuntimeError("Could not discover API prefix (all probes failed).")
 
 # ----------------------------
-# Strategy / Market selection
-# ----------------------------
-def extract_ticker_from_url(url: str) -> Optional[str]:
-    try:
-        base = url.split("?")[0]
-        tail = base.rstrip("/").split("/")[-1]
-        return tail if tail else None
-    except Exception:
-        return None
-
-def pick_next_open_market(markets_payload: Any) -> Optional[str]:
-    # We don’t assume exact schema; we try common ones and log.
-    if not is_dict(markets_payload):
-        return None
-
-    candidates = None
-    for key in ["markets", "data", "results"]:
-        if key in markets_payload and is_list(markets_payload[key]):
-            candidates = markets_payload[key]
-            break
-
-    if not candidates:
-        # some APIs return list directly; handled earlier
-        return None
-
-    # Prefer earliest close or soonest start if present
-    def sort_key(m: dict):
-        # Try fields commonly seen in exchange APIs:
-        return (
-            m.get("close_time", 10**18),
-            m.get("end_time", 10**18),
-            m.get("open_time", 10**18),
-            m.get("start_time", 10**18),
-        )
-
-    try:
-        candidates_sorted = sorted([m for m in candidates if is_dict(m)], key=sort_key)
-    except Exception:
-        candidates_sorted = [m for m in candidates if is_dict(m)]
-
-    for m in candidates_sorted[:50]:
-        t = m.get("ticker") or m.get("market_ticker")
-        if t:
-            return t
-    return None
-
-
-# ----------------------------
-# Main loop
+# Main loop (minimal, no strategy changes yet)
 # ----------------------------
 def main():
-    load_dotenv()
+    logging.info("=== BOT STARTED ===")
+    logging.info(f"ENABLE_TRADING={ENABLE_TRADING}")
+    logging.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
+    logging.info(f"POLL_SECONDS={POLL_SECONDS}")
+    logging.info(f"SERIES_PREFIX={SERIES_PREFIX}")
+    logging.info(f"MARKET_TICKER={MARKET_TICKER or 'None'}")
+    logging.info(f"API_BASE={API_BASE}")
+    logging.info(f"SUBACCOUNT={SUBACCOUNT}")
 
-    api_base = os.getenv("API_BASE", "https://api.elections.kalshi.com")
-    api_prefix = os.getenv("API_PREFIX", "/trade-api/v2")
+    kc = KalshiClient(API_BASE, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_B64, subaccount=SUBACCOUNT)
+    kc.discover_prefix()
 
-    key_id = os.getenv("KALSHI_KEY_ID", "").strip()
-    private_key_b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
+    # --- Debug ping: list markets (small)
+    code, data = kc.request("GET", f"{kc.prefix}/markets?limit=3")
+    logging.info(f"Markets probe HTTP={code} shape={shape_of(data)}")
+    if isinstance(data, dict):
+        logging.info(f"Markets probe keys={list(data.keys())}")
 
-    # Market selection inputs
-    market_ticker = os.getenv("MARKET_TICKER", "").strip()
-    market_url = os.getenv("MARKET_URL", "").strip()
-    series_ticker = os
+    # Keep running so Render doesn’t restart loop
+    while True:
+        logging.info("Heartbeat: bot alive (no strategy yet).")
+        time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    main()
