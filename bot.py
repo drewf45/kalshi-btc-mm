@@ -116,7 +116,7 @@ class KalshiClient:
         Signature format can vary by API.
         This matches the style we’ve been using in this project: sign "ts + method + path + body".
         """
-        payload = f"{ts}{method.upper()}{path}{body}".encode("utf-8")
+        payload = f"{method.upper()}{path}{body}{ts}".encode("utf-8")
         sig = self.private_key.sign(
             payload,
             padding.PKCS1v15(),
