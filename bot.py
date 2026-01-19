@@ -14,30 +14,17 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ----------------------------
 # Logging
 # ----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-bot")
 
 # ----------------------------
-# Safe helpers
+# Small utils
 # ----------------------------
-def is_dict(x: Any) -> bool:
-    return isinstance(x, dict)
-
-def is_list(x: Any) -> bool:
-    return isinstance(x, list)
-
-def jget(obj: Any, key: str, default=None):
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return default
+def is_dict(x: Any) -> bool: return isinstance(x, dict)
+def is_list(x: Any) -> bool: return isinstance(x, list)
 
 def first_item(x: Any) -> Any:
-    if isinstance(x, list) and x:
-        return x[0]
-    return None
+    return x[0] if is_list(x) and x else None
 
 def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
     for n in names:
@@ -48,27 +35,20 @@ def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
 
 def env_bool(*names: str, default: bool = False) -> bool:
     v = env_first(*names)
-    if v is None:
-        return default
+    if v is None: return default
     return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 def env_int(*names: str, default: int) -> int:
     v = env_first(*names)
-    if v is None:
-        return default
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return default
+    if v is None: return default
+    try: return int(str(v).strip())
+    except Exception: return default
 
 def env_float(*names: str, default: float) -> float:
     v = env_first(*names)
-    if v is None:
-        return default
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
+    if v is None: return default
+    try: return float(str(v).strip())
+    except Exception: return default
 
 def now_et() -> dt.datetime:
     return dt.datetime.now(dt.timezone(dt.timedelta(hours=-5)))
@@ -113,7 +93,7 @@ def send_email(subject: str, body: str):
         log.exception(f"Email send failed: {e}")
 
 # ----------------------------
-# Kalshi Client (RSA signing)
+# Kalshi client (RSA signing)
 # ----------------------------
 class KalshiClient:
     def __init__(self, api_base: str, key_id: str, private_key_pem_b64: str, subaccount: Optional[str] = None):
@@ -125,10 +105,7 @@ class KalshiClient:
         self.private_key = serialization.load_pem_private_key(pem_bytes, password=None)
 
         self.session = requests.Session()
-        self.session.headers.update({
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        })
+        self.session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
         self.api_prefix: Optional[str] = None
 
     def _sign(self, method: str, path_with_query: str, body: str) -> Dict[str, str]:
@@ -158,9 +135,7 @@ class KalshiClient:
         body = "" if json_body is None else json.dumps(json_body, separators=(",", ":"))
 
         if params:
-            parts = []
-            for k in sorted(params.keys()):
-                parts.append(f"{k}={params[k]}")
+            parts = [f"{k}={params[k]}" for k in sorted(params.keys())]
             qs = "&".join(parts)
             path_for_sig = f"{path}?{qs}"
         else:
@@ -205,7 +180,7 @@ class KalshiClient:
         return f"{self.api_prefix}{suffix}"
 
 # ----------------------------
-# JSON parsing
+# JSON helpers
 # ----------------------------
 def parse_json_safe(resp: requests.Response) -> Any:
     try:
@@ -213,98 +188,104 @@ def parse_json_safe(resp: requests.Response) -> Any:
     except Exception:
         return None
 
-def summarize_shape(x: Any) -> str:
-    """Loggable summary: keys only, types only (no values)."""
+def summarize_shape(x: Any, depth: int = 2) -> str:
+    """Keys/types only. No values. Safe for logs."""
+    if depth <= 0:
+        return type(x).__name__
     if is_dict(x):
         keys = sorted(list(x.keys()))
-        return f"dict keys={keys[:30]}{'...' if len(keys) > 30 else ''}"
+        preview = keys[:30]
+        return f"dict keys={preview}{'...' if len(keys) > 30 else ''}"
     if is_list(x):
-        return f"list len={len(x)} first={summarize_shape(first_item(x))}"
+        return f"list len={len(x)} first={summarize_shape(first_item(x), depth-1)}"
     if x is None:
         return "None"
-    return f"{type(x).__name__}"
+    return type(x).__name__
 
-def extract_cash_usd(any_json: Any) -> Optional[float]:
+def find_cash_recursively(node: Any) -> Optional[float]:
     """
-    Tries a LOT of known shapes for balance responses.
-    Returns USD float if found, else None.
+    Robust cash finder:
+    - looks for keys containing 'cash' at any level
+    - supports USD floats or cents ints
+    - supports dict/list nesting
     """
-    # If list, try first element
-    if is_list(any_json):
-        any_json = first_item(any_json)
-
-    if not is_dict(any_json):
+    if node is None:
         return None
 
-    # Common top-level keys
-    candidates = [
+    # If list, scan items
+    if is_list(node):
+        for item in node[:25]:
+            got = find_cash_recursively(item)
+            if got is not None:
+                return got
+        return None
+
+    if not is_dict(node):
+        return None
+
+    # 1) Direct key hits (USD-like)
+    usd_keys = [
         "cash", "available_cash", "cash_available", "availableCash",
-        "cash_usd", "available_cash_usd"
+        "cash_usd", "available_cash_usd", "cashAvailable",
     ]
-    for k in candidates:
-        v = any_json.get(k)
-        if v is not None:
+    for k in usd_keys:
+        if k in node and node[k] is not None:
             try:
-                return float(v)
+                # Sometimes cash is nested dict like {"value": 49.8}
+                if is_dict(node[k]):
+                    for kk in ("usd", "value", "amount", "dollars"):
+                        if kk in node[k] and node[k][kk] is not None:
+                            return float(node[k][kk])
+                    for kk in ("cents", "value_cents", "amount_cents"):
+                        if kk in node[k] and node[k][kk] is not None:
+                            return cents_to_usd(int(node[k][kk]))
+                return float(node[k])
             except Exception:
                 pass
 
-    # Cents variants
-    cents_candidates = ["cash_cents", "available_cash_cents", "cashAvailableCents", "availableCashCents"]
-    for k in cents_candidates:
-        v = any_json.get(k)
-        if v is not None:
+    # 2) Cents-like hits
+    cents_keys = [
+        "cash_cents", "available_cash_cents", "cashAvailableCents", "availableCashCents",
+        "available_cents", "cash_in_cents"
+    ]
+    for k in cents_keys:
+        if k in node and node[k] is not None:
             try:
-                return cents_to_usd(int(v))
+                return cents_to_usd(int(node[k]))
             except Exception:
                 pass
 
-    # Nested keys: balance / balances / portfolio_balance / data / portfolio
-    nested_roots = ["balance", "balances", "portfolio_balance", "portfolio", "data", "account"]
-    for root in nested_roots:
-        node = any_json.get(root)
-        if is_list(node):
-            node = first_item(node)
-        if not is_dict(node):
-            continue
-
-        # Repeat checks inside nested dict
-        for k in candidates:
-            v = node.get(k)
-            if v is not None:
-                try:
+    # 3) Heuristic: any key that contains 'cash' (safe, but controlled)
+    for k, v in node.items():
+        lk = str(k).lower()
+        if "cash" in lk and v is not None:
+            try:
+                if is_dict(v):
+                    for kk in ("usd", "value", "amount", "dollars"):
+                        if kk in v and v[kk] is not None:
+                            return float(v[kk])
+                    for kk in ("cents", "value_cents", "amount_cents"):
+                        if kk in v and v[kk] is not None:
+                            return cents_to_usd(int(v[kk]))
+                if isinstance(v, (int, float, str)):
+                    # If it looks like cents (large int), we won't guess—only parse if key says cents
                     return float(v)
-                except Exception:
-                    pass
-        for k in cents_candidates:
-            v = node.get(k)
-            if v is not None:
-                try:
-                    return cents_to_usd(int(v))
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
-        # Sometimes it's like: {"cash":{"value":4980,"currency":"USD"}} or {"cash":{"cents":4980}}
-        cash_obj = node.get("cash") or node.get("available_cash")
-        if is_dict(cash_obj):
-            for kk in ("usd", "value", "amount", "dollars"):
-                if cash_obj.get(kk) is not None:
-                    try:
-                        return float(cash_obj.get(kk))
-                    except Exception:
-                        pass
-            for kk in ("cents", "value_cents", "amount_cents"):
-                if cash_obj.get(kk) is not None:
-                    try:
-                        return cents_to_usd(int(cash_obj.get(kk)))
-                    except Exception:
-                        pass
+    # 4) Recurse into children (bounded)
+    for _, v in node.items():
+        got = find_cash_recursively(v)
+        if got is not None:
+            return got
 
     return None
 
 def auth_check(kc: KalshiClient) -> Optional[float]:
     """
-    Returns cash USD float if parseable, else None (NOT 0).
+    Returns cash USD float if parseable, else None.
+    Your current shape: dict keys=['balance','portfolio_value','updated_ts']
+    So we specifically recurse into 'balance' first.
     """
     paths = [
         kc.p("/portfolio/balance"),
@@ -313,6 +294,7 @@ def auth_check(kc: KalshiClient) -> Optional[float]:
         kc.p("/account/balance"),
         kc.p("/account"),
     ]
+
     last_err = None
     last_shape = None
 
@@ -321,11 +303,23 @@ def auth_check(kc: KalshiClient) -> Optional[float]:
         if r.status_code == 200:
             data = parse_json_safe(r)
             last_shape = summarize_shape(data)
-            cash = extract_cash_usd(data)
-            if cash is None:
-                log.info(f"Auth check OK (endpoint 200), but cash not parseable. shape={last_shape}")
-                return None
-            return cash
+
+            # Special: your observed top-level keys
+            if is_dict(data) and "balance" in data:
+                cash = find_cash_recursively(data["balance"])
+                if cash is not None:
+                    return cash
+
+            # Fallback: recurse whole response
+            cash = find_cash_recursively(data)
+            if cash is not None:
+                return cash
+
+            log.info(f"Auth check OK (endpoint 200), but cash not parseable. shape={last_shape}")
+            # Additional safe hint: show balance child shape if present
+            if is_dict(data) and "balance" in data:
+                log.info(f"Balance child shape: {summarize_shape(data['balance'])}")
+            return None
 
         last_err = f"HTTP {r.status_code} {r.text[:200]}"
 
@@ -334,29 +328,43 @@ def auth_check(kc: KalshiClient) -> Optional[float]:
 # ----------------------------
 # Markets / orderbook
 # ----------------------------
-def list_open_markets(kc: KalshiClient, series_prefix: str, limit: int = 100) -> List[Dict[str, Any]]:
-    r = kc.get(kc.p("/markets"), params={"limit": limit, "status": "open"})
+def list_markets(kc: KalshiClient, limit: int = 200) -> List[Dict[str, Any]]:
+    # Do NOT rely on status filter—Kalshi status strings vary.
+    r = kc.get(kc.p("/markets"), params={"limit": limit})
     if r.status_code != 200:
         raise RuntimeError(f"markets fetch failed: HTTP {r.status_code} {r.text[:200]}")
     data = parse_json_safe(r)
 
     markets = None
     if is_dict(data):
-        markets = data.get("markets") or data.get("data")
+        markets = data.get("markets") or data.get("data") or data.get("results")
     elif is_list(data):
         markets = data
 
     if not is_list(markets):
         return []
 
-    out: List[Dict[str, Any]] = []
+    out = []
     for m in markets:
-        if not is_dict(m):
-            continue
+        if is_dict(m):
+            out.append(m)
+    return out
+
+def list_openish_series_markets(kc: KalshiClient, series_prefix: str) -> List[Dict[str, Any]]:
+    allm = list_markets(kc, limit=200)
+
+    def status_ok(m: dict) -> bool:
+        s = (m.get("status") or m.get("market_status") or "").lower()
+        # include common values
+        return s in ("open", "active", "trading", "listed", "")  # "" if API omits it
+
+    out = []
+    for m in allm:
         t = m.get("ticker") or ""
-        if t.startswith(series_prefix):
+        if t.startswith(series_prefix) and status_ok(m):
             out.append(m)
 
+    # newest tickers tend to sort higher lexicographically for these series
     out.sort(key=lambda x: (x.get("ticker") or ""), reverse=True)
     return out
 
@@ -372,318 +380,20 @@ def fetch_orderbook(kc: KalshiClient, ticker: str, depth: int = 1) -> Any:
             return parse_json_safe(r)
     return None
 
-def _side_obj(maybe_side: Any) -> Optional[dict]:
-    if is_dict(maybe_side):
-        return maybe_side
-    if is_list(maybe_side):
-        x = first_item(maybe_side)
-        if is_dict(x):
-            return x
-    return None
+def parse_level(level: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Supports:
+    - {"price": 51, "quantity": 10}
+    - {"p": 51, "q": 10}
+    - [51, 10]
+    """
+    if is_dict(level):
+        px = level.get("price", level.get("p"))
+        qty = level.get("quantity", level.get("qty", level.get("q")))
+        try: px_i = int(px) if px is not None else None
+        except Exception: px_i = None
+        try: qty_i = int(qty) if qty is not None else None
+        except Exception: qty_i = None
+        return px_i, qty_i
 
-def parse_best_bid_ask(ob_json: Any, side: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
-    if ob_json is None:
-        return (None, None, None, None)
-
-    if is_list(ob_json):
-        ob_json = first_item(ob_json)
-
-    if not is_dict(ob_json):
-        return (None, None, None, None)
-
-    ob = ob_json.get("orderbook") if is_dict(ob_json) else None
-    if ob is None:
-        ob = ob_json
-
-    if not is_dict(ob):
-        return (None, None, None, None)
-
-    s_raw = ob.get(side) or ob.get(side.upper())
-    s = _side_obj(s_raw)
-    if s is None:
-        return (None, None, None, None)
-
-    bids = s.get("bids")
-    asks = s.get("asks")
-    if not is_list(bids):
-        bids = []
-    if not is_list(asks):
-        asks = []
-
-    def parse_level(level: Any) -> Tuple[Optional[int], Optional[int]]:
-        if not is_dict(level):
-            return (None, None)
-        px = level.get("price")
-        qty = level.get("quantity") or level.get("qty")
-        try:
-            px_i = int(px) if px is not None else None
-        except Exception:
-            px_i = None
-        try:
-            qty_i = int(qty) if qty is not None else None
-        except Exception:
-            qty_i = None
-        return (px_i, qty_i)
-
-    bid_px, bid_qty = (None, None)
-    ask_px, ask_qty = (None, None)
-    if bids:
-        bid_px, bid_qty = parse_level(bids[0])
-    if asks:
-        ask_px, ask_qty = parse_level(asks[0])
-
-    return (bid_px, bid_qty, ask_px, ask_qty)
-
-def market_has_quotes(kc: KalshiClient, ticker: str) -> bool:
-    ob = fetch_orderbook(kc, ticker, depth=1)
-    ybp, _, yap, _ = parse_best_bid_ask(ob, "yes")
-    nbp, _, nap, _ = parse_best_bid_ask(ob, "no")
-    return any(v is not None for v in [ybp, yap, nbp, nap])
-
-def pick_market_with_quotes(kc: KalshiClient, series_prefix: str) -> Optional[str]:
-    markets = list_open_markets(kc, series_prefix, limit=100)
-    for m in markets:
-        t = m.get("ticker")
-        if not t:
-            continue
-        if market_has_quotes(kc, t):
-            return t
-    return None
-
-# ----------------------------
-# Orders
-# ----------------------------
-def place_order(kc: KalshiClient, ticker: str, side: str, action: str, price: int, quantity: int) -> Optional[dict]:
-    payload = {
-        "ticker": ticker,
-        "side": side,
-        "action": action,
-        "type": "limit",
-        "price": int(price),
-        "quantity": int(quantity),
-    }
-    r = kc.post(kc.p("/orders"), payload)
-    if r.status_code not in (200, 201):
-        log.warning(f"Order failed {ticker} {side} {action} px={price} qty={quantity}: HTTP {r.status_code} {r.text[:200]}")
-        return None
-    return parse_json_safe(r)
-
-# ----------------------------
-# State
-# ----------------------------
-STATE_PATH = "state.json"
-
-def load_state() -> dict:
-    try:
-        with open(STATE_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_state(st: dict):
-    try:
-        with open(STATE_PATH, "w") as f:
-            json.dump(st, f, indent=2, sort_keys=True)
-    except Exception as e:
-        log.warning(f"Could not save state: {e}")
-
-# ----------------------------
-# Env config
-# ----------------------------
-API_BASE = env_first("KALSHI_API_BASE", "KALSHI_BASE_URL", default="https://api.elections.kalshi.com")
-
-KALSHI_KEY_ID = env_first("KALSHI_KEY_ID", "KALSHI_API_KEY_ID", "KALSHI_ACCESS_KEY", default=None)
-KALSHI_PRIVATE_KEY_B64 = env_first(
-    "KALSHI_PRIVATE_KEY_B64",
-    "KALSHI_PRIVATE_KEY_PEM_BASE64",
-    "KALSHI_PRIVATE_KEY_BASE64",
-    default=None
-)
-
-SUBACCOUNT = env_first("KALSHI_SUBACCOUNT", "SUBACCOUNT", default=None)
-
-SERIES_PREFIX = env_first("SERIES_PREFIX", default="KXBTC15M")
-POLL_SECONDS = env_int("POLL_SECONDS", default=60)
-
-ENABLE_TRADING = env_bool("ENABLE_TRADING", default=False)
-CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", "CONFIRM_LIVE", default=False)
-
-ORDER_USD_PER_SIDE = env_float("ORDER_USD_PER_SIDE", default=1.00)
-IMPROVE_TICKS = env_int("IMPROVE_TICKS", default=1)
-MAX_SPREAD_CENTS = env_int("MAX_SPREAD_CENTS", default=8)
-TAKE_PROFIT_CENTS = env_int("TAKE_PROFIT_CENTS", default=3)
-MAX_POSITION_MARKETS = env_int("MAX_POSITION_MARKETS", default=3)
-MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", default=10.0)
-
-EMAIL_ENABLED = env_bool("EMAIL_ENABLED", default=False)
-EMAIL_TO = env_first("EMAIL_TO", default=None)
-SMTP_HOST = env_first("SMTP_HOST", default=None)
-SMTP_PORT = env_int("SMTP_PORT", default=587)
-SMTP_USERNAME = env_first("SMTP_USERNAME", default=None)
-SMTP_PASSWORD = env_first("SMTP_PASSWORD", default=None)
-SMTP_TLS = env_bool("SMTP_TLS", default=True)
-
-# ----------------------------
-# Main logic
-# ----------------------------
-def sanity_check_env():
-    if not KALSHI_KEY_ID:
-        raise RuntimeError("Missing env var: KALSHI_KEY_ID (or KALSHI_API_KEY_ID)")
-    if not KALSHI_PRIVATE_KEY_B64:
-        raise RuntimeError("Missing env var: KALSHI_PRIVATE_KEY_B64 (or KALSHI_PRIVATE_KEY_PEM_BASE64)")
-
-def compute_qty(limit_price_cents: int) -> int:
-    if limit_price_cents <= 0:
-        return 0
-    budget_cents = usd_to_cents(ORDER_USD_PER_SIDE)
-    return int(max(0, budget_cents // limit_price_cents))
-
-def loop_once(kc: KalshiClient, state: dict):
-    today = now_et().date().isoformat()
-
-    # Daily reset
-    if state.get("day") != today:
-        cash = auth_check(kc)  # may be None
-        state.clear()
-        state.update({
-            "day": today,
-            "starting_cash": cash,  # may be None
-            "daily_loss_limit_usd": None if cash is None else round(cash * (MAX_DAILY_LOSS_PCT / 100.0), 2),
-            "markets_traded": [],
-            "last_email_day": None,
-        })
-        save_state(state)
-
-        # optional daily email
-        if EMAIL_ENABLED and state.get("last_email_day") != today:
-            send_email(
-                subject=f"Kalshi bot started {today}",
-                body=f"Bot started.\nSubaccount={SUBACCOUNT}\nSeries={SERIES_PREFIX}\nCash={'UNKNOWN' if cash is None else f'${cash:.2f}'}"
-            )
-            state["last_email_day"] = today
-            save_state(state)
-
-    # Re-check cash
-    cash_now = auth_check(kc)  # may be None
-    start_cash = state.get("starting_cash", None)
-
-    # IMPORTANT FIX:
-    # If cash is unknown, do NOT block trading with a fake "loss limit hit".
-    if cash_now is None or start_cash is None:
-        log.warning("Cash is UNKNOWN from balance endpoint; skipping daily-loss enforcement (still trading).")
-    else:
-        loss = max(0.0, float(start_cash) - float(cash_now))
-        limit = float(state.get("daily_loss_limit_usd") or 0.0)
-        if limit > 0 and loss >= limit:
-            log.warning(f"Daily loss limit hit. start=${start_cash:.2f} now=${cash_now:.2f} loss=${loss:.2f}. Not trading.")
-            return
-
-    ticker = pick_market_with_quotes(kc, SERIES_PREFIX)
-    if not ticker:
-        log.warning(f"No open markets with quotes found for {SERIES_PREFIX}.")
-        return
-
-    traded = state.get("markets_traded", [])
-    if not is_list(traded):
-        traded = []
-    if ticker in traded:
-        return
-
-    ob = fetch_orderbook(kc, ticker, depth=1)
-    ybp, ybq, yap, yaq = parse_best_bid_ask(ob, "yes")
-    nbp, nbq, nap, naq = parse_best_bid_ask(ob, "no")
-
-    log.info(
-        f"Heartbeat ET now={now_et().strftime('%Y-%m-%d %H:%M:%S')} | market={ticker} | "
-        f"yes {ybp}/{yap} no {nbp}/{nap}"
-    )
-
-    def ok_book(bid_px, ask_px):
-        if bid_px is None or ask_px is None:
-            return False
-        if ask_px <= bid_px:
-            return False
-        if (ask_px - bid_px) > MAX_SPREAD_CENTS:
-            return False
-        return True
-
-    yes_ok = ok_book(ybp, yap)
-    no_ok = ok_book(nbp, nap)
-    if not yes_ok and not no_ok:
-        log.info("Both books fail spread checks. Skipping.")
-        return
-
-    if ENABLE_TRADING and not CONFIRM_LIVE_TRADING:
-        log.warning("ENABLE_TRADING=True but CONFIRM_LIVE_TRADING=False. Not placing orders.")
-        return
-
-    if not ENABLE_TRADING:
-        log.info("ENABLE_TRADING=False. Marking market as handled (no trades).")
-        traded.append(ticker)
-        state["markets_traded"] = traded[:MAX_POSITION_MARKETS]
-        save_state(state)
-        return
-
-    def buy_then_tp(side: str, bid_px: int, ask_px: int) -> bool:
-        buy_px = min(bid_px + IMPROVE_TICKS, ask_px - 1)
-        qty = compute_qty(buy_px)
-        if qty <= 0:
-            log.info(f"{side.upper()} budget too small for price {buy_px}c. Skipping.")
-            return False
-
-        o = place_order(kc, ticker, side=side, action="buy", price=buy_px, quantity=qty)
-        if not o:
-            return False
-        log.info(f"Placed BUY {side.upper()} {ticker} px={buy_px} qty={qty}")
-
-        sell_px = min(99, buy_px + TAKE_PROFIT_CENTS)
-        so = place_order(kc, ticker, side=side, action="sell", price=sell_px, quantity=qty)
-        if so:
-            log.info(f"Placed TP SELL {side.upper()} {ticker} px={sell_px} qty={qty}")
-        else:
-            log.warning(f"TP SELL failed for {side.upper()} {ticker}")
-        return True
-
-    placed_any = False
-    if yes_ok and ybp is not None and yap is not None:
-        placed_any = buy_then_tp("yes", ybp, yap) or placed_any
-    if no_ok and nbp is not None and nap is not None:
-        placed_any = buy_then_tp("no", nbp, nap) or placed_any
-
-    if placed_any:
-        traded.append(ticker)
-        state["markets_traded"] = traded[:MAX_POSITION_MARKETS]
-        save_state(state)
-
-def main():
-    log.info("=== BOT STARTED ===")
-    log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
-    log.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
-    log.info(f"POLL_SECONDS={POLL_SECONDS}")
-    log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
-    log.info(f"API_BASE={API_BASE}")
-    if SUBACCOUNT:
-        log.info(f"SUBACCOUNT={SUBACCOUNT}")
-
-    sanity_check_env()
-
-    kc = KalshiClient(API_BASE, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_B64, subaccount=SUBACCOUNT)
-    kc.discover_prefix()
-
-    cash = auth_check(kc)
-    if cash is None:
-        log.info("Auth OK. cash=UNKNOWN (parser mismatch).")
-    else:
-        log.info(f"Auth OK. cash=${cash:.2f}")
-
-    state = load_state()
-
-    while True:
-        try:
-            loop_once(kc, state)
-        except Exception as e:
-            log.exception(f"Loop crashed: {repr(e)}")
-        time.sleep(POLL_SECONDS)
-
-if __name__ == "__main__":
-    main()
+    if is_list(level) and len(level)
