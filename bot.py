@@ -101,18 +101,14 @@ class KalshiClient:
         self.subaccount = (subaccount or "").strip() or None
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
-        self.api_prefix = None
+        self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
 
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
         path_no_query = path.split("?")[0]
         payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
-
         sig = self.private_key.sign(
             payload,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
+            padding.PKCS1v15(),
             hashes.SHA256(),
         )
         return base64.b64encode(sig).decode("utf-8")
@@ -121,6 +117,7 @@ class KalshiClient:
         ts = now_utc_ts()
         sig = self._sign(method, path, ts, body)
 
+        # ---- DEBUG SIGNING (safe) ----
         try:
             payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
@@ -131,6 +128,7 @@ class KalshiClient:
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
         except Exception as _e:
             log.info(f"[SIGNDBG] failed to compute debug hash: {_e}")
+        # -------------------------------
 
         h = {
             "KALSHI-ACCESS-KEY": self.key_id,
@@ -212,18 +210,38 @@ class KalshiClient:
             raise RuntimeError(f"Orderbook fetch failed HTTP={code} body={safe_json(body)}")
         return body
 
+    # --- MICRO CHANGE: pull resting orders so we don't stack duplicates ---
+    def get_resting_orders(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/portfolio/orders"
+        # Common filter patterns; if Kalshi ignores params, it still returns orders and we can filter client-side.
+        code, body, text = self.request("GET", path, params={"status": "resting", "limit": limit})
+        log.info(
+            f"[ORDERS] GET {path}?status=resting&limit={limit} -> HTTP={code} "
+            f"shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}"
+        )
+        if code != 200:
+            raise RuntimeError(f"Resting orders fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        orders = body.get("orders", []) if isinstance(body, dict) else []
+        return orders
+    # ---------------------------------------------------------------
+
     def place_order(self, payload: Dict[str, Any]) -> Tuple[int, Any]:
         if not self.api_prefix:
             self.discover_prefix()
         path = f"{self.api_prefix}/portfolio/orders"
         code, body, _ = self.request("POST", path, json_body=payload)
-        if code != 200:
+        if code not in (200, 201):
             log.error(f"HTTP POST {path} -> {code} {safe_json(body)}")
         else:
-            log.info(f"[ORDER] POST {path} -> 200 {safe_json(body)}")
+            log.info(f"[ORDER] POST {path} -> {code} {safe_json(body)}")
         return code, body
 
 
+# -----------------------------
+# Strategy helpers
+# -----------------------------
 def parse_best_ask(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
     ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
     yes = ob.get("yes") or []
@@ -266,6 +284,9 @@ def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return future[0][1]
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     log.info("=== BOT STARTED ===")
 
@@ -303,7 +324,6 @@ def main():
     private_key = load_rsa_private_key_from_env()
 
     client = KalshiClient(api_base=API_BASE, key_id=key_id, private_key=private_key, subaccount=SUBACCOUNT)
-
     client.discover_prefix()
 
     if not MARKET_TICKER:
@@ -327,36 +347,43 @@ def main():
 
     yes_best = best.get("yes_best_ask")
     no_best = best.get("no_best_ask")
-    if yes_best and no_best:
-        log.info(
-            f"[SANITY] yes_ask={yes_best['price_cents']}c no_ask={no_best['price_cents']}c "
-            f"sum={yes_best['price_cents'] + no_best['price_cents']}c"
-        )
 
-    side = FARM_SIDE
-    best_ask = (yes_best["price_cents"] if side == "YES" and yes_best else None) or (
-        no_best["price_cents"] if side == "NO" and no_best else None
-    )
-    if best_ask is None:
-        log.warning("[STRAT] No best ask found; cannot place order yet.")
-        return
-
+    side = FARM_SIDE  # "YES" or "NO"
     target_buy = BUY_PRICE_CENTS
-    log.info(f"[STRAT] side={side} best_ask={best_ask}c target_buy={target_buy}c")
-
     qty = BASE_QTY
+
     log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
 
     if not (ENABLE_TRADING and CONFIRM_LIVE_TRADING):
         log.warning("[ORDER] Trading disabled by env. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True to actually place.")
         return
 
+    # --- MICRO CHANGE: stop stacking duplicates ---
+    try:
+        existing = client.get_resting_orders(limit=200)
+        side_key = "yes" if side == "YES" else "no"
+        already = False
+        for o in existing:
+            if (o.get("ticker") == MARKET_TICKER and
+                o.get("status") == "resting" and
+                o.get("side") == side_key and
+                int(o.get(f"{side_key}_price") or -1) == int(target_buy) and
+                int(o.get("remaining_count") or 0) > 0):
+                already = True
+                break
+        if already:
+            log.warning("[GUARD] Existing resting order found (same ticker/side/price). Skipping new order.")
+            return
+    except Exception as e:
+        log.warning(f"[GUARD] Could not check existing orders (will proceed): {e}")
+    # ------------------------------------------------
+
     payload = {
         "ticker": MARKET_TICKER,
-        "side": side.lower(),  # <-- ONLY CHANGE: was "buy"
         "action": "buy",
         "type": "limit",
         "count": qty,
+        "side": "yes" if side == "YES" else "no",
         "yes_price": target_buy if side == "YES" else None,
         "no_price": target_buy if side == "NO" else None,
     }
