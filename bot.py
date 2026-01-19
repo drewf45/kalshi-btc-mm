@@ -402,6 +402,10 @@ def main():
     code, body = client.place_order(payload)
     log.info(f"[HEARTBEAT] alive order_post_http={code} resp={safe_json(body)}")
 
+    # ✅ ONLY CHANGE: keep process alive so Render does not restart and re-run the bot
+    while True:
+        time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
