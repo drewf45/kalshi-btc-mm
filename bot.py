@@ -104,8 +104,7 @@ class KalshiClient:
         self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
 
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
-        path_no_query = path.split("?")[0]
-        payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
+        payload = f"{ts}{method.upper()}{path}".encode("utf-8")
         sig = self.private_key.sign(
             payload,
             padding.PKCS1v15(),
@@ -121,8 +120,7 @@ class KalshiClient:
         try:
             payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
-            path_no_query = path.split("?")[0]
-            signing_payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
+            signing_payload = f"{ts}{method.upper()}{path}".encode("utf-8")
             payload_hash.update(signing_payload)
             digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
@@ -136,7 +134,7 @@ class KalshiClient:
             "KALSHI-ACCESS-TIMESTAMP": str(ts),
         }
         if self.subaccount:
-            h["KALSHI-SUBACCOUNT"] = self.subaccount
+            h["KALSHI-SUBACCOUNT"]sS = self.subaccount
         return h
 
     def request(
