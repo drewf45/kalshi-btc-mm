@@ -26,7 +26,8 @@ log = logging.getLogger("kalshi-bot")
 # Helpers
 # -----------------------------
 def now_utc_ts() -> int:
-    return int(time.time())
+    # CHANGED: Kalshi expects timestamp in milliseconds
+    return int(time.time() * 1000)
 
 
 def iso_utc() -> str:
@@ -113,10 +114,12 @@ class KalshiClient:
 
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
         """
-        Signature format can vary by API.
-        This matches the style we’ve been using in this project: sign "METHOD + path + body + ts".
+        CHANGED: Match the working bot:
+          signature message = f"{timestamp_ms}{METHOD}{path_without_query}"
+          (no body included)
         """
-        payload = f"{method.upper()}{path}{body}{ts}".encode("utf-8")
+        path_no_query = path.split("?", 1)[0]
+        payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
         sig = self.private_key.sign(
             payload,
             padding.PKCS1v15(),
@@ -130,9 +133,10 @@ class KalshiClient:
 
         # ---- DEBUG SIGNING (safe) ----
         try:
-            payload_preview = f"{method.upper()} {path} ts={ts} body_len={len(body.encode('utf-8')) if body else 0}"
+            path_no_query = path.split("?", 1)[0]
+            payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
-            signing_payload = f"{method.upper()}{path}{body}{ts}".encode("utf-8")
+            signing_payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
             payload_hash.update(signing_payload)
             digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
