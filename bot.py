@@ -5,6 +5,7 @@ import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
+from urllib.parse import urlencode  # ✅ ADDED
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -103,8 +104,10 @@ class KalshiClient:
         self.session.headers.update({"Content-Type": "application/json"})
         self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
 
+    # ✅ CHANGED: include full path (WITH query) + body in the signature payload
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
-        payload = f"{ts}{method.upper()}{path}".encode("utf-8")
+        body = body or ""
+        payload = f"{ts}{method.upper()}{path}{body}".encode("utf-8")
         sig = self.private_key.sign(
             payload,
             padding.PKCS1v15(),
@@ -120,7 +123,7 @@ class KalshiClient:
         try:
             payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
-            signing_payload = f"{ts}{method.upper()}{path}".encode("utf-8")
+            signing_payload = f"{ts}{method.upper()}{path}{body or ''}".encode("utf-8")
             payload_hash.update(signing_payload)
             digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
@@ -144,18 +147,28 @@ class KalshiClient:
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, Any, str]:
-        url = f"{self.api_base}{path}"
+        # ✅ CHANGED: build the exact path including query string before signing
+        path_q = path
+        if params:
+            qs = urlencode(params, doseq=True)
+            path_q = f"{path}?{qs}"
+
+        url = f"{self.api_base}{path_q}"
+
         body_str = ""
         data = None
         if json_body is not None:
             body_str = json.dumps(json_body, separators=(",", ":"))
             data = body_str
 
-        headers = self._headers(method, path, body_str)
+        # ✅ CHANGED: sign the path WITH query (path_q), and include body_str
+        headers = self._headers(method, path_q, body_str)
+
         try:
-            r = self.session.request(method=method, url=url, params=params, data=data, headers=headers, timeout=20)
+            # ✅ CHANGED: do NOT pass params separately (already baked into path_q)
+            r = self.session.request(method=method, url=url, params=None, data=data, headers=headers, timeout=20)
         except Exception as e:
-            log.error(f"HTTP {method} {path} failed: {e}")
+            log.error(f"HTTP {method} {path_q} failed: {e}")
             return 0, None, ""
 
         text = r.text or ""
@@ -213,7 +226,6 @@ class KalshiClient:
         if not self.api_prefix:
             self.discover_prefix()
         path = f"{self.api_prefix}/portfolio/orders"
-        # Common filter patterns; if Kalshi ignores params, it still returns orders and we can filter client-side.
         code, body, text = self.request("GET", path, params={"status": "resting", "limit": limit})
         log.info(
             f"[ORDERS] GET {path}?status=resting&limit={limit} -> HTTP={code} "
@@ -342,9 +354,6 @@ def main():
     ob = client.get_orderbook(MARKET_TICKER)
     best = parse_best_ask(ob)
     log.info(f"[BEST] {safe_json(best)}")
-
-    yes_best = best.get("yes_best_ask")
-    no_best = best.get("no_best_ask")
 
     side = FARM_SIDE  # "YES" or "NO"
     target_buy = BUY_PRICE_CENTS
