@@ -26,7 +26,7 @@ log = logging.getLogger("kalshi-bot")
 # Helpers
 # -----------------------------
 def now_utc_ts() -> int:
-    # Kalshi expects timestamp in milliseconds
+    # CHANGED: Kalshi signature uses timestamp in milliseconds
     return int(time.time() * 1000)
 
 
@@ -114,13 +114,12 @@ class KalshiClient:
 
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
         """
-        CHANGED (only change):
-          Keep the working prefix: f"{timestamp_ms}{METHOD}{path_without_query}"
-          BUT include body for POST/requests that send a JSON body:
-            f"{timestamp_ms}{METHOD}{path_without_query}{body}"
+        CHANGED: Match the working bot signature payload:
+          message = f"{timestamp_ms}{METHOD}{path_no_query}"
+        (No body in the signed message.)
         """
-        path_no_query = path.split("?", 1)[0]
-        payload = f"{ts}{method.upper()}{path_no_query}{body or ''}".encode("utf-8")
+        path_no_query = path.split("?")[0]
+        payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
         sig = self.private_key.sign(
             payload,
             padding.PKCS1v15(),
@@ -134,10 +133,10 @@ class KalshiClient:
 
         # ---- DEBUG SIGNING (safe) ----
         try:
-            path_no_query = path.split("?", 1)[0]
             payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
-            signing_payload = f"{ts}{method.upper()}{path_no_query}{body or ''}".encode("utf-8")
+            path_no_query = path.split("?")[0]
+            signing_payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
             payload_hash.update(signing_payload)
             digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
