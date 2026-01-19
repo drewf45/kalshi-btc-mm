@@ -114,12 +114,21 @@ class KalshiClient:
 
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
         """
-        CHANGED: Match the working bot signature payload:
-          message = f"{timestamp_ms}{METHOD}{path_no_query}"
-        (No body in the signed message.)
+        CHANGED: Sign GETs as:
+          f"{timestamp_ms}{METHOD}{path_no_query}"
+
+        Micro-change: For POST/PUT/PATCH include the exact body string:
+          f"{timestamp_ms}{METHOD}{path_no_query}{body}"
         """
         path_no_query = path.split("?")[0]
-        payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
+        m = method.upper()
+        body_part = body or ""
+
+        if m in ("POST", "PUT", "PATCH"):
+            payload = f"{ts}{m}{path_no_query}{body_part}".encode("utf-8")
+        else:
+            payload = f"{ts}{m}{path_no_query}".encode("utf-8")
+
         sig = self.private_key.sign(
             payload,
             padding.PKCS1v15(),
@@ -136,7 +145,13 @@ class KalshiClient:
             payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
             payload_hash = hashes.Hash(hashes.SHA256())
             path_no_query = path.split("?")[0]
-            signing_payload = f"{ts}{method.upper()}{path_no_query}".encode("utf-8")
+
+            m = method.upper()
+            if m in ("POST", "PUT", "PATCH"):
+                signing_payload = f"{ts}{m}{path_no_query}{body or ''}".encode("utf-8")
+            else:
+                signing_payload = f"{ts}{m}{path_no_query}".encode("utf-8")
+
             payload_hash.update(signing_payload)
             digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
             log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
