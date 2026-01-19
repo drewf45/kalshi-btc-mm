@@ -1,67 +1,36 @@
-# bot.py
 import os
-import time
 import json
+import time
 import base64
 import logging
-import datetime as dt
-from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
-from dotenv import load_dotenv
-
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 
-# ----------------------------
+# -----------------------------
 # Logging
-# ----------------------------
+# -----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger("kalshi-bot")
+log = logging.getLogger("kalshi-bot")
 
 
-def safe_preview(obj: Any, max_chars: int = 600) -> str:
-    try:
-        s = json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        s = str(obj)
-    if len(s) > max_chars:
-        return s[:max_chars] + "...(truncated)"
-    return s
+# -----------------------------
+# Helpers
+# -----------------------------
+def now_utc_ts() -> int:
+    return int(time.time())
 
 
-def utc_now_ts() -> str:
-    # Unix timestamp as string (seconds)
-    return str(int(time.time()))
-
-
-# ----------------------------
-# Config
-# ----------------------------
-@dataclass
-class BotConfig:
-    enable_trading: bool
-    confirm_live_trading: bool
-    poll_seconds: int
-    api_base: str
-    series_prefix: str
-    market_ticker: Optional[str]
-    subaccount: Optional[str]
-
-    farm_side: str
-    buy_price_cents: int
-    target_profit_cents: int
-
-    # sizing
-    base_size: int
-    scale_after_wins: int
-    mult: float
-    cap: int
+def iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -71,413 +40,351 @@ def env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def load_config() -> BotConfig:
-    return BotConfig(
-        enable_trading=env_bool("ENABLE_TRADING", False),
-        confirm_live_trading=env_bool("CONFIRM_LIVE_TRADING", False),
-        poll_seconds=int(os.getenv("POLL_SECONDS", "60")),
-        api_base=os.getenv("API_BASE", "https://api.elections.kalshi.com").rstrip("/"),
-        series_prefix=os.getenv("SERIES_PREFIX", "KXBTC15M"),
-        market_ticker=os.getenv("MARKET_TICKER") or None,
-        subaccount=os.getenv("SUBACCOUNT") or None,
-
-        farm_side=(os.getenv("FARM_SIDE", "YES").strip().upper()),
-        buy_price_cents=int(os.getenv("BUY_PRICE_CENTS", "1")),
-        target_profit_cents=int(os.getenv("TARGET_PROFIT_CENTS", "1")),
-
-        base_size=int(os.getenv("SIZE_BASE", "1")),
-        scale_after_wins=int(os.getenv("SIZE_SCALE_AFTER_WINS", "20")),
-        mult=float(os.getenv("SIZE_MULT", "1.25")),
-        cap=int(os.getenv("SIZE_CAP", "10")),
-    )
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or not str(v).strip():
+        return default
+    return int(v)
 
 
-# ----------------------------
-# Kalshi Client (RSA auth)
-# ----------------------------
-class KalshiClient:
-    def __init__(self, api_base: str, api_key: str, private_key_pem_or_b64: str, subaccount: Optional[str] = None):
-        self.api_base = api_base.rstrip("/")
-        self.api_key = api_key
-        self.subaccount = subaccount
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or not str(v).strip():
+        return default
+    return float(v)
 
-        # autodiscovered
-        self.api_prefix = None  # like "/trade-api/v2"
-        self.orders_path = None  # FULL path candidate that works
 
-        self._priv = self._load_private_key(private_key_pem_or_b64)
+def safe_json(obj: Any, max_len: int = 900) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        s = str(obj)
+    if len(s) > max_len:
+        return s[:max_len] + "...(truncated)"
+    return s
 
-    def _load_private_key(self, s: str):
-        """
-        Supports:
-          - raw PEM starting with -----BEGIN
-          - base64 string that decodes into PEM
-        """
-        raw = s.strip()
 
-        # If it's base64, decode; otherwise treat as PEM
-        pem_bytes: Optional[bytes] = None
-        if raw.startswith("-----BEGIN"):
-            pem_bytes = raw.encode("utf-8")
-        else:
-            # try base64 decode
-            try:
-                decoded = base64.b64decode(raw)
-                # if decoded looks like PEM
-                if b"-----BEGIN" in decoded:
-                    pem_bytes = decoded
-                else:
-                    # might be already PEM without header (unlikely for RSA)
-                    pem_bytes = decoded
-            except Exception as e:
-                raise RuntimeError(f"Could not parse private key. Provide PEM or base64(PEM). Error: {e}")
+def load_rsa_private_key_from_env() -> Any:
+    """
+    Supports:
+      - KALSHI_PRIVATE_KEY (raw PEM starting with -----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----)
+      - KALSHI_PRIVATE_KEY_B64 (base64 of the PEM)
+      - KALSHI_PRIVATE_KEY (sometimes user puts base64 here) -> we detect and decode if PEM header absent
+    """
+    pem_or_b64 = os.getenv("KALSHI_PRIVATE_KEY") or ""
+    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64") or ""
 
+    candidate = pem_or_b64.strip() if pem_or_b64.strip() else b64.strip()
+    if not candidate:
+        raise RuntimeError("Missing env var KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_B64")
+
+    if "BEGIN" not in candidate:
+        # assume base64
         try:
-            key = serialization.load_pem_private_key(pem_bytes, password=None)
-            logger.info("Loaded RSA private key (PEM).")
-            return key
+            candidate_bytes = base64.b64decode(candidate)
+            candidate = candidate_bytes.decode("utf-8")
         except Exception as e:
-            raise RuntimeError(f"Failed to load RSA private key. Error: {e}")
+            raise RuntimeError(f"Private key not PEM and base64 decode failed: {e}")
 
-    def _sign(self, message: bytes) -> str:
-        sig = self._priv.sign(
-            message,
+    try:
+        key = serialization.load_pem_private_key(
+            candidate.encode("utf-8"),
+            password=None,
+        )
+        log.info("Loaded RSA private key (PEM).")
+        return key
+    except Exception as e:
+        raise RuntimeError(f"Failed to load RSA private key: {e}")
+
+
+# -----------------------------
+# Kalshi Client (RSA signing)
+# -----------------------------
+class KalshiClient:
+    def __init__(self, api_base: str, key_id: str, private_key: Any, subaccount: Optional[str] = None):
+        self.api_base = api_base.rstrip("/")
+        self.key_id = key_id
+        self.private_key = private_key
+        self.subaccount = (subaccount or "").strip() or None
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+        self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
+
+    def _sign(self, method: str, path: str, ts: int, body: str) -> str:
+        """
+        Signature format can vary by API.
+        This matches the style we’ve been using in this project: sign "ts + method + path + body".
+        """
+        payload = f"{ts}{method.upper()}{path}{body}".encode("utf-8")
+        sig = self.private_key.sign(
+            payload,
             padding.PKCS1v15(),
             hashes.SHA256(),
         )
         return base64.b64encode(sig).decode("utf-8")
 
     def _headers(self, method: str, path: str, body: str) -> Dict[str, str]:
-        """
-        Kalshi-style header signing (RSA).
-        This matches the pattern that already got you 200s for markets/orderbook.
-        """
-        ts = utc_now_ts()
-        # Sign method + path + timestamp + body
-        payload = (method.upper() + path + ts + body).encode("utf-8")
-
+        ts = now_utc_ts()
+        sig = self._sign(method, path, ts, body)
         h = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "KALSHI-ACCESS-KEY": self.api_key,
-            "KALSHI-ACCESS-TIMESTAMP": ts,
-            "KALSHI-ACCESS-SIGNATURE": self._sign(payload),
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": str(ts),
         }
         if self.subaccount:
             h["KALSHI-SUBACCOUNT"] = self.subaccount
         return h
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        body_obj: Optional[dict] = None,
-        require_prefix: bool = True,
-        timeout: int = 15,
-    ) -> Tuple[int, Any]:
-        """
-        If require_prefix=True, path is relative to self.api_prefix, and we will call:
-          {api_base}{api_prefix}{path}
-        If require_prefix=False, path is treated as absolute (e.g. "/trade-api/v1/orders")
-          {api_base}{path}
-        """
-        if body_obj is None:
-            body = ""
-        else:
-            body = json.dumps(body_obj, separators=(",", ":"), ensure_ascii=False)
+    def request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any, str]:
+        url = f"{self.api_base}{path}"
+        body_str = ""
+        data = None
+        if json_body is not None:
+            body_str = json.dumps(json_body, separators=(",", ":"))
+            data = body_str
 
-        if require_prefix:
-            if not self.api_prefix:
-                raise RuntimeError("api_prefix not discovered yet")
-            full_path = self.api_prefix + path
-        else:
-            full_path = path
-
-        url = self.api_base + full_path
-        headers = self._headers(method, full_path, body)
-
+        headers = self._headers(method, path, body_str)
         try:
-            resp = requests.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                data=(body if body_obj is not None else None),
-                timeout=timeout,
-            )
-            code = resp.status_code
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"_raw": resp.text}
-            if code >= 400:
-                logger.error(f"HTTP {method} {full_path} -> {code} {safe_preview(data)}")
-            else:
-                logger.info(f"[OK] {method} {full_path} -> {code} shape={type(data).__name__} keys={list(data.keys()) if isinstance(data, dict) else 'n/a'}")
-            return code, data
+            r = self.session.request(method=method, url=url, params=params, data=data, headers=headers, timeout=20)
         except Exception as e:
-            logger.exception(f"HTTP {method} {full_path} failed: {e}")
-            return 0, {"error": str(e)}
+            log.error(f"HTTP {method} {path} failed: {e}")
+            return 0, None, ""
 
-    # ----------------------------
-    # Discovery
-    # ----------------------------
-    def discover_prefix(self) -> None:
+        text = r.text or ""
+        parsed: Any = None
+        if text:
+            try:
+                parsed = r.json()
+            except Exception:
+                parsed = {"_raw": text}
+        return r.status_code, parsed, text
+
+    def discover_prefix(self) -> str:
         """
-        Find which API prefix works for markets.
+        Probe known prefixes and pick the one that returns 200 for /markets.
         """
         candidates = ["/trade-api/v2", "/trade-api/v1"]
-
-        for p in candidates:
-            self.api_prefix = p
-            code, data = self.request("GET", "/markets?limit=1", require_prefix=True)
+        for pref in candidates:
+            code, body, _ = self.request("GET", f"{pref}/markets", params={"limit": 1})
             if code == 200:
-                logger.info(f"Discovered API prefix: {p} (probe {p}/markets?limit=1 -> 200)")
-                return
+                self.api_prefix = pref
+                log.info(f"Discovered API prefix: {pref} (probe {pref}/markets?limit=1 -> 200)")
+                # show shape
+                shape = type(body).__name__
+                keys = list(body.keys()) if isinstance(body, dict) else None
+                log.info(f"Markets probe HTTP=200 shape={shape} keys={keys}")
+                return pref
+        raise RuntimeError("Could not discover API prefix (markets probe not 200).")
 
-        raise RuntimeError("Could not discover API prefix. markets probes failed.")
+    def get_markets_by_series(self, series_ticker: str, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/markets"
+        code, body, text = self.request("GET", path, params={"series_ticker": series_ticker, "limit": limit})
+        log.info(f"[SERIES] GET {path}?series_ticker={series_ticker}&limit={limit} -> HTTP={code} shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}")
+        if code != 200:
+            raise RuntimeError(f"Series markets fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        markets = body.get("markets", []) if isinstance(body, dict) else []
+        log.info(f"[SERIES] Returned markets count={len(markets)}")
+        return markets
 
-    # ----------------------------
-    # ✅ THIS IS THE ONLY NEW LOGIC: discover_orders_path()
-    # ----------------------------
-    def discover_orders_path(self) -> None:
+    def get_orderbook(self, market_ticker: str) -> Dict[str, Any]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/markets/{market_ticker}/orderbook"
+        code, body, _ = self.request("GET", path)
+        log.info(f"[BOOK] GET {path} -> HTTP={code} shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}")
+        if code != 200:
+            raise RuntimeError(f"Orderbook fetch failed HTTP={code} body={safe_json(body)}")
+        return body
+
+    def place_order(self, payload: Dict[str, Any]) -> Tuple[int, Any]:
         """
-        Find the correct endpoint path for creating orders.
-        We'll probe common candidates and pick the first that does NOT return 404.
+        NOTE: In your logs, POST /trade-api/v2/orders is returning 404.
+        We are NOT fixing that in this step. This is just here so you can see the exact next failure.
         """
         if not self.api_prefix:
-            raise RuntimeError("api_prefix not discovered yet")
-
-        # FULL paths (some include prefix; some absolute fallbacks)
-        candidates = [
-            f"{self.api_prefix}/orders",
-            f"{self.api_prefix}/portfolio/orders",
-            f"{self.api_prefix}/exchange/orders",
-            f"{self.api_prefix}/trading/orders",
-            f"{self.api_prefix}/orders/place",
-            "/trade-api/v2/orders",
-            "/trade-api/v1/orders",
-        ]
-
-        # Minimal invalid body to avoid accidental order placement.
-        # If endpoint exists, it should respond 400/401/405 rather than 404.
-        probe_body = {"_probe": True}
-
-        for full in candidates:
-            if full.startswith(self.api_prefix):
-                rel = full.replace(self.api_prefix, "")
-                code, data = self.request("POST", rel, body_obj=probe_body, require_prefix=True)
-            else:
-                code, data = self.request("POST", full, body_obj=probe_body, require_prefix=False)
-
-            if code == 404:
-                logger.info(f"[ORDERS_PROBE] {full} -> 404 (not found)")
-                continue
-
-            logger.info(f"[ORDERS_PROBE] FOUND orders path: {full} -> HTTP={code} body={safe_preview(data, 400)}")
-            self.orders_path = full
-            return
-
-        raise RuntimeError("Could not discover a working orders path (all candidates 404).")
-
-    # ----------------------------
-    # Market helpers
-    # ----------------------------
-    def list_markets_for_series(self, series_ticker: str, limit: int = 200) -> List[dict]:
-        code, data = self.request("GET", f"/markets?series_ticker={series_ticker}&limit={limit}", require_prefix=True)
-        logger.info(f"[SERIES] GET {self.api_prefix}/markets?series_ticker={series_ticker}&limit={limit} -> HTTP={code} shape=dict keys={list(data.keys()) if isinstance(data, dict) else 'n/a'}")
+            self.discover_prefix()
+        path = f"{self.api_prefix}/orders"
+        code, body, raw = self.request("POST", path, json_body=payload)
         if code != 200:
-            return []
-        return data.get("markets", []) or []
-
-    def get_orderbook(self, market_ticker: str) -> Tuple[int, Any]:
-        return self.request("GET", f"/markets/{market_ticker}/orderbook", require_prefix=True)
-
-    def create_order(self, order: dict) -> Tuple[int, Any]:
-        """
-        Use discovered orders_path.
-        """
-        if not self.orders_path:
-            raise RuntimeError("orders_path not discovered yet")
-
-        if self.orders_path.startswith(self.api_prefix):
-            rel = self.orders_path.replace(self.api_prefix, "")
-            return self.request("POST", rel, body_obj=order, require_prefix=True)
+            log.error(f"HTTP POST {path} -> {code} {safe_json(body)}")
         else:
-            return self.request("POST", self.orders_path, body_obj=order, require_prefix=False)
+            log.info(f"[ORDER] POST {path} -> 200 {safe_json(body)}")
+        return code, body
 
 
-# ----------------------------
+# -----------------------------
 # Strategy helpers
-# ----------------------------
-def parse_iso_z(s: str) -> Optional[dt.datetime]:
-    # "2026-01-19T16:15:00Z"
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return dt.datetime.fromisoformat(s)
-    except Exception:
-        return None
+# -----------------------------
+def parse_best_ask(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
+    """
+    Kalshi orderbook response example:
+      {"orderbook": {"yes": [[price_cents, qty], ...], "no": [[price_cents, qty], ...], ...}}
+    Lowest price in 'yes' is yes_best_ask; lowest in 'no' is no_best_ask.
+    """
+    ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
+    yes = ob.get("yes") or []
+    no = ob.get("no") or []
+    yes_best = None
+    no_best = None
+
+    if isinstance(yes, list) and yes:
+        # best ask = min price
+        p, q = min(yes, key=lambda x: x[0])
+        yes_best = {"price_cents": int(p), "qty": int(q)}
+    if isinstance(no, list) and no:
+        p, q = min(no, key=lambda x: x[0])
+        no_best = {"price_cents": int(p), "qty": int(q)}
+
+    return {"yes_best_ask": yes_best, "no_best_ask": no_best}
 
 
-def pick_next_closing_market(markets: List[dict]) -> Optional[dict]:
-    now = dt.datetime.now(dt.timezone.utc)
-    best = None
-    best_close = None
+def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Pick the market whose close_time is the soonest in the future.
+    close_time comes like "2026-01-19T16:15:00Z"
+    """
+    now = datetime.now(timezone.utc)
 
+    def parse_z(ts: str) -> datetime:
+        # "2026-01-19T16:15:00Z"
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+    future = []
     for m in markets:
-        # prefer close_time; fallback expected_expiration_time/open_time
-        close_s = m.get("close_time") or m.get("expected_expiration_time") or m.get("expiration_time")
-        close_dt = parse_iso_z(close_s) if close_s else None
-        if not close_dt:
+        ct = m.get("close_time")
+        if not ct:
             continue
-        if close_dt <= now:
+        try:
+            dt = parse_z(ct)
+        except Exception:
             continue
-        if best is None or close_dt < best_close:
-            best = m
-            best_close = close_dt
+        if dt > now:
+            future.append((dt, m))
 
-    return best
-
-
-def best_ask_from_orderbook(ob: dict, side: str) -> Optional[dict]:
-    """
-    Kalshi orderbook payload includes:
-      orderbook: { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...] }
-    where lists are asks at various prices.
-    We take the lowest price available as "best ask".
-    """
-    try:
-        book = ob["orderbook"]
-        levels = book["yes"] if side.upper() == "YES" else book["no"]
-        if not levels:
-            return None
-        # levels are [price_cents, qty]
-        levels_sorted = sorted(levels, key=lambda x: int(x[0]))
-        p, q = int(levels_sorted[0][0]), int(levels_sorted[0][1])
-        return {"price_cents": p, "qty": q}
-    except Exception:
+    if not future:
         return None
 
-
-def build_buy_order(market_ticker: str, side: str, price_cents: int, count: int) -> dict:
-    """
-    NOTE: exact Kalshi order schema can differ by account/version.
-    This matches the typical "orders" shape for trade-api.
-    """
-    # Side YES/NO, action BUY, type LIMIT
-    return {
-        "market_ticker": market_ticker,
-        "action": "buy",
-        "side": side.lower(),   # "yes" / "no"
-        "type": "limit",
-        "count": int(count),
-        "price": int(price_cents),  # cents
-        "client_order_id": f"farm-{int(time.time())}-{market_ticker}",
-    }
+    future.sort(key=lambda x: x[0])
+    return future[0][1]
 
 
-# ----------------------------
+# -----------------------------
 # Main
-# ----------------------------
+# -----------------------------
 def main():
-    load_dotenv()
+    log.info("=== BOT STARTED ===")
 
-    cfg = load_config()
+    # Core env
+    ENABLE_TRADING = env_bool("ENABLE_TRADING", False)
+    CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", False)
+    POLL_SECONDS = env_int("POLL_SECONDS", 60)
+    SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
+    MARKET_TICKER = os.getenv("MARKET_TICKER")  # optional override
+    API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
+    SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT")
 
-    logger.info("=== BOT STARTED ===")
-    logger.info(f"ENABLE_TRADING={cfg.enable_trading}")
-    logger.info(f"CONFIRM_LIVE_TRADING={cfg.confirm_live_trading}")
-    logger.info(f"POLL_SECONDS={cfg.poll_seconds}")
-    logger.info(f"SERIES_PREFIX={cfg.series_prefix}")
-    logger.info(f"MARKET_TICKER={cfg.market_ticker}")
-    logger.info(f"API_BASE={cfg.api_base}")
-    logger.info(f"SUBACCOUNT={cfg.subaccount}")
-    logger.info(f"FARM_SIDE={cfg.farm_side} BUY_PRICE_CENTS={cfg.buy_price_cents} TARGET_PROFIT_CENTS={cfg.target_profit_cents}")
-    logger.info(f"SIZING base={cfg.base_size} scale_after_wins={cfg.scale_after_wins} mult={cfg.mult} cap={cfg.cap}")
+    # Farm env (already in your logs)
+    FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()  # YES or NO
+    BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
+    TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
-    api_key = os.getenv("KALSHI_API_KEY") or os.getenv("KALSHI_ACCESS_KEY") or ""
-    priv_b64 = os.getenv("KALSHI_PRIVATE_KEY_B64") or ""
+    # Sizing
+    BASE_QTY = env_int("BASE_QTY", 1)
+    SCALE_AFTER_WINS = env_int("SCALE_AFTER_WINS", 20)
+    SIZE_MULT = env_float("SIZE_MULT", 1.25)
+    SIZE_CAP = env_int("SIZE_CAP", 10)
 
-    if not api_key:
-        raise RuntimeError("Missing env var KALSHI_API_KEY")
-    if not priv_b64:
-        raise RuntimeError("Missing env var KALSHI_PRIVATE_KEY_B64 (base64 of PEM is OK)")
+    log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
+    log.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
+    log.info(f"POLL_SECONDS={POLL_SECONDS}")
+    log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
+    log.info(f"MARKET_TICKER={MARKET_TICKER}")
+    log.info(f"API_BASE={API_BASE}")
+    log.info(f"SUBACCOUNT={SUBACCOUNT if SUBACCOUNT else None}")
+    log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
+    log.info(f"SIZING base={BASE_QTY} scale_after_wins={SCALE_AFTER_WINS} mult={SIZE_MULT} cap={SIZE_CAP}")
 
-    kc = KalshiClient(cfg.api_base, api_key, priv_b64, subaccount=cfg.subaccount)
+    # --------- ONLY CHANGE IN THIS STEP ----------
+    # We DO NOT require KALSHI_API_KEY because RSA auth uses KEY_ID + PRIVATE_KEY.
+    # Validate only what is actually needed:
+    if not os.getenv("KALSHI_KEY_ID"):
+        raise RuntimeError("Missing env var KALSHI_KEY_ID")
+    # private key validated by loader below
+    # --------------------------------------------
 
-    # 1) discover working API prefix (markets)
-    kc.discover_prefix()
+    key_id = os.getenv("KALSHI_KEY_ID").strip()
+    private_key = load_rsa_private_key_from_env()
 
-    # ✅ 2) NEW: discover working ORDERS endpoint
-    kc.discover_orders_path()
+    client = KalshiClient(api_base=API_BASE, key_id=key_id, private_key=private_key, subaccount=SUBACCOUNT)
 
-    # 3) show we can fetch series and select next market
-    markets = kc.list_markets_for_series(cfg.series_prefix, limit=200)
-    logger.info(f"[SERIES] Returned markets count={len(markets)}")
+    # Prefix discovery
+    client.discover_prefix()
 
-    nxt = pick_next_closing_market(markets)
-    if not nxt:
-        logger.error("No future markets found for series. Exiting.")
+    # Market selection
+    if not MARKET_TICKER:
+        markets = client.get_markets_by_series(SERIES_PREFIX, limit=200)
+        chosen = select_next_closing(markets)
+        if not chosen:
+            log.warning(f"No markets found matching prefix {SERIES_PREFIX} with a future close_time.")
+            raise RuntimeError("Could not resolve MARKET_TICKER. Exiting.")
+        MARKET_TICKER = chosen.get("ticker") or chosen.get("market_ticker") or chosen.get("id")  # be defensive
+
+        close_time = chosen.get("close_time")
+        seconds_to_close = None
+        if close_time:
+            dt = datetime.strptime(close_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            seconds_to_close = int((dt - datetime.now(timezone.utc)).total_seconds())
+        log.info(
+            f"[SELECT] Next closing market: {MARKET_TICKER} close={close_time} seconds_to_close={seconds_to_close}"
+        )
+
+    # Fetch orderbook
+    ob = client.get_orderbook(MARKET_TICKER)
+    best = parse_best_ask(ob)
+    log.info(f"[BEST] {safe_json(best)}")
+
+    yes_best = best.get("yes_best_ask")
+    no_best = best.get("no_best_ask")
+    if yes_best and no_best:
+        log.info(f"[SANITY] yes_ask={yes_best['price_cents']}c no_ask={no_best['price_cents']}c sum={yes_best['price_cents'] + no_best['price_cents']}c")
+
+    # Decide buy
+    side = FARM_SIDE  # "YES" or "NO"
+    best_ask = (yes_best["price_cents"] if side == "YES" and yes_best else None) or (no_best["price_cents"] if side == "NO" and no_best else None)
+    if best_ask is None:
+        log.warning("[STRAT] No best ask found; cannot place order yet.")
+        log.info("Heartbeat: orderbook fetch attempt complete. Next step will be to identify best bid/ask and compute tiny-order plan.")
         return
 
-    ticker = nxt.get("ticker") or nxt.get("market_ticker") or nxt.get("event_ticker")
-    close_s = nxt.get("close_time") or nxt.get("expected_expiration_time")
-    close_dt = parse_iso_z(close_s) if close_s else None
-    now = dt.datetime.now(dt.timezone.utc)
-    seconds_to_close = int((close_dt - now).total_seconds()) if close_dt else -1
+    target_buy = BUY_PRICE_CENTS  # you are forcing micro buy at 1c
+    log.info(f"[STRAT] side={side} best_ask={best_ask}c target_buy={target_buy}c")
 
-    logger.info(
-        f"[SELECT] Next closing market: {ticker} "
-        f"close={close_s} seconds_to_close={seconds_to_close}"
-    )
+    qty = BASE_QTY
+    log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
 
-    # 4) fetch orderbook
-    code, ob = kc.get_orderbook(ticker)
-    logger.info(f"[BOOK] Used endpoint: {kc.api_prefix}/markets/{ticker}/orderbook HTTP={code}")
-    if code != 200:
-        logger.error("Orderbook fetch failed. Exiting.")
+    if not (ENABLE_TRADING and CONFIRM_LIVE_TRADING):
+        log.warning("[ORDER] Trading disabled by env. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True to actually place.")
         return
 
-    logger.info(f"[BOOK] Payload preview: {safe_preview(ob, 700)}")
+    # This is where your next bug shows up: POST path returns 404.
+    # We are NOT fixing it in this step. We want the logs to confirm it consistently.
+    payload = {
+        "ticker": MARKET_TICKER,
+        "side": "buy",
+        "action": "buy",
+        "type": "limit",
+        "count": qty,
+        "yes_price": target_buy if side == "YES" else None,
+        "no_price": target_buy if side == "NO" else None,
+    }
+    # remove None keys (clean payload)
+    payload = {k: v for k, v in payload.items() if v is not None}
 
-    yes_best = best_ask_from_orderbook(ob, "YES")
-    no_best = best_ask_from_orderbook(ob, "NO")
-
-    logger.info(f"[BEST] {safe_preview({'yes_best_ask': yes_best, 'no_best_ask': no_best}, 400)}")
-
-    if not yes_best or not no_best:
-        logger.error("Could not parse best asks. Exiting.")
-        return
-
-    logger.info(f"[SANITY] yes_ask={yes_best['price_cents']}c no_ask={no_best['price_cents']}c sum={yes_best['price_cents'] + no_best['price_cents']}c")
-
-    # 5) Decide whether to place a tiny buy (your current test behavior)
-    side = cfg.farm_side.upper()
-    best_ask = yes_best["price_cents"] if side == "YES" else no_best["price_cents"]
-    target_buy = min(best_ask, cfg.buy_price_cents)
-
-    logger.info(f"[STRAT] side={side} best_ask={best_ask}c target_buy={target_buy}c")
-
-    # If you want the bot to ONLY buy when it can get at/below target, keep this guard.
-    if best_ask > target_buy:
-        logger.info(f"[STRAT] Best ask {best_ask}c is above target {target_buy}c. No trade.")
-        return
-
-    order = build_buy_order(ticker, side, target_buy, cfg.base_size)
-    logger.info(f"[ORDER] BUY {side} {cfg.base_size}@{target_buy}c on {ticker}")
-
-    if not (cfg.enable_trading and cfg.confirm_live_trading):
-        logger.warning("[ORDER] Trading disabled by flags. Set ENABLE_TRADING=true and CONFIRM_LIVE_TRADING=true to place live orders.")
-        return
-
-    # 6) Place order (THIS is where you were getting 404 before)
-    code, data = kc.create_order(order)
-    if code in (200, 201):
-        logger.info(f"[ORDER] success HTTP={code} body={safe_preview(data, 800)}")
-    else:
-        logger.error(f"[ORDER] buy failed HTTP={code} body={safe_preview(data, 800)}")
-
-    logger.info("[HEARTBEAT] done")
+    code, body = client.place_order(payload)
+    log.info(f"[HEARTBEAT] alive order_post_http={code} resp={safe_json(body)}")
 
 
 if __name__ == "__main__":
