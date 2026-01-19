@@ -4,7 +4,7 @@ import json
 import base64
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -36,11 +36,9 @@ def shape_of(x):
     return type(x).__name__
 
 def parse_iso_ts(ts: str) -> float | None:
-    """Return epoch seconds from an ISO timestamp or None."""
     if not ts or not isinstance(ts, str):
         return None
     try:
-        # Handles "2026-01-19T14:59:17Z" etc
         if ts.endswith("Z"):
             ts = ts[:-1] + "+00:00"
         return datetime.fromisoformat(ts).timestamp()
@@ -144,76 +142,42 @@ class KalshiClient:
                 return p
         raise RuntimeError("Could not discover API prefix (all probes failed).")
 
-    # ---- Change #2: resolve ticker automatically ----
-    def resolve_market_ticker(self, series_prefix: str) -> str | None:
+    # ---- Change #3: probe for the correct "series markets list" endpoint ----
+    def probe_series_market_listing(self, series_prefix: str):
         """
-        Find an active market ticker for a series prefix.
-        Strategy:
-        - fetch first N markets that match prefix
-        - choose the one with the soonest close_time in the future
+        Try likely endpoints that could list markets for a given series/event.
+        We log which endpoint (if any) returns tickers starting with series_prefix-.
         """
-        # NOTE: we are not assuming the filter param name; we’ll just page and filter client-side.
-        # Keep it simple and safe.
-        cursor = None
-        candidates = []
+        candidates = [
+            f"{self.prefix}/markets?series_ticker={series_prefix}&limit=200",
+            f"{self.prefix}/markets?event_ticker={series_prefix}&limit=200",
+            f"{self.prefix}/series/{series_prefix}/markets?limit=200",
+            f"{self.prefix}/events/{series_prefix}/markets?limit=200",
+            f"{self.prefix}/markets?search={series_prefix}&limit=200",
+        ]
 
-        for _ in range(5):  # up to 5 pages
-            path = f"{self.prefix}/markets?limit=200"
-            if cursor:
-                path += f"&cursor={cursor}"
-
+        for path in candidates:
             code, data = self.request("GET", path)
-            if code != 200 or not isinstance(data, dict) or "markets" not in data:
-                logging.error(f"Could not list markets to resolve ticker. HTTP={code} shape={shape_of(data)}")
-                return None
+            markets = []
+            if isinstance(data, dict):
+                markets = data.get("markets") or data.get("data") or []
+            logging.info(f"[PROBE] GET {path} -> HTTP={code} shape={shape_of(data)}")
 
-            markets = data.get("markets", [])
-            for m in markets:
-                tkr = m.get("ticker") or m.get("market_ticker")
-                if not tkr or not isinstance(tkr, str):
-                    continue
-                if not tkr.startswith(series_prefix + "-"):
-                    continue
+            found = []
+            if isinstance(markets, list):
+                for m in markets:
+                    tkr = None
+                    if isinstance(m, dict):
+                        tkr = m.get("ticker") or m.get("market_ticker")
+                    if isinstance(tkr, str) and tkr.startswith(series_prefix + "-"):
+                        found.append(tkr)
 
-                status = (m.get("status") or m.get("market_status") or "").lower()
-                close_ts = m.get("close_time") or m.get("close_ts") or m.get("closeTime")
-                close_epoch = parse_iso_ts(close_ts) if isinstance(close_ts, str) else None
+            if found:
+                logging.info(f"[PROBE] SUCCESS endpoint returned {len(found)} matching tickers. Example={found[0]}")
+                return path, found
 
-                # If no close time parseable, still keep (low priority)
-                candidates.append((close_epoch, status, tkr, m))
-
-            cursor = data.get("cursor")
-            if not cursor:
-                break
-
-        if not candidates:
-            logging.warning(f"No markets found matching prefix {series_prefix}.")
-            return None
-
-        now_epoch = time.time()
-
-        # Prefer: close time in the future and status indicates open/trading
-        def score(item):
-            close_epoch, status, tkr, _ = item
-            # open-ish status gets preference
-            open_bonus = 0
-            if "open" in status or "trading" in status or status == "":
-                open_bonus = 1
-            # future close gets preference
-            future_bonus = 0
-            if close_epoch and close_epoch > now_epoch:
-                future_bonus = 1
-            # sort: future first, open first, soonest close time
-            close_sort = close_epoch if close_epoch is not None else (now_epoch + 10**12)
-            return (-future_bonus, -open_bonus, close_sort)
-
-        candidates.sort(key=score)
-        best = candidates[0]
-        close_epoch, status, tkr, m = best
-
-        logging.info(f"Resolved market ticker: {tkr}")
-        logging.info(f"Resolved market status={status or 'UNKNOWN'} close_time={m.get('close_time') or m.get('close_ts')}")
-        return tkr
+        logging.warning("[PROBE] No candidate series endpoints returned matching tickers.")
+        return None, []
 
 def main():
     logging.info("=== BOT STARTED ===")
@@ -228,20 +192,13 @@ def main():
     kc = KalshiClient(API_BASE, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_B64, subaccount=SUBACCOUNT)
     kc.discover_prefix()
 
-    # If ticker not set, auto-resolve it
-    ticker = MARKET_TICKER or kc.resolve_market_ticker(SERIES_PREFIX)
-    if not ticker:
-        logging.error("Could not resolve MARKET_TICKER. Exiting.")
+    # Change #3: probe correct listing endpoint
+    path, found = kc.probe_series_market_listing(SERIES_PREFIX)
+    if not found:
+        logging.error("Could not find BTC15M markets via probe. Exiting.")
         return
 
-    # Debug: fetch the resolved market object (this is the next failure point we want to verify)
-    code, data = kc.request("GET", f"{kc.prefix}/markets/{ticker}")
-    logging.info(f"Market fetch HTTP={code} shape={shape_of(data)}")
-    if code != 200:
-        logging.error("Market fetch failed. Exiting (we will fix this in the next change).")
-        return
-
-    logging.info("Heartbeat: ticker resolved and market fetch OK (no strategy yet).")
+    logging.info("Heartbeat: probe found BTC markets. Next step will be to select the next closing one.")
     while True:
         time.sleep(POLL_SECONDS)
 
