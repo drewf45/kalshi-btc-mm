@@ -134,7 +134,7 @@ class KalshiClient:
             "KALSHI-ACCESS-TIMESTAMP": str(ts),
         }
         if self.subaccount:
-            h["KALSHI-SUBACCOUNT"]sS = self.subaccount
+            h["KALSHI-SUBACCOUNT"]s = self.subaccount
         return h
 
     def request(
