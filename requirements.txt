@@ -1,8 +1,5 @@
-requests
-websockets
-python-dotenv
-requests
-cryptography
+# requirements.txt
 requests==2.32.5
+websockets==16.0
 python-dotenv==1.2.1
 cryptography==46.0.3
