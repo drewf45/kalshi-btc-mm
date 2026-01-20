@@ -2,6 +2,7 @@ import os
 import json
 import time
 import base64
+import binascii
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
@@ -9,6 +10,7 @@ from urllib.parse import urlencode
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
 
@@ -56,6 +58,11 @@ def load_private_key() -> Any:
     Supports:
       - KALSHI_PRIVATE_KEY_B64: base64-encoded PEM
       - KALSHI_PRIVATE_KEY_PATH: path to PEM file
+
+    Micro-fix:
+      - strict base64 validation
+      - confirm decoded content looks like PEM
+      - log safe pubkey fingerprint so we can confirm the key in Render matches the KEY_ID
     """
     b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
     path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
@@ -63,16 +70,43 @@ def load_private_key() -> Any:
     pem_bytes: Optional[bytes] = None
 
     if b64:
-        pem_bytes = base64.b64decode(b64)
+        try:
+            pem_bytes = base64.b64decode(b64, validate=True)
+        except binascii.Error as e:
+            raise RuntimeError(f"KALSHI_PRIVATE_KEY_B64 is not valid base64: {e}")
+
+        if b"BEGIN" not in pem_bytes:
+            raise RuntimeError(
+                "Decoded KALSHI_PRIVATE_KEY_B64 does not look like a PEM (missing 'BEGIN'). "
+                "Make sure you base64-encoded the full PEM file contents."
+            )
+
         log.info("Loaded RSA private key from KALSHI_PRIVATE_KEY_B64.")
+        log.info(f"[BOOT] KALSHI_PRIVATE_KEY_B64 len={len(b64)} decoded_pem_bytes={len(pem_bytes)}")
+
     elif path:
         with open(path, "rb") as f:
             pem_bytes = f.read()
         log.info("Loaded RSA private key from KALSHI_PRIVATE_KEY_PATH.")
+        log.info(f"[BOOT] KALSHI_PRIVATE_KEY_PATH={path} pem_bytes={len(pem_bytes)}")
+
     else:
         raise RuntimeError("Missing PRIVATE_KEY (set KALSHI_PRIVATE_KEY_B64 or KALSHI_PRIVATE_KEY_PATH).")
 
-    return serialization.load_pem_private_key(pem_bytes, password=None)
+    priv = serialization.load_pem_private_key(pem_bytes, password=None)
+
+    # Safe fingerprint (public key only) to verify we are signing with the expected key
+    try:
+        pub = priv.public_key()
+        pub_der = pub.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        h = hashes.Hash(hashes.SHA256())
+        h.update(pub_der)
+        fp_hex = h.finalize().hex()[:16]
+        log.info(f"[BOOT] pubkey_fp={fp_hex}")
+    except Exception as e:
+        log.warning(f"[BOOT] Could not compute pubkey fingerprint: {e}")
+
+    return priv
 
 
 PRIVATE_KEY = load_private_key()
@@ -114,14 +148,21 @@ def sign_request(method: str, path: str, ts_ms: int, body: bytes) -> Dict[str, s
     # Debug line consistent with your logs
     try:
         sha_b64 = base64.b64encode(payload_hash).decode("utf-8")
-        log.info(f"[SIGNDBG] {method.upper()} {path} ts={ts_ms}ms body_len={len(body)} signing_payload_sha256_b64={sha_b64}")
+        log.info(
+            f"[SIGNDBG] {method.upper()} {path} ts={ts_ms}ms body_len={len(body)} signing_payload_sha256_b64={sha_b64}"
+        )
     except Exception:
         pass
 
     return headers
 
 
-def kalshi_request(method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+def kalshi_request(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, Any]:
     if params:
         qs = urlencode(params)
         full_path = f"{path}?{qs}"
@@ -137,7 +178,13 @@ def kalshi_request(method: str, path: str, params: Optional[Dict[str, Any]] = No
 
     url = API_BASE.rstrip("/") + full_path
 
-    resp = requests.request(method.upper(), url, headers=headers, data=body_bytes if body_bytes else None, timeout=15)
+    resp = requests.request(
+        method.upper(),
+        url,
+        headers=headers,
+        data=body_bytes if body_bytes else None,
+        timeout=15,
+    )
     text = resp.text.strip()
     try:
         data = resp.json() if text else {}
@@ -176,7 +223,9 @@ def get_series_markets(series_ticker: str, limit: int = 200) -> List[Dict[str, A
     code, data = kalshi_request("GET", f"{prefix}/markets", params={"series_ticker": series_ticker, "limit": limit})
     shape = "dict" if isinstance(data, dict) else type(data).__name__
     keys = list(data.keys()) if isinstance(data, dict) else []
-    log.info(f"[SERIES] GET {prefix}/markets?series_ticker={series_ticker}&limit={limit} -> HTTP={code} shape={shape} keys={keys}")
+    log.info(
+        f"[SERIES] GET {prefix}/markets?series_ticker={series_ticker}&limit={limit} -> HTTP={code} shape={shape} keys={keys}"
+    )
     if code != 200:
         raise RuntimeError(f"Series markets fetch failed: HTTP={code} body={data}")
     markets = data.get("markets", []) if isinstance(data, dict) else []
@@ -214,7 +263,9 @@ def select_next_closing_market(markets: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise RuntimeError("No future-closing market found in series list.")
 
     seconds_to_close = int((best_dt - now).total_seconds())
-    log.info(f"[SELECT] Next closing market: {best.get('ticker')} close={best_dt.isoformat().replace('+00:00','Z')} seconds_to_close={seconds_to_close}")
+    log.info(
+        f"[SELECT] Next closing market: {best.get('ticker')} close={best_dt.isoformat().replace('+00:00','Z')} seconds_to_close={seconds_to_close}"
+    )
     return best
 
 
@@ -308,16 +359,25 @@ def cancel_order(order_id: str) -> bool:
         log.info(f"[CANCEL] order_id={order_id} -> HTTP={code2} (fallback)")
         return True
 
-    log.warning(f"[CANCEL] Failed order_id={order_id} HTTP={code} body={data} fallback_http={code2} fallback_body={data2}")
+    log.warning(
+        f"[CANCEL] Failed order_id={order_id} HTTP={code} body={data} fallback_http={code2} fallback_body={data2}"
+    )
     return False
 
 
-def place_order(ticker: str, action: str, side: str, price_cents: int, count: int, subaccount: Optional[str] = None) -> Tuple[int, Any]:
+def place_order(
+    ticker: str,
+    action: str,
+    side: str,
+    price_cents: int,
+    count: int,
+    subaccount: Optional[str] = None,
+) -> Tuple[int, Any]:
     prefix = discover_api_prefix()
     payload: Dict[str, Any] = {
         "ticker": ticker,
-        "action": action,   # "buy" or "sell"
-        "side": side,       # "yes" or "no"
+        "action": action,  # "buy" or "sell"
+        "side": side,  # "yes" or "no"
         "type": "limit",
         "count": int(count),
     }
@@ -390,8 +450,8 @@ def main() -> None:
 
     # Safety controls (THIS STEP)
     ENTRY_TTL_SECONDS = env_int("ENTRY_TTL_SECONDS", 20)  # cancel entry if not filled quickly
-    EXIT_TTL_SECONDS = env_int("EXIT_TTL_SECONDS", 60)    # keep simple exit; cancel if stale
-    STALE_REPRICE = env_bool("STALE_REPRICE", True)       # cancel/replace if our price no longer matches desired
+    EXIT_TTL_SECONDS = env_int("EXIT_TTL_SECONDS", 60)  # keep simple exit; cancel if stale
+    STALE_REPRICE = env_bool("STALE_REPRICE", True)  # cancel/replace if our price no longer matches desired
 
     # your prior step: escalation is opt-in only now
     ESCALATE_AFTER_POLLS = env_int("ESCALATE_AFTER_POLLS", 0)  # 0 disables
@@ -454,7 +514,9 @@ def main() -> None:
 
                 # If price is not what we want anymore, cancel it (stale)
                 if STALE_REPRICE and p is not None and p != buy_price:
-                    log.warning(f"[ENTRY] Stale price detected resting_buy={p} desired={buy_price}. Cancelling order_id={entry_order_id}")
+                    log.warning(
+                        f"[ENTRY] Stale price detected resting_buy={p} desired={buy_price}. Cancelling order_id={entry_order_id}"
+                    )
                     cancel_order(entry_order_id or "")
                     entry_order_id = None
                     entry_rest = None
@@ -557,4 +619,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()
