@@ -94,9 +94,9 @@ def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
 # Config
 # -----------------------------
 API_BASE = env_str("API_BASE", "https://api.elections.kalshi.com")
-API_PREFIX = "/trade-api/v2"  # keep explicit; discovery is optional
+API_PREFIX = "/trade-api/v2"
 
-KALSHI_KEY_ID = env_str("KALSHI_KEY_ID")  # <-- this is the API Key ID shown in Kalshi UI
+KALSHI_KEY_ID = env_str("KALSHI_KEY_ID")  # API key id from Kalshi
 KALSHI_PRIVATE_KEY_B64 = env_str("KALSHI_PRIVATE_KEY_B64")
 
 SUBACCOUNT = env_str("SUBACCOUNT")  # optional
@@ -109,7 +109,7 @@ POLL_SECONDS = env_int("POLL_SECONDS", 1)
 SERIES_PREFIX = env_str("SERIES_PREFIX", "KXBTC15M")
 MARKET_TICKER = env_str("MARKET_TICKER")  # if set, overrides auto-selection
 
-FARM_SIDE = env_str("FARM_SIDE", "YES").upper()  # "YES" only for now as requested
+FARM_SIDE = env_str("FARM_SIDE", "YES").upper()  # YES only right now
 BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
 TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
@@ -127,11 +127,6 @@ SESSION.headers.update({"Content-Type": "application/json"})
 # HTTP Wrapper
 # -----------------------------
 def kalshi_request(method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
-    """
-    FIXED:
-      - headers: KALSHI-ACCESS-KEY / TIMESTAMP / SIGNATURE
-      - signature message: timestamp + METHOD + path_without_query (no query, no body hash)
-    """
     if params:
         qs = urlencode(params, doseq=True)
         full_path = f"{path}?{qs}"
@@ -149,7 +144,6 @@ def kalshi_request(method: str, path: str, params: Optional[Dict[str, Any]] = No
             "KALSHI-ACCESS-TIMESTAMP": ts,
             "KALSHI-ACCESS-SIGNATURE": signature,
         }
-        # DEBUG: show signed path without leaking signature
         signed_path = full_path.split("?", 1)[0]
         log.info(f"[SIGNDBG] {method.upper()} {full_path} ts={ts}ms signed_path={signed_path}")
 
@@ -183,17 +177,28 @@ def list_orders(status: str = "resting", limit: int = 200) -> List[Dict[str, Any
 
 def create_order(ticker: str, side: str, action: str, count: int, price_cents: int, order_type: str = "limit") -> Dict[str, Any]:
     """
-    NOTE: Keeping structure simple. If your existing schema differs, we’ll adjust after logs.
+    FIXED (per your error):
+      - Must provide exactly one of: yes_price, no_price, yes_price_dollars, no_price_dollars
+      - Do NOT send generic 'price'
     """
-    body = {
+    side_l = side.lower().strip()
+    if side_l not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side}")
+
+    body: Dict[str, Any] = {
         "ticker": ticker,
         "action": action,      # "buy" or "sell"
-        "side": side,          # "yes" or "no" (Kalshi uses yes/no positions)
         "type": order_type,    # "limit"
         "count": count,
-        "price": price_cents,
         "client_order_id": f"mm-{ticker}-{now_ms()}",
     }
+
+    # Kalshi expects outcome-specific price fields
+    if side_l == "yes":
+        body["yes_price"] = int(price_cents)
+    else:
+        body["no_price"] = int(price_cents)
+
     if SUBACCOUNT:
         body["subaccount"] = SUBACCOUNT
 
@@ -207,7 +212,6 @@ def cancel_order(order_id: str) -> Dict[str, Any]:
     code, data = kalshi_request("DELETE", f"{API_PREFIX}/portfolio/orders/{order_id}")
     log.info(f"[CANCEL] DELETE {API_PREFIX}/portfolio/orders/{order_id} -> HTTP={code}")
     if code not in (200, 204):
-        # sometimes 204 no-content
         if code != 204:
             raise RuntimeError(f"Cancel order failed: HTTP={code} body={data}")
     return data if isinstance(data, dict) else {"status": "ok"}
@@ -216,14 +220,10 @@ def cancel_order(order_id: str) -> Dict[str, Any]:
 # Market Selection
 # -----------------------------
 def parse_close_ts(mkt: Dict[str, Any]) -> Optional[int]:
-    """
-    markets return close_time like '2026-01-20T15:45:00Z'
-    """
     close = mkt.get("close_time") or mkt.get("closeTime") or mkt.get("close")
     if not close or not isinstance(close, str):
         return None
     try:
-        # handle Z
         if close.endswith("Z"):
             close = close.replace("Z", "+00:00")
         dt = datetime.fromisoformat(close)
@@ -237,9 +237,7 @@ def select_next_closing_market(markets: List[Dict[str, Any]]) -> Optional[Dict[s
     best_close = None
     for m in markets:
         ts = parse_close_ts(m)
-        if ts is None:
-            continue
-        if ts <= now_s:
+        if ts is None or ts <= now_s:
             continue
         if best is None or ts < best_close:
             best = m
@@ -252,7 +250,7 @@ def select_next_closing_market(markets: List[Dict[str, Any]]) -> Optional[Dict[s
 if not KALSHI_PRIVATE_KEY_B64:
     raise SystemExit("Missing env KALSHI_PRIVATE_KEY_B64")
 if not KALSHI_KEY_ID:
-    raise SystemExit("Missing env KALSHI_KEY_ID (this is your API Key ID shown in Kalshi UI)")
+    raise SystemExit("Missing env KALSHI_KEY_ID (API Key ID from Kalshi)")
 
 PRIVATE_KEY, PEM_BYTES = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 log.info("Loaded RSA private key from KALSHI_PRIVATE_KEY_B64.")
@@ -280,7 +278,6 @@ def main():
         raise SystemExit("ENABLE_TRADING=True but CONFIRM_LIVE_TRADING is not True. Refusing to run live.")
 
     active_ticker = MARKET_TICKER
-    last_selected = None
 
     while True:
         try:
@@ -298,26 +295,28 @@ def main():
                 close_ts = parse_close_ts(m)
                 secs_to_close = (close_ts - int(time.time())) if close_ts else None
                 log.info(f"[SELECT] Next closing market: {active_ticker} close={close_time} seconds_to_close={secs_to_close}")
-                last_selected = active_ticker
 
-            # Auth sanity check (this is the failing call in your logs)
+            # Sanity: list orders
             resting = list_orders("resting", limit=200)
             log.info(f"[ORDERS] resting_count={len(resting)}")
 
-            # For now: do not place orders unless enabled
             if not ENABLE_TRADING:
                 log.info("[DRYRUN] Trading disabled; polling only.")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Minimal "YES-only" placeholder:
-            # Place 1-lot buy YES at BUY_PRICE_CENTS
+            # YES-only entry attempt
             side = "yes"
             action = "buy"
             create_order(active_ticker, side=side, action=action, count=BASE_SIZE, price_cents=BUY_PRICE_CENTS)
             log.info(f"[TRADE] placed {action.upper()} {side.upper()} {BASE_SIZE} @ {BUY_PRICE_CENTS}c on {active_ticker}")
 
             time.sleep(POLL_SECONDS)
+
+        except RuntimeError as e:
+            # tiny anti-spam backoff if order schema/price errors happen
+            log.error(f"[LOOPERR] {e}", exc_info=True)
+            time.sleep(max(POLL_SECONDS, 2))
 
         except Exception as e:
             log.error(f"[LOOPERR] {e}", exc_info=True)
