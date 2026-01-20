@@ -264,6 +264,27 @@ class KalshiClient:
         orders = body.get("orders", []) if isinstance(body, dict) else []
         return orders
 
+    # ✅ ADDED (PART OF THE 2-MINUTE ESCALATION CHANGE): cancel an order so we don't stack exposure
+    def cancel_order(self, order_id: str) -> Tuple[int, Any]:
+        if not self.api_prefix:
+            self.discover_prefix()
+
+        # try DELETE /portfolio/orders/{order_id}
+        path = f"{self.api_prefix}/portfolio/orders/{order_id}"
+        code, body, _ = self.request("DELETE", path)
+        if code in (200, 204):
+            log.info(f"[CANCEL] DELETE {path} -> {code} {safe_json(body)}")
+            return code, body
+
+        # fallback: POST /portfolio/orders/{order_id}/cancel
+        path2 = f"{self.api_prefix}/portfolio/orders/{order_id}/cancel"
+        code2, body2, _ = self.request("POST", path2, json_body={})
+        if code2 in (200, 201, 204):
+            log.info(f"[CANCEL] POST {path2} -> {code2} {safe_json(body2)}")
+        else:
+            log.warning(f"[CANCEL] Failed cancel attempts http={code}/{code2} body1={safe_json(body)} body2={safe_json(body2)}")
+        return code2, body2
+
     def place_order(self, payload: Dict[str, Any]) -> Tuple[int, Any]:
         if not self.api_prefix:
             self.discover_prefix()
@@ -463,25 +484,76 @@ def main():
 
     log.info(f"[EXIT] Watching for fill of order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
 
+    # ✅ MICRO CHANGE (YOU SAID "2"): if still RESTING for 2 polls, cancel+replace at +1c (capped)
+    resting_polls = 0
+    escalated = False
+    # ---------------------------------------------------------------
+
     while True:
         time.sleep(POLL_SECONDS)
 
         if sell_sent:
             continue
 
-        # ✅ ADDED: detect "no longer resting" as a hint that a fill likely occurred
         try:
-            resting = client.get_resting_orders(limit=200)
-            still_resting = any(o.get("order_id") == order_id for o in resting)
-            if still_resting:
-                log.info(f"[EXIT] Still resting order_id={order_id}.")
-            else:
-                log.info(f"[EXIT] Order_id={order_id} no longer resting; checking filled.")
-        except Exception as e:
-            log.warning(f"[EXIT] Could not check resting status: {e}")
-            still_resting = True  # default to safe wait
+            # ✅ MICRO CHANGE PART (2-minute escalation): detect still-resting for THIS order_id
+            still_resting = False
+            try:
+                resting = client.get_resting_orders(limit=200)
+                for o in resting:
+                    if o.get("order_id") == order_id:
+                        still_resting = True
+                        break
+            except Exception as e:
+                log.warning(f"[EXIT] Could not check resting status: {e}")
+                still_resting = False
 
-        try:
+            if still_resting:
+                resting_polls += 1
+                log.info(f"[EXIT] Still resting order_id={order_id}. polls={resting_polls}")
+
+                if (not escalated) and resting_polls >= 2:
+                    new_buy = max(1, min(99, int(target_buy) + 1))
+                    new_buy = min(MAX_BUY_PRICE_CENTS, new_buy)
+
+                    if new_buy > int(target_buy):
+                        log.info(f"[ESCALATE] 2 polls resting. Cancel+replace {target_buy}c -> {new_buy}c (order_id={order_id})")
+                        client.cancel_order(order_id)
+
+                        replace_payload = {
+                            "ticker": MARKET_TICKER,
+                            "action": "buy",
+                            "type": "limit",
+                            "count": qty,
+                            "side": "yes" if side == "YES" else "no",
+                            "yes_price": new_buy if side == "YES" else None,
+                            "no_price": new_buy if side == "NO" else None,
+                        }
+                        replace_payload = {k: v for k, v in replace_payload.items() if v is not None}
+
+                        rcode, rbody = client.place_order(replace_payload)
+                        log.info(f"[ESCALATE] Replaced BUY http={rcode} resp={safe_json(rbody)}")
+
+                        new_order_id = None
+                        try:
+                            if isinstance(rbody, dict) and isinstance(rbody.get("order"), dict):
+                                new_order_id = rbody["order"].get("order_id")
+                        except Exception:
+                            new_order_id = None
+
+                        if new_order_id:
+                            order_id = new_order_id
+                            target_buy = int(new_buy)
+                            sell_price = max(1, min(99, int(target_buy) + int(TARGET_PROFIT_CENTS)))
+                            log.info(f"[EXIT] Now watching order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
+                            escalated = True
+                            resting_polls = 0
+                            continue
+                    else:
+                        log.info(f"[ESCALATE] Wanted +1c but capped (target_buy={target_buy} MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS}).")
+                        escalated = True
+            # ---------------------------------------------------------------
+
             filled = client.get_filled_orders(limit=200)
             hit = None
             for o in filled:
@@ -489,12 +561,8 @@ def main():
                     hit = o
                     break
 
-            if still_resting and not hit:
-                log.info(f"[EXIT] Not filled yet order_id={order_id}.")
-                continue
-
             if not hit:
-                log.info(f"[EXIT] Filled not found yet for order_id={order_id}.")
+                log.info(f"[EXIT] Not filled yet order_id={order_id}.")
                 continue
 
             log.info(f"[EXIT] Filled detected order_id={order_id} fill_count={hit.get('fill_count')} remaining={hit.get('remaining_count')}")
