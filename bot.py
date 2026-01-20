@@ -249,6 +249,21 @@ class KalshiClient:
         orders = body.get("orders", []) if isinstance(body, dict) else []
         return orders
 
+    # ✅ ADDED: check fills for the specific order
+    def get_filled_orders(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/portfolio/orders"
+        code, body, text = self.request("GET", path, params={"status": "filled", "limit": limit})
+        log.info(
+            f"[FILLED] GET {path}?status=filled&limit={limit} -> HTTP={code} "
+            f"shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}"
+        )
+        if code != 200:
+            raise RuntimeError(f"Filled orders fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        orders = body.get("orders", []) if isinstance(body, dict) else []
+        return orders
+
     def place_order(self, payload: Dict[str, Any]) -> Tuple[int, Any]:
         if not self.api_prefix:
             self.discover_prefix()
@@ -429,9 +444,63 @@ def main():
     code, body = client.place_order(payload)
     log.info(f"[HEARTBEAT] alive order_post_http={code} resp={safe_json(body)}")
 
+    # ✅ MICRO CHANGE ONLY: if/when the buy fills, place ONE sell at buy+profit
+    order_id = None
+    try:
+        if isinstance(body, dict) and isinstance(body.get("order"), dict):
+            order_id = body["order"].get("order_id")
+    except Exception:
+        order_id = None
+
+    if not order_id:
+        log.warning("[EXIT] No order_id returned; cannot watch fills to place exit sell.")
+        while True:
+            time.sleep(POLL_SECONDS)
+
+    sell_sent = False
+    sell_price = max(1, min(99, int(target_buy) + int(TARGET_PROFIT_CENTS)))
+    sell_side_key = "yes" if side == "YES" else "no"
+
+    log.info(f"[EXIT] Watching for fill of order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
+
     while True:
         time.sleep(POLL_SECONDS)
 
+        if sell_sent:
+            continue
+
+        try:
+            filled = client.get_filled_orders(limit=200)
+            hit = None
+            for o in filled:
+                if o.get("order_id") == order_id:
+                    hit = o
+                    break
+
+            if not hit:
+                log.info(f"[EXIT] Not filled yet order_id={order_id}.")
+                continue
+
+            log.info(f"[EXIT] Filled detected order_id={order_id} fill_count={hit.get('fill_count')} remaining={hit.get('remaining_count')}")
+
+            sell_payload = {
+                "ticker": MARKET_TICKER,
+                "action": "sell",
+                "type": "limit",
+                "count": qty,
+                "side": sell_side_key,
+                "yes_price": sell_price if side == "YES" else None,
+                "no_price": sell_price if side == "NO" else None,
+            }
+            sell_payload = {k: v for k, v in sell_payload.items() if v is not None}
+
+            scode, sbody = client.place_order(sell_payload)
+            log.info(f"[EXIT] SELL placed http={scode} resp={safe_json(sbody)}")
+            sell_sent = True
+
+        except Exception as e:
+            log.warning(f"[EXIT] Error while watching fills / placing sell: {e}")
+
 
 if __name__ == "__main__":
-    main() 
+    main()
