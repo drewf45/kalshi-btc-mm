@@ -38,19 +38,19 @@ CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "false").lower() == "tr
 SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
 MARKET_TICKER = os.getenv("MARKET_TICKER", "").strip() or None
 
-# Loop speed (you said POLL_SECONDS=60 was accidental; we go to 1s by default for MM)
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
 
-# Strategy knobs (still simple “farm” behavior for now)
 FARM_SIDE = os.getenv("FARM_SIDE", "YES").upper().strip()  # YES / NO
 BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
 BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
 
-# Anti-spam / governance
-BOT_TAG = os.getenv("BOT_TAG", "MMBOT").strip()  # used in client_order_id
+BOT_TAG = os.getenv("BOT_TAG", "MMBOT").strip()
 MAX_BOT_RESTING_PER_TICKER = int(os.getenv("MAX_BOT_RESTING_PER_TICKER", "1"))
 CLEANUP_ON_START = os.getenv("CLEANUP_ON_START", "true").lower() == "true"
-MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))  # for pagination safety
+MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
+
+# debug knobs
+DUMP_ORDERBOOK_ONCE = os.getenv("DUMP_ORDERBOOK_ONCE", "true").lower() == "true"
 
 
 # -----------------------------
@@ -58,10 +58,6 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))  # for pagination safety
 # -----------------------------
 def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
-
-
-def iso_utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _require_env() -> None:
@@ -72,7 +68,6 @@ def _require_env() -> None:
 
 
 def load_private_key() -> Any:
-    # KALSHI_PRIVATE_KEY_B64 is base64 of PEM bytes
     key_bytes = base64.b64decode(KALSHI_PRIVATE_KEY_B64)
     return serialization.load_pem_private_key(key_bytes, password=None)
 
@@ -86,13 +81,13 @@ def sha256_b64(data: bytes) -> str:
     return base64.b64encode(digest.finalize()).decode("utf-8")
 
 
-def sign_request(private_key: Any, ts_ms: int, method: str, path: str, body_bytes: bytes) -> str:
+def sign_request(private_key: Any, ts_ms: int, method: str, signed_path: str, body_bytes: bytes) -> str:
     """
-    Kalshi signing pattern (REST & WS): timestamp + method + path + body
-    Signature: RSA PKCS#1 v1.5 with SHA256, base64 encoded.
+    IMPORTANT: Kalshi signature must match EXACT request target:
+      timestamp + METHOD + (path + ?query if present) + body
     """
     method = method.upper()
-    message = f"{ts_ms}{method}{path}".encode("utf-8") + body_bytes
+    message = f"{ts_ms}{method}{signed_path}".encode("utf-8") + body_bytes
     signature = private_key.sign(
         message,
         asy_padding.PKCS1v15(),
@@ -101,9 +96,9 @@ def sign_request(private_key: Any, ts_ms: int, method: str, path: str, body_byte
     return base64.b64encode(signature).decode("utf-8")
 
 
-def auth_headers(method: str, path: str, body_bytes: bytes) -> Dict[str, str]:
+def auth_headers(method: str, signed_path: str, body_bytes: bytes) -> Dict[str, str]:
     ts = now_utc_ts_ms()
-    sig = sign_request(PRIVATE_KEY, ts, method, path, body_bytes)
+    sig = sign_request(PRIVATE_KEY, ts, method, signed_path, body_bytes)
 
     hdrs = {
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
@@ -112,27 +107,30 @@ def auth_headers(method: str, path: str, body_bytes: bytes) -> Dict[str, str]:
         "Content-Type": "application/json",
     }
     if SUBACCOUNT:
-        # Kalshi supports subaccounts via header in many clients; keep optional.
         hdrs["KALSHI-SUBACCOUNT"] = SUBACCOUNT
 
-    # Small debug line similar to your logs
     log.info(
-        f"[SIGNDBG] {method.upper()} {path} ts={ts}ms "
-        f"body_len={len(body_bytes)} signing_payload_sha256_b64={sha256_b64((str(ts)+method.upper()+path).encode('utf-8')+body_bytes)}"
+        f"[SIGNDBG] {method.upper()} {signed_path} ts={ts}ms "
+        f"body_len={len(body_bytes)} signing_payload_sha256_b64={sha256_b64((str(ts)+method.upper()+signed_path).encode('utf-8')+body_bytes)}"
     )
     return hdrs
 
 
 def http_json(method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
-    url = f"{API_BASE}{path}"
+    # Build query exactly (and use it for BOTH URL + SIGNED PATH)
+    qs = ""
     if params:
-        url = url + "?" + urlencode(params)
+        # urlencode preserves insertion order of dict; our dicts are built deterministically
+        qs = urlencode(params)
+
+    signed_path = path + (("?" + qs) if qs else "")
+    url = f"{API_BASE}{signed_path}"
 
     body_bytes = b""
     if body is not None:
         body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
 
-    headers = auth_headers(method, path, body_bytes)
+    headers = auth_headers(method, signed_path, body_bytes)
     resp = requests.request(method, url, headers=headers, data=body_bytes if body is not None else None, timeout=20)
 
     try:
@@ -146,7 +144,7 @@ def http_json(method: str, path: str, params: Optional[Dict[str, Any]] = None, b
 # -----------------------------
 # API prefix discovery
 # -----------------------------
-API_PREFIX = None  # e.g. /trade-api/v2
+API_PREFIX = None
 
 
 def discover_api_prefix() -> str:
@@ -174,7 +172,6 @@ def get_series_markets(series_ticker: str, limit: int = 200) -> List[Dict[str, A
 
 
 def pick_next_closing_market(markets: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Choose the soonest future close_time
     now = datetime.now(timezone.utc)
     best = None
     best_dt = None
@@ -199,39 +196,80 @@ def pick_next_closing_market(markets: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Orderbook (minimal)
+# Orderbook
 # -----------------------------
-def get_orderbook(ticker: str) -> Dict[str, Any]:
+_ob_dumped = False
+
+
+def get_orderbook(ticker: str) -> Any:
     code, data = http_json("GET", f"{API_PREFIX}/markets/{ticker}/orderbook")
     log.info(f"[BOOK] GET {API_PREFIX}/markets/{ticker}/orderbook -> HTTP={code} shape=dict keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
     if code != 200:
         raise RuntimeError(f"Orderbook failed: HTTP={code} body={data}")
-    return data.get("orderbook", {})
+    return data.get("orderbook")
 
 
-def best_asks(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
+def _best_from_list(levels: Any) -> Optional[Dict[str, int]]:
     """
-    Supports common shapes:
-      orderbook: { yes: { asks: [[price,qty],...], bids: ... }, no: {...} }
-      or flattened variants.
-    We only need best ask for now.
+    levels can be:
+      [[price, qty], ...]
     """
-    def _best(side_key: str) -> Optional[Dict[str, int]]:
-        book = orderbook.get(side_key) or {}
-        asks = book.get("asks") or []
-        # asks often sorted best price first
-        if asks and isinstance(asks[0], (list, tuple)) and len(asks[0]) >= 2:
-            return {"price_cents": int(asks[0][0]), "qty": int(asks[0][1])}
+    if isinstance(levels, list) and levels:
+        top = levels[0]
+        if isinstance(top, (list, tuple)) and len(top) >= 2:
+            return {"price_cents": int(top[0]), "qty": int(top[1])}
+    return None
+
+
+def best_asks(orderbook: Any) -> Dict[str, Optional[Dict[str, int]]]:
+    """
+    Robust for multiple shapes.
+
+    Seen shapes:
+      A) orderbook = {"yes": {"asks": [[p,q],...], "bids": ...}, "no": {...}}
+      B) orderbook = {"yes": [[p,q],...], "no": [[p,q],...]}  (LIST directly)
+      C) orderbook = [{"side":"yes","asks":[...]}] etc (less common)
+    We only need best ask for yes/no.
+    """
+
+    def _best_side(side_key: str) -> Optional[Dict[str, int]]:
+        if orderbook is None:
+            return None
+
+        # dict shapes
+        if isinstance(orderbook, dict):
+            side_val = orderbook.get(side_key)
+
+            # B) side_val is LIST already
+            if isinstance(side_val, list):
+                return _best_from_list(side_val)
+
+            # A) side_val is dict with asks
+            if isinstance(side_val, dict):
+                asks = side_val.get("asks") or []
+                return _best_from_list(asks)
+
+            return None
+
+        # list shapes (C)
+        if isinstance(orderbook, list):
+            for item in orderbook:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("side") == side_key:
+                    asks = item.get("asks") or item.get("levels") or []
+                    return _best_from_list(asks)
+
         return None
 
     return {
-        "yes_best_ask": _best("yes"),
-        "no_best_ask": _best("no"),
+        "yes_best_ask": _best_side("yes"),
+        "no_best_ask": _best_side("no"),
     }
 
 
 # -----------------------------
-# Orders (list / place / cancel)
+# Orders
 # -----------------------------
 def list_orders_page(status: str, limit: int = 200, cursor: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     params: Dict[str, Any] = {"status": status, "limit": limit}
@@ -249,7 +287,7 @@ def list_orders_page(status: str, limit: int = 200, cursor: Optional[str] = None
 def list_orders_all(status: str, limit: int = 200, max_pages: int = 10) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     cursor = None
-    for i in range(max_pages):
+    for _ in range(max_pages):
         page, cursor = list_orders_page(status=status, limit=limit, cursor=cursor)
         out.extend(page)
         if not cursor:
@@ -258,16 +296,14 @@ def list_orders_all(status: str, limit: int = 200, max_pages: int = 10) -> List[
 
 
 def cancel_order(order_id: str) -> bool:
-    # Try DELETE first; if not supported, try POST /cancel
     code, data = http_json("DELETE", f"{API_PREFIX}/portfolio/orders/{order_id}")
     if code in (200, 204):
-        log.info(f"[CANCEL] DELETE {order_id} -> HTTP={code}")
+        log.info(f"[CANCEL] DELETE order_id={order_id} -> HTTP={code}")
         return True
 
-    # Fallback
     code2, data2 = http_json("POST", f"{API_PREFIX}/portfolio/orders/{order_id}/cancel", body={})
     if code2 in (200, 204):
-        log.info(f"[CANCEL] POST {order_id}/cancel -> HTTP={code2}")
+        log.info(f"[CANCEL] POST order_id={order_id}/cancel -> HTTP={code2}")
         return True
 
     log.warning(f"[CANCEL] failed order_id={order_id} HTTP={code} body={data} fallbackHTTP={code2} fallbackBody={data2}")
@@ -290,7 +326,6 @@ def create_order(
         "type": "limit",
         "client_order_id": client_order_id,
     }
-    # Kalshi uses yes_price/no_price in cents
     if side == "yes":
         body["yes_price"] = price_cents
     else:
@@ -304,15 +339,10 @@ def create_order(
 
 
 def bot_client_id(ticker: str, action: str, side: str, price_cents: int) -> str:
-    # Stable id so the bot can detect “already placed”
     return f"{BOT_TAG}:{ticker}:{action}:{side}:{price_cents}"
 
 
 def cleanup_bot_orders_for_ticker(resting: List[Dict[str, Any]], ticker: str, keep_client_id: Optional[str]) -> None:
-    """
-    Cancel all resting orders for this ticker that were created by this bot tag,
-    except keep_client_id.
-    """
     bot_orders = []
     for o in resting:
         if o.get("ticker") != ticker:
@@ -324,26 +354,24 @@ def cleanup_bot_orders_for_ticker(resting: List[Dict[str, Any]], ticker: str, ke
     if not bot_orders:
         return
 
-    # If too many, cancel all but the keep one.
     cancels = 0
     for o in bot_orders:
         cid = (o.get("client_order_id") or "").strip()
         if keep_client_id and cid == keep_client_id:
             continue
         oid = o.get("order_id")
-        if oid:
-            if cancel_order(oid):
-                cancels += 1
+        if oid and cancel_order(oid):
+            cancels += 1
 
     if cancels:
         log.info(f"[CLEAN] canceled {cancels} bot resting orders on ticker={ticker}")
 
 
 # -----------------------------
-# Main loop
+# Main
 # -----------------------------
 def main() -> None:
-    global PRIVATE_KEY, API_PREFIX
+    global PRIVATE_KEY, API_PREFIX, _ob_dumped
 
     _require_env()
     PRIVATE_KEY = load_private_key()
@@ -362,7 +390,6 @@ def main() -> None:
     log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} BASE_SIZE={BASE_SIZE}")
     log.info(f"BOT_TAG={BOT_TAG} MAX_BOT_RESTING_PER_TICKER={MAX_BOT_RESTING_PER_TICKER} CLEANUP_ON_START={CLEANUP_ON_START}")
 
-    # Choose ticker (one market at a time)
     if MARKET_TICKER:
         active_ticker = MARKET_TICKER
         log.info(f"[SELECT] Using MARKET_TICKER override: {active_ticker}")
@@ -374,30 +401,34 @@ def main() -> None:
     side = "yes" if FARM_SIDE == "YES" else "no"
     action = "buy"
 
-    # Optional: cleanup on boot (prevents the “resting_count=200” trap from prior runs)
     if CLEANUP_ON_START:
         try:
             resting_all = list_orders_all("resting", limit=200, max_pages=MAX_PAGES)
             log.info(f"[ORDERS] resting_total={len(resting_all)} (paged up to {MAX_PAGES})")
-            # cancel all bot orders for this ticker on boot
             cleanup_bot_orders_for_ticker(resting_all, ticker=active_ticker, keep_client_id=None)
         except Exception as e:
             log.warning(f"[CLEAN] startup cleanup skipped due to error: {e}")
 
     while True:
         try:
-            # Observe book (not used yet for pricing logic, but keep logs)
             ob = get_orderbook(active_ticker)
+
+            # One-time dump so we can see the exact shape in logs if needed
+            if DUMP_ORDERBOOK_ONCE and not _ob_dumped:
+                try:
+                    log.info(f"[OBDUMP] orderbook_type={type(ob).__name__} sample={json.dumps(ob)[:800]}")
+                except Exception:
+                    log.info(f"[OBDUMP] orderbook_type={type(ob).__name__} (not json-serializable)")
+                _ob_dumped = True
+
             b = best_asks(ob)
             log.info(f"[BEST] {json.dumps(b)}")
 
-            # Fetch resting orders (paged)
             resting_all = list_orders_all("resting", limit=200, max_pages=MAX_PAGES)
             log.info(f"[ORDERS] resting_total={len(resting_all)} (paged up to {MAX_PAGES})")
 
             desired_client_id = bot_client_id(active_ticker, action, side, BUY_PRICE_CENTS)
 
-            # If we already have the desired order resting, do nothing.
             already = False
             bot_resting_for_ticker = 0
             for o in resting_all:
@@ -409,7 +440,6 @@ def main() -> None:
                 if cid == desired_client_id:
                     already = True
 
-            # Keep the book clean: cancel any other bot orders for this ticker
             cleanup_bot_orders_for_ticker(resting_all, ticker=active_ticker, keep_client_id=desired_client_id)
 
             if bot_resting_for_ticker > MAX_BOT_RESTING_PER_TICKER:
@@ -425,7 +455,6 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Place (gated)
             if not ENABLE_TRADING:
                 log.info("[DRYRUN] ENABLE_TRADING is false; not placing.")
                 time.sleep(POLL_SECONDS)
@@ -443,7 +472,10 @@ def main() -> None:
                 price_cents=BUY_PRICE_CENTS,
                 client_order_id=desired_client_id,
             )
-            log.info(f"[TRADE] placed {action.upper()} {side.upper()} {BASE_SIZE} @ {BUY_PRICE_CENTS}c on {active_ticker} client_order_id={desired_client_id} order_id={order.get('order_id')}")
+            log.info(
+                f"[TRADE] placed {action.upper()} {side.upper()} {BASE_SIZE} @ {BUY_PRICE_CENTS}c "
+                f"on {active_ticker} client_order_id={desired_client_id} order_id={order.get('order_id')}"
+            )
 
         except Exception as e:
             log.error(f"[LOOPERR] {e}", exc_info=True)
