@@ -187,10 +187,8 @@ def create_order(
     order_type: str = "limit",
 ) -> Dict[str, Any]:
     """
-    FIXES:
-      - 'side' is REQUIRED by Kalshi (CreateOrderRequest.Side)
-      - Must provide exactly one of: yes_price, no_price, yes_price_dollars, no_price_dollars
-      - Do NOT send generic 'price'
+    - 'side' is REQUIRED by Kalshi (CreateOrderRequest.Side)
+    - Must provide exactly one of: yes_price / no_price (cents)
     """
     side_l = side.lower().strip()
     if side_l not in ("yes", "no"):
@@ -205,7 +203,6 @@ def create_order(
         "side": side_l,        # ✅ REQUIRED FIELD
     }
 
-    # Outcome-specific price field (exactly one)
     if side_l == "yes":
         body["yes_price"] = int(price_cents)
     else:
@@ -254,7 +251,7 @@ def select_next_closing_market(markets: List[Dict[str, Any]]) -> Optional[Dict[s
 if not KALSHI_PRIVATE_KEY_B64:
     raise SystemExit("Missing env KALSHI_PRIVATE_KEY_B64")
 if not KALSHI_KEY_ID:
-    raise SystemExit("Missing env KALSHI_KEY_ID (API Key ID from Kalshi)")
+    raise SystemExit("Missing env KALSHI_KEY_ID")
 
 PRIVATE_KEY, PEM_BYTES = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 log.info("Loaded RSA private key from KALSHI_PRIVATE_KEY_B64.")
@@ -285,7 +282,6 @@ def main():
 
     while True:
         try:
-            # Select market if needed
             if not active_ticker:
                 mkts = get_markets(SERIES_PREFIX, limit=200)
                 log.info(f"[SERIES] Returned markets count={len(mkts)}")
@@ -319,7 +315,6 @@ def main():
         except RuntimeError as e:
             log.error(f"[LOOPERR] {e}", exc_info=True)
             time.sleep(max(POLL_SECONDS, 2))
-
         except Exception as e:
             log.error(f"[LOOPERR] {e}", exc_info=True)
             time.sleep(POLL_SECONDS)
