@@ -108,12 +108,9 @@ PRIVATE_KEY = load_private_key()
 
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 if not KALSHI_KEY_ID:
-    # fallback
     KALSHI_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "").strip()
 
 API_BASE = os.getenv("API_BASE", "https://api.elections.kalshi.com").strip()
-
-# discovered at runtime
 API_PREFIX = os.getenv("API_PREFIX", "").strip()  # optional override
 
 
@@ -123,14 +120,11 @@ def sign_request(method: str, path: str, ts_ms: int, body: bytes) -> Dict[str, s
     if not KALSHI_KEY_ID:
         raise RuntimeError("Missing KALSHI_KEY_ID (or KALSHI_API_KEY_ID).")
 
-    # canonical signing payload
     payload = (method.upper() + "\n" + path + "\n" + str(ts_ms) + "\n").encode("utf-8") + body
 
-    # --- MICRO FIX ---
-    # Sign the RAW payload bytes. cryptography hashes internally when you specify hashes.SHA256().
+    # Sign raw payload bytes
     signature = PRIVATE_KEY.sign(payload, asy_padding.PKCS1v15(), hashes.SHA256())
     sig_b64 = base64.b64encode(signature).decode("utf-8")
-    # --- END MICRO FIX ---
 
     headers = {
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
@@ -139,7 +133,7 @@ def sign_request(method: str, path: str, ts_ms: int, body: bytes) -> Dict[str, s
         "Content-Type": "application/json",
     }
 
-    # Debug: keep your hash logging (hash of payload bytes)
+    # Debug: hash of payload bytes
     try:
         digest = hashes.Hash(hashes.SHA256())
         digest.update(payload)
@@ -158,11 +152,18 @@ def kalshi_request(
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None
 ) -> Tuple[int, Any]:
+    # -----------------------------
+    # MICRO FIX: Canonicalize query string (sorted keys) BEFORE signing
+    # -----------------------------
     if params:
-        qs = urlencode(params)
+        # sort by key to match server-side canonicalization
+        qs = urlencode(sorted(params.items()), doseq=True)
         full_path = f"{path}?{qs}"
     else:
         full_path = path
+    # -----------------------------
+    # END MICRO FIX
+    # -----------------------------
 
     body_bytes = b""
     if json_body is not None:
@@ -261,12 +262,7 @@ def get_orderbook(market_ticker: str) -> Dict[str, Any]:
 
 
 def best_levels_from_orderbook(ob: Dict[str, Any]) -> Dict[str, Any]:
-    out = {
-        "yes_best_bid": None,
-        "yes_best_ask": None,
-        "no_best_bid": None,
-        "no_best_ask": None,
-    }
+    out = {"yes_best_bid": None, "yes_best_ask": None, "no_best_bid": None, "no_best_ask": None}
 
     book = ob.get("orderbook", {}) if isinstance(ob, dict) else {}
     yes = book.get("yes", {}) if isinstance(book, dict) else {}
@@ -370,10 +366,7 @@ def find_resting_order(orders: List[Dict[str, Any]], ticker: str, action: str, s
 
 
 def order_price_cents(order: Dict[str, Any]) -> Optional[int]:
-    if order.get("side") == "yes":
-        v = order.get("yes_price")
-    else:
-        v = order.get("no_price")
+    v = order.get("yes_price") if order.get("side") == "yes" else order.get("no_price")
     try:
         return int(v) if v is not None else None
     except Exception:
@@ -413,7 +406,6 @@ def main() -> None:
     STALE_REPRICE = env_bool("STALE_REPRICE", True)
 
     ESCALATE_AFTER_POLLS = env_int("ESCALATE_AFTER_POLLS", 0)
-
     SIZE_BASE = env_int("SIZE_BASE", 1)
 
     log.info("=== BOT STARTED ===")
@@ -428,7 +420,6 @@ def main() -> None:
     log.info(f"ENTRY_TTL_SECONDS={ENTRY_TTL_SECONDS} EXIT_TTL_SECONDS={EXIT_TTL_SECONDS} STALE_REPRICE={STALE_REPRICE}")
     log.info(f"ESCALATE_AFTER_POLLS={ESCALATE_AFTER_POLLS} (0 disables)")
     log.info(f"SIZING base={SIZE_BASE}")
-    log.info(f"[BOOT] KALSHI_KEY_ID len={len(KALSHI_KEY_ID)}")
 
     if ENABLE_TRADING and not CONFIRM_LIVE_TRADING:
         raise RuntimeError("Refusing to trade: ENABLE_TRADING=True but CONFIRM_LIVE_TRADING!=True")
