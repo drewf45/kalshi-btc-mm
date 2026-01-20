@@ -1,20 +1,19 @@
 import os
 import time
+import json
 import base64
-import uuid
 import logging
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
-
-# =====================================================
+# ============================================================
 # LOGGING
-# =====================================================
+# ============================================================
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -22,213 +21,171 @@ logging.basicConfig(
 )
 log = logging.getLogger("kalshi-bot")
 
+# ============================================================
+# ENV / CONFIG
+# ============================================================
 
-# =====================================================
-# BASE URL SPLIT (FINAL)
-# =====================================================
-ELECTIONS_BASE_URL = "https://api.elections.kalshi.com"
-TRADING_BASE_URL   = "https://trading-api.kalshi.com"
+# READ vs WRITE API SPLIT (CRITICAL FIX)
+READ_BASE = "https://trading-api.kalshi.com"
+WRITE_BASE = "https://api.elections.kalshi.com"
 
+KEY_ID = os.environ["KALSHI_KEY_ID"]
+PRIVATE_KEY_B64 = os.environ["KALSHI_PRIVATE_KEY_B64"]
+SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", None)
 
-# =====================================================
-# CONFIG
-# =====================================================
-KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
-KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
-KALSHI_SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()
-
-SERIES_PREFIX = (
-    os.getenv("SERIES_PREFIX", "").strip()
-    or os.getenv("Series_PREFIC", "").strip()
-    or os.getenv("SERIES_PREFIC", "").strip()
-)
-
+SERIES_PREFIX = os.environ["SERIES_PREFIX"]      # KXBTC15m
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
+
 BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
-BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
-POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
+BASE_SIZE = int(os.getenv("ORDER_USD_PER_SIDE", "1"))
 
+POST_ONLY = os.getenv("POST_ONLY", "true").lower() == "true"
 
-# =====================================================
-# AUTH HELPERS
-# =====================================================
-def now_utc_ts_ms() -> int:
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_ms() -> int:
     return int(time.time() * 1000)
 
+def sign_request(private_key, method, path, body):
+    ts = str(now_ms())
+    payload = f"{ts}{method}{path}{body}".encode()
+    sig = private_key.sign(
+        payload,
+        asy_padding.PKCS1v15(),
+        hashes.SHA256()
+    )
+    return ts, base64.b64encode(sig).decode()
 
-def load_private_key_from_b64(b64: str):
-    key_bytes = base64.b64decode(b64)
+def load_private_key():
+    key_bytes = base64.b64decode(PRIVATE_KEY_B64)
     return serialization.load_pem_private_key(key_bytes, password=None)
 
+PRIVATE_KEY = load_private_key()
+log.info("[BOOT] Private key loaded OK (b64)")
 
-def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
-    sign_str = f"{timestamp_ms}{method.upper()}{path}"
-    sig = private_key.sign(
-        sign_str.encode("utf-8"),
-        asy_padding.PSS(
-            mgf=asy_padding.MGF1(hashes.SHA256()),
-            salt_length=asy_padding.PSS.MAX_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(sig).decode("utf-8")
+# ============================================================
+# HTTP WRAPPERS
+# ============================================================
 
+def kalshi_get(path):
+    url = READ_BASE + path
+    headers = {
+        "KALSHI-ACCESS-KEY": KEY_ID,
+    }
+    r = requests.get(url, headers=headers, timeout=10)
+    log.info(f"[REQ] GET {path} -> {r.status_code}")
+    r.raise_for_status()
+    return r.json()
 
-def kalshi_headers(private_key, method: str, signed_path: str) -> Dict[str, str]:
-    ts = now_utc_ts_ms()
+def kalshi_post(path, body):
+    body_json = json.dumps(body)
+    ts, sig = sign_request(PRIVATE_KEY, "POST", path, body_json)
+
     headers = {
         "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
-        "KALSHI-ACCESS-SIGNATURE": sign_request(private_key, ts, method, signed_path),
-        "KALSHI-ACCESS-TIMESTAMP": str(ts),
+        "KALSHI-ACCESS-KEY": KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
     }
-    if KALSHI_SUBACCOUNT:
-        headers["KALSHI-SUBACCOUNT"] = KALSHI_SUBACCOUNT
-    return headers
 
+    if SUBACCOUNT:
+        headers["KALSHI-ACCESS-SUBACCOUNT"] = SUBACCOUNT
 
-def canonical_query(params: Optional[Dict[str, Any]]) -> str:
-    if not params:
-        return ""
-    return urlencode(sorted((k, str(v)) for k, v in params.items() if v is not None))
+    url = WRITE_BASE + path
+    r = requests.post(url, headers=headers, data=body_json, timeout=10)
+    log.info(f"[REQ] POST {path} -> {r.status_code}")
 
+    data = r.json()
+    if r.status_code != 200:
+        raise RuntimeError(f"Order failed: {data}")
+    return data
 
-def _request(
-    base_url: str,
-    private_key,
-    method: str,
-    path: str,
-    params=None,
-    body=None,
-) -> Tuple[int, Any]:
-    q = canonical_query(params)
-    signed_path = f"{path}?{q}" if q else path
+# ============================================================
+# MARKET RESOLUTION (ONCE)
+# ============================================================
 
-    resp = requests.request(
-        method=method,
-        url=f"{base_url}{path}",
-        headers=kalshi_headers(private_key, method, signed_path),
-        params=params,
-        json=body,
-        timeout=15,
-    )
+def resolve_active_market() -> Optional[str]:
+    markets = kalshi_get(
+        f"/trade-api/v2/markets?series_ticker={SERIES_PREFIX}&status=open&limit=50"
+    )["markets"]
 
-    try:
-        data = resp.json()
-    except Exception:
-        data = resp.text
-
-    log.info("[REQ] %s %s -> %s", method, signed_path, resp.status_code)
-    return resp.status_code, data
-
-
-# =====================================================
-# MARKET RESOLUTION (ELECTIONS)
-# =====================================================
-def parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
-    if "close_time" in m:
-        try:
-            dt = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))
-            return int(dt.timestamp() * 1000)
-        except Exception:
-            pass
-    return m.get("close_time_ms")
-
-
-def resolve_active_market(private_key) -> str:
-    code, data = _request(
-        ELECTIONS_BASE_URL,
-        private_key,
-        "GET",
-        "/trade-api/v2/markets",
-        params={
-            "series_ticker": SERIES_PREFIX.upper(),
-            "status": "open",
-            "limit": 50,
-        },
-    )
-
-    if code != 200:
-        raise RuntimeError(f"Market resolve failed: {data}")
-
-    markets = data.get("markets", [])
-    now_ms = now_utc_ts_ms()
-
-    future = []
     for m in markets:
-        close_ms = parse_close_ms(m)
-        if close_ms and close_ms > now_ms:
-            future.append((close_ms, m["ticker"]))
+        if m["status"] == "open":
+            return m["ticker"]
 
-    if not future:
-        raise RuntimeError("No future open markets found")
+    return None
 
-    future.sort()
-    return future[0][1]
+# ============================================================
+# ORDERBOOK
+# ============================================================
 
+def get_yes_best_ask(ticker: str) -> Optional[int]:
+    ob = kalshi_get(f"/trade-api/v2/markets/{ticker}/orderbook")
+    asks = ob.get("orderbook", {}).get("yes", {}).get("asks", [])
+    if not asks:
+        return None
+    return int(asks[0]["price"])
 
-# =====================================================
-# ORDERBOOK (ELECTIONS — FIX)
-# =====================================================
-def get_orderbook(private_key, ticker: str):
-    code, data = _request(
-        ELECTIONS_BASE_URL,
-        private_key,
-        "GET",
-        f"/trade-api/v2/markets/{ticker}/orderbook",
-    )
-    if code != 200:
-        raise RuntimeError(f"Orderbook error: {data}")
-    return data["orderbook"]
+# ============================================================
+# TRADING
+# ============================================================
 
-
-# =====================================================
-# TRADING (TRADING API)
-# =====================================================
-def place_yes_buy(private_key, ticker: str, price: int, count: int):
-    body = {
+def place_yes_buy(ticker: str, price: int, size: int):
+    order = {
         "ticker": ticker,
         "side": "yes",
         "action": "buy",
         "type": "limit",
-        "count": count,
-        "yes_price": price,
-        "client_order_id": str(uuid.uuid4()),
+        "price": price,
+        "count": size,
         "post_only": POST_ONLY,
     }
+    return kalshi_post("/trade-api/v2/portfolio/orders", order)
 
-    code, data = _request(
-        TRADING_BASE_URL,
-        private_key,
-        "POST",
-        "/trade-api/v2/portfolio/orders",
-        body=body,
-    )
+def has_open_position(ticker: str) -> bool:
+    pos = kalshi_get("/trade-api/v2/portfolio/positions")
+    for p in pos.get("positions", []):
+        if p["ticker"] == ticker and p["position"] != 0:
+            return True
+    return False
 
-    if code not in (200, 201):
-        raise RuntimeError(f"Order failed: {data}")
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-
-# =====================================================
-# MAIN
-# =====================================================
 def main():
-    private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
+    log.info("[BOOT] BOT STARTED")
+    log.info(f"[BOOT] READ_BASE={READ_BASE}")
+    log.info(f"[BOOT] WRITE_BASE={WRITE_BASE}")
+    log.info(f"[BOOT] SERIES_PREFIX={SERIES_PREFIX}")
 
-    log.info("[BOOT] LIVE BTC BOT — FINAL ROUTING FIX")
+    active_ticker = resolve_active_market()
+    if not active_ticker:
+        log.warning("No active market found")
+        return
 
-    active_ticker = resolve_active_market(private_key)
-    log.info("[MARKET] Locked active contract: %s", active_ticker)
+    log.info(f"[MARKET] Active ticker: {active_ticker}")
 
     while True:
         try:
-            ob = get_orderbook(private_key, active_ticker)
-            place_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
+            if has_open_position(active_ticker):
+                time.sleep(POLL_SECONDS)
+                continue
+
+            best_ask = get_yes_best_ask(active_ticker)
+            if best_ask is None:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            if best_ask <= BUY_PRICE_CENTS:
+                place_yes_buy(active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
+
         except Exception as e:
-            log.exception("[LOOPERR] %s", e)
+            log.error(f"[LOOPERR] {e}")
 
         time.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     main()
