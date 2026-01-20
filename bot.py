@@ -24,9 +24,13 @@ log = logging.getLogger("kalshi-bot")
 
 
 # -----------------------------
-# Config
+# Config  (MICRO: prefer KALSHI_API_BASE as in Render screenshot)
 # -----------------------------
-BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+BASE_URL = (
+    os.getenv("KALSHI_API_BASE", "").strip()
+    or os.getenv("KALSHI_BASE_URL", "").strip()
+    or "https://api.elections.kalshi.com"
+).rstrip("/")
 
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
@@ -51,12 +55,40 @@ def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _redact(s: str, keep: int = 4) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "<empty>"
+    if len(s) <= keep * 2:
+        return "<redacted>"
+    return f"{s[:keep]}…{s[-keep:]}"
+
+
 def load_private_key_from_b64(b64: str):
-    key_bytes = base64.b64decode(b64)
-    return serialization.load_pem_private_key(key_bytes, password=None)
+    try:
+        key_bytes = base64.b64decode(b64)
+        return serialization.load_pem_private_key(key_bytes, password=None)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load private key from KALSHI_PRIVATE_KEY_B64: {e}") from e
+
+
+def _canonical_query(params: Optional[Dict[str, Any]]) -> str:
+    """
+    MICRO: canonicalize query string for stable signing.
+    """
+    if not params:
+        return ""
+    items = []
+    for k in sorted(params.keys()):
+        v = params[k]
+        if v is None:
+            continue
+        items.append((k, str(v)))
+    return urlencode(items)
 
 
 def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
+    # Keep your exact signing format
     sign_str = f"{timestamp_ms}{method.upper()}{path}"
     sig = private_key.sign(
         sign_str.encode("utf-8"),
@@ -80,12 +112,15 @@ def kalshi_headers(private_key, method: str, signed_path: str) -> Dict[str, str]
 
 
 def request(private_key, method: str, path: str, params=None, body=None) -> Tuple[int, Any]:
-    signed_path = f"{path}?{urlencode(params)}" if params else path
+    # MICRO: canonical query for signing
+    q = _canonical_query(params)
+    signed_path = f"{path}?{q}" if q else path
+
     resp = requests.request(
         method=method,
         url=f"{BASE_URL}{path}",
         headers=kalshi_headers(private_key, method, signed_path),
-        params=params,
+        params=params,   # requests sends real query; signing uses canonical q (should match)
         json=body,
         timeout=15,
     )
@@ -202,7 +237,6 @@ def get_orderbook(private_key, ticker: str):
 
 
 def _extract_price_cents(level: Dict[str, Any]) -> Optional[int]:
-    # common variants seen across Kalshi endpoints
     for k in ("price_cents", "price", "yes_price", "no_price"):
         if k in level and level[k] is not None:
             try:
@@ -223,19 +257,11 @@ def _extract_qty(level: Dict[str, Any]) -> int:
 
 
 def parse_yes_best(orderbook: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    Supports BOTH:
-      A) orderbook["yes"] == {"bids":[...], "asks":[...]}
-      B) orderbook["yes"] == [ {price_cents:.., count:.., side:"bid"/"ask"} , ... ]
-    Returns:
-      (best_bid_level, best_ask_level) where each level has at least price_cents/count if possible.
-    """
     if not isinstance(orderbook, dict):
         return None, None
 
     y = orderbook.get("yes")
 
-    # Shape A: dict with bids/asks
     if isinstance(y, dict):
         bids = y.get("bids", []) if isinstance(y.get("bids", []), list) else []
         asks = y.get("asks", []) if isinstance(y.get("asks", []), list) else []
@@ -257,7 +283,6 @@ def parse_yes_best(orderbook: Any) -> Tuple[Optional[Dict[str, Any]], Optional[D
         best_ask = min(nasks, key=lambda x: x["price_cents"]) if nasks else None
         return best_bid, best_ask
 
-    # Shape B: list of levels
     if isinstance(y, list):
         bids: List[Dict[str, Any]] = []
         asks: List[Dict[str, Any]] = []
@@ -272,22 +297,17 @@ def parse_yes_best(orderbook: Any) -> Tuple[Optional[Dict[str, Any]], Optional[D
 
             lvl = {"price_cents": p, "count": _extract_qty(item), "raw": item}
 
-            # common side labels
             if side in ("bid", "buy", "bids"):
                 bids.append(lvl)
             elif side in ("ask", "sell", "asks", "offer"):
                 asks.append(lvl)
             else:
-                # If no side label, we can't reliably split. Keep in "unknown" bucket by inference later.
-                # We'll infer by assuming that the lower half are asks and upper half are bids only if there is a gap.
-                # For now, store under bids to at least get a best bid candidate.
                 bids.append(lvl)
 
         best_bid = max(bids, key=lambda x: x["price_cents"]) if bids else None
         best_ask = min(asks, key=lambda x: x["price_cents"]) if asks else None
         return best_bid, best_ask
 
-    # Unknown shape
     return None, None
 
 
@@ -318,27 +338,25 @@ def main():
     )
     if not series_prefix:
         log.error("[CONFIG] Missing SERIES prefix. Set SERIES_PREFIX (preferred) or your existing Series_PREFIC.")
-        while True:
-            time.sleep(30)
+        raise SystemExit(1)
 
     series_ticker = os.getenv("SERIES_TICKER", "").strip() or series_prefix.upper()
 
     if not KALSHI_KEY_ID:
         log.error("[CONFIG] Missing KALSHI_KEY_ID")
-        while True:
-            time.sleep(30)
+        raise SystemExit(1)
 
     if not KALSHI_PRIVATE_KEY_B64:
         log.error("[CONFIG] Missing KALSHI_PRIVATE_KEY_B64")
-        while True:
-            time.sleep(30)
+        raise SystemExit(1)
 
     private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 
     log.info(
-        "[BOOT] BASE_URL=%s SERIES_PREFIX=%s SERIES_TICKER=%s POLL_SECONDS=%.2f RESOLVE_EVERY_SECONDS=%d BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s RESOLVE_BACKOFF_SECONDS=%d",
-        BASE_URL, series_prefix, series_ticker, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY, RESOLVE_BACKOFF_SECONDS
+        "[BOOT] BASE_URL=%s KALSHI_KEY_ID=%s SERIES_PREFIX=%s SERIES_TICKER=%s POLL_SECONDS=%.2f RESOLVE_EVERY_SECONDS=%d BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s RESOLVE_BACKOFF_SECONDS=%d",
+        BASE_URL, _redact(KALSHI_KEY_ID), series_prefix, series_ticker, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY, RESOLVE_BACKOFF_SECONDS
     )
+    log.info("[BOOT] Private key loaded OK (b64)")
 
     active_ticker: Optional[str] = None
     next_resolve_at = 0.0
@@ -365,7 +383,6 @@ def main():
                 if new_ticker and new_ticker != active_ticker:
                     log.info("[MARKET] Switched active ticker -> %s", new_ticker)
                     active_ticker = new_ticker
-                    # reset one-time logs when switching markets
                     ob_sampled = False
                     parse_warned = False
 
@@ -382,7 +399,6 @@ def main():
 
             ob = get_orderbook(private_key, active_ticker)
 
-            # One-time schema sample to lock down the real format
             if LOG_ORDERBOOK_SAMPLE and not ob_sampled:
                 y = ob.get("yes") if isinstance(ob, dict) else None
                 preview = None
@@ -414,7 +430,7 @@ def main():
                 log.info("[SPREAD] %s YES bid=%dc qty=%d | ask=%dc qty=%d | spread=%dc",
                          active_ticker, bid["price_cents"], bid["count"], ask["price_cents"], ask["count"], spread)
 
-            # Only place orders when we have at least a parsed book (prevents blind firing)
+            # Strategy unchanged: still places a YES buy at BUY_PRICE_CENTS each loop
             create_order_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
 
         except Exception as e:
