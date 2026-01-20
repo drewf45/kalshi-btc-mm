@@ -6,7 +6,7 @@ import uuid
 import logging
 from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -25,20 +25,12 @@ log = logging.getLogger("kalshi-bot")
 
 
 # -----------------------------
-# Config
+# Config (NO HARD FAILS ON ENV HERE)
 # -----------------------------
 BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
 
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
-
-if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_B64:
-    raise RuntimeError("Missing Kalshi API credentials")
-
-# ✅ MICRO-CHANGE: rolling series identifier
-SERIES_PREFIX = os.getenv("SERIES_PREFIX", "").strip()  # e.g. KXBTC15m
-if not SERIES_PREFIX:
-    raise RuntimeError("Missing env var: SERIES_PREFIX")
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
 RESOLVE_EVERY_SECONDS = int(os.getenv("RESOLVE_EVERY_SECONDS", "20"))
@@ -62,9 +54,6 @@ def load_private_key_from_b64(b64: str):
     return serialization.load_pem_private_key(key_bytes, password=None)
 
 
-PRIVATE_KEY = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
-
-
 def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
     sign_str = f"{timestamp_ms}{method.upper()}{path}"
     sig = private_key.sign(
@@ -78,51 +67,59 @@ def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
     return base64.b64encode(sig).decode("utf-8")
 
 
-def kalshi_headers(method: str, path: str) -> Dict[str, str]:
+def kalshi_headers(private_key, method: str, path: str) -> Dict[str, str]:
     ts = now_utc_ts_ms()
     return {
         "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
-        "KALSHI-ACCESS-SIGNATURE": sign_request(PRIVATE_KEY, ts, method, path),
+        "KALSHI-ACCESS-SIGNATURE": sign_request(private_key, ts, method, path),
         "KALSHI-ACCESS-TIMESTAMP": str(ts),
     }
 
 
-def request(method: str, path: str, params=None, body=None):
+def request(private_key, method: str, path: str, params=None, body=None):
     signed_path = f"{path}?{urlencode(params)}" if params else path
     resp = requests.request(
         method=method,
         url=f"{BASE_URL}{path}",
-        headers=kalshi_headers(method, signed_path),
+        headers=kalshi_headers(private_key, method, signed_path),
         params=params,
         json=body,
         timeout=15,
     )
-    return resp.status_code, resp.json()
+    code = resp.status_code
+    try:
+        data = resp.json()
+    except Exception:
+        data = resp.text
+    log.info("[REQ] %s %s -> HTTP=%s", method, signed_path, code)
+    return code, data
 
 
 # -----------------------------
-# Market resolution (MICRO-CHANGE)
+# Market resolution
 # -----------------------------
-def list_markets(limit=200, cursor=None):
+def list_markets(private_key, limit=200, cursor=None):
     params = {"limit": limit}
     if cursor:
         params["cursor"] = cursor
-    code, data = request("GET", "/trade-api/v2/markets", params=params)
+    code, data = request(private_key, "GET", "/trade-api/v2/markets", params=params)
     if code != 200:
-        raise RuntimeError(data)
-    return data.get("markets", []), data.get("cursor")
+        raise RuntimeError(f"List markets failed: {data}")
+    markets = data.get("markets", [])
+    next_cursor = data.get("cursor")
+    return markets, next_cursor
 
 
-def resolve_active_ticker(series_prefix: str) -> Optional[str]:
+def resolve_active_ticker(private_key, series_prefix: str) -> Optional[str]:
     now_ms = now_utc_ts_ms()
     best: Optional[Tuple[int, str]] = None  # (delta_ms, ticker)
 
     cursor = None
     for _ in range(5):
-        markets, cursor = list_markets(cursor=cursor)
+        markets, cursor = list_markets(private_key, cursor=cursor)
         for m in markets:
-            t = m.get("ticker", "")
+            t = (m.get("ticker") or "").strip()
             if not t.startswith(series_prefix):
                 continue
 
@@ -152,10 +149,10 @@ def resolve_active_ticker(series_prefix: str) -> Optional[str]:
 # -----------------------------
 # Trading
 # -----------------------------
-def get_orderbook(ticker: str):
-    code, data = request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
+def get_orderbook(private_key, ticker: str):
+    code, data = request(private_key, "GET", f"/trade-api/v2/markets/{ticker}/orderbook")
     if code != 200:
-        raise RuntimeError(data)
+        raise RuntimeError(f"Orderbook failed: {data}")
     return data["orderbook"]
 
 
@@ -168,45 +165,74 @@ def parse_yes_best(orderbook):
     return best_bid, best_ask
 
 
-def create_order_yes_buy(ticker, price, count):
+def create_order_yes_buy(private_key, ticker, price, count):
     body = {
         "ticker": ticker,
         "side": "yes",
         "action": "buy",
         "type": "limit",
-        "count": count,
-        "yes_price": price,
+        "count": int(count),
+        "yes_price": int(price),
         "client_order_id": str(uuid.uuid4()),
-        "post_only": POST_ONLY,
+        "post_only": bool(POST_ONLY),
     }
-    code, data = request("POST", "/trade-api/v2/portfolio/orders", body=body)
+    code, data = request(private_key, "POST", "/trade-api/v2/portfolio/orders", body=body)
     if code not in (200, 201):
-        raise RuntimeError(data)
+        raise RuntimeError(f"Place order failed: {data}")
 
 
 # -----------------------------
 # Main loop
 # -----------------------------
 def main():
+    # ✅ MICRO-CHANGE: accept your current env var name(s)
+    series_prefix = (
+        os.getenv("SERIES_PREFIX", "").strip()
+        or os.getenv("Series_PREFIC", "").strip()   # your current env var
+        or os.getenv("SERIES_PREFIC", "").strip()
+        or os.getenv("SERIES_PREFIx", "").strip()
+    )
+
+    # ✅ MICRO-CHANGE: validate inside main and do not crash-loop the container
+    if not series_prefix:
+        log.error("[CONFIG] Missing series prefix. Set SERIES_PREFIX (preferred) or your existing Series_PREFIC.")
+        while True:
+            time.sleep(30)
+
+    if not KALSHI_KEY_ID:
+        log.error("[CONFIG] Missing KALSHI_KEY_ID")
+        while True:
+            time.sleep(30)
+
+    if not KALSHI_PRIVATE_KEY_B64:
+        log.error("[CONFIG] Missing KALSHI_PRIVATE_KEY_B64")
+        while True:
+            time.sleep(30)
+
+    private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
+
+    log.info("[BOOT] BASE_URL=%s SERIES_PREFIX=%s POLL_SECONDS=%.2f RESOLVE_EVERY_SECONDS=%d BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s",
+             BASE_URL, series_prefix, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY)
+
     active_ticker = None
-    last_resolve = 0
+    last_resolve = 0.0
 
     while True:
         try:
             now = time.time()
-            if active_ticker is None or now - last_resolve > RESOLVE_EVERY_SECONDS:
-                new_ticker = resolve_active_ticker(SERIES_PREFIX)
+            if active_ticker is None or (now - last_resolve) > RESOLVE_EVERY_SECONDS:
+                new_ticker = resolve_active_ticker(private_key, series_prefix)
                 if new_ticker and new_ticker != active_ticker:
                     log.info("[MARKET] Switched active ticker -> %s", new_ticker)
                     active_ticker = new_ticker
                 last_resolve = now
 
             if not active_ticker:
-                log.warning("[MARKET] No active ticker resolved yet")
+                log.warning("[MARKET] No active ticker resolved yet for prefix=%s", series_prefix)
                 time.sleep(2)
                 continue
 
-            ob = get_orderbook(active_ticker)
+            ob = get_orderbook(private_key, active_ticker)
             bid, ask = parse_yes_best(ob)
 
             if bid and ask and LOG_SPREAD:
@@ -219,8 +245,8 @@ def main():
                     spread,
                 )
 
-            # still blind order (unchanged on purpose)
-            create_order_yes_buy(active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
+            # Still blind order (unchanged intentionally for micro-iteration discipline)
+            create_order_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
 
         except Exception as e:
             log.exception("[LOOPERR] %s", e)
