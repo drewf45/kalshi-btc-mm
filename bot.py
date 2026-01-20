@@ -29,7 +29,6 @@ log = logging.getLogger("kalshi-bot")
 # -----------------------------
 BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
 
-# You said: env vars are KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_B64
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
 
@@ -38,16 +37,18 @@ if not KALSHI_KEY_ID:
 if not KALSHI_PRIVATE_KEY_B64:
     raise RuntimeError("Missing env var: KALSHI_PRIVATE_KEY_B64")
 
-# Market / strategy
 MARKET_TICKER = os.getenv("MARKET_TICKER", "").strip()
 if not MARKET_TICKER:
     raise RuntimeError("Missing env var: MARKET_TICKER (example: KXBTC15M-26JAN201245-45)")
 
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))  # you said 60 was accidental
-BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))  # default 1c
-BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))  # contracts
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
+BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
+BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
 POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "5"))
+
+# Micro-change toggles (safe defaults)
+LOG_SPREAD = os.getenv("LOG_SPREAD", "true").lower() in ("1", "true", "yes", "y")
 
 
 # -----------------------------
@@ -90,8 +91,6 @@ def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
     """
     Kalshi v2 signature string:
       <timestamp_ms><METHOD><path>
-    Example:
-      1768930882027POST/trade-api/v2/portfolio/orders
     """
     sign_str = f"{timestamp_ms}{method.upper()}{path}"
     sig = private_key.sign(
@@ -116,7 +115,12 @@ def kalshi_headers(method: str, path: str) -> Dict[str, str]:
     }
 
 
-def request(method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+def request(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None
+) -> Tuple[int, Any]:
     """
     Signs ONLY the path (including query string) and sends JSON body if present.
     """
@@ -127,10 +131,8 @@ def request(method: str, path: str, params: Optional[Dict[str, Any]] = None, bod
         signed_path = path
 
     headers = kalshi_headers(method, signed_path)
-
     url = f"{BASE_URL}{path}"
 
-    # Debug signature inputs
     if os.getenv("SIGN_DEBUG", "true").lower() in ("1", "true", "yes", "y"):
         body_bytes = b"" if body is None else json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
         log.info(
@@ -162,12 +164,14 @@ def request(method: str, path: str, params: Optional[Dict[str, Any]] = None, bod
     except Exception:
         data = resp.text
 
-    log.info("[REQ] %s %s -> HTTP=%s shape=%s keys=%s",
-             method.upper(),
-             signed_path,
-             code,
-             type(data).__name__,
-             list(data.keys()) if isinstance(data, dict) else None)
+    log.info(
+        "[REQ] %s %s -> HTTP=%s shape=%s keys=%s",
+        method.upper(),
+        signed_path,
+        code,
+        type(data).__name__,
+        list(data.keys()) if isinstance(data, dict) else None
+    )
 
     return code, data
 
@@ -183,49 +187,124 @@ def get_orderbook(ticker: str) -> Dict[str, Any]:
     return data.get("orderbook", {})
 
 
+# -----------------------------
+# Micro-change #1:
+# Parse YES best bid + YES best ask (spread awareness)
+# -----------------------------
+def _coerce_price_to_cents(p: Any) -> Optional[int]:
+    """
+    Accepts price formats like:
+      - 0.52 (dollars) -> 52
+      - "0.52" -> 52
+      - 52 (already cents) -> 52
+      - "52" -> 52
+    Returns int cents or None.
+    """
+    if p is None:
+        return None
+    try:
+        if isinstance(p, str):
+            s = p.strip()
+            if not s:
+                return None
+            if "." in s:
+                return int(round(float(s) * 100))
+            return int(s)
+        if isinstance(p, int):
+            return int(p)
+        if isinstance(p, float):
+            if p <= 1.0:
+                return int(round(p * 100))
+            return int(round(p))
+    except Exception:
+        return None
+    return None
+
+
+def _pick_qty(level: Dict[str, Any]) -> Optional[int]:
+    for k in ("qty", "count", "quantity", "size", "amount"):
+        if k in level and level[k] is not None:
+            try:
+                return int(level[k])
+            except Exception:
+                pass
+    return None
+
+
+def _best_from_levels(levels: Any, want: str) -> Optional[Dict[str, int]]:
+    """
+    levels: list[dict]
+    want: "bid" or "ask"
+    Returns {"price_cents": int, "qty": int} or None
+    """
+    if not isinstance(levels, list) or not levels:
+        return None
+
+    parsed: List[Tuple[int, int]] = []
+    for lv in levels:
+        if not isinstance(lv, dict):
+            continue
+
+        price_raw = lv.get("price_cents", lv.get("price", lv.get("p")))
+        price_cents = _coerce_price_to_cents(price_raw)
+        qty = _pick_qty(lv)
+        if price_cents is None or qty is None:
+            continue
+        parsed.append((price_cents, qty))
+
+    if not parsed:
+        return None
+
+    # bids: max price. asks: min price.
+    if want == "bid":
+        price_cents, qty = max(parsed, key=lambda x: x[0])
+    else:
+        price_cents, qty = min(parsed, key=lambda x: x[0])
+
+    return {"price_cents": int(price_cents), "qty": int(qty)}
+
+
 def parse_best_levels(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
     """
-    Conservative parsing: handle common Kalshi orderbook shapes.
-    We only need best bid/ask for YES/NO eventually, but right now you’re YES-only.
+    Conservative parsing for best bid/ask on YES/NO.
+    Micro-change: ensure YES best bid is parsed (not only ask),
+    and log spread sanity downstream.
     """
-    best = {"yes_best_bid": None, "yes_best_ask": None, "no_best_bid": None, "no_best_ask": None}
+    best: Dict[str, Optional[Dict[str, int]]] = {
+        "yes_best_bid": None,
+        "yes_best_ask": None,
+        "no_best_bid": None,
+        "no_best_ask": None,
+    }
 
-    # Some shapes use separate arrays, some nested. We’ll try likely keys.
-    # If your current log already prints BEST, keep this safe.
-    def best_from_side(arr: Any, want: str) -> Optional[Dict[str, int]]:
-        if not isinstance(arr, list) or not arr:
-            return None
-        # entries can be {"price":x,"count":y} or {"price_cents":x,"qty":y}
-        first = arr[0]
-        if not isinstance(first, dict):
-            return None
-        price = first.get("price_cents", first.get("price"))
-        qty = first.get("qty", first.get("count"))
-        if price is None or qty is None:
-            return None
-        return {"price_cents": int(price), "qty": int(qty)}
-
-    # Try common:
-    # orderbook = {"yes": {"bids": [...], "asks":[...]}, "no": {...}}
-    if "yes" in orderbook and isinstance(orderbook["yes"], dict):
+    # Shape A:
+    # {"yes":{"bids":[...],"asks":[...]}, "no":{...}}
+    if isinstance(orderbook.get("yes"), dict):
         y = orderbook["yes"]
-        best["yes_best_bid"] = best_from_side(y.get("bids"), "bid")
-        best["yes_best_ask"] = best_from_side(y.get("asks"), "ask")
-    if "no" in orderbook and isinstance(orderbook["no"], dict):
-        n = orderbook["no"]
-        best["no_best_bid"] = best_from_side(n.get("bids"), "bid")
-        best["no_best_ask"] = best_from_side(n.get("asks"), "ask")
+        best["yes_best_bid"] = _best_from_levels(y.get("bids"), "bid")
+        best["yes_best_ask"] = _best_from_levels(y.get("asks"), "ask")
 
-    # Other possible shape:
-    # orderbook = {"bids": {"yes":[...],"no":[...]}, "asks": {"yes":[...],"no":[...]}}
-    if best["yes_best_bid"] is None and isinstance(orderbook.get("bids"), dict):
-        best["yes_best_bid"] = best_from_side(orderbook["bids"].get("yes"), "bid")
-    if best["yes_best_ask"] is None and isinstance(orderbook.get("asks"), dict):
-        best["yes_best_ask"] = best_from_side(orderbook["asks"].get("yes"), "ask")
-    if best["no_best_bid"] is None and isinstance(orderbook.get("bids"), dict):
-        best["no_best_bid"] = best_from_side(orderbook["bids"].get("no"), "bid")
-    if best["no_best_ask"] is None and isinstance(orderbook.get("asks"), dict):
-        best["no_best_ask"] = best_from_side(orderbook["asks"].get("no"), "ask")
+    if isinstance(orderbook.get("no"), dict):
+        n = orderbook["no"]
+        best["no_best_bid"] = _best_from_levels(n.get("bids"), "bid")
+        best["no_best_ask"] = _best_from_levels(n.get("asks"), "ask")
+
+    # Shape B:
+    # {"bids":{"yes":[...],"no":[...]}, "asks":{"yes":[...],"no":[...]}}
+    bids = orderbook.get("bids")
+    asks = orderbook.get("asks")
+
+    if isinstance(bids, dict):
+        if best["yes_best_bid"] is None:
+            best["yes_best_bid"] = _best_from_levels(bids.get("yes"), "bid")
+        if best["no_best_bid"] is None:
+            best["no_best_bid"] = _best_from_levels(bids.get("no"), "bid")
+
+    if isinstance(asks, dict):
+        if best["yes_best_ask"] is None:
+            best["yes_best_ask"] = _best_from_levels(asks.get("yes"), "ask")
+        if best["no_best_ask"] is None:
+            best["no_best_ask"] = _best_from_levels(asks.get("no"), "ask")
 
     return best
 
@@ -259,8 +338,7 @@ def list_orders_all(status: str, limit: int = 200, max_pages: int = 5) -> List[D
 
 def create_order_yes_buy(ticker: str, yes_price_cents: int, count: int) -> Dict[str, Any]:
     """
-    FIX: send Kalshi Create Order body with REQUIRED lowercase keys:
-      ticker, side, action, type, count, and yes_price
+    Create Order body with required lowercase keys.
     """
     path = "/trade-api/v2/portfolio/orders"
 
@@ -285,14 +363,36 @@ def create_order_yes_buy(ticker: str, yes_price_cents: int, count: int) -> Dict[
 # Main loop
 # -----------------------------
 def main():
-    log.info("[BOOT] BASE_URL=%s MARKET_TICKER=%s POLL_SECONDS=%.2f BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s",
-             BASE_URL, MARKET_TICKER, POLL_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY)
+    log.info(
+        "[BOOT] BASE_URL=%s MARKET_TICKER=%s POLL_SECONDS=%.2f BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s",
+        BASE_URL, MARKET_TICKER, POLL_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY
+    )
 
     while True:
         try:
             ob = get_orderbook(MARKET_TICKER)
             best = parse_best_levels(ob)
             log.info("[BEST] %s", json.dumps(best))
+
+            # Micro-change: log spread for YES (maker must see bid/ask)
+            if LOG_SPREAD:
+                yb = best.get("yes_best_bid")
+                ya = best.get("yes_best_ask")
+                if yb and ya:
+                    spread = int(ya["price_cents"]) - int(yb["price_cents"])
+                    log.info(
+                        "[SPREAD] YES bid=%dc(qty=%s) ask=%dc(qty=%s) spread=%dc",
+                        int(yb["price_cents"]), yb.get("qty"),
+                        int(ya["price_cents"]), ya.get("qty"),
+                        spread,
+                    )
+                    if spread < 0:
+                        log.warning(
+                            "[SPREADWARN] ask < bid (unexpected). raw_yes_bid=%s raw_yes_ask=%s",
+                            yb, ya
+                        )
+                else:
+                    log.warning("[SPREAD] Missing YES bid/ask (yb=%s ya=%s). Orderbook shape likely different.", yb, ya)
 
             resting = list_orders_all("resting", limit=200, max_pages=MAX_PAGES)
             log.info("[ORDERS] resting_count=%d", len(resting))
