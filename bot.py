@@ -23,8 +23,6 @@ log = logging.getLogger("kalshi-bot")
 # -----------------------------
 # Config
 # -----------------------------
-# The key fix: Kalshi "markets/orderbook" reads are now served from api.elections.kalshi.com,
-# while portfolio endpoints still work from trading-api.kalshi.com (for many accounts/keys).
 ELECTIONS_BASE_URL = os.getenv("KALSHI_ELECTIONS_BASE_URL", "https://api.elections.kalshi.com").strip()
 TRADING_BASE_URL = os.getenv("KALSHI_TRADING_BASE_URL", "https://trading-api.kalshi.com").strip()
 
@@ -65,7 +63,6 @@ def load_private_key_from_b64(b64: str):
 
 
 def sign_request(private_key, timestamp_ms: int, method: str, signed_path: str) -> str:
-    # Kalshi expects: timestamp + METHOD + PATH(+query)
     sign_str = f"{timestamp_ms}{method.upper()}{signed_path}"
     sig = private_key.sign(
         sign_str.encode("utf-8"),
@@ -86,24 +83,19 @@ def kalshi_headers(private_key, method: str, signed_path: str) -> Dict[str, str]
         "KALSHI-ACCESS-SIGNATURE": sign_request(private_key, ts, method, signed_path),
         "KALSHI-ACCESS-TIMESTAMP": str(ts),
     }
-    # optional, only if you're actually using it
     if SUBACCOUNT:
         h["KALSHI-ACCESS-SUBACCOUNT"] = SUBACCOUNT
     return h
 
 
 def _route_base_url(path: str) -> str:
-    """
-    KEY FIX for your current failure:
-    - /trade-api/v2/markets* and /orderbook reads => elections host
-    - /trade-api/v2/portfolio/* (positions/orders) => trading host
-    """
     p = path or ""
+    # reads for market listings/orderbooks -> elections host
     if p.startswith("/trade-api/v2/markets") or "/orderbook" in p:
         return ELECTIONS_BASE_URL
+    # portfolio endpoints -> trading host
     if p.startswith("/trade-api/v2/portfolio"):
         return TRADING_BASE_URL
-    # default safe choice: elections (where the "moved" message points)
     return ELECTIONS_BASE_URL
 
 
@@ -188,9 +180,6 @@ def list_markets(private_key, params: Dict[str, Any]) -> Tuple[int, List[Dict[st
 
 
 def resolve_active_ticker(private_key, series_prefix: str) -> Tuple[Optional[str], bool]:
-    """
-    Returns: (ticker_or_none, hit_rate_limit_bool)
-    """
     sp = (series_prefix or "").strip()
     if not sp:
         return None, False
@@ -239,7 +228,7 @@ def resolve_active_ticker(private_key, series_prefix: str) -> Tuple[Optional[str
 
 
 # -----------------------------
-# Orderbook parsing
+# Orderbook parsing (FIXED)
 # -----------------------------
 def get_orderbook(private_key, ticker: str) -> Dict[str, Any]:
     code, data, _ = request_json(private_key, "GET", f"/trade-api/v2/markets/{ticker}/orderbook")
@@ -269,59 +258,108 @@ def _extract_qty(level: Dict[str, Any]) -> int:
     return 0
 
 
+def _normalize_levels(levels: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(levels, list):
+        return out
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        p = _extract_price_cents(lvl)
+        if p is None:
+            continue
+        out.append({"price_cents": p, "count": _extract_qty(lvl), "raw": lvl})
+    return out
+
+
+def _best_bid(levels: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return max(levels, key=lambda x: x["price_cents"]) if levels else None
+
+
+def _best_ask(levels: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return min(levels, key=lambda x: x["price_cents"]) if levels else None
+
+
 def parse_yes_best(orderbook: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Your logs show: orderbook["yes"] is None (yes_type=NoneType).
+    So the API is using a different shape than {"yes": {...}}.
+
+    This parser now supports (in order):
+      1) { "yes_bids": [...], "yes_asks": [...] }
+      2) { "bids": [...], "asks": [...]} where each level has outcome/side fields ("yes"/"no")
+      3) { "yes": { "bids": [...], "asks": [...] } } (old shape)
+      4) Any keys that look like yes+bid/ask (best-effort)
+    """
     if not isinstance(orderbook, dict):
         return None, None
 
+    # --- Shape 1: yes_bids / yes_asks (common)
+    yes_bids = orderbook.get("yes_bids") or orderbook.get("yesBid") or orderbook.get("yes_bid") or orderbook.get("yesBids")
+    yes_asks = orderbook.get("yes_asks") or orderbook.get("yesAsk") or orderbook.get("yes_ask") or orderbook.get("yesAsks")
+    if isinstance(yes_bids, list) or isinstance(yes_asks, list):
+        nb = _normalize_levels(yes_bids)
+        na = _normalize_levels(yes_asks)
+        return _best_bid(nb), _best_ask(na)
+
+    # --- Shape 2: top-level bids/asks with outcome flag per level
+    bids = orderbook.get("bids")
+    asks = orderbook.get("asks")
+    if isinstance(bids, list) or isinstance(asks, list):
+        yb: List[Dict[str, Any]] = []
+        ya: List[Dict[str, Any]] = []
+
+        def is_yes_level(lvl: Dict[str, Any]) -> bool:
+            # try multiple common fields
+            for k in ("outcome", "side", "contract", "token", "leg", "name"):
+                v = lvl.get(k)
+                if v is None:
+                    continue
+                s = str(v).lower()
+                if s == "yes":
+                    return True
+            # sometimes "ticker" includes "-YES" etc
+            tv = str(lvl.get("ticker") or "").lower()
+            if "yes" in tv and "no" not in tv:
+                return True
+            return False
+
+        for lvl in bids or []:
+            if isinstance(lvl, dict) and is_yes_level(lvl):
+                p = _extract_price_cents(lvl)
+                if p is not None:
+                    yb.append({"price_cents": p, "count": _extract_qty(lvl), "raw": lvl})
+        for lvl in asks or []:
+            if isinstance(lvl, dict) and is_yes_level(lvl):
+                p = _extract_price_cents(lvl)
+                if p is not None:
+                    ya.append({"price_cents": p, "count": _extract_qty(lvl), "raw": lvl})
+
+        if yb or ya:
+            return _best_bid(yb), _best_ask(ya)
+
+    # --- Shape 3: old nested yes dict
     y = orderbook.get("yes")
-
-    # Shape A: dict with bids/asks
     if isinstance(y, dict):
-        bids = y.get("bids", []) if isinstance(y.get("bids", []), list) else []
-        asks = y.get("asks", []) if isinstance(y.get("asks", []), list) else []
+        nb = _normalize_levels(y.get("bids"))
+        na = _normalize_levels(y.get("asks"))
+        return _best_bid(nb), _best_ask(na)
 
-        def norm(level: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not isinstance(level, dict):
-                return None
-            p = _extract_price_cents(level)
-            if p is None:
-                return None
-            return {"price_cents": p, "count": _extract_qty(level), "raw": level}
+    # --- Shape 4: best-effort key scan (yes+bid/ask)
+    keys = [k for k in orderbook.keys() if isinstance(k, str)]
+    cand_yes_bid = None
+    cand_yes_ask = None
+    for k in keys:
+        kl = k.lower()
+        if "yes" in kl and "bid" in kl:
+            cand_yes_bid = orderbook.get(k)
+        if "yes" in kl and ("ask" in kl or "offer" in kl):
+            cand_yes_ask = orderbook.get(k)
 
-        nbids = [norm(l) for l in bids]
-        nasks = [norm(l) for l in asks]
-        nbids = [x for x in nbids if x]
-        nasks = [x for x in nasks if x]
-
-        best_bid = max(nbids, key=lambda x: x["price_cents"]) if nbids else None
-        best_ask = min(nasks, key=lambda x: x["price_cents"]) if nasks else None
-        return best_bid, best_ask
-
-    # Shape B: list of levels
-    if isinstance(y, list):
-        bids: List[Dict[str, Any]] = []
-        asks: List[Dict[str, Any]] = []
-
-        for item in y:
-            if not isinstance(item, dict):
-                continue
-            p = _extract_price_cents(item)
-            if p is None:
-                continue
-            side = str(item.get("side") or item.get("type") or item.get("action") or "").lower()
-            lvl = {"price_cents": p, "count": _extract_qty(item), "raw": item}
-
-            if side in ("bid", "buy", "bids"):
-                bids.append(lvl)
-            elif side in ("ask", "sell", "asks", "offer"):
-                asks.append(lvl)
-            else:
-                # unknown side => don't guess
-                pass
-
-        best_bid = max(bids, key=lambda x: x["price_cents"]) if bids else None
-        best_ask = min(asks, key=lambda x: x["price_cents"]) if asks else None
-        return best_bid, best_ask
+    nb = _normalize_levels(cand_yes_bid)
+    na = _normalize_levels(cand_yes_ask)
+    if nb or na:
+        return _best_bid(nb), _best_ask(na)
 
     return None, None
 
@@ -337,15 +375,9 @@ def get_positions(private_key) -> Dict[str, Any]:
 
 
 def has_position_in_ticker(positions_payload: Dict[str, Any], ticker: str) -> bool:
-    """
-    Keep conservative: if we can't parse positions shape, return False (do not block trading).
-    """
     if not isinstance(positions_payload, dict):
         return False
 
-    # Common shapes:
-    # - {"positions":[{"ticker":"...","position":...}, ...]}
-    # - {"market_positions":[...]}
     for key in ("positions", "market_positions", "portfolio_positions"):
         arr = positions_payload.get(key)
         if isinstance(arr, list):
@@ -353,7 +385,6 @@ def has_position_in_ticker(positions_payload: Dict[str, Any], ticker: str) -> bo
                 if not isinstance(p, dict):
                     continue
                 if str(p.get("ticker") or "").strip() == ticker:
-                    # any nonzero size?
                     for sk in ("position", "quantity", "count", "shares", "size"):
                         if p.get(sk) is not None:
                             try:
@@ -365,10 +396,6 @@ def has_position_in_ticker(positions_payload: Dict[str, Any], ticker: str) -> bo
 
 
 def place_yes_buy(private_key, ticker: str, price_cents: int, count: int) -> None:
-    """
-    NOTE: Your most recent blocker was resolver 401 "moved". That is fixed by routing.
-    This keeps the existing order format you’ve been using.
-    """
     body = {
         "ticker": ticker,
         "side": "yes",
@@ -386,26 +413,16 @@ def place_yes_buy(private_key, ticker: str, price_cents: int, count: int) -> Non
 
 
 def safe_maker_buy_price(desired: int, best_bid: Optional[int], best_ask: Optional[int]) -> Optional[int]:
-    """
-    If POST_ONLY is on, you cannot cross the ask.
-    So enforce: price < best_ask (if best_ask exists).
-    """
     p = int(desired)
 
     if best_ask is not None and POST_ONLY:
         if p >= best_ask:
             p = best_ask - max(1, IMPROVE_TICKS)
 
-    # also keep in bounds
     if p < 1:
         return None
     if p > 99:
         p = 99
-
-    # Optional: don't place below bid by a mile — but keep it simple.
-    # If you want to be closer to the market, uncomment:
-    # if best_bid is not None:
-    #     p = max(p, min(99, best_bid + 0))
 
     return p
 
@@ -462,7 +479,6 @@ def main():
         try:
             now = time.time()
 
-            # Resolve ticker periodically
             if active_ticker is None or now >= next_resolve_at:
                 new_ticker, hit_rl = resolve_active_ticker(private_key, SERIES_PREFIX)
 
@@ -485,23 +501,27 @@ def main():
 
                 next_resolve_at = now + RESOLVE_EVERY_SECONDS
 
-            # Fetch orderbook
             ob = get_orderbook(private_key, active_ticker)
 
+            # FIX: log real orderbook keys + previews so you can see the actual shape
             if LOG_ORDERBOOK_SAMPLE and not ob_sampled:
-                y = ob.get("yes") if isinstance(ob, dict) else None
-                preview = None
-                if isinstance(y, list):
-                    preview = y[:3]
-                elif isinstance(y, dict):
-                    preview = {
-                        "keys": list(y.keys())[:10],
-                        "bids_preview": (y.get("bids") or [])[:2] if isinstance(y.get("bids"), list) else None,
-                        "asks_preview": (y.get("asks") or [])[:2] if isinstance(y.get("asks"), list) else None,
-                    }
-                else:
-                    preview = {"type": str(type(y)), "value_preview": str(y)[:200]}
-                log.info("[OB] %s yes_type=%s yes_preview=%s", active_ticker, type(y).__name__, preview)
+                keys = sorted([k for k in ob.keys() if isinstance(k, str)])
+                preview: Dict[str, Any] = {"keys": keys[:30]}
+
+                # add quick previews for anything that looks like yes/bid/ask
+                def prev(x: Any):
+                    if isinstance(x, list):
+                        return x[:2]
+                    if isinstance(x, dict):
+                        return {kk: x[kk] for kk in list(x.keys())[:8]}
+                    return x
+
+                for k in keys:
+                    kl = k.lower()
+                    if ("yes" in kl and ("bid" in kl or "ask" in kl or "offer" in kl)) or k in ("bids", "asks", "yes"):
+                        preview[k] = prev(ob.get(k))
+
+                log.info("[OB] %s orderbook_preview=%s", active_ticker, preview)
                 ob_sampled = True
 
             bid, ask = parse_yes_best(ob)
@@ -527,15 +547,12 @@ def main():
                     spread,
                 )
 
-            # Optional: if you want "only one open contract at a time" (you mentioned it)
-            # We'll skip placing new orders if you already have a position in this ticker.
             pos_payload = get_positions(private_key)
             if has_position_in_ticker(pos_payload, active_ticker):
                 log.info("[POS] Already have position in %s; skipping new order.", active_ticker)
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Maker-safe price (prevents "post only cross" if you use aggressive BUY_PRICE_CENTS)
             price_to_post = safe_maker_buy_price(BUY_PRICE_CENTS, best_bid, best_ask)
             if price_to_post is None:
                 log.info("[ORDER] No safe maker price (desired=%d bid=%s ask=%s). Skipping.", BUY_PRICE_CENTS, best_bid, best_ask)
