@@ -5,7 +5,7 @@ import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
-from urllib.parse import urlencode  # ✅ ADDED
+from urllib.parse import urlencode
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -104,10 +104,9 @@ class KalshiClient:
         self.session.headers.update({"Content-Type": "application/json"})
         self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
 
-    # ✅ CHANGED: use PSS and do NOT include body in the signature payload
+    # RSA-PSS signature of: timestamp + METHOD + PATH (no body)
     def _sign(self, method: str, path: str, ts: int, body: str) -> str:
         payload = f"{ts}{method.upper()}{path}".encode("utf-8")
-
         sig = self.private_key.sign(
             payload,
             asy_padding.PSS(
@@ -150,7 +149,6 @@ class KalshiClient:
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, Any, str]:
-        # build exact path including query string before signing
         path_q = path
         if params:
             items: List[Tuple[str, Any]] = []
@@ -172,7 +170,8 @@ class KalshiClient:
             body_str = json.dumps(json_body, separators=(",", ":"))
             data = body_str
 
-        # ✅ ONLY CHANGE: for GET /portfolio/orders, sign WITHOUT the query string
+        # NOTE: you previously had a special-case for signing /portfolio/orders without query.
+        # Keep it to avoid breaking what you already fixed.
         sign_path = path_q
         if method.upper() == "GET" and path.endswith("/portfolio/orders") and params:
             sign_path = path  # sign only the base path
@@ -249,7 +248,6 @@ class KalshiClient:
         orders = body.get("orders", []) if isinstance(body, dict) else []
         return orders
 
-    # ✅ ADDED: check fills for the specific order
     def get_filled_orders(self, limit: int = 200) -> List[Dict[str, Any]]:
         if not self.api_prefix:
             self.discover_prefix()
@@ -264,19 +262,26 @@ class KalshiClient:
         orders = body.get("orders", []) if isinstance(body, dict) else []
         return orders
 
-    # ✅ ADDED (PART OF THE 2-MINUTE ESCALATION CHANGE): cancel an order so we don't stack exposure
+    # ✅ ADDED: fetch single order status (fast + exact)
+    def get_order(self, order_id: str) -> Dict[str, Any]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/portfolio/orders/{order_id}"
+        code, body, text = self.request("GET", path)
+        if code != 200:
+            raise RuntimeError(f"Get order failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        return body
+
     def cancel_order(self, order_id: str) -> Tuple[int, Any]:
         if not self.api_prefix:
             self.discover_prefix()
 
-        # try DELETE /portfolio/orders/{order_id}
         path = f"{self.api_prefix}/portfolio/orders/{order_id}"
         code, body, _ = self.request("DELETE", path)
         if code in (200, 204):
             log.info(f"[CANCEL] DELETE {path} -> {code} {safe_json(body)}")
             return code, body
 
-        # fallback: POST /portfolio/orders/{order_id}/cancel
         path2 = f"{self.api_prefix}/portfolio/orders/{order_id}/cancel"
         code2, body2, _ = self.request("POST", path2, json_body={})
         if code2 in (200, 201, 204):
@@ -297,21 +302,46 @@ class KalshiClient:
         return code, body
 
 
-def parse_best_ask(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
+# -----------------------------
+# Orderbook parsing (BIDS ONLY -> implied asks)
+# -----------------------------
+def _best_bid(levels: Any) -> Optional[Dict[str, int]]:
+    # levels = [[price_cents, qty], ...] for BIDS
+    if not isinstance(levels, list) or not levels:
+        return None
+    # best bid = max price
+    p, q = max(levels, key=lambda x: x[0])
+    return {"price_cents": int(p), "qty": int(q)}
+
+
+def parse_best_quotes(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
+    """
+    Kalshi orderbook returns bids only for YES and NO.
+    Implied asks:
+      YES ask = 100 - (best NO bid)
+      NO  ask = 100 - (best YES bid)
+    """
     ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
-    yes = ob.get("yes") or []
-    no = ob.get("no") or []
-    yes_best = None
-    no_best = None
+    yes_bids = ob.get("yes") or []
+    no_bids = ob.get("no") or []
 
-    if isinstance(yes, list) and yes:
-        p, q = min(yes, key=lambda x: x[0])
-        yes_best = {"price_cents": int(p), "qty": int(q)}
-    if isinstance(no, list) and no:
-        p, q = min(no, key=lambda x: x[0])
-        no_best = {"price_cents": int(p), "qty": int(q)}
+    yes_best_bid = _best_bid(yes_bids)
+    no_best_bid = _best_bid(no_bids)
 
-    return {"yes_best_ask": yes_best, "no_best_ask": no_best}
+    yes_best_ask = None
+    no_best_ask = None
+
+    if no_best_bid:
+        yes_best_ask = {"price_cents": int(100 - no_best_bid["price_cents"]), "qty": int(no_best_bid["qty"])}
+    if yes_best_bid:
+        no_best_ask = {"price_cents": int(100 - yes_best_bid["price_cents"]), "qty": int(yes_best_bid["qty"])}
+
+    return {
+        "yes_best_bid": yes_best_bid,
+        "yes_best_ask": yes_best_ask,
+        "no_best_bid": no_best_bid,
+        "no_best_ask": no_best_ask,
+    }
 
 
 def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -344,7 +374,13 @@ def main():
 
     ENABLE_TRADING = env_bool("ENABLE_TRADING", False)
     CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", False)
+
+    # ✅ NEW: fast maker loop for keeping your quote at the intended price
+    LOOP_SECONDS = env_int("LOOP_SECONDS", 1)
+
+    # keep your existing fill/watch cadence separate if you want
     POLL_SECONDS = env_int("POLL_SECONDS", 60)
+
     SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
     MARKET_TICKER = os.getenv("MARKET_TICKER")
     API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
@@ -352,7 +388,7 @@ def main():
 
     FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()
     BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
-    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", BUY_PRICE_CENTS)  # ✅ ADDED
+    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", BUY_PRICE_CENTS)
     TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
     BASE_QTY = env_int("BASE_QTY", 1)
@@ -362,6 +398,7 @@ def main():
 
     log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
     log.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
+    log.info(f"LOOP_SECONDS={LOOP_SECONDS}")
     log.info(f"POLL_SECONDS={POLL_SECONDS}")
     log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
     log.info(f"MARKET_TICKER={MARKET_TICKER}")
@@ -371,7 +408,7 @@ def main():
         f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} "
         f"MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}"
     )
-    log.info(f"SIZING base={BASE_QTY} scale_after_wins=20 mult={SIZE_MULT} cap={SIZE_CAP}")
+    log.info(f"SIZING base={BASE_QTY} scale_after_wins={SCALE_AFTER_WINS} mult={SIZE_MULT} cap={SIZE_CAP}")
 
     if not os.getenv("KALSHI_KEY_ID"):
         raise RuntimeError("Missing env var KALSHI_KEY_ID")
@@ -397,193 +434,130 @@ def main():
             seconds_to_close = int((dt - datetime.now(timezone.utc)).total_seconds())
         log.info(f"[SELECT] Next closing market: {MARKET_TICKER} close={close_time} seconds_to_close={seconds_to_close}")
 
-    ob = client.get_orderbook(MARKET_TICKER)
-    best = parse_best_ask(ob)
-    log.info(f"[BEST] {safe_json(best)}")
+    # -----------------------------
+    # Maker quote loop (BUY side)
+    # -----------------------------
+    side = FARM_SIDE  # you said YES only right now
+    if side != "YES":
+        raise RuntimeError("This version is tuned for YES-only. Set FARM_SIDE=YES.")
 
-    side = FARM_SIDE
     qty = BASE_QTY
 
-    # ✅ MICRO CHANGE (SAFER): step toward the SAME-SIDE ask instead of parity.
-    # This prevents "opposite ask = 1c" from forcing you up to MAX.
-    if side == "YES":
-        yes_best_ask = best.get("yes_best_ask")
-        if not yes_best_ask:
-            raise RuntimeError("No YES ask available.")
-        ask = int(yes_best_ask["price_cents"])
-    else:
-        no_best_ask = best.get("no_best_ask")
-        if not no_best_ask:
-            raise RuntimeError("No NO ask available.")
-        ask = int(no_best_ask["price_cents"])
-
-    # "best bid + 1" behavior, but anchored to ask:
-    # - if ask is 1c, stay at 1c
-    # - otherwise bid 1c below ask (inside the spread)
-    target_buy = ask if ask <= 1 else (ask - 1)
-
-    # apply safety caps
-    target_buy = max(1, min(99, target_buy))
-    target_buy = min(MAX_BUY_PRICE_CENTS, target_buy)
-    # ---------------------------------------------------------------
-
-    log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
-
-    if not (ENABLE_TRADING and CONFIRM_LIVE_TRADING):
-        log.warning("[ORDER] Trading disabled by env. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True to actually place.")
-        return
-
-    try:
-        existing = client.get_resting_orders(limit=200)
-        side_key = "yes" if side == "YES" else "no"
-        already = False
-        for o in existing:
-            if (o.get("ticker") == MARKET_TICKER and
-                o.get("status") == "resting" and
-                o.get("side") == side_key and
-                int(o.get(f"{side_key}_price") or -1) == int(target_buy) and
-                int(o.get("remaining_count") or 0) > 0):
-                already = True
-                break
-        if already:
-            log.warning("[GUARD] Existing resting order found (same ticker/side/price). Skipping new order.")
-            return
-    except Exception as e:
-        log.warning(f"[GUARD] Could not check existing orders (will proceed): {e}")
-
-    payload = {
-        "ticker": MARKET_TICKER,
-        "action": "buy",
-        "type": "limit",
-        "count": qty,
-        "side": "yes" if side == "YES" else "no",
-        "yes_price": target_buy if side == "YES" else None,
-        "no_price": target_buy if side == "NO" else None,
-    }
-    payload = {k: v for k, v in payload.items() if v is not None}
-
-    code, body = client.place_order(payload)
-    log.info(f"[HEARTBEAT] alive order_post_http={code} resp={safe_json(body)}")
-
-    # ✅ MICRO CHANGE ONLY: if/when the buy fills, place ONE sell at buy+profit
-    order_id = None
-    try:
-        if isinstance(body, dict) and isinstance(body.get("order"), dict):
-            order_id = body["order"].get("order_id")
-    except Exception:
-        order_id = None
-
-    if not order_id:
-        log.warning("[EXIT] No order_id returned; cannot watch fills to place exit sell.")
-        while True:
-            time.sleep(POLL_SECONDS)
-
+    active_buy_order_id: Optional[str] = None
+    active_buy_price: Optional[int] = None
     sell_sent = False
-    sell_price = max(1, min(99, int(target_buy) + int(TARGET_PROFIT_CENTS)))
-    sell_side_key = "yes" if side == "YES" else "no"
 
-    log.info(f"[EXIT] Watching for fill of order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
+    target_buy: Optional[int] = None
 
-    # ✅ MICRO CHANGE (YOU SAID "2"): if still RESTING for 2 polls, cancel+replace at +1c (capped)
-    resting_polls = 0
-    escalated = False
-    # ---------------------------------------------------------------
+    log.info("[MM] Starting quote-maintenance loop for BUY (YES).")
 
     while True:
-        time.sleep(POLL_SECONDS)
-
+        # stop maintaining buy once sell is sent (you can change this later)
         if sell_sent:
+            time.sleep(POLL_SECONDS)
             continue
 
-        try:
-            # ✅ MICRO CHANGE PART (2-minute escalation): detect still-resting for THIS order_id
-            still_resting = False
+        # 1) read book + compute desired buy
+        ob = client.get_orderbook(MARKET_TICKER)
+        best = parse_best_quotes(ob)
+        log.info(f"[BEST] {safe_json(best)}")
+
+        yes_bid = best.get("yes_best_bid")
+        yes_ask = best.get("yes_best_ask")  # implied
+
+        if not yes_ask:
+            log.warning("[MM] No implied YES ask (no NO bids). Skipping tick.")
+            time.sleep(LOOP_SECONDS)
+            continue
+
+        ask = int(yes_ask["price_cents"])
+        bid = int(yes_bid["price_cents"]) if yes_bid else 0
+
+        # Desired maker behavior:
+        # - if spread exists, sit at min(ask-1, bid+1) (inside spread / top bid)
+        # - never exceed MAX_BUY_PRICE_CENTS
+        # - never go below 1
+        desired = bid + 1
+        if ask > 1:
+            desired = min(desired, ask - 1)
+        desired = max(1, min(99, desired))
+        desired = min(MAX_BUY_PRICE_CENTS, desired)
+
+        # If user pins BUY_PRICE_CENTS > 0, treat it as a floor target (optional)
+        # Keep it micro: only apply if BUY_PRICE_CENTS > 1
+        if BUY_PRICE_CENTS > 1:
+            desired = max(desired, BUY_PRICE_CENTS)
+
+        target_buy = desired
+        log.info(f"[MM] Desired BUY YES {qty}@{target_buy}c (bid={bid} ask={ask} MAX={MAX_BUY_PRICE_CENTS})")
+
+        if not (ENABLE_TRADING and CONFIRM_LIVE_TRADING):
+            log.warning("[MM] Trading disabled by env. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True to actually trade.")
+            time.sleep(LOOP_SECONDS)
+            continue
+
+        # 2) if we have an active order, check it; cancel/replace if price != desired
+        if active_buy_order_id:
             try:
-                resting = client.get_resting_orders(limit=200)
-                for o in resting:
-                    if o.get("order_id") == order_id:
-                        still_resting = True
-                        break
+                owrap = client.get_order(active_buy_order_id)
+                o = owrap.get("order") if isinstance(owrap, dict) else None
+                status = (o or {}).get("status")
+                remaining = int((o or {}).get("remaining_count") or 0)
+                cur_price = int((o or {}).get("yes_price") or -1)
+
+                if status == "filled" or remaining <= 0:
+                    log.info(f"[MM] BUY filled order_id={active_buy_order_id} price={cur_price} remaining={remaining}")
+                    # place ONE sell at buy+profit
+                    sell_price = max(1, min(99, int(cur_price) + int(TARGET_PROFIT_CENTS)))
+                    sell_payload = {
+                        "ticker": MARKET_TICKER,
+                        "action": "sell",
+                        "type": "limit",
+                        "count": qty,
+                        "side": "yes",
+                        "yes_price": sell_price,
+                    }
+                    scode, sbody = client.place_order(sell_payload)
+                    log.info(f"[EXIT] SELL placed http={scode} resp={safe_json(sbody)}")
+                    sell_sent = True
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                # still resting/open -> ensure price matches desired
+                if cur_price != int(target_buy):
+                    log.info(f"[MM] Drift: active {cur_price}c != desired {target_buy}c. Cancel+replace.")
+                    client.cancel_order(active_buy_order_id)
+                    active_buy_order_id = None
+                    active_buy_price = None
+                else:
+                    # good, keep our queue spot
+                    time.sleep(LOOP_SECONDS)
+                    continue
             except Exception as e:
-                log.warning(f"[EXIT] Could not check resting status: {e}")
-                still_resting = False
+                log.warning(f"[MM] get_order failed for {active_buy_order_id} (will reset): {e}")
+                active_buy_order_id = None
+                active_buy_price = None
 
-            if still_resting:
-                resting_polls += 1
-                log.info(f"[EXIT] Still resting order_id={order_id}. polls={resting_polls}")
+        # 3) no active order -> place desired
+        payload = {
+            "ticker": MARKET_TICKER,
+            "action": "buy",
+            "type": "limit",
+            "count": qty,
+            "side": "yes",
+            "yes_price": int(target_buy),
+        }
+        code, body = client.place_order(payload)
+        log.info(f"[MM] BUY placed http={code} resp={safe_json(body)}")
 
-                if (not escalated) and resting_polls >= 2:
-                    new_buy = max(1, min(99, int(target_buy) + 1))
-                    new_buy = min(MAX_BUY_PRICE_CENTS, new_buy)
+        try:
+            if isinstance(body, dict) and isinstance(body.get("order"), dict):
+                active_buy_order_id = body["order"].get("order_id")
+        except Exception:
+            active_buy_order_id = None
 
-                    if new_buy > int(target_buy):
-                        log.info(f"[ESCALATE] 2 polls resting. Cancel+replace {target_buy}c -> {new_buy}c (order_id={order_id})")
-                        client.cancel_order(order_id)
-
-                        replace_payload = {
-                            "ticker": MARKET_TICKER,
-                            "action": "buy",
-                            "type": "limit",
-                            "count": qty,
-                            "side": "yes" if side == "YES" else "no",
-                            "yes_price": new_buy if side == "YES" else None,
-                            "no_price": new_buy if side == "NO" else None,
-                        }
-                        replace_payload = {k: v for k, v in replace_payload.items() if v is not None}
-
-                        rcode, rbody = client.place_order(replace_payload)
-                        log.info(f"[ESCALATE] Replaced BUY http={rcode} resp={safe_json(rbody)}")
-
-                        new_order_id = None
-                        try:
-                            if isinstance(rbody, dict) and isinstance(rbody.get("order"), dict):
-                                new_order_id = rbody["order"].get("order_id")
-                        except Exception:
-                            new_order_id = None
-
-                        if new_order_id:
-                            order_id = new_order_id
-                            target_buy = int(new_buy)
-                            sell_price = max(1, min(99, int(target_buy) + int(TARGET_PROFIT_CENTS)))
-                            log.info(f"[EXIT] Now watching order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
-                            escalated = True
-                            resting_polls = 0
-                            continue
-                    else:
-                        log.info(f"[ESCALATE] Wanted +1c but capped (target_buy={target_buy} MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS}).")
-                        escalated = True
-            # ---------------------------------------------------------------
-
-            filled = client.get_filled_orders(limit=200)
-            hit = None
-            for o in filled:
-                if o.get("order_id") == order_id:
-                    hit = o
-                    break
-
-            if not hit:
-                log.info(f"[EXIT] Not filled yet order_id={order_id}.")
-                continue
-
-            log.info(f"[EXIT] Filled detected order_id={order_id} fill_count={hit.get('fill_count')} remaining={hit.get('remaining_count')}")
-
-            sell_payload = {
-                "ticker": MARKET_TICKER,
-                "action": "sell",
-                "type": "limit",
-                "count": qty,
-                "side": sell_side_key,
-                "yes_price": sell_price if side == "YES" else None,
-                "no_price": sell_price if side == "NO" else None,
-            }
-            sell_payload = {k: v for k, v in sell_payload.items() if v is not None}
-
-            scode, sbody = client.place_order(sell_payload)
-            log.info(f"[EXIT] SELL placed http={scode} resp={safe_json(sbody)}")
-            sell_sent = True
-
-        except Exception as e:
-            log.warning(f"[EXIT] Error while watching fills / placing sell: {e}")
+        active_buy_price = int(target_buy) if active_buy_order_id else None
+        time.sleep(LOOP_SECONDS)
 
 
 if __name__ == "__main__":
