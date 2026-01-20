@@ -5,10 +5,12 @@ import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
+from urllib.parse import urlencode  # ✅ ADDED
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
+
 
 # -----------------------------
 # Logging
@@ -20,280 +22,575 @@ logging.basicConfig(
 )
 log = logging.getLogger("kalshi-bot")
 
-# -----------------------------
-# Env
-# -----------------------------
-KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://api.kalshi.com")
-KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "")
-KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
-MARKET_TICKER = os.getenv("MARKET_TICKER", "KXBTC15M-26JAN200900-00")
-
-LOOP_SECONDS = float(os.getenv("LOOP_SECONDS", "1"))
-BUY_QTY = int(os.getenv("BUY_QTY", "1"))
-
-# For now: YES-only, keep it simple
-MAX_YES_PRICE_CENTS = int(os.getenv("MAX_YES_PRICE_CENTS", "99"))
-
-SESSION = requests.Session()
-SESSION.headers.update({"Content-Type": "application/json"})
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def now_utc_ts_ms() -> int:
+def now_utc_ts() -> int:
     return int(time.time() * 1000)
+
 
 def iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def load_private_key(path: str):
-    with open(path, "rb") as f:
-        key_bytes = f.read()
-    return serialization.load_pem_private_key(key_bytes, password=None)
 
-PRIVATE_KEY = load_private_key(KALSHI_PRIVATE_KEY_PATH) if KALSHI_PRIVATE_KEY_PATH else None
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-def sha256_b64(data: bytes) -> str:
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(data)
-    return base64.b64encode(digest.finalize()).decode()
 
-def sign_request(method: str, path: str, ts_ms: int, body: bytes) -> Dict[str, str]:
-    """
-    Kalshi signature: sign payload = f"{ts_ms}{method}{path}{sha256(body)}"
-    (Your existing bot already does this; keep consistent with your working auth.)
-    """
-    if PRIVATE_KEY is None:
-        raise RuntimeError("Missing PRIVATE_KEY (set KALSHI_PRIVATE_KEY_PATH).")
-    body_hash_b64 = sha256_b64(body)
-    signing_payload = f"{ts_ms}{method.upper()}{path}{body_hash_b64}".encode()
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or not str(v).strip():
+        return default
+    return int(v)
 
-    signature = PRIVATE_KEY.sign(
-        signing_payload,
-        asy_padding.PKCS1v15(),
-        hashes.SHA256()
-    )
-    sig_b64 = base64.b64encode(signature).decode()
 
-    log.info(
-        "[SIGNDBG] %s %s ts=%sms body_len=%s signing_payload_sha256_b64=%s",
-        method.upper(), path, ts_ms, len(body), sha256_b64(signing_payload)
-    )
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or not str(v).strip():
+        return default
+    return float(v)
 
-    return {
-        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
-    }
 
-def kalshi_request(method: str, path: str, payload: Optional[dict] = None) -> dict:
-    url = f"{KALSHI_API_BASE}{path}"
-    body = b""
-    if payload is not None:
-        body = json.dumps(payload, separators=(",", ":")).encode()
-
-    ts_ms = now_utc_ts_ms()
-    headers = sign_request(method, path, ts_ms, body)
-
-    resp = SESSION.request(method.upper(), url, headers=headers, data=body if body else None, timeout=10)
+def safe_json(obj: Any, max_len: int = 900) -> str:
     try:
-        j = resp.json()
+        s = json.dumps(obj, ensure_ascii=False)
     except Exception:
-        j = {"_raw": resp.text}
+        s = str(obj)
+    if len(s) > max_len:
+        return s[:max_len] + "...(truncated)"
+    return s
 
-    log.info("[HTTP] %s %s -> %s", method.upper(), path, resp.status_code)
-    if resp.status_code >= 400:
-        log.warning("[HTTPERR] %s", j)
-        raise RuntimeError(f"HTTP {resp.status_code}: {j}")
-    return j
+
+# ✅ STEP 1 MICRO-CHANGE: support PATH, PEM, or B64 (Render-friendly) + log which was used
+def load_rsa_private_key_from_env() -> Any:
+    # 1) Secret file path (optional)
+    key_path = (os.getenv("KALSHI_PRIVATE_KEY_PATH") or "").strip()
+    if key_path:
+        try:
+            with open(key_path, "rb") as f:
+                key_bytes = f.read()
+            key = serialization.load_pem_private_key(key_bytes, password=None)
+            log.info(f"Loaded RSA private key from KALSHI_PRIVATE_KEY_PATH={key_path}")
+            return key
+        except Exception as e:
+            raise RuntimeError(f"Failed to load RSA private key from path {key_path}: {e}")
+
+    # 2) Raw PEM string OR base64 PEM
+    pem_or_b64 = os.getenv("KALSHI_PRIVATE_KEY") or ""
+    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64") or ""
+
+    candidate = pem_or_b64.strip() if pem_or_b64.strip() else b64.strip()
+    if not candidate:
+        raise RuntimeError(
+            "Missing env var. Set ONE of: "
+            "KALSHI_PRIVATE_KEY_PATH (secret file), "
+            "KALSHI_PRIVATE_KEY (raw PEM), "
+            "KALSHI_PRIVATE_KEY_B64 (base64 PEM)."
+        )
+
+    # Decide whether it’s raw PEM or base64
+    used = "KALSHI_PRIVATE_KEY" if pem_or_b64.strip() else "KALSHI_PRIVATE_KEY_B64"
+
+    if "BEGIN" not in candidate:
+        try:
+            candidate_bytes = base64.b64decode(candidate)
+            candidate = candidate_bytes.decode("utf-8")
+        except Exception as e:
+            raise RuntimeError(f"Private key not PEM and base64 decode failed: {e}")
+
+    try:
+        key = serialization.load_pem_private_key(
+            candidate.encode("utf-8"),
+            password=None,
+        )
+        log.info(f"Loaded RSA private key from {used}.")
+        return key
+    except Exception as e:
+        raise RuntimeError(f"Failed to load RSA private key: {e}")
+
 
 # -----------------------------
-# Orderbook parsing (FIX)
+# Kalshi Client (RSA signing)
 # -----------------------------
-def _normalize_levels(levels: Any) -> List[Tuple[int, int]]:
-    """
-    Kalshi docs: orderbook.yes and orderbook.no are arrays of bids
-    where each bid is [price, quantity].  [oai_citation:1‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/orderbook_responses?utm_source=chatgpt.com)
+class KalshiClient:
+    def __init__(self, api_base: str, key_id: str, private_key: Any, subaccount: Optional[str] = None):
+        self.api_base = api_base.rstrip("/")
+        self.key_id = key_id
+        self.private_key = private_key
+        self.subaccount = (subaccount or "").strip() or None
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+        self.api_prefix = None  # discovered, e.g. "/trade-api/v2"
 
-    But we also tolerate dict-ish formats defensively.
-    Returns list of (price_cents, qty).
-    """
-    out: List[Tuple[int, int]] = []
-    if levels is None:
-        return out
+    # ✅ CHANGED: use PSS and do NOT include body in the signature payload
+    def _sign(self, method: str, path: str, ts: int, body: str) -> str:
+        payload = f"{ts}{method.upper()}{path}".encode("utf-8")
 
-    if isinstance(levels, list):
-        for x in levels:
-            # Common: [price, qty]
-            if isinstance(x, list) and len(x) >= 2 and isinstance(x[0], (int, float)) and isinstance(x[1], (int, float)):
-                out.append((int(x[0]), int(x[1])))
-                continue
-            # Sometimes: {"price": 32, "quantity": 10} or variants
-            if isinstance(x, dict):
-                p = x.get("price") or x.get("price_cents")
-                q = x.get("quantity") or x.get("qty")
-                if p is not None and q is not None:
-                    out.append((int(p), int(q)))
-    elif isinstance(levels, dict):
-        # If someone passes a dict keyed by price -> qty
-        for k, v in levels.items():
+        sig = self.private_key.sign(
+            payload,
+            asy_padding.PSS(
+                mgf=asy_padding.MGF1(hashes.SHA256()),
+                salt_length=asy_padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(sig).decode("utf-8")
+
+    def _headers(self, method: str, path: str, body: str) -> Dict[str, str]:
+        ts = now_utc_ts()
+        sig = self._sign(method, path, ts, body)
+
+        # ---- DEBUG SIGNING (safe) ----
+        try:
+            payload_preview = f"{method.upper()} {path} ts={ts}ms body_len={len(body.encode('utf-8')) if body else 0}"
+            payload_hash = hashes.Hash(hashes.SHA256())
+            signing_payload = f"{ts}{method.upper()}{path}".encode("utf-8")
+            payload_hash.update(signing_payload)
+            digest = base64.b64encode(payload_hash.finalize()).decode("utf-8")
+            log.info(f"[SIGNDBG] {payload_preview} signing_payload_sha256_b64={digest}")
+        except Exception as _e:
+            log.info(f"[SIGNDBG] failed to compute debug hash: {_e}")
+        # -------------------------------
+
+        h = {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": str(ts),
+        }
+        if self.subaccount:
+            h["KALSHI-SUBACCOUNT"] = self.subaccount
+        return h
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Any, str]:
+        # build exact path including query string before signing
+        path_q = path
+        if params:
+            items: List[Tuple[str, Any]] = []
+            for k in sorted(params.keys()):
+                v = params[k]
+                if isinstance(v, (list, tuple)):
+                    for vv in v:
+                        items.append((k, vv))
+                else:
+                    items.append((k, v))
+            qs = urlencode(items, doseq=True)
+            path_q = f"{path}?{qs}"
+
+        url = f"{self.api_base}{path_q}"
+
+        body_str = ""
+        data = None
+        if json_body is not None:
+            body_str = json.dumps(json_body, separators=(",", ":"))
+            data = body_str
+
+        # ✅ ONLY CHANGE: for GET /portfolio/orders, sign WITHOUT the query string
+        sign_path = path_q
+        if method.upper() == "GET" and path.endswith("/portfolio/orders") and params:
+            sign_path = path  # sign only the base path
+
+        headers = self._headers(method, sign_path, body_str)
+
+        try:
+            r = self.session.request(method=method, url=url, params=None, data=data, headers=headers, timeout=20)
+        except Exception as e:
+            log.error(f"HTTP {method} {path_q} failed: {e}")
+            return 0, None, ""
+
+        text = r.text or ""
+        parsed: Any = None
+        if text:
             try:
-                out.append((int(k), int(v)))
+                parsed = r.json()
             except Exception:
-                pass
+                parsed = {"_raw": text}
+        return r.status_code, parsed, text
 
-    return out
+    def discover_prefix(self) -> str:
+        candidates = ["/trade-api/v2", "/trade-api/v1"]
+        for pref in candidates:
+            code, body, _ = self.request("GET", f"{pref}/markets", params={"limit": 1})
+            if code == 200:
+                self.api_prefix = pref
+                log.info(f"Discovered API prefix: {pref} (probe {pref}/markets?limit=1 -> 200)")
+                shape = type(body).__name__
+                keys = list(body.keys()) if isinstance(body, dict) else None
+                log.info(f"Markets probe HTTP=200 shape={shape} keys={keys}")
+                return pref
+        raise RuntimeError("Could not discover API prefix (markets probe not 200).")
 
-def parse_best_from_bids_only(orderbook_json: dict) -> Tuple[dict, bool]:
-    """
-    Returns:
-      yes_best_bid: {"price_cents": int, "qty": int} or None
-      yes_best_ask: derived from no_best_bid => 100 - no_best_bid_price
-      no_best_bid: ...
-      no_best_ask: derived from yes_best_bid => 100 - yes_best_bid_price
+    def get_markets_by_series(self, series_ticker: str, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/markets"
+        code, body, text = self.request("GET", path, params={"series_ticker": series_ticker, "limit": limit})
+        log.info(
+            f"[SERIES] GET {path}?series_ticker={series_ticker}&limit={limit} -> HTTP={code} "
+            f"shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}"
+        )
+        if code != 200:
+            raise RuntimeError(f"Series markets fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        markets = body.get("markets", []) if isinstance(body, dict) else []
+        log.info(f"[SERIES] Returned markets count={len(markets)}")
+        return markets
 
-    NOTE: asks are *derived*, because API returns bids only.  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/orderbook_responses?utm_source=chatgpt.com)
-    """
-    ob = orderbook_json.get("orderbook")
-    if not isinstance(ob, dict):
-        return ({"yes_best_bid": None, "yes_best_ask": None, "no_best_bid": None, "no_best_ask": None}, False)
+    def get_orderbook(self, market_ticker: str) -> Dict[str, Any]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/markets/{market_ticker}/orderbook"
+        code, body, _ = self.request("GET", path)
+        log.info(
+            f"[BOOK] GET {path} -> HTTP={code} shape={type(body).__name__} "
+            f"keys={list(body.keys()) if isinstance(body, dict) else None}"
+        )
+        if code != 200:
+            raise RuntimeError(f"Orderbook fetch failed HTTP={code} body={safe_json(body)}")
+        return body
 
-    yes_levels = _normalize_levels(ob.get("yes"))
-    no_levels = _normalize_levels(ob.get("no"))
+    def get_resting_orders(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/portfolio/orders"
+        code, body, text = self.request("GET", path, params={"status": "resting", "limit": limit})
+        log.info(
+            f"[ORDERS] GET {path}?status=resting&limit={limit} -> HTTP={code} "
+            f"shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}"
+        )
+        if code != 200:
+            raise RuntimeError(f"Resting orders fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        orders = body.get("orders", []) if isinstance(body, dict) else []
+        return orders
 
-    yes_best_bid = None
-    no_best_bid = None
+    def get_filled_orders(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/portfolio/orders"
+        code, body, text = self.request("GET", path, params={"status": "filled", "limit": limit})
+        log.info(
+            f"[FILLED] GET {path}?status=filled&limit={limit} -> HTTP={code} "
+            f"shape={type(body).__name__} keys={list(body.keys()) if isinstance(body, dict) else None}"
+        )
+        if code != 200:
+            raise RuntimeError(f"Filled orders fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
+        orders = body.get("orders", []) if isinstance(body, dict) else []
+        return orders
 
-    if yes_levels:
-        p, q = max(yes_levels, key=lambda t: t[0])  # best bid = highest price
-        yes_best_bid = {"price_cents": p, "qty": q}
+    def cancel_order(self, order_id: str) -> Tuple[int, Any]:
+        if not self.api_prefix:
+            self.discover_prefix()
 
-    if no_levels:
-        p, q = max(no_levels, key=lambda t: t[0])
-        no_best_bid = {"price_cents": p, "qty": q}
+        path = f"{self.api_prefix}/portfolio/orders/{order_id}"
+        code, body, _ = self.request("DELETE", path)
+        if code in (200, 204):
+            log.info(f"[CANCEL] DELETE {path} -> {code} {safe_json(body)}")
+            return code, body
 
-    # Derived asks (complements)
-    yes_best_ask = None
-    no_best_ask = None
+        path2 = f"{self.api_prefix}/portfolio/orders/{order_id}/cancel"
+        code2, body2, _ = self.request("POST", path2, json_body={})
+        if code2 in (200, 201, 204):
+            log.info(f"[CANCEL] POST {path2} -> {code2} {safe_json(body2)}")
+        else:
+            log.warning(f"[CANCEL] Failed cancel attempts http={code}/{code2} body1={safe_json(body)} body2={safe_json(body2)}")
+        return code2, body2
 
-    if no_best_bid is not None:
-        yes_best_ask = {"price_cents": max(0, 100 - int(no_best_bid["price_cents"])), "qty": int(no_best_bid["qty"])}
+    def place_order(self, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        if not self.api_prefix:
+            self.discover_prefix()
+        path = f"{self.api_prefix}/portfolio/orders"
+        code, body, _ = self.request("POST", path, json_body=payload)
+        if code not in (200, 201):
+            log.error(f"HTTP POST {path} -> {code} {safe_json(body)}")
+        else:
+            log.info(f"[ORDER] POST {path} -> {code} {safe_json(body)}")
+        return code, body
 
-    if yes_best_bid is not None:
-        no_best_ask = {"price_cents": max(0, 100 - int(yes_best_bid["price_cents"])), "qty": int(yes_best_bid["qty"])}
 
-    # Basic sanity:
-    # In a clean book, yes_best_bid + no_best_bid <= 100 (otherwise crossed/arby-ish)
-    ok = True
-    if yes_best_bid and no_best_bid:
-        if int(yes_best_bid["price_cents"]) + int(no_best_bid["price_cents"]) > 100:
-            ok = False
+def parse_best_ask(orderbook: Dict[str, Any]) -> Dict[str, Optional[Dict[str, int]]]:
+    ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
+    yes = ob.get("yes") or []
+    no = ob.get("no") or []
+    yes_best = None
+    no_best = None
 
-    return (
-        {
-            "yes_best_bid": yes_best_bid,
-            "yes_best_ask": yes_best_ask,
-            "no_best_bid": no_best_bid,
-            "no_best_ask": no_best_ask,
-        },
-        ok,
+    if isinstance(yes, list) and yes:
+        p, q = min(yes, key=lambda x: x[0])
+        yes_best = {"price_cents": int(p), "qty": int(q)}
+    if isinstance(no, list) and no:
+        p, q = min(no, key=lambda x: x[0])
+        no_best = {"price_cents": int(p), "qty": int(q)}
+
+    return {"yes_best_ask": yes_best, "no_best_ask": no_best}
+
+
+def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+
+    def parse_z(ts: str) -> datetime:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+    future = []
+    for m in markets:
+        ct = m.get("close_time")
+        if not ct:
+            continue
+        try:
+            dt = parse_z(ct)
+        except Exception:
+            continue
+        if dt > now:
+            future.append((dt, m))
+
+    if not future:
+        return None
+
+    future.sort(key=lambda x: x[0])
+    return future[0][1]
+
+
+def main():
+    log.info("=== BOT STARTED ===")
+
+    ENABLE_TRADING = env_bool("ENABLE_TRADING", False)
+    CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", False)
+    POLL_SECONDS = env_int("POLL_SECONDS", 60)
+    SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
+    MARKET_TICKER = os.getenv("MARKET_TICKER")
+    API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
+    SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT")
+
+    FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()
+    BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
+    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", BUY_PRICE_CENTS)
+    TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
+
+    BASE_QTY = env_int("BASE_QTY", 1)
+    SCALE_AFTER_WINS = env_int("SCALE_AFTER_WINS", 20)
+    SIZE_MULT = env_float("SIZE_MULT", 1.25)
+    SIZE_CAP = env_int("SIZE_CAP", 10)
+
+    log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
+    log.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
+    log.info(f"POLL_SECONDS={POLL_SECONDS}")
+    log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
+    log.info(f"MARKET_TICKER={MARKET_TICKER}")
+    log.info(f"API_BASE={API_BASE}")
+    log.info(f"SUBACCOUNT={SUBACCOUNT if SUBACCOUNT else None}")
+    log.info(
+        f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} "
+        f"MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}"
     )
+    log.info(f"SIZING base={BASE_QTY} scale_after_wins={SCALE_AFTER_WINS} mult={SIZE_MULT} cap={SIZE_CAP}")
 
-# -----------------------------
-# Market Data
-# -----------------------------
-def get_orderbook(ticker: str) -> dict:
-    path = f"/trade-api/v2/markets/{ticker}/orderbook"
-    j = kalshi_request("GET", path)
-    log.info("[BOOK] GET %s -> keys=%s", path, list(j.keys()) if isinstance(j, dict) else type(j).__name__)
-    return j
+    if not os.getenv("KALSHI_KEY_ID"):
+        raise RuntimeError("Missing env var KALSHI_KEY_ID")
 
-# -----------------------------
-# Trading (YES-only, minimal)
-# -----------------------------
-def place_limit_buy_yes(ticker: str, price_cents: int, qty: int) -> dict:
-    """
-    NOTE: You must match your account’s required fields.
-    This is a typical shape; if your current bot already has working place-order payload,
-    swap only the 'price' and 'count' fields into your existing payload shape.
-    """
-    path = "/trade-api/v2/orders"
+    key_id = os.getenv("KALSHI_KEY_ID").strip()
+    private_key = load_rsa_private_key_from_env()
+
+    client = KalshiClient(api_base=API_BASE, key_id=key_id, private_key=private_key, subaccount=SUBACCOUNT)
+    client.discover_prefix()
+
+    if not MARKET_TICKER:
+        markets = client.get_markets_by_series(SERIES_PREFIX, limit=200)
+        chosen = select_next_closing(markets)
+        if not chosen:
+            log.warning(f"No markets found matching prefix {SERIES_PREFIX} with a future close_time.")
+            raise RuntimeError("Could not resolve MARKET_TICKER. Exiting.")
+        MARKET_TICKER = chosen.get("ticker") or chosen.get("market_ticker") or chosen.get("id")
+
+        close_time = chosen.get("close_time")
+        seconds_to_close = None
+        if close_time:
+            dt = datetime.strptime(close_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            seconds_to_close = int((dt - datetime.now(timezone.utc)).total_seconds())
+        log.info(f"[SELECT] Next closing market: {MARKET_TICKER} close={close_time} seconds_to_close={seconds_to_close}")
+
+    ob = client.get_orderbook(MARKET_TICKER)
+    best = parse_best_ask(ob)
+    log.info(f"[BEST] {safe_json(best)}")
+
+    side = FARM_SIDE
+    qty = BASE_QTY
+
+    if side == "YES":
+        yes_best_ask = best.get("yes_best_ask")
+        if not yes_best_ask:
+            raise RuntimeError("No YES ask available.")
+        ask = int(yes_best_ask["price_cents"])
+    else:
+        no_best_ask = best.get("no_best_ask")
+        if not no_best_ask:
+            raise RuntimeError("No NO ask available.")
+        ask = int(no_best_ask["price_cents"])
+
+    target_buy = ask if ask <= 1 else (ask - 1)
+
+    target_buy = max(1, min(99, target_buy))
+    target_buy = min(MAX_BUY_PRICE_CENTS, target_buy)
+
+    log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
+
+    if not (ENABLE_TRADING and CONFIRM_LIVE_TRADING):
+        log.warning("[ORDER] Trading disabled by env. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True to actually place.")
+        return
+
+    try:
+        existing = client.get_resting_orders(limit=200)
+        side_key = "yes" if side == "YES" else "no"
+        already = False
+        for o in existing:
+            if (o.get("ticker") == MARKET_TICKER and
+                o.get("status") == "resting" and
+                o.get("side") == side_key and
+                int(o.get(f"{side_key}_price") or -1) == int(target_buy) and
+                int(o.get("remaining_count") or 0) > 0):
+                already = True
+                break
+        if already:
+            log.warning("[GUARD] Existing resting order found (same ticker/side/price). Skipping new order.")
+            return
+    except Exception as e:
+        log.warning(f"[GUARD] Could not check existing orders (will proceed): {e}")
+
     payload = {
-        "ticker": ticker,
-        "client_order_id": f"mm-yes-{int(time.time()*1000)}",
-        "side": "yes",
+        "ticker": MARKET_TICKER,
         "action": "buy",
         "type": "limit",
         "count": qty,
-        "price": price_cents,
+        "side": "yes" if side == "YES" else "no",
+        "yes_price": target_buy if side == "YES" else None,
+        "no_price": target_buy if side == "NO" else None,
     }
-    return kalshi_request("POST", path, payload)
+    payload = {k: v for k, v in payload.items() if v is not None}
 
-def decide_yes_bid(best: dict) -> Optional[Tuple[int, int]]:
-    """
-    Strategy (still simple):
-    - We want to rest near top-of-book, but NEVER above derived YES ask.
-    - If derived ask is missing, just don't trade.
-    """
-    yb = best["yes_best_bid"]
-    ya = best["yes_best_ask"]
+    code, body = client.place_order(payload)
+    log.info(f"[HEARTBEAT] alive order_post_http={code} resp={safe_json(body)}")
 
-    if yb is None or ya is None:
-        return None
+    order_id = None
+    try:
+        if isinstance(body, dict) and isinstance(body.get("order"), dict):
+            order_id = body["order"].get("order_id")
+    except Exception:
+        order_id = None
 
-    best_bid = int(yb["price_cents"])
-    best_ask = int(ya["price_cents"])
+    if not order_id:
+        log.warning("[EXIT] No order_id returned; cannot watch fills to place exit sell.")
+        while True:
+            time.sleep(POLL_SECONDS)
 
-    # If market is super wide, we step up by 1c from best bid (maker-ish),
-    # but never cross the derived ask.
-    target = min(best_bid + 1, best_ask - 1)
+    sell_sent = False
+    sell_price = max(1, min(99, int(target_buy) + int(TARGET_PROFIT_CENTS)))
+    sell_side_key = "yes" if side == "YES" else "no"
 
-    # Guardrails
-    target = max(1, min(target, MAX_YES_PRICE_CENTS))
-    if target >= best_ask:
-        # No room to be a maker without crossing; skip.
-        return None
+    log.info(f"[EXIT] Watching for fill of order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
 
-    return (target, BUY_QTY)
-
-# -----------------------------
-# Main loop
-# -----------------------------
-def main():
-    log.info("Starting Kalshi YES-only MM bot @ %s ticker=%s", iso_utc(), MARKET_TICKER)
+    resting_polls = 0
+    escalated = False
 
     while True:
+        time.sleep(POLL_SECONDS)
+
+        if sell_sent:
+            continue
+
         try:
-            ob = get_orderbook(MARKET_TICKER)
-            best, ok = parse_best_from_bids_only(ob)
+            still_resting = False
+            try:
+                resting = client.get_resting_orders(limit=200)
+                for o in resting:
+                    if o.get("order_id") == order_id:
+                        still_resting = True
+                        break
+            except Exception as e:
+                log.warning(f"[EXIT] Could not check resting status: {e}")
+                still_resting = False
 
-            log.info("[BEST] %s ok=%s", json.dumps(best), ok)
-            if not ok:
-                log.warning("[MM] Book sanity failed (crossed?). Standing down.")
-                time.sleep(LOOP_SECONDS)
+            if still_resting:
+                resting_polls += 1
+                log.info(f"[EXIT] Still resting order_id={order_id}. polls={resting_polls}")
+
+                if (not escalated) and resting_polls >= 2:
+                    new_buy = max(1, min(99, int(target_buy) + 1))
+                    new_buy = min(MAX_BUY_PRICE_CENTS, new_buy)
+
+                    if new_buy > int(target_buy):
+                        log.info(f"[ESCALATE] 2 polls resting. Cancel+replace {target_buy}c -> {new_buy}c (order_id={order_id})")
+                        client.cancel_order(order_id)
+
+                        replace_payload = {
+                            "ticker": MARKET_TICKER,
+                            "action": "buy",
+                            "type": "limit",
+                            "count": qty,
+                            "side": "yes" if side == "YES" else "no",
+                            "yes_price": new_buy if side == "YES" else None,
+                            "no_price": new_buy if side == "NO" else None,
+                        }
+                        replace_payload = {k: v for k, v in replace_payload.items() if v is not None}
+
+                        rcode, rbody = client.place_order(replace_payload)
+                        log.info(f"[ESCALATE] Replaced BUY http={rcode} resp={safe_json(rbody)}")
+
+                        new_order_id = None
+                        try:
+                            if isinstance(rbody, dict) and isinstance(rbody.get("order"), dict):
+                                new_order_id = rbody["order"].get("order_id")
+                        except Exception:
+                            new_order_id = None
+
+                        if new_order_id:
+                            order_id = new_order_id
+                            target_buy = int(new_buy)
+                            sell_price = max(1, min(99, int(target_buy) + int(TARGET_PROFIT_CENTS)))
+                            log.info(f"[EXIT] Now watching order_id={order_id}. Will SELL {sell_side_key.upper()} {qty}@{sell_price}c when filled.")
+                            escalated = True
+                            resting_polls = 0
+                            continue
+                    else:
+                        log.info(f"[ESCALATE] Wanted +1c but capped (target_buy={target_buy} MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS}).")
+                        escalated = True
+
+            filled = client.get_filled_orders(limit=200)
+            hit = None
+            for o in filled:
+                if o.get("order_id") == order_id:
+                    hit = o
+                    break
+
+            if not hit:
+                log.info(f"[EXIT] Not filled yet order_id={order_id}.")
                 continue
 
-            decision = decide_yes_bid(best)
-            if decision is None:
-                yb = best["yes_best_bid"]["price_cents"] if best["yes_best_bid"] else None
-                ya = best["yes_best_ask"]["price_cents"] if best["yes_best_ask"] else None
-                log.info("[MM] No valid maker YES bid (bid=%s ask=%s). Standing down.", yb, ya)
-                time.sleep(LOOP_SECONDS)
-                continue
+            log.info(f"[EXIT] Filled detected order_id={order_id} fill_count={hit.get('fill_count')} remaining={hit.get('remaining_count')}")
 
-            price_cents, qty = decision
-            yb = best["yes_best_bid"]["price_cents"] if best["yes_best_bid"] else None
-            ya = best["yes_best_ask"]["price_cents"] if best["yes_best_ask"] else None
-            log.info("[MM] Desired BUY YES %s@%sc (bid=%s ask=%s MAX=%s)", qty, price_cents, yb, ya, MAX_YES_PRICE_CENTS)
+            sell_payload = {
+                "ticker": MARKET_TICKER,
+                "action": "sell",
+                "type": "limit",
+                "count": qty,
+                "side": sell_side_key,
+                "yes_price": sell_price if side == "YES" else None,
+                "no_price": sell_price if side == "NO" else None,
+            }
+            sell_payload = {k: v for k, v in sell_payload.items() if v is not None}
 
-            # 🔒 Keep this disabled until you confirm payload fields match your working bot:
-            # resp = place_limit_buy_yes(MARKET_TICKER, price_cents, qty)
-            # log.info("[ORDER] %s", resp)
+            scode, sbody = client.place_order(sell_payload)
+            log.info(f"[EXIT] SELL placed http={scode} resp={safe_json(sbody)}")
+            sell_sent = True
 
         except Exception as e:
-            log.exception("[LOOPERR] %s", e)
+            log.warning(f"[EXIT] Error while watching fills / placing sell: {e}")
 
-        time.sleep(LOOP_SECONDS)
 
 if __name__ == "__main__":
     main()
