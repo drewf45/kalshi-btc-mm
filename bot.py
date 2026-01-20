@@ -469,6 +469,18 @@ def main():
         if sell_sent:
             continue
 
+        # ✅ ADDED: detect "no longer resting" as a hint that a fill likely occurred
+        try:
+            resting = client.get_resting_orders(limit=200)
+            still_resting = any(o.get("order_id") == order_id for o in resting)
+            if still_resting:
+                log.info(f"[EXIT] Still resting order_id={order_id}.")
+            else:
+                log.info(f"[EXIT] Order_id={order_id} no longer resting; checking filled.")
+        except Exception as e:
+            log.warning(f"[EXIT] Could not check resting status: {e}")
+            still_resting = True  # default to safe wait
+
         try:
             filled = client.get_filled_orders(limit=200)
             hit = None
@@ -477,8 +489,12 @@ def main():
                     hit = o
                     break
 
-            if not hit:
+            if still_resting and not hit:
                 log.info(f"[EXIT] Not filled yet order_id={order_id}.")
+                continue
+
+            if not hit:
+                log.info(f"[EXIT] Filled not found yet for order_id={order_id}.")
                 continue
 
             log.info(f"[EXIT] Filled detected order_id={order_id} fill_count={hit.get('fill_count')} remaining={hit.get('remaining_count')}")
