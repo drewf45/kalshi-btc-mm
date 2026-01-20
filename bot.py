@@ -316,7 +316,7 @@ def main():
 
     FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()
     BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
-    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", BUY_PRICE_CENTS)  # ✅ ADDED (needed for best_bid+1 cap)
+    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", BUY_PRICE_CENTS)  # ✅ ADDED
     TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
     BASE_QTY = env_int("BASE_QTY", 1)
@@ -331,7 +331,10 @@ def main():
     log.info(f"MARKET_TICKER={MARKET_TICKER}")
     log.info(f"API_BASE={API_BASE}")
     log.info(f"SUBACCOUNT={SUBACCOUNT if SUBACCOUNT else None}")
-    log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
+    log.info(
+        f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} "
+        f"MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}"
+    )
     log.info(f"SIZING base={BASE_QTY} scale_after_wins=20 mult={SIZE_MULT} cap={SIZE_CAP}")
 
     if not os.getenv("KALSHI_KEY_ID"):
@@ -365,21 +368,27 @@ def main():
     side = FARM_SIDE
     qty = BASE_QTY
 
-    # ✅ MICRO CHANGE: set buy price to (best bid + 1) using parity:
-    # best_bid_yes = 100 - best_ask_no
-    # best_bid_no  = 100 - best_ask_yes
+    # ✅ MICRO CHANGE (SAFER): step toward the SAME-SIDE ask instead of parity.
+    # This prevents "opposite ask = 1c" from forcing you up to MAX.
     if side == "YES":
-        no_best_ask = best.get("no_best_ask")
-        if not no_best_ask:
-            raise RuntimeError("No NO ask available to compute YES best bid.")
-        best_bid = 100 - int(no_best_ask["price_cents"])
-    else:
         yes_best_ask = best.get("yes_best_ask")
         if not yes_best_ask:
-            raise RuntimeError("No YES ask available to compute NO best bid.")
-        best_bid = 100 - int(yes_best_ask["price_cents"])
+            raise RuntimeError("No YES ask available.")
+        ask = int(yes_best_ask["price_cents"])
+    else:
+        no_best_ask = best.get("no_best_ask")
+        if not no_best_ask:
+            raise RuntimeError("No NO ask available.")
+        ask = int(no_best_ask["price_cents"])
 
-    target_buy = min(MAX_BUY_PRICE_CENTS, max(1, min(99, best_bid + 1)))
+    # "best bid + 1" behavior, but anchored to ask:
+    # - if ask is 1c, stay at 1c
+    # - otherwise bid 1c below ask (inside the spread)
+    target_buy = ask if ask <= 1 else (ask - 1)
+
+    # apply safety caps
+    target_buy = max(1, min(99, target_buy))
+    target_buy = min(MAX_BUY_PRICE_CENTS, target_buy)
     # ---------------------------------------------------------------
 
     log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
