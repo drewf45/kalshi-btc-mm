@@ -3,9 +3,9 @@ import time
 import base64
 import uuid
 import logging
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -24,10 +24,15 @@ log = logging.getLogger("kalshi-bot")
 
 
 # =====================================================
-# CONFIG — FINAL, FOLDER-ALIGNED
+# BASE URL SPLIT (FIX)
 # =====================================================
-BASE_URL = "https://trading-api.kalshi.com"
+ELECTIONS_BASE_URL = "https://api.elections.kalshi.com"
+TRADING_BASE_URL   = "https://trading-api.kalshi.com"
 
+
+# =====================================================
+# CONFIG
+# =====================================================
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
 KALSHI_SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()  # BTC1
@@ -39,14 +44,13 @@ SERIES_PREFIX = (
 )
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
-
 BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
 BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
 POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
 
 # =====================================================
-# AUTH HELPERS (UNCHANGED, VERIFIED)
+# AUTH HELPERS (UNCHANGED)
 # =====================================================
 def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
@@ -89,13 +93,20 @@ def canonical_query(params: Optional[Dict[str, Any]]) -> str:
     return urlencode(sorted((k, str(v)) for k, v in params.items() if v is not None))
 
 
-def request(private_key, method: str, path: str, params=None, body=None) -> Tuple[int, Any]:
+def _request(
+    base_url: str,
+    private_key,
+    method: str,
+    path: str,
+    params=None,
+    body=None,
+) -> Tuple[int, Any]:
     q = canonical_query(params)
     signed_path = f"{path}?{q}" if q else path
 
     resp = requests.request(
         method=method,
-        url=f"{BASE_URL}{path}",
+        url=f"{base_url}{path}",
         headers=kalshi_headers(private_key, method, signed_path),
         params=params,
         json=body,
@@ -112,7 +123,7 @@ def request(private_key, method: str, path: str, params=None, body=None) -> Tupl
 
 
 # =====================================================
-# MARKET RESOLUTION — RUN ONCE PER CONTRACT
+# MARKET RESOLUTION (ELECTIONS API)
 # =====================================================
 def parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
     if "close_time" in m:
@@ -128,7 +139,8 @@ def resolve_active_market(private_key) -> str:
     if not SERIES_PREFIX:
         raise RuntimeError("SERIES_PREFIX missing")
 
-    code, data = request(
+    code, data = _request(
+        ELECTIONS_BASE_URL,
         private_key,
         "GET",
         "/trade-api/v2/markets",
@@ -159,10 +171,11 @@ def resolve_active_market(private_key) -> str:
 
 
 # =====================================================
-# ORDERBOOK + TRADING
+# ORDERBOOK + TRADING (TRADING API)
 # =====================================================
 def get_orderbook(private_key, ticker: str):
-    code, data = request(
+    code, data = _request(
+        TRADING_BASE_URL,
         private_key,
         "GET",
         f"/trade-api/v2/markets/{ticker}/orderbook",
@@ -193,18 +206,21 @@ def place_yes_buy(private_key, ticker: str, price: int, count: int):
         "client_order_id": str(uuid.uuid4()),
         "post_only": POST_ONLY,
     }
-    code, data = request(
+
+    code, data = _request(
+        TRADING_BASE_URL,
         private_key,
         "POST",
         "/trade-api/v2/portfolio/orders",
         body=body,
     )
+
     if code not in (200, 201):
         raise RuntimeError(f"Order failed: {data}")
 
 
 # =====================================================
-# MAIN — FINAL
+# MAIN
 # =====================================================
 def main():
     if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_B64:
@@ -213,10 +229,9 @@ def main():
     private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 
     log.info("[BOOT] LIVE BTC BOT")
-    log.info("[BOOT] BASE_URL=%s", BASE_URL)
     log.info("[BOOT] SERIES_PREFIX=%s SUBACCOUNT=%s", SERIES_PREFIX, KALSHI_SUBACCOUNT or "<default>")
 
-    # ---- Resolve ONCE ----
+    # Resolve ONCE
     active_ticker = resolve_active_market(private_key)
     log.info("[MARKET] Locked active contract: %s", active_ticker)
 
@@ -228,7 +243,6 @@ def main():
             if bid is not None and ask is not None:
                 log.info("[SPREAD] YES bid=%dc ask=%dc spread=%dc", bid, ask, ask - bid)
 
-            # Strategy intentionally minimal per instructions
             place_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
 
         except Exception as e:
