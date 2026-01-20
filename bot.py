@@ -316,6 +316,7 @@ def main():
 
     FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()
     BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
+    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", 60)  # ✅ MICRO CHANGE #1
     TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
     BASE_QTY = env_int("BASE_QTY", 1)
@@ -330,7 +331,7 @@ def main():
     log.info(f"MARKET_TICKER={MARKET_TICKER}")
     log.info(f"API_BASE={API_BASE}")
     log.info(f"SUBACCOUNT={SUBACCOUNT if SUBACCOUNT else None}")
-    log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
+    log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
     log.info(f"SIZING base={BASE_QTY} scale_after_wins=20 mult={SIZE_MULT} cap={SIZE_CAP}")
 
     if not os.getenv("KALSHI_KEY_ID"):
@@ -362,8 +363,23 @@ def main():
     log.info(f"[BEST] {safe_json(best)}")
 
     side = FARM_SIDE
-    target_buy = BUY_PRICE_CENTS
     qty = BASE_QTY
+
+    # ✅ MICRO CHANGE #1: buy at live ask (with safety cap)
+    if side == "YES":
+        live_ask = (best.get("yes_best_ask") or {}).get("price_cents")
+    else:
+        live_ask = (best.get("no_best_ask") or {}).get("price_cents")
+
+    if live_ask is None:
+        log.warning("[GUARD] No live ask found in orderbook. Skipping.")
+        return
+
+    if int(live_ask) > int(MAX_BUY_PRICE_CENTS):
+        log.warning(f"[GUARD] Live ask {live_ask}c > MAX_BUY_PRICE_CENTS {MAX_BUY_PRICE_CENTS}c. Skipping.")
+        return
+
+    target_buy = int(live_ask)
 
     log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
 
