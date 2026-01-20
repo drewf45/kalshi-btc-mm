@@ -116,46 +116,10 @@ def _parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-# -----------------------------
-# Market resolution (MICRO-CHANGE #5)
-# -----------------------------
-def list_markets_filtered(private_key, series_ticker: str) -> Tuple[int, List[Dict[str, Any]], Any]:
-    """
-    ✅ Micro-change: use the documented filter instead of paging the whole /markets universe:
-      /markets?series_ticker=KXBTC15M&status=open
-    """
-    params = {
-        "limit": 200,
-        "series_ticker": series_ticker,
-        "status": "open",
-    }
-    code, data = request(private_key, "GET", "/trade-api/v2/markets", params=params)
-    if code != 200:
-        return code, [], data
-    markets = data.get("markets", [])
-    if not isinstance(markets, list):
-        markets = []
-    return code, markets, data
-
-
-def resolve_active_ticker(private_key, series_ticker: str) -> Tuple[Optional[str], bool]:
-    """
-    Returns (ticker, hit_rate_limit)
-    Choose the open market in this series whose close_time is the soonest in the future.
-    """
+def pick_soonest_future_market(markets: List[Dict[str, Any]]) -> Optional[str]:
     now_ms = now_utc_ts_ms()
-
-    code, markets, err = list_markets_filtered(private_key, series_ticker)
-
-    if code == 429:
-        log.warning("[RL] /markets?series_ticker=%s rate-limited (429).", series_ticker)
-        return None, True
-
-    if code != 200:
-        log.warning("[MARKETS] filtered list failed series=%s code=%s err=%s", series_ticker, code, err)
-        return None, False
-
     best: Optional[Tuple[int, str]] = None
+
     for m in markets:
         if not isinstance(m, dict):
             continue
@@ -174,7 +138,66 @@ def resolve_active_ticker(private_key, series_ticker: str) -> Tuple[Optional[str
         if best is None or delta < best[0]:
             best = (delta, t)
 
-    return (best[1] if best else None), False
+    return best[1] if best else None
+
+
+# -----------------------------
+# Market resolution (MICRO-CHANGE #6: probe)
+# -----------------------------
+def list_markets_with_params(private_key, params: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]], Any]:
+    code, data = request(private_key, "GET", "/trade-api/v2/markets", params=params)
+    if code != 200:
+        return code, [], data
+    markets = data.get("markets", [])
+    if not isinstance(markets, list):
+        markets = []
+    return code, markets, data
+
+
+def resolve_active_ticker_probe(private_key, series_prefix: str, series_ticker: str) -> Tuple[Optional[str], bool]:
+    """
+    Returns (ticker, hit_rate_limit)
+
+    We don't guess one endpoint anymore.
+    We try a tiny set of likely filters and log which one works.
+    """
+    # Build candidates (keep it very small to avoid spamming)
+    # NOTE: Kalshi sometimes uses uppercase identifiers even if UI path is lowercase.
+    sp = (series_prefix or "").strip()
+    st = (series_ticker or "").strip()
+    st_upper = st.upper()
+    sp_upper = sp.upper()
+
+    candidates: List[Tuple[str, Dict[str, Any]]] = [
+        ("series_ticker+open", {"limit": 200, "series_ticker": st_upper, "status": "open"}),
+        ("series_ticker+active", {"limit": 200, "series_ticker": st_upper, "status": "active"}),
+        # Some APIs use "event_ticker" for grouping (try both forms)
+        ("event_ticker+open(st)", {"limit": 200, "event_ticker": st_upper, "status": "open"}),
+        ("event_ticker+open(sp)", {"limit": 200, "event_ticker": sp_upper, "status": "open"}),
+        # Last resort: omit status (still filtered)
+        ("series_ticker(no status)", {"limit": 200, "series_ticker": st_upper}),
+    ]
+
+    for label, params in candidates:
+        code, markets, err = list_markets_with_params(private_key, params)
+
+        if code == 429:
+            log.warning("[RL] Resolver probe rate-limited on %s (429).", label)
+            return None, True
+
+        if code != 200:
+            log.warning("[RESOLVE] probe=%s failed code=%s err=%s", label, code, err)
+            continue
+
+        if markets:
+            ticker = pick_soonest_future_market(markets)
+            log.info("[RESOLVE] probe=%s markets=%d picked=%s", label, len(markets), ticker)
+            if ticker:
+                return ticker, False
+
+        log.warning("[RESOLVE] probe=%s returned 200 but markets empty", label)
+
+    return None, False
 
 
 # -----------------------------
@@ -228,8 +251,7 @@ def main():
         while True:
             time.sleep(30)
 
-    # ✅ Micro-change: explicit SERIES_TICKER (defaults to upper-case prefix)
-    # Example: SERIES_PREFIX=KXBTC15m -> SERIES_TICKER=KXBTC15M
+    # explicit SERIES_TICKER if you want, else derive
     series_ticker = os.getenv("SERIES_TICKER", "").strip() or series_prefix.upper()
 
     if not KALSHI_KEY_ID:
@@ -261,7 +283,7 @@ def main():
                 continue
 
             if active_ticker is None or now >= next_resolve_at:
-                new_ticker, hit_rl = resolve_active_ticker(private_key, series_ticker)
+                new_ticker, hit_rl = resolve_active_ticker_probe(private_key, series_prefix, series_ticker)
 
                 if hit_rl:
                     next_resolve_at = now + RESOLVE_BACKOFF_SECONDS
