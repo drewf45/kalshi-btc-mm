@@ -24,7 +24,7 @@ log = logging.getLogger("kalshi-bot")
 
 
 # =====================================================
-# BASE URL SPLIT (FIX)
+# BASE URL SPLIT (FINAL)
 # =====================================================
 ELECTIONS_BASE_URL = "https://api.elections.kalshi.com"
 TRADING_BASE_URL   = "https://trading-api.kalshi.com"
@@ -35,7 +35,7 @@ TRADING_BASE_URL   = "https://trading-api.kalshi.com"
 # =====================================================
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
-KALSHI_SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()  # BTC1
+KALSHI_SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()
 
 SERIES_PREFIX = (
     os.getenv("SERIES_PREFIX", "").strip()
@@ -50,7 +50,7 @@ POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
 
 # =====================================================
-# AUTH HELPERS (UNCHANGED)
+# AUTH HELPERS
 # =====================================================
 def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
@@ -123,7 +123,7 @@ def _request(
 
 
 # =====================================================
-# MARKET RESOLUTION (ELECTIONS API)
+# MARKET RESOLUTION (ELECTIONS)
 # =====================================================
 def parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
     if "close_time" in m:
@@ -136,9 +136,6 @@ def parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
 
 
 def resolve_active_market(private_key) -> str:
-    if not SERIES_PREFIX:
-        raise RuntimeError("SERIES_PREFIX missing")
-
     code, data = _request(
         ELECTIONS_BASE_URL,
         private_key,
@@ -171,11 +168,11 @@ def resolve_active_market(private_key) -> str:
 
 
 # =====================================================
-# ORDERBOOK + TRADING (TRADING API)
+# ORDERBOOK (ELECTIONS — FIX)
 # =====================================================
 def get_orderbook(private_key, ticker: str):
     code, data = _request(
-        TRADING_BASE_URL,
+        ELECTIONS_BASE_URL,
         private_key,
         "GET",
         f"/trade-api/v2/markets/{ticker}/orderbook",
@@ -185,16 +182,9 @@ def get_orderbook(private_key, ticker: str):
     return data["orderbook"]
 
 
-def best_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    y = ob.get("yes", {})
-    bids = y.get("bids", [])
-    asks = y.get("asks", [])
-
-    best_bid = max((b["price_cents"] for b in bids), default=None)
-    best_ask = min((a["price_cents"] for a in asks), default=None)
-    return best_bid, best_ask
-
-
+# =====================================================
+# TRADING (TRADING API)
+# =====================================================
 def place_yes_buy(private_key, ticker: str, price: int, count: int):
     body = {
         "ticker": ticker,
@@ -223,28 +213,17 @@ def place_yes_buy(private_key, ticker: str, price: int, count: int):
 # MAIN
 # =====================================================
 def main():
-    if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_B64:
-        raise SystemExit("Missing API credentials")
-
     private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 
-    log.info("[BOOT] LIVE BTC BOT")
-    log.info("[BOOT] SERIES_PREFIX=%s SUBACCOUNT=%s", SERIES_PREFIX, KALSHI_SUBACCOUNT or "<default>")
+    log.info("[BOOT] LIVE BTC BOT — FINAL ROUTING FIX")
 
-    # Resolve ONCE
     active_ticker = resolve_active_market(private_key)
     log.info("[MARKET] Locked active contract: %s", active_ticker)
 
     while True:
         try:
             ob = get_orderbook(private_key, active_ticker)
-            bid, ask = best_yes_bid_ask(ob)
-
-            if bid is not None and ask is not None:
-                log.info("[SPREAD] YES bid=%dc ask=%dc spread=%dc", bid, ask, ask - bid)
-
             place_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
-
         except Exception as e:
             log.exception("[LOOPERR] %s", e)
 
