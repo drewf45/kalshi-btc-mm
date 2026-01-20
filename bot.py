@@ -5,16 +5,16 @@ import uuid
 import logging
 from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
 
-# -----------------------------
-# Logging
-# -----------------------------
+# =====================================================
+# LOGGING
+# =====================================================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -23,45 +23,39 @@ logging.basicConfig(
 log = logging.getLogger("kalshi-bot")
 
 
-# -----------------------------
-# Config  (MICRO: prefer KALSHI_API_BASE as in Render screenshot)
-# -----------------------------
+# =====================================================
+# CONFIG (FOLDER + RENDER ALIGNED)
+# =====================================================
 BASE_URL = (
     os.getenv("KALSHI_API_BASE", "").strip()
     or os.getenv("KALSHI_BASE_URL", "").strip()
-    or "https://api.elections.kalshi.com"
+    or "https://trading-api.kalshi.com"
 ).rstrip("/")
 
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
+KALSHI_SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()  # BTC1
+
+SERIES_PREFIX = (
+    os.getenv("SERIES_PREFIX", "").strip()
+    or os.getenv("Series_PREFIC", "").strip()
+    or os.getenv("SERIES_PREFIC", "").strip()
+)
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
-RESOLVE_EVERY_SECONDS = int(os.getenv("RESOLVE_EVERY_SECONDS", "20"))
 
 BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
 BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
 POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
-LOG_SPREAD = os.getenv("LOG_SPREAD", "true").lower() in ("1", "true", "yes", "y")
-LOG_ORDERBOOK_SAMPLE = os.getenv("LOG_ORDERBOOK_SAMPLE", "true").lower() in ("1", "true", "yes", "y")
-
-RESOLVE_BACKOFF_SECONDS = int(os.getenv("RESOLVE_BACKOFF_SECONDS", "60"))
+LOG_SPREAD = True
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# =====================================================
+# AUTH HELPERS (UNCHANGED FORMAT)
+# =====================================================
 def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _redact(s: str, keep: int = 4) -> str:
-    s = (s or "").strip()
-    if not s:
-        return "<empty>"
-    if len(s) <= keep * 2:
-        return "<redacted>"
-    return f"{s[:keep]}…{s[-keep:]}"
 
 
 def load_private_key_from_b64(b64: str):
@@ -69,26 +63,10 @@ def load_private_key_from_b64(b64: str):
         key_bytes = base64.b64decode(b64)
         return serialization.load_pem_private_key(key_bytes, password=None)
     except Exception as e:
-        raise RuntimeError(f"Failed to load private key from KALSHI_PRIVATE_KEY_B64: {e}") from e
-
-
-def _canonical_query(params: Optional[Dict[str, Any]]) -> str:
-    """
-    MICRO: canonicalize query string for stable signing.
-    """
-    if not params:
-        return ""
-    items = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if v is None:
-            continue
-        items.append((k, str(v)))
-    return urlencode(items)
+        raise RuntimeError(f"Failed to load private key: {e}") from e
 
 
 def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
-    # Keep your exact signing format
     sign_str = f"{timestamp_ms}{method.upper()}{path}"
     sig = private_key.sign(
         sign_str.encode("utf-8"),
@@ -103,341 +81,161 @@ def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
 
 def kalshi_headers(private_key, method: str, signed_path: str) -> Dict[str, str]:
     ts = now_utc_ts_ms()
-    return {
+    headers = {
         "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": sign_request(private_key, ts, method, signed_path),
         "KALSHI-ACCESS-TIMESTAMP": str(ts),
     }
+    if KALSHI_SUBACCOUNT:
+        headers["KALSHI-SUBACCOUNT"] = KALSHI_SUBACCOUNT
+    return headers
+
+
+def canonical_query(params: Optional[Dict[str, Any]]) -> str:
+    if not params:
+        return ""
+    return urlencode(sorted((k, str(v)) for k, v in params.items() if v is not None))
 
 
 def request(private_key, method: str, path: str, params=None, body=None) -> Tuple[int, Any]:
-    # MICRO: canonical query for signing
-    q = _canonical_query(params)
+    q = canonical_query(params)
     signed_path = f"{path}?{q}" if q else path
 
     resp = requests.request(
         method=method,
         url=f"{BASE_URL}{path}",
         headers=kalshi_headers(private_key, method, signed_path),
-        params=params,   # requests sends real query; signing uses canonical q (should match)
+        params=params,
         json=body,
         timeout=15,
     )
-    code = resp.status_code
+
     try:
         data = resp.json()
     except Exception:
         data = resp.text
-    log.info("[REQ] %s %s -> HTTP=%s", method, signed_path, code)
-    return code, data
+
+    log.info("[REQ] %s %s -> %s", method, signed_path, resp.status_code)
+    return resp.status_code, data
 
 
-def _parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
-    close_iso = m.get("close_time")
-    if close_iso:
+# =====================================================
+# MARKET RESOLUTION — RUN ONCE
+# =====================================================
+def parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
+    if "close_time" in m:
         try:
-            dt = datetime.fromisoformat(str(close_iso).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))
             return int(dt.timestamp() * 1000)
         except Exception:
             pass
-
-    for k in ("close_time_ms", "close_ts_ms", "end_time_ms", "settlement_time_ms"):
-        if m.get(k) is not None:
-            try:
-                return int(m[k])
-            except Exception:
-                pass
-
-    return None
+    return m.get("close_time_ms")
 
 
-def pick_soonest_future_market(markets: List[Dict[str, Any]]) -> Optional[str]:
-    now_ms = now_utc_ts_ms()
-    best: Optional[Tuple[int, str]] = None
+def resolve_active_market(private_key) -> str:
+    if not SERIES_PREFIX:
+        raise RuntimeError("SERIES_PREFIX missing")
 
-    for m in markets:
-        if not isinstance(m, dict):
-            continue
-        t = str(m.get("ticker") or "").strip()
-        if not t:
-            continue
+    code, data = request(
+        private_key,
+        "GET",
+        "/trade-api/v2/markets",
+        params={
+            "series_ticker": SERIES_PREFIX.upper(),
+            "status": "open",
+            "limit": 50,
+        },
+    )
 
-        close_ms = _parse_close_ms(m)
-        if close_ms is None:
-            continue
-
-        delta = close_ms - now_ms
-        if delta <= 0:
-            continue
-
-        if best is None or delta < best[0]:
-            best = (delta, t)
-
-    return best[1] if best else None
-
-
-# -----------------------------
-# Market resolution (probe)
-# -----------------------------
-def list_markets_with_params(private_key, params: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]], Any]:
-    code, data = request(private_key, "GET", "/trade-api/v2/markets", params=params)
     if code != 200:
-        return code, [], data
+        raise RuntimeError(f"Market resolve failed: {data}")
+
     markets = data.get("markets", [])
-    if not isinstance(markets, list):
-        markets = []
-    return code, markets, data
+    now_ms = now_utc_ts_ms()
+
+    future = []
+    for m in markets:
+        close_ms = parse_close_ms(m)
+        if close_ms and close_ms > now_ms:
+            future.append((close_ms, m["ticker"]))
+
+    if not future:
+        raise RuntimeError("No future open markets found")
+
+    future.sort()
+    return future[0][1]
 
 
-def resolve_active_ticker_probe(private_key, series_prefix: str, series_ticker: str) -> Tuple[Optional[str], bool]:
-    sp = (series_prefix or "").strip()
-    st = (series_ticker or "").strip()
-    st_upper = st.upper()
-    sp_upper = sp.upper()
-
-    candidates: List[Tuple[str, Dict[str, Any]]] = [
-        ("series_ticker+open", {"limit": 200, "series_ticker": st_upper, "status": "open"}),
-        ("series_ticker+active", {"limit": 200, "series_ticker": st_upper, "status": "active"}),
-        ("event_ticker+open(st)", {"limit": 200, "event_ticker": st_upper, "status": "open"}),
-        ("event_ticker+open(sp)", {"limit": 200, "event_ticker": sp_upper, "status": "open"}),
-        ("series_ticker(no status)", {"limit": 200, "series_ticker": st_upper}),
-    ]
-
-    for label, params in candidates:
-        code, markets, err = list_markets_with_params(private_key, params)
-
-        if code == 429:
-            log.warning("[RL] Resolver probe rate-limited on %s (429).", label)
-            return None, True
-
-        if code != 200:
-            log.warning("[RESOLVE] probe=%s failed code=%s err=%s", label, code, err)
-            continue
-
-        if markets:
-            ticker = pick_soonest_future_market(markets)
-            log.info("[RESOLVE] probe=%s markets=%d picked=%s", label, len(markets), ticker)
-            if ticker:
-                return ticker, False
-
-        log.warning("[RESOLVE] probe=%s returned 200 but markets empty", label)
-
-    return None, False
-
-
-# -----------------------------
-# Trading
-# -----------------------------
+# =====================================================
+# ORDERBOOK + TRADING
+# =====================================================
 def get_orderbook(private_key, ticker: str):
-    code, data = request(private_key, "GET", f"/trade-api/v2/markets/{ticker}/orderbook")
+    code, data = request(
+        private_key,
+        "GET",
+        f"/trade-api/v2/markets/{ticker}/orderbook",
+    )
     if code != 200:
-        raise RuntimeError(f"Orderbook failed: {data}")
-    return data.get("orderbook", {})
+        raise RuntimeError(f"Orderbook error: {data}")
+    return data["orderbook"]
 
 
-def _extract_price_cents(level: Dict[str, Any]) -> Optional[int]:
-    for k in ("price_cents", "price", "yes_price", "no_price"):
-        if k in level and level[k] is not None:
-            try:
-                return int(level[k])
-            except Exception:
-                pass
-    return None
+def best_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    y = ob.get("yes", {})
+    bids = y.get("bids", [])
+    asks = y.get("asks", [])
+
+    best_bid = max((b["price_cents"] for b in bids), default=None)
+    best_ask = min((a["price_cents"] for a in asks), default=None)
+    return best_bid, best_ask
 
 
-def _extract_qty(level: Dict[str, Any]) -> int:
-    for k in ("count", "qty", "quantity", "shares", "size"):
-        if k in level and level[k] is not None:
-            try:
-                return int(level[k])
-            except Exception:
-                pass
-    return 0
-
-
-def parse_yes_best(orderbook: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    if not isinstance(orderbook, dict):
-        return None, None
-
-    y = orderbook.get("yes")
-
-    if isinstance(y, dict):
-        bids = y.get("bids", []) if isinstance(y.get("bids", []), list) else []
-        asks = y.get("asks", []) if isinstance(y.get("asks", []), list) else []
-
-        def norm(level: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not isinstance(level, dict):
-                return None
-            p = _extract_price_cents(level)
-            if p is None:
-                return None
-            return {"price_cents": p, "count": _extract_qty(level), "raw": level}
-
-        nbids = [norm(l) for l in bids]
-        nasks = [norm(l) for l in asks]
-        nbids = [x for x in nbids if x]
-        nasks = [x for x in nasks if x]
-
-        best_bid = max(nbids, key=lambda x: x["price_cents"]) if nbids else None
-        best_ask = min(nasks, key=lambda x: x["price_cents"]) if nasks else None
-        return best_bid, best_ask
-
-    if isinstance(y, list):
-        bids: List[Dict[str, Any]] = []
-        asks: List[Dict[str, Any]] = []
-
-        for item in y:
-            if not isinstance(item, dict):
-                continue
-            p = _extract_price_cents(item)
-            if p is None:
-                continue
-            side = str(item.get("side") or item.get("type") or item.get("action") or "").lower()
-
-            lvl = {"price_cents": p, "count": _extract_qty(item), "raw": item}
-
-            if side in ("bid", "buy", "bids"):
-                bids.append(lvl)
-            elif side in ("ask", "sell", "asks", "offer"):
-                asks.append(lvl)
-            else:
-                bids.append(lvl)
-
-        best_bid = max(bids, key=lambda x: x["price_cents"]) if bids else None
-        best_ask = min(asks, key=lambda x: x["price_cents"]) if asks else None
-        return best_bid, best_ask
-
-    return None, None
-
-
-def create_order_yes_buy(private_key, ticker: str, price: int, count: int):
+def place_yes_buy(private_key, ticker: str, price: int, count: int):
     body = {
         "ticker": ticker,
         "side": "yes",
         "action": "buy",
         "type": "limit",
-        "count": int(count),
-        "yes_price": int(price),
+        "count": count,
+        "yes_price": price,
         "client_order_id": str(uuid.uuid4()),
-        "post_only": bool(POST_ONLY),
+        "post_only": POST_ONLY,
     }
-    code, data = request(private_key, "POST", "/trade-api/v2/portfolio/orders", body=body)
-    if code not in (200, 201):
-        raise RuntimeError(f"Place order failed: {data}")
-
-
-# -----------------------------
-# Main loop
-# -----------------------------
-def main():
-    series_prefix = (
-        os.getenv("SERIES_PREFIX", "").strip()
-        or os.getenv("Series_PREFIC", "").strip()
-        or os.getenv("SERIES_PREFIC", "").strip()
+    code, data = request(
+        private_key,
+        "POST",
+        "/trade-api/v2/portfolio/orders",
+        body=body,
     )
-    if not series_prefix:
-        log.error("[CONFIG] Missing SERIES prefix. Set SERIES_PREFIX (preferred) or your existing Series_PREFIC.")
-        raise SystemExit(1)
+    if code not in (200, 201):
+        raise RuntimeError(f"Order failed: {data}")
 
-    series_ticker = os.getenv("SERIES_TICKER", "").strip() or series_prefix.upper()
 
-    if not KALSHI_KEY_ID:
-        log.error("[CONFIG] Missing KALSHI_KEY_ID")
-        raise SystemExit(1)
-
-    if not KALSHI_PRIVATE_KEY_B64:
-        log.error("[CONFIG] Missing KALSHI_PRIVATE_KEY_B64")
-        raise SystemExit(1)
+# =====================================================
+# MAIN
+# =====================================================
+def main():
+    if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_B64:
+        raise SystemExit("Missing API credentials")
 
     private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 
-    log.info(
-        "[BOOT] BASE_URL=%s KALSHI_KEY_ID=%s SERIES_PREFIX=%s SERIES_TICKER=%s POLL_SECONDS=%.2f RESOLVE_EVERY_SECONDS=%d BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s RESOLVE_BACKOFF_SECONDS=%d",
-        BASE_URL, _redact(KALSHI_KEY_ID), series_prefix, series_ticker, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY, RESOLVE_BACKOFF_SECONDS
-    )
-    log.info("[BOOT] Private key loaded OK (b64)")
+    log.info("[BOOT] BASE_URL=%s SERIES_PREFIX=%s SUBACCOUNT=%s",
+             BASE_URL, SERIES_PREFIX, KALSHI_SUBACCOUNT or "<default>")
+    log.info("[BOOT] Live trading ENABLED")
 
-    active_ticker: Optional[str] = None
-    next_resolve_at = 0.0
-
-    ob_sampled = False
-    parse_warned = False
+    # -------- RESOLVE ONCE --------
+    active_ticker = resolve_active_market(private_key)
+    log.info("[MARKET] Active contract locked: %s", active_ticker)
 
     while True:
         try:
-            now = time.time()
-
-            if active_ticker is None and now < next_resolve_at:
-                time.sleep(1)
-                continue
-
-            if active_ticker is None or now >= next_resolve_at:
-                new_ticker, hit_rl = resolve_active_ticker_probe(private_key, series_prefix, series_ticker)
-
-                if hit_rl:
-                    next_resolve_at = now + RESOLVE_BACKOFF_SECONDS
-                    active_ticker = None
-                    continue
-
-                if new_ticker and new_ticker != active_ticker:
-                    log.info("[MARKET] Switched active ticker -> %s", new_ticker)
-                    active_ticker = new_ticker
-                    ob_sampled = False
-                    parse_warned = False
-
-                if not active_ticker:
-                    log.warning("[MARKET] No active ticker resolved yet for series_ticker=%s (cooldown %ds)", series_ticker, RESOLVE_BACKOFF_SECONDS)
-                    next_resolve_at = now + RESOLVE_BACKOFF_SECONDS
-                    continue
-
-                next_resolve_at = now + RESOLVE_EVERY_SECONDS
-
-            if not active_ticker:
-                time.sleep(1)
-                continue
-
             ob = get_orderbook(private_key, active_ticker)
+            bid, ask = best_yes_bid_ask(ob)
 
-            if LOG_ORDERBOOK_SAMPLE and not ob_sampled:
-                y = ob.get("yes") if isinstance(ob, dict) else None
-                preview = None
-                if isinstance(y, list):
-                    preview = y[:3]
-                elif isinstance(y, dict):
-                    preview = {
-                        "keys": list(y.keys())[:10],
-                        "bids_preview": (y.get("bids") or [])[:2] if isinstance(y.get("bids"), list) else None,
-                        "asks_preview": (y.get("asks") or [])[:2] if isinstance(y.get("asks"), list) else None,
-                    }
-                else:
-                    preview = {"type": str(type(y)), "value_preview": str(y)[:200]}
+            if bid is not None and ask is not None:
+                spread = ask - bid
+                log.info("[SPREAD] YES bid=%dc ask=%dc spread=%dc", bid, ask, spread)
 
-                log.info("[OB] %s yes_type=%s yes_preview=%s", active_ticker, type(y).__name__, preview)
-                ob_sampled = True
-
-            bid, ask = parse_yes_best(ob)
-
-            if not bid and not ask:
-                if not parse_warned:
-                    log.warning("[PARSE] Could not parse YES bid/ask for %s; skipping order placement until parsed.", active_ticker)
-                    parse_warned = True
-                time.sleep(POLL_SECONDS)
-                continue
-
-            if bid and ask and LOG_SPREAD:
-                spread = ask["price_cents"] - bid["price_cents"]
-                log.info("[SPREAD] %s YES bid=%dc qty=%d | ask=%dc qty=%d | spread=%dc",
-                         active_ticker, bid["price_cents"], bid["count"], ask["price_cents"], ask["count"], spread)
-
-            # Strategy unchanged: still places a YES buy at BUY_PRICE_CENTS each loop
-            create_order_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
-
-        except Exception as e:
-            log.exception("[LOOPERR] %s", e)
-
-        time.sleep(POLL_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
+            place_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
