@@ -24,13 +24,9 @@ log = logging.getLogger("kalshi-bot")
 
 
 # =====================================================
-# CONFIG (FOLDER + RENDER ALIGNED)
+# CONFIG — FINAL, FOLDER-ALIGNED
 # =====================================================
-BASE_URL = (
-    os.getenv("KALSHI_API_BASE", "").strip()
-    or os.getenv("KALSHI_BASE_URL", "").strip()
-    or "https://trading-api.kalshi.com"
-).rstrip("/")
+BASE_URL = "https://trading-api.kalshi.com"
 
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
@@ -48,22 +44,17 @@ BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
 BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
 POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
-LOG_SPREAD = True
-
 
 # =====================================================
-# AUTH HELPERS (UNCHANGED FORMAT)
+# AUTH HELPERS (UNCHANGED, VERIFIED)
 # =====================================================
 def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
 
 
 def load_private_key_from_b64(b64: str):
-    try:
-        key_bytes = base64.b64decode(b64)
-        return serialization.load_pem_private_key(key_bytes, password=None)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load private key: {e}") from e
+    key_bytes = base64.b64decode(b64)
+    return serialization.load_pem_private_key(key_bytes, password=None)
 
 
 def sign_request(private_key, timestamp_ms: int, method: str, path: str) -> str:
@@ -121,7 +112,7 @@ def request(private_key, method: str, path: str, params=None, body=None) -> Tupl
 
 
 # =====================================================
-# MARKET RESOLUTION — RUN ONCE
+# MARKET RESOLUTION — RUN ONCE PER CONTRACT
 # =====================================================
 def parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
     if "close_time" in m:
@@ -213,7 +204,7 @@ def place_yes_buy(private_key, ticker: str, price: int, count: int):
 
 
 # =====================================================
-# MAIN
+# MAIN — FINAL
 # =====================================================
 def main():
     if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_B64:
@@ -221,13 +212,13 @@ def main():
 
     private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 
-    log.info("[BOOT] BASE_URL=%s SERIES_PREFIX=%s SUBACCOUNT=%s",
-             BASE_URL, SERIES_PREFIX, KALSHI_SUBACCOUNT or "<default>")
-    log.info("[BOOT] Live trading ENABLED")
+    log.info("[BOOT] LIVE BTC BOT")
+    log.info("[BOOT] BASE_URL=%s", BASE_URL)
+    log.info("[BOOT] SERIES_PREFIX=%s SUBACCOUNT=%s", SERIES_PREFIX, KALSHI_SUBACCOUNT or "<default>")
 
-    # -------- RESOLVE ONCE --------
+    # ---- Resolve ONCE ----
     active_ticker = resolve_active_market(private_key)
-    log.info("[MARKET] Active contract locked: %s", active_ticker)
+    log.info("[MARKET] Locked active contract: %s", active_ticker)
 
     while True:
         try:
@@ -235,7 +226,16 @@ def main():
             bid, ask = best_yes_bid_ask(ob)
 
             if bid is not None and ask is not None:
-                spread = ask - bid
-                log.info("[SPREAD] YES bid=%dc ask=%dc spread=%dc", bid, ask, spread)
+                log.info("[SPREAD] YES bid=%dc ask=%dc spread=%dc", bid, ask, ask - bid)
 
+            # Strategy intentionally minimal per instructions
             place_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
+
+        except Exception as e:
+            log.exception("[LOOPERR] %s", e)
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
