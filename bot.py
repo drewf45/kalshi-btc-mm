@@ -40,7 +40,6 @@ POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
 LOG_SPREAD = os.getenv("LOG_SPREAD", "true").lower() in ("1", "true", "yes", "y")
 
-MAX_MARKET_PAGES = int(os.getenv("MAX_MARKET_PAGES", "2"))
 RESOLVE_BACKOFF_SECONDS = int(os.getenv("RESOLVE_BACKOFF_SECONDS", "60"))
 
 
@@ -118,137 +117,64 @@ def _parse_close_ms(m: Dict[str, Any]) -> Optional[int]:
 
 
 # -----------------------------
-# Market resolution
+# Market resolution (MICRO-CHANGE #5)
 # -----------------------------
-def list_markets(private_key, limit=200, cursor=None) -> Tuple[int, List[Dict[str, Any]], Optional[str], Any]:
-    params = {"limit": limit}
-    if cursor:
-        params["cursor"] = cursor
+def list_markets_filtered(private_key, series_ticker: str) -> Tuple[int, List[Dict[str, Any]], Any]:
+    """
+    ✅ Micro-change: use the documented filter instead of paging the whole /markets universe:
+      /markets?series_ticker=KXBTC15M&status=open
+    """
+    params = {
+        "limit": 200,
+        "series_ticker": series_ticker,
+        "status": "open",
+    }
     code, data = request(private_key, "GET", "/trade-api/v2/markets", params=params)
     if code != 200:
-        return code, [], None, data
+        return code, [], data
     markets = data.get("markets", [])
-    next_cursor = data.get("cursor")
     if not isinstance(markets, list):
         markets = []
-    return code, markets, next_cursor, data
+    return code, markets, data
 
 
-# ✅ MICRO-CHANGE: query event markets directly (kxbtc15m)
-def list_event_markets(private_key, event_ticker: str, limit=200, cursor=None) -> Tuple[int, List[Dict[str, Any]], Optional[str], Any]:
-    path = f"/trade-api/v2/events/{event_ticker}/markets"
-    params = {"limit": limit}
-    if cursor:
-        params["cursor"] = cursor
-
-    code, data = request(private_key, "GET", path, params=params)
-    if code != 200:
-        return code, [], None, data
-
-    # Some APIs return {"markets":[...]} plus {"cursor":...}
-    markets = data.get("markets", [])
-    next_cursor = data.get("cursor")
-    if not isinstance(markets, list):
-        markets = []
-    return code, markets, next_cursor, data
-
-
-def resolve_active_ticker(private_key, series_prefix: str, event_ticker: Optional[str]) -> Tuple[Optional[str], bool]:
+def resolve_active_ticker(private_key, series_ticker: str) -> Tuple[Optional[str], bool]:
     """
     Returns (ticker, hit_rate_limit)
-
-    Micro-change:
-      1) Prefer resolving via event markets endpoint using EVENT_TICKER (kxbtc15m)
-      2) Fallback to /markets scan if event endpoint fails
+    Choose the open market in this series whose close_time is the soonest in the future.
     """
-    want = (series_prefix or "").strip().lower()
     now_ms = now_utc_ts_ms()
 
-    # --------------- Prefer event markets ---------------
-    if event_ticker:
-        cursor = None
-        best: Optional[Tuple[int, str]] = None
-        for _ in range(3):  # keep cheap
-            code, markets, cursor, err = list_event_markets(private_key, event_ticker, cursor=cursor)
+    code, markets, err = list_markets_filtered(private_key, series_ticker)
 
-            if code == 429:
-                log.warning("[RL] /events/%s/markets rate-limited (429).", event_ticker)
-                return None, True
+    if code == 429:
+        log.warning("[RL] /markets?series_ticker=%s rate-limited (429).", series_ticker)
+        return None, True
 
-            if code != 200:
-                log.warning("[EVENT] list_event_markets failed event=%s code=%s err=%s", event_ticker, code, err)
-                break
+    if code != 200:
+        log.warning("[MARKETS] filtered list failed series=%s code=%s err=%s", series_ticker, code, err)
+        return None, False
 
-            for m in markets:
-                if not isinstance(m, dict):
-                    continue
-                t = str(m.get("ticker") or "").strip()
-                if not t:
-                    continue
+    best: Optional[Tuple[int, str]] = None
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        t = str(m.get("ticker") or "").strip()
+        if not t:
+            continue
 
-                # If prefix is provided, use it as a filter (case-insensitive)
-                if want and not t.lower().startswith(want):
-                    continue
+        close_ms = _parse_close_ms(m)
+        if close_ms is None:
+            continue
 
-                close_ms = _parse_close_ms(m)
-                if close_ms is None:
-                    continue
+        delta = close_ms - now_ms
+        if delta <= 0:
+            continue
 
-                delta = close_ms - now_ms
-                if delta <= 0:
-                    continue
+        if best is None or delta < best[0]:
+            best = (delta, t)
 
-                if best is None or delta < best[0]:
-                    best = (delta, t)
-
-            if not cursor:
-                break
-
-        if best:
-            return best[1], False
-
-    # --------------- Fallback global markets scan ---------------
-    best2: Optional[Tuple[int, str]] = None
-    cursor = None
-    hit_rl = False
-
-    for _ in range(MAX_MARKET_PAGES):
-        code, markets, cursor, err = list_markets(private_key, cursor=cursor)
-
-        if code == 429:
-            hit_rl = True
-            log.warning("[RL] /markets rate-limited (429).")
-            break
-
-        if code != 200:
-            log.warning("[MARKETS] list failed code=%s err=%s", code, err)
-            break
-
-        for m in markets:
-            if not isinstance(m, dict):
-                continue
-            t = str(m.get("ticker") or "").strip()
-            if not t:
-                continue
-
-            if want and not t.lower().startswith(want):
-                continue
-
-            close_ms = _parse_close_ms(m)
-            if close_ms is None:
-                continue
-
-            delta = close_ms - now_ms
-            if delta <= 0:
-                continue
-
-            if best2 is None or delta < best2[0]:
-                best2 = (delta, t)
-
-        if not cursor:
-            break
-
-    return (best2[1] if best2 else None), hit_rl
+    return (best[1] if best else None), False
 
 
 # -----------------------------
@@ -290,22 +216,21 @@ def create_order_yes_buy(private_key, ticker, price, count):
 # Main loop
 # -----------------------------
 def main():
-    # Accept your existing env var aliases
+    # keep your existing env var aliases
     series_prefix = (
         os.getenv("SERIES_PREFIX", "").strip()
         or os.getenv("Series_PREFIC", "").strip()
         or os.getenv("SERIES_PREFIC", "").strip()
     )
 
-    # ✅ MICRO-CHANGE: support EVENT_TICKER (from your link: kxbtc15m)
-    event_ticker = os.getenv("EVENT_TICKER", "").strip() or (series_prefix.lower() if series_prefix else "")
-    if event_ticker == "":
-        event_ticker = None
-
     if not series_prefix:
         log.error("[CONFIG] Missing SERIES prefix. Set SERIES_PREFIX (preferred) or your existing Series_PREFIC.")
         while True:
             time.sleep(30)
+
+    # ✅ Micro-change: explicit SERIES_TICKER (defaults to upper-case prefix)
+    # Example: SERIES_PREFIX=KXBTC15m -> SERIES_TICKER=KXBTC15M
+    series_ticker = os.getenv("SERIES_TICKER", "").strip() or series_prefix.upper()
 
     if not KALSHI_KEY_ID:
         log.error("[CONFIG] Missing KALSHI_KEY_ID")
@@ -320,8 +245,8 @@ def main():
     private_key = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 
     log.info(
-        "[BOOT] BASE_URL=%s SERIES_PREFIX=%s EVENT_TICKER=%s POLL_SECONDS=%.2f RESOLVE_EVERY_SECONDS=%d BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s MAX_MARKET_PAGES=%d RESOLVE_BACKOFF_SECONDS=%d",
-        BASE_URL, series_prefix, event_ticker, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY, MAX_MARKET_PAGES, RESOLVE_BACKOFF_SECONDS
+        "[BOOT] BASE_URL=%s SERIES_PREFIX=%s SERIES_TICKER=%s POLL_SECONDS=%.2f RESOLVE_EVERY_SECONDS=%d BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s RESOLVE_BACKOFF_SECONDS=%d",
+        BASE_URL, series_prefix, series_ticker, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY, RESOLVE_BACKOFF_SECONDS
     )
 
     active_ticker = None
@@ -336,7 +261,7 @@ def main():
                 continue
 
             if active_ticker is None or now >= next_resolve_at:
-                new_ticker, hit_rl = resolve_active_ticker(private_key, series_prefix, event_ticker)
+                new_ticker, hit_rl = resolve_active_ticker(private_key, series_ticker)
 
                 if hit_rl:
                     next_resolve_at = now + RESOLVE_BACKOFF_SECONDS
@@ -348,7 +273,7 @@ def main():
                     active_ticker = new_ticker
 
                 if not active_ticker:
-                    log.warning("[MARKET] No active ticker resolved yet for prefix=%s event=%s (cooldown %ds)", series_prefix, event_ticker, RESOLVE_BACKOFF_SECONDS)
+                    log.warning("[MARKET] No active ticker resolved yet for series_ticker=%s (cooldown %ds)", series_ticker, RESOLVE_BACKOFF_SECONDS)
                     next_resolve_at = now + RESOLVE_BACKOFF_SECONDS
                     continue
 
