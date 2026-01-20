@@ -39,6 +39,7 @@ BASE_SIZE = int(os.getenv("BASE_SIZE", "1"))
 POST_ONLY = os.getenv("POST_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
 LOG_SPREAD = os.getenv("LOG_SPREAD", "true").lower() in ("1", "true", "yes", "y")
+LOG_ORDERBOOK_SAMPLE = os.getenv("LOG_ORDERBOOK_SAMPLE", "true").lower() in ("1", "true", "yes", "y")
 
 RESOLVE_BACKOFF_SECONDS = int(os.getenv("RESOLVE_BACKOFF_SECONDS", "60"))
 
@@ -142,7 +143,7 @@ def pick_soonest_future_market(markets: List[Dict[str, Any]]) -> Optional[str]:
 
 
 # -----------------------------
-# Market resolution (MICRO-CHANGE #6: probe)
+# Market resolution (probe)
 # -----------------------------
 def list_markets_with_params(private_key, params: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]], Any]:
     code, data = request(private_key, "GET", "/trade-api/v2/markets", params=params)
@@ -155,14 +156,6 @@ def list_markets_with_params(private_key, params: Dict[str, Any]) -> Tuple[int, 
 
 
 def resolve_active_ticker_probe(private_key, series_prefix: str, series_ticker: str) -> Tuple[Optional[str], bool]:
-    """
-    Returns (ticker, hit_rate_limit)
-
-    We don't guess one endpoint anymore.
-    We try a tiny set of likely filters and log which one works.
-    """
-    # Build candidates (keep it very small to avoid spamming)
-    # NOTE: Kalshi sometimes uses uppercase identifiers even if UI path is lowercase.
     sp = (series_prefix or "").strip()
     st = (series_ticker or "").strip()
     st_upper = st.upper()
@@ -171,10 +164,8 @@ def resolve_active_ticker_probe(private_key, series_prefix: str, series_ticker: 
     candidates: List[Tuple[str, Dict[str, Any]]] = [
         ("series_ticker+open", {"limit": 200, "series_ticker": st_upper, "status": "open"}),
         ("series_ticker+active", {"limit": 200, "series_ticker": st_upper, "status": "active"}),
-        # Some APIs use "event_ticker" for grouping (try both forms)
         ("event_ticker+open(st)", {"limit": 200, "event_ticker": st_upper, "status": "open"}),
         ("event_ticker+open(sp)", {"limit": 200, "event_ticker": sp_upper, "status": "open"}),
-        # Last resort: omit status (still filtered)
         ("series_ticker(no status)", {"limit": 200, "series_ticker": st_upper}),
     ]
 
@@ -210,16 +201,97 @@ def get_orderbook(private_key, ticker: str):
     return data.get("orderbook", {})
 
 
-def parse_yes_best(orderbook):
-    y = orderbook.get("yes", {})
-    bids = y.get("bids", [])
-    asks = y.get("asks", [])
-    best_bid = max(bids, key=lambda x: x["price_cents"]) if bids else None
-    best_ask = min(asks, key=lambda x: x["price_cents"]) if asks else None
-    return best_bid, best_ask
+def _extract_price_cents(level: Dict[str, Any]) -> Optional[int]:
+    # common variants seen across Kalshi endpoints
+    for k in ("price_cents", "price", "yes_price", "no_price"):
+        if k in level and level[k] is not None:
+            try:
+                return int(level[k])
+            except Exception:
+                pass
+    return None
 
 
-def create_order_yes_buy(private_key, ticker, price, count):
+def _extract_qty(level: Dict[str, Any]) -> int:
+    for k in ("count", "qty", "quantity", "shares", "size"):
+        if k in level and level[k] is not None:
+            try:
+                return int(level[k])
+            except Exception:
+                pass
+    return 0
+
+
+def parse_yes_best(orderbook: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Supports BOTH:
+      A) orderbook["yes"] == {"bids":[...], "asks":[...]}
+      B) orderbook["yes"] == [ {price_cents:.., count:.., side:"bid"/"ask"} , ... ]
+    Returns:
+      (best_bid_level, best_ask_level) where each level has at least price_cents/count if possible.
+    """
+    if not isinstance(orderbook, dict):
+        return None, None
+
+    y = orderbook.get("yes")
+
+    # Shape A: dict with bids/asks
+    if isinstance(y, dict):
+        bids = y.get("bids", []) if isinstance(y.get("bids", []), list) else []
+        asks = y.get("asks", []) if isinstance(y.get("asks", []), list) else []
+
+        def norm(level: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not isinstance(level, dict):
+                return None
+            p = _extract_price_cents(level)
+            if p is None:
+                return None
+            return {"price_cents": p, "count": _extract_qty(level), "raw": level}
+
+        nbids = [norm(l) for l in bids]
+        nasks = [norm(l) for l in asks]
+        nbids = [x for x in nbids if x]
+        nasks = [x for x in nasks if x]
+
+        best_bid = max(nbids, key=lambda x: x["price_cents"]) if nbids else None
+        best_ask = min(nasks, key=lambda x: x["price_cents"]) if nasks else None
+        return best_bid, best_ask
+
+    # Shape B: list of levels
+    if isinstance(y, list):
+        bids: List[Dict[str, Any]] = []
+        asks: List[Dict[str, Any]] = []
+
+        for item in y:
+            if not isinstance(item, dict):
+                continue
+            p = _extract_price_cents(item)
+            if p is None:
+                continue
+            side = str(item.get("side") or item.get("type") or item.get("action") or "").lower()
+
+            lvl = {"price_cents": p, "count": _extract_qty(item), "raw": item}
+
+            # common side labels
+            if side in ("bid", "buy", "bids"):
+                bids.append(lvl)
+            elif side in ("ask", "sell", "asks", "offer"):
+                asks.append(lvl)
+            else:
+                # If no side label, we can't reliably split. Keep in "unknown" bucket by inference later.
+                # We'll infer by assuming that the lower half are asks and upper half are bids only if there is a gap.
+                # For now, store under bids to at least get a best bid candidate.
+                bids.append(lvl)
+
+        best_bid = max(bids, key=lambda x: x["price_cents"]) if bids else None
+        best_ask = min(asks, key=lambda x: x["price_cents"]) if asks else None
+        return best_bid, best_ask
+
+    # Unknown shape
+    return None, None
+
+
+def create_order_yes_buy(private_key, ticker: str, price: int, count: int):
     body = {
         "ticker": ticker,
         "side": "yes",
@@ -239,19 +311,16 @@ def create_order_yes_buy(private_key, ticker, price, count):
 # Main loop
 # -----------------------------
 def main():
-    # keep your existing env var aliases
     series_prefix = (
         os.getenv("SERIES_PREFIX", "").strip()
         or os.getenv("Series_PREFIC", "").strip()
         or os.getenv("SERIES_PREFIC", "").strip()
     )
-
     if not series_prefix:
         log.error("[CONFIG] Missing SERIES prefix. Set SERIES_PREFIX (preferred) or your existing Series_PREFIC.")
         while True:
             time.sleep(30)
 
-    # explicit SERIES_TICKER if you want, else derive
     series_ticker = os.getenv("SERIES_TICKER", "").strip() or series_prefix.upper()
 
     if not KALSHI_KEY_ID:
@@ -271,8 +340,11 @@ def main():
         BASE_URL, series_prefix, series_ticker, POLL_SECONDS, RESOLVE_EVERY_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY, RESOLVE_BACKOFF_SECONDS
     )
 
-    active_ticker = None
+    active_ticker: Optional[str] = None
     next_resolve_at = 0.0
+
+    ob_sampled = False
+    parse_warned = False
 
     while True:
         try:
@@ -293,6 +365,9 @@ def main():
                 if new_ticker and new_ticker != active_ticker:
                     log.info("[MARKET] Switched active ticker -> %s", new_ticker)
                     active_ticker = new_ticker
+                    # reset one-time logs when switching markets
+                    ob_sampled = False
+                    parse_warned = False
 
                 if not active_ticker:
                     log.warning("[MARKET] No active ticker resolved yet for series_ticker=%s (cooldown %ds)", series_ticker, RESOLVE_BACKOFF_SECONDS)
@@ -306,12 +381,40 @@ def main():
                 continue
 
             ob = get_orderbook(private_key, active_ticker)
+
+            # One-time schema sample to lock down the real format
+            if LOG_ORDERBOOK_SAMPLE and not ob_sampled:
+                y = ob.get("yes") if isinstance(ob, dict) else None
+                preview = None
+                if isinstance(y, list):
+                    preview = y[:3]
+                elif isinstance(y, dict):
+                    preview = {
+                        "keys": list(y.keys())[:10],
+                        "bids_preview": (y.get("bids") or [])[:2] if isinstance(y.get("bids"), list) else None,
+                        "asks_preview": (y.get("asks") or [])[:2] if isinstance(y.get("asks"), list) else None,
+                    }
+                else:
+                    preview = {"type": str(type(y)), "value_preview": str(y)[:200]}
+
+                log.info("[OB] %s yes_type=%s yes_preview=%s", active_ticker, type(y).__name__, preview)
+                ob_sampled = True
+
             bid, ask = parse_yes_best(ob)
+
+            if not bid and not ask:
+                if not parse_warned:
+                    log.warning("[PARSE] Could not parse YES bid/ask for %s; skipping order placement until parsed.", active_ticker)
+                    parse_warned = True
+                time.sleep(POLL_SECONDS)
+                continue
 
             if bid and ask and LOG_SPREAD:
                 spread = ask["price_cents"] - bid["price_cents"]
-                log.info("[SPREAD] %s YES bid=%dc ask=%dc spread=%dc", active_ticker, bid["price_cents"], ask["price_cents"], spread)
+                log.info("[SPREAD] %s YES bid=%dc qty=%d | ask=%dc qty=%d | spread=%dc",
+                         active_ticker, bid["price_cents"], bid["count"], ask["price_cents"], ask["count"], spread)
 
+            # Only place orders when we have at least a parsed book (prevents blind firing)
             create_order_yes_buy(private_key, active_ticker, BUY_PRICE_CENTS, BASE_SIZE)
 
         except Exception as e:
@@ -321,4 +424,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
