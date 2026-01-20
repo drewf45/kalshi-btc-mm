@@ -5,12 +5,10 @@ import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
-from urllib.parse import urlencode
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
-
 
 # -----------------------------
 # Logging
@@ -22,371 +20,280 @@ logging.basicConfig(
 )
 log = logging.getLogger("kalshi-bot")
 
+# -----------------------------
+# Env
+# -----------------------------
+KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://api.kalshi.com")
+KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "")
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+MARKET_TICKER = os.getenv("MARKET_TICKER", "KXBTC15M-26JAN200900-00")
+
+LOOP_SECONDS = float(os.getenv("LOOP_SECONDS", "1"))
+BUY_QTY = int(os.getenv("BUY_QTY", "1"))
+
+# For now: YES-only, keep it simple
+MAX_YES_PRICE_CENTS = int(os.getenv("MAX_YES_PRICE_CENTS", "99"))
+
+SESSION = requests.Session()
+SESSION.headers.update({"Content-Type": "application/json"})
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def now_utc_ts() -> int:
+def now_utc_ts_ms() -> int:
     return int(time.time() * 1000)
 
+def iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+def load_private_key(path: str):
+    with open(path, "rb") as f:
+        key_bytes = f.read()
+    return serialization.load_pem_private_key(key_bytes, password=None)
 
+PRIVATE_KEY = load_private_key(KALSHI_PRIVATE_KEY_PATH) if KALSHI_PRIVATE_KEY_PATH else None
 
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or not str(v).strip():
-        return default
-    return int(v)
+def sha256_b64(data: bytes) -> str:
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    return base64.b64encode(digest.finalize()).decode()
 
-
-def safe_json(obj: Any, max_len: int = 1200) -> str:
-    try:
-        s = json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        s = str(obj)
-    if len(s) > max_len:
-        return s[:max_len] + "...(truncated)"
-    return s
-
-
-def load_rsa_private_key_from_env() -> Any:
-    pem_or_b64 = os.getenv("KALSHI_PRIVATE_KEY") or ""
-    b64 = os.getenv("KALSHI_PRIVATE_KEY_B64") or ""
-    candidate = pem_or_b64.strip() if pem_or_b64.strip() else b64.strip()
-    if not candidate:
-        raise RuntimeError("Missing env var KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_B64")
-
-    if "BEGIN" not in candidate:
-        try:
-            candidate_bytes = base64.b64decode(candidate)
-            candidate = candidate_bytes.decode("utf-8")
-        except Exception as e:
-            raise RuntimeError(f"Private key not PEM and base64 decode failed: {e}")
-
-    try:
-        key = serialization.load_pem_private_key(
-            candidate.encode("utf-8"),
-            password=None,
-        )
-        log.info("Loaded RSA private key (PEM).")
-        return key
-    except Exception as e:
-        raise RuntimeError(f"Failed to load RSA private key: {e}")
-
-
-# -----------------------------
-# Kalshi Client (RSA signing)
-# -----------------------------
-class KalshiClient:
-    def __init__(self, api_base: str, key_id: str, private_key: Any, subaccount: Optional[str] = None):
-        self.api_base = api_base.rstrip("/")
-        self.key_id = key_id
-        self.private_key = private_key
-        self.subaccount = (subaccount or "").strip() or None
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        self.api_prefix = None
-
-    def _sign(self, method: str, path: str, ts: int) -> str:
-        payload = f"{ts}{method.upper()}{path}".encode("utf-8")
-        sig = self.private_key.sign(
-            payload,
-            asy_padding.PSS(
-                mgf=asy_padding.MGF1(hashes.SHA256()),
-                salt_length=asy_padding.PSS.MAX_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
-        return base64.b64encode(sig).decode("utf-8")
-
-    def _headers(self, method: str, path: str) -> Dict[str, str]:
-        ts = now_utc_ts()
-        sig = self._sign(method, path, ts)
-
-        # signing debug
-        try:
-            signing_payload = f"{ts}{method.upper()}{path}".encode("utf-8")
-            h = hashes.Hash(hashes.SHA256())
-            h.update(signing_payload)
-            digest = base64.b64encode(h.finalize()).decode("utf-8")
-            log.info(f"[SIGNDBG] {method.upper()} {path} ts={ts}ms signing_payload_sha256_b64={digest}")
-        except Exception as _e:
-            log.info(f"[SIGNDBG] failed: {_e}")
-
-        headers = {
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": sig,
-            "KALSHI-ACCESS-TIMESTAMP": str(ts),
-        }
-        if self.subaccount:
-            headers["KALSHI-SUBACCOUNT"] = self.subaccount
-        return headers
-
-    def request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None):
-        path_q = path
-        if params:
-            items: List[Tuple[str, Any]] = []
-            for k in sorted(params.keys()):
-                v = params[k]
-                if isinstance(v, (list, tuple)):
-                    for vv in v:
-                        items.append((k, vv))
-                else:
-                    items.append((k, v))
-            qs = urlencode(items, doseq=True)
-            path_q = f"{path}?{qs}"
-
-        url = f"{self.api_base}{path_q}"
-
-        data = None
-        if json_body is not None:
-            data = json.dumps(json_body, separators=(",", ":"))
-
-        headers = self._headers(method, path_q if method.upper() == "GET" else path)
-
-        try:
-            r = self.session.request(method=method, url=url, params=None, data=data, headers=headers, timeout=20)
-        except Exception as e:
-            log.error(f"HTTP {method} {path_q} failed: {e}")
-            return 0, None, ""
-
-        text = r.text or ""
-        parsed: Any = None
-        if text:
-            try:
-                parsed = r.json()
-            except Exception:
-                parsed = {"_raw": text}
-        return r.status_code, parsed, text
-
-    def discover_prefix(self) -> str:
-        for pref in ("/trade-api/v2", "/trade-api/v1"):
-            code, body, _ = self.request("GET", f"{pref}/markets", params={"limit": 1})
-            if code == 200:
-                self.api_prefix = pref
-                log.info(f"Discovered API prefix: {pref}")
-                log.info(f"Markets probe keys={list(body.keys()) if isinstance(body, dict) else None}")
-                return pref
-        raise RuntimeError("Could not discover API prefix.")
-
-    def get_markets_by_series(self, series_ticker: str, limit: int = 200) -> List[Dict[str, Any]]:
-        if not self.api_prefix:
-            self.discover_prefix()
-        path = f"{self.api_prefix}/markets"
-        code, body, text = self.request("GET", path, params={"series_ticker": series_ticker, "limit": limit})
-        log.info(f"[SERIES] HTTP={code} keys={list(body.keys()) if isinstance(body, dict) else None}")
-        if code != 200:
-            raise RuntimeError(f"Series markets fetch failed HTTP={code} body={safe_json(body)} raw={text[:200]}")
-        return body.get("markets", []) if isinstance(body, dict) else []
-
-    def get_orderbook(self, market_ticker: str) -> Dict[str, Any]:
-        if not self.api_prefix:
-            self.discover_prefix()
-        path = f"{self.api_prefix}/markets/{market_ticker}/orderbook"
-        code, body, _ = self.request("GET", path)
-        log.info(f"[BOOK] GET {path} -> HTTP={code} keys={list(body.keys()) if isinstance(body, dict) else None}")
-        if code != 200:
-            raise RuntimeError(f"Orderbook fetch failed HTTP={code} body={safe_json(body)}")
-        return body
-
-    def place_order(self, payload: Dict[str, Any]):
-        if not self.api_prefix:
-            self.discover_prefix()
-        path = f"{self.api_prefix}/portfolio/orders"
-        code, body, _ = self.request("POST", path, json_body=payload)
-        return code, body
-
-
-# -----------------------------
-# ✅ FIXED PARSER (handles real shapes)
-# -----------------------------
-def _best_from_list(side_list: Any, choose: str) -> Optional[Dict[str, int]]:
-    if not isinstance(side_list, list) or not side_list:
-        return None
-    # entries usually [price, qty]
-    try:
-        if choose == "max":
-            p, q = max(side_list, key=lambda x: x[0])
-        else:
-            p, q = min(side_list, key=lambda x: x[0])
-        return {"price_cents": int(p), "qty": int(q)}
-    except Exception:
-        return None
-
-
-def parse_best_bid_ask(orderbook: Dict[str, Any]) -> Tuple[Dict[str, Optional[Dict[str, int]]], bool]:
+def sign_request(method: str, path: str, ts_ms: int, body: bytes) -> Dict[str, str]:
     """
-    Returns (best_dict, ok)
-    ok=False means "we could not reliably find bids+asks", so bot should stand down.
+    Kalshi signature: sign payload = f"{ts_ms}{method}{path}{sha256(body)}"
+    (Your existing bot already does this; keep consistent with your working auth.)
     """
-    ob = orderbook.get("orderbook", {}) if isinstance(orderbook, dict) else {}
+    if PRIVATE_KEY is None:
+        raise RuntimeError("Missing PRIVATE_KEY (set KALSHI_PRIVATE_KEY_PATH).")
+    body_hash_b64 = sha256_b64(body)
+    signing_payload = f"{ts_ms}{method.upper()}{path}{body_hash_b64}".encode()
 
-    # If yes/no are dicts with bids/asks, use that (reliable).
-    yes = ob.get("yes")
-    no = ob.get("no")
+    signature = PRIVATE_KEY.sign(
+        signing_payload,
+        asy_padding.PKCS1v15(),
+        hashes.SHA256()
+    )
+    sig_b64 = base64.b64encode(signature).decode()
 
-    def parse_side(side_obj: Any) -> Tuple[Optional[Dict[str, int]], Optional[Dict[str, int]], bool]:
-        # returns (bid, ask, ok)
-        if isinstance(side_obj, dict):
-            bids = side_obj.get("bids")
-            asks = side_obj.get("asks")
-            bid = _best_from_list(bids, "max")
-            ask = _best_from_list(asks, "min")
-            ok = bid is not None and ask is not None
-            return bid, ask, ok
+    log.info(
+        "[SIGNDBG] %s %s ts=%sms body_len=%s signing_payload_sha256_b64=%s",
+        method.upper(), path, ts_ms, len(body), sha256_b64(signing_payload)
+    )
 
-        # If it's only a list, we DO NOT know if it's bids or asks.
-        # Stand down rather than guessing.
-        if isinstance(side_obj, list):
-            return None, None, False
-
-        return None, None, False
-
-    yes_bid, yes_ask, yes_ok = parse_side(yes)
-    no_bid, no_ask, no_ok = parse_side(no)
-
-    best = {
-        "yes_best_bid": yes_bid,
-        "yes_best_ask": yes_ask,
-        "no_best_bid": no_bid,
-        "no_best_ask": no_ask,
+    return {
+        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
+        "KALSHI-ACCESS-SIGNATURE": sig_b64,
     }
-    ok = yes_ok and no_ok
 
-    # Sanity check (bid must be <= ask)
-    if ok:
-        if best["yes_best_bid"]["price_cents"] > best["yes_best_ask"]["price_cents"]:
+def kalshi_request(method: str, path: str, payload: Optional[dict] = None) -> dict:
+    url = f"{KALSHI_API_BASE}{path}"
+    body = b""
+    if payload is not None:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+
+    ts_ms = now_utc_ts_ms()
+    headers = sign_request(method, path, ts_ms, body)
+
+    resp = SESSION.request(method.upper(), url, headers=headers, data=body if body else None, timeout=10)
+    try:
+        j = resp.json()
+    except Exception:
+        j = {"_raw": resp.text}
+
+    log.info("[HTTP] %s %s -> %s", method.upper(), path, resp.status_code)
+    if resp.status_code >= 400:
+        log.warning("[HTTPERR] %s", j)
+        raise RuntimeError(f"HTTP {resp.status_code}: {j}")
+    return j
+
+# -----------------------------
+# Orderbook parsing (FIX)
+# -----------------------------
+def _normalize_levels(levels: Any) -> List[Tuple[int, int]]:
+    """
+    Kalshi docs: orderbook.yes and orderbook.no are arrays of bids
+    where each bid is [price, quantity].  [oai_citation:1‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/orderbook_responses?utm_source=chatgpt.com)
+
+    But we also tolerate dict-ish formats defensively.
+    Returns list of (price_cents, qty).
+    """
+    out: List[Tuple[int, int]] = []
+    if levels is None:
+        return out
+
+    if isinstance(levels, list):
+        for x in levels:
+            # Common: [price, qty]
+            if isinstance(x, list) and len(x) >= 2 and isinstance(x[0], (int, float)) and isinstance(x[1], (int, float)):
+                out.append((int(x[0]), int(x[1])))
+                continue
+            # Sometimes: {"price": 32, "quantity": 10} or variants
+            if isinstance(x, dict):
+                p = x.get("price") or x.get("price_cents")
+                q = x.get("quantity") or x.get("qty")
+                if p is not None and q is not None:
+                    out.append((int(p), int(q)))
+    elif isinstance(levels, dict):
+        # If someone passes a dict keyed by price -> qty
+        for k, v in levels.items():
+            try:
+                out.append((int(k), int(v)))
+            except Exception:
+                pass
+
+    return out
+
+def parse_best_from_bids_only(orderbook_json: dict) -> Tuple[dict, bool]:
+    """
+    Returns:
+      yes_best_bid: {"price_cents": int, "qty": int} or None
+      yes_best_ask: derived from no_best_bid => 100 - no_best_bid_price
+      no_best_bid: ...
+      no_best_ask: derived from yes_best_bid => 100 - yes_best_bid_price
+
+    NOTE: asks are *derived*, because API returns bids only.  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/orderbook_responses?utm_source=chatgpt.com)
+    """
+    ob = orderbook_json.get("orderbook")
+    if not isinstance(ob, dict):
+        return ({"yes_best_bid": None, "yes_best_ask": None, "no_best_bid": None, "no_best_ask": None}, False)
+
+    yes_levels = _normalize_levels(ob.get("yes"))
+    no_levels = _normalize_levels(ob.get("no"))
+
+    yes_best_bid = None
+    no_best_bid = None
+
+    if yes_levels:
+        p, q = max(yes_levels, key=lambda t: t[0])  # best bid = highest price
+        yes_best_bid = {"price_cents": p, "qty": q}
+
+    if no_levels:
+        p, q = max(no_levels, key=lambda t: t[0])
+        no_best_bid = {"price_cents": p, "qty": q}
+
+    # Derived asks (complements)
+    yes_best_ask = None
+    no_best_ask = None
+
+    if no_best_bid is not None:
+        yes_best_ask = {"price_cents": max(0, 100 - int(no_best_bid["price_cents"])), "qty": int(no_best_bid["qty"])}
+
+    if yes_best_bid is not None:
+        no_best_ask = {"price_cents": max(0, 100 - int(yes_best_bid["price_cents"])), "qty": int(yes_best_bid["qty"])}
+
+    # Basic sanity:
+    # In a clean book, yes_best_bid + no_best_bid <= 100 (otherwise crossed/arby-ish)
+    ok = True
+    if yes_best_bid and no_best_bid:
+        if int(yes_best_bid["price_cents"]) + int(no_best_bid["price_cents"]) > 100:
             ok = False
-        if best["no_best_bid"]["price_cents"] > best["no_best_ask"]["price_cents"]:
-            ok = False
 
-    return best, ok
+    return (
+        {
+            "yes_best_bid": yes_best_bid,
+            "yes_best_ask": yes_best_ask,
+            "no_best_bid": no_best_bid,
+            "no_best_ask": no_best_ask,
+        },
+        ok,
+    )
 
+# -----------------------------
+# Market Data
+# -----------------------------
+def get_orderbook(ticker: str) -> dict:
+    path = f"/trade-api/v2/markets/{ticker}/orderbook"
+    j = kalshi_request("GET", path)
+    log.info("[BOOK] GET %s -> keys=%s", path, list(j.keys()) if isinstance(j, dict) else type(j).__name__)
+    return j
 
-def select_next_closing(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    now = datetime.now(timezone.utc)
+# -----------------------------
+# Trading (YES-only, minimal)
+# -----------------------------
+def place_limit_buy_yes(ticker: str, price_cents: int, qty: int) -> dict:
+    """
+    NOTE: You must match your account’s required fields.
+    This is a typical shape; if your current bot already has working place-order payload,
+    swap only the 'price' and 'count' fields into your existing payload shape.
+    """
+    path = "/trade-api/v2/orders"
+    payload = {
+        "ticker": ticker,
+        "client_order_id": f"mm-yes-{int(time.time()*1000)}",
+        "side": "yes",
+        "action": "buy",
+        "type": "limit",
+        "count": qty,
+        "price": price_cents,
+    }
+    return kalshi_request("POST", path, payload)
 
-    def parse_z(ts: str) -> datetime:
-        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+def decide_yes_bid(best: dict) -> Optional[Tuple[int, int]]:
+    """
+    Strategy (still simple):
+    - We want to rest near top-of-book, but NEVER above derived YES ask.
+    - If derived ask is missing, just don't trade.
+    """
+    yb = best["yes_best_bid"]
+    ya = best["yes_best_ask"]
 
-    future = []
-    for m in markets:
-        ct = m.get("close_time")
-        if not ct:
-            continue
-        try:
-            dt = parse_z(ct)
-        except Exception:
-            continue
-        if dt > now:
-            future.append((dt, m))
-    if not future:
+    if yb is None or ya is None:
         return None
-    future.sort(key=lambda x: x[0])
-    return future[0][1]
 
+    best_bid = int(yb["price_cents"])
+    best_ask = int(ya["price_cents"])
 
+    # If market is super wide, we step up by 1c from best bid (maker-ish),
+    # but never cross the derived ask.
+    target = min(best_bid + 1, best_ask - 1)
+
+    # Guardrails
+    target = max(1, min(target, MAX_YES_PRICE_CENTS))
+    if target >= best_ask:
+        # No room to be a maker without crossing; skip.
+        return None
+
+    return (target, BUY_QTY)
+
+# -----------------------------
+# Main loop
+# -----------------------------
 def main():
-    log.info("=== BOT STARTED ===")
-
-    ENABLE_TRADING = env_bool("ENABLE_TRADING", False)
-    CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", False)
-
-    LOOP_SECONDS = env_int("LOOP_SECONDS", 1)
-    SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
-    MARKET_TICKER = os.getenv("MARKET_TICKER")
-
-    API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
-    SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT")
-
-    FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()
-    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", 99)
-    BASE_QTY = env_int("BASE_QTY", 1)
-
-    log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
-    log.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
-    log.info(f"LOOP_SECONDS={LOOP_SECONDS}")
-    log.info(f"SERIES_PREFIX={SERIES_PREFIX}")
-    log.info(f"MARKET_TICKER={MARKET_TICKER}")
-    log.info(f"API_BASE={API_BASE}")
-    log.info(f"SUBACCOUNT={SUBACCOUNT if SUBACCOUNT else None}")
-    log.info(f"FARM_SIDE={FARM_SIDE} MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS}")
-    log.info(f"QTY base={BASE_QTY}")
-
-    if FARM_SIDE != "YES":
-        raise RuntimeError("YES-only right now. Set FARM_SIDE=YES.")
-
-    key_id = (os.getenv("KALSHI_KEY_ID") or "").strip()
-    if not key_id:
-        raise RuntimeError("Missing env var KALSHI_KEY_ID")
-
-    private_key = load_rsa_private_key_from_env()
-
-    client = KalshiClient(api_base=API_BASE, key_id=key_id, private_key=private_key, subaccount=SUBACCOUNT)
-    client.discover_prefix()
-
-    if not MARKET_TICKER:
-        markets = client.get_markets_by_series(SERIES_PREFIX, limit=200)
-        chosen = select_next_closing(markets)
-        if not chosen:
-            raise RuntimeError("Could not resolve MARKET_TICKER (no future close_time).")
-        MARKET_TICKER = chosen.get("ticker") or chosen.get("market_ticker") or chosen.get("id")
-        close_time = chosen.get("close_time")
-        log.info(f"[SELECT] Next closing market: {MARKET_TICKER} close={close_time}")
-
-    log.info("[MM] Starting quote loop (YES BUY).")
+    log.info("Starting Kalshi YES-only MM bot @ %s ticker=%s", iso_utc(), MARKET_TICKER)
 
     while True:
+        try:
+            ob = get_orderbook(MARKET_TICKER)
+            best, ok = parse_best_from_bids_only(ob)
+
+            log.info("[BEST] %s ok=%s", json.dumps(best), ok)
+            if not ok:
+                log.warning("[MM] Book sanity failed (crossed?). Standing down.")
+                time.sleep(LOOP_SECONDS)
+                continue
+
+            decision = decide_yes_bid(best)
+            if decision is None:
+                yb = best["yes_best_bid"]["price_cents"] if best["yes_best_bid"] else None
+                ya = best["yes_best_ask"]["price_cents"] if best["yes_best_ask"] else None
+                log.info("[MM] No valid maker YES bid (bid=%s ask=%s). Standing down.", yb, ya)
+                time.sleep(LOOP_SECONDS)
+                continue
+
+            price_cents, qty = decision
+            yb = best["yes_best_bid"]["price_cents"] if best["yes_best_bid"] else None
+            ya = best["yes_best_ask"]["price_cents"] if best["yes_best_ask"] else None
+            log.info("[MM] Desired BUY YES %s@%sc (bid=%s ask=%s MAX=%s)", qty, price_cents, yb, ya, MAX_YES_PRICE_CENTS)
+
+            # 🔒 Keep this disabled until you confirm payload fields match your working bot:
+            # resp = place_limit_buy_yes(MARKET_TICKER, price_cents, qty)
+            # log.info("[ORDER] %s", resp)
+
+        except Exception as e:
+            log.exception("[LOOPERR] %s", e)
+
         time.sleep(LOOP_SECONDS)
-
-        ob = client.get_orderbook(MARKET_TICKER)
-
-        # NEW: best + ok
-        best, ok = parse_best_bid_ask(ob)
-        log.info(f"[BEST] {safe_json(best)} ok={ok}")
-
-        if not ok:
-            # key: do not trade on garbage parsing
-            # but also print the raw shape so we can fix quickly
-            raw_ob = ob.get("orderbook", {})
-            yes_shape = type(raw_ob.get("yes")).__name__
-            no_shape = type(raw_ob.get("no")).__name__
-            log.warning(f"[MM] Orderbook shape not parseable reliably. yes_shape={yes_shape} no_shape={no_shape}. Standing down.")
-            continue
-
-        yes_bid = best["yes_best_bid"]["price_cents"]
-        yes_ask = best["yes_best_ask"]["price_cents"]
-
-        if yes_ask > MAX_BUY_PRICE_CENTS:
-            log.info(f"[MM] Out of range: ask={yes_ask}c > MAX={MAX_BUY_PRICE_CENTS}c. Standing down.")
-            continue
-
-        # basic quote rule: buy 1 tick inside ask
-        desired = yes_ask - 1 if yes_ask > 1 else 1
-        desired = max(1, min(MAX_BUY_PRICE_CENTS, desired))
-
-        log.info(f"[MM] Desired BUY YES {BASE_QTY}@{desired}c (bid={yes_bid} ask={yes_ask} MAX={MAX_BUY_PRICE_CENTS})")
-
-        if not (ENABLE_TRADING and CONFIRM_LIVE_TRADING):
-            log.warning("[MM] Trading disabled. Set ENABLE_TRADING=True and CONFIRM_LIVE_TRADING=True.")
-            continue
-
-        payload = {
-            "ticker": MARKET_TICKER,
-            "action": "buy",
-            "type": "limit",
-            "count": int(BASE_QTY),
-            "side": "yes",
-            "yes_price": int(desired),
-        }
-        code, body = client.place_order(payload)
-        log.info(f"[ORDER] place http={code} resp={safe_json(body)}")
-
 
 if __name__ == "__main__":
     main()
