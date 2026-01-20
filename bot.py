@@ -1,12 +1,12 @@
 import os
 import time
-import json
 import base64
 import uuid
 import logging
-from typing import Any, Dict, Optional, Tuple
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
+from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -23,14 +23,12 @@ log = logging.getLogger("kalshi-bot")
 
 
 # ============================================================
-# BASE URLS (Kalshi migration reality)
-# - We will use elections as PRIMARY for reads+write since it consistently 200s.
-# - We keep trading-api as fallback for reads.
+# KALSHI BASES (migration reality)
 # ============================================================
 
-READ_BASE = "https://api.elections.kalshi.com"
-READ_FALLBACK_BASE = "https://trading-api.kalshi.com"
-WRITE_BASE = "https://api.elections.kalshi.com"
+MARKET_BASE = "https://trading-api.kalshi.com"          # market data (orderbook, markets)
+MARKET_FALLBACK_BASE = "https://api.elections.kalshi.com"  # fallback if needed
+PORTFOLIO_BASE = "https://api.elections.kalshi.com"     # portfolio + trading
 
 
 # ============================================================
@@ -41,8 +39,7 @@ KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
 KALSHI_SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()
 
-# For this market family: KXBTC15M
-SERIES_PREFIX = os.getenv("SERIES_PREFIX", "").strip()  # ex: KXBTC15m or KXBTC15M
+SERIES_PREFIX = os.getenv("SERIES_PREFIX", "").strip()  # e.g. KXBTC15m
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
 BUY_PRICE_CENTS = int(os.getenv("BUY_PRICE_CENTS", "1"))
@@ -60,7 +57,9 @@ SERIES_PREFIX = SERIES_PREFIX.upper()
 
 
 # ============================================================
-# AUTH
+# AUTH (MATCH YOUR ORIGINAL WORKING STYLE)
+# - PSS padding
+# - sign only: timestamp + METHOD + signed_path
 # ============================================================
 
 def now_ms() -> int:
@@ -73,80 +72,83 @@ def load_private_key_from_b64(b64: str):
 PRIVATE_KEY = load_private_key_from_b64(KALSHI_PRIVATE_KEY_B64)
 log.info("[BOOT] Private key loaded OK (b64)")
 
-def sign_request(method: str, signed_path: str, body_json: str) -> Tuple[str, str]:
-    """
-    Signature payload: timestamp + METHOD + signed_path + body_json
-    - signed_path MUST include query string if present.
-    - body_json must be '' for GET.
-    """
-    ts = str(now_ms())
-    payload = f"{ts}{method.upper()}{signed_path}{body_json}".encode("utf-8")
-    sig = PRIVATE_KEY.sign(payload, asy_padding.PKCS1v15(), hashes.SHA256())
-    return ts, base64.b64encode(sig).decode("utf-8")
+def sign_request(private_key, timestamp_ms: int, method: str, signed_path: str) -> str:
+    sign_str = f"{timestamp_ms}{method.upper()}{signed_path}"
+    sig = private_key.sign(
+        sign_str.encode("utf-8"),
+        asy_padding.PSS(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            salt_length=asy_padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(sig).decode("utf-8")
 
-def auth_headers(method: str, signed_path: str, body_json: str) -> Dict[str, str]:
-    ts, sig = sign_request(method, signed_path, body_json)
+def kalshi_headers(method: str, signed_path: str) -> Dict[str, str]:
+    ts = now_ms()
     h = {
         "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
-        "KALSHI-ACCESS-SIGNATURE": sig,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": sign_request(PRIVATE_KEY, ts, method, signed_path),
+        "KALSHI-ACCESS-TIMESTAMP": str(ts),
     }
     if KALSHI_SUBACCOUNT:
-        # keep your existing behavior
         h["KALSHI-ACCESS-SUBACCOUNT"] = KALSHI_SUBACCOUNT
     return h
 
+def signed_path(path: str, params: Optional[Dict[str, Any]] = None) -> str:
+    if not params:
+        return path
+    # stable ordering
+    items = sorted((k, str(v)) for k, v in params.items() if v is not None)
+    return f"{path}?{urlencode(items)}"
+
 
 # ============================================================
-# HTTP
+# HTTP HELPERS
 # ============================================================
 
-def _get_json(base: str, path: str, signed_path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    url = f"{base}{path}"
-    r = requests.get(url, headers=auth_headers("GET", signed_path, ""), params=params, timeout=10)
-    log.info("[REQ] GET %s -> %s", signed_path, r.status_code)
+def market_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    sp = signed_path(path, params)
+    url = f"{MARKET_BASE}{path}"
+    r = requests.get(url, headers=kalshi_headers("GET", sp), params=params, timeout=10)
+    log.info("[REQ] GET %s -> %s", sp, r.status_code)
+
+    # fallback if trading-api refuses (migration weirdness)
+    if r.status_code in (401, 403, 404):
+        url2 = f"{MARKET_FALLBACK_BASE}{path}"
+        r2 = requests.get(url2, headers=kalshi_headers("GET", sp), params=params, timeout=10)
+        log.info("[REQ] GET(fallback) %s -> %s", sp, r2.status_code)
+        r = r2
+
     r.raise_for_status()
     return r.json()
 
-def kalshi_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    if params:
-        # stable ordering for signing
-        items = sorted((k, str(v)) for k, v in params.items() if v is not None)
-        qs = "&".join(f"{k}={requests.utils.quote(v, safe='')}" for k, v in items)
-        signed_path = f"{path}?{qs}"
-    else:
-        signed_path = path
+def portfolio_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    sp = signed_path(path, params)
+    url = f"{PORTFOLIO_BASE}{path}"
+    r = requests.get(url, headers=kalshi_headers("GET", sp), params=params, timeout=10)
+    log.info("[REQ] GET %s -> %s", sp, r.status_code)
+    r.raise_for_status()
+    return r.json()
 
-    # primary
-    try:
-        return _get_json(READ_BASE, path, signed_path, params=params)
-    except Exception:
-        # fallback
-        return _get_json(READ_FALLBACK_BASE, path, signed_path, params=params)
-
-def kalshi_post(path: str, body: dict) -> Any:
-    body_json = json.dumps(body, separators=(",", ":"))
-    url = f"{WRITE_BASE}{path}"
-
-    r = requests.post(url, headers=auth_headers("POST", path, body_json), data=body_json, timeout=10)
-    log.info("[REQ] POST %s -> %s", path, r.status_code)
-
+def portfolio_post(path: str, body: Dict[str, Any]) -> Any:
+    sp = path  # POST signature uses path (no query)
+    url = f"{PORTFOLIO_BASE}{path}"
+    r = requests.post(url, headers=kalshi_headers("POST", sp), json=body, timeout=10)
+    log.info("[REQ] POST %s -> %s", sp, r.status_code)
     try:
         data = r.json()
     except Exception:
         data = r.text
-
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Order failed: {data}")
-
     return data
 
 
 # ============================================================
-# TICKER COMPUTATION (YOUR LINK FORMAT)
-# Format: {SERIES}-{YY}{MON}{DD}{HH}{MM}
-# Example: KXBTC15M-26JAN201645  == 2026-01-20 16:45 (America/New_York)
+# TICKER COMPUTATION (every 15 minutes)
+# Example: KXBTC15M-26JAN201645
 # ============================================================
 
 MONTH_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
@@ -156,7 +158,7 @@ def floor_to_15m(dt: datetime) -> datetime:
     m = (dt.minute // 15) * 15
     return dt.replace(minute=m, second=0, microsecond=0)
 
-def market_ticker_for_now() -> str:
+def current_market_ticker() -> str:
     now_et = datetime.now(ET)
     slot = floor_to_15m(now_et)
     yy = slot.year % 100
@@ -168,15 +170,14 @@ def market_ticker_for_now() -> str:
 
 
 # ============================================================
-# ORDERBOOK / POSITIONS
+# MARKET DATA
 # ============================================================
 
 def get_best_yes_ask(ticker: str) -> Optional[int]:
-    resp = kalshi_get(f"/trade-api/v2/markets/{ticker}/orderbook")
+    resp = market_get(f"/trade-api/v2/markets/{ticker}/orderbook")
     asks = resp.get("orderbook", {}).get("yes", {}).get("asks", [])
     if not asks:
         return None
-    # robust key handling
     p = asks[0].get("price_cents")
     if p is None:
         p = asks[0].get("price")
@@ -184,8 +185,14 @@ def get_best_yes_ask(ticker: str) -> Optional[int]:
         p = asks[0].get("yes_price")
     return int(p) if p is not None else None
 
+
+# ============================================================
+# PORTFOLIO (MIGRATED PATH — THIS IS THE FIX)
+# ============================================================
+
 def has_position(ticker: str) -> bool:
-    resp = kalshi_get("/trade-api/v2/portfolio/positions")
+    # MIGRATED: no /trade-api here
+    resp = portfolio_get("/v2/portfolio/positions")
     for p in resp.get("positions", []):
         if p.get("ticker") == ticker and int(p.get("position", 0)) != 0:
             return True
@@ -193,7 +200,7 @@ def has_position(ticker: str) -> bool:
 
 
 # ============================================================
-# TRADING (WRITE PATH)
+# TRADING (MIGRATED PATH)
 # ============================================================
 
 def place_yes_buy(ticker: str, price: int, count: int) -> Any:
@@ -207,12 +214,11 @@ def place_yes_buy(ticker: str, price: int, count: int) -> Any:
         "post_only": bool(POST_ONLY),
         "client_order_id": str(uuid.uuid4()),
     }
-    # migrated write path (NO /trade-api)
-    return kalshi_post("/v2/portfolio/orders", body)
+    return portfolio_post("/v2/portfolio/orders", body)
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
@@ -220,16 +226,16 @@ def main():
     log.info("[BOOT] SERIES_PREFIX=%s POLL_SECONDS=%.2f BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s",
              SERIES_PREFIX, POLL_SECONDS, BUY_PRICE_CENTS, BASE_SIZE, POST_ONLY)
 
-    active_ticker = None
+    active_ticker: Optional[str] = None
 
     while True:
         try:
-            computed = market_ticker_for_now()
+            computed = current_market_ticker()
             if computed != active_ticker:
                 active_ticker = computed
                 log.info("[MARKET] Switched active ticker -> %s", active_ticker)
 
-            # One-open-contract behavior via position check
+            # one contract at a time
             if has_position(active_ticker):
                 time.sleep(POLL_SECONDS)
                 continue
