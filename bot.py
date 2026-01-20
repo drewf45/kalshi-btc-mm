@@ -277,3 +277,96 @@ def has_position(private_key, ticker: str) -> bool:
         if (p.get("ticker") == ticker) and (int(p.get("position", 0)) != 0 or int(p.get("count", 0)) != 0):
             return True
     return False
+
+
+# -----------------------------
+# Trading
+# -----------------------------
+def choose_maker_buy_price(target_buy_cents: int, yes_best_bid: int, yes_best_ask: int) -> Optional[int]:
+    """
+    Maker-only logic:
+      - If POST_ONLY, we must NOT cross the (implied) ask.
+      - We also try to improve the best bid by IMPROVE_TICKS.
+    """
+    px = target_buy_cents
+
+    # Improve inside spread by pushing above best bid
+    px = max(px, yes_best_bid + max(IMPROVE_TICKS, 0))
+
+    if POST_ONLY:
+        # Maker order must be strictly below ask to avoid "post only cross"
+        px = min(px, yes_best_ask - 1)
+
+    if px <= 0 or px >= 100:
+        return None
+    if POST_ONLY and px >= yes_best_ask:
+        return None
+    return px
+
+
+def place_yes_buy(private_key, ticker: str, limit_price_cents: int, count: int, post_only: bool) -> Any:
+    body = {
+        "ticker": ticker,
+        "side": "yes",
+        "action": "buy",
+        "type": "limit",
+        "count": int(count),
+        "price": int(limit_price_cents),
+        "client_order_id": f"btc15m_yes_{int(time.time()*1000)}",
+    }
+    if post_only:
+        body["post_only"] = True
+
+    # Orders endpoint per docs: /trade-api/v2/portfolio/orders (on elections base now)
+    return elections_post(private_key, "/trade-api/v2/portfolio/orders", body)
+
+
+# -----------------------------
+# Main loop
+# -----------------------------
+def main():
+    private_key = load_private_key()
+
+    log.info(
+        "[BOOT] ELECTIONS_BASE_URL=%s TRADING_BASE_URL=%s SERIES_PREFIX=%s POLL_SECONDS=%.2f BUY_PRICE_CENTS=%d BASE_SIZE=%d POST_ONLY=%s IMPROVE_TICKS=%d ENABLE_TRADING=%s CONFIRM_LIVE_TRADING=%s SUBACCOUNT=%s",
+        ELECTIONS_BASE_URL,
+        TRADING_BASE_URL,
+        SERIES_PREFIX,
+        POLL_SECONDS,
+        BUY_PRICE_CENTS,
+        BASE_SIZE,
+        POST_ONLY,
+        IMPROVE_TICKS,
+        ENABLE_TRADING,
+        CONFIRM_LIVE_TRADING,
+        SUBACCOUNT,
+    )
+    log.info("[BOOT] Private key loaded OK (b64)" if PRIVATE_KEY_B64 else "[BOOT] Private key loaded OK (path)")
+    log.info("[BOOT] LIVE BTC BOT STARTED")
+
+    if ENABLE_TRADING and not CONFIRM_LIVE_TRADING:
+        raise RuntimeError("ENABLE_TRADING is true but CONFIRM_LIVE_TRADING is not true. Refusing to trade live.")
+
+    active_ticker: Optional[str] = None
+    last_resolve_ms = 0
+
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+
+            # Re-resolve every ~20s (you already solved the 15m rotation issue)
+            if active_ticker is None or (now_ms - last_resolve_ms) > 20_000:
+                last_resolve_ms = now_ms
+                new_ticker = resolve_active_market(private_key)
+                if new_ticker and new_ticker != active_ticker:
+                    active_ticker = new_ticker
+                    log.info("[MARKET] Switched active ticker -> %s", active_ticker)
+
+            if not active_ticker:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # If you already have a position in this market: do nothing (1 open contract at a time)
+            if has_position(private_key, active_ticker):
+                log.info("[GUARD] Already holding position in %s; skipping.", active_ticker)
+                time.sleep(POLL_SECONDS
