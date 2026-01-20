@@ -316,7 +316,7 @@ def main():
 
     FARM_SIDE = os.getenv("FARM_SIDE", "YES").strip().upper()
     BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
-    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", 60)  # ✅ MICRO CHANGE #1
+    MAX_BUY_PRICE_CENTS = env_int("MAX_BUY_PRICE_CENTS", BUY_PRICE_CENTS)  # ✅ ADDED (needed for best_bid+1 cap)
     TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
     BASE_QTY = env_int("BASE_QTY", 1)
@@ -365,21 +365,22 @@ def main():
     side = FARM_SIDE
     qty = BASE_QTY
 
-    # ✅ MICRO CHANGE #1: buy at live ask (with safety cap)
+    # ✅ MICRO CHANGE: set buy price to (best bid + 1) using parity:
+    # best_bid_yes = 100 - best_ask_no
+    # best_bid_no  = 100 - best_ask_yes
     if side == "YES":
-        live_ask = (best.get("yes_best_ask") or {}).get("price_cents")
+        no_best_ask = best.get("no_best_ask")
+        if not no_best_ask:
+            raise RuntimeError("No NO ask available to compute YES best bid.")
+        best_bid = 100 - int(no_best_ask["price_cents"])
     else:
-        live_ask = (best.get("no_best_ask") or {}).get("price_cents")
+        yes_best_ask = best.get("yes_best_ask")
+        if not yes_best_ask:
+            raise RuntimeError("No YES ask available to compute NO best bid.")
+        best_bid = 100 - int(yes_best_ask["price_cents"])
 
-    if live_ask is None:
-        log.warning("[GUARD] No live ask found in orderbook. Skipping.")
-        return
-
-    if int(live_ask) > int(MAX_BUY_PRICE_CENTS):
-        log.warning(f"[GUARD] Live ask {live_ask}c > MAX_BUY_PRICE_CENTS {MAX_BUY_PRICE_CENTS}c. Skipping.")
-        return
-
-    target_buy = int(live_ask)
+    target_buy = min(MAX_BUY_PRICE_CENTS, max(1, min(99, best_bid + 1)))
+    # ---------------------------------------------------------------
 
     log.info(f"[ORDER] BUY {side} {qty}@{target_buy}c on {MARKET_TICKER}")
 
