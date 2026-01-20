@@ -65,35 +65,13 @@ def safe_json(obj: Any, max_len: int = 900) -> str:
     return s
 
 
-# ✅ STEP 1 MICRO-CHANGE: support PATH, PEM, or B64 (Render-friendly) + log which was used
 def load_rsa_private_key_from_env() -> Any:
-    # 1) Secret file path (optional)
-    key_path = (os.getenv("KALSHI_PRIVATE_KEY_PATH") or "").strip()
-    if key_path:
-        try:
-            with open(key_path, "rb") as f:
-                key_bytes = f.read()
-            key = serialization.load_pem_private_key(key_bytes, password=None)
-            log.info(f"Loaded RSA private key from KALSHI_PRIVATE_KEY_PATH={key_path}")
-            return key
-        except Exception as e:
-            raise RuntimeError(f"Failed to load RSA private key from path {key_path}: {e}")
-
-    # 2) Raw PEM string OR base64 PEM
     pem_or_b64 = os.getenv("KALSHI_PRIVATE_KEY") or ""
     b64 = os.getenv("KALSHI_PRIVATE_KEY_B64") or ""
 
     candidate = pem_or_b64.strip() if pem_or_b64.strip() else b64.strip()
     if not candidate:
-        raise RuntimeError(
-            "Missing env var. Set ONE of: "
-            "KALSHI_PRIVATE_KEY_PATH (secret file), "
-            "KALSHI_PRIVATE_KEY (raw PEM), "
-            "KALSHI_PRIVATE_KEY_B64 (base64 PEM)."
-        )
-
-    # Decide whether it’s raw PEM or base64
-    used = "KALSHI_PRIVATE_KEY" if pem_or_b64.strip() else "KALSHI_PRIVATE_KEY_B64"
+        raise RuntimeError("Missing env var KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_B64")
 
     if "BEGIN" not in candidate:
         try:
@@ -107,7 +85,7 @@ def load_rsa_private_key_from_env() -> Any:
             candidate.encode("utf-8"),
             password=None,
         )
-        log.info(f"Loaded RSA private key from {used}.")
+        log.info("Loaded RSA private key from KALSHI_PRIVATE_KEY_B64.")
         return key
     except Exception as e:
         raise RuntimeError(f"Failed to load RSA private key: {e}")
@@ -362,7 +340,10 @@ def main():
 
     ENABLE_TRADING = env_bool("ENABLE_TRADING", False)
     CONFIRM_LIVE_TRADING = env_bool("CONFIRM_LIVE_TRADING", False)
-    POLL_SECONDS = env_int("POLL_SECONDS", 60)
+
+    # ✅ STEP 1 CHANGE: default to 1s loop for market making
+    POLL_SECONDS = env_int("POLL_SECONDS", 1)
+
     SERIES_PREFIX = os.getenv("SERIES_PREFIX", "KXBTC15M").strip()
     MARKET_TICKER = os.getenv("MARKET_TICKER")
     API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").strip()
@@ -378,6 +359,9 @@ def main():
     SIZE_MULT = env_float("SIZE_MULT", 1.25)
     SIZE_CAP = env_int("SIZE_CAP", 10)
 
+    # ✅ STEP 1 CHANGE: escalation OFF by default (opt-in)
+    ESCALATE_AFTER_POLLS = env_int("ESCALATE_AFTER_POLLS", 0)  # 0 disables escalation
+
     log.info(f"ENABLE_TRADING={ENABLE_TRADING}")
     log.info(f"CONFIRM_LIVE_TRADING={CONFIRM_LIVE_TRADING}")
     log.info(f"POLL_SECONDS={POLL_SECONDS}")
@@ -390,6 +374,7 @@ def main():
         f"MAX_BUY_PRICE_CENTS={MAX_BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}"
     )
     log.info(f"SIZING base={BASE_QTY} scale_after_wins={SCALE_AFTER_WINS} mult={SIZE_MULT} cap={SIZE_CAP}")
+    log.info(f"ESCALATE_AFTER_POLLS={ESCALATE_AFTER_POLLS} (0 disables)")
 
     if not os.getenv("KALSHI_KEY_ID"):
         raise RuntimeError("Missing env var KALSHI_KEY_ID")
@@ -434,7 +419,6 @@ def main():
         ask = int(no_best_ask["price_cents"])
 
     target_buy = ask if ask <= 1 else (ask - 1)
-
     target_buy = max(1, min(99, target_buy))
     target_buy = min(MAX_BUY_PRICE_CENTS, target_buy)
 
@@ -519,12 +503,13 @@ def main():
                 resting_polls += 1
                 log.info(f"[EXIT] Still resting order_id={order_id}. polls={resting_polls}")
 
-                if (not escalated) and resting_polls >= 2:
+                # ✅ STEP 1 CHANGE: only escalate if ESCALATE_AFTER_POLLS > 0
+                if (ESCALATE_AFTER_POLLS > 0) and (not escalated) and (resting_polls >= ESCALATE_AFTER_POLLS):
                     new_buy = max(1, min(99, int(target_buy) + 1))
                     new_buy = min(MAX_BUY_PRICE_CENTS, new_buy)
 
                     if new_buy > int(target_buy):
-                        log.info(f"[ESCALATE] 2 polls resting. Cancel+replace {target_buy}c -> {new_buy}c (order_id={order_id})")
+                        log.info(f"[ESCALATE] {ESCALATE_AFTER_POLLS} polls resting. Cancel+replace {target_buy}c -> {new_buy}c (order_id={order_id})")
                         client.cancel_order(order_id)
 
                         replace_payload = {
