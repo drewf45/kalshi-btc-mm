@@ -1,4 +1,4 @@
-import os
+limport os
 import json
 import time
 import base64
@@ -53,7 +53,7 @@ def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
     return v if v != "" else default
 
 # -----------------------------
-# Kalshi Auth (FIXED)
+# Kalshi Auth
 # -----------------------------
 def load_private_key_from_b64(b64_str: str):
     """
@@ -96,7 +96,7 @@ def sign_request(private_key, timestamp_ms: str, method: str, path: str) -> str:
 API_BASE = env_str("API_BASE", "https://api.elections.kalshi.com")
 API_PREFIX = "/trade-api/v2"
 
-KALSHI_KEY_ID = env_str("KALSHI_KEY_ID")  # API key id from Kalshi
+KALSHI_KEY_ID = env_str("KALSHI_KEY_ID")
 KALSHI_PRIVATE_KEY_B64 = env_str("KALSHI_PRIVATE_KEY_B64")
 
 SUBACCOUNT = env_str("SUBACCOUNT")  # optional
@@ -111,11 +111,9 @@ MARKET_TICKER = env_str("MARKET_TICKER")  # if set, overrides auto-selection
 
 FARM_SIDE = env_str("FARM_SIDE", "YES").upper()  # YES only right now
 BUY_PRICE_CENTS = env_int("BUY_PRICE_CENTS", 1)
-TARGET_PROFIT_CENTS = env_int("TARGET_PROFIT_CENTS", 1)
 
 ENTRY_TTL_SECONDS = env_int("ENTRY_TTL_SECONDS", 20)
 EXIT_TTL_SECONDS = env_int("EXIT_TTL_SECONDS", 60)
-STALE_REPRICE = env_bool("STALE_REPRICE", True)
 
 ESCALATE_AFTER_POLLS = env_int("ESCALATE_AFTER_POLLS", 0)  # 0 disables
 BASE_SIZE = env_int("BASE_SIZE", 1)
@@ -126,7 +124,12 @@ SESSION.headers.update({"Content-Type": "application/json"})
 # -----------------------------
 # HTTP Wrapper
 # -----------------------------
-def kalshi_request(method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+def kalshi_request(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, Any]:
     if params:
         qs = urlencode(params, doseq=True)
         full_path = f"{path}?{qs}"
@@ -175,9 +178,17 @@ def list_orders(status: str = "resting", limit: int = 200) -> List[Dict[str, Any
         raise RuntimeError(f"List orders failed: HTTP={code} body={data}")
     return data.get("orders", [])
 
-def create_order(ticker: str, side: str, action: str, count: int, price_cents: int, order_type: str = "limit") -> Dict[str, Any]:
+def create_order(
+    ticker: str,
+    side: str,
+    action: str,
+    count: int,
+    price_cents: int,
+    order_type: str = "limit",
+) -> Dict[str, Any]:
     """
-    FIXED (per your error):
+    FIXES:
+      - 'side' is REQUIRED by Kalshi (CreateOrderRequest.Side)
       - Must provide exactly one of: yes_price, no_price, yes_price_dollars, no_price_dollars
       - Do NOT send generic 'price'
     """
@@ -189,11 +200,12 @@ def create_order(ticker: str, side: str, action: str, count: int, price_cents: i
         "ticker": ticker,
         "action": action,      # "buy" or "sell"
         "type": order_type,    # "limit"
-        "count": count,
+        "count": int(count),
         "client_order_id": f"mm-{ticker}-{now_ms()}",
+        "side": side_l,        # ✅ REQUIRED FIELD
     }
 
-    # Kalshi expects outcome-specific price fields
+    # Outcome-specific price field (exactly one)
     if side_l == "yes":
         body["yes_price"] = int(price_cents)
     else:
@@ -207,14 +219,6 @@ def create_order(ticker: str, side: str, action: str, count: int, price_cents: i
     if code not in (200, 201):
         raise RuntimeError(f"Create order failed: HTTP={code} body={data}")
     return data
-
-def cancel_order(order_id: str) -> Dict[str, Any]:
-    code, data = kalshi_request("DELETE", f"{API_PREFIX}/portfolio/orders/{order_id}")
-    log.info(f"[CANCEL] DELETE {API_PREFIX}/portfolio/orders/{order_id} -> HTTP={code}")
-    if code not in (200, 204):
-        if code != 204:
-            raise RuntimeError(f"Cancel order failed: HTTP={code} body={data}")
-    return data if isinstance(data, dict) else {"status": "ok"}
 
 # -----------------------------
 # Market Selection
@@ -269,8 +273,8 @@ def main():
     log.info(f"MARKET_TICKER={MARKET_TICKER}")
     log.info(f"API_BASE={API_BASE}")
     log.info(f"SUBACCOUNT={SUBACCOUNT}")
-    log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS} TARGET_PROFIT_CENTS={TARGET_PROFIT_CENTS}")
-    log.info(f"ENTRY_TTL_SECONDS={ENTRY_TTL_SECONDS} EXIT_TTL_SECONDS={EXIT_TTL_SECONDS} STALE_REPRICE={STALE_REPRICE}")
+    log.info(f"FARM_SIDE={FARM_SIDE} BUY_PRICE_CENTS={BUY_PRICE_CENTS}")
+    log.info(f"ENTRY_TTL_SECONDS={ENTRY_TTL_SECONDS} EXIT_TTL_SECONDS={EXIT_TTL_SECONDS}")
     log.info(f"ESCALATE_AFTER_POLLS={ESCALATE_AFTER_POLLS} (0 disables)")
     log.info(f"SIZING base={BASE_SIZE}")
 
@@ -296,7 +300,6 @@ def main():
                 secs_to_close = (close_ts - int(time.time())) if close_ts else None
                 log.info(f"[SELECT] Next closing market: {active_ticker} close={close_time} seconds_to_close={secs_to_close}")
 
-            # Sanity: list orders
             resting = list_orders("resting", limit=200)
             log.info(f"[ORDERS] resting_count={len(resting)}")
 
@@ -314,7 +317,6 @@ def main():
             time.sleep(POLL_SECONDS)
 
         except RuntimeError as e:
-            # tiny anti-spam backoff if order schema/price errors happen
             log.error(f"[LOOPERR] {e}", exc_info=True)
             time.sleep(max(POLL_SECONDS, 2))
 
