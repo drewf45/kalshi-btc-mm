@@ -505,10 +505,8 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     spread = yes_ask - yes_bid
 
     # =========================================================
-    # CHANGE #2 (ONLY):
+    # CHANGE #2:
     # Require MIN_SPREAD_CENTS before quoting anything.
-    # This disables "join best bid/ask" and "one-sided tight"
-    # behavior when spread is 1–2 cents.
     # =========================================================
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
@@ -558,17 +556,15 @@ def reconcile_quotes(
     dry_run: bool,
     yes_bid: Optional[int],
     yes_ask: Optional[int],
+    # =========================================================
+    # CHANGE #3 (ONLY):
+    # If we're skipping because spread is too tight, cancel now.
+    # (Do NOT "hold stale quotes" for 10s in tight spread.)
+    # =========================================================
+    skip_reason: Optional[str] = None,
 ) -> None:
     """
     Maintain at most ONE working buy (target_bid) and at most ONE working sell (target_ask).
-
-    Micro #3:
-      - BOTH None => global HOLD/CANCEL logic
-      - One side None => one-sided mode
-
-    ✅ Micro #4:
-      - If one side becomes None, do NOT instantly cancel that side.
-      - Hold it for SIDE_HOLD_SECONDS, unless it becomes unsafe (cross/lock risk).
     """
     global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
 
@@ -601,20 +597,24 @@ def reconcile_quotes(
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
     def unsafe_to_hold(side: str, cur: WorkingOrder) -> bool:
-        # If we don't have both sides of the book, don't attempt safety cross-check.
         if yes_bid is None or yes_ask is None:
             return False
         if side == "sell":
-            # selling at or below current best bid is immediately unsafe (cross/lock risk)
             return int(cur.price_cents) <= int(yes_bid)
         if side == "buy":
-            # buying at or above current best ask is immediately unsafe (cross/lock risk)
             return int(cur.price_cents) >= int(yes_ask)
         return False
 
-    # --- BOTH missing: global HOLD/CANCEL logic (unchanged) ---
+    # --- BOTH missing: global HOLD/CANCEL logic ---
     both_missing = (target_bid is None) and (target_ask is None)
     if both_missing:
+        # CHANGE #3: if skip is due to tight spread, cancel immediately (avoid stale quotes)
+        if isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight"):
+            cancel("buy", f"tight_spread_exit({skip_reason})")
+            cancel("sell", f"tight_spread_exit({skip_reason})")
+            NO_TARGET_SINCE_TS = None
+            return
+
         if NO_TARGET_SINCE_TS is None:
             NO_TARGET_SINCE_TS = now
 
@@ -635,32 +635,27 @@ def reconcile_quotes(
         NO_TARGET_SINCE_TS = None
 
     # --- Micro #4: per-side hold when a single side is missing ---
-    # Reset timers when target is present
     if target_bid is not None:
         NO_TARGET_SIDE_SINCE_TS["buy"] = None
     if target_ask is not None:
         NO_TARGET_SIDE_SINCE_TS["sell"] = None
 
-    # For missing side: hold (if working) for SIDE_HOLD_SECONDS unless unsafe; then cancel
     def handle_missing_side(side: str) -> None:
         cur = WORKING[side]
         if cur is None:
             return
 
-        # Immediate safety cancel
         if unsafe_to_hold(side, cur):
             cancel(side, "unsafe_hold(cross_risk)")
             NO_TARGET_SIDE_SINCE_TS[side] = None
             return
 
-        # Start per-side timer
         if NO_TARGET_SIDE_SINCE_TS[side] is None:
             NO_TARGET_SIDE_SINCE_TS[side] = now
 
         held_for = now - float(NO_TARGET_SIDE_SINCE_TS[side] or now)
 
         if SIDE_HOLD_SECONDS > 0 and held_for < SIDE_HOLD_SECONDS:
-            # light log suppression: once every ~5s per side
             if (now - _LAST_SIDE_HOLD_LOG_TS.get(side, 0.0)) >= 5.0:
                 log.info(
                     "[OM] %s %s HOLD_SIDE held_for=%.2fs<%.2fs price=@%d DRY_RUN=%s",
@@ -689,13 +684,11 @@ def reconcile_quotes(
 
         off = price_off(cur.price_cents, int(target_price))
 
-        # ✅ Tight-mode detection (spread < MIN_SPREAD_CENTS)
         tight_mode = (
             (yes_bid is not None and yes_ask is not None)
             and ((yes_ask - yes_bid) < MIN_SPREAD_CENTS)
         )
 
-        # ✅ Existing join-mode special-case
         tight_join_mode = (
             ENABLE_JOIN_TIGHT_SPREAD
             and tight_mode
@@ -705,17 +698,12 @@ def reconcile_quotes(
             )
         )
 
-        # ✅ In *any* tight-mode (including one-sided stepping inside),
-        # do NOT allow 2-cent hysteresis. Only KEEP on exact match.
-        # (Cooldown still applies below to prevent churn.)
         if tight_mode:
             if off == 0:
                 note = "join_mode exact_match" if tight_join_mode else "tight_mode exact_match"
                 keep(side, cur, note)
                 return
-            # else: fall through to cooldown/reprice logic
 
-        # Normal hysteresis outside tight_mode
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
@@ -743,97 +731,4 @@ def main():
     )
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
     log.info(
-        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
-        ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS
-    )
-    log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
-    log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
-    log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
-    log.info("TIGHT_JOIN: ENABLE_JOIN_TIGHT_SPREAD=%s", ENABLE_JOIN_TIGHT_SPREAD)
-    log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
-
-    last_market: Optional[str] = None
-    last_yes_bid: Optional[int] = None
-    last_yes_ask: Optional[int] = None
-    last_tb: Optional[int] = None
-    last_ta: Optional[int] = None
-    last_why: Optional[str] = None
-
-    while True:
-        try:
-            mkt = roll_active_market()
-
-            market_changed = (mkt != last_market)
-            if market_changed:
-                last_market = mkt
-                last_yes_bid = None
-                last_yes_ask = None
-                last_tb = None
-                last_ta = None
-                last_why = None
-
-                WORKING["buy"] = None
-                WORKING["sell"] = None
-                _LAST_KEEP_LOGGED["buy"] = None
-                _LAST_KEEP_LOGGED["sell"] = None
-                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS
-                NO_TARGET_SINCE_TS = None
-                NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
-
-                # reset ask cache on roll to avoid carrying stale ask across markets
-                _YES_ASK_CACHE["ask"] = None
-                _YES_ASK_CACHE["ts"] = 0.0
-
-                # reset fallback throttle window on roll (fresh market)
-                global _LAST_MARKET_FALLBACK_TS
-                _LAST_MARKET_FALLBACK_TS = 0.0
-
-                log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
-
-            ob = fetch_orderbook(mkt)
-            yes_bid, yes_ask = get_yes_bid_ask(ob, mkt)
-
-            quote_changed = (yes_bid != last_yes_bid) or (yes_ask != last_yes_ask) or market_changed
-            if quote_changed:
-                last_yes_bid, last_yes_ask = yes_bid, yes_ask
-                if yes_bid is None and yes_ask is None:
-                    log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
-                else:
-                    log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
-
-            tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
-
-            target_changed = (tb != last_tb) or (ta != last_ta) or (why != last_why) or market_changed
-            if target_changed:
-                last_tb, last_ta, last_why = tb, ta, why
-                if tb is None and ta is None:
-                    log.info("[TARGET] %s → SKIP (%s)", mkt, why)
-                else:
-                    log.info(
-                        "[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s",
-                        mkt,
-                        str(tb) if tb is not None else "None",
-                        str(ta) if ta is not None else "None",
-                        why,
-                        DRY_RUN,
-                    )
-
-            # ✅ reconcile every loop (timers need time progression even if target doesn't "change")
-            reconcile_quotes(
-                market_ticker=mkt,
-                target_bid=tb,
-                target_ask=ta,
-                qty=ORDER_QTY,
-                dry_run=DRY_RUN,
-                yes_bid=yes_bid,
-                yes_ask=yes_ask,
-            )
-
-        except Exception as e:
-            log.error("[LOOPERR] %s", e)
-
-        time.sleep(POLL)
-
-
-if __name__ == "__main__":
-    main()
+        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE
