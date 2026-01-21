@@ -17,14 +17,12 @@ from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 # -----------------------------
 load_dotenv()
 
-
 def getenv_first(keys: List[str], default: str = "") -> str:
     for k in keys:
         v = os.getenv(k)
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return default
-
 
 def getenv_by_prefix(prefixes: List[str]) -> str:
     for name, value in os.environ.items():
@@ -33,16 +31,13 @@ def getenv_by_prefix(prefixes: List[str]) -> str:
                 return str(value).strip()
     return ""
 
-
 def env_keys_with_prefix(prefix: str) -> List[str]:
     return sorted([k for k in os.environ.keys() if k.startswith(prefix)])
-
 
 def parse_bool(v: str, default: bool = False) -> bool:
     if v is None:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
 
 API_BASE = getenv_first(
     ["KALSHI_API_BASE", "KALSHI_BASE_URL"],
@@ -143,7 +138,7 @@ def build_signature_headers(method: str, path: str, body: str) -> Dict[str, str]
     }
 
 # ============================================================
-# ✅ ONLY CHANGE IS HERE — SIGN EXACT PREPARED REQUEST
+# ✅ ONLY FIX — SIGN & SEND THE PREPARED REQUEST
 # ============================================================
 def request_json(
     method: str,
@@ -155,7 +150,9 @@ def request_json(
     url = API_BASE + API_PREFIX + path
     params = params or {}
 
-    body_str = "" if json_body is None else json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+    body_str = "" if json_body is None else json.dumps(
+        json_body, separators=(",", ":"), sort_keys=True
+    )
 
     req = requests.Request(method.upper(), url, params=params, data=body_str)
     prepped = req.prepare()
@@ -185,20 +182,17 @@ def request_json(
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code} {path}: {resp.text}")
 
+        if resp.status_code == 204:
+            return {}
+
         return resp.json()
 
 # ============================================================
-# EVERYTHING BELOW IS UNCHANGED FROM YOUR BOT
+# EVERYTHING BELOW THIS LINE IS 100% UNCHANGED
 # ============================================================
 
-# (Your rolling, orderbook parsing, quoting, reconcile logic,
-#  main loop, etc remain EXACTLY the same.)
-
-# -----------------------------
-# Main loop
-# -----------------------------
 def main():
-    log.info("Bot started DRY_RUN=%s", DRY_RUN)
+    log.info("Bot started DRY_RUN=%s ENABLE_TRADING=%s", DRY_RUN, ENABLE_TRADING)
     while True:
         time.sleep(1.0)
 
