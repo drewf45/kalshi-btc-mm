@@ -1,7 +1,5 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# FIX: uses /markets?series=XYZ instead of non-existent /series endpoint
-# FIX: Kalshi auth signature must be RSA-PSS and sign only timestamp+method+path (no query, no body)
 
 import os
 import time
@@ -58,7 +56,7 @@ def load_config() -> BotConfig:
         api_base=os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").rstrip("/"),
         api_key_id=os.environ["KALSHI_API_KEY_ID"],
         private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
-        series_ticker=os.environ["SERIES_TICKER"],   # e.g. KXBTC15M
+        series_ticker=os.environ["SERIES_TICKER"],
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
@@ -78,12 +76,8 @@ def load_private_key(b64: str):
     )
 
 
-def canonical_json(obj):
-    return "" if obj is None else json.dumps(obj, separators=(",", ":"), sort_keys=True)
-
-
-# ✅ MICRO CHANGE: Kalshi wants RSA-PSS + SHA256, and message is timestamp+method+path_without_query (NO BODY)
 def sign_request(priv, ts: str, method: str, path_qs: str) -> str:
+    # Sign only timestamp+method+path (no query, no body)
     path_without_query = path_qs.split("?", 1)[0]
     msg = f"{ts}{method}{path_without_query}".encode("utf-8")
     sig = priv.sign(
@@ -132,20 +126,45 @@ def public_get(cfg, path, params=None):
 
 
 # -----------------------------
-# ✅ FIXED SERIES RESOLUTION
+# ✅ MICRO CHANGE: sticky + throttled roll resolver to prevent 429 + random market fallback
 # -----------------------------
+_last_roll_check_ts: float = 0.0
+_cached_active_market: Optional[str] = None
+ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "10"))
+
+
 def resolve_active_market(cfg) -> str:
-    data = public_get(
-        cfg,
-        "/trade-api/v2/markets",
-        params={"series": cfg.series_ticker, "status": "open"},
-    )
+    global _last_roll_check_ts, _cached_active_market
 
-    markets = data.get("markets") or data.get("data") or []
-    if not markets:
-        raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
+    now = time.time()
 
-    return markets[0]["ticker"]
+    # Throttle the series->market lookup to avoid 429
+    if _cached_active_market is not None and (now - _last_roll_check_ts) < ROLL_CHECK_MIN_SECONDS:
+        return _cached_active_market
+
+    _last_roll_check_ts = now
+
+    try:
+        data = public_get(
+            cfg,
+            "/trade-api/v2/markets",
+            params={"series": cfg.series_ticker, "status": "open"},
+        )
+        markets = data.get("markets") or data.get("data") or []
+        if not markets:
+            # If series returns nothing, keep last active rather than switching to random
+            if _cached_active_market is not None:
+                return _cached_active_market
+            raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
+
+        _cached_active_market = markets[0]["ticker"]
+        return _cached_active_market
+
+    except Exception as e:
+        # On 429 or any transient issue, keep last active market
+        if _cached_active_market is not None:
+            return _cached_active_market
+        raise
 
 
 # -----------------------------
@@ -170,9 +189,8 @@ def parse_yes_book(ob):
 
 def choose_price(bid, ask, improve, max_px):
     if bid is None and ask is None:
-        return None  # signal empty
+        return None
     if bid is None:
-        # don't cross; one tick below ask
         px = ask - 1
         return px if px >= 1 else 1
     px = bid + improve
@@ -185,7 +203,6 @@ def choose_price(bid, ask, improve, max_px):
 # Trading (YES-only buy)
 # -----------------------------
 def place_yes_buy(cfg, priv, market_ticker: str, price_cents: int, qty: int):
-    # NOTE: endpoint path should start with /trade-api/v2/ per docs
     body = {
         "ticker": market_ticker,
         "action": "buy",
@@ -228,7 +245,10 @@ def main():
                     log.info("[DRYRUN] Not placing order")
                 else:
                     resp = place_yes_buy(cfg, priv, active, price, cfg.base_size)
-                    log.info(f"[ORDER] placed YES buy {cfg.base_size}@{price}c id={resp.get('order_id') or resp.get('id') or 'unknown'}")
+                    log.info(
+                        f"[ORDER] placed YES buy {cfg.base_size}@{price}c "
+                        f"id={resp.get('order_id') or resp.get('id') or 'unknown'}"
+                    )
 
         except Exception as e:
             log.error(f"[LOOPERR] {e}")
