@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: rate-limit backoff when Kalshi returns too_many_requests
+# MICRO CHANGE: reduce API calls by refreshing active market only every MARKET_REFRESH_SECONDS
 
 import os
 import time
@@ -46,12 +46,14 @@ class BotConfig:
     poll_seconds: float
     empty_poll_seconds: float
     rate_limit_backoff_seconds: float
+    market_refresh_seconds: float  # MICRO CHANGE
     enable_trading: bool
     dry_run: bool
     base_size: int
     improve_ticks: int
     post_only: bool
     max_buy_price: int
+    min_edge_cents: int
 
 
 def load_config() -> BotConfig:
@@ -62,13 +64,15 @@ def load_config() -> BotConfig:
         series_ticker=os.environ["SERIES_TICKER"],
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),
-        rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),  # MICRO CHANGE
+        rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
+        market_refresh_seconds=float(os.getenv("MARKET_REFRESH_SECONDS", "30")),  # MICRO CHANGE
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
         base_size=env_int("BASE_SIZE", 1),
         improve_ticks=env_int("IMPROVE_TICKS", 1),
         post_only=env_bool("POST_ONLY", True),
         max_buy_price=env_int("MAX_BUY_PRICE_CENTS", 99),
+        min_edge_cents=env_int("MIN_EDGE_CENTS", 2),
     )
 
 
@@ -150,23 +154,30 @@ def parse_yes_book(ob):
     )
 
 
-def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: int) -> Optional[int]:
+def choose_price(
+    bid: Optional[int],
+    ask: Optional[int],
+    improve: int,
+    max_px: int,
+    min_edge_cents: int,
+) -> Optional[int]:
     if bid is None and ask is None:
         return None
 
-    if bid is not None and ask is not None:
-        if (ask - bid) < 2:
-            return None
-        if (ask - (bid + improve)) < 2:
-            return None
-
     if bid is None:
-        return min(ask - 1, max_px)
+        px = min(ask - 1, max_px)
+        if ask is not None and (ask - px) < min_edge_cents:
+            return None
+        return px
 
-    px = bid + improve
+    px = min(bid + improve, max_px)
+
     if ask is not None:
         px = min(px, ask - 1)
-    return min(px, max_px)
+        if (ask - px) < min_edge_cents:
+            return None
+
+    return px
 
 
 def is_rate_limited(err: Exception) -> bool:
@@ -186,32 +197,37 @@ def main():
     active = None
     last_state: Optional[Tuple] = None
     last_intended_price: Optional[int] = None
-    last_rl_log_ts: float = 0.0  # MICRO CHANGE: throttle RL logs
+    last_rl_log_ts: float = 0.0
+
+    last_market_refresh_ts: float = 0.0  # MICRO CHANGE
 
     while True:
         sleep_for = cfg.poll_seconds
 
         try:
-            ticker = resolve_active_market(cfg)
-            if ticker != active:
-                active = ticker
-                log.info(f"[ROLL] Active market → {active}")
-                last_state = None
-                last_intended_price = None
+            # MICRO CHANGE: refresh active market on a timer (cuts /markets calls drastically)
+            now = time.time()
+            if active is None or (now - last_market_refresh_ts) >= cfg.market_refresh_seconds:
+                ticker = resolve_active_market(cfg)
+                last_market_refresh_ts = now
+                if ticker != active:
+                    active = ticker
+                    log.info(f"[ROLL] Active market → {active}")
+                    last_state = None
+                    last_intended_price = None
 
             ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
-            price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price)
+            price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price, cfg.min_edge_cents)
 
             if price is None:
                 if bid is None and ask is None:
                     state = ("skip", "empty")
                     sleep_for = cfg.empty_poll_seconds
                 elif bid is not None and ask is not None:
-                    if (ask - bid) < 2:
-                        state = ("skip", "tight_spread")
-                    elif (ask - (bid + cfg.improve_ticks)) < 2:
-                        state = ("skip", "no_edge_buffer")
+                    intended = min(bid + cfg.improve_ticks, ask - 1, cfg.max_buy_price)
+                    if (ask - intended) < cfg.min_edge_cents:
+                        state = ("skip", f"edge<{cfg.min_edge_cents}c")
                     else:
                         state = ("skip", "other")
                 else:
@@ -220,7 +236,6 @@ def main():
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
                     last_state = state
-
                 time.sleep(sleep_for)
                 continue
 
@@ -235,7 +250,6 @@ def main():
                 last_state = state
 
         except Exception as e:
-            # MICRO CHANGE: backoff on rate limits
             if is_rate_limited(e):
                 now = time.time()
                 if now - last_rl_log_ts > 30:
