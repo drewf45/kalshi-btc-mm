@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: use a single requests.Session() (keep-alive) to reduce latency/overhead
+# MICRO CHANGE: robust client-side series enforcement (never roll wrong market)
 
 import os
 import time
@@ -85,34 +85,12 @@ def load_private_key(b64: str):
     )
 
 
-def canonical_json(obj):
-    return "" if obj is None else json.dumps(obj, separators=(",", ":"), sort_keys=True)
-
-
-def sign_request(priv, ts, method, path_qs, body):
-    msg = f"{ts}{method}{path_qs}{body}".encode()
-    sig = priv.sign(msg, padding.PKCS1v15(), hashes.SHA256())
-    return base64.b64encode(sig).decode()
-
-
-def headers(cfg, priv, method, path_qs, body):
-    ts = str(int(time.time() * 1000))
-    body_str = canonical_json(body) if method != "GET" else ""
-    sig = sign_request(priv, ts, method, path_qs, body_str)
-    return {
-        "KALSHI-ACCESS-KEY": cfg.api_key_id,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig,
-        "Content-Type": "application/json",
-    }
-
-
 # -----------------------------
 # HTTP helpers
 # -----------------------------
 def public_get(cfg, session: requests.Session, path, params=None):
     qs = path if not params else f"{path}?{urlencode(params)}"
-    r = session.get(cfg.api_base + qs, timeout=20)  # MICRO CHANGE (session)
+    r = session.get(cfg.api_base + qs, timeout=20)
     data = r.json()
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {qs}: {data}")
@@ -120,19 +98,47 @@ def public_get(cfg, session: requests.Session, path, params=None):
 
 
 # -----------------------------
-# Market resolution
+# Market resolution (ROBUST)
 # -----------------------------
+def normalize(s: str) -> str:
+    return s.replace("-", "").replace("_", "").lower()
+
+
 def resolve_active_market(cfg, session: requests.Session) -> str:
     data = public_get(
         cfg,
         session,
         "/trade-api/v2/markets",
-        params={"series": cfg.series_ticker, "status": "open"},
+        params={"status": "open"},
     )
+
     markets = data.get("markets") or data.get("data") or []
     if not markets:
-        raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
-    return markets[0]["ticker"]
+        raise RuntimeError("No open markets returned from API")
+
+    want = normalize(cfg.series_ticker)
+
+    def matches(m: dict) -> bool:
+        fields = [
+            m.get("series_ticker"),
+            m.get("series"),
+            m.get("ticker"),
+        ]
+        for f in fields:
+            if f and normalize(f).startswith(want):
+                return True
+        return False
+
+    filtered = [m for m in markets if matches(m)]
+
+    if not filtered:
+        sample = [m.get("ticker") for m in markets[:5]]
+        raise RuntimeError(
+            f"No open markets matched SERIES_TICKER={cfg.series_ticker}. "
+            f"Sample returned tickers={sample}"
+        )
+
+    return filtered[0]["ticker"]
 
 
 # -----------------------------
@@ -155,35 +161,23 @@ def parse_yes_book(ob):
     )
 
 
-def choose_price(
-    bid: Optional[int],
-    ask: Optional[int],
-    improve: int,
-    max_px: int,
-    min_edge_cents: int,
-) -> Optional[int]:
+def choose_price(bid, ask, improve, max_px, min_edge):
     if bid is None and ask is None:
         return None
-
     if bid is None:
         px = min(ask - 1, max_px)
-        if ask is not None and (ask - px) < min_edge_cents:
-            return None
-        return px
-
+        return px if (ask - px) >= min_edge else None
     px = min(bid + improve, max_px)
-
     if ask is not None:
         px = min(px, ask - 1)
-        if (ask - px) < min_edge_cents:
+        if (ask - px) < min_edge:
             return None
-
     return px
 
 
 def is_rate_limited(err: Exception) -> bool:
     s = str(err).lower()
-    return ("too_many_requests" in s) or ("http 429" in s) or ("status_code" in s and "429" in s)
+    return "429" in s or "too_many_requests" in s
 
 
 # -----------------------------
@@ -191,22 +185,15 @@ def is_rate_limited(err: Exception) -> bool:
 # -----------------------------
 def main():
     cfg = load_config()
-    priv = load_private_key(cfg.private_key_b64)
+    session = requests.Session()
 
     log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
 
-    # MICRO CHANGE: one session for keep-alive
-    session = requests.Session()
-
     active = None
-    last_state: Optional[Tuple] = None
-    last_intended_price: Optional[int] = None
-    last_rl_log_ts: float = 0.0
-    last_market_refresh_ts: float = 0.0
+    last_state = None
+    last_market_refresh_ts = 0.0
 
     while True:
-        sleep_for = cfg.poll_seconds
-
         try:
             now = time.time()
             if active is None or (now - last_market_refresh_ts) >= cfg.market_refresh_seconds:
@@ -214,55 +201,35 @@ def main():
                 last_market_refresh_ts = now
                 if ticker != active:
                     active = ticker
-                    log.info(f"[ROLL] Active market → {active}")
                     last_state = None
-                    last_intended_price = None
+                    log.info(f"[ROLL] Active market → {active}")
 
             ob = public_get(cfg, session, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price, cfg.min_edge_cents)
 
             if price is None:
-                if bid is None and ask is None:
-                    state = ("skip", "empty")
-                    sleep_for = cfg.empty_poll_seconds
-                elif bid is not None and ask is not None:
-                    intended = min(bid + cfg.improve_ticks, ask - 1, cfg.max_buy_price)
-                    if (ask - intended) < cfg.min_edge_cents:
-                        state = ("skip", f"edge<{cfg.min_edge_cents}c")
-                    else:
-                        state = ("skip", "other")
-                else:
-                    state = ("skip", "other")
-
+                state = ("skip", "empty" if bid is None and ask is None else "edge")
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
                     last_state = state
-                time.sleep(sleep_for)
+                time.sleep(cfg.empty_poll_seconds)
                 continue
-
-            if price != last_intended_price:
-                last_intended_price = price
 
             state = ("quote", price)
             if state != last_state:
                 log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
-                if not cfg.enable_trading or cfg.dry_run:
-                    log.info("[DRYRUN] Not placing order")
+                log.info("[DRYRUN] Not placing order")
                 last_state = state
 
         except Exception as e:
             if is_rate_limited(e):
-                now = time.time()
-                if now - last_rl_log_ts > 30:
-                    log.warning(f"[RATELIMIT] Backing off {cfg.rate_limit_backoff_seconds}s ({e})")
-                    last_rl_log_ts = now
+                log.warning("[RATELIMIT] backing off")
                 time.sleep(cfg.rate_limit_backoff_seconds)
-                continue
+            else:
+                log.error(f"[LOOPERR] {e}")
 
-            log.error(f"[LOOPERR] {e}")
-
-        time.sleep(sleep_for)
+        time.sleep(cfg.poll_seconds)
 
 
 if __name__ == "__main__":
