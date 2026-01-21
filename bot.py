@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: when orderbook parses as empty, log response shape ONCE per active market to map JSON structure
+# MICRO CHANGE: parse BTC-style YES ladders (orderbook["yes"] is a price ladder)
 
 import os
 import time
@@ -89,7 +89,7 @@ def public_get(cfg, session: requests.Session, path, params=None):
 
 
 # -----------------------------
-# Market resolution (client-side robust match)
+# Market resolution
 # -----------------------------
 def normalize(s: str) -> str:
     return (s or "").replace("-", "").replace("_", "").strip().lower()
@@ -108,107 +108,60 @@ def resolve_active_market(cfg, session: requests.Session) -> str:
     )
 
     markets = data.get("markets") or data.get("data") or []
-    if not markets:
-        raise RuntimeError(f"No open markets returned for series {cfg.series_ticker}")
-
     want = normalize(cfg.series_ticker)
 
     def matches(m: dict) -> bool:
-        candidates = [
-            m.get("series_ticker"),
-            m.get("series"),
-            m.get("ticker"),
-        ]
-        return any(normalize(c).startswith(want) for c in candidates if c)
+        return any(
+            normalize(m.get(k)).startswith(want)
+            for k in ("series_ticker", "series", "ticker")
+            if m.get(k)
+        )
 
     filtered = [m for m in markets if matches(m)]
     if not filtered:
-        sample = [m.get("ticker") for m in markets[:5]]
-        raise RuntimeError(
-            f"No open markets matched SERIES_TICKER={cfg.series_ticker}. Sample returned tickers={sample}"
-        )
+        raise RuntimeError("No open BTC markets found")
 
     return filtered[0]["ticker"]
 
 
 # -----------------------------
-# Orderbook parsing
+# Orderbook parsing (BTC-style)
 # -----------------------------
-def best_price(levels, want):
-    if not levels:
-        return None
-    pairs = [(int(p), int(q)) for p, q in levels]
-    return max(pairs)[0] if want == "bid" else min(pairs)[0]
-
-
 def parse_yes_book(ob: Any):
-    # handle list -> first dict
-    if isinstance(ob, list):
-        if not ob:
-            return None, None
-        ob = ob[0] if isinstance(ob[0], dict) else None
-
+    """
+    MICRO CHANGE:
+    BTC markets expose YES as a flat ladder:
+      orderbook["yes"] = [[price, qty], ...]
+    Lowest price = best bid
+    Highest price = best ask
+    """
     if not isinstance(ob, dict):
         return None, None
 
-    container = ob.get("orderbook", ob)
-    if not isinstance(container, dict):
+    ob = ob.get("orderbook")
+    if not isinstance(ob, dict):
         return None, None
 
-    yes = container.get("yes")
-    if not isinstance(yes, dict):
+    ladder = ob.get("yes")
+    if not isinstance(ladder, list) or not ladder:
         return None, None
 
-    return (
-        best_price(yes.get("bids"), "bid"),
-        best_price(yes.get("asks"), "ask"),
-    )
+    prices = [int(p) for p, _ in ladder if isinstance(p, (int, float))]
+    if not prices:
+        return None, None
+
+    return min(prices), max(prices)
 
 
 def choose_price(bid, ask, improve, max_px, min_edge):
-    if bid is None and ask is None:
+    if bid is None or ask is None:
         return None
 
-    if bid is None:
-        px = min(ask - 1, max_px)
-        return px if (ask - px) >= min_edge else None
-
     px = min(bid + improve, max_px)
-    if ask is not None:
-        px = min(px, ask - 1)
-        if (ask - px) < min_edge:
-            return None
+    if (ask - px) < min_edge:
+        return None
+
     return px
-
-
-def is_rate_limited(err: Exception) -> bool:
-    s = str(err).lower()
-    return ("429" in s) or ("too_many_requests" in s)
-
-
-def log_orderbook_shape_once(active: str, ob: Any):
-    """
-    MICRO CHANGE: lightweight shape log (no spam). Call only once per active ticker.
-    """
-    try:
-        if isinstance(ob, list):
-            log.info(f"[OBSHAPE] {active} top=list len={len(ob)}")
-            if ob and isinstance(ob[0], dict):
-                log.info(f"[OBSHAPE] {active} first_keys={list(ob[0].keys())[:20]}")
-                # if nested orderbook exists, show its keys
-                if "orderbook" in ob[0] and isinstance(ob[0]["orderbook"], dict):
-                    log.info(f"[OBSHAPE] {active} orderbook_keys={list(ob[0]['orderbook'].keys())[:20]}")
-            return
-
-        if isinstance(ob, dict):
-            log.info(f"[OBSHAPE] {active} top=dict keys={list(ob.keys())[:25]}")
-            if "orderbook" in ob and isinstance(ob["orderbook"], dict):
-                log.info(f"[OBSHAPE] {active} orderbook_keys={list(ob['orderbook'].keys())[:25]}")
-            return
-
-        log.info(f"[OBSHAPE] {active} top={type(ob).__name__}")
-    except Exception as e:
-        log.info(f"[OBSHAPE] {active} failed_to_log_shape: {e}")
 
 
 # -----------------------------
@@ -223,39 +176,24 @@ def main():
     active: Optional[str] = None
     last_state: Optional[Tuple] = None
     last_market_refresh_ts: float = 0.0
-    last_rl_log_ts: float = 0.0
-
-    # MICRO CHANGE: track shape logging per active ticker
-    shape_logged_for_active: Optional[str] = None
 
     while True:
-        sleep_for = cfg.poll_seconds
-
         try:
             now = time.time()
             if active is None or (now - last_market_refresh_ts) >= cfg.market_refresh_seconds:
-                ticker = resolve_active_market(cfg, session)
+                active = resolve_active_market(cfg, session)
                 last_market_refresh_ts = now
-                if ticker != active:
-                    active = ticker
-                    last_state = None
-                    shape_logged_for_active = None  # reset on roll
-                    log.info(f"[ROLL] Active market → {active}")
+                last_state = None
+                log.info(f"[ROLL] Active market → {active}")
 
             ob = public_get(cfg, session, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
-
-            # MICRO CHANGE: if empty, log shape once per active ticker
-            if bid is None and ask is None and shape_logged_for_active != active:
-                log_orderbook_shape_once(active, ob)
-                shape_logged_for_active = active
-
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price, cfg.min_edge_cents)
 
             if price is None:
-                state = ("skip", "empty" if bid is None and ask is None else f"edge<{cfg.min_edge_cents}c")
+                state = ("skip", bid, ask)
                 if state != last_state:
-                    log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
+                    log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP")
                     last_state = state
                 time.sleep(cfg.empty_poll_seconds)
                 continue
@@ -267,17 +205,9 @@ def main():
                 last_state = state
 
         except Exception as e:
-            if is_rate_limited(e):
-                now = time.time()
-                if now - last_rl_log_ts > 30:
-                    log.warning(f"[RATELIMIT] Backing off {cfg.rate_limit_backoff_seconds}s ({e})")
-                    last_rl_log_ts = now
-                time.sleep(cfg.rate_limit_backoff_seconds)
-                continue
-
             log.error(f"[LOOPERR] {e}")
 
-        time.sleep(sleep_for)
+        time.sleep(cfg.poll_seconds)
 
 
 if __name__ == "__main__":
