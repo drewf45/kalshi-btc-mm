@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: do NOT reset last_intended_price on SKIP (preserve intent continuity)
+# MICRO CHANGE: rate-limit backoff when Kalshi returns too_many_requests
 
 import os
 import time
@@ -45,6 +45,7 @@ class BotConfig:
     series_ticker: str
     poll_seconds: float
     empty_poll_seconds: float
+    rate_limit_backoff_seconds: float
     enable_trading: bool
     dry_run: bool
     base_size: int
@@ -61,6 +62,7 @@ def load_config() -> BotConfig:
         series_ticker=os.environ["SERIES_TICKER"],
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),
+        rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),  # MICRO CHANGE
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
         base_size=env_int("BASE_SIZE", 1),
@@ -167,6 +169,11 @@ def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: i
     return min(px, max_px)
 
 
+def is_rate_limited(err: Exception) -> bool:
+    s = str(err).lower()
+    return ("too_many_requests" in s) or ("http 429" in s) or ("status_code" in s and "429" in s)
+
+
 # -----------------------------
 # Main loop
 # -----------------------------
@@ -179,6 +186,7 @@ def main():
     active = None
     last_state: Optional[Tuple] = None
     last_intended_price: Optional[int] = None
+    last_rl_log_ts: float = 0.0  # MICRO CHANGE: throttle RL logs
 
     while True:
         sleep_for = cfg.poll_seconds
@@ -209,11 +217,10 @@ def main():
                 else:
                     state = ("skip", "other")
 
-                # MICRO CHANGE: do not reset last_intended_price on skips
-
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
                     last_state = state
+
                 time.sleep(sleep_for)
                 continue
 
@@ -228,6 +235,15 @@ def main():
                 last_state = state
 
         except Exception as e:
+            # MICRO CHANGE: backoff on rate limits
+            if is_rate_limited(e):
+                now = time.time()
+                if now - last_rl_log_ts > 30:
+                    log.warning(f"[RATELIMIT] Backing off {cfg.rate_limit_backoff_seconds}s ({e})")
+                    last_rl_log_ts = now
+                time.sleep(cfg.rate_limit_backoff_seconds)
+                continue
+
             log.error(f"[LOOPERR] {e}")
 
         time.sleep(sleep_for)
