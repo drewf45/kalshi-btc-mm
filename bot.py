@@ -80,11 +80,14 @@ HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
 # Only cancel after target has been None continuously for this long
 CANCEL_IF_NO_TARGET_SECONDS = float(getenv_first(["CANCEL_IF_NO_TARGET_SECONDS"], "10.0"))
 
-# ✅ MICRO CHANGE #1: ask cache TTL to ride out NO-side blips
+# Micro #1: ask cache TTL to ride out NO-side blips
 ASK_CACHE_TTL_SECONDS = float(getenv_first(["ASK_CACHE_TTL_SECONDS"], "5.0"))
 
-# ✅ MICRO CHANGE #2: fallback to /markets/{ticker} when ask missing (throttled)
+# Micro #2: fallback to /markets/{ticker} when ask missing (throttled)
 MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"], "5.0"))
+
+# ✅ Micro #3: allow one-sided quoting when spread is tight
+ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
 
 # -----------------------------
 # Logging
@@ -346,7 +349,7 @@ def best_bid_from_side(side: Any) -> Optional[int]:
     return best
 
 
-# ✅ MICRO CHANGE #1: cache inferred YES ask for short TTL
+# Micro #1: cache inferred YES ask for short TTL
 _YES_ASK_CACHE: Dict[str, Any] = {"ask": None, "ts": 0.0}
 
 
@@ -367,7 +370,7 @@ def _get_cached_yes_ask() -> Optional[int]:
     return None
 
 
-# ✅ MICRO CHANGE #2: /markets/{ticker} fallback (throttled)
+# Micro #2: /markets/{ticker} fallback (throttled)
 _LAST_MARKET_FALLBACK_TS: float = 0.0
 
 
@@ -389,16 +392,12 @@ def _to_cents(x: Any) -> Optional[int]:
             s = x.strip()
             if s == "":
                 return None
-            # try float first (handles "0.91")
             fx = float(s)
         elif isinstance(x, (int, float)):
             fx = float(x)
         else:
             return None
 
-        # Heuristic:
-        #  - if <= 1.0, assume dollars
-        #  - if > 1.0, assume cents already
         if fx <= 1.0:
             cents = int(round(fx * 100))
         else:
@@ -412,19 +411,12 @@ def _to_cents(x: Any) -> Optional[int]:
 
 
 def _market_top_of_book_yes(market_payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Try multiple possible key layouts. We only need YES ask, but we'll also accept YES bid if present.
-    """
     if not isinstance(market_payload, dict):
         return (None, None)
 
     m = market_payload.get("market")
-    if isinstance(m, dict):
-        d = m
-    else:
-        d = market_payload
+    d = m if isinstance(m, dict) else market_payload
 
-    # Common candidates observed across versions / wrappers
     yes_bid = _to_cents(
         d.get("yes_bid_dollars")
         or d.get("yes_bid")
@@ -453,22 +445,18 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
-    # YES ask is inferred from NO best bid: yes_ask = 100 - no_best_bid
     if no_bid is not None:
         yes_ask = 100 - int(no_bid)
         _cache_yes_ask(yes_ask)
         return (yes_bid, yes_ask)
 
-    # NO side missing -> use cache if fresh
     cached = _get_cached_yes_ask()
     if cached is not None:
         return (yes_bid, cached)
 
-    # ✅ MICRO CHANGE #2: fallback to /markets/{ticker} (throttled)
     global _LAST_MARKET_FALLBACK_TS
     now = time.time()
     if MARKET_FALLBACK_MIN_SECONDS > 0 and (now - _LAST_MARKET_FALLBACK_TS) < MARKET_FALLBACK_MIN_SECONDS:
-        # Too soon to fallback again; behave like before
         return (yes_bid, None)
 
     _LAST_MARKET_FALLBACK_TS = now
@@ -477,7 +465,6 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
         fb_bid, fb_ask = _market_top_of_book_yes(mp)
         if fb_ask is not None:
             _cache_yes_ask(int(fb_ask))
-            # If orderbook yes_bid missing, accept fallback bid too
             if yes_bid is None and fb_bid is not None:
                 yes_bid = int(fb_bid)
             log.info("[FALLBACK] %s /markets top-of-book: yes_bid=%s yes_ask=%s", market_ticker, fb_bid, fb_ask)
@@ -508,9 +495,40 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
         return (None, None, "crossed_or_locked")
 
     spread = yes_ask - yes_bid
+
+    # ✅ Micro #3: allow one-sided quoting when spread is tight
     if spread < MIN_SPREAD_CENTS:
+        if not ENABLE_ONE_SIDED_TIGHT:
+            return (None, None, f"spread_too_tight({spread})")
+
+        # try to improve each side by 1 tick without crossing
+        buy_p = clamp_price(yes_bid + TICK_CENTS)
+        sell_p = clamp_price(yes_ask - TICK_CENTS)
+
+        buy_ok = buy_p < yes_ask
+        sell_ok = sell_p > yes_bid
+
+        # Apply EDGE constraints when present (prevents collapsing to mid / crossing)
+        # For one-sided we only ensure we keep at least EDGE away from the opposite side.
+        if EDGE_CENTS > 0:
+            buy_ok = buy_ok and (buy_p <= clamp_price(yes_ask - EDGE_CENTS))
+            sell_ok = sell_ok and (sell_p >= clamp_price(yes_bid + EDGE_CENTS))
+
+        if buy_ok and sell_ok:
+            # still room to do both (rare if spread<MIN_SPREAD), but keep consistent behavior
+            if buy_p >= sell_p:
+                # if they collide, choose the more conservative: quote only one side (buy by default)
+                return (buy_p, None, f"tight_one_sided(buy_only spread={spread})")
+            return (buy_p, sell_p, f"tight_two_sided(spread={spread})")
+
+        if buy_ok:
+            return (buy_p, None, f"tight_one_sided(buy_only spread={spread})")
+        if sell_ok:
+            return (None, sell_p, f"tight_one_sided(sell_only spread={spread})")
+
         return (None, None, f"spread_too_tight({spread})")
 
+    # Normal two-sided quoting
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
@@ -537,10 +555,9 @@ class WorkingOrder:
 
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
-
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
 
-# Track when we entered "no target" state
+# Track when we entered "both sides missing" state
 NO_TARGET_SINCE_TS: Optional[float] = None
 
 
@@ -552,11 +569,11 @@ def reconcile_quotes(
     dry_run: bool,
 ) -> None:
     """
-    Maintain exactly ONE working buy at target_bid and ONE working sell at target_ask.
+    Maintain at most ONE working buy (target_bid) and at most ONE working sell (target_ask).
 
-    Behavior:
-      - repricing throttles (MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS)
-      - if target is None (skip), HOLD orders for a while, then cancel if it persists
+    Micro #3 change:
+      - Only treat as "no_target" if BOTH target_bid and target_ask are None.
+      - If one side is None, cancel that side and continue managing the other.
     """
     global NO_TARGET_SINCE_TS
 
@@ -588,16 +605,15 @@ def reconcile_quotes(
             log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
-    # --- handle "no target" state globally ---
-    no_target = (target_bid is None) or (target_ask is None)
-    if no_target:
+    # --- handle "both missing" no-target state (same as before) ---
+    both_missing = (target_bid is None) and (target_ask is None)
+    if both_missing:
         if NO_TARGET_SINCE_TS is None:
             NO_TARGET_SINCE_TS = now
 
         held_for = now - NO_TARGET_SINCE_TS
 
         if HOLD_ON_SKIP and held_for < CANCEL_IF_NO_TARGET_SECONDS:
-            # Do nothing: hold existing orders
             if WORKING["buy"] or WORKING["sell"]:
                 log.info(
                     "[OM] %s HOLD (no_target) held_for=%.2fs<%.2fs DRY_RUN=%s",
@@ -605,22 +621,23 @@ def reconcile_quotes(
                 )
             return
 
-        # Past the hold threshold: cancel anything working
         cancel("buy", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         cancel("sell", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         return
     else:
         NO_TARGET_SINCE_TS = None
 
-    # --- normal maintain logic ---
+    # If one side is missing, cancel that side immediately (prevents stale orders)
+    if target_bid is None:
+        cancel("buy", "no_target_side(buy)")
+    if target_ask is None:
+        cancel("sell", "no_target_side(sell)")
+
     def maintain(side: str, target_price: Optional[int]) -> None:
-        cur = WORKING[side]
-
         if target_price is None:
-            # shouldn't happen because no_target handled above
-            cancel(side, "no_target")
-            return
+            return  # one-sided mode: this side already canceled above
 
+        cur = WORKING[side]
         if cur is None:
             place(side, int(target_price))
             return
@@ -658,6 +675,7 @@ def main():
     )
     log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
     log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
+    log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -686,11 +704,11 @@ def main():
                 global NO_TARGET_SINCE_TS
                 NO_TARGET_SINCE_TS = None
 
-                # ✅ reset ask cache on roll to avoid carrying stale ask across markets
+                # reset ask cache on roll to avoid carrying stale ask across markets
                 _YES_ASK_CACHE["ask"] = None
                 _YES_ASK_CACHE["ts"] = 0.0
 
-                # ✅ reset fallback throttle window on roll (fresh market)
+                # reset fallback throttle window on roll (fresh market)
                 global _LAST_MARKET_FALLBACK_TS
                 _LAST_MARKET_FALLBACK_TS = 0.0
 
@@ -712,10 +730,17 @@ def main():
             target_changed = (tb != last_tb) or (ta != last_ta) or (why != last_why) or market_changed
             if target_changed:
                 last_tb, last_ta, last_why = tb, ta, why
-                if tb is None or ta is None:
+                if tb is None and ta is None:
                     log.info("[TARGET] %s → SKIP (%s)", mkt, why)
                 else:
-                    log.info("[TARGET] %s YES-only would_quote: bid@%d ask@%d (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
+                    log.info(
+                        "[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s",
+                        mkt,
+                        str(tb) if tb is not None else "None",
+                        str(ta) if ta is not None else "None",
+                        why,
+                        DRY_RUN,
+                    )
 
                 # reconcile when TARGET changes
                 reconcile_quotes(
