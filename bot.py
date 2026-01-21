@@ -195,6 +195,9 @@ _last_roll_ts = 0.0
 _active_event_ticker: Optional[str] = None
 _active_market_ticker: Optional[str] = None
 
+# ✅ MICRO CHANGE: remember if /events/{event}/markets is unsupported (404)
+_event_markets_supported: Optional[bool] = None
+
 
 def _parse_dt_to_ts(s: Any) -> float:
     if not isinstance(s, str):
@@ -207,9 +210,6 @@ def _parse_dt_to_ts(s: Any) -> float:
 
 
 def pick_open_market(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Return the best open market object (not just ticker) so we can also read event_ticker.
-    """
     now = time.time()
     open_markets = []
     for m in markets:
@@ -239,29 +239,7 @@ def pick_open_market(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return sorted(candidates, key=score, reverse=True)[0]
 
 
-def fetch_events_for_series(series_ticker: str, limit: int = 250) -> List[Dict[str, Any]]:
-    # attempt #1 (some hosts have it)
-    try:
-        data = request_json("GET", f"/series/{series_ticker}/events", params={"limit": limit})
-        events = data.get("events") or data.get("data") or data.get("results") or []
-        if isinstance(events, list) and events:
-            return events
-    except Exception as e:
-        log.warning("[EVENTS] series endpoint failed: %s", e)
-
-    # attempt #2 (some hosts support /events listing)
-    data = request_json("GET", "/events", params={"series_ticker": series_ticker, "limit": limit})
-    events = data.get("events") or data.get("data") or data.get("results") or []
-    return events if isinstance(events, list) else []
-
-
-# ✅ MICRO-CHANGE: fallback resolver via /markets?series_ticker=...
 def resolve_event_and_market_via_markets(series_ticker: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Fallback path when /series/{series}/events and /events?series_ticker fail (as on elections host).
-    We ask /markets for the series, pick an open market, then read event_ticker off the market payload.
-    """
-    # try a couple param names defensively
     param_sets = [
         {"series_ticker": series_ticker, "limit": 200},
         {"series": series_ticker, "limit": 200},
@@ -280,7 +258,6 @@ def resolve_event_and_market_via_markets(series_ticker: str) -> Tuple[Optional[s
             if not best:
                 continue
 
-            # log one-time keys so you can see what field names exist
             log.info("[MARKETS] Sample market keys: %s", sorted(list(best.keys())))
 
             mkt_ticker = best.get("ticker") or best.get("market_ticker")
@@ -293,38 +270,6 @@ def resolve_event_and_market_via_markets(series_ticker: str) -> Tuple[Optional[s
 
     log.warning("[MARKETS] Could not resolve via /markets fallback: %s", last_err)
     return (None, None)
-
-
-def pick_active_event(events: List[Dict[str, Any]]) -> Optional[str]:
-    now = time.time()
-
-    def score(e: Dict[str, Any]) -> Tuple[int, float]:
-        status = str(e.get("status", "")).lower()
-        start_ts = 0.0
-        end_ts = 0.0
-        for k in ("start_time", "open_time"):
-            if k in e:
-                start_ts = max(start_ts, _parse_dt_to_ts(e.get(k)))
-        for k in ("close_time", "end_time", "expiration_time", "settlement_time"):
-            if k in e:
-                end_ts = max(end_ts, _parse_dt_to_ts(e.get(k)))
-
-        in_window = (start_ts > 0 and end_ts > 0 and start_ts <= now <= end_ts)
-        is_open = status in ("open", "active", "trading")
-
-        if is_open and in_window:
-            return (3, -(end_ts - now))
-        if is_open:
-            return (2, 0.0)
-        if start_ts > now:
-            return (1, -(start_ts - now))
-        return (0, -1e18)
-
-    candidates = [e for e in events if isinstance(e, dict) and (e.get("ticker") or e.get("event_ticker"))]
-    if not candidates:
-        return None
-    best = sorted(candidates, key=score, reverse=True)[0]
-    return best.get("ticker") or best.get("event_ticker")
 
 
 def roll_active_event() -> str:
@@ -340,33 +285,20 @@ def roll_active_event() -> str:
     if _active_event_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
         return _active_event_ticker
 
-    # try normal path first
-    try:
-        events = fetch_events_for_series(SERIES, limit=250)
-        if events:
-            picked = pick_active_event(events)
-            if picked:
-                _active_event_ticker = picked
-                _last_roll_ts = time.time()
-                log.info("[ROLL] Series=%s → Active event → %s", SERIES, _active_event_ticker)
-                return _active_event_ticker
-    except Exception as e:
-        log.warning("[ROLL] event listing path failed: %s", e)
-
-    # ✅ fallback to /markets listing
+    # On elections host, the reliable resolver is /markets
     evt, mkt = resolve_event_and_market_via_markets(SERIES)
     if not evt:
-        raise RuntimeError(f"Could not auto-resolve active EVENT for series {SERIES} (events endpoints failed, markets fallback failed).")
+        raise RuntimeError(f"Could not auto-resolve active EVENT for series {SERIES} via /markets.")
 
     _active_event_ticker = evt
-    _active_market_ticker = mkt  # optional cache if we got it
+    _active_market_ticker = mkt
     _last_roll_ts = time.time()
-    log.info("[ROLL] (fallback) Series=%s → Active event → %s (via markets)", SERIES, _active_event_ticker)
+    log.info("[ROLL] Series=%s → Active event → %s (via markets)", SERIES, _active_event_ticker)
     return _active_event_ticker
 
 
 def roll_active_market() -> str:
-    global _active_market_ticker
+    global _active_market_ticker, _event_markets_supported
 
     if MARKET_TICKER_OVERRIDE:
         if _active_market_ticker != MARKET_TICKER_OVERRIDE:
@@ -374,29 +306,54 @@ def roll_active_market() -> str:
         _active_market_ticker = MARKET_TICKER_OVERRIDE
         return _active_market_ticker
 
-    # if fallback already discovered a market, use it
-    if _active_market_ticker and (time.time() - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
+    now = time.time()
+    if _active_market_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
         return _active_market_ticker
 
+    # ensure event is resolved (also sets _active_market_ticker via /markets)
     event_ticker = roll_active_event()
 
-    data = request_json("GET", f"/events/{event_ticker}/markets", params={"limit": 200})
-    markets = data.get("markets") or data.get("data") or data.get("results") or []
-    if not isinstance(markets, list) or not markets:
-        raise RuntimeError(f"No markets returned for event {event_ticker}. Response keys={list(data.keys())}")
+    # ✅ MICRO CHANGE: if event->markets unsupported, do NOT call it again
+    if _event_markets_supported is False:
+        evt, mkt = resolve_event_and_market_via_markets(SERIES)
+        if mkt:
+            if _active_market_ticker != mkt:
+                log.info("[ROLL] (fallback) Active market → %s", mkt)
+            _active_market_ticker = mkt
+            return _active_market_ticker
+        raise RuntimeError("event->markets unsupported and /markets fallback did not return a market ticker.")
 
-    best = pick_open_market(markets)
-    if not best:
-        raise RuntimeError(f"Could not pick a market for event {event_ticker} (markets={len(markets)})")
+    # try event->markets ONCE; if 404, permanently disable it for this host
+    try:
+        data = request_json("GET", f"/events/{event_ticker}/markets", params={"limit": 200})
+        markets = data.get("markets") or data.get("data") or data.get("results") or []
+        if not isinstance(markets, list) or not markets:
+            raise RuntimeError(f"No markets returned for event {event_ticker}. keys={list(data.keys())}")
 
-    picked = best.get("ticker") or best.get("market_ticker")
-    if not picked:
-        raise RuntimeError(f"Picked market missing ticker fields for event {event_ticker}")
+        best = pick_open_market(markets)
+        if not best:
+            raise RuntimeError(f"Could not pick a market for event {event_ticker} (markets={len(markets)})")
 
-    if _active_market_ticker != picked:
-        log.info("[ROLL] Event=%s → Active market → %s", event_ticker, picked)
-    _active_market_ticker = picked
-    return _active_market_ticker
+        picked = best.get("ticker") or best.get("market_ticker")
+        if not picked:
+            raise RuntimeError(f"Picked market missing ticker fields for event {event_ticker}")
+
+        _event_markets_supported = True
+        if _active_market_ticker != picked:
+            log.info("[ROLL] Event=%s → Active market → %s", event_ticker, picked)
+        _active_market_ticker = picked
+        return _active_market_ticker
+
+    except Exception as e:
+        msg = str(e)
+        if "HTTP 404" in msg and "/events/" in msg and "/markets" in msg:
+            _event_markets_supported = False
+            log.warning("[ROLL] event->markets unsupported on this host; using /markets resolver")
+            evt, mkt = resolve_event_and_market_via_markets(SERIES)
+            if mkt:
+                _active_market_ticker = mkt
+                return _active_market_ticker
+        raise
 
 # -----------------------------
 # Orderbook parsing (binary)
