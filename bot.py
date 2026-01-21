@@ -74,11 +74,14 @@ MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
 # Only reprice if we are "meaningfully" off target
 REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 
-# NEW: when target is None (SKIP), hold existing orders instead of canceling immediately
+# When target is None (SKIP), hold existing orders instead of canceling immediately
 HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
 
-# NEW: only cancel after target has been None continuously for this long
+# Only cancel after target has been None continuously for this long
 CANCEL_IF_NO_TARGET_SECONDS = float(getenv_first(["CANCEL_IF_NO_TARGET_SECONDS"], "10.0"))
+
+# ✅ MICRO CHANGE #1: ask cache TTL to ride out NO-side blips
+ASK_CACHE_TTL_SECONDS = float(getenv_first(["ASK_CACHE_TTL_SECONDS"], "5.0"))
 
 # -----------------------------
 # Logging
@@ -340,6 +343,27 @@ def best_bid_from_side(side: Any) -> Optional[int]:
     return best
 
 
+# ✅ MICRO CHANGE #1: cache inferred YES ask for short TTL
+_YES_ASK_CACHE: Dict[str, Any] = {"ask": None, "ts": 0.0}
+
+
+def _cache_yes_ask(ask: int) -> None:
+    _YES_ASK_CACHE["ask"] = int(ask)
+    _YES_ASK_CACHE["ts"] = time.time()
+
+
+def _get_cached_yes_ask() -> Optional[int]:
+    ask = _YES_ASK_CACHE.get("ask")
+    ts = float(_YES_ASK_CACHE.get("ts") or 0.0)
+    if ask is None:
+        return None
+    if ASK_CACHE_TTL_SECONDS <= 0:
+        return None
+    if (time.time() - ts) <= ASK_CACHE_TTL_SECONDS:
+        return int(ask)
+    return None
+
+
 def get_yes_bid_ask(orderbook_payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     ob = orderbook_payload.get("orderbook") if isinstance(orderbook_payload, dict) else None
     if not isinstance(ob, dict):
@@ -351,10 +375,14 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any]) -> Tuple[Optional[int], O
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
-    yes_ask = None
-    if no_bid is not None:
-        yes_ask = 100 - no_bid
+    # YES ask is inferred from NO best bid: yes_ask = 100 - no_best_bid
+    if no_bid is None:
+        # ✅ MICRO CHANGE #1: reuse recent cached ask during NO-side blips
+        cached = _get_cached_yes_ask()
+        return (yes_bid, cached)
 
+    yes_ask = 100 - int(no_bid)
+    _cache_yes_ask(yes_ask)
     return (yes_bid, yes_ask)
 
 
@@ -408,7 +436,7 @@ WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
 
-# NEW: track when we entered "no target" state
+# Track when we entered "no target" state
 NO_TARGET_SINCE_TS: Optional[float] = None
 
 
@@ -456,7 +484,7 @@ def reconcile_quotes(
             log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
-    # --- NEW: handle "no target" state globally ---
+    # --- handle "no target" state globally ---
     no_target = (target_bid is None) or (target_ask is None)
     if no_target:
         if NO_TARGET_SINCE_TS is None:
@@ -524,6 +552,7 @@ def main():
         "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
         ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS
     )
+    log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -551,6 +580,10 @@ def main():
                 _LAST_KEEP_LOGGED["sell"] = None
                 global NO_TARGET_SINCE_TS
                 NO_TARGET_SINCE_TS = None
+
+                # ✅ reset ask cache on roll to avoid carrying stale ask across markets
+                _YES_ASK_CACHE["ask"] = None
+                _YES_ASK_CACHE["ts"] = 0.0
 
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
