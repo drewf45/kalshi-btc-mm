@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: parse BTC-style YES ladders (orderbook["yes"] is a price ladder)
+# MICRO CHANGE: add authenticated POST /portfolio/orders and place post-only limit buys when ENABLE_TRADING && !DRY_RUN
 
 import os
 import time
@@ -77,7 +77,47 @@ def load_config() -> BotConfig:
 
 
 # -----------------------------
-# HTTP helpers
+# Auth / signing (for private endpoints)
+# -----------------------------
+def canonical_json(obj) -> str:
+    return "" if obj is None else json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+def load_private_key_from_b64(b64: str):
+    return serialization.load_pem_private_key(base64.b64decode(b64), password=None)
+
+
+def sign_request(priv, ts_ms: str, method: str, path_qs: str, body_str: str) -> str:
+    msg = f"{ts_ms}{method}{path_qs}{body_str}".encode("utf-8")
+    sig = priv.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    return base64.b64encode(sig).decode("utf-8")
+
+
+def auth_headers(cfg: BotConfig, priv, method: str, path_qs: str, body_obj: Optional[dict]) -> dict:
+    ts = str(int(time.time() * 1000))
+    body_str = "" if method == "GET" else canonical_json(body_obj)
+    sig = sign_request(priv, ts, method, path_qs, body_str)
+    return {
+        "Content-Type": "application/json",
+        "KALSHI-ACCESS-KEY": cfg.api_key_id,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+    }
+
+
+def private_request_json(cfg: BotConfig, session: requests.Session, priv, method: str, path: str, params=None, body=None):
+    qs = path if not params else f"{path}?{urlencode(params)}"
+    url = cfg.api_base + qs
+    h = auth_headers(cfg, priv, method, qs, body)
+    r = session.request(method, url, headers=h, json=body, timeout=20)
+    data = r.json() if r.content else {}
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code} {qs}: {data}")
+    return data
+
+
+# -----------------------------
+# HTTP helpers (public)
 # -----------------------------
 def public_get(cfg, session: requests.Session, path, params=None):
     qs = path if not params else f"{path}?{urlencode(params)}"
@@ -129,7 +169,6 @@ def resolve_active_market(cfg, session: requests.Session) -> str:
 # -----------------------------
 def parse_yes_book(ob: Any):
     """
-    MICRO CHANGE:
     BTC markets expose YES as a flat ladder:
       orderbook["yes"] = [[price, qty], ...]
     Lowest price = best bid
@@ -146,7 +185,13 @@ def parse_yes_book(ob: Any):
     if not isinstance(ladder, list) or not ladder:
         return None, None
 
-    prices = [int(p) for p, _ in ladder if isinstance(p, (int, float))]
+    prices = []
+    for row in ladder:
+        if isinstance(row, (list, tuple)) and len(row) >= 1:
+            p = row[0]
+            if isinstance(p, (int, float)):
+                prices.append(int(p))
+
     if not prices:
         return None, None
 
@@ -165,11 +210,43 @@ def choose_price(bid, ask, improve, max_px, min_edge):
 
 
 # -----------------------------
+# MICRO CHANGE: Place order (post-only YES limit buy)
+# -----------------------------
+def make_client_order_id(ticker: str, yes_price: int) -> str:
+    # deterministic enough to avoid collisions, but still unique
+    return f"mm-{ticker}-{yes_price}-{int(time.time()*1000)}"
+
+
+def place_yes_limit_buy(cfg: BotConfig, session: requests.Session, priv, ticker: str, yes_price: int, count: int):
+    body = {
+        "ticker": ticker,
+        "side": "yes",
+        "action": "buy",
+        "type": "limit",
+        "count": count,
+        "yes_price": yes_price,
+        "post_only": bool(cfg.post_only),
+        "client_order_id": make_client_order_id(ticker, yes_price),
+    }
+    resp = private_request_json(cfg, session, priv, "POST", "/trade-api/v2/portfolio/orders", body=body)
+    order = resp.get("order") or resp
+    log.info(f"[ORDER] placed yes buy {count}@{yes_price}c id={order.get('order_id', 'n/a')}")
+    return order
+
+
+# -----------------------------
 # Main loop
 # -----------------------------
 def main():
     cfg = load_config()
     session = requests.Session()
+
+    # Only load private key if we might trade for real
+    priv = None
+    if cfg.enable_trading and not cfg.dry_run:
+        if not cfg.api_key_id or not cfg.private_key_b64:
+            raise RuntimeError("ENABLE_TRADING requires KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PEM_BASE64")
+        priv = load_private_key_from_b64(cfg.private_key_b64)
 
     log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
 
@@ -201,8 +278,13 @@ def main():
             state = ("quote", price)
             if state != last_state:
                 log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
-                log.info("[DRYRUN] Not placing order")
                 last_state = state
+
+            # MICRO CHANGE: place order when live-trading is enabled
+            if cfg.enable_trading and not cfg.dry_run:
+                place_yes_limit_buy(cfg, session, priv, active, price, cfg.base_size)
+            else:
+                log.info("[DRYRUN] Not placing order")
 
         except Exception as e:
             log.error(f"[LOOPERR] {e}")
