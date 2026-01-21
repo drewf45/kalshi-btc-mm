@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: add authenticated POST /portfolio/orders and place post-only limit buys when ENABLE_TRADING && !DRY_RUN
+# MICRO CHANGE: fix INCORRECT_API_KEY_SIGNATURE by signing the exact JSON bytes we send (data=body_str)
 
 import os
 import time
@@ -80,6 +80,7 @@ def load_config() -> BotConfig:
 # Auth / signing (for private endpoints)
 # -----------------------------
 def canonical_json(obj) -> str:
+    # Keep deterministic + compact. IMPORTANT: we will send exactly this string.
     return "" if obj is None else json.dumps(obj, separators=(",", ":"), sort_keys=True)
 
 
@@ -93,9 +94,8 @@ def sign_request(priv, ts_ms: str, method: str, path_qs: str, body_str: str) -> 
     return base64.b64encode(sig).decode("utf-8")
 
 
-def auth_headers(cfg: BotConfig, priv, method: str, path_qs: str, body_obj: Optional[dict]) -> dict:
+def auth_headers(cfg: BotConfig, priv, method: str, path_qs: str, body_str: str) -> dict:
     ts = str(int(time.time() * 1000))
-    body_str = "" if method == "GET" else canonical_json(body_obj)
     sig = sign_request(priv, ts, method, path_qs, body_str)
     return {
         "Content-Type": "application/json",
@@ -108,8 +108,18 @@ def auth_headers(cfg: BotConfig, priv, method: str, path_qs: str, body_obj: Opti
 def private_request_json(cfg: BotConfig, session: requests.Session, priv, method: str, path: str, params=None, body=None):
     qs = path if not params else f"{path}?{urlencode(params)}"
     url = cfg.api_base + qs
-    h = auth_headers(cfg, priv, method, qs, body)
-    r = session.request(method, url, headers=h, json=body, timeout=20)
+
+    # MICRO CHANGE: serialize once, sign that exact string, and send those exact bytes
+    body_str = "" if method == "GET" else canonical_json(body)
+    h = auth_headers(cfg, priv, method, qs, body_str)
+
+    r = session.request(
+        method,
+        url,
+        headers=h,
+        data=(None if method == "GET" else body_str),
+        timeout=20,
+    )
     data = r.json() if r.content else {}
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {qs}: {data}")
@@ -210,10 +220,9 @@ def choose_price(bid, ask, improve, max_px, min_edge):
 
 
 # -----------------------------
-# MICRO CHANGE: Place order (post-only YES limit buy)
+# Place order (post-only YES limit buy)
 # -----------------------------
 def make_client_order_id(ticker: str, yes_price: int) -> str:
-    # deterministic enough to avoid collisions, but still unique
     return f"mm-{ticker}-{yes_price}-{int(time.time()*1000)}"
 
 
@@ -241,7 +250,6 @@ def main():
     cfg = load_config()
     session = requests.Session()
 
-    # Only load private key if we might trade for real
     priv = None
     if cfg.enable_trading and not cfg.dry_run:
         if not cfg.api_key_id or not cfg.private_key_b64:
@@ -280,7 +288,6 @@ def main():
                 log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
                 last_state = state
 
-            # MICRO CHANGE: place order when live-trading is enabled
             if cfg.enable_trading and not cfg.dry_run:
                 place_yes_limit_buy(cfg, session, priv, active, price, cfg.base_size)
             else:
