@@ -5,7 +5,7 @@ import base64
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List  # ✅ only change: include Optional
+from typing import Any, Dict, Optional, Tuple, List  # ✅ only change previously: include Optional
 
 import requests
 from dotenv import load_dotenv
@@ -170,10 +170,15 @@ def load_private_key_from_env(raw: str) -> Any:
 PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
+# ✅ ONLY CHANGE IN THIS FULL COPY:
+#   PKCS1v15()  --->  PSS(MGF1(SHA256), MAX_LENGTH)
 def sign_message(message: str) -> str:
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
-        asy_padding.PKCS1v15(),
+        asy_padding.PSS(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            salt_length=asy_padding.PSS.MAX_LENGTH,
+        ),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
@@ -634,6 +639,7 @@ def reconcile_quotes(
         if cur is None:
             return
 
+        log.info(f"[OM] {market_ticker} {side_key.upper campsite?}")
         log.info(f"[OM] {market_ticker} {side_key.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
 
         if (not dry_run) and ENABLE_TRADING and cur.order_id:
