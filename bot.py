@@ -74,10 +74,10 @@ MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
 # Only reprice if we are "meaningfully" off target
 REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 
-# When target is None (SKIP), hold existing orders instead of canceling immediately
+# When BOTH sides are None, hold existing orders instead of canceling immediately
 HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
 
-# Only cancel after target has been None continuously for this long
+# Only cancel after BOTH targets have been None continuously for this long
 CANCEL_IF_NO_TARGET_SECONDS = float(getenv_first(["CANCEL_IF_NO_TARGET_SECONDS"], "10.0"))
 
 # Micro #1: ask cache TTL to ride out NO-side blips
@@ -86,8 +86,11 @@ ASK_CACHE_TTL_SECONDS = float(getenv_first(["ASK_CACHE_TTL_SECONDS"], "5.0"))
 # Micro #2: fallback to /markets/{ticker} when ask missing (throttled)
 MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"], "5.0"))
 
-# ✅ Micro #3: allow one-sided quoting when spread is tight
+# Micro #3: allow one-sided quoting when spread is tight
 ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
+
+# ✅ Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
+SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 
 # -----------------------------
 # Logging
@@ -311,7 +314,9 @@ def roll_active_market() -> str:
     if EVENT_TICKER:
         evt, mkt = resolve_event_and_market_via_markets(SERIES)
         if not mkt:
-            raise RuntimeError(f"Could not resolve market via /markets for series={SERIES} (EVENT_TICKER pinned={EVENT_TICKER}).")
+            raise RuntimeError(
+                f"Could not resolve market via /markets for series={SERIES} (EVENT_TICKER pinned={EVENT_TICKER})."
+            )
         _active_event_ticker = EVENT_TICKER
         _active_market_ticker = mkt
         _last_roll_ts = time.time()
@@ -496,28 +501,23 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
 
     spread = yes_ask - yes_bid
 
-    # ✅ Micro #3: allow one-sided quoting when spread is tight
+    # Micro #3: allow one-sided quoting when spread is tight
     if spread < MIN_SPREAD_CENTS:
         if not ENABLE_ONE_SIDED_TIGHT:
             return (None, None, f"spread_too_tight({spread})")
 
-        # try to improve each side by 1 tick without crossing
         buy_p = clamp_price(yes_bid + TICK_CENTS)
         sell_p = clamp_price(yes_ask - TICK_CENTS)
 
         buy_ok = buy_p < yes_ask
         sell_ok = sell_p > yes_bid
 
-        # Apply EDGE constraints when present (prevents collapsing to mid / crossing)
-        # For one-sided we only ensure we keep at least EDGE away from the opposite side.
         if EDGE_CENTS > 0:
             buy_ok = buy_ok and (buy_p <= clamp_price(yes_ask - EDGE_CENTS))
             sell_ok = sell_ok and (sell_p >= clamp_price(yes_bid + EDGE_CENTS))
 
         if buy_ok and sell_ok:
-            # still room to do both (rare if spread<MIN_SPREAD), but keep consistent behavior
             if buy_p >= sell_p:
-                # if they collide, choose the more conservative: quote only one side (buy by default)
                 return (buy_p, None, f"tight_one_sided(buy_only spread={spread})")
             return (buy_p, sell_p, f"tight_two_sided(spread={spread})")
 
@@ -560,6 +560,10 @@ _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
 # Track when we entered "both sides missing" state
 NO_TARGET_SINCE_TS: Optional[float] = None
 
+# ✅ Micro #4: per-side missing timers + light log suppression
+NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
+_LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
+
 
 def reconcile_quotes(
     market_ticker: str,
@@ -567,15 +571,21 @@ def reconcile_quotes(
     target_ask: Optional[int],
     qty: int,
     dry_run: bool,
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
 ) -> None:
     """
     Maintain at most ONE working buy (target_bid) and at most ONE working sell (target_ask).
 
-    Micro #3 change:
-      - Only treat as "no_target" if BOTH target_bid and target_ask are None.
-      - If one side is None, cancel that side and continue managing the other.
+    Micro #3:
+      - BOTH None => global HOLD/CANCEL logic
+      - One side None => one-sided mode
+
+    ✅ Micro #4:
+      - If one side becomes None, do NOT instantly cancel that side.
+      - Hold it for SIDE_HOLD_SECONDS, unless it becomes unsafe (cross/lock risk).
     """
-    global NO_TARGET_SINCE_TS
+    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
 
     now = time.time()
 
@@ -605,7 +615,19 @@ def reconcile_quotes(
             log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
-    # --- handle "both missing" no-target state (same as before) ---
+    def unsafe_to_hold(side: str, cur: WorkingOrder) -> bool:
+        # If we don't have both sides of the book, don't attempt safety cross-check.
+        if yes_bid is None or yes_ask is None:
+            return False
+        if side == "sell":
+            # selling at or below current best bid is immediately unsafe (cross/lock risk)
+            return int(cur.price_cents) <= int(yes_bid)
+        if side == "buy":
+            # buying at or above current best ask is immediately unsafe (cross/lock risk)
+            return int(cur.price_cents) >= int(yes_ask)
+        return False
+
+    # --- BOTH missing: global HOLD/CANCEL logic (unchanged) ---
     both_missing = (target_bid is None) and (target_ask is None)
     if both_missing:
         if NO_TARGET_SINCE_TS is None:
@@ -627,15 +649,53 @@ def reconcile_quotes(
     else:
         NO_TARGET_SINCE_TS = None
 
-    # If one side is missing, cancel that side immediately (prevents stale orders)
-    if target_bid is None:
-        cancel("buy", "no_target_side(buy)")
-    if target_ask is None:
-        cancel("sell", "no_target_side(sell)")
+    # --- Micro #4: per-side hold when a single side is missing ---
+    # Reset timers when target is present
+    if target_bid is not None:
+        NO_TARGET_SIDE_SINCE_TS["buy"] = None
+    if target_ask is not None:
+        NO_TARGET_SIDE_SINCE_TS["sell"] = None
 
+    # For missing side: hold (if working) for SIDE_HOLD_SECONDS unless unsafe; then cancel
+    def handle_missing_side(side: str) -> None:
+        cur = WORKING[side]
+        if cur is None:
+            return
+
+        # Immediate safety cancel
+        if unsafe_to_hold(side, cur):
+            cancel(side, "unsafe_hold(cross_risk)")
+            NO_TARGET_SIDE_SINCE_TS[side] = None
+            return
+
+        # Start per-side timer
+        if NO_TARGET_SIDE_SINCE_TS[side] is None:
+            NO_TARGET_SIDE_SINCE_TS[side] = now
+
+        held_for = now - float(NO_TARGET_SIDE_SINCE_TS[side] or now)
+
+        if SIDE_HOLD_SECONDS > 0 and held_for < SIDE_HOLD_SECONDS:
+            # light log suppression: once every ~5s per side
+            if (now - _LAST_SIDE_HOLD_LOG_TS.get(side, 0.0)) >= 5.0:
+                log.info(
+                    "[OM] %s %s HOLD_SIDE held_for=%.2fs<%.2fs price=@%d DRY_RUN=%s",
+                    market_ticker, side.upper(), held_for, SIDE_HOLD_SECONDS, cur.price_cents, dry_run
+                )
+                _LAST_SIDE_HOLD_LOG_TS[side] = now
+            return
+
+        cancel(side, f"no_target_side>{SIDE_HOLD_SECONDS:.2f}s")
+        NO_TARGET_SIDE_SINCE_TS[side] = None
+
+    if target_bid is None:
+        handle_missing_side("buy")
+    if target_ask is None:
+        handle_missing_side("sell")
+
+    # --- Normal maintain logic for sides that have targets ---
     def maintain(side: str, target_price: Optional[int]) -> None:
         if target_price is None:
-            return  # one-sided mode: this side already canceled above
+            return
 
         cur = WORKING[side]
         if cur is None:
@@ -676,6 +736,7 @@ def main():
     log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
     log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
     log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
+    log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -701,8 +762,9 @@ def main():
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
                 _LAST_KEEP_LOGGED["sell"] = None
-                global NO_TARGET_SINCE_TS
+                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS
                 NO_TARGET_SINCE_TS = None
+                NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
 
                 # reset ask cache on roll to avoid carrying stale ask across markets
                 _YES_ASK_CACHE["ask"] = None
@@ -742,14 +804,16 @@ def main():
                         DRY_RUN,
                     )
 
-                # reconcile when TARGET changes
-                reconcile_quotes(
-                    market_ticker=mkt,
-                    target_bid=tb,
-                    target_ask=ta,
-                    qty=ORDER_QTY,
-                    dry_run=DRY_RUN,
-                )
+            # ✅ Micro #4: reconcile every loop (timers need time progression even if target doesn't "change")
+            reconcile_quotes(
+                market_ticker=mkt,
+                target_bid=tb,
+                target_ask=ta,
+                qty=ORDER_QTY,
+                dry_run=DRY_RUN,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+            )
 
         except Exception as e:
             log.error("[LOOPERR] %s", e)
