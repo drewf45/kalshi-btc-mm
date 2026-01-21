@@ -68,11 +68,13 @@ TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "3"))
 
-# --- Safety / Patience gates (THIS is the big long-term win) ---
+# --- Safety / Patience gates ---
 # Spread must be >= MIN_SPREAD_CENTS continuously for this long before we place quotes
 ENTER_OK_SECONDS = float(getenv_first(["ENTER_OK_SECONDS"], "3.0"))
-# Once we are quoting, spread must be "bad" continuously for this long before we cancel due to tight spread
+# Once we are quoting, spread must be "tight" continuously for this long before we cancel due to tight spread
 EXIT_BAD_SECONDS = float(getenv_first(["EXIT_BAD_SECONDS"], "6.0"))
+# NEW: if spread is OK but NOT stable yet, do not leave orders hanging very long
+NOT_STABLE_EXIT_SECONDS = float(getenv_first(["NOT_STABLE_EXIT_SECONDS"], "1.5"))
 
 # Order params
 ORDER_QTY = int(getenv_first(["ORDER_QTY"], "1"))
@@ -124,7 +126,9 @@ KALSHI_PRIVATE_KEY_RAW = getenv_first(
 
 if not KALSHI_PRIVATE_KEY_RAW:
     # Render env key in your logs: KALSHI_PRIVATE_KEY_PEM_BASE64
-    KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]).strip()
+    KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(
+        ["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]
+    ).strip()
 
 _detected_kalshi_keys = env_keys_with_prefix("KALSHI_")
 log.info("[ENV] Detected KALSHI_* keys: %s", _detected_kalshi_keys if _detected_kalshi_keys else "<none>")
@@ -549,8 +553,10 @@ NO_TARGET_SINCE_TS: Optional[float] = None
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
-# Tight spread timer (used for "EXIT_BAD_SECONDS" patience)
+# Tight spread timer (EXIT_BAD_SECONDS)
 TIGHT_SPREAD_SINCE_TS: Optional[float] = None
+# Not-stable timer (NOT_STABLE_EXIT_SECONDS)
+NOT_STABLE_SINCE_TS: Optional[float] = None
 
 
 def reconcile_quotes(
@@ -563,7 +569,7 @@ def reconcile_quotes(
     yes_ask: Optional[int],
     skip_reason: Optional[str] = None,
 ) -> None:
-    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS, TIGHT_SPREAD_SINCE_TS
+    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS, TIGHT_SPREAD_SINCE_TS, NOT_STABLE_SINCE_TS
 
     now = time.time()
 
@@ -605,13 +611,14 @@ def reconcile_quotes(
 
     both_missing = (target_bid is None) and (target_ask is None)
 
-    # BOTH missing: global HOLD/CANCEL logic, but with "tight spread patience"
+    # BOTH missing: global HOLD/CANCEL logic, with special handling for "tight spread" and "not stable"
     if both_missing:
-        # If we're skipping because spread is tight, do NOT insta-cancel.
-        # Hold until EXIT_BAD_SECONDS has elapsed continuously in tight-spread state.
         is_tight_spread_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight")
+        is_not_stable_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_ok_not_stable")
 
+        # 1) Tight spread: patience window EXIT_BAD_SECONDS
         if is_tight_spread_skip:
+            NOT_STABLE_SINCE_TS = None  # reset other timer
             if TIGHT_SPREAD_SINCE_TS is None:
                 TIGHT_SPREAD_SINCE_TS = now
             tight_for = now - TIGHT_SPREAD_SINCE_TS
@@ -624,14 +631,34 @@ def reconcile_quotes(
                     )
                 return
 
-            # After EXIT_BAD_SECONDS tight, we do allow canceling (risk control)
             cancel("buy", f"tight_spread>{EXIT_BAD_SECONDS:.2f}s({skip_reason})")
             cancel("sell", f"tight_spread>{EXIT_BAD_SECONDS:.2f}s({skip_reason})")
             NO_TARGET_SINCE_TS = None
             return
 
-        # Not a tight-spread skip: fall back to generic no-target hold/cancel
+        # 2) Spread OK but NOT stable yet: short patience window NOT_STABLE_EXIT_SECONDS
+        if is_not_stable_skip:
+            TIGHT_SPREAD_SINCE_TS = None  # reset other timer
+            if NOT_STABLE_SINCE_TS is None:
+                NOT_STABLE_SINCE_TS = now
+            ns_for = now - NOT_STABLE_SINCE_TS
+
+            if HOLD_ON_SKIP and ns_for < NOT_STABLE_EXIT_SECONDS:
+                if WORKING["buy"] or WORKING["sell"]:
+                    log.info(
+                        "[OM] %s HOLD (not_stable) held_for=%.2fs<%.2fs DRY_RUN=%s",
+                        market_ticker, ns_for, NOT_STABLE_EXIT_SECONDS, dry_run
+                    )
+                return
+
+            cancel("buy", f"not_stable>{NOT_STABLE_EXIT_SECONDS:.2f}s({skip_reason})")
+            cancel("sell", f"not_stable>{NOT_STABLE_EXIT_SECONDS:.2f}s({skip_reason})")
+            NO_TARGET_SINCE_TS = None
+            return
+
+        # 3) Generic no-target (missing book etc.)
         TIGHT_SPREAD_SINCE_TS = None
+        NOT_STABLE_SINCE_TS = None
 
         if NO_TARGET_SINCE_TS is None:
             NO_TARGET_SINCE_TS = now
@@ -653,6 +680,7 @@ def reconcile_quotes(
     # We have at least one target => reset "no-target" timers
     NO_TARGET_SINCE_TS = None
     TIGHT_SPREAD_SINCE_TS = None
+    NOT_STABLE_SINCE_TS = None
 
     # per-side hold when a single side is missing
     if target_bid is not None:
@@ -735,8 +763,14 @@ def main():
         EVENT_TICKER or "<auto>", MARKET_TICKER_OVERRIDE or "<none>",
         POLL, DRY_RUN, ENABLE_TRADING,
     )
-    log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
-    log.info("SAFETY_GATES: ENTER_OK_SECONDS=%.2f EXIT_BAD_SECONDS=%.2f", ENTER_OK_SECONDS, EXIT_BAD_SECONDS)
+    log.info(
+        "QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d",
+        TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS
+    )
+    log.info(
+        "SAFETY_GATES: ENTER_OK_SECONDS=%.2f EXIT_BAD_SECONDS=%.2f NOT_STABLE_EXIT_SECONDS=%.2f",
+        ENTER_OK_SECONDS, EXIT_BAD_SECONDS, NOT_STABLE_EXIT_SECONDS
+    )
     log.info(
         "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
         ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS,
@@ -774,10 +808,12 @@ def main():
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
                 _LAST_KEEP_LOGGED["sell"] = None
-                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, TIGHT_SPREAD_SINCE_TS
+
+                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, TIGHT_SPREAD_SINCE_TS, NOT_STABLE_SINCE_TS
                 NO_TARGET_SINCE_TS = None
                 NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
                 TIGHT_SPREAD_SINCE_TS = None
+                NOT_STABLE_SINCE_TS = None
 
                 _YES_ASK_CACHE["ask"] = None
                 _YES_ASK_CACHE["ts"] = 0.0
@@ -803,7 +839,7 @@ def main():
             # Compute raw targets (spread gate lives here)
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
 
-            # Add ENTER_OK_SECONDS stability requirement (prevents place->cancel churn)
+            # Add ENTER_OK_SECONDS stability requirement
             if tb is not None and ta is not None and yes_bid is not None and yes_ask is not None:
                 spread = int(yes_ask) - int(yes_bid)
                 if spread >= MIN_SPREAD_CENTS:
@@ -815,7 +851,6 @@ def main():
                 else:
                     spread_ok_since = None
             else:
-                # If not currently eligible, reset stability timer unless we just lack data
                 if isinstance(why, str) and why.startswith("spread_too_tight"):
                     spread_ok_since = None
 
