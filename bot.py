@@ -715,6 +715,26 @@ def reconcile_quotes(
             return
 
         off = price_off(cur.price_cents, int(target_price))
+
+        # ✅ MICRO CHANGE (Join must actually join):
+        # If the market is in a "too-tight" state and the target is exactly best bid/ask,
+        # do NOT allow the normal 2-cent hysteresis to keep us 1c behind.
+        # In join mode, we only KEEP when off == 0.
+        tight_join_mode = (
+            ENABLE_JOIN_TIGHT_SPREAD
+            and (yes_bid is not None and yes_ask is not None)
+            and ((yes_ask - yes_bid) < MIN_SPREAD_CENTS)
+            and (
+                (side == "buy" and int(target_price) == int(yes_bid))
+                or (side == "sell" and int(target_price) == int(yes_ask))
+            )
+        )
+        if tight_join_mode:
+            if off == 0:
+                keep(side, cur, "join_mode exact_match")
+                return
+            # otherwise: fall through to reprice logic (respect cooldown)
+
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
