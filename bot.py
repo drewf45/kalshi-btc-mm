@@ -5,7 +5,7 @@ import base64
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List  # ✅ only change: include Optional
 
 import requests
 from dotenv import load_dotenv
@@ -630,9 +630,6 @@ def reconcile_quotes(
         return (now - cur.created_ts) >= MIN_REQUOTE_SECONDS
 
     def cancel(side_key: str, reason: str) -> None:
-        """
-        side_key is "buy" or "sell" (our working slot)
-        """
         cur = WORKING[side_key]
         if cur is None:
             return
@@ -646,16 +643,13 @@ def reconcile_quotes(
         _LAST_KEEP_LOGGED[side_key] = None
 
     def place(side_key: str, price: int) -> None:
-        """
-        side_key is "buy" or "sell" (our action)
-        """
         log.info(f"[OM] {market_ticker} {side_key.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
 
         order_id = None
         if (not dry_run) and ENABLE_TRADING:
             order_id = place_order_live(
                 market_ticker=market_ticker,
-                action=side_key,               # "buy" or "sell"
+                action=side_key,
                 yes_price_cents=int(price),
                 count=int(qty),
             )
@@ -876,8 +870,6 @@ def main():
                 last_ta = None
                 last_why = None
 
-                # If we rolled markets, dump locals.
-                # (If you want to cancel live orders on roll, you can do it here too—keeping behavior unchanged.)
                 WORKING["buy"] = None
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
@@ -950,4 +942,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
