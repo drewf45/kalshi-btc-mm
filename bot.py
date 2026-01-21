@@ -215,7 +215,7 @@ def request_json(
 
     backoff = BACKOFF_START
     while True:
-        resp = requests.request(method.upper(), url, params=params, data=body_str, headers=headers, timeout=20)
+        resp = requests.request(method.upper(), url, params=params, json=json_body, headers=headers, timeout=20)
 
         if resp.status_code == 429:
             log.warning("[429] %s backing off %.1fs", path, backoff)
