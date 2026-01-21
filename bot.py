@@ -3,6 +3,7 @@ import json
 import time
 import base64
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -63,6 +64,10 @@ BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "2"))
+
+# Order params (new)
+ORDER_QTY = int(getenv_first(["ORDER_QTY"], "1"))
+MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "0"))
 
 # -----------------------------
 # Logging
@@ -378,6 +383,74 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     return (bid, ask, f"ok(spread={spread})")
 
 # -----------------------------
+# Order management (DRY_RUN now, real later)
+# -----------------------------
+@dataclass
+class WorkingOrder:
+    side: str            # "buy" or "sell"
+    price_cents: int
+    qty: int
+    created_ts: float
+
+
+WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
+
+
+def reconcile_quotes(
+    market_ticker: str,
+    target_bid: Optional[int],
+    target_ask: Optional[int],
+    qty: int,
+    dry_run: bool,
+) -> None:
+    """
+    Maintain exactly ONE working buy at target_bid and ONE working sell at target_ask.
+
+    In DRY_RUN: only logs + updates in-memory state.
+    When you go live: replace cancel/place stubs with API calls.
+    """
+    now = time.time()
+
+    def should_requote(current: WorkingOrder, new_price: int) -> bool:
+        if current.price_cents == new_price:
+            return False
+        if MIN_REQUOTE_SECONDS > 0 and (now - current.created_ts) < MIN_REQUOTE_SECONDS:
+            return False
+        return True
+
+    def cancel(side: str, reason: str) -> None:
+        cur = WORKING[side]
+        if cur is None:
+            return
+        log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
+        WORKING[side] = None
+
+    def place(side: str, price: int) -> None:
+        log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
+        WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now)
+
+    def maintain(side: str, target_price: Optional[int]) -> None:
+        cur = WORKING[side]
+
+        if target_price is None:
+            cancel(side, "no_target")
+            return
+
+        if cur is None:
+            place(side, target_price)
+            return
+
+        if should_requote(cur, target_price):
+            cancel(side, "reprice")
+            place(side, target_price)
+            return
+
+        log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} DRY_RUN={dry_run}")
+
+    maintain("buy", target_bid)
+    maintain("sell", target_ask)
+
+# -----------------------------
 # Main loop (✅ only log on change)
 # -----------------------------
 def main():
@@ -388,6 +461,7 @@ def main():
         POLL, DRY_RUN, ENABLE_TRADING
     )
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
+    log.info("ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f", ORDER_QTY, MIN_REQUOTE_SECONDS)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -409,6 +483,10 @@ def main():
                 last_tb = None
                 last_ta = None
                 last_why = None
+                # also clear working orders on roll
+                WORKING["buy"] = None
+                WORKING["sell"] = None
+                log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
             ob = fetch_orderbook(mkt)
             yes_bid, yes_ask = get_yes_bid_ask(ob)
@@ -430,6 +508,15 @@ def main():
                     log.info("[TARGET] %s → SKIP (%s)", mkt, why)
                 else:
                     log.info("[TARGET] %s YES-only would_quote: bid@%d ask@%d (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
+
+                # IMPORTANT: only reconcile when target changes (prevents log spam/churn)
+                reconcile_quotes(
+                    market_ticker=mkt,
+                    target_bid=tb,
+                    target_ask=ta,
+                    qty=ORDER_QTY,
+                    dry_run=DRY_RUN,
+                )
 
         except Exception as e:
             log.error("[LOOPERR] %s", e)
