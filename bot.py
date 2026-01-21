@@ -1,6 +1,7 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
 # FIX: uses /markets?series=XYZ instead of non-existent /series endpoint
+# MICRO CHANGE: If YES book is empty (bid=None and ask=None) -> SKIP (do not quote)
 
 import os
 import time
@@ -159,13 +160,16 @@ def parse_yes_book(ob):
     )
 
 
-def choose_price(bid, ask, improve, max_px):
+def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: int) -> Optional[int]:
+    # MICRO CHANGE: if both sides are empty, do not quote
     if bid is None and ask is None:
-        return max_px
+        return None
+
     if bid is None:
         return min(ask - 1, max_px)
+
     px = bid + improve
-    if ask:
+    if ask is not None:
         px = min(px, ask - 1)
     return min(px, max_px)
 
@@ -191,6 +195,11 @@ def main():
             ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price)
+
+            # MICRO CHANGE: skip empty books (no invented price like 99c)
+            if price is None:
+                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP (empty book)")
+                continue
 
             log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
 
