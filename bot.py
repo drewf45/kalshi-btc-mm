@@ -68,6 +68,12 @@ TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "3"))
 
+# --- Safety / Patience gates (THIS is the big long-term win) ---
+# Spread must be >= MIN_SPREAD_CENTS continuously for this long before we place quotes
+ENTER_OK_SECONDS = float(getenv_first(["ENTER_OK_SECONDS"], "3.0"))
+# Once we are quoting, spread must be "bad" continuously for this long before we cancel due to tight spread
+EXIT_BAD_SECONDS = float(getenv_first(["EXIT_BAD_SECONDS"], "6.0"))
+
 # Order params
 ORDER_QTY = int(getenv_first(["ORDER_QTY"], "1"))
 
@@ -80,7 +86,7 @@ REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 # When BOTH targets are None, hold existing orders instead of canceling immediately
 HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
 
-# Only cancel after BOTH targets have been None continuously for this long
+# Only cancel after BOTH targets have been None continuously for this long (generic no-target)
 CANCEL_IF_NO_TARGET_SECONDS = float(getenv_first(["CANCEL_IF_NO_TARGET_SECONDS"], "10.0"))
 
 # Micro #1: ask cache TTL to ride out NO-side blips
@@ -89,10 +95,8 @@ ASK_CACHE_TTL_SECONDS = float(getenv_first(["ASK_CACHE_TTL_SECONDS"], "5.0"))
 # Micro #2: fallback to /markets/{ticker} when ask missing (throttled)
 MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"], "5.0"))
 
-# Micro #3: allow one-sided quoting when spread is tight (kept as a toggle, but Change #2 forces skip anyway)
+# Micro #3 toggles (kept, but we still hard-gate on MIN_SPREAD_CENTS)
 ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
-
-# Micro: join best bid/ask when spread is too tight to step inside (kept as a toggle, but Change #2 forces skip anyway)
 ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"], "true"), default=True)
 
 # Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
@@ -456,6 +460,7 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
+    # Kalshi binary: YES ask can be inferred from NO bid: yes_ask = 100 - no_best_bid
     if no_bid is not None:
         yes_ask = 100 - int(no_bid)
         _cache_yes_ask(yes_ask)
@@ -507,13 +512,11 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
 
     spread = yes_ask - yes_bid
 
-    # =========================================================
-    # CHANGE #2: hard gate — do NOT quote unless spread >= MIN_SPREAD_CENTS
-    # =========================================================
+    # Hard gate — do NOT quote unless spread >= MIN_SPREAD_CENTS
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
 
-    # Normal two-sided quoting
+    # Normal two-sided quoting: step inside by 1 tick (or configured tick)
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
@@ -543,9 +546,11 @@ WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
 
 NO_TARGET_SINCE_TS: Optional[float] = None
-
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
+
+# Tight spread timer (used for "EXIT_BAD_SECONDS" patience)
+TIGHT_SPREAD_SINCE_TS: Optional[float] = None
 
 
 def reconcile_quotes(
@@ -558,7 +563,7 @@ def reconcile_quotes(
     yes_ask: Optional[int],
     skip_reason: Optional[str] = None,
 ) -> None:
-    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
+    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS, TIGHT_SPREAD_SINCE_TS
 
     now = time.time()
 
@@ -589,6 +594,7 @@ def reconcile_quotes(
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
     def unsafe_to_hold(side: str, cur: WorkingOrder) -> bool:
+        # If we have a book snapshot, avoid being taker / crossed
         if yes_bid is None or yes_ask is None:
             return False
         if side == "sell":
@@ -597,17 +603,35 @@ def reconcile_quotes(
             return int(cur.price_cents) >= int(yes_ask)
         return False
 
-    # BOTH missing: global HOLD/CANCEL logic
     both_missing = (target_bid is None) and (target_ask is None)
+
+    # BOTH missing: global HOLD/CANCEL logic, but with "tight spread patience"
     if both_missing:
-        # =========================================================
-        # CHANGE #3: immediate cancel on "spread_too_tight" skips
-        # =========================================================
-        if isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight"):
-            cancel("buy", f"tight_spread_exit({skip_reason})")
-            cancel("sell", f"tight_spread_exit({skip_reason})")
+        # If we're skipping because spread is tight, do NOT insta-cancel.
+        # Hold until EXIT_BAD_SECONDS has elapsed continuously in tight-spread state.
+        is_tight_spread_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight")
+
+        if is_tight_spread_skip:
+            if TIGHT_SPREAD_SINCE_TS is None:
+                TIGHT_SPREAD_SINCE_TS = now
+            tight_for = now - TIGHT_SPREAD_SINCE_TS
+
+            if HOLD_ON_SKIP and tight_for < EXIT_BAD_SECONDS:
+                if WORKING["buy"] or WORKING["sell"]:
+                    log.info(
+                        "[OM] %s HOLD (tight_spread) held_for=%.2fs<%.2fs DRY_RUN=%s",
+                        market_ticker, tight_for, EXIT_BAD_SECONDS, dry_run
+                    )
+                return
+
+            # After EXIT_BAD_SECONDS tight, we do allow canceling (risk control)
+            cancel("buy", f"tight_spread>{EXIT_BAD_SECONDS:.2f}s({skip_reason})")
+            cancel("sell", f"tight_spread>{EXIT_BAD_SECONDS:.2f}s({skip_reason})")
             NO_TARGET_SINCE_TS = None
             return
+
+        # Not a tight-spread skip: fall back to generic no-target hold/cancel
+        TIGHT_SPREAD_SINCE_TS = None
 
         if NO_TARGET_SINCE_TS is None:
             NO_TARGET_SINCE_TS = now
@@ -625,8 +649,10 @@ def reconcile_quotes(
         cancel("buy", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         cancel("sell", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         return
-    else:
-        NO_TARGET_SINCE_TS = None
+
+    # We have at least one target => reset "no-target" timers
+    NO_TARGET_SINCE_TS = None
+    TIGHT_SPREAD_SINCE_TS = None
 
     # per-side hold when a single side is missing
     if target_bid is not None:
@@ -678,16 +704,11 @@ def reconcile_quotes(
 
         off = price_off(cur.price_cents, int(target_price))
 
-        # Note: compute_target_yes_quotes() already blocks tight spreads, but keep this safe.
-        tight_mode = (
-            (yes_bid is not None and yes_ask is not None)
-            and ((yes_ask - yes_bid) < MIN_SPREAD_CENTS)
-        )
-
-        if tight_mode:
-            if off == 0:
-                keep(side, cur, "tight_mode exact_match")
-                return
+        # Safety guard: if current order is now unsafe vs book snapshot, cancel it.
+        if unsafe_to_hold(side, cur):
+            cancel(side, "unsafe_hold(cross_risk)")
+            place(side, int(target_price))
+            return
 
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
@@ -715,7 +736,7 @@ def main():
         POLL, DRY_RUN, ENABLE_TRADING,
     )
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
-    # IMPORTANT: keep this format string on ONE LINE to avoid Render copy/paste breaking it.
+    log.info("SAFETY_GATES: ENTER_OK_SECONDS=%.2f EXIT_BAD_SECONDS=%.2f", ENTER_OK_SECONDS, EXIT_BAD_SECONDS)
     log.info(
         "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
         ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS,
@@ -732,6 +753,9 @@ def main():
     last_tb: Optional[int] = None
     last_ta: Optional[int] = None
     last_why: Optional[str] = None
+
+    # Spread stability tracking
+    spread_ok_since: Optional[float] = None
 
     while True:
         try:
@@ -750,15 +774,18 @@ def main():
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
                 _LAST_KEEP_LOGGED["sell"] = None
-                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS
+                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, TIGHT_SPREAD_SINCE_TS
                 NO_TARGET_SINCE_TS = None
                 NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
+                TIGHT_SPREAD_SINCE_TS = None
 
                 _YES_ASK_CACHE["ask"] = None
                 _YES_ASK_CACHE["ts"] = 0.0
 
                 global _LAST_MARKET_FALLBACK_TS
                 _LAST_MARKET_FALLBACK_TS = 0.0
+
+                spread_ok_since = None
 
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
@@ -773,7 +800,24 @@ def main():
                 else:
                     log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
 
+            # Compute raw targets (spread gate lives here)
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
+
+            # Add ENTER_OK_SECONDS stability requirement (prevents place->cancel churn)
+            if tb is not None and ta is not None and yes_bid is not None and yes_ask is not None:
+                spread = int(yes_ask) - int(yes_bid)
+                if spread >= MIN_SPREAD_CENTS:
+                    if spread_ok_since is None:
+                        spread_ok_since = time.time()
+                    ok_for = time.time() - spread_ok_since
+                    if ok_for < ENTER_OK_SECONDS:
+                        tb, ta, why = (None, None, f"spread_ok_not_stable({spread}) {ok_for:.2f}s<{ENTER_OK_SECONDS:.2f}s")
+                else:
+                    spread_ok_since = None
+            else:
+                # If not currently eligible, reset stability timer unless we just lack data
+                if isinstance(why, str) and why.startswith("spread_too_tight"):
+                    spread_ok_since = None
 
             target_changed = (tb != last_tb) or (ta != last_ta) or (why != last_why) or market_changed
             if target_changed:
