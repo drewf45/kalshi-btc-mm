@@ -1,26 +1,46 @@
-# bot.py
-# Kalshi YES-only maker bot (roll + orderbook)
-# Fixes in this version:
-# - Removes non-existent /trade-api/v2/series/<series>/markets (404)
-# - Uses /trade-api/v2/markets with series param if supported; otherwise scans without status filter
-# - Local filtering for ticker prefix + "open-ish" statuses
-# - Cooldown after "no match" so you don't rescan 2500 markets every 2 seconds
-# - Default POLL_SECONDS=2, DRY_RUN=True
-
 import os
-import time
 import json
+import time
 import base64
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
-from urllib.parse import urlencode
 from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
+from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
+# -----------------------------
+# Env / Config
+# -----------------------------
+load_dotenv()
+
+API_BASE = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").rstrip("/")
+API_PREFIX = os.getenv("KALSHI_API_PREFIX", "/trade-api/v2")
+
+SERIES = os.getenv("SERIES", "KXBTC15M").strip()
+EVENT_TICKER = os.getenv("EVENT_TICKER", "").strip()  # <-- IMPORTANT: event, not market
+MARKET_TICKER_OVERRIDE = os.getenv("MARKET_TICKER", "").strip()  # optional hard pin
+
+POLL = float(os.getenv("POLL", "2.0"))
+ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "30.0"))
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y")
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "true").lower() in ("1", "true", "yes", "y")
+
+# backoff for 429s
+BACKOFF_START = float(os.getenv("BACKOFF_START", "1.0"))
+BACKOFF_MAX = float(os.getenv("BACKOFF_MAX", "16.0"))
+
+# quoting knobs (safe defaults; tune later)
+TICK_CENTS = int(os.getenv("TICK_CENTS", "1"))
+EDGE_CENTS = int(os.getenv("EDGE_CENTS", "1"))
+
+KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
+KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "").strip()
+
+if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_B64:
+    raise RuntimeError("Missing KALSHI_KEY_ID or KALSHI_PRIVATE_KEY_B64 env vars")
 
 # -----------------------------
 # Logging
@@ -29,421 +49,227 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-bot")
 
-
 # -----------------------------
-# Env helpers
+# Signing helpers
 # -----------------------------
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    return default if v is None else v.lower() in ("1", "true", "yes", "y", "on")
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
+def load_private_key() -> Any:
+    key_bytes = base64.b64decode(KALSHI_PRIVATE_KEY_B64)
+    return serialization.load_pem_private_key(key_bytes, password=None)
 
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    return default if not v else int(v)
+PRIVATE_KEY = load_private_key()
 
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    return default if not v else float(v)
-
-
-@dataclass
-class BotConfig:
-    api_base: str
-    api_key_id: str
-    private_key_b64: str
-    series_ticker: str
-
-    poll_seconds: float
-    enable_trading: bool
-    dry_run: bool
-
-    base_size: int
-    improve_ticks: int
-    post_only: bool
-    max_buy_price: int
-
-    roll_check_min_seconds: float
-    market_page_limit: int
-    market_scan_pages_max: int
-
-    http_backoff_max_seconds: float
-    http_429_max_retries: int
-
-    # NEW: prevent constant rescan when no match
-    roll_no_match_cooldown_seconds: float
-
-
-def load_config() -> BotConfig:
-    return BotConfig(
-        api_base=os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").rstrip("/"),
-        api_key_id=os.environ["KALSHI_API_KEY_ID"],
-        private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
-        series_ticker=os.environ["SERIES_TICKER"],
-
-        poll_seconds=env_float("POLL_SECONDS", 2.0),     # ✅ 2 seconds default
-        enable_trading=env_bool("ENABLE_TRADING", True),
-        dry_run=env_bool("DRY_RUN", True),               # ✅ dry run default
-
-        base_size=env_int("BASE_SIZE", 1),
-        improve_ticks=env_int("IMPROVE_TICKS", 1),
-        post_only=env_bool("POST_ONLY", True),
-        max_buy_price=env_int("MAX_BUY_PRICE_CENTS", 99),
-
-        roll_check_min_seconds=env_float("ROLL_CHECK_MIN_SECONDS", 60.0),
-        market_page_limit=env_int("MARKET_PAGE_LIMIT", 250),
-        market_scan_pages_max=env_int("MARKET_SCAN_PAGES_MAX", 10),
-
-        http_backoff_max_seconds=env_float("HTTP_BACKOFF_MAX_SECONDS", 16.0),
-        http_429_max_retries=env_int("HTTP_429_MAX_RETRIES", 5),
-
-        roll_no_match_cooldown_seconds=env_float("ROLL_NO_MATCH_COOLDOWN_SECONDS", 120.0),
-    )
-
-
-# -----------------------------
-# Auth / signing
-# -----------------------------
-def load_private_key(b64: str):
-    return serialization.load_pem_private_key(base64.b64decode(b64), password=None)
-
-
-def sign_request(priv, ts: str, method: str, path_qs: str) -> str:
-    path_without_query = path_qs.split("?", 1)[0]
-    msg = f"{ts}{method}{path_without_query}".encode("utf-8")
-    sig = priv.sign(
-        msg,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+def sign_message(message: str) -> str:
+    sig = PRIVATE_KEY.sign(
+        message.encode("utf-8"),
+        asy_padding.PKCS1v15(),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
 
-
-def make_headers(cfg, priv, method, path_qs):
-    ts = str(int(time.time() * 1000))
-    sig = sign_request(priv, ts, method, path_qs)
+def build_signature_headers(method: str, path_with_query: str, body: str) -> Dict[str, str]:
+    ts = str(now_ms())
+    payload = ts + method.upper() + path_with_query + body
     return {
-        "KALSHI-ACCESS-KEY": cfg.api_key_id,
+        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": sign_message(payload),
         "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig,
         "Content-Type": "application/json",
     }
 
-
 # -----------------------------
-# HTTP helpers (safe JSON)
+# HTTP helper (with 429 backoff)
 # -----------------------------
-def _safe_json(resp: requests.Response) -> Dict[str, Any]:
-    if not resp.content:
-        return {}
-    try:
-        return resp.json()
-    except Exception:
-        txt = resp.text[:250].replace("\n", "\\n")
-        return {"_non_json": True, "_status": resp.status_code, "_text_head": txt}
+def request_json(method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = API_BASE + API_PREFIX + path
+    params = params or {}
+    body_str = "" if json_body is None else json.dumps(json_body, separators=(",", ":"), sort_keys=True)
 
+    # Sign the exact path+query
+    if params:
+        req = requests.Request(method.upper(), url, params=params, data=body_str)
+        prepped = req.prepare()
+        signed_path = prepped.path_url
+    else:
+        signed_path = path
 
-def signed_get_with_429(cfg, priv, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    backoff = 1.0
-    for attempt in range(cfg.http_429_max_retries + 1):
-        qs = path if not params else f"{path}?{urlencode(params)}"
-        url = cfg.api_base + qs
-        h = make_headers(cfg, priv, "GET", qs)
-        r = requests.get(url, headers=h, timeout=20)
-        payload = _safe_json(r)
+    headers = build_signature_headers(method, signed_path, body_str)
 
-        if r.status_code == 200:
-            return payload
+    backoff = BACKOFF_START
+    while True:
+        resp = requests.request(method.upper(), url, params=params, data=body_str, headers=headers, timeout=20)
 
-        if r.status_code == 429 or (isinstance(payload.get("error"), dict) and payload["error"].get("code") == "too_many_requests"):
-            if attempt >= cfg.http_429_max_retries:
-                raise RuntimeError(f"HTTP 429 {qs}: giving up after {cfg.http_429_max_retries} retries")
-            log.warning(f"[HTTP429] {path} backing off {backoff:.1f}s (attempt {attempt+1}/{cfg.http_429_max_retries})")
+        if resp.status_code == 429:
+            log.warning("[429] %s backing off %.1fs", path, backoff)
             time.sleep(backoff)
-            backoff = min(cfg.http_backoff_max_seconds, backoff * 2.0)
+            backoff = min(BACKOFF_MAX, backoff * 2)
             continue
 
-        raise RuntimeError(f"HTTP {r.status_code} {qs}: {payload}")
-
-
-def signed_request_json(cfg, priv, method: str, path: str, params=None, body=None) -> Dict[str, Any]:
-    qs = path if not params else f"{path}?{urlencode(params)}"
-    url = cfg.api_base + qs
-    h = make_headers(cfg, priv, method, qs)
-    r = requests.request(method, url, headers=h, json=body, timeout=20)
-    payload = _safe_json(r)
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code} {qs}: {payload}")
-    return payload
-
-
-# -----------------------------
-# Market extraction helpers
-# -----------------------------
-def _extract_markets(payload: Dict[str, Any]) -> list:
-    mkts = payload.get("markets")
-    if isinstance(mkts, list):
-        return mkts
-    mkts = payload.get("data")
-    if isinstance(mkts, list):
-        return mkts
-    return []
-
-
-def _extract_cursor(payload: Dict[str, Any]) -> Optional[str]:
-    for k in ("cursor", "next_cursor", "nextCursor", "next_page_token", "nextPageToken"):
-        v = payload.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return None
-
-
-def _market_close_ts(m: Dict[str, Any]) -> float:
-    """
-    Returns a sortable close time as unix seconds.
-    Supports numeric timestamps or ISO strings.
-    """
-    for k in ("close_ts", "close_time", "expiration_ts", "expiration_time", "end_ts", "end_time"):
-        v = m.get(k)
-        if isinstance(v, (int, float)):
-            # could be ms; normalize
-            vv = float(v)
-            return vv / 1000.0 if vv > 10_000_000_000 else vv
-        if isinstance(v, str) and v:
+        if resp.status_code >= 400:
             try:
-                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
-                return dt.timestamp()
+                j = resp.json()
+                raise RuntimeError(f"HTTP {resp.status_code} {path}: {j}")
             except Exception:
-                pass
-    return float("inf")
+                text_head = (resp.text or "")[:200]
+                raise RuntimeError(f"HTTP {resp.status_code} {path}: {{'_non_json': True, '_text_head': {text_head!r}}}")
 
-
-def _is_openish_status(m: Dict[str, Any]) -> bool:
-    s = m.get("status")
-    if not isinstance(s, str):
-        return True  # if no status, don’t exclude
-    s = s.lower()
-    return s in ("open", "active", "trading", "live")
-
+        try:
+            return resp.json()
+        except Exception:
+            text_head = (resp.text or "")[:200]
+            raise RuntimeError(f"Bad JSON response for {path}: {text_head!r}")
 
 # -----------------------------
-# Rolling active market resolver
+# Rolling: EVENT -> MARKET
 # -----------------------------
-_last_roll_check_ts: float = 0.0
-_cached_active_market: Optional[str] = None
-_no_match_block_until: float = 0.0
+_last_roll_ts = 0.0
+_active_market_ticker: Optional[str] = None
 
+def pick_open_market(markets: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Choose an 'open' market if possible.
+    If multiple, prefer the one closing soonest (best for current window).
+    """
+    def parse_dt(s: Any) -> float:
+        if not isinstance(s, str):
+            return 0.0
+        try:
+            s2 = s.replace("Z", "+00:00")
+            return datetime.fromisoformat(s2).timestamp()
+        except Exception:
+            return 0.0
 
-def resolve_active_market(cfg: BotConfig, priv) -> str:
-    global _last_roll_check_ts, _cached_active_market, _no_match_block_until
+    open_markets = []
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        status = str(m.get("status", "")).lower()
+        if status in ("open", "active"):
+            open_markets.append(m)
+
+    if not open_markets:
+        # fallback: anything with a ticker
+        for m in markets:
+            t = m.get("ticker") or m.get("market_ticker")
+            if t:
+                return t
+        return None
+
+    # prefer closest close_time in the future
+    now = time.time()
+    def score(m: Dict[str, Any]) -> Tuple[int, float]:
+        # higher is better: open first, then minimal positive time-to-close
+        t = 0.0
+        for k in ("close_time", "end_time", "expiration_time", "settlement_time"):
+            if k in m:
+                t = max(t, parse_dt(m.get(k)))
+        # time_to_close: prefer smallest > now
+        if t <= 0:
+            return (1, -1e18)
+        dtc = t - now
+        # if already passed, deprioritize
+        if dtc < 0:
+            return (1, -1e12 + dtc)
+        return (1, -dtc)  # smaller dtc => bigger score
+
+    open_markets_sorted = sorted(open_markets, key=score, reverse=True)
+    return open_markets_sorted[0].get("ticker") or open_markets_sorted[0].get("market_ticker")
+
+def roll_active_market() -> str:
+    global _last_roll_ts, _active_market_ticker
+
+    if MARKET_TICKER_OVERRIDE:
+        if _active_market_ticker != MARKET_TICKER_OVERRIDE:
+            log.info("[ROLL] Using MARKET_TICKER override → %s", MARKET_TICKER_OVERRIDE)
+        _active_market_ticker = MARKET_TICKER_OVERRIDE
+        return _active_market_ticker
 
     now = time.time()
+    if _active_market_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
+        return _active_market_ticker
 
-    # ✅ if user accidentally passes a full market ticker, just use it
-    if "-" in cfg.series_ticker:
-        return cfg.series_ticker
+    if not EVENT_TICKER:
+        raise RuntimeError("EVENT_TICKER is empty. Set EVENT_TICKER=KXBTC15M-26JAN210730 (from your app link).")
 
-    prefix = cfg.series_ticker + "-"
+    # This is the key change: get markets for the EVENT, not scanning everything.
+    # If this 404s, we’ll adjust the path based on the returned schema.
+    data = request_json("GET", f"/events/{EVENT_TICKER}/markets", params={"limit": 200})
+    markets = data.get("markets") or data.get("data") or data.get("results") or []
+    if not isinstance(markets, list) or not markets:
+        raise RuntimeError(f"No markets returned for event {EVENT_TICKER}. Response keys={list(data.keys())}")
 
-    # Cooldown after no-match so we don’t rescan endlessly
-    if now < _no_match_block_until:
-        raise RuntimeError(f"No-match cooldown active for {int(_no_match_block_until - now)}s")
+    picked = pick_open_market(markets)
+    if not picked:
+        raise RuntimeError(f"Could not pick a market for event {EVENT_TICKER} (markets={len(markets)})")
 
-    # Cache good result
-    if _cached_active_market is not None and (now - _last_roll_check_ts) < cfg.roll_check_min_seconds:
-        return _cached_active_market
-    _last_roll_check_ts = now
-
-    matched_all: List[Dict[str, Any]] = []
-    sample_tickers: List[str] = []
-
-    # 1) First try using series filter (if API supports it). DO NOT filter by status here.
-    # If the API ignores it, we’ll see no matches and fall through to scanning.
-    try:
-        data = signed_get_with_429(cfg, priv, "/trade-api/v2/markets", {
-            "series": cfg.series_ticker,
-            "limit": cfg.market_page_limit,
-        })
-        mkts = _extract_markets(data)
-        for m in mkts[:12]:
-            t = m.get("ticker")
-            if isinstance(t, str):
-                sample_tickers.append(t)
-        matched = [m for m in mkts if isinstance(m.get("ticker"), str) and m["ticker"].startswith(prefix)]
-        log.info(f"[ROLLDBG] (series_param) got={len(mkts)} matched={len(matched)} prefix={prefix} sample={sample_tickers[:6]}")
-        if matched:
-            # prefer open-ish + soonest close
-            matched = [m for m in matched if _is_openish_status(m)]
-            matched.sort(key=_market_close_ts)
-            _cached_active_market = matched[0]["ticker"]
-            return _cached_active_market
-    except Exception as e:
-        log.warning(f"[ROLLDBG] (series_param) failed: {e}")
-
-    # 2) Full scan: /markets?limit&cursor (no status filter), then filter locally
-    cursor: Optional[str] = None
-    scanned_total = 0
-
-    for _page in range(cfg.market_scan_pages_max):
-        params = {"limit": cfg.market_page_limit}
-        if cursor:
-            params["cursor"] = cursor
-
-        data = signed_get_with_429(cfg, priv, "/trade-api/v2/markets", params)
-        mkts = _extract_markets(data)
-        cursor = _extract_cursor(data)
-
-        if not mkts:
-            break
-
-        scanned_total += len(mkts)
-
-        # keep some samples for debugging
-        for m in mkts[:6]:
-            t = m.get("ticker")
-            if isinstance(t, str) and len(sample_tickers) < 18:
-                sample_tickers.append(t)
-
-        for m in mkts:
-            t = m.get("ticker")
-            if isinstance(t, str) and t.startswith(prefix) and _is_openish_status(m):
-                matched_all.append(m)
-
-        if matched_all:
-            matched_all.sort(key=_market_close_ts)
-            _cached_active_market = matched_all[0]["ticker"]
-            log.info(f"[ROLLDBG] (scan) scanned_total={scanned_total} matched={len(matched_all)} pick={_cached_active_market}")
-            return _cached_active_market
-
-        if not cursor:
-            break
-
-    # No match → cooldown to prevent constant rescan spam
-    log.info(f"[ROLLDBG] (scan_fail) scanned_total={scanned_total} matched=0 prefix={prefix} sample={sample_tickers}")
-    _no_match_block_until = time.time() + cfg.roll_no_match_cooldown_seconds
-    raise RuntimeError(f"No open-ish markets matched prefix {prefix} (scanned {scanned_total})")
-
+    _active_market_ticker = picked
+    _last_roll_ts = time.time()
+    log.info("[ROLL] Event=%s → Active market → %s", EVENT_TICKER, _active_market_ticker)
+    return _active_market_ticker
 
 # -----------------------------
-# Orderbook parsing (YES-only)
-# orderbook: { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...] }
-# YES best bid = max(yes prices)
-# YES best ask = 100 - (NO best bid)
+# Orderbook parsing (binary)
 # -----------------------------
-def _best_bid_from_levels(levels: Any) -> Optional[int]:
-    if not levels or not isinstance(levels, list):
+def best_bid_from_side(side: Any) -> Optional[int]:
+    if not isinstance(side, list) or not side:
         return None
-    best: Optional[int] = None
-    for row in levels:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        try:
-            p = int(row[0])
-        except Exception:
-            continue
-        best = p if best is None else max(best, p)
+    best = None
+    for lvl in side:
+        if isinstance(lvl, list) and len(lvl) >= 1:
+            try:
+                p = int(lvl[0])
+                best = p if best is None else max(best, p)
+            except Exception:
+                continue
     return best
 
+def get_yes_bid_ask(orderbook_payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    ob = orderbook_payload.get("orderbook") if isinstance(orderbook_payload, dict) else None
+    if not isinstance(ob, dict):
+        return (None, None)
 
-def parse_yes_book(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    root = ob.get("orderbook") if isinstance(ob, dict) else None
-    if not isinstance(root, dict):
-        return None, None
-    yes_levels = root.get("yes")
-    no_levels = root.get("no")
-    yes_bid = _best_bid_from_levels(yes_levels)
-    no_bid = _best_bid_from_levels(no_levels)
-    yes_ask: Optional[int] = None
+    yes = ob.get("yes")
+    no = ob.get("no")
+
+    yes_bid = best_bid_from_side(yes)
+    no_bid = best_bid_from_side(no)
+
+    yes_ask = None
     if no_bid is not None:
         yes_ask = 100 - no_bid
-        yes_ask = max(1, min(99, yes_ask))
-    return yes_bid, yes_ask
 
+    return (yes_bid, yes_ask)
 
-def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: int) -> Optional[int]:
-    if bid is None and ask is None:
-        return None
-    if bid is None:
-        px = (ask - 1) if ask is not None else 1
-        return max(1, min(px, max_px))
-    px = bid + improve
-    if ask is not None:
-        px = min(px, ask - 1)
-    px = max(1, min(px, max_px))
-    return px
-
-
-def signed_get_orderbook_with_429(cfg, priv, market_ticker: str) -> Dict[str, Any]:
-    backoff = 1.0
-    path = f"/trade-api/v2/markets/{market_ticker}/orderbook"
-    for attempt in range(cfg.http_429_max_retries + 1):
-        try:
-            return signed_request_json(cfg, priv, "GET", path)
-        except Exception as e:
-            if "HTTP 429" in str(e):
-                if attempt >= cfg.http_429_max_retries:
-                    raise
-                log.warning(f"[OB429] backing off {backoff:.1f}s (attempt {attempt+1}/{cfg.http_429_max_retries})")
-                time.sleep(backoff)
-                backoff = min(cfg.http_backoff_max_seconds, backoff * 2.0)
-                continue
-            raise
-
-
-def place_yes_buy(cfg, priv, market_ticker: str, price_cents: int, qty: int) -> Dict[str, Any]:
-    body = {
-        "ticker": market_ticker,
-        "action": "buy",
-        "side": "yes",
-        "type": "limit",
-        "price": price_cents,
-        "count": qty,
-    }
-    return signed_request_json(cfg, priv, "POST", "/trade-api/v2/portfolio/orders", body=body)
-
+def fetch_orderbook(market_ticker: str) -> Dict[str, Any]:
+    return request_json("GET", f"/markets/{market_ticker}/orderbook")
 
 # -----------------------------
 # Main loop
 # -----------------------------
 def main():
-    cfg = load_config()
-    priv = load_private_key(cfg.private_key_b64)
-
-    log.info(
-        f"SERIES={cfg.series_ticker} POLL={cfg.poll_seconds:.1f}s "
-        f"ROLL_CHECK_MIN_SECONDS={cfg.roll_check_min_seconds:.1f}s "
-        f"DRY_RUN={cfg.dry_run} ENABLE_TRADING={cfg.enable_trading}"
-    )
-
-    active: Optional[str] = None
+    log.info("SERIES=%s EVENT_TICKER=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s",
+             SERIES, EVENT_TICKER or "<unset>", POLL, DRY_RUN, ENABLE_TRADING)
 
     while True:
         try:
-            ticker = resolve_active_market(cfg, priv)
-            if ticker != active:
-                active = ticker
-                log.info(f"[ROLL] Active market → {active}")
+            mkt = roll_active_market()
+            ob = fetch_orderbook(mkt)
+            yes_bid, yes_ask = get_yes_bid_ask(ob)
 
-            ob = signed_get_orderbook_with_429(cfg, priv, active)
-            bid, ask = parse_yes_book(ob)
-            price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price)
-
-            if price is None:
-                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP (empty)")
+            if yes_bid is None and yes_ask is None:
+                log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
             else:
-                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
-                if (not cfg.enable_trading) or cfg.dry_run:
-                    log.info("[DRYRUN] Not placing order")
-                else:
-                    resp = place_yes_buy(cfg, priv, active, price, cfg.base_size)
-                    log.info(f"[ORDER] placed YES buy {cfg.base_size}@{price}c resp={resp}")
+                log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
+
+                # later: compute our quotes & place/cancel orders
+                # For now, DRY_RUN just prints.
 
         except Exception as e:
-            log.error(f"[LOOPERR] {e}")
+            log.error("[LOOPERR] %s", e)
 
-        time.sleep(cfg.poll_seconds)
-
+        time.sleep(POLL)
 
 if __name__ == "__main__":
     main()
