@@ -5,7 +5,7 @@ import base64
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List  # ✅ only change previously: include Optional
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from dotenv import load_dotenv
@@ -82,7 +82,7 @@ MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
 # Only reprice if we are "meaningfully" off target
 REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 
-# NEW: Anti-churn / volatility controls
+# Anti-churn / volatility controls
 MAX_CHASE_CENTS = int(getenv_first(["MAX_CHASE_CENTS"], "4"))
 UNSAFE_GRACE_SECONDS = float(getenv_first(["UNSAFE_GRACE_SECONDS"], "0.6"))
 
@@ -134,7 +134,10 @@ if not KALSHI_PRIVATE_KEY_RAW:
     ).strip()
 
 _detected_kalshi_keys = env_keys_with_prefix("KALSHI_")
-log.info("[ENV] Detected KALSHI_* keys: %s", _detected_kalshi_keys if _detected_kalshi_keys else "<none>")
+log.info(
+    "[ENV] Detected KALSHI_* keys: %s",
+    _detected_kalshi_keys if _detected_kalshi_keys else "<none>",
+)
 
 if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
     raise RuntimeError(
@@ -170,15 +173,10 @@ def load_private_key_from_env(raw: str) -> Any:
 PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
-# ✅ ONLY CHANGE IN THIS FULL COPY:
-#   PKCS1v15()  --->  PSS(MGF1(SHA256), MAX_LENGTH)
 def sign_message(message: str) -> str:
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
-        asy_padding.PSS(
-            mgf=asy_padding.MGF1(hashes.SHA256()),
-            salt_length=asy_padding.PSS.MAX_LENGTH,
-        ),
+        asy_padding.PKCS1v15(),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
@@ -206,7 +204,6 @@ def request_json(
     url = API_BASE + API_PREFIX + path
     params = params or {}
 
-    # Build exact bytes we will send (and sign exactly those bytes)
     if json_body is None:
         body_bytes = b""
     else:
@@ -217,7 +214,6 @@ def request_json(
     session = requests.Session()
 
     while True:
-        # IMPORTANT: re-prepare + re-sign every attempt (timestamp changes; avoids stale signatures)
         req = requests.Request(
             method.upper(),
             url,
@@ -229,11 +225,7 @@ def request_json(
         signed_path = prepped.path_url
         body_for_sig = "" if not body_bytes else body_bytes.decode("utf-8")
 
-        headers = build_signature_headers(
-            method,
-            signed_path,
-            body_for_sig,
-        )
+        headers = build_signature_headers(method, signed_path, body_for_sig)
         prepped.headers.update(headers)
 
         resp = session.send(prepped, timeout=20)
@@ -261,33 +253,25 @@ def request_json(
         try:
             return resp.json()
         except Exception:
-            raise RuntimeError(
-                f"Bad JSON response for {path}: {(resp.text or '')[:200]!r}"
-            )
+            raise RuntimeError(f"Bad JSON response for {path}: {(resp.text or '')[:200]!r}")
 
 # -----------------------------
-# LIVE ORDER ROUTES (the missing piece)
+# LIVE ORDER ROUTES
 # -----------------------------
 def place_order_live(market_ticker: str, action: str, yes_price_cents: int, count: int) -> str:
-    """
-    Posts a limit order to Kalshi.
-    Returns order_id.
-    NOTE: We quote YES only, so side is always YES.
-    """
     body: Dict[str, Any] = {
         "ticker": market_ticker,
         "action": action,          # "buy" or "sell"
         "type": "limit",
-        "side": "yes",             # YES contract
+        "side": "yes",
         "count": int(count),
-        "yes_price": int(yes_price_cents),  # cents
+        "yes_price": int(yes_price_cents),
     }
     if POST_ONLY:
         body["post_only"] = True
 
     resp = request_json("POST", "/portfolio/orders", json_body=body)
 
-    # tolerate multiple response shapes
     order = resp.get("order") if isinstance(resp, dict) else None
     if isinstance(order, dict):
         oid = order.get("order_id") or order.get("id")
@@ -302,9 +286,6 @@ def place_order_live(market_ticker: str, action: str, yes_price_cents: int, coun
 
 
 def cancel_order_live(order_id: str) -> None:
-    """
-    Cancels an existing order.
-    """
     request_json("DELETE", f"/portfolio/orders/{order_id}")
 
 # -----------------------------
@@ -378,7 +359,7 @@ def resolve_event_and_market_via_markets(series_ticker: str) -> Tuple[Optional[s
             evt_ticker = best.get("event_ticker") or best.get("event") or best.get("eventTicker")
 
             if mkt_ticker and evt_ticker:
-                return (evt_ticker, mkt_ticker)
+                return (str(evt_ticker), str(mkt_ticker))
         except Exception as e:
             last_err = e
             continue
@@ -410,7 +391,12 @@ def roll_active_market() -> str:
     _last_roll_ts = time.time()
 
     if changed:
-        log.info("[ROLL] Series=%s → Active event=%s market=%s (via /markets)", SERIES, _active_event_ticker, _active_market_ticker)
+        log.info(
+            "[ROLL] Series=%s → Active event=%s market=%s (via /markets)",
+            SERIES,
+            _active_event_ticker,
+            _active_market_ticker,
+        )
 
     return _active_market_ticker
 
@@ -541,7 +527,12 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
             _cache_yes_ask(int(fb_ask))
             if yes_bid is None and fb_bid is not None:
                 yes_bid = int(fb_bid)
-            log.info("[FALLBACK] %s /markets top-of-book: yes_bid=%s yes_ask=%s", market_ticker, fb_bid, fb_ask)
+            log.info(
+                "[FALLBACK] %s /markets top-of-book: yes_bid=%s yes_ask=%s",
+                market_ticker,
+                fb_bid,
+                fb_ask,
+            )
             return (yes_bid, int(fb_ask))
         else:
             log.info("[FALLBACK] %s /markets returned no usable yes_ask fields", market_ticker)
@@ -561,7 +552,10 @@ def clamp_price(p: int) -> int:
     return max(1, min(99, p))
 
 
-def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) -> Tuple[Optional[int], Optional[int], str]:
+def compute_target_yes_quotes(
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+) -> Tuple[Optional[int], Optional[int], str]:
     if yes_bid is None or yes_ask is None:
         return (None, None, "missing_bid_or_ask")
 
@@ -587,7 +581,7 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     return (bid, ask, f"ok(spread={spread})")
 
 # -----------------------------
-# Order management (now LIVE when DRY_RUN=False)
+# Order management
 # -----------------------------
 @dataclass
 class WorkingOrder:
@@ -639,8 +633,9 @@ def reconcile_quotes(
         if cur is None:
             return
 
-        log.info(f"[OM] {market_ticker} {side_key.upper campsite?}")
-        log.info(f"[OM] {market_ticker} {side_key.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
+        log.info(
+            f"[OM] {market_ticker} {side_key.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}"
+        )
 
         if (not dry_run) and ENABLE_TRADING and cur.order_id:
             cancel_order_live(cur.order_id)
@@ -655,7 +650,7 @@ def reconcile_quotes(
         if (not dry_run) and ENABLE_TRADING:
             order_id = place_order_live(
                 market_ticker=market_ticker,
-                action=side_key,
+                action=side_key,  # "buy" or "sell"
                 yes_price_cents=int(price),
                 count=int(qty),
             )
@@ -715,7 +710,10 @@ def reconcile_quotes(
                 if WORKING["buy"] or WORKING["sell"]:
                     log.info(
                         "[OM] %s HOLD (tight_spread) held_for=%.2fs<%.2fs DRY_RUN=%s",
-                        market_ticker, tight_for, EXIT_BAD_SECONDS, dry_run
+                        market_ticker,
+                        tight_for,
+                        EXIT_BAD_SECONDS,
+                        dry_run,
                     )
                 return
 
@@ -734,7 +732,10 @@ def reconcile_quotes(
                 if WORKING["buy"] or WORKING["sell"]:
                     log.info(
                         "[OM] %s HOLD (not_stable) held_for=%.2fs<%.2fs DRY_RUN=%s",
-                        market_ticker, ns_for, NOT_STABLE_EXIT_SECONDS, dry_run
+                        market_ticker,
+                        ns_for,
+                        NOT_STABLE_EXIT_SECONDS,
+                        dry_run,
                     )
                 return
 
@@ -755,7 +756,10 @@ def reconcile_quotes(
             if WORKING["buy"] or WORKING["sell"]:
                 log.info(
                     "[OM] %s HOLD (no_target) held_for=%.2fs<%.2fs DRY_RUN=%s",
-                    market_ticker, held_for, CANCEL_IF_NO_TARGET_SECONDS, dry_run
+                    market_ticker,
+                    held_for,
+                    CANCEL_IF_NO_TARGET_SECONDS,
+                    dry_run,
                 )
             return
 
@@ -792,7 +796,12 @@ def reconcile_quotes(
             if (now - _LAST_SIDE_HOLD_LOG_TS.get(side_key, 0.0)) >= 5.0:
                 log.info(
                     "[OM] %s %s HOLD_SIDE held_for=%.2fs<%.2fs price=@%d DRY_RUN=%s",
-                    market_ticker, side_key.upper(), held_for, SIDE_HOLD_SECONDS, cur.price_cents, dry_run
+                    market_ticker,
+                    side_key.upper(),
+                    held_for,
+                    SIDE_HOLD_SECONDS,
+                    cur.price_cents,
+                    dry_run,
                 )
                 _LAST_SIDE_HOLD_LOG_TS[side_key] = now
             return
@@ -849,9 +858,15 @@ def reconcile_quotes(
 def main():
     log.info(
         "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
-        API_BASE, API_PREFIX, SERIES,
-        EVENT_TICKER or "<auto>", MARKET_TICKER_OVERRIDE or "<none>",
-        POLL, DRY_RUN, ENABLE_TRADING, POST_ONLY,
+        API_BASE,
+        API_PREFIX,
+        SERIES,
+        EVENT_TICKER or "<auto>",
+        MARKET_TICKER_OVERRIDE or "<none>",
+        POLL,
+        DRY_RUN,
+        ENABLE_TRADING,
+        POST_ONLY,
     )
 
     last_market: Optional[str] = None
