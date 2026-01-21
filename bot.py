@@ -69,11 +69,8 @@ EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "3"))
 
 # --- Safety / Patience gates ---
-# Spread must be >= MIN_SPREAD_CENTS continuously for this long before we place quotes
 ENTER_OK_SECONDS = float(getenv_first(["ENTER_OK_SECONDS"], "3.0"))
-# Once we are quoting, spread must be "tight" continuously for this long before we cancel due to tight spread
 EXIT_BAD_SECONDS = float(getenv_first(["EXIT_BAD_SECONDS"], "6.0"))
-# NEW: if spread is OK but NOT stable yet, do not leave orders hanging very long
 NOT_STABLE_EXIT_SECONDS = float(getenv_first(["NOT_STABLE_EXIT_SECONDS"], "1.5"))
 
 # Order params
@@ -84,6 +81,10 @@ MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
 
 # Only reprice if we are "meaningfully" off target
 REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
+
+# NEW: Anti-churn / volatility controls
+MAX_CHASE_CENTS = int(getenv_first(["MAX_CHASE_CENTS"], "4"))
+UNSAFE_GRACE_SECONDS = float(getenv_first(["UNSAFE_GRACE_SECONDS"], "0.6"))
 
 # When BOTH targets are None, hold existing orders instead of canceling immediately
 HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
@@ -125,7 +126,6 @@ KALSHI_PRIVATE_KEY_RAW = getenv_first(
 ).strip()
 
 if not KALSHI_PRIVATE_KEY_RAW:
-    # Render env key in your logs: KALSHI_PRIVATE_KEY_PEM_BASE64
     KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(
         ["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]
     ).strip()
@@ -368,7 +368,6 @@ def best_bid_from_side(side: Any) -> Optional[int]:
     return best
 
 
-# Micro #1: cache inferred YES ask for short TTL
 _YES_ASK_CACHE: Dict[str, Any] = {"ask": None, "ts": 0.0}
 
 
@@ -389,7 +388,6 @@ def _get_cached_yes_ask() -> Optional[int]:
     return None
 
 
-# Micro #2: /markets/{ticker} fallback (throttled)
 _LAST_MARKET_FALLBACK_TS: float = 0.0
 
 
@@ -398,12 +396,6 @@ def fetch_market(market_ticker: str) -> Dict[str, Any]:
 
 
 def _to_cents(x: Any) -> Optional[int]:
-    """
-    Accepts:
-      - dollars like 0.91, "0.91", 0.91 -> 91
-      - cents like 91, "91" -> 91
-    Returns int cents (1..99) or None
-    """
     if x is None:
         return None
     try:
@@ -464,7 +456,7 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
-    # Kalshi binary: YES ask can be inferred from NO bid: yes_ask = 100 - no_best_bid
+    # Kalshi binary: YES ask inferred from NO bid: yes_ask = 100 - no_best_bid
     if no_bid is not None:
         yes_ask = 100 - int(no_bid)
         _cache_yes_ask(yes_ask)
@@ -516,11 +508,9 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
 
     spread = yes_ask - yes_bid
 
-    # Hard gate — do NOT quote unless spread >= MIN_SPREAD_CENTS
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
 
-    # Normal two-sided quoting: step inside by 1 tick (or configured tick)
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
@@ -540,7 +530,7 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
 # -----------------------------
 @dataclass
 class WorkingOrder:
-    side: str            # "buy" or "sell"
+    side: str
     price_cents: int
     qty: int
     created_ts: float
@@ -553,10 +543,11 @@ NO_TARGET_SINCE_TS: Optional[float] = None
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
-# Tight spread timer (EXIT_BAD_SECONDS)
 TIGHT_SPREAD_SINCE_TS: Optional[float] = None
-# Not-stable timer (NOT_STABLE_EXIT_SECONDS)
 NOT_STABLE_SINCE_TS: Optional[float] = None
+
+# NEW: unsafe timers (per-side) to reduce whipsaw
+UNSAFE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
 
 def reconcile_quotes(
@@ -569,7 +560,8 @@ def reconcile_quotes(
     yes_ask: Optional[int],
     skip_reason: Optional[str] = None,
 ) -> None:
-    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS, TIGHT_SPREAD_SINCE_TS, NOT_STABLE_SINCE_TS
+    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
+    global TIGHT_SPREAD_SINCE_TS, NOT_STABLE_SINCE_TS, UNSAFE_SINCE_TS
 
     now = time.time()
 
@@ -599,26 +591,37 @@ def reconcile_quotes(
             log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
-    def unsafe_to_hold(side: str, cur: WorkingOrder) -> bool:
-        # If we have a book snapshot, avoid being taker / crossed
+    # Unsafe detection + grace
+    def is_unsafe(side: str, price_cents: int) -> bool:
         if yes_bid is None or yes_ask is None:
             return False
         if side == "sell":
-            return int(cur.price_cents) <= int(yes_bid)
+            return int(price_cents) <= int(yes_bid)
         if side == "buy":
-            return int(cur.price_cents) >= int(yes_ask)
+            return int(price_cents) >= int(yes_ask)
         return False
+
+    def unsafe_to_hold_with_grace(side: str, cur: WorkingOrder) -> bool:
+        if not is_unsafe(side, cur.price_cents):
+            UNSAFE_SINCE_TS[side] = None
+            return False
+
+        if UNSAFE_SINCE_TS[side] is None:
+            UNSAFE_SINCE_TS[side] = now
+            return False
+
+        unsafe_for = now - float(UNSAFE_SINCE_TS[side] or now)
+        return unsafe_for >= max(0.0, UNSAFE_GRACE_SECONDS)
 
     both_missing = (target_bid is None) and (target_ask is None)
 
-    # BOTH missing: global HOLD/CANCEL logic, with special handling for "tight spread" and "not stable"
+    # BOTH missing: global HOLD/CANCEL logic
     if both_missing:
         is_tight_spread_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight")
         is_not_stable_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_ok_not_stable")
 
-        # 1) Tight spread: patience window EXIT_BAD_SECONDS
         if is_tight_spread_skip:
-            NOT_STABLE_SINCE_TS = None  # reset other timer
+            NOT_STABLE_SINCE_TS = None
             if TIGHT_SPREAD_SINCE_TS is None:
                 TIGHT_SPREAD_SINCE_TS = now
             tight_for = now - TIGHT_SPREAD_SINCE_TS
@@ -636,9 +639,8 @@ def reconcile_quotes(
             NO_TARGET_SINCE_TS = None
             return
 
-        # 2) Spread OK but NOT stable yet: short patience window NOT_STABLE_EXIT_SECONDS
         if is_not_stable_skip:
-            TIGHT_SPREAD_SINCE_TS = None  # reset other timer
+            TIGHT_SPREAD_SINCE_TS = None
             if NOT_STABLE_SINCE_TS is None:
                 NOT_STABLE_SINCE_TS = now
             ns_for = now - NOT_STABLE_SINCE_TS
@@ -656,7 +658,6 @@ def reconcile_quotes(
             NO_TARGET_SINCE_TS = None
             return
 
-        # 3) Generic no-target (missing book etc.)
         TIGHT_SPREAD_SINCE_TS = None
         NOT_STABLE_SINCE_TS = None
 
@@ -677,7 +678,7 @@ def reconcile_quotes(
         cancel("sell", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         return
 
-    # We have at least one target => reset "no-target" timers
+    # We have at least one target => reset timers
     NO_TARGET_SINCE_TS = None
     TIGHT_SPREAD_SINCE_TS = None
     NOT_STABLE_SINCE_TS = None
@@ -693,9 +694,10 @@ def reconcile_quotes(
         if cur is None:
             return
 
-        if unsafe_to_hold(side, cur):
-            cancel(side, "unsafe_hold(cross_risk)")
+        if unsafe_to_hold_with_grace(side, cur):
+            cancel(side, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
             NO_TARGET_SIDE_SINCE_TS[side] = None
+            UNSAFE_SINCE_TS[side] = None
             return
 
         if NO_TARGET_SIDE_SINCE_TS[side] is None:
@@ -720,7 +722,7 @@ def reconcile_quotes(
     if target_ask is None:
         handle_missing_side("sell")
 
-    # maintain logic for sides that have targets
+    # NEW: safer long-term maintain logic (grace + max chase + cooldown override)
     def maintain(side: str, target_price: Optional[int]) -> None:
         if target_price is None:
             return
@@ -732,21 +734,33 @@ def reconcile_quotes(
 
         off = price_off(cur.price_cents, int(target_price))
 
-        # Safety guard: if current order is now unsafe vs book snapshot, cancel it.
-        if unsafe_to_hold(side, cur):
-            cancel(side, "unsafe_hold(cross_risk)")
+        # A) Unsafe? cancel only after grace
+        if unsafe_to_hold_with_grace(side, cur):
+            cancel(side, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
+            UNSAFE_SINCE_TS[side] = None
+            # if market jumped, don't immediately re-place (stand down)
+            if off >= MAX_CHASE_CENTS:
+                return
             place(side, int(target_price))
             return
 
+        # B) Too far away? don't chase
+        if off >= MAX_CHASE_CENTS:
+            cancel(side, f"too_far_to_chase(off_by={off}>=MAX_CHASE_CENTS={MAX_CHASE_CENTS})")
+            return
+
+        # C) close enough? keep
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
 
+        # D) cooldown: don't keep stale if we're meaningfully off
         if not can_requote(cur):
             age = now - cur.created_ts
-            keep(side, cur, f"cooldown age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off}")
+            cancel(side, f"cooldown_but_stale(off_by={off} age={age:.2f}s)")
             return
 
+        # E) normal reprice
         cancel(side, f"reprice(off_by={off})")
         place(side, int(target_price))
 
@@ -775,6 +789,10 @@ def main():
         "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
         ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS,
     )
+    log.info(
+        "ANTI_CHURN: MAX_CHASE_CENTS=%d UNSAFE_GRACE_SECONDS=%.2f",
+        MAX_CHASE_CENTS, UNSAFE_GRACE_SECONDS
+    )
     log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
     log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
     log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
@@ -788,7 +806,6 @@ def main():
     last_ta: Optional[int] = None
     last_why: Optional[str] = None
 
-    # Spread stability tracking
     spread_ok_since: Optional[float] = None
 
     while True:
@@ -810,10 +827,12 @@ def main():
                 _LAST_KEEP_LOGGED["sell"] = None
 
                 global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, TIGHT_SPREAD_SINCE_TS, NOT_STABLE_SINCE_TS
+                global UNSAFE_SINCE_TS
                 NO_TARGET_SINCE_TS = None
                 NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
                 TIGHT_SPREAD_SINCE_TS = None
                 NOT_STABLE_SINCE_TS = None
+                UNSAFE_SINCE_TS = {"buy": None, "sell": None}
 
                 _YES_ASK_CACHE["ask"] = None
                 _YES_ASK_CACHE["ts"] = 0.0
@@ -836,10 +855,9 @@ def main():
                 else:
                     log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
 
-            # Compute raw targets (spread gate lives here)
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
 
-            # Add ENTER_OK_SECONDS stability requirement
+            # Spread stability requirement
             if tb is not None and ta is not None and yes_bid is not None and yes_ask is not None:
                 spread = int(yes_ask) - int(yes_bid)
                 if spread >= MIN_SPREAD_CENTS:
