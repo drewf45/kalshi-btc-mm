@@ -124,35 +124,23 @@ def public_get(cfg, path, params=None):
 
 
 # -----------------------------
-# ✅ MICRO CHANGE: sticky + throttled roll resolver
-# - Stay on current active market as long as it's still open
-# - Only roll when active disappears from open list
+# Sticky + throttled roll resolver (with 429 backoff)
 # -----------------------------
 _last_roll_check_ts: float = 0.0
 _cached_active_market: Optional[str] = None
-ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "10"))
+
+# ✅ micro change: increase default roll check and add exponential backoff on 429
+ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "60"))
+_roll_backoff_seconds: float = 0.0  # grows on 429, decays on success
+ROLL_BACKOFF_MAX_SECONDS = float(os.getenv("ROLL_BACKOFF_MAX_SECONDS", "600"))
 
 
 def _extract_markets_list(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return data.get("markets") or data.get("data") or []
 
 
-def _market_is_open(m: Dict[str, Any]) -> bool:
-    # tolerate different key names
-    status = (m.get("status") or "").lower()
-    if status:
-        return status == "open"
-    # if no status provided, assume caller filtered to open
-    return True
-
-
 def _pick_deterministic_market(markets: List[Dict[str, Any]]) -> str:
-    """
-    Deterministic pick to avoid reshuffle:
-    - Prefer earliest close time if present; else alphabetical ticker.
-    """
     def close_key(m: Dict[str, Any]) -> str:
-        # common variants
         return (
             m.get("close_time")
             or m.get("close_ts")
@@ -161,7 +149,6 @@ def _pick_deterministic_market(markets: List[Dict[str, Any]]) -> str:
             or ""
         )
 
-    # If close times exist, sort by them then ticker
     have_close = any(close_key(m) for m in markets)
     if have_close:
         markets = sorted(markets, key=lambda m: (close_key(m), m.get("ticker", "")))
@@ -172,37 +159,60 @@ def _pick_deterministic_market(markets: List[Dict[str, Any]]) -> str:
 
 
 def resolve_active_market(cfg) -> str:
-    global _last_roll_check_ts, _cached_active_market
+    global _last_roll_check_ts, _cached_active_market, _roll_backoff_seconds
 
     now = time.time()
 
-    # Throttle the series->market lookup to avoid 429
-    if _cached_active_market is not None and (now - _last_roll_check_ts) < ROLL_CHECK_MIN_SECONDS:
+    # Throttle series lookup (+ backoff)
+    min_wait = ROLL_CHECK_MIN_SECONDS + _roll_backoff_seconds
+    if _cached_active_market is not None and (now - _last_roll_check_ts) < min_wait:
         return _cached_active_market
 
     _last_roll_check_ts = now
 
-    data = public_get(
-        cfg,
-        "/trade-api/v2/markets",
-        params={"series": cfg.series_ticker, "status": "open"},
-    )
-    markets = _extract_markets_list(data)
+    try:
+        data = public_get(
+            cfg,
+            "/trade-api/v2/markets",
+            params={"series": cfg.series_ticker, "status": "open"},
+        )
+        markets = _extract_markets_list(data)
+  # type: ignore
 
-    if not markets:
+        if not markets:
+            if _cached_active_market is not None:
+                return _cached_active_market
+            raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
+
+        # If current active is still open, keep it
+        if _cached_active_market is not None:
+            open_tickers = {m.get("ticker") for m in markets if m.get("ticker")}
+            if _cached_active_market in open_tickers:
+                # ✅ success → decay backoff
+                _roll_backoff_seconds = max(0.0, _roll_backoff_seconds * 0.5)
+                return _cached_active_market
+
+        _cached_active_market = _pick_deterministic_market(markets)
+
+        # ✅ success → decay backoff
+        _roll_backoff_seconds = max(0.0, _roll_backoff_seconds * 0.5)
+        return _cached_active_market
+
+    except Exception as e:
+        msg = str(e)
+        if "too_many_requests" in msg or "HTTP 429" in msg:
+            # ✅ micro change: grow backoff, keep current active
+            _roll_backoff_seconds = min(
+                ROLL_BACKOFF_MAX_SECONDS,
+                5.0 if _roll_backoff_seconds <= 0 else _roll_backoff_seconds * 2.0,
+            )
+            log.warning(f"[ROLL429] backing off {_roll_backoff_seconds:.0f}s (keeping active={_cached_active_market})")
+            if _cached_active_market is not None:
+                return _cached_active_market
+        # otherwise: if we can, keep last active
         if _cached_active_market is not None:
             return _cached_active_market
-        raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
-
-    # If we already have an active market and it's still in the open set, STAY there.
-    if _cached_active_market is not None:
-        open_tickers = {m.get("ticker") for m in markets if m.get("ticker")}
-        if _cached_active_market in open_tickers:
-            return _cached_active_market
-
-    # Otherwise pick deterministically (no random reshuffle)
-    _cached_active_market = _pick_deterministic_market(markets)
-    return _cached_active_market
+        raise
 
 
 # -----------------------------
@@ -213,14 +223,17 @@ def _normalize_levels(levels: Any) -> Optional[List[Tuple[int, int]]]:
     Accepts:
       - [[price, qty], ...]
       - [{"price": 55, "quantity": 10}, ...]  (or qty/count/size)
-    Returns list[(price:int, qty:int)] or None
+      - {"levels": [[p,q],...]} or {"levels":[{"price":..,"quantity":..},...]}
     """
     if not levels:
         return None
 
+    # ✅ micro change: handle dict wrapper like {"levels": ...}
+    if isinstance(levels, dict) and "levels" in levels:
+        levels = levels.get("levels")
+
     out: List[Tuple[int, int]] = []
 
-    # list of lists
     if isinstance(levels, list) and levels and isinstance(levels[0], (list, tuple)) and len(levels[0]) >= 2:
         for row in levels:
             try:
@@ -231,7 +244,6 @@ def _normalize_levels(levels: Any) -> Optional[List[Tuple[int, int]]]:
                 continue
         return out or None
 
-    # list of dicts
     if isinstance(levels, list) and levels and isinstance(levels[0], dict):
         for row in levels:
             try:
@@ -255,40 +267,31 @@ def best_price(levels: Any, want: str) -> Optional[int]:
 
 
 def _try_get_yes_node(ob: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Try multiple schemas:
-      - {"orderbook": {"yes": {"bids":..., "asks":...}}}
-      - {"orderbook": {"yes_bids":..., "yes_asks":...}}
-      - {"yes": {"bids":..., "asks":...}}
-    """
     root = ob.get("orderbook") or ob
 
-    # classic
     yes = root.get("yes")
     if isinstance(yes, dict):
         return yes
 
-    # alternate flattened keys
     if any(k in root for k in ("yes_bids", "yes_asks")):
         return {"bids": root.get("yes_bids"), "asks": root.get("yes_asks")}
 
     return None
 
 
-# ✅ MICRO CHANGE: more robust YES parsing + one-line debug hint when empty
-_last_ob_schema_log_ts: float = 0.0
-OB_SCHEMA_LOG_MIN_SECONDS = float(os.getenv("OB_SCHEMA_LOG_MIN_SECONDS", "60"))
+# ✅ micro change: log YES-book shape occasionally when bid/ask are None
+_last_ob_debug_ts: float = 0.0
+OB_DEBUG_MIN_SECONDS = float(os.getenv("OB_DEBUG_MIN_SECONDS", "60"))
 
 
 def parse_yes_book(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    global _last_ob_schema_log_ts
+    global _last_ob_debug_ts
 
     yes = _try_get_yes_node(ob)
     if not yes:
-        # print schema hint occasionally so we can align parser
         now = time.time()
-        if (now - _last_ob_schema_log_ts) >= OB_SCHEMA_LOG_MIN_SECONDS:
-            _last_ob_schema_log_ts = now
+        if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
+            _last_ob_debug_ts = now
             root = ob.get("orderbook") if isinstance(ob, dict) else None
             log.info(
                 f"[OBSCHEMA] missing YES node; top_keys={list(ob.keys())[:12]} "
@@ -298,6 +301,26 @@ def parse_yes_book(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
 
     bid = best_price(yes.get("bids"), "bid")
     ask = best_price(yes.get("asks"), "ask")
+
+    if bid is None and ask is None:
+        now = time.time()
+        if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
+            _last_ob_debug_ts = now
+            bids = yes.get("bids")
+            asks = yes.get("asks")
+            # tiny sample so we don't spam logs
+            def sample(x):
+                if isinstance(x, dict):
+                    return {k: ("<list>" if isinstance(v, list) else type(v).__name__) for k, v in list(x.items())[:6]}
+                if isinstance(x, list):
+                    return x[:2]
+                return type(x).__name__
+
+            log.info(
+                f"[OBYES] yes_keys={list(yes.keys())[:12]} "
+                f"bids_type={type(bids).__name__} bids_sample={sample(bids)} "
+                f"asks_type={type(asks).__name__} asks_sample={sample(asks)}"
+            )
 
     return bid, ask
 
@@ -336,7 +359,10 @@ def main():
     cfg = load_config()
     priv = load_private_key(cfg.private_key_b64)
 
-    log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
+    log.info(
+        f"SERIES={cfg.series_ticker} POLL={cfg.poll_seconds}s "
+        f"ROLL_CHECK_MIN_SECONDS={ROLL_CHECK_MIN_SECONDS}s DRY_RUN={cfg.dry_run} ENABLE_TRADING={cfg.enable_trading}"
+    )
 
     active = None
 
