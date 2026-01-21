@@ -63,11 +63,16 @@ BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
-MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "2"))
+MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "3"))
 
-# Order params (new)
+# Order params
 ORDER_QTY = int(getenv_first(["ORDER_QTY"], "1"))
-MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "0"))
+
+# Minimum time between reprices (prevents churn)
+MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
+
+# Only reprice if we are "meaningfully" off target
+REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 
 # -----------------------------
 # Logging
@@ -395,6 +400,9 @@ class WorkingOrder:
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 
+# keep-log suppression (new): only log KEEP when it changes
+_LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
+
 
 def reconcile_quotes(
     market_ticker: str,
@@ -406,17 +414,20 @@ def reconcile_quotes(
     """
     Maintain exactly ONE working buy at target_bid and ONE working sell at target_ask.
 
-    In DRY_RUN: only logs + updates in-memory state.
-    When you go live: replace cancel/place stubs with API calls.
+    Improvements:
+      - MIN_REQUOTE_SECONDS: don't reprice too often
+      - REPRICE_IF_OFF_BY_CENTS: ignore tiny target wiggles
+      - KEEP logs only when the keep-price changes
     """
     now = time.time()
 
-    def should_requote(current: WorkingOrder, new_price: int) -> bool:
-        if current.price_cents == new_price:
-            return False
-        if MIN_REQUOTE_SECONDS > 0 and (now - current.created_ts) < MIN_REQUOTE_SECONDS:
-            return False
-        return True
+    def price_off(cur_price: int, target_price: int) -> int:
+        return abs(int(cur_price) - int(target_price))
+
+    def can_requote(cur: WorkingOrder) -> bool:
+        if MIN_REQUOTE_SECONDS <= 0:
+            return True
+        return (now - cur.created_ts) >= MIN_REQUOTE_SECONDS
 
     def cancel(side: str, reason: str) -> None:
         cur = WORKING[side]
@@ -424,10 +435,18 @@ def reconcile_quotes(
             return
         log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
         WORKING[side] = None
+        _LAST_KEEP_LOGGED[side] = None
 
     def place(side: str, price: int) -> None:
         log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
         WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now)
+        _LAST_KEEP_LOGGED[side] = None
+
+    def keep(side: str, cur: WorkingOrder, note: str) -> None:
+        # Only log KEEP if the kept price changed vs last keep log
+        if _LAST_KEEP_LOGGED.get(side) != cur.price_cents:
+            log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
+            _LAST_KEEP_LOGGED[side] = cur.price_cents
 
     def maintain(side: str, target_price: Optional[int]) -> None:
         cur = WORKING[side]
@@ -437,15 +456,22 @@ def reconcile_quotes(
             return
 
         if cur is None:
-            place(side, target_price)
+            place(side, int(target_price))
             return
 
-        if should_requote(cur, target_price):
-            cancel(side, "reprice")
-            place(side, target_price)
+        off = price_off(cur.price_cents, int(target_price))
+        if off < REPRICE_IF_OFF_BY_CENTS:
+            keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
 
-        log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} DRY_RUN={dry_run}")
+        if not can_requote(cur):
+            age = now - cur.created_ts
+            keep(side, cur, f"cooldown age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off}")
+            return
+
+        # reprice
+        cancel(side, f"reprice(off_by={off})")
+        place(side, int(target_price))
 
     maintain("buy", target_bid)
     maintain("sell", target_ask)
@@ -461,7 +487,10 @@ def main():
         POLL, DRY_RUN, ENABLE_TRADING
     )
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
-    log.info("ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f", ORDER_QTY, MIN_REQUOTE_SECONDS)
+    log.info(
+        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d",
+        ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS
+    )
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -483,9 +512,12 @@ def main():
                 last_tb = None
                 last_ta = None
                 last_why = None
-                # also clear working orders on roll
+
+                # clear working orders on roll
                 WORKING["buy"] = None
                 WORKING["sell"] = None
+                _LAST_KEEP_LOGGED["buy"] = None
+                _LAST_KEEP_LOGGED["sell"] = None
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
             ob = fetch_orderbook(mkt)
@@ -509,7 +541,7 @@ def main():
                 else:
                     log.info("[TARGET] %s YES-only would_quote: bid@%d ask@%d (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
 
-                # IMPORTANT: only reconcile when target changes (prevents log spam/churn)
+                # Only reconcile when the TARGET changes (reduces churn/log spam)
                 reconcile_quotes(
                     market_ticker=mkt,
                     target_bid=tb,
