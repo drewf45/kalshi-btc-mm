@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: adaptive sleep — slow poll when YES book is empty
+# MICRO CHANGE: track last_intended_price (intent hygiene for future order placement)
 
 import os
 import time
@@ -60,7 +60,7 @@ def load_config() -> BotConfig:
         private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
         series_ticker=os.environ["SERIES_TICKER"],
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
-        empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),  # MICRO CHANGE
+        empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
         base_size=env_int("BASE_SIZE", 1),
@@ -172,9 +172,10 @@ def main():
 
     active = None
     last_state: Optional[Tuple] = None
+    last_intended_price: Optional[int] = None  # MICRO CHANGE: track intended quote price
 
     while True:
-        sleep_for = cfg.poll_seconds  # default
+        sleep_for = cfg.poll_seconds
 
         try:
             ticker = resolve_active_market(cfg)
@@ -182,6 +183,7 @@ def main():
                 active = ticker
                 log.info(f"[ROLL] Active market → {active}")
                 last_state = None
+                last_intended_price = None  # reset on roll
 
             ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
@@ -190,17 +192,24 @@ def main():
             if price is None:
                 if bid is None and ask is None:
                     state = ("skip", "empty")
-                    sleep_for = cfg.empty_poll_seconds  # MICRO CHANGE
+                    sleep_for = cfg.empty_poll_seconds
                 elif bid is not None and ask is not None:
                     state = ("skip", "tight")
                 else:
                     state = ("skip", "other")
+
+                # MICRO CHANGE: clear intended price when we are not quoting
+                last_intended_price = None
 
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
                     last_state = state
                 time.sleep(sleep_for)
                 continue
+
+            # MICRO CHANGE: update intended price only when it changes
+            if price != last_intended_price:
+                last_intended_price = price
 
             state = ("quote", price)
             if state != last_state:
