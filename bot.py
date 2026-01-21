@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: reduce API calls by refreshing active market only every MARKET_REFRESH_SECONDS
+# MICRO CHANGE: use a single requests.Session() (keep-alive) to reduce latency/overhead
 
 import os
 import time
@@ -46,7 +46,7 @@ class BotConfig:
     poll_seconds: float
     empty_poll_seconds: float
     rate_limit_backoff_seconds: float
-    market_refresh_seconds: float  # MICRO CHANGE
+    market_refresh_seconds: float
     enable_trading: bool
     dry_run: bool
     base_size: int
@@ -65,7 +65,7 @@ def load_config() -> BotConfig:
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),
         rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
-        market_refresh_seconds=float(os.getenv("MARKET_REFRESH_SECONDS", "30")),  # MICRO CHANGE
+        market_refresh_seconds=float(os.getenv("MARKET_REFRESH_SECONDS", "30")),
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
         base_size=env_int("BASE_SIZE", 1),
@@ -110,9 +110,9 @@ def headers(cfg, priv, method, path_qs, body):
 # -----------------------------
 # HTTP helpers
 # -----------------------------
-def public_get(cfg, path, params=None):
+def public_get(cfg, session: requests.Session, path, params=None):
     qs = path if not params else f"{path}?{urlencode(params)}"
-    r = requests.get(cfg.api_base + qs, timeout=20)
+    r = session.get(cfg.api_base + qs, timeout=20)  # MICRO CHANGE (session)
     data = r.json()
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {qs}: {data}")
@@ -122,9 +122,10 @@ def public_get(cfg, path, params=None):
 # -----------------------------
 # Market resolution
 # -----------------------------
-def resolve_active_market(cfg) -> str:
+def resolve_active_market(cfg, session: requests.Session) -> str:
     data = public_get(
         cfg,
+        session,
         "/trade-api/v2/markets",
         params={"series": cfg.series_ticker, "status": "open"},
     )
@@ -194,21 +195,22 @@ def main():
 
     log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
 
+    # MICRO CHANGE: one session for keep-alive
+    session = requests.Session()
+
     active = None
     last_state: Optional[Tuple] = None
     last_intended_price: Optional[int] = None
     last_rl_log_ts: float = 0.0
-
-    last_market_refresh_ts: float = 0.0  # MICRO CHANGE
+    last_market_refresh_ts: float = 0.0
 
     while True:
         sleep_for = cfg.poll_seconds
 
         try:
-            # MICRO CHANGE: refresh active market on a timer (cuts /markets calls drastically)
             now = time.time()
             if active is None or (now - last_market_refresh_ts) >= cfg.market_refresh_seconds:
-                ticker = resolve_active_market(cfg)
+                ticker = resolve_active_market(cfg, session)
                 last_market_refresh_ts = now
                 if ticker != active:
                     active = ticker
@@ -216,7 +218,7 @@ def main():
                     last_state = None
                     last_intended_price = None
 
-            ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
+            ob = public_get(cfg, session, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price, cfg.min_edge_cents)
 
