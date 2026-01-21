@@ -98,12 +98,15 @@ ASK_CACHE_TTL_SECONDS = float(getenv_first(["ASK_CACHE_TTL_SECONDS"], "5.0"))
 # Micro #2: fallback to /markets/{ticker} when ask missing (throttled)
 MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"], "5.0"))
 
-# Micro #3 toggles (kept, but we still hard-gate on MIN_SPREAD_CENTS)
+# Micro #3 toggles
 ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
 ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"], "true"), default=True)
 
-# Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
+# Micro #4: per-side hysteresis
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
+
+# Live flags (optional)
+POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
 
 # -----------------------------
 # Logging
@@ -139,7 +142,7 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
         f"Detected KALSHI_* keys: {_detected_kalshi_keys}\n"
         "Expected one of:\n"
         "  - KALSHI_KEY_ID or KALSHI_API_KEY_ID\n"
-        "  - KALSHI_PRIVATE_KEY_B64 or KALSHI_PRIVATE_KEY_PEM (or any env starting with KALSHI_PRIVATE_KEY_PEM)\n"
+        "  - KALSHI_PRIVATE_KEY_B64 or KALSHI_PRIVATE_KEY_PEM\n"
     )
 
 # -----------------------------
@@ -199,8 +202,7 @@ def request_json(
     params = params or {}
     body_str = "" if json_body is None else json.dumps(json_body, separators=(",", ":"), sort_keys=True)
 
-    # ✅ ONLY CHANGE NEEDED:
-    # Always derive signed_path from a prepared Request so it matches the on-wire path exactly
+    # IMPORTANT: sign exactly what we send (path + query)
     req = requests.Request(method.upper(), url, params=params, data=body_str)
     prepped = req.prepare()
     signed_path = prepped.path_url
@@ -218,18 +220,64 @@ def request_json(
             continue
 
         if resp.status_code >= 400:
+            text = resp.text or ""
             try:
                 j = resp.json()
                 raise RuntimeError(f"HTTP {resp.status_code} {path}: {j}")
             except Exception:
-                text_head = (resp.text or "")[:200]
+                text_head = text[:200]
                 raise RuntimeError(f"HTTP {resp.status_code} {path}: {{'_non_json': True, '_text_head': {text_head!r}}}")
+
+        if resp.status_code == 204:
+            return {}
 
         try:
             return resp.json()
         except Exception:
             text_head = (resp.text or "")[:200]
             raise RuntimeError(f"Bad JSON response for {path}: {text_head!r}")
+
+# -----------------------------
+# LIVE ORDER ROUTES (the missing piece)
+# -----------------------------
+def place_order_live(market_ticker: str, action: str, yes_price_cents: int, count: int) -> str:
+    """
+    Posts a limit order to Kalshi.
+    Returns order_id.
+    NOTE: We quote YES only, so side is always YES.
+    """
+    body: Dict[str, Any] = {
+        "ticker": market_ticker,
+        "action": action,          # "buy" or "sell"
+        "type": "limit",
+        "side": "yes",             # YES contract
+        "count": int(count),
+        "yes_price": int(yes_price_cents),  # cents
+    }
+    if POST_ONLY:
+        body["post_only"] = True
+
+    resp = request_json("POST", "/portfolio/orders", json_body=body)
+
+    # tolerate multiple response shapes
+    order = resp.get("order") if isinstance(resp, dict) else None
+    if isinstance(order, dict):
+        oid = order.get("order_id") or order.get("id")
+        if oid:
+            return str(oid)
+
+    oid = resp.get("order_id") or resp.get("id")
+    if oid:
+        return str(oid)
+
+    raise RuntimeError(f"Order placed but could not find order_id in response: {resp}")
+
+
+def cancel_order_live(order_id: str) -> None:
+    """
+    Cancels an existing order.
+    """
+    request_json("DELETE", f"/portfolio/orders/{order_id}")
 
 # -----------------------------
 # Rolling via /markets ONLY
@@ -322,18 +370,6 @@ def roll_active_market() -> str:
 
     now = time.time()
     if _active_market_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
-        return _active_market_ticker
-
-    if EVENT_TICKER:
-        evt, mkt = resolve_event_and_market_via_markets(SERIES)
-        if not mkt:
-            raise RuntimeError(
-                f"Could not resolve market via /markets for series={SERIES} (EVENT_TICKER pinned={EVENT_TICKER})."
-            )
-        _active_event_ticker = EVENT_TICKER
-        _active_market_ticker = mkt
-        _last_roll_ts = time.time()
-        log.info("[ROLL] Event pinned=%s → Active market → %s (via /markets)", _active_event_ticker, _active_market_ticker)
         return _active_market_ticker
 
     evt, mkt = resolve_event_and_market_via_markets(SERIES)
@@ -455,7 +491,6 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
-    # Kalshi binary: YES ask inferred from NO bid: yes_ask = 100 - no_best_bid
     if no_bid is not None:
         yes_ask = 100 - int(no_bid)
         _cache_yes_ask(yes_ask)
@@ -506,7 +541,6 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
         return (None, None, "crossed_or_locked")
 
     spread = yes_ask - yes_bid
-
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
 
@@ -525,14 +559,15 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     return (bid, ask, f"ok(spread={spread})")
 
 # -----------------------------
-# Order management (DRY_RUN now, real later)
+# Order management (now LIVE when DRY_RUN=False)
 # -----------------------------
 @dataclass
 class WorkingOrder:
-    side: str
+    side: str                 # "buy" or "sell" (action)
     price_cents: int
     qty: int
     created_ts: float
+    order_id: Optional[str] = None
 
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
@@ -545,7 +580,6 @@ _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 TIGHT_SPREAD_SINCE_TS: Optional[float] = None
 NOT_STABLE_SINCE_TS: Optional[float] = None
 
-# NEW: unsafe timers (per-side) to reduce whipsaw
 UNSAFE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
 
@@ -572,49 +606,78 @@ def reconcile_quotes(
             return True
         return (now - cur.created_ts) >= MIN_REQUOTE_SECONDS
 
-    def cancel(side: str, reason: str) -> None:
-        cur = WORKING[side]
+    def cancel(side_key: str, reason: str) -> None:
+        """
+        side_key is "buy" or "sell" (our working slot)
+        """
+        cur = WORKING[side_key]
         if cur is None:
             return
-        log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
-        WORKING[side] = None
-        _LAST_KEEP_LOGGED[side] = None
 
-    def place(side: str, price: int) -> None:
-        log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
-        WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now)
-        _LAST_KEEP_LOGGED[side] = None
+        log.info(f"[OM] {market_ticker} {side_key.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
 
-    def keep(side: str, cur: WorkingOrder, note: str) -> None:
-        if _LAST_KEEP_LOGGED.get(side) != cur.price_cents:
-            log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
-            _LAST_KEEP_LOGGED[side] = cur.price_cents
+        if (not dry_run) and ENABLE_TRADING and cur.order_id:
+            cancel_order_live(cur.order_id)
 
-    # Unsafe detection + grace
-    def is_unsafe(side: str, price_cents: int) -> bool:
+        WORKING[side_key] = None
+        _LAST_KEEP_LOGGED[side_key] = None
+
+    def place(side_key: str, price: int) -> None:
+        """
+        side_key is "buy" or "sell" (our action)
+        """
+        log.info(f"[OM] {market_ticker} {side_key.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
+
+        order_id = None
+        if (not dry_run) and ENABLE_TRADING:
+            order_id = place_order_live(
+                market_ticker=market_ticker,
+                action=side_key,               # "buy" or "sell"
+                yes_price_cents=int(price),
+                count=int(qty),
+            )
+            log.info(f"[OM] {market_ticker} {side_key.upper()} POSTED order_id={order_id} @ {price} qty={qty}")
+
+        WORKING[side_key] = WorkingOrder(
+            side=side_key,
+            price_cents=int(price),
+            qty=int(qty),
+            created_ts=now,
+            order_id=order_id,
+        )
+        _LAST_KEEP_LOGGED[side_key] = None
+
+    def keep(side_key: str, cur: WorkingOrder, note: str) -> None:
+        if _LAST_KEEP_LOGGED.get(side_key) != cur.price_cents:
+            log.info(
+                f"[OM] {market_ticker} {side_key.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) "
+                f"DRY_RUN={dry_run} order_id={cur.order_id}"
+            )
+            _LAST_KEEP_LOGGED[side_key] = cur.price_cents
+
+    def is_unsafe(side_key: str, price_cents: int) -> bool:
         if yes_bid is None or yes_ask is None:
             return False
-        if side == "sell":
+        if side_key == "sell":
             return int(price_cents) <= int(yes_bid)
-        if side == "buy":
+        if side_key == "buy":
             return int(price_cents) >= int(yes_ask)
         return False
 
-    def unsafe_to_hold_with_grace(side: str, cur: WorkingOrder) -> bool:
-        if not is_unsafe(side, cur.price_cents):
-            UNSAFE_SINCE_TS[side] = None
+    def unsafe_to_hold_with_grace(side_key: str, cur: WorkingOrder) -> bool:
+        if not is_unsafe(side_key, cur.price_cents):
+            UNSAFE_SINCE_TS[side_key] = None
             return False
 
-        if UNSAFE_SINCE_TS[side] is None:
-            UNSAFE_SINCE_TS[side] = now
+        if UNSAFE_SINCE_TS[side_key] is None:
+            UNSAFE_SINCE_TS[side_key] = now
             return False
 
-        unsafe_for = now - float(UNSAFE_SINCE_TS[side] or now)
+        unsafe_for = now - float(UNSAFE_SINCE_TS[side_key] or now)
         return unsafe_for >= max(0.0, UNSAFE_GRACE_SECONDS)
 
     both_missing = (target_bid is None) and (target_ask is None)
 
-    # BOTH missing: global HOLD/CANCEL logic
     if both_missing:
         is_tight_spread_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight")
         is_not_stable_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_ok_not_stable")
@@ -677,91 +740,82 @@ def reconcile_quotes(
         cancel("sell", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         return
 
-    # We have at least one target => reset timers
     NO_TARGET_SINCE_TS = None
     TIGHT_SPREAD_SINCE_TS = None
     NOT_STABLE_SINCE_TS = None
 
-    # per-side hold when a single side is missing
     if target_bid is not None:
         NO_TARGET_SIDE_SINCE_TS["buy"] = None
     if target_ask is not None:
         NO_TARGET_SIDE_SINCE_TS["sell"] = None
 
-    def handle_missing_side(side: str) -> None:
-        cur = WORKING[side]
+    def handle_missing_side(side_key: str) -> None:
+        cur = WORKING[side_key]
         if cur is None:
             return
 
-        if unsafe_to_hold_with_grace(side, cur):
-            cancel(side, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
-            NO_TARGET_SIDE_SINCE_TS[side] = None
-            UNSAFE_SINCE_TS[side] = None
+        if unsafe_to_hold_with_grace(side_key, cur):
+            cancel(side_key, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
+            NO_TARGET_SIDE_SINCE_TS[side_key] = None
+            UNSAFE_SINCE_TS[side_key] = None
             return
 
-        if NO_TARGET_SIDE_SINCE_TS[side] is None:
-            NO_TARGET_SIDE_SINCE_TS[side] = now
+        if NO_TARGET_SIDE_SINCE_TS[side_key] is None:
+            NO_TARGET_SIDE_SINCE_TS[side_key] = now
 
-        held_for = now - float(NO_TARGET_SIDE_SINCE_TS[side] or now)
+        held_for = now - float(NO_TARGET_SIDE_SINCE_TS[side_key] or now)
 
         if SIDE_HOLD_SECONDS > 0 and held_for < SIDE_HOLD_SECONDS:
-            if (now - _LAST_SIDE_HOLD_LOG_TS.get(side, 0.0)) >= 5.0:
+            if (now - _LAST_SIDE_HOLD_LOG_TS.get(side_key, 0.0)) >= 5.0:
                 log.info(
                     "[OM] %s %s HOLD_SIDE held_for=%.2fs<%.2fs price=@%d DRY_RUN=%s",
-                    market_ticker, side.upper(), held_for, SIDE_HOLD_SECONDS, cur.price_cents, dry_run
+                    market_ticker, side_key.upper(), held_for, SIDE_HOLD_SECONDS, cur.price_cents, dry_run
                 )
-                _LAST_SIDE_HOLD_LOG_TS[side] = now
+                _LAST_SIDE_HOLD_LOG_TS[side_key] = now
             return
 
-        cancel(side, f"no_target_side>{SIDE_HOLD_SECONDS:.2f}s")
-        NO_TARGET_SIDE_SINCE_TS[side] = None
+        cancel(side_key, f"no_target_side>{SIDE_HOLD_SECONDS:.2f}s")
+        NO_TARGET_SIDE_SINCE_TS[side_key] = None
 
     if target_bid is None:
         handle_missing_side("buy")
     if target_ask is None:
         handle_missing_side("sell")
 
-    # NEW: safer long-term maintain logic (grace + max chase + cooldown override)
-    def maintain(side: str, target_price: Optional[int]) -> None:
+    def maintain(side_key: str, target_price: Optional[int]) -> None:
         if target_price is None:
             return
 
-        cur = WORKING[side]
+        cur = WORKING[side_key]
         if cur is None:
-            place(side, int(target_price))
+            place(side_key, int(target_price))
             return
 
         off = price_off(cur.price_cents, int(target_price))
 
-        # A) Unsafe? cancel only after grace
-        if unsafe_to_hold_with_grace(side, cur):
-            cancel(side, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
-            UNSAFE_SINCE_TS[side] = None
-            # if market jumped, don't immediately re-place (stand down)
+        if unsafe_to_hold_with_grace(side_key, cur):
+            cancel(side_key, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
+            UNSAFE_SINCE_TS[side_key] = None
             if off >= MAX_CHASE_CENTS:
                 return
-            place(side, int(target_price))
+            place(side_key, int(target_price))
             return
 
-        # B) Too far away? don't chase
         if off >= MAX_CHASE_CENTS:
-            cancel(side, f"too_far_to_chase(off_by={off}>=MAX_CHASE_CENTS={MAX_CHASE_CENTS})")
+            cancel(side_key, f"too_far_to_chase(off_by={off}>=MAX_CHASE_CENTS={MAX_CHASE_CENTS})")
             return
 
-        # C) close enough? keep
         if off < REPRICE_IF_OFF_BY_CENTS:
-            keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
+            keep(side_key, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
 
-        # D) cooldown: don't keep stale if we're meaningfully off
         if not can_requote(cur):
             age = now - cur.created_ts
-            cancel(side, f"cooldown_but_stale(off_by={off} age={age:.2f}s)")
+            cancel(side_key, f"cooldown_but_stale(off_by={off} age={age:.2f}s)")
             return
 
-        # E) normal reprice
-        cancel(side, f"reprice(off_by={off})")
-        place(side, int(target_price))
+        cancel(side_key, f"reprice(off_by={off})")
+        place(side_key, int(target_price))
 
     maintain("buy", target_bid)
     maintain("sell", target_ask)
@@ -771,32 +825,11 @@ def reconcile_quotes(
 # -----------------------------
 def main():
     log.info(
-        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s",
+        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
         API_BASE, API_PREFIX, SERIES,
         EVENT_TICKER or "<auto>", MARKET_TICKER_OVERRIDE or "<none>",
-        POLL, DRY_RUN, ENABLE_TRADING,
+        POLL, DRY_RUN, ENABLE_TRADING, POST_ONLY,
     )
-    log.info(
-        "QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d",
-        TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS
-    )
-    log.info(
-        "SAFETY_GATES: ENTER_OK_SECONDS=%.2f EXIT_BAD_SECONDS=%.2f NOT_STABLE_EXIT_SECONDS=%.2f",
-        ENTER_OK_SECONDS, EXIT_BAD_SECONDS, NOT_STABLE_EXIT_SECONDS
-    )
-    log.info(
-        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
-        ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS,
-    )
-    log.info(
-        "ANTI_CHURN: MAX_CHASE_CENTS=%d UNSAFE_GRACE_SECONDS=%.2f",
-        MAX_CHASE_CENTS, UNSAFE_GRACE_SECONDS
-    )
-    log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
-    log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
-    log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
-    log.info("TIGHT_JOIN: ENABLE_JOIN_TIGHT_SPREAD=%s", ENABLE_JOIN_TIGHT_SPREAD)
-    log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -820,6 +853,8 @@ def main():
                 last_ta = None
                 last_why = None
 
+                # If we rolled markets, dump locals.
+                # (If you want to cancel live orders on roll, you can do it here too—keeping behavior unchanged.)
                 WORKING["buy"] = None
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
@@ -840,7 +875,6 @@ def main():
                 _LAST_MARKET_FALLBACK_TS = 0.0
 
                 spread_ok_since = None
-
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
             ob = fetch_orderbook(mkt)
@@ -849,14 +883,10 @@ def main():
             quote_changed = (yes_bid != last_yes_bid) or (yes_ask != last_yes_ask) or market_changed
             if quote_changed:
                 last_yes_bid, last_yes_ask = yes_bid, yes_ask
-                if yes_bid is None and yes_ask is None:
-                    log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
-                else:
-                    log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
+                log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
 
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
 
-            # Spread stability requirement
             if tb is not None and ta is not None and yes_bid is not None and yes_ask is not None:
                 spread = int(yes_ask) - int(yes_bid)
                 if spread >= MIN_SPREAD_CENTS:
@@ -877,14 +907,7 @@ def main():
                 if tb is None and ta is None:
                     log.info("[TARGET] %s → SKIP (%s)", mkt, why)
                 else:
-                    log.info(
-                        "[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s",
-                        mkt,
-                        str(tb) if tb is not None else "None",
-                        str(ta) if ta is not None else "None",
-                        why,
-                        DRY_RUN,
-                    )
+                    log.info("[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
 
             reconcile_quotes(
                 market_ticker=mkt,
