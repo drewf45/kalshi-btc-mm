@@ -1,9 +1,10 @@
 # bot.py
 # Kalshi YES-only maker bot (roll + orderbook)
-# Fixes:
-# - Trade API endpoints use SIGNED auth (no public_get for /trade-api/*)
-# - Safe JSON parsing to avoid "Extra data" crashes on non-JSON responses
-# - Bounded 429 retry w/ cooldown to avoid hammering markets endpoint
+# Fixes in this version:
+# - Removes non-existent /trade-api/v2/series/<series>/markets (404)
+# - Uses /trade-api/v2/markets with series param if supported; otherwise scans without status filter
+# - Local filtering for ticker prefix + "open-ish" statuses
+# - Cooldown after "no match" so you don't rescan 2500 markets every 2 seconds
 # - Default POLL_SECONDS=2, DRY_RUN=True
 
 import os
@@ -14,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
+from datetime import datetime, timezone
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -52,20 +54,25 @@ class BotConfig:
     api_key_id: str
     private_key_b64: str
     series_ticker: str
+
     poll_seconds: float
     enable_trading: bool
     dry_run: bool
+
     base_size: int
     improve_ticks: int
     post_only: bool
     max_buy_price: int
+
     roll_check_min_seconds: float
     market_page_limit: int
     market_scan_pages_max: int
+
     http_backoff_max_seconds: float
-    # NEW:
     http_429_max_retries: int
-    roll_429_cooldown_seconds: float
+
+    # NEW: prevent constant rescan when no match
+    roll_no_match_cooldown_seconds: float
 
 
 def load_config() -> BotConfig:
@@ -74,19 +81,24 @@ def load_config() -> BotConfig:
         api_key_id=os.environ["KALSHI_API_KEY_ID"],
         private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
         series_ticker=os.environ["SERIES_TICKER"],
-        poll_seconds=env_float("POLL_SECONDS", 2.0),        # ✅ 2 seconds
+
+        poll_seconds=env_float("POLL_SECONDS", 2.0),     # ✅ 2 seconds default
         enable_trading=env_bool("ENABLE_TRADING", True),
-        dry_run=env_bool("DRY_RUN", True),                  # ✅ dry run default
+        dry_run=env_bool("DRY_RUN", True),               # ✅ dry run default
+
         base_size=env_int("BASE_SIZE", 1),
         improve_ticks=env_int("IMPROVE_TICKS", 1),
         post_only=env_bool("POST_ONLY", True),
         max_buy_price=env_int("MAX_BUY_PRICE_CENTS", 99),
+
         roll_check_min_seconds=env_float("ROLL_CHECK_MIN_SECONDS", 60.0),
-        market_page_limit=env_int("MARKET_PAGE_LIMIT", 100),
-        market_scan_pages_max=env_int("MARKET_SCAN_PAGES_MAX", 25),
+        market_page_limit=env_int("MARKET_PAGE_LIMIT", 250),
+        market_scan_pages_max=env_int("MARKET_SCAN_PAGES_MAX", 10),
+
         http_backoff_max_seconds=env_float("HTTP_BACKOFF_MAX_SECONDS", 16.0),
         http_429_max_retries=env_int("HTTP_429_MAX_RETRIES", 5),
-        roll_429_cooldown_seconds=env_float("ROLL_429_COOLDOWN_SECONDS", 30.0),
+
+        roll_no_match_cooldown_seconds=env_float("ROLL_NO_MATCH_COOLDOWN_SECONDS", 120.0),
     )
 
 
@@ -98,7 +110,6 @@ def load_private_key(b64: str):
 
 
 def sign_request(priv, ts: str, method: str, path_qs: str) -> str:
-    # Kalshi expects signing timestamp+method+path (no query, no body)
     path_without_query = path_qs.split("?", 1)[0]
     msg = f"{ts}{method}{path_without_query}".encode("utf-8")
     sig = priv.sign(
@@ -129,22 +140,31 @@ def _safe_json(resp: requests.Response) -> Dict[str, Any]:
     try:
         return resp.json()
     except Exception:
-        # log the first chunk so we can see what it is (HTML/text/etc.)
         txt = resp.text[:250].replace("\n", "\\n")
         return {"_non_json": True, "_status": resp.status_code, "_text_head": txt}
 
 
-def is_429_payload(payload: Dict[str, Any]) -> bool:
-    # supports both your old style and safe_json fallback
-    if isinstance(payload, dict):
-        err = payload.get("error")
-        if isinstance(err, dict) and err.get("code") == "too_many_requests":
-            return True
-    return False
+def signed_get_with_429(cfg, priv, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    backoff = 1.0
+    for attempt in range(cfg.http_429_max_retries + 1):
+        qs = path if not params else f"{path}?{urlencode(params)}"
+        url = cfg.api_base + qs
+        h = make_headers(cfg, priv, "GET", qs)
+        r = requests.get(url, headers=h, timeout=20)
+        payload = _safe_json(r)
 
+        if r.status_code == 200:
+            return payload
 
-def is_429_status(resp: requests.Response) -> bool:
-    return resp.status_code == 429
+        if r.status_code == 429 or (isinstance(payload.get("error"), dict) and payload["error"].get("code") == "too_many_requests"):
+            if attempt >= cfg.http_429_max_retries:
+                raise RuntimeError(f"HTTP 429 {qs}: giving up after {cfg.http_429_max_retries} retries")
+            log.warning(f"[HTTP429] {path} backing off {backoff:.1f}s (attempt {attempt+1}/{cfg.http_429_max_retries})")
+            time.sleep(backoff)
+            backoff = min(cfg.http_backoff_max_seconds, backoff * 2.0)
+            continue
+
+        raise RuntimeError(f"HTTP {r.status_code} {qs}: {payload}")
 
 
 def signed_request_json(cfg, priv, method: str, path: str, params=None, body=None) -> Dict[str, Any]:
@@ -158,34 +178,8 @@ def signed_request_json(cfg, priv, method: str, path: str, params=None, body=Non
     return payload
 
 
-def signed_get_with_429(cfg, priv, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Bounded 429 retries so we do NOT backoff forever inside a single call.
-    """
-    backoff = 1.0
-    for attempt in range(cfg.http_429_max_retries + 1):
-        qs = path if not params else f"{path}?{urlencode(params)}"
-        url = cfg.api_base + qs
-        h = make_headers(cfg, priv, "GET", qs)
-        r = requests.get(url, headers=h, timeout=20)
-        payload = _safe_json(r)
-
-        if r.status_code == 200:
-            return payload
-
-        if is_429_status(r) or is_429_payload(payload):
-            if attempt >= cfg.http_429_max_retries:
-                raise RuntimeError(f"HTTP 429 {qs}: giving up after {cfg.http_429_max_retries} retries")
-            log.warning(f"[MKT429] {path} backing off {backoff:.1f}s (attempt {attempt+1}/{cfg.http_429_max_retries})")
-            time.sleep(backoff)
-            backoff = min(cfg.http_backoff_max_seconds, backoff * 2.0)
-            continue
-
-        raise RuntimeError(f"HTTP {r.status_code} {qs}: {payload}")
-
-
 # -----------------------------
-# Market extraction
+# Market extraction helpers
 # -----------------------------
 def _extract_markets(payload: Dict[str, Any]) -> list:
     mkts = payload.get("markets")
@@ -205,12 +199,32 @@ def _extract_cursor(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _sort_key(m: Dict[str, Any]) -> float:
+def _market_close_ts(m: Dict[str, Any]) -> float:
+    """
+    Returns a sortable close time as unix seconds.
+    Supports numeric timestamps or ISO strings.
+    """
     for k in ("close_ts", "close_time", "expiration_ts", "expiration_time", "end_ts", "end_time"):
         v = m.get(k)
         if isinstance(v, (int, float)):
-            return float(v)
-    return 0.0
+            # could be ms; normalize
+            vv = float(v)
+            return vv / 1000.0 if vv > 10_000_000_000 else vv
+        if isinstance(v, str) and v:
+            try:
+                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                return dt.timestamp()
+            except Exception:
+                pass
+    return float("inf")
+
+
+def _is_openish_status(m: Dict[str, Any]) -> bool:
+    s = m.get("status")
+    if not isinstance(s, str):
+        return True  # if no status, don’t exclude
+    s = s.lower()
+    return s in ("open", "active", "trading", "live")
 
 
 # -----------------------------
@@ -218,94 +232,97 @@ def _sort_key(m: Dict[str, Any]) -> float:
 # -----------------------------
 _last_roll_check_ts: float = 0.0
 _cached_active_market: Optional[str] = None
-_roll_block_until_ts: float = 0.0  # ✅ NEW: cooldown after 429 to prevent spam
+_no_match_block_until: float = 0.0
 
 
 def resolve_active_market(cfg: BotConfig, priv) -> str:
-    global _last_roll_check_ts, _cached_active_market, _roll_block_until_ts
+    global _last_roll_check_ts, _cached_active_market, _no_match_block_until
 
     now = time.time()
+
+    # ✅ if user accidentally passes a full market ticker, just use it
+    if "-" in cfg.series_ticker:
+        return cfg.series_ticker
+
     prefix = cfg.series_ticker + "-"
 
-    # If we just got rate-limited hard, wait before trying again
-    if now < _roll_block_until_ts:
-        raise RuntimeError(f"ROLL blocked until {int(_roll_block_until_ts)} (cooldown)")
+    # Cooldown after no-match so we don’t rescan endlessly
+    if now < _no_match_block_until:
+        raise RuntimeError(f"No-match cooldown active for {int(_no_match_block_until - now)}s")
 
-    # Normal caching
+    # Cache good result
     if _cached_active_market is not None and (now - _last_roll_check_ts) < cfg.roll_check_min_seconds:
         return _cached_active_market
-
     _last_roll_check_ts = now
 
-    # 1) Try series-specific endpoints (SIGNED)
-    series_paths = [
-        (f"/trade-api/v2/series/{cfg.series_ticker}/markets", {"status": "open", "limit": cfg.market_page_limit}),
-        ("/trade-api/v2/markets", {"series": cfg.series_ticker, "status": "open", "limit": cfg.market_page_limit}),
-    ]
-
-    for path, params in series_paths:
-        try:
-            data = signed_get_with_429(cfg, priv, path, params)
-            mkts = _extract_markets(data)
-            matched = [m for m in mkts if isinstance(m.get("ticker"), str) and m["ticker"].startswith(prefix)]
-            log.info(f"[ROLLDBG] (series) path={path} total={len(mkts)} matched_series={len(matched)} prefix={prefix}")
-            if matched:
-                matched.sort(key=_sort_key)
-                _cached_active_market = matched[0]["ticker"]
-                return _cached_active_market
-        except Exception as e:
-            # If we got hard 429 giveup, start cooldown
-            if "HTTP 429" in str(e):
-                _roll_block_until_ts = time.time() + cfg.roll_429_cooldown_seconds
-            log.warning(f"[ROLLDBG] (series) path={path} failed: {e}")
-
-    # 2) Paginate open markets list (SIGNED) and scan for prefix
-    cursor: Optional[str] = None
-    scanned_total = 0
     matched_all: List[Dict[str, Any]] = []
     sample_tickers: List[str] = []
 
+    # 1) First try using series filter (if API supports it). DO NOT filter by status here.
+    # If the API ignores it, we’ll see no matches and fall through to scanning.
     try:
-        for _page in range(cfg.market_scan_pages_max):
-            params = {"status": "open", "limit": cfg.market_page_limit}
-            if cursor:
-                params["cursor"] = cursor
-
-            data = signed_get_with_429(cfg, priv, "/trade-api/v2/markets", params)
-            mkts = _extract_markets(data)
-            cursor = _extract_cursor(data)
-
-            if not mkts:
-                break
-
-            scanned_total += len(mkts)
-
-            # sample tickers for debug
-            for m in mkts[:6]:
-                t = m.get("ticker")
-                if isinstance(t, str) and len(sample_tickers) < 18:
-                    sample_tickers.append(t)
-
-            for m in mkts:
-                t = m.get("ticker")
-                if isinstance(t, str) and t.startswith(prefix):
-                    matched_all.append(m)
-
-            if matched_all:
-                matched_all.sort(key=_sort_key)
-                _cached_active_market = matched_all[0]["ticker"]
-                log.info(f"[ROLLDBG] (scan) scanned_total={scanned_total} matched_series={len(matched_all)} prefix={prefix}")
-                return _cached_active_market
-
-            if not cursor:
-                break
-
-        log.info(f"[ROLLDBG] (scan_fail) scanned_total={scanned_total} matched_series=0 prefix={prefix} sample={sample_tickers}")
-        raise RuntimeError(f"No open markets matched series prefix {prefix} (scanned {scanned_total})")
+        data = signed_get_with_429(cfg, priv, "/trade-api/v2/markets", {
+            "series": cfg.series_ticker,
+            "limit": cfg.market_page_limit,
+        })
+        mkts = _extract_markets(data)
+        for m in mkts[:12]:
+            t = m.get("ticker")
+            if isinstance(t, str):
+                sample_tickers.append(t)
+        matched = [m for m in mkts if isinstance(m.get("ticker"), str) and m["ticker"].startswith(prefix)]
+        log.info(f"[ROLLDBG] (series_param) got={len(mkts)} matched={len(matched)} prefix={prefix} sample={sample_tickers[:6]}")
+        if matched:
+            # prefer open-ish + soonest close
+            matched = [m for m in matched if _is_openish_status(m)]
+            matched.sort(key=_market_close_ts)
+            _cached_active_market = matched[0]["ticker"]
+            return _cached_active_market
     except Exception as e:
-        if "HTTP 429" in str(e):
-            _roll_block_until_ts = time.time() + cfg.roll_429_cooldown_seconds
-        raise
+        log.warning(f"[ROLLDBG] (series_param) failed: {e}")
+
+    # 2) Full scan: /markets?limit&cursor (no status filter), then filter locally
+    cursor: Optional[str] = None
+    scanned_total = 0
+
+    for _page in range(cfg.market_scan_pages_max):
+        params = {"limit": cfg.market_page_limit}
+        if cursor:
+            params["cursor"] = cursor
+
+        data = signed_get_with_429(cfg, priv, "/trade-api/v2/markets", params)
+        mkts = _extract_markets(data)
+        cursor = _extract_cursor(data)
+
+        if not mkts:
+            break
+
+        scanned_total += len(mkts)
+
+        # keep some samples for debugging
+        for m in mkts[:6]:
+            t = m.get("ticker")
+            if isinstance(t, str) and len(sample_tickers) < 18:
+                sample_tickers.append(t)
+
+        for m in mkts:
+            t = m.get("ticker")
+            if isinstance(t, str) and t.startswith(prefix) and _is_openish_status(m):
+                matched_all.append(m)
+
+        if matched_all:
+            matched_all.sort(key=_market_close_ts)
+            _cached_active_market = matched_all[0]["ticker"]
+            log.info(f"[ROLLDBG] (scan) scanned_total={scanned_total} matched={len(matched_all)} pick={_cached_active_market}")
+            return _cached_active_market
+
+        if not cursor:
+            break
+
+    # No match → cooldown to prevent constant rescan spam
+    log.info(f"[ROLLDBG] (scan_fail) scanned_total={scanned_total} matched=0 prefix={prefix} sample={sample_tickers}")
+    _no_match_block_until = time.time() + cfg.roll_no_match_cooldown_seconds
+    raise RuntimeError(f"No open-ish markets matched prefix {prefix} (scanned {scanned_total})")
 
 
 # -----------------------------
@@ -357,21 +374,6 @@ def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: i
     return px
 
 
-# -----------------------------
-# Trading (YES-only buy)
-# -----------------------------
-def place_yes_buy(cfg, priv, market_ticker: str, price_cents: int, qty: int) -> Dict[str, Any]:
-    body = {
-        "ticker": market_ticker,
-        "action": "buy",
-        "side": "yes",
-        "type": "limit",
-        "price": price_cents,
-        "count": qty,
-    }
-    return signed_request_json(cfg, priv, "POST", "/trade-api/v2/portfolio/orders", body=body)
-
-
 def signed_get_orderbook_with_429(cfg, priv, market_ticker: str) -> Dict[str, Any]:
     backoff = 1.0
     path = f"/trade-api/v2/markets/{market_ticker}/orderbook"
@@ -387,6 +389,18 @@ def signed_get_orderbook_with_429(cfg, priv, market_ticker: str) -> Dict[str, An
                 backoff = min(cfg.http_backoff_max_seconds, backoff * 2.0)
                 continue
             raise
+
+
+def place_yes_buy(cfg, priv, market_ticker: str, price_cents: int, qty: int) -> Dict[str, Any]:
+    body = {
+        "ticker": market_ticker,
+        "action": "buy",
+        "side": "yes",
+        "type": "limit",
+        "price": price_cents,
+        "count": qty,
+    }
+    return signed_request_json(cfg, priv, "POST", "/trade-api/v2/portfolio/orders", body=body)
 
 
 # -----------------------------
@@ -419,7 +433,6 @@ def main():
                 log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP (empty)")
             else:
                 log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
-
                 if (not cfg.enable_trading) or cfg.dry_run:
                     log.info("[DRYRUN] Not placing order")
                 else:
