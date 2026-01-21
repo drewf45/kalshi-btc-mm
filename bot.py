@@ -7,7 +7,7 @@ import json
 import base64
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -36,6 +36,11 @@ def env_int(name: str, default: int) -> int:
     return default if not v else int(v)
 
 
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    return default if not v else float(v)
+
+
 @dataclass
 class BotConfig:
     api_base: str
@@ -57,7 +62,7 @@ def load_config() -> BotConfig:
         api_key_id=os.environ["KALSHI_API_KEY_ID"],
         private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
         series_ticker=os.environ["SERIES_TICKER"],
-        poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
+        poll_seconds=env_float("POLL_SECONDS", 2.0),  # ✅ you said you’re switching to 2 seconds
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
         base_size=env_int("BASE_SIZE", 1),
@@ -71,7 +76,9 @@ def load_config() -> BotConfig:
 # Auth / signing
 # -----------------------------
 def load_private_key(b64: str):
-    return serialization.load_pem_private_key(base64.b64decode(b64), password=None)
+    return serialization.load_pem_private_key(
+        base64.b64decode(b64), password=None
+    )
 
 
 def sign_request(priv, ts: str, method: str, path_qs: str) -> str:
@@ -117,211 +124,102 @@ def request_json(cfg, priv, method, path, params=None, body=None):
 def public_get(cfg, path, params=None):
     qs = path if not params else f"{path}?{urlencode(params)}"
     r = requests.get(cfg.api_base + qs, timeout=20)
-    data = r.json()
+    data = r.json() if r.content else {}
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} {qs}: {data}")
     return data
 
 
 # -----------------------------
-# Sticky + throttled roll resolver (with 429 backoff)
+# Sticky + throttled roll resolver to prevent 429 + random market fallback
 # -----------------------------
 _last_roll_check_ts: float = 0.0
 _cached_active_market: Optional[str] = None
-
-ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "60"))
-_roll_backoff_seconds: float = 0.0
-ROLL_BACKOFF_MAX_SECONDS = float(os.getenv("ROLL_BACKOFF_MAX_SECONDS", "600"))
-
-
-def _extract_markets_list(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return data.get("markets") or data.get("data") or []
-
-
-def _pick_deterministic_market(markets: List[Dict[str, Any]]) -> str:
-    def close_key(m: Dict[str, Any]) -> str:
-        return (
-            m.get("close_time")
-            or m.get("close_ts")
-            or m.get("expiration_time")
-            or m.get("settlement_time")
-            or ""
-        )
-
-    have_close = any(close_key(m) for m in markets)
-    if have_close:
-        markets = sorted(markets, key=lambda m: (close_key(m), m.get("ticker", "")))
-    else:
-        markets = sorted(markets, key=lambda m: m.get("ticker", ""))
-
-    return markets[0]["ticker"]
+ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "60"))  # ✅ keep at 60s by default
 
 
 def resolve_active_market(cfg) -> str:
-    global _last_roll_check_ts, _cached_active_market, _roll_backoff_seconds
+    global _last_roll_check_ts, _cached_active_market
 
     now = time.time()
 
-    min_wait = ROLL_CHECK_MIN_SECONDS + _roll_backoff_seconds
-    if _cached_active_market is not None and (now - _last_roll_check_ts) < min_wait:
+    # Throttle series->market lookup
+    if _cached_active_market is not None and (now - _last_roll_check_ts) < ROLL_CHECK_MIN_SECONDS:
         return _cached_active_market
 
     _last_roll_check_ts = now
 
     try:
-        # ✅ MICRO CHANGE: send BOTH param names so the API actually filters.
-        # If Kalshi expects series_ticker, "series" gets ignored (what you’re seeing now).
-        params = {
-            "series": cfg.series_ticker,
-            "series_ticker": cfg.series_ticker,
-            "status": "open",
-        }
-        data = public_get(cfg, "/trade-api/v2/markets", params=params)
-
-        markets = _extract_markets_list(data)
+        data = public_get(
+            cfg,
+            "/trade-api/v2/markets",
+            params={"series": cfg.series_ticker, "status": "open"},
+        )
+        markets = data.get("markets") or data.get("data") or []
         if not markets:
             if _cached_active_market is not None:
                 return _cached_active_market
             raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
 
-        if _cached_active_market is not None:
-            open_tickers = {m.get("ticker") for m in markets if m.get("ticker")}
-            if _cached_active_market in open_tickers:
-                _roll_backoff_seconds = max(0.0, _roll_backoff_seconds * 0.5)
-                return _cached_active_market
-
-        _cached_active_market = _pick_deterministic_market(markets)
-
-        _roll_backoff_seconds = max(0.0, _roll_backoff_seconds * 0.5)
+        _cached_active_market = markets[0]["ticker"]
         return _cached_active_market
 
-    except Exception as e:
-        msg = str(e)
-        if "too_many_requests" in msg or "HTTP 429" in msg:
-            _roll_backoff_seconds = min(
-                ROLL_BACKOFF_MAX_SECONDS,
-                5.0 if _roll_backoff_seconds <= 0 else _roll_backoff_seconds * 2.0,
-            )
-            log.warning(
-                f"[ROLL429] backing off {_roll_backoff_seconds:.0f}s (keeping active={_cached_active_market})"
-            )
-            if _cached_active_market is not None:
-                return _cached_active_market
-
+    except Exception:
         if _cached_active_market is not None:
             return _cached_active_market
         raise
 
 
 # -----------------------------
-# Orderbook parsing
+# ✅ MICRO CHANGE: correct YES bid/ask parsing for Kalshi orderbook schema
+# Schema observed in your logs:
+#   orderbook: { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...], yes_dollars: [...], no_dollars: [...] }
+# Interp:
+#   YES best bid = max(yes prices)
+#   YES best ask = 100 - (NO best bid)    (since NO bid implies YES ask via complement)
 # -----------------------------
-def _normalize_levels(levels: Any) -> Optional[List[Tuple[int, int]]]:
-    if not levels:
+def _best_bid_from_levels(levels: Any) -> Optional[int]:
+    if not levels or not isinstance(levels, list):
         return None
-
-    if isinstance(levels, dict) and "levels" in levels:
-        levels = levels.get("levels")
-
-    out: List[Tuple[int, int]] = []
-
-    if isinstance(levels, list) and levels and isinstance(levels[0], (list, tuple)) and len(levels[0]) >= 2:
-        for row in levels:
-            try:
-                out.append((int(row[0]), int(row[1])))
-            except Exception:
-                continue
-        return out or None
-
-    if isinstance(levels, list) and levels and isinstance(levels[0], dict):
-        for row in levels:
-            try:
-                p = row.get("price") or row.get("p")
-                q = row.get("quantity") or row.get("qty") or row.get("count") or row.get("size") or row.get("q")
-                if p is None or q is None:
-                    continue
-                out.append((int(p), int(q)))
-            except Exception:
-                continue
-        return out or None
-
-    return None
-
-
-def best_price(levels: Any, want: str) -> Optional[int]:
-    norm = _normalize_levels(levels)
-    if not norm:
-        return None
-    return max(norm)[0] if want == "bid" else min(norm)[0]
-
-
-def _try_get_yes_node(ob: Dict[str, Any]) -> Optional[Any]:
-    root = ob.get("orderbook") or ob
-    return root.get("yes")
-
-
-_last_ob_debug_ts: float = 0.0
-OB_DEBUG_MIN_SECONDS = float(os.getenv("OB_DEBUG_MIN_SECONDS", "60"))
-
-
-def _tiny_sample(x: Any) -> Any:
-    if isinstance(x, dict):
-        # show first keys + type hints
-        return {k: ("<list>" if isinstance(v, list) else type(v).__name__) for k, v in list(x.items())[:8]}
-    if isinstance(x, list):
-        return x[:2]
-    return type(x).__name__
+    best: Optional[int] = None
+    for row in levels:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        try:
+            p = int(row[0])
+        except Exception:
+            continue
+        best = p if best is None else max(best, p)
+    return best
 
 
 def parse_yes_book(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    global _last_ob_debug_ts
-
     root = ob.get("orderbook") if isinstance(ob, dict) else None
-    yes_raw = _try_get_yes_node(ob)
-
-    # ✅ MICRO CHANGE: if "yes" exists but isn't dict, print its type/sample
-    if yes_raw is None or not isinstance(root, dict) or ("yes" not in root):
-        now = time.time()
-        if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
-            _last_ob_debug_ts = now
-            log.info(
-                f"[OBSCHEMA] top_keys={list(ob.keys())[:12]} "
-                f"orderbook_keys={(list(root.keys())[:12] if isinstance(root, dict) else None)}"
-            )
+    if not isinstance(root, dict):
         return None, None
 
-    if not isinstance(yes_raw, dict):
-        now = time.time()
-        if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
-            _last_ob_debug_ts = now
-            yd = root.get("yes_dollars") if isinstance(root, dict) else None
-            log.info(
-                f"[OBYES_RAW] yes_type={type(yes_raw).__name__} yes_sample={_tiny_sample(yes_raw)} "
-                f"yes_dollars_type={type(yd).__name__} yes_dollars_sample={_tiny_sample(yd)}"
-            )
-        return None, None
+    yes_levels = root.get("yes")
+    no_levels = root.get("no")
 
-    bid = best_price(yes_raw.get("bids"), "bid")
-    ask = best_price(yes_raw.get("asks"), "ask")
+    yes_bid = _best_bid_from_levels(yes_levels)
+    no_bid = _best_bid_from_levels(no_levels)
 
-    if bid is None and ask is None:
-        now = time.time()
-        if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
-            _last_ob_debug_ts = now
-            log.info(
-                f"[OBYES] yes_keys={list(yes_raw.keys())[:12]} "
-                f"bids_type={type(yes_raw.get('bids')).__name__} bids_sample={_tiny_sample(yes_raw.get('bids'))} "
-                f"asks_type={type(yes_raw.get('asks')).__name__} asks_sample={_tiny_sample(yes_raw.get('asks'))}"
-            )
+    yes_ask: Optional[int] = None
+    if no_bid is not None:
+        yes_ask = 100 - no_bid
+        if yes_ask < 1:
+            yes_ask = 1
+        if yes_ask > 99:
+            yes_ask = 99
 
-    return bid, ask
+    return yes_bid, yes_ask
 
 
 def choose_price(bid, ask, improve, max_px):
     if bid is None and ask is None:
         return None
     if bid is None:
-        px = ask - 1
+        px = (ask - 1) if ask is not None else 1
         return px if px >= 1 else 1
     px = bid + improve
     if ask is not None:
@@ -345,6 +243,13 @@ def place_yes_buy(cfg, priv, market_ticker: str, price_cents: int, qty: int):
 
 
 # -----------------------------
+# ✅ MICRO CHANGE: orderbook 429 exponential backoff
+# -----------------------------
+_ob_backoff = 0.0
+OB_BACKOFF_MAX = float(os.getenv("OB_BACKOFF_MAX_SECONDS", "30"))
+
+
+# -----------------------------
 # Main loop
 # -----------------------------
 def main():
@@ -352,11 +257,14 @@ def main():
     priv = load_private_key(cfg.private_key_b64)
 
     log.info(
-        f"SERIES={cfg.series_ticker} POLL={cfg.poll_seconds}s "
-        f"ROLL_CHECK_MIN_SECONDS={ROLL_CHECK_MIN_SECONDS}s DRY_RUN={cfg.dry_run} ENABLE_TRADING={cfg.enable_trading}"
+        f"SERIES={cfg.series_ticker} "
+        f"POLL={cfg.poll_seconds:.1f}s "
+        f"ROLL_CHECK_MIN_SECONDS={ROLL_CHECK_MIN_SECONDS:.1f}s "
+        f"DRY_RUN={cfg.dry_run} ENABLE_TRADING={cfg.enable_trading}"
     )
 
     active = None
+    global _ob_backoff
 
     while True:
         try:
@@ -365,7 +273,19 @@ def main():
                 active = ticker
                 log.info(f"[ROLL] Active market → {active}")
 
-            ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
+            # Orderbook fetch with 429 backoff
+            try:
+                ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
+                _ob_backoff = 0.0
+            except Exception as e:
+                msg = str(e)
+                if "too_many_requests" in msg or "HTTP 429" in msg:
+                    _ob_backoff = min(OB_BACKOFF_MAX, 1.0 if _ob_backoff <= 0 else _ob_backoff * 2.0)
+                    log.warning(f"[OB429] backing off {_ob_backoff:.1f}s")
+                    time.sleep(_ob_backoff)
+                    continue
+                raise
+
             bid, ask = parse_yes_book(ob)
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price)
 
