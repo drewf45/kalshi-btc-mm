@@ -1,7 +1,8 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
 # FIX: uses /markets?series=XYZ instead of non-existent /series endpoint
-# MICRO CHANGE: If YES book is empty (bid=None and ask=None) -> SKIP (do not quote)
+# MICRO CHANGE #1: If YES book is empty (bid=None and ask=None) -> SKIP (do not quote)
+# MICRO CHANGE #2 (THIS CHANGE): If bid+ask exist but spread < 2c -> SKIP (no edge)
 
 import os
 import time
@@ -9,7 +10,7 @@ import json
 import base64
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Optional
 from urllib.parse import urlencode
 
 import requests
@@ -161,8 +162,12 @@ def parse_yes_book(ob):
 
 
 def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: int) -> Optional[int]:
-    # MICRO CHANGE: if both sides are empty, do not quote
+    # If both sides are empty, do not quote
     if bid is None and ask is None:
+        return None
+
+    # MICRO CHANGE (THIS ONE): if both sides exist but spread is < 2c, do not quote
+    if bid is not None and ask is not None and (ask - bid) < 2:
         return None
 
     if bid is None:
@@ -196,9 +201,15 @@ def main():
             bid, ask = parse_yes_book(ob)
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price)
 
-            # MICRO CHANGE: skip empty books (no invented price like 99c)
             if price is None:
-                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP (empty book)")
+                # Keep reason minimal, derived from current inputs
+                if bid is None and ask is None:
+                    reason = "empty book"
+                elif bid is not None and ask is not None and (ask - bid) < 2:
+                    reason = "tight spread"
+                else:
+                    reason = "skip"
+                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({reason})")
                 continue
 
             log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
