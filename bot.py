@@ -1,30 +1,18 @@
 # bot.py
-# Kalshi YES-only quoting bot (fast loop)
-# - Resolves the CURRENT active market from a SERIES TICKER (so you don't have to hardcode MARKET_TICKER)
-# - Signs requests using the EXACT body bytes that are sent (prevents INCORRECT_API_KEY_SIGNATURE mismatches)
+# Kalshi YES-only quoting bot (fast loop) with correct signing (includes query + body)
 #
 # REQUIRED ENV:
-#   KALSHI_API_KEY_ID              = your Kalshi API key ID (UUID)
-#   KALSHI_PRIVATE_KEY_PEM_BASE64  = base64 of the downloaded .pem private key (UNENCRYPTED)
+#   KALSHI_API_KEY_ID              = your Kalshi API key ID (looks like a UUID)
+#   KALSHI_PRIVATE_KEY_PEM_BASE64  = base64 of the downloaded .pem private key
 #
-# REQUIRED FOR SERIES RESOLVE:
-#   SERIES_TICKER                  = e.g. KXBTC15M   (series ticker, NOT full market ticker)
+# STRONGLY RECOMMENDED ENV:
+#   KALSHI_API_BASE                = https://trading-api.kalshi.com   (default below)
 #
-# OPTIONAL:
-#   KALSHI_API_BASE                = https://trading-api.kalshi.com   (default)
-#   POLL_SECONDS                   = 1
-#   ENABLE_TRADING                 = false (default)
-#   DRY_RUN                        = true  (default)
-#   BASE_SIZE                      = 1
-#   POST_ONLY                      = true
-#   IMPROVE_TICKS                  = 1
-#   MAX_BUY_PRICE_CENTS            = 99
-#   SUBACCOUNT                     = (optional subaccount string if you use one)
+# SERIES MODE (15-min rolling markets)  ✅ THIS IS THE CHANGE
+#   SERIES_TICKER                  = series prefix (e.g. KXBTC15M)
 #
-# NOTES:
-# - Public endpoints: orderbook + markets list (no auth)
-# - Private endpoints: portfolio/orders (auth)
-# - If you still get 401 INCORRECT_API_KEY_SIGNATURE, your key-id and PEM likely don't match.
+# SAFETY DEFAULTS:
+#   ENABLE_TRADING=false by default (dry-run logging only)
 
 import os
 import time
@@ -49,7 +37,7 @@ log = logging.getLogger("kalshi-bot")
 
 
 # -----------------------------
-# Config helpers
+# Config
 # -----------------------------
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -78,7 +66,7 @@ class BotConfig:
     api_key_id: str
     private_key_pem_b64: str
 
-    # dynamic resolve:
+    # In SERIES mode, this holds the SERIES_TICKER (e.g. KXBTC15M)
     series_ticker: str
 
     poll_seconds: float
@@ -91,13 +79,13 @@ class BotConfig:
     improve_ticks: int
     max_buy_price_cents: int  # never buy above this
 
-    subaccount: str
-
 
 def load_config() -> BotConfig:
     api_base = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").strip().rstrip("/")
     api_key_id = os.getenv("KALSHI_API_KEY_ID", "").strip()
     private_key_pem_b64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_BASE64", "").strip()
+
+    # ✅ CHANGE: read SERIES_TICKER instead of MARKET_TICKER
     series_ticker = os.getenv("SERIES_TICKER", "").strip()
 
     if not api_key_id:
@@ -113,7 +101,7 @@ def load_config() -> BotConfig:
         private_key_pem_b64=private_key_pem_b64,
         series_ticker=series_ticker,
 
-        poll_seconds=env_float("POLL_SECONDS", 1.0),
+        poll_seconds=float(os.getenv("POLL_SECONDS", "1").strip()),
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
 
@@ -121,8 +109,6 @@ def load_config() -> BotConfig:
         post_only=env_bool("POST_ONLY", True),
         improve_ticks=env_int("IMPROVE_TICKS", 1),
         max_buy_price_cents=env_int("MAX_BUY_PRICE_CENTS", 99),
-
-        subaccount=os.getenv("SUBACCOUNT", "").strip(),
     )
 
 
@@ -143,8 +129,6 @@ def _canonical_json(obj: Optional[dict]) -> str:
 def _build_path_with_query(path: str, params: Optional[dict]) -> str:
     if not params:
         return path
-    # urlencode will be deterministic for a dict in py3.7+ insertion order;
-    # we build params in a stable order anyway
     return f"{path}?{urlencode(params)}"
 
 
@@ -154,53 +138,30 @@ def _sign(private_key, ts_ms: str, method: str, path_with_query: str, body_str: 
     return base64.b64encode(sig).decode("utf-8")
 
 
-def _headers(cfg: BotConfig, private_key, method: str, path_with_query: str, body_str: str) -> Dict[str, str]:
+def _headers(cfg: BotConfig, private_key, method: str, path_with_query: str, json_body: Optional[dict]) -> Dict[str, str]:
     ts_ms = str(int(time.time() * 1000))
+    body_str = _canonical_json(json_body) if method.upper() in ("POST", "PUT", "PATCH") else ""
     sig = _sign(private_key, ts_ms, method, path_with_query, body_str)
-    hdrs = {
+
+    return {
         "KALSHI-ACCESS-KEY": cfg.api_key_id,
         "KALSHI-ACCESS-TIMESTAMP": ts_ms,
         "KALSHI-ACCESS-SIGNATURE": sig,
         "Content-Type": "application/json",
     }
-    # optional subaccount header (only if you use it)
-    if cfg.subaccount:
-        hdrs["KALSHI-SUBACCOUNT"] = cfg.subaccount
-    return hdrs
 
 
 # -----------------------------
 # HTTP helpers
 # -----------------------------
-def _req_json(
-    cfg: BotConfig,
-    private_key,
-    method: str,
-    path: str,
-    params: Optional[dict] = None,
-    json_body: Optional[dict] = None,
-    timeout: int = 20,
-) -> Any:
+def _req_json(cfg: BotConfig, private_key, method: str, path: str, params: Optional[dict] = None,
+             json_body: Optional[dict] = None, timeout: int = 20) -> Any:
     path_with_query = _build_path_with_query(path, params)
     url = cfg.api_base + path_with_query
-
-    # IMPORTANT: sign EXACTLY the bytes sent over the wire
-    body_str = ""
-    data_payload = None
-    if method.upper() in ("POST", "PUT", "PATCH"):
-        body_str = _canonical_json(json_body) if json_body is not None else ""
-        data_payload = body_str
-
-    hdrs = _headers(cfg, private_key, method, path_with_query, body_str)
+    hdrs = _headers(cfg, private_key, method, path_with_query, json_body)
 
     log.info(f"[REQ] {method.upper()} {path_with_query}")
-    r = requests.request(
-        method.upper(),
-        url,
-        headers=hdrs,
-        data=data_payload,  # DO NOT use json= (would re-serialize differently)
-        timeout=timeout,
-    )
+    r = requests.request(method.upper(), url, headers=hdrs, json=json_body, timeout=timeout)
 
     try:
         data = r.json()
@@ -229,40 +190,6 @@ def public_get(cfg: BotConfig, path: str, params: Optional[dict] = None, timeout
 # -----------------------------
 # Kalshi endpoints (v2)
 # -----------------------------
-def list_open_markets_for_series(cfg: BotConfig, series_ticker: str, limit: int = 200) -> List[dict]:
-    # Public in your logs
-    data = public_get(cfg, "/trade-api/v2/markets", params={"limit": limit, "series_ticker": series_ticker, "status": "open"})
-    # Common shapes
-    if isinstance(data, dict):
-        for k in ("markets", "data", "results"):
-            if k in data and isinstance(data[k], list):
-                return data[k]
-    if isinstance(data, list):
-        return data
-    return []
-
-
-def resolve_active_market_ticker(cfg: BotConfig) -> str:
-    markets = list_open_markets_for_series(cfg, cfg.series_ticker, limit=200)
-    if not markets:
-        raise RuntimeError(f"No open markets found for series_ticker={cfg.series_ticker}")
-
-    # Prefer the first open market returned.
-    # If API returns multiple, you can refine selection here (e.g., nearest close time).
-    # For your BTC15M case, you were seeing markets=1.
-    picked = None
-    for m in markets:
-        t = m.get("ticker") or m.get("market_ticker")
-        if t:
-            picked = t
-            break
-
-    if not picked:
-        raise RuntimeError(f"Could not find ticker in markets response for series_ticker={cfg.series_ticker}")
-
-    return str(picked)
-
-
 def get_orderbook(cfg: BotConfig, ticker: str) -> dict:
     return public_get(cfg, f"/trade-api/v2/markets/{ticker}/orderbook")
 
@@ -291,15 +218,14 @@ def create_order_yes_buy(cfg: BotConfig, private_key, ticker: str, price_cents: 
         "action": "buy",
         "side": "yes",
         "type": "limit",
-        "yes_price": int(price_cents),
-        "count": int(size),
+        "yes_price": price_cents,
+        "count": size,
         "post_only": bool(post_only),
     }
     return _req_json(cfg, private_key, "POST", "/trade-api/v2/portfolio/orders", params=None, json_body=body)
 
 
 def cancel_order(cfg: BotConfig, private_key, order_id: str) -> Optional[dict]:
-    # Endpoint may differ by account/version; keep best-effort.
     try:
         return _req_json(cfg, private_key, "POST", f"/trade-api/v2/portfolio/orders/{order_id}/cancel", params=None, json_body={})
     except Exception as e:
@@ -308,16 +234,43 @@ def cancel_order(cfg: BotConfig, private_key, order_id: str) -> Optional[dict]:
 
 
 # -----------------------------
+# ✅ SERIES MODE helper (15-min rolling markets)
+# -----------------------------
+def resolve_active_market_ticker(cfg: BotConfig) -> str:
+    """
+    Uses SERIES_TICKER (e.g. KXBTC15M) and returns the currently OPEN market ticker.
+    If the endpoint shape differs, paste the JSON and I’ll adjust in one shot.
+    """
+    data = public_get(cfg, f"/trade-api/v2/series/{cfg.series_ticker}/markets")
+
+    # Common shapes: {"markets":[{...}]} or {"data":{"markets":[...]}}
+    markets = None
+    if isinstance(data, dict):
+        if isinstance(data.get("markets"), list):
+            markets = data["markets"]
+        elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("markets"), list):
+            markets = data["data"]["markets"]
+
+    if not markets:
+        raise RuntimeError(f"No markets found for series {cfg.series_ticker}: {data}")
+
+    for m in markets:
+        if (m.get("status") or "").lower() == "open":
+            t = m.get("ticker")
+            if t:
+                return t
+
+    # Fallback: if none marked open, take first ticker
+    t0 = markets[0].get("ticker")
+    if not t0:
+        raise RuntimeError(f"Could not find ticker in markets list for series {cfg.series_ticker}: {markets[:2]}")
+    return t0
+
+
+# -----------------------------
 # Orderbook parsing (YES only)
 # -----------------------------
 def _best_from_levels(levels: Any, want: str) -> Optional[Tuple[int, int]]:
-    """
-    levels can be:
-      - list of [price, qty] or {"price":..,"qty":..}
-      - dict mapping price->qty
-    want: "bid" (highest price) or "ask" (lowest price)
-    returns (price_cents, qty)
-    """
     if levels is None:
         return None
 
@@ -355,20 +308,15 @@ def _best_from_levels(levels: Any, want: str) -> Optional[Tuple[int, int]]:
 
 
 def parse_yes_best_bid_ask(ob: dict) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Tries likely Kalshi shapes.
-    Returns (best_bid_cents, best_ask_cents) for YES.
-    """
-    root = ob.get("orderbook") if isinstance(ob, dict) and "orderbook" in ob else ob
-    if not isinstance(root, dict):
-        return (None, None)
+    root = ob.get("orderbook") if isinstance(ob, dict) else None
+    if root is None:
+        root = ob
 
-    yes = root.get("yes")
-    if not isinstance(yes, dict):
-        # some shapes might nest deeper
-        nested = root.get("orderbook")
-        if isinstance(nested, dict):
-            yes = nested.get("yes")
+    yes = None
+    if isinstance(root, dict):
+        yes = root.get("yes")
+        if yes is None and "orderbook" in root and isinstance(root["orderbook"], dict):
+            yes = root["orderbook"].get("yes")
 
     if not isinstance(yes, dict):
         return (None, None)
@@ -386,11 +334,6 @@ def parse_yes_best_bid_ask(ob: dict) -> Tuple[Optional[int], Optional[int]]:
 # Strategy (YES-only)
 # -----------------------------
 def choose_yes_buy_price(best_bid: Optional[int], best_ask: Optional[int], improve_ticks: int, max_buy: int) -> int:
-    """
-    Maker-ish logic:
-      - If there's a best_bid, improve it by improve_ticks (but never >= best_ask)
-      - If no book, bid at max_buy
-    """
     if best_bid is None and best_ask is None:
         return max_buy
 
@@ -412,16 +355,14 @@ def find_existing_yes_buy(open_orders: List[dict], ticker: str) -> Optional[dict
             continue
         side = (o.get("side") or o.get("contract") or o.get("outcome") or "").lower()
         action = (o.get("action") or o.get("direction") or "").lower()
-        if action == "buy" and side == "yes":
+        if "yes" in side and "buy" in action:
             return o
-        if "buy" in action and "yes" in side:
+        if action == "buy" and side == "yes":
             return o
     return None
 
 
 def order_price_cents(order: dict) -> Optional[int]:
-    if not order:
-        return None
     for k in ("yes_price", "price", "price_cents", "limit_price"):
         if k in order:
             try:
@@ -438,26 +379,23 @@ def main():
     cfg = load_config()
     private_key = load_private_key_from_env(cfg.private_key_pem_b64)
 
-    log.info(f"[BOOT] API_BASE={cfg.api_base} SERIES_TICKER={cfg.series_ticker} POLL_SECONDS={cfg.poll_seconds:.2f}")
-    log.info(f"[BOOT] ENABLE_TRADING={cfg.enable_trading} DRY_RUN={cfg.dry_run} SUBACCOUNT={'set' if cfg.subaccount else ''}")
-    log.info(f"[BOOT] YES-only: BASE_SIZE={cfg.base_size} POST_ONLY={cfg.post_only} IMPROVE_TICKS={cfg.improve_ticks} MAX_BUY_PRICE_CENTS={cfg.max_buy_price_cents}")
+    log.info(f"API_BASE={cfg.api_base}")
+    log.info(f"SERIES_TICKER={cfg.series_ticker}")
+    log.info(f"ENABLE_TRADING={cfg.enable_trading} DRY_RUN={cfg.dry_run} POLL_SECONDS={cfg.poll_seconds}")
+    log.info(f"YES-only: BASE_SIZE={cfg.base_size} POST_ONLY={cfg.post_only} IMPROVE_TICKS={cfg.improve_ticks} MAX_BUY_PRICE_CENTS={cfg.max_buy_price_cents}")
 
     active_ticker = None
-    last_resolve_ts = 0.0
-    RESOLVE_EVERY_SECONDS = 15.0  # re-resolve often enough to follow your 15m markets
 
     while True:
         t0 = time.time()
         try:
-            # Resolve current market ticker from series
-            if (active_ticker is None) or (time.time() - last_resolve_ts >= RESOLVE_EVERY_SECONDS):
-                new_ticker = resolve_active_market_ticker(cfg)
-                last_resolve_ts = time.time()
-                if new_ticker != active_ticker:
-                    active_ticker = new_ticker
-                    log.info(f"[MARKET] Switched active ticker -> {active_ticker}")
+            # ✅ Resolve the currently active market from the series (rolling every 15m)
+            resolved = resolve_active_market_ticker(cfg)
+            if resolved != active_ticker:
+                active_ticker = resolved
+                log.info(f"[SERIES] Active market -> {active_ticker}")
 
-            # Orderbook (public)
+            # Orderbook
             ob = get_orderbook(cfg, active_ticker)
             preview = {"keys": list(ob.keys())} if isinstance(ob, dict) else {"type": str(type(ob))}
             log.info(f"[OB] {active_ticker} orderbook_preview={preview}")
@@ -468,16 +406,17 @@ def main():
             target_px = choose_yes_buy_price(best_bid, best_ask, cfg.improve_ticks, cfg.max_buy_price_cents)
             log.info(f"[QUOTE] {active_ticker} target YES buy = {target_px}c post_only={cfg.post_only}")
 
-            # Portfolio (auth)
+            # Open orders (auth required)
             open_orders = list_open_orders(cfg, private_key)
             existing = find_existing_yes_buy(open_orders, active_ticker)
-            existing_px = order_price_cents(existing)
+            existing_px = order_price_cents(existing) if existing else None
 
             if existing:
-                log.info(f"[OPEN] Found existing YES buy order price={existing_px}c id={existing.get('id') or existing.get('order_id')}")
+                log.info(f"[OPEN] Found existing YES buy order (price={existing_px}c) id={existing.get('id') or existing.get('order_id')}")
             else:
                 log.info("[OPEN] No existing YES buy order found for this market")
 
+            # Place / replace
             if existing and existing_px == target_px:
                 log.info("[SKIP] Existing order already at target price")
             else:
