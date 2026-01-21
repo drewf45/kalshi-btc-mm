@@ -62,7 +62,7 @@ BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
-MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "2"))  # ✅ NEW: require at least this spread to quote
+MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "2"))
 
 # -----------------------------
 # Logging
@@ -85,7 +85,7 @@ KALSHI_PRIVATE_KEY_RAW = getenv_first(
 ).strip()
 
 if not KALSHI_PRIVATE_KEY_RAW:
-    # Render env key in your screenshots is: KALSHI_PRIVATE_KEY_PEM_BASE64
+    # Render env key in your logs: KALSHI_PRIVATE_KEY_PEM_BASE64
     KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]).strip()
 
 _detected_kalshi_keys = env_keys_with_prefix("KALSHI_")
@@ -283,7 +283,6 @@ def roll_active_market() -> str:
     if _active_market_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
         return _active_market_ticker
 
-    # If user pins event, still resolve market via /markets.
     if EVENT_TICKER:
         evt, mkt = resolve_event_and_market_via_markets(SERIES)
         if not mkt:
@@ -336,7 +335,6 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any]) -> Tuple[Optional[int], O
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
-    # Derive YES ask from NO best bid: if someone bids NO at X, they offer YES at (100 - X)
     yes_ask = None
     if no_bid is not None:
         yes_ask = 100 - no_bid
@@ -348,17 +346,13 @@ def fetch_orderbook(market_ticker: str) -> Dict[str, Any]:
     return request_json("GET", f"/markets/{market_ticker}/orderbook")
 
 # -----------------------------
-# ✅ NEW: quote target calculator (YES-only)
+# Quote target calculator (YES-only)
 # -----------------------------
 def clamp_price(p: int) -> int:
     return max(1, min(99, p))
 
 
 def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) -> Tuple[Optional[int], Optional[int], str]:
-    """
-    Returns (target_bid, target_ask, reason).
-    YES-only: we quote inside the current spread when it's wide enough.
-    """
     if yes_bid is None or yes_ask is None:
         return (None, None, "missing_bid_or_ask")
 
@@ -369,12 +363,9 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
 
-    # Place 1 tick inside the best prices, while maintaining EDGE_CENTS away from the opposite side
-    # (simple and safe for now)
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
-    # Enforce edge: ensure bid <= (yes_ask - EDGE) and ask >= (yes_bid + EDGE)
     max_bid = clamp_price(yes_ask - EDGE_CENTS)
     min_ask = clamp_price(yes_bid + EDGE_CENTS)
 
@@ -387,7 +378,7 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     return (bid, ask, f"ok(spread={spread})")
 
 # -----------------------------
-# Main loop
+# Main loop (✅ only log on change)
 # -----------------------------
 def main():
     log.info(
@@ -396,25 +387,49 @@ def main():
         EVENT_TICKER or "<auto>", MARKET_TICKER_OVERRIDE or "<none>",
         POLL, DRY_RUN, ENABLE_TRADING
     )
-
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
+
+    last_market: Optional[str] = None
+    last_yes_bid: Optional[int] = None
+    last_yes_ask: Optional[int] = None
+    last_tb: Optional[int] = None
+    last_ta: Optional[int] = None
+    last_why: Optional[str] = None
 
     while True:
         try:
             mkt = roll_active_market()
+
+            # If market changed, force a fresh log of everything once
+            market_changed = (mkt != last_market)
+            if market_changed:
+                last_market = mkt
+                last_yes_bid = None
+                last_yes_ask = None
+                last_tb = None
+                last_ta = None
+                last_why = None
+
             ob = fetch_orderbook(mkt)
             yes_bid, yes_ask = get_yes_bid_ask(ob)
 
-            if yes_bid is None and yes_ask is None:
-                log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
-            else:
-                log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
+            quote_changed = (yes_bid != last_yes_bid) or (yes_ask != last_yes_ask) or market_changed
+            if quote_changed:
+                last_yes_bid, last_yes_ask = yes_bid, yes_ask
+                if yes_bid is None and yes_ask is None:
+                    log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
+                else:
+                    log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
 
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
-            if tb is None or ta is None:
-                log.info("[TARGET] %s → SKIP (%s)", mkt, why)
-            else:
-                log.info("[TARGET] %s YES-only would_quote: bid@%d ask@%d (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
+
+            target_changed = (tb != last_tb) or (ta != last_ta) or (why != last_why) or market_changed
+            if target_changed:
+                last_tb, last_ta, last_why = tb, ta, why
+                if tb is None or ta is None:
+                    log.info("[TARGET] %s → SKIP (%s)", mkt, why)
+                else:
+                    log.info("[TARGET] %s YES-only would_quote: bid@%d ask@%d (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
 
         except Exception as e:
             log.error("[LOOPERR] %s", e)
