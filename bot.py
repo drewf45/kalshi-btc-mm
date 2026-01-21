@@ -84,6 +84,7 @@ KALSHI_PRIVATE_KEY_RAW = getenv_first(
 ).strip()
 
 if not KALSHI_PRIVATE_KEY_RAW:
+    # Render env key in your screenshots is: KALSHI_PRIVATE_KEY_PEM_BASE64
     KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]).strip()
 
 _detected_kalshi_keys = env_keys_with_prefix("KALSHI_")
@@ -189,14 +190,12 @@ def request_json(
             raise RuntimeError(f"Bad JSON response for {path}: {text_head!r}")
 
 # -----------------------------
-# Rolling: SERIES -> EVENT -> MARKET
+# Rolling via /markets ONLY
+# (micro change: stop calling /series/* or /events* endpoints entirely)
 # -----------------------------
 _last_roll_ts = 0.0
 _active_event_ticker: Optional[str] = None
 _active_market_ticker: Optional[str] = None
-
-# ✅ MICRO CHANGE: remember if /events/{event}/markets is unsupported (404)
-_event_markets_supported: Optional[bool] = None
 
 
 def _parse_dt_to_ts(s: Any) -> float:
@@ -258,47 +257,21 @@ def resolve_event_and_market_via_markets(series_ticker: str) -> Tuple[Optional[s
             if not best:
                 continue
 
-            log.info("[MARKETS] Sample market keys: %s", sorted(list(best.keys())))
-
             mkt_ticker = best.get("ticker") or best.get("market_ticker")
             evt_ticker = best.get("event_ticker") or best.get("event") or best.get("eventTicker")
 
-            return (evt_ticker, mkt_ticker)
+            if mkt_ticker and evt_ticker:
+                return (evt_ticker, mkt_ticker)
         except Exception as e:
             last_err = e
             continue
 
-    log.warning("[MARKETS] Could not resolve via /markets fallback: %s", last_err)
+    log.warning("[MARKETS] Could not resolve via /markets: %s", last_err)
     return (None, None)
 
 
-def roll_active_event() -> str:
-    global _last_roll_ts, _active_event_ticker, _active_market_ticker
-
-    if EVENT_TICKER:
-        if _active_event_ticker != EVENT_TICKER:
-            log.info("[ROLL] Using EVENT_TICKER override → %s", EVENT_TICKER)
-        _active_event_ticker = EVENT_TICKER
-        return _active_event_ticker
-
-    now = time.time()
-    if _active_event_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
-        return _active_event_ticker
-
-    # On elections host, the reliable resolver is /markets
-    evt, mkt = resolve_event_and_market_via_markets(SERIES)
-    if not evt:
-        raise RuntimeError(f"Could not auto-resolve active EVENT for series {SERIES} via /markets.")
-
-    _active_event_ticker = evt
-    _active_market_ticker = mkt
-    _last_roll_ts = time.time()
-    log.info("[ROLL] Series=%s → Active event → %s (via markets)", SERIES, _active_event_ticker)
-    return _active_event_ticker
-
-
 def roll_active_market() -> str:
-    global _active_market_ticker, _event_markets_supported
+    global _last_roll_ts, _active_event_ticker, _active_market_ticker
 
     if MARKET_TICKER_OVERRIDE:
         if _active_market_ticker != MARKET_TICKER_OVERRIDE:
@@ -310,50 +283,30 @@ def roll_active_market() -> str:
     if _active_market_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
         return _active_market_ticker
 
-    # ensure event is resolved (also sets _active_market_ticker via /markets)
-    event_ticker = roll_active_event()
-
-    # ✅ MICRO CHANGE: if event->markets unsupported, do NOT call it again
-    if _event_markets_supported is False:
+    # If user pins event, we still resolve market via /markets since events endpoints are unreliable on this host.
+    if EVENT_TICKER:
         evt, mkt = resolve_event_and_market_via_markets(SERIES)
-        if mkt:
-            if _active_market_ticker != mkt:
-                log.info("[ROLL] (fallback) Active market → %s", mkt)
-            _active_market_ticker = mkt
-            return _active_market_ticker
-        raise RuntimeError("event->markets unsupported and /markets fallback did not return a market ticker.")
-
-    # try event->markets ONCE; if 404, permanently disable it for this host
-    try:
-        data = request_json("GET", f"/events/{event_ticker}/markets", params={"limit": 200})
-        markets = data.get("markets") or data.get("data") or data.get("results") or []
-        if not isinstance(markets, list) or not markets:
-            raise RuntimeError(f"No markets returned for event {event_ticker}. keys={list(data.keys())}")
-
-        best = pick_open_market(markets)
-        if not best:
-            raise RuntimeError(f"Could not pick a market for event {event_ticker} (markets={len(markets)})")
-
-        picked = best.get("ticker") or best.get("market_ticker")
-        if not picked:
-            raise RuntimeError(f"Picked market missing ticker fields for event {event_ticker}")
-
-        _event_markets_supported = True
-        if _active_market_ticker != picked:
-            log.info("[ROLL] Event=%s → Active market → %s", event_ticker, picked)
-        _active_market_ticker = picked
+        if not mkt:
+            raise RuntimeError(f"Could not resolve market via /markets for series={SERIES} (EVENT_TICKER pinned={EVENT_TICKER}).")
+        _active_event_ticker = EVENT_TICKER
+        _active_market_ticker = mkt
+        _last_roll_ts = time.time()
+        log.info("[ROLL] Event pinned=%s → Active market → %s (via /markets)", _active_event_ticker, _active_market_ticker)
         return _active_market_ticker
 
-    except Exception as e:
-        msg = str(e)
-        if "HTTP 404" in msg and "/events/" in msg and "/markets" in msg:
-            _event_markets_supported = False
-            log.warning("[ROLL] event->markets unsupported on this host; using /markets resolver")
-            evt, mkt = resolve_event_and_market_via_markets(SERIES)
-            if mkt:
-                _active_market_ticker = mkt
-                return _active_market_ticker
-        raise
+    evt, mkt = resolve_event_and_market_via_markets(SERIES)
+    if not evt or not mkt:
+        raise RuntimeError(f"Could not auto-resolve active event/market for series={SERIES} via /markets.")
+
+    changed = (evt != _active_event_ticker) or (mkt != _active_market_ticker)
+    _active_event_ticker = evt
+    _active_market_ticker = mkt
+    _last_roll_ts = time.time()
+
+    if changed:
+        log.info("[ROLL] Series=%s → Active event=%s market=%s (via /markets)", SERIES, _active_event_ticker, _active_market_ticker)
+
+    return _active_market_ticker
 
 # -----------------------------
 # Orderbook parsing (binary)
