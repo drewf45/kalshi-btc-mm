@@ -71,9 +71,7 @@ def load_config() -> BotConfig:
 # Auth / signing
 # -----------------------------
 def load_private_key(b64: str):
-    return serialization.load_pem_private_key(
-        base64.b64decode(b64), password=None
-    )
+    return serialization.load_pem_private_key(base64.b64decode(b64), password=None)
 
 
 def sign_request(priv, ts: str, method: str, path_qs: str) -> str:
@@ -126,11 +124,51 @@ def public_get(cfg, path, params=None):
 
 
 # -----------------------------
-# ✅ MICRO CHANGE: sticky + throttled roll resolver to prevent 429 + random market fallback
+# ✅ MICRO CHANGE: sticky + throttled roll resolver
+# - Stay on current active market as long as it's still open
+# - Only roll when active disappears from open list
 # -----------------------------
 _last_roll_check_ts: float = 0.0
 _cached_active_market: Optional[str] = None
 ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "10"))
+
+
+def _extract_markets_list(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return data.get("markets") or data.get("data") or []
+
+
+def _market_is_open(m: Dict[str, Any]) -> bool:
+    # tolerate different key names
+    status = (m.get("status") or "").lower()
+    if status:
+        return status == "open"
+    # if no status provided, assume caller filtered to open
+    return True
+
+
+def _pick_deterministic_market(markets: List[Dict[str, Any]]) -> str:
+    """
+    Deterministic pick to avoid reshuffle:
+    - Prefer earliest close time if present; else alphabetical ticker.
+    """
+    def close_key(m: Dict[str, Any]) -> str:
+        # common variants
+        return (
+            m.get("close_time")
+            or m.get("close_ts")
+            or m.get("expiration_time")
+            or m.get("settlement_time")
+            or ""
+        )
+
+    # If close times exist, sort by them then ticker
+    have_close = any(close_key(m) for m in markets)
+    if have_close:
+        markets = sorted(markets, key=lambda m: (close_key(m), m.get("ticker", "")))
+    else:
+        markets = sorted(markets, key=lambda m: m.get("ticker", ""))
+
+    return markets[0]["ticker"]
 
 
 def resolve_active_market(cfg) -> str:
@@ -144,47 +182,124 @@ def resolve_active_market(cfg) -> str:
 
     _last_roll_check_ts = now
 
-    try:
-        data = public_get(
-            cfg,
-            "/trade-api/v2/markets",
-            params={"series": cfg.series_ticker, "status": "open"},
-        )
-        markets = data.get("markets") or data.get("data") or []
-        if not markets:
-            # If series returns nothing, keep last active rather than switching to random
-            if _cached_active_market is not None:
-                return _cached_active_market
-            raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
+    data = public_get(
+        cfg,
+        "/trade-api/v2/markets",
+        params={"series": cfg.series_ticker, "status": "open"},
+    )
+    markets = _extract_markets_list(data)
 
-        _cached_active_market = markets[0]["ticker"]
-        return _cached_active_market
-
-    except Exception as e:
-        # On 429 or any transient issue, keep last active market
+    if not markets:
         if _cached_active_market is not None:
             return _cached_active_market
-        raise
+        raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
+
+    # If we already have an active market and it's still in the open set, STAY there.
+    if _cached_active_market is not None:
+        open_tickers = {m.get("ticker") for m in markets if m.get("ticker")}
+        if _cached_active_market in open_tickers:
+            return _cached_active_market
+
+    # Otherwise pick deterministically (no random reshuffle)
+    _cached_active_market = _pick_deterministic_market(markets)
+    return _cached_active_market
 
 
 # -----------------------------
 # Orderbook parsing
 # -----------------------------
-def best_price(levels, want):
+def _normalize_levels(levels: Any) -> Optional[List[Tuple[int, int]]]:
+    """
+    Accepts:
+      - [[price, qty], ...]
+      - [{"price": 55, "quantity": 10}, ...]  (or qty/count/size)
+    Returns list[(price:int, qty:int)] or None
+    """
     if not levels:
         return None
-    pairs = [(int(p), int(q)) for p, q in levels]
-    return max(pairs)[0] if want == "bid" else min(pairs)[0]
+
+    out: List[Tuple[int, int]] = []
+
+    # list of lists
+    if isinstance(levels, list) and levels and isinstance(levels[0], (list, tuple)) and len(levels[0]) >= 2:
+        for row in levels:
+            try:
+                p = int(row[0])
+                q = int(row[1])
+                out.append((p, q))
+            except Exception:
+                continue
+        return out or None
+
+    # list of dicts
+    if isinstance(levels, list) and levels and isinstance(levels[0], dict):
+        for row in levels:
+            try:
+                p = row.get("price") or row.get("p")
+                q = row.get("quantity") or row.get("qty") or row.get("count") or row.get("size") or row.get("q")
+                if p is None or q is None:
+                    continue
+                out.append((int(p), int(q)))
+            except Exception:
+                continue
+        return out or None
+
+    return None
 
 
-def parse_yes_book(ob):
-    yes = ob.get("orderbook", {}).get("yes")
+def best_price(levels: Any, want: str) -> Optional[int]:
+    norm = _normalize_levels(levels)
+    if not norm:
+        return None
+    return max(norm)[0] if want == "bid" else min(norm)[0]
+
+
+def _try_get_yes_node(ob: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Try multiple schemas:
+      - {"orderbook": {"yes": {"bids":..., "asks":...}}}
+      - {"orderbook": {"yes_bids":..., "yes_asks":...}}
+      - {"yes": {"bids":..., "asks":...}}
+    """
+    root = ob.get("orderbook") or ob
+
+    # classic
+    yes = root.get("yes")
+    if isinstance(yes, dict):
+        return yes
+
+    # alternate flattened keys
+    if any(k in root for k in ("yes_bids", "yes_asks")):
+        return {"bids": root.get("yes_bids"), "asks": root.get("yes_asks")}
+
+    return None
+
+
+# ✅ MICRO CHANGE: more robust YES parsing + one-line debug hint when empty
+_last_ob_schema_log_ts: float = 0.0
+OB_SCHEMA_LOG_MIN_SECONDS = float(os.getenv("OB_SCHEMA_LOG_MIN_SECONDS", "60"))
+
+
+def parse_yes_book(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    global _last_ob_schema_log_ts
+
+    yes = _try_get_yes_node(ob)
     if not yes:
+        # print schema hint occasionally so we can align parser
+        now = time.time()
+        if (now - _last_ob_schema_log_ts) >= OB_SCHEMA_LOG_MIN_SECONDS:
+            _last_ob_schema_log_ts = now
+            root = ob.get("orderbook") if isinstance(ob, dict) else None
+            log.info(
+                f"[OBSCHEMA] missing YES node; top_keys={list(ob.keys())[:12]} "
+                f"orderbook_keys={(list(root.keys())[:12] if isinstance(root, dict) else None)}"
+            )
         return None, None
-    return (
-        best_price(yes.get("bids"), "bid"),
-        best_price(yes.get("asks"), "ask"),
-    )
+
+    bid = best_price(yes.get("bids"), "bid")
+    ask = best_price(yes.get("asks"), "ask")
+
+    return bid, ask
 
 
 def choose_price(bid, ask, improve, max_px):
