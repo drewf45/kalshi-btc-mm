@@ -504,40 +504,13 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
 
     spread = yes_ask - yes_bid
 
-    # Micro #3: allow one-sided quoting when spread is tight
+    # =========================================================
+    # CHANGE #2 (ONLY):
+    # Require MIN_SPREAD_CENTS before quoting anything.
+    # This disables "join best bid/ask" and "one-sided tight"
+    # behavior when spread is 1–2 cents.
+    # =========================================================
     if spread < MIN_SPREAD_CENTS:
-        if not ENABLE_ONE_SIDED_TIGHT:
-            return (None, None, f"spread_too_tight({spread})")
-
-        buy_p = clamp_price(yes_bid + TICK_CENTS)
-        sell_p = clamp_price(yes_ask - TICK_CENTS)
-
-        buy_ok = buy_p < yes_ask
-        sell_ok = sell_p > yes_bid
-
-        if EDGE_CENTS > 0:
-            buy_ok = buy_ok and (buy_p <= clamp_price(yes_ask - EDGE_CENTS))
-            sell_ok = sell_ok and (sell_p >= clamp_price(yes_bid + EDGE_CENTS))
-
-        if buy_ok and sell_ok:
-            if buy_p >= sell_p:
-                return (buy_p, None, f"tight_one_sided(buy_only spread={spread})")
-            return (buy_p, sell_p, f"tight_two_sided(spread={spread})")
-
-        if buy_ok:
-            return (buy_p, None, f"tight_one_sided(buy_only spread={spread})")
-        if sell_ok:
-            return (None, sell_p, f"tight_one_sided(sell_only spread={spread})")
-
-        # ✅ Micro change: when spread is so tight we can't step inside (e.g. spread=1),
-        # join the best level instead of skipping entirely.
-        if ENABLE_JOIN_TIGHT_SPREAD:
-            # Prefer joining the bid (keeps you as maker if POST_ONLY)
-            if yes_bid is not None and yes_bid < yes_ask:
-                return (clamp_price(int(yes_bid)), None, f"tight_join(buy@best_bid spread={spread})")
-            if yes_ask is not None and yes_ask > yes_bid:
-                return (None, clamp_price(int(yes_ask)), f"tight_join(sell@best_ask spread={spread})")
-
         return (None, None, f"spread_too_tight({spread})")
 
     # Normal two-sided quoting
