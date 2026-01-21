@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: track last_intended_price (intent hygiene for future order placement)
+# MICRO CHANGE: require 2c "room to ask" before quoting (edge buffer)
 
 import os
 import time
@@ -151,10 +151,18 @@ def parse_yes_book(ob):
 def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: int) -> Optional[int]:
     if bid is None and ask is None:
         return None
-    if bid is not None and ask is not None and (ask - bid) < 2:
-        return None
+
+    if bid is not None and ask is not None:
+        # Keep existing tight-spread guard
+        if (ask - bid) < 2:
+            return None
+        # MICRO CHANGE: require 2c room to the ask after improvement
+        if (ask - (bid + improve)) < 2:
+            return None
+
     if bid is None:
         return min(ask - 1, max_px)
+
     px = bid + improve
     if ask is not None:
         px = min(px, ask - 1)
@@ -172,7 +180,7 @@ def main():
 
     active = None
     last_state: Optional[Tuple] = None
-    last_intended_price: Optional[int] = None  # MICRO CHANGE: track intended quote price
+    last_intended_price: Optional[int] = None
 
     while True:
         sleep_for = cfg.poll_seconds
@@ -183,7 +191,7 @@ def main():
                 active = ticker
                 log.info(f"[ROLL] Active market → {active}")
                 last_state = None
-                last_intended_price = None  # reset on roll
+                last_intended_price = None
 
             ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
@@ -198,7 +206,6 @@ def main():
                 else:
                     state = ("skip", "other")
 
-                # MICRO CHANGE: clear intended price when we are not quoting
                 last_intended_price = None
 
                 if state != last_state:
@@ -207,7 +214,6 @@ def main():
                 time.sleep(sleep_for)
                 continue
 
-            # MICRO CHANGE: update intended price only when it changes
             if price != last_intended_price:
                 last_intended_price = price
 
