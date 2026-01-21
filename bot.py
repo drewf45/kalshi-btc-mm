@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: require 2c "room to ask" before quoting (edge buffer)
+# MICRO CHANGE: distinguish skip reasons (tight_spread vs no_edge_buffer)
 
 import os
 import time
@@ -153,10 +153,8 @@ def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: i
         return None
 
     if bid is not None and ask is not None:
-        # Keep existing tight-spread guard
         if (ask - bid) < 2:
             return None
-        # MICRO CHANGE: require 2c room to the ask after improvement
         if (ask - (bid + improve)) < 2:
             return None
 
@@ -202,7 +200,13 @@ def main():
                     state = ("skip", "empty")
                     sleep_for = cfg.empty_poll_seconds
                 elif bid is not None and ask is not None:
-                    state = ("skip", "tight")
+                    # MICRO CHANGE: split reasons
+                    if (ask - bid) < 2:
+                        state = ("skip", "tight_spread")
+                    elif (ask - (bid + cfg.improve_ticks)) < 2:
+                        state = ("skip", "no_edge_buffer")
+                    else:
+                        state = ("skip", "other")
                 else:
                     state = ("skip", "other")
 
