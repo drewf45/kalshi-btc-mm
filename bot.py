@@ -105,7 +105,7 @@ ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"],
 # Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 
-# --- LIVE ORDER FLAGS (micro add; defaults safe for market making) ---
+# --- LIVE ORDER FLAGS ---
 POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
 SELL_POSITION_CAPPED = parse_bool(getenv_first(["SELL_POSITION_CAPPED"], "true"), default=True)
 
@@ -208,7 +208,8 @@ def request_json(
         prepped = req.prepare()
         signed_path = prepped.path_url
     else:
-        signed_path = path
+        # ✅ FIX: must sign full path including API_PREFIX (e.g., /trade-api/v2/portfolio/orders)
+        signed_path = API_PREFIX + path
 
     headers = build_signature_headers(method, signed_path, body_str)
 
@@ -230,7 +231,6 @@ def request_json(
                 text_head = (resp.text or "")[:200]
                 raise RuntimeError(f"HTTP {resp.status_code} {path}: {{'_non_json': True, '_text_head': {text_head!r}}}")
 
-        # Some DELETEs may return 204 with empty body; tolerate that and return {}
         if resp.status_code == 204:
             return {}
 
@@ -241,12 +241,9 @@ def request_json(
             raise RuntimeError(f"Bad JSON response for {path}: {text_head!r}")
 
 # -----------------------------
-# LIVE ORDER FUNCTIONS (MICRO CHANGE)
+# LIVE ORDER FUNCTIONS
 # -----------------------------
 def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
-    """
-    Kalshi responses vary slightly across endpoints; handle common shapes.
-    """
     if not isinstance(resp, dict):
         return None
     if isinstance(resp.get("order_id"), str):
@@ -254,7 +251,6 @@ def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
     o = resp.get("order")
     if isinstance(o, dict) and isinstance(o.get("order_id"), str):
         return o["order_id"]
-    # sometimes nested under "result" etc.
     for k in ("result", "data"):
         v = resp.get(k)
         if isinstance(v, dict) and isinstance(v.get("order_id"), str):
@@ -267,17 +263,13 @@ def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
 
 
 def create_order_yes(market_ticker: str, action: str, yes_price: int, count: int) -> str:
-    """
-    Posts a real LIMIT order on YES side.
-    Endpoint: POST /portfolio/orders  (under API_PREFIX)  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/orders/create-order?utm_source=chatgpt.com)
-    """
     payload: Dict[str, Any] = {
         "ticker": market_ticker,
         "type": "limit",
         "action": action,        # "buy" or "sell"
         "side": "yes",
         "count": int(count),
-        "yes_price": int(yes_price),  # cents 1-99
+        "yes_price": int(yes_price),
         "post_only": bool(POST_ONLY),
     }
     if action.lower() == "sell":
@@ -291,10 +283,6 @@ def create_order_yes(market_ticker: str, action: str, yes_price: int, count: int
 
 
 def cancel_order(order_id: str) -> None:
-    """
-    Cancels (reduces remaining to zero).
-    Endpoint: DELETE /portfolio/orders/{order_id}  [oai_citation:3‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/quick_start_create_order?utm_source=chatgpt.com)
-    """
     request_json("DELETE", f"/portfolio/orders/{order_id}")
 
 # -----------------------------
@@ -591,7 +579,7 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     return (bid, ask, f"ok(spread={spread})")
 
 # -----------------------------
-# Order management (DRY_RUN now, real later)
+# Order management (LIVE)
 # -----------------------------
 @dataclass
 class WorkingOrder:
@@ -599,7 +587,7 @@ class WorkingOrder:
     price_cents: int
     qty: int
     created_ts: float
-    order_id: Optional[str] = None   # <-- MICRO: store live order id for cancel
+    order_id: Optional[str] = None
 
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
@@ -612,7 +600,6 @@ _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 TIGHT_SPREAD_SINCE_TS: Optional[float] = None
 NOT_STABLE_SINCE_TS: Optional[float] = None
 
-# NEW: unsafe timers (per-side) to reduce whipsaw
 UNSAFE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
 
@@ -646,12 +633,11 @@ def reconcile_quotes(
 
         log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
 
-        # MICRO: actually cancel on Kalshi when live
         if (not dry_run) and ENABLE_TRADING:
-            if not cur.order_id:
-                log.warning("[OM] %s %s CANCEL skipped (missing order_id) — clearing local state", market_ticker, side.upper())
-            else:
+            if cur.order_id:
                 cancel_order(cur.order_id)
+            else:
+                log.warning("[OM] %s %s CANCEL skipped (missing order_id) — clearing local state", market_ticker, side.upper())
 
         WORKING[side] = None
         _LAST_KEEP_LOGGED[side] = None
@@ -660,7 +646,6 @@ def reconcile_quotes(
         log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
 
         oid: Optional[str] = None
-        # MICRO: actually post on Kalshi when live
         if (not dry_run) and ENABLE_TRADING:
             action = "buy" if side == "buy" else "sell"
             oid = create_order_yes(
@@ -680,7 +665,6 @@ def reconcile_quotes(
             log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
-    # Unsafe detection + grace
     def is_unsafe(side: str, price_cents: int) -> bool:
         if yes_bid is None or yes_ask is None:
             return False
@@ -704,7 +688,6 @@ def reconcile_quotes(
 
     both_missing = (target_bid is None) and (target_ask is None)
 
-    # BOTH missing: global HOLD/CANCEL logic
     if both_missing:
         is_tight_spread_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight")
         is_not_stable_skip = isinstance(skip_reason, str) and skip_reason.startswith("spread_ok_not_stable")
@@ -767,12 +750,10 @@ def reconcile_quotes(
         cancel("sell", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
         return
 
-    # We have at least one target => reset timers
     NO_TARGET_SINCE_TS = None
     TIGHT_SPREAD_SINCE_TS = None
     NOT_STABLE_SINCE_TS = None
 
-    # per-side hold when a single side is missing
     if target_bid is not None:
         NO_TARGET_SIDE_SINCE_TS["buy"] = None
     if target_ask is not None:
@@ -811,7 +792,6 @@ def reconcile_quotes(
     if target_ask is None:
         handle_missing_side("sell")
 
-    # NEW: safer long-term maintain logic (grace + max chase + cooldown override)
     def maintain(side: str, target_price: Optional[int]) -> None:
         if target_price is None:
             return
@@ -823,33 +803,27 @@ def reconcile_quotes(
 
         off = price_off(cur.price_cents, int(target_price))
 
-        # A) Unsafe? cancel only after grace
         if unsafe_to_hold_with_grace(side, cur):
             cancel(side, f"unsafe_hold(cross_risk>{UNSAFE_GRACE_SECONDS:.2f}s)")
             UNSAFE_SINCE_TS[side] = None
-            # if market jumped, don't immediately re-place (stand down)
             if off >= MAX_CHASE_CENTS:
                 return
             place(side, int(target_price))
             return
 
-        # B) Too far away? don't chase
         if off >= MAX_CHASE_CENTS:
             cancel(side, f"too_far_to_chase(off_by={off}>=MAX_CHASE_CENTS={MAX_CHASE_CENTS})")
             return
 
-        # C) close enough? keep
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
 
-        # D) cooldown: don't keep stale if we're meaningfully off
         if not can_requote(cur):
             age = now - cur.created_ts
             cancel(side, f"cooldown_but_stale(off_by={off} age={age:.2f}s)")
             return
 
-        # E) normal reprice
         cancel(side, f"reprice(off_by={off})")
         place(side, int(target_price))
 
@@ -947,7 +921,6 @@ def main():
 
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
 
-            # Spread stability requirement
             if tb is not None and ta is not None and yes_bid is not None and yes_ask is not None:
                 spread = int(yes_ask) - int(yes_bid)
                 if spread >= MIN_SPREAD_CENTS:
