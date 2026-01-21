@@ -173,21 +173,30 @@ def load_private_key_from_env(raw: str) -> Any:
 PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
-def sign_message(message: str) -> str:
+# ✅ UPDATED SIGNING (PSS + no query + no body)
+def sign_request(method: str, path_with_query: str, ts_ms: str) -> str:
+    # drop query string
+    path_no_query = path_with_query.split("?", 1)[0]
+
+    # do NOT include body in signed message
+    message = f"{ts_ms}{method.upper()}{path_no_query}".encode("utf-8")
+
     sig = PRIVATE_KEY.sign(
-        message.encode("utf-8"),
-        asy_padding.PKCS1v15(),
+        message,
+        asy_padding.PSS(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            salt_length=asy_padding.PSS.DIGEST_LENGTH,
+        ),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
 
 
-def build_signature_headers(method: str, path_with_query: str, body: str) -> Dict[str, str]:
+def build_signature_headers(method: str, path_with_query: str) -> Dict[str, str]:
     ts = str(now_ms())
-    payload = ts + method.upper() + path_with_query + body
     return {
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
-        "KALSHI-ACCESS-SIGNATURE": sign_message(payload),
+        "KALSHI-ACCESS-SIGNATURE": sign_request(method, path_with_query, ts),
         "KALSHI-ACCESS-TIMESTAMP": ts,
         "Content-Type": "application/json",
     }
@@ -223,9 +232,9 @@ def request_json(
         prepped = req.prepare()
 
         signed_path = prepped.path_url
-        body_for_sig = "" if not body_bytes else body_bytes.decode("utf-8")
 
-        headers = build_signature_headers(method, signed_path, body_for_sig)
+        # ✅ UPDATED: no body passed into signing
+        headers = build_signature_headers(method, signed_path)
         prepped.headers.update(headers)
 
         resp = session.send(prepped, timeout=20)
@@ -930,7 +939,11 @@ def main():
                         spread_ok_since = time.time()
                     ok_for = time.time() - spread_ok_since
                     if ok_for < ENTER_OK_SECONDS:
-                        tb, ta, why = (None, None, f"spread_ok_not_stable({spread}) {ok_for:.2f}s<{ENTER_OK_SECONDS:.2f}s")
+                        tb, ta, why = (
+                            None,
+                            None,
+                            f"spread_ok_not_stable({spread}) {ok_for:.2f}s<{ENTER_OK_SECONDS:.2f}s",
+                        )
                 else:
                     spread_ok_since = None
             else:
@@ -943,7 +956,14 @@ def main():
                 if tb is None and ta is None:
                     log.info("[TARGET] %s → SKIP (%s)", mkt, why)
                 else:
-                    log.info("[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
+                    log.info(
+                        "[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s",
+                        mkt,
+                        tb,
+                        ta,
+                        why,
+                        DRY_RUN,
+                    )
 
             reconcile_quotes(
                 market_ticker=mkt,
