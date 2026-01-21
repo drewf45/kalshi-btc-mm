@@ -3,7 +3,7 @@ import json
 import time
 import base64
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
@@ -26,6 +26,22 @@ def getenv_first(keys: List[str], default: str = "") -> str:
     return default
 
 
+def getenv_by_prefix(prefixes: List[str]) -> str:
+    """
+    Return the value of the first env var whose NAME starts with any of the prefixes.
+    Useful when Render UI truncates names like KALSHI_PRIVATE_KEY_PEM...
+    """
+    for name, value in os.environ.items():
+        for p in prefixes:
+            if name.startswith(p) and str(value).strip() != "":
+                return str(value).strip()
+    return ""
+
+
+def env_keys_with_prefix(prefix: str) -> List[str]:
+    return sorted([k for k in os.environ.keys() if k.startswith(prefix)])
+
+
 def parse_bool(v: str, default: bool = False) -> bool:
     if v is None:
         return default
@@ -38,9 +54,9 @@ API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2")
 # ✅ your Render uses SERIES_TICKER
 SERIES = getenv_first(["SERIES", "SERIES_TICKER"], "KXBTC15M").strip()
 
-# you said "I am looking for events not markets"
-EVENT_TICKER = getenv_first(["EVENT_TICKER", "EVENT"], "").strip()  # optional now
-MARKET_TICKER_OVERRIDE = getenv_first(["MARKET_TICKER", "MARKET"], "").strip()  # optional hard pin
+# event-first
+EVENT_TICKER = getenv_first(["EVENT_TICKER", "EVENT"], "").strip()
+MARKET_TICKER_OVERRIDE = getenv_first(["MARKET_TICKER", "MARKET"], "").strip()
 
 # ✅ your Render uses POLL_SECONDS
 POLL = float(getenv_first(["POLL", "POLL_SECONDS"], "2.0"))
@@ -57,24 +73,46 @@ BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 
-# ✅ Backward-compatible key env names:
-# Your Render screenshot shows KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PEM
-KALSHI_KEY_ID = getenv_first(["KALSHI_KEY_ID", "KALSHI_API_KEY_ID"], "").strip()
-KALSHI_PRIVATE_KEY_RAW = getenv_first(["KALSHI_PRIVATE_KEY_B64", "KALSHI_PRIVATE_KEY_PEM"], "").strip()
-
-if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
-    raise RuntimeError(
-        "Missing Kalshi credentials. Expected one of:\n"
-        "  - KALSHI_KEY_ID or KALSHI_API_KEY_ID\n"
-        "  - KALSHI_PRIVATE_KEY_B64 or KALSHI_PRIVATE_KEY_PEM"
-    )
-
 # -----------------------------
 # Logging
 # -----------------------------
 LOG_LEVEL = getenv_first(["LOG_LEVEL"], "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-bot")
+
+# -----------------------------
+# ✅ Micro-change: Credential discovery + diagnostics
+# -----------------------------
+# Key ID: support old + possible variants
+KALSHI_KEY_ID = getenv_first(
+    ["KALSHI_KEY_ID", "KALSHI_API_KEY_ID", "KALSHI_ACCESS_KEY", "KALSHI_API_KEY"],
+    ""
+).strip()
+
+# Private key: support exact names + "prefix" names like KALSHI_PRIVATE_KEY_PEM_B64
+KALSHI_PRIVATE_KEY_RAW = getenv_first(
+    ["KALSHI_PRIVATE_KEY_B64", "KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY"],
+    ""
+).strip()
+
+if not KALSHI_PRIVATE_KEY_RAW:
+    # prefix match catches names like "KALSHI_PRIVATE_KEY_PEM_B64"
+    KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]).strip()
+
+# Safe diagnostics: show what the runtime process actually has (names only)
+_detected_kalshi_keys = env_keys_with_prefix("KALSHI_")
+log.info("[ENV] Detected KALSHI_* keys: %s", _detected_kalshi_keys if _detected_kalshi_keys else "<none>")
+
+if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
+    raise RuntimeError(
+        "Missing Kalshi credentials at runtime.\n"
+        f"Detected KALSHI_* keys: {_detected_kalshi_keys}\n"
+        "Expected one of:\n"
+        "  - KALSHI_KEY_ID or KALSHI_API_KEY_ID (or KALSHI_ACCESS_KEY / KALSHI_API_KEY)\n"
+        "  - KALSHI_PRIVATE_KEY_B64 or KALSHI_PRIVATE_KEY_PEM (or any env starting with KALSHI_PRIVATE_KEY_PEM)\n"
+        "\n"
+        "If your keys appear in Render UI but NOT in the detected list above, they are set on a different service/environment."
+    )
 
 # -----------------------------
 # Signing helpers
@@ -86,24 +124,23 @@ def now_ms() -> int:
 def load_private_key_from_env(raw: str) -> Any:
     """
     Supports:
-      - PEM text directly (contains 'BEGIN')
+      - PEM text directly (contains 'BEGIN' + 'PRIVATE KEY')
       - base64-encoded PEM (common in env vars)
     """
     s = raw.strip()
 
-    # If it's PEM text already
+    # PEM text already
     if "BEGIN" in s and "PRIVATE KEY" in s:
-        key_bytes = s.encode("utf-8")
-        return serialization.load_pem_private_key(key_bytes, password=None)
+        return serialization.load_pem_private_key(s.encode("utf-8"), password=None)
 
-    # Otherwise try base64 decode -> PEM bytes
+    # base64 -> PEM bytes
     try:
         key_bytes = base64.b64decode(s)
         return serialization.load_pem_private_key(key_bytes, password=None)
     except Exception as e:
         raise RuntimeError(
             "Could not parse private key. Provide PEM text in KALSHI_PRIVATE_KEY_PEM "
-            "or base64 PEM in KALSHI_PRIVATE_KEY_B64."
+            "or base64 PEM in KALSHI_PRIVATE_KEY_B64 (or PEM-prefixed variant)."
         ) from e
 
 
@@ -195,16 +232,10 @@ def _parse_dt_to_ts(s: Any) -> float:
 
 
 def pick_active_event(events: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    Choose an 'active/open' event if possible.
-    If multiple, prefer the one whose window is currently live (or closest upcoming).
-    """
     now = time.time()
 
     def score(e: Dict[str, Any]) -> Tuple[int, float]:
         status = str(e.get("status", "")).lower()
-
-        # try common timestamp keys
         start_ts = 0.0
         end_ts = 0.0
         for k in ("start_time", "open_time"):
@@ -214,38 +245,25 @@ def pick_active_event(events: List[Dict[str, Any]]) -> Optional[str]:
             if k in e:
                 end_ts = max(end_ts, _parse_dt_to_ts(e.get(k)))
 
-        # live window
         in_window = (start_ts > 0 and end_ts > 0 and start_ts <= now <= end_ts)
-
-        # prefer explicit open/active first
         is_open = status in ("open", "active", "trading")
 
-        # scoring: open + in_window highest; else nearest upcoming
         if is_open and in_window:
-            return (3, -(end_ts - now))  # closer end = higher
+            return (3, -(end_ts - now))
         if is_open:
-            # open but missing times, still good
             return (2, 0.0)
         if start_ts > now:
-            # upcoming: closer start = better
             return (1, -(start_ts - now))
         return (0, -1e18)
 
-    # filter to events with tickers
     candidates = [e for e in events if isinstance(e, dict) and (e.get("ticker") or e.get("event_ticker"))]
     if not candidates:
         return None
-
     best = sorted(candidates, key=score, reverse=True)[0]
     return best.get("ticker") or best.get("event_ticker")
 
 
 def fetch_events_for_series(series_ticker: str, limit: int = 200) -> List[Dict[str, Any]]:
-    """
-    Robustly try multiple likely endpoints because Kalshi deployments differ:
-      1) /series/{SERIES}/events
-      2) /events?series_ticker=SERIES
-    """
     # attempt #1
     try:
         data = request_json("GET", f"/series/{series_ticker}/events", params={"limit": limit})
@@ -258,22 +276,18 @@ def fetch_events_for_series(series_ticker: str, limit: int = 200) -> List[Dict[s
     # attempt #2
     data = request_json("GET", "/events", params={"series_ticker": series_ticker, "limit": limit})
     events = data.get("events") or data.get("data") or data.get("results") or []
-    if not isinstance(events, list):
-        return []
-    return events
+    return events if isinstance(events, list) else []
 
 
 def roll_active_event() -> str:
     global _last_roll_ts, _active_event_ticker
 
-    # if user pins EVENT_TICKER, use it
     if EVENT_TICKER:
         if _active_event_ticker != EVENT_TICKER:
             log.info("[ROLL] Using EVENT_TICKER override → %s", EVENT_TICKER)
         _active_event_ticker = EVENT_TICKER
         return _active_event_ticker
 
-    # otherwise auto-pick from series (this matches “I am looking for events not markets”)
     now = time.time()
     if _active_event_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
         return _active_event_ticker
@@ -293,10 +307,6 @@ def roll_active_event() -> str:
 
 
 def pick_open_market(markets: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    Choose an 'open' market if possible.
-    If multiple, prefer the one closing soonest (best for current window).
-    """
     now = time.time()
     open_markets = []
     for m in markets:
@@ -382,7 +392,6 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any]) -> Tuple[Optional[int], O
     yes_bid = best_bid_from_side(yes)
     no_bid = best_bid_from_side(no)
 
-    # binary relationship: YES ask implied from NO bid (100 - no_bid)
     yes_ask = None
     if no_bid is not None:
         yes_ask = 100 - no_bid
@@ -414,9 +423,6 @@ def main():
                 log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
             else:
                 log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
-
-                # later: compute our quotes & place/cancel orders
-                # For now, DRY_RUN just prints.
 
         except Exception as e:
             log.error("[LOOPERR] %s", e)
