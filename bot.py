@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: robust client-side series enforcement (never roll wrong market)
+# MICRO CHANGE: normalize SERIES_TICKER to uppercase to avoid 15m/15M format mismatch
 
 import os
 import time
@@ -59,9 +59,9 @@ class BotConfig:
 def load_config() -> BotConfig:
     return BotConfig(
         api_base=os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").rstrip("/"),
-        api_key_id=os.environ["KALSHI_API_KEY_ID"],
-        private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
-        series_ticker=os.environ["SERIES_TICKER"],
+        api_key_id=os.environ.get("KALSHI_API_KEY_ID", ""),
+        private_key_b64=os.environ.get("KALSHI_PRIVATE_KEY_PEM_BASE64", ""),
+        series_ticker=os.environ["SERIES_TICKER"].strip().upper(),  # MICRO CHANGE
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),
         rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
@@ -77,12 +77,32 @@ def load_config() -> BotConfig:
 
 
 # -----------------------------
-# Auth / signing
+# Auth / signing (kept for later trading wiring)
 # -----------------------------
 def load_private_key(b64: str):
-    return serialization.load_pem_private_key(
-        base64.b64decode(b64), password=None
-    )
+    return serialization.load_pem_private_key(base64.b64decode(b64), password=None)
+
+
+def canonical_json(obj):
+    return "" if obj is None else json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+def sign_request(priv, ts, method, path_qs, body):
+    msg = f"{ts}{method}{path_qs}{body}".encode()
+    sig = priv.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    return base64.b64encode(sig).decode()
+
+
+def headers(cfg, priv, method, path_qs, body):
+    ts = str(int(time.time() * 1000))
+    body_str = canonical_json(body) if method != "GET" else ""
+    sig = sign_request(priv, ts, method, path_qs, body_str)
+    return {
+        "KALSHI-ACCESS-KEY": cfg.api_key_id,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+        "Content-Type": "application/json",
+    }
 
 
 # -----------------------------
@@ -98,10 +118,10 @@ def public_get(cfg, session: requests.Session, path, params=None):
 
 
 # -----------------------------
-# Market resolution (ROBUST)
+# Market resolution (client-side robust match)
 # -----------------------------
 def normalize(s: str) -> str:
-    return s.replace("-", "").replace("_", "").lower()
+    return (s or "").replace("-", "").replace("_", "").strip().lower()
 
 
 def resolve_active_market(cfg, session: requests.Session) -> str:
@@ -109,33 +129,32 @@ def resolve_active_market(cfg, session: requests.Session) -> str:
         cfg,
         session,
         "/trade-api/v2/markets",
-        params={"status": "open"},
+        params={
+            "series": cfg.series_ticker,
+            "series_ticker": cfg.series_ticker,
+            "status": "open",
+        },
     )
 
     markets = data.get("markets") or data.get("data") or []
     if not markets:
-        raise RuntimeError("No open markets returned from API")
+        raise RuntimeError(f"No open markets returned for series {cfg.series_ticker}")
 
     want = normalize(cfg.series_ticker)
 
     def matches(m: dict) -> bool:
-        fields = [
+        candidates = [
             m.get("series_ticker"),
             m.get("series"),
             m.get("ticker"),
         ]
-        for f in fields:
-            if f and normalize(f).startswith(want):
-                return True
-        return False
+        return any(normalize(c).startswith(want) for c in candidates if c)
 
     filtered = [m for m in markets if matches(m)]
-
     if not filtered:
         sample = [m.get("ticker") for m in markets[:5]]
         raise RuntimeError(
-            f"No open markets matched SERIES_TICKER={cfg.series_ticker}. "
-            f"Sample returned tickers={sample}"
+            f"No open markets matched SERIES_TICKER={cfg.series_ticker}. Sample returned tickers={sample}"
         )
 
     return filtered[0]["ticker"]
@@ -164,9 +183,11 @@ def parse_yes_book(ob):
 def choose_price(bid, ask, improve, max_px, min_edge):
     if bid is None and ask is None:
         return None
+
     if bid is None:
         px = min(ask - 1, max_px)
         return px if (ask - px) >= min_edge else None
+
     px = min(bid + improve, max_px)
     if ask is not None:
         px = min(px, ask - 1)
@@ -177,7 +198,7 @@ def choose_price(bid, ask, improve, max_px, min_edge):
 
 def is_rate_limited(err: Exception) -> bool:
     s = str(err).lower()
-    return "429" in s or "too_many_requests" in s
+    return ("429" in s) or ("too_many_requests" in s)
 
 
 # -----------------------------
@@ -189,11 +210,14 @@ def main():
 
     log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
 
-    active = None
-    last_state = None
-    last_market_refresh_ts = 0.0
+    active: Optional[str] = None
+    last_state: Optional[Tuple] = None
+    last_market_refresh_ts: float = 0.0
+    last_rl_log_ts: float = 0.0
 
     while True:
+        sleep_for = cfg.poll_seconds
+
         try:
             now = time.time()
             if active is None or (now - last_market_refresh_ts) >= cfg.market_refresh_seconds:
@@ -209,7 +233,7 @@ def main():
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price, cfg.min_edge_cents)
 
             if price is None:
-                state = ("skip", "empty" if bid is None and ask is None else "edge")
+                state = ("skip", "empty" if bid is None and ask is None else f"edge<{cfg.min_edge_cents}c")
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
                     last_state = state
@@ -224,12 +248,16 @@ def main():
 
         except Exception as e:
             if is_rate_limited(e):
-                log.warning("[RATELIMIT] backing off")
+                now = time.time()
+                if now - last_rl_log_ts > 30:
+                    log.warning(f"[RATELIMIT] Backing off {cfg.rate_limit_backoff_seconds}s ({e})")
+                    last_rl_log_ts = now
                 time.sleep(cfg.rate_limit_backoff_seconds)
-            else:
-                log.error(f"[LOOPERR] {e}")
+                continue
 
-        time.sleep(cfg.poll_seconds)
+            log.error(f"[LOOPERR] {e}")
+
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
