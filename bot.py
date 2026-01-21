@@ -129,9 +129,8 @@ def public_get(cfg, path, params=None):
 _last_roll_check_ts: float = 0.0
 _cached_active_market: Optional[str] = None
 
-# ✅ micro change: increase default roll check and add exponential backoff on 429
 ROLL_CHECK_MIN_SECONDS = float(os.getenv("ROLL_CHECK_MIN_SECONDS", "60"))
-_roll_backoff_seconds: float = 0.0  # grows on 429, decays on success
+_roll_backoff_seconds: float = 0.0
 ROLL_BACKOFF_MAX_SECONDS = float(os.getenv("ROLL_BACKOFF_MAX_SECONDS", "600"))
 
 
@@ -163,7 +162,6 @@ def resolve_active_market(cfg) -> str:
 
     now = time.time()
 
-    # Throttle series lookup (+ backoff)
     min_wait = ROLL_CHECK_MIN_SECONDS + _roll_backoff_seconds
     if _cached_active_market is not None and (now - _last_roll_check_ts) < min_wait:
         return _cached_active_market
@@ -171,45 +169,45 @@ def resolve_active_market(cfg) -> str:
     _last_roll_check_ts = now
 
     try:
-        data = public_get(
-            cfg,
-            "/trade-api/v2/markets",
-            params={"series": cfg.series_ticker, "status": "open"},
-        )
-        markets = _extract_markets_list(data)
-  # type: ignore
+        # ✅ MICRO CHANGE: send BOTH param names so the API actually filters.
+        # If Kalshi expects series_ticker, "series" gets ignored (what you’re seeing now).
+        params = {
+            "series": cfg.series_ticker,
+            "series_ticker": cfg.series_ticker,
+            "status": "open",
+        }
+        data = public_get(cfg, "/trade-api/v2/markets", params=params)
 
+        markets = _extract_markets_list(data)
         if not markets:
             if _cached_active_market is not None:
                 return _cached_active_market
             raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
 
-        # If current active is still open, keep it
         if _cached_active_market is not None:
             open_tickers = {m.get("ticker") for m in markets if m.get("ticker")}
             if _cached_active_market in open_tickers:
-                # ✅ success → decay backoff
                 _roll_backoff_seconds = max(0.0, _roll_backoff_seconds * 0.5)
                 return _cached_active_market
 
         _cached_active_market = _pick_deterministic_market(markets)
 
-        # ✅ success → decay backoff
         _roll_backoff_seconds = max(0.0, _roll_backoff_seconds * 0.5)
         return _cached_active_market
 
     except Exception as e:
         msg = str(e)
         if "too_many_requests" in msg or "HTTP 429" in msg:
-            # ✅ micro change: grow backoff, keep current active
             _roll_backoff_seconds = min(
                 ROLL_BACKOFF_MAX_SECONDS,
                 5.0 if _roll_backoff_seconds <= 0 else _roll_backoff_seconds * 2.0,
             )
-            log.warning(f"[ROLL429] backing off {_roll_backoff_seconds:.0f}s (keeping active={_cached_active_market})")
+            log.warning(
+                f"[ROLL429] backing off {_roll_backoff_seconds:.0f}s (keeping active={_cached_active_market})"
+            )
             if _cached_active_market is not None:
                 return _cached_active_market
-        # otherwise: if we can, keep last active
+
         if _cached_active_market is not None:
             return _cached_active_market
         raise
@@ -219,16 +217,9 @@ def resolve_active_market(cfg) -> str:
 # Orderbook parsing
 # -----------------------------
 def _normalize_levels(levels: Any) -> Optional[List[Tuple[int, int]]]:
-    """
-    Accepts:
-      - [[price, qty], ...]
-      - [{"price": 55, "quantity": 10}, ...]  (or qty/count/size)
-      - {"levels": [[p,q],...]} or {"levels":[{"price":..,"quantity":..},...]}
-    """
     if not levels:
         return None
 
-    # ✅ micro change: handle dict wrapper like {"levels": ...}
     if isinstance(levels, dict) and "levels" in levels:
         levels = levels.get("levels")
 
@@ -237,9 +228,7 @@ def _normalize_levels(levels: Any) -> Optional[List[Tuple[int, int]]]:
     if isinstance(levels, list) and levels and isinstance(levels[0], (list, tuple)) and len(levels[0]) >= 2:
         for row in levels:
             try:
-                p = int(row[0])
-                q = int(row[1])
-                out.append((p, q))
+                out.append((int(row[0]), int(row[1])))
             except Exception:
                 continue
         return out or None
@@ -266,60 +255,63 @@ def best_price(levels: Any, want: str) -> Optional[int]:
     return max(norm)[0] if want == "bid" else min(norm)[0]
 
 
-def _try_get_yes_node(ob: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _try_get_yes_node(ob: Dict[str, Any]) -> Optional[Any]:
     root = ob.get("orderbook") or ob
-
-    yes = root.get("yes")
-    if isinstance(yes, dict):
-        return yes
-
-    if any(k in root for k in ("yes_bids", "yes_asks")):
-        return {"bids": root.get("yes_bids"), "asks": root.get("yes_asks")}
-
-    return None
+    return root.get("yes")
 
 
-# ✅ micro change: log YES-book shape occasionally when bid/ask are None
 _last_ob_debug_ts: float = 0.0
 OB_DEBUG_MIN_SECONDS = float(os.getenv("OB_DEBUG_MIN_SECONDS", "60"))
+
+
+def _tiny_sample(x: Any) -> Any:
+    if isinstance(x, dict):
+        # show first keys + type hints
+        return {k: ("<list>" if isinstance(v, list) else type(v).__name__) for k, v in list(x.items())[:8]}
+    if isinstance(x, list):
+        return x[:2]
+    return type(x).__name__
 
 
 def parse_yes_book(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     global _last_ob_debug_ts
 
-    yes = _try_get_yes_node(ob)
-    if not yes:
+    root = ob.get("orderbook") if isinstance(ob, dict) else None
+    yes_raw = _try_get_yes_node(ob)
+
+    # ✅ MICRO CHANGE: if "yes" exists but isn't dict, print its type/sample
+    if yes_raw is None or not isinstance(root, dict) or ("yes" not in root):
         now = time.time()
         if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
             _last_ob_debug_ts = now
-            root = ob.get("orderbook") if isinstance(ob, dict) else None
             log.info(
-                f"[OBSCHEMA] missing YES node; top_keys={list(ob.keys())[:12]} "
+                f"[OBSCHEMA] top_keys={list(ob.keys())[:12]} "
                 f"orderbook_keys={(list(root.keys())[:12] if isinstance(root, dict) else None)}"
             )
         return None, None
 
-    bid = best_price(yes.get("bids"), "bid")
-    ask = best_price(yes.get("asks"), "ask")
+    if not isinstance(yes_raw, dict):
+        now = time.time()
+        if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
+            _last_ob_debug_ts = now
+            yd = root.get("yes_dollars") if isinstance(root, dict) else None
+            log.info(
+                f"[OBYES_RAW] yes_type={type(yes_raw).__name__} yes_sample={_tiny_sample(yes_raw)} "
+                f"yes_dollars_type={type(yd).__name__} yes_dollars_sample={_tiny_sample(yd)}"
+            )
+        return None, None
+
+    bid = best_price(yes_raw.get("bids"), "bid")
+    ask = best_price(yes_raw.get("asks"), "ask")
 
     if bid is None and ask is None:
         now = time.time()
         if (now - _last_ob_debug_ts) >= OB_DEBUG_MIN_SECONDS:
             _last_ob_debug_ts = now
-            bids = yes.get("bids")
-            asks = yes.get("asks")
-            # tiny sample so we don't spam logs
-            def sample(x):
-                if isinstance(x, dict):
-                    return {k: ("<list>" if isinstance(v, list) else type(v).__name__) for k, v in list(x.items())[:6]}
-                if isinstance(x, list):
-                    return x[:2]
-                return type(x).__name__
-
             log.info(
-                f"[OBYES] yes_keys={list(yes.keys())[:12]} "
-                f"bids_type={type(bids).__name__} bids_sample={sample(bids)} "
-                f"asks_type={type(asks).__name__} asks_sample={sample(asks)}"
+                f"[OBYES] yes_keys={list(yes_raw.keys())[:12]} "
+                f"bids_type={type(yes_raw.get('bids')).__name__} bids_sample={_tiny_sample(yes_raw.get('bids'))} "
+                f"asks_type={type(yes_raw.get('asks')).__name__} asks_sample={_tiny_sample(yes_raw.get('asks'))}"
             )
 
     return bid, ask
