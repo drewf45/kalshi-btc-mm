@@ -74,6 +74,12 @@ MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
 # Only reprice if we are "meaningfully" off target
 REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 
+# NEW: when target is None (SKIP), hold existing orders instead of canceling immediately
+HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
+
+# NEW: only cancel after target has been None continuously for this long
+CANCEL_IF_NO_TARGET_SECONDS = float(getenv_first(["CANCEL_IF_NO_TARGET_SECONDS"], "10.0"))
+
 # -----------------------------
 # Logging
 # -----------------------------
@@ -400,8 +406,10 @@ class WorkingOrder:
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 
-# keep-log suppression (new): only log KEEP when it changes
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
+
+# NEW: track when we entered "no target" state
+NO_TARGET_SINCE_TS: Optional[float] = None
 
 
 def reconcile_quotes(
@@ -414,11 +422,12 @@ def reconcile_quotes(
     """
     Maintain exactly ONE working buy at target_bid and ONE working sell at target_ask.
 
-    Improvements:
-      - MIN_REQUOTE_SECONDS: don't reprice too often
-      - REPRICE_IF_OFF_BY_CENTS: ignore tiny target wiggles
-      - KEEP logs only when the keep-price changes
+    Behavior:
+      - repricing throttles (MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS)
+      - if target is None (skip), HOLD orders for a while, then cancel if it persists
     """
+    global NO_TARGET_SINCE_TS
+
     now = time.time()
 
     def price_off(cur_price: int, target_price: int) -> int:
@@ -443,15 +452,40 @@ def reconcile_quotes(
         _LAST_KEEP_LOGGED[side] = None
 
     def keep(side: str, cur: WorkingOrder, note: str) -> None:
-        # Only log KEEP if the kept price changed vs last keep log
         if _LAST_KEEP_LOGGED.get(side) != cur.price_cents:
             log.info(f"[OM] {market_ticker} {side.upper()} KEEP @{cur.price_cents} qty={cur.qty} ({note}) DRY_RUN={dry_run}")
             _LAST_KEEP_LOGGED[side] = cur.price_cents
 
+    # --- NEW: handle "no target" state globally ---
+    no_target = (target_bid is None) or (target_ask is None)
+    if no_target:
+        if NO_TARGET_SINCE_TS is None:
+            NO_TARGET_SINCE_TS = now
+
+        held_for = now - NO_TARGET_SINCE_TS
+
+        if HOLD_ON_SKIP and held_for < CANCEL_IF_NO_TARGET_SECONDS:
+            # Do nothing: hold existing orders
+            if WORKING["buy"] or WORKING["sell"]:
+                log.info(
+                    "[OM] %s HOLD (no_target) held_for=%.2fs<%.2fs DRY_RUN=%s",
+                    market_ticker, held_for, CANCEL_IF_NO_TARGET_SECONDS, dry_run
+                )
+            return
+
+        # Past the hold threshold: cancel anything working
+        cancel("buy", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
+        cancel("sell", f"no_target>{CANCEL_IF_NO_TARGET_SECONDS:.2f}s")
+        return
+    else:
+        NO_TARGET_SINCE_TS = None
+
+    # --- normal maintain logic ---
     def maintain(side: str, target_price: Optional[int]) -> None:
         cur = WORKING[side]
 
         if target_price is None:
+            # shouldn't happen because no_target handled above
             cancel(side, "no_target")
             return
 
@@ -469,7 +503,6 @@ def reconcile_quotes(
             keep(side, cur, f"cooldown age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off}")
             return
 
-        # reprice
         cancel(side, f"reprice(off_by={off})")
         place(side, int(target_price))
 
@@ -477,7 +510,7 @@ def reconcile_quotes(
     maintain("sell", target_ask)
 
 # -----------------------------
-# Main loop (✅ only log on change)
+# Main loop
 # -----------------------------
 def main():
     log.info(
@@ -488,8 +521,8 @@ def main():
     )
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
     log.info(
-        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d",
-        ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS
+        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
+        ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS
     )
 
     last_market: Optional[str] = None
@@ -503,7 +536,6 @@ def main():
         try:
             mkt = roll_active_market()
 
-            # If market changed, force a fresh log of everything once
             market_changed = (mkt != last_market)
             if market_changed:
                 last_market = mkt
@@ -513,11 +545,13 @@ def main():
                 last_ta = None
                 last_why = None
 
-                # clear working orders on roll
                 WORKING["buy"] = None
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
                 _LAST_KEEP_LOGGED["sell"] = None
+                global NO_TARGET_SINCE_TS
+                NO_TARGET_SINCE_TS = None
+
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
             ob = fetch_orderbook(mkt)
@@ -541,7 +575,7 @@ def main():
                 else:
                     log.info("[TARGET] %s YES-only would_quote: bid@%d ask@%d (%s) DRY_RUN=%s", mkt, tb, ta, why, DRY_RUN)
 
-                # Only reconcile when the TARGET changes (reduces churn/log spam)
+                # reconcile when TARGET changes
                 reconcile_quotes(
                     market_ticker=mkt,
                     target_bid=tb,
