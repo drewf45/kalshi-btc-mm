@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: normalize SERIES_TICKER to uppercase to avoid 15m/15M format mismatch
+# MICRO CHANGE: parse_yes_book() now handles orderbook responses that are a list (prevents "'list' object has no attribute 'get'")
 
 import os
 import time
@@ -8,7 +8,7 @@ import json
 import base64
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 from urllib.parse import urlencode
 
 import requests
@@ -61,7 +61,7 @@ def load_config() -> BotConfig:
         api_base=os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").rstrip("/"),
         api_key_id=os.environ.get("KALSHI_API_KEY_ID", ""),
         private_key_b64=os.environ.get("KALSHI_PRIVATE_KEY_PEM_BASE64", ""),
-        series_ticker=os.environ["SERIES_TICKER"].strip().upper(),  # MICRO CHANGE
+        series_ticker=os.environ["SERIES_TICKER"].strip().upper(),
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),
         rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
@@ -170,10 +170,31 @@ def best_price(levels, want):
     return max(pairs)[0] if want == "bid" else min(pairs)[0]
 
 
-def parse_yes_book(ob):
-    yes = ob.get("orderbook", {}).get("yes")
-    if not yes:
+def parse_yes_book(ob: Any):
+    """
+    MICRO CHANGE: Kalshi may return a list at the top-level for orderbook.
+    We safely coerce list -> first dict item.
+    """
+    if isinstance(ob, list):
+        if not ob:
+            return None, None
+        if isinstance(ob[0], dict):
+            ob = ob[0]
+        else:
+            return None, None
+
+    if not isinstance(ob, dict):
         return None, None
+
+    # Some responses may be {"orderbook": {...}}; others may already be {...}
+    container = ob.get("orderbook", ob)
+    if not isinstance(container, dict):
+        return None, None
+
+    yes = container.get("yes")
+    if not isinstance(yes, dict):
+        return None, None
+
     return (
         best_price(yes.get("bids"), "bid"),
         best_price(yes.get("asks"), "ask"),
