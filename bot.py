@@ -1,8 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# FIX: uses /markets?series=XYZ instead of non-existent /series endpoint
-# MICRO CHANGE #1: If YES book is empty (bid=None and ask=None) -> SKIP (do not quote)
-# MICRO CHANGE #2 (THIS CHANGE): If bid+ask exist but spread < 2c -> SKIP (no edge)
+# MICRO CHANGE: only log when quote state changes (no repeated SKIP spam)
 
 import os
 import time
@@ -10,7 +8,7 @@ import json
 import base64
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -59,7 +57,7 @@ def load_config() -> BotConfig:
         api_base=os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com").rstrip("/"),
         api_key_id=os.environ["KALSHI_API_KEY_ID"],
         private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
-        series_ticker=os.environ["SERIES_TICKER"],   # e.g. KXBTC15M
+        series_ticker=os.environ["SERIES_TICKER"],
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
@@ -104,17 +102,6 @@ def headers(cfg, priv, method, path_qs, body):
 # -----------------------------
 # HTTP helpers
 # -----------------------------
-def request_json(cfg, priv, method, path, params=None, body=None):
-    qs = path if not params else f"{path}?{urlencode(params)}"
-    url = cfg.api_base + qs
-    h = headers(cfg, priv, method, qs, body)
-    r = requests.request(method, url, headers=h, json=body, timeout=20)
-    data = r.json() if r.content else {}
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code} {qs}: {data}")
-    return data
-
-
 def public_get(cfg, path, params=None):
     qs = path if not params else f"{path}?{urlencode(params)}"
     r = requests.get(cfg.api_base + qs, timeout=20)
@@ -125,7 +112,7 @@ def public_get(cfg, path, params=None):
 
 
 # -----------------------------
-# ✅ FIXED SERIES RESOLUTION
+# Market resolution
 # -----------------------------
 def resolve_active_market(cfg) -> str:
     data = public_get(
@@ -133,11 +120,9 @@ def resolve_active_market(cfg) -> str:
         "/trade-api/v2/markets",
         params={"series": cfg.series_ticker, "status": "open"},
     )
-
     markets = data.get("markets") or data.get("data") or []
     if not markets:
         raise RuntimeError(f"No open markets for series {cfg.series_ticker}")
-
     return markets[0]["ticker"]
 
 
@@ -162,17 +147,12 @@ def parse_yes_book(ob):
 
 
 def choose_price(bid: Optional[int], ask: Optional[int], improve: int, max_px: int) -> Optional[int]:
-    # If both sides are empty, do not quote
     if bid is None and ask is None:
         return None
-
-    # MICRO CHANGE (THIS ONE): if both sides exist but spread is < 2c, do not quote
     if bid is not None and ask is not None and (ask - bid) < 2:
         return None
-
     if bid is None:
         return min(ask - 1, max_px)
-
     px = bid + improve
     if ask is not None:
         px = min(px, ask - 1)
@@ -189,6 +169,7 @@ def main():
     log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
 
     active = None
+    last_state: Optional[Tuple] = None  # MICRO CHANGE: track last quote state
 
     while True:
         try:
@@ -196,26 +177,31 @@ def main():
             if ticker != active:
                 active = ticker
                 log.info(f"[ROLL] Active market → {active}")
+                last_state = None  # reset on roll
 
             ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price)
 
             if price is None:
-                # Keep reason minimal, derived from current inputs
                 if bid is None and ask is None:
-                    reason = "empty book"
-                elif bid is not None and ask is not None and (ask - bid) < 2:
-                    reason = "tight spread"
+                    state = ("skip", "empty")
+                elif bid is not None and ask is not None:
+                    state = ("skip", "tight")
                 else:
-                    reason = "skip"
-                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({reason})")
+                    state = ("skip", "other")
+
+                if state != last_state:
+                    log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
+                    last_state = state
                 continue
 
-            log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
-
-            if not cfg.enable_trading or cfg.dry_run:
-                log.info("[DRYRUN] Not placing order")
+            state = ("quote", price)
+            if state != last_state:
+                log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → {price}c")
+                if not cfg.enable_trading or cfg.dry_run:
+                    log.info("[DRYRUN] Not placing order")
+                last_state = state
 
         except Exception as e:
             log.error(f"[LOOPERR] {e}")
