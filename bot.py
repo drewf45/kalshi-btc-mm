@@ -89,11 +89,11 @@ MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"]
 # Micro #3: allow one-sided quoting when spread is tight
 ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
 
+# ✅ Micro change: join best bid/ask when spread is too tight to step inside (e.g., 1-cent spread)
+ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"], "true"), default=True)
+
 # ✅ Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
-
-# ✅ Micro #6 (THIS CHANGE): require a new target price to persist for N loops before repricing
-TARGET_CONFIRM_LOOPS = int(getenv_first(["TARGET_CONFIRM_LOOPS"], "2"))
 
 # -----------------------------
 # Logging
@@ -529,6 +529,15 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
         if sell_ok:
             return (None, sell_p, f"tight_one_sided(sell_only spread={spread})")
 
+        # ✅ Micro change: when spread is so tight we can't step inside (e.g. spread=1),
+        # join the best level instead of skipping entirely.
+        if ENABLE_JOIN_TIGHT_SPREAD:
+            # Prefer joining the bid (keeps you as maker if POST_ONLY)
+            if yes_bid is not None and yes_bid < yes_ask:
+                return (clamp_price(int(yes_bid)), None, f"tight_join(buy@best_bid spread={spread})")
+            if yes_ask is not None and yes_ask > yes_bid:
+                return (None, clamp_price(int(yes_ask)), f"tight_join(sell@best_ask spread={spread})")
+
         return (None, None, f"spread_too_tight({spread})")
 
     # Normal two-sided quoting
@@ -567,12 +576,6 @@ NO_TARGET_SINCE_TS: Optional[float] = None
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
-# ✅ Micro #6: track candidate targets per-side; require confirmation before repricing
-_PENDING_TARGET: Dict[str, Dict[str, Any]] = {
-    "buy": {"price": None, "count": 0},
-    "sell": {"price": None, "count": 0},
-}
-
 
 def reconcile_quotes(
     market_ticker: str,
@@ -593,11 +596,8 @@ def reconcile_quotes(
     ✅ Micro #4:
       - If one side becomes None, do NOT instantly cancel that side.
       - Hold it for SIDE_HOLD_SECONDS, unless it becomes unsafe (cross/lock risk).
-
-    ✅ Micro #6:
-      - Before repricing, require the new target to persist TARGET_CONFIRM_LOOPS times.
     """
-    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS, _PENDING_TARGET
+    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
 
     now = time.time()
 
@@ -616,17 +616,11 @@ def reconcile_quotes(
         log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
         WORKING[side] = None
         _LAST_KEEP_LOGGED[side] = None
-        # reset pending target when we cancel
-        _PENDING_TARGET[side]["price"] = None
-        _PENDING_TARGET[side]["count"] = 0
 
     def place(side: str, price: int) -> None:
         log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
         WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now)
         _LAST_KEEP_LOGGED[side] = None
-        # reset pending target after placing
-        _PENDING_TARGET[side]["price"] = None
-        _PENDING_TARGET[side]["count"] = 0
 
     def keep(side: str, cur: WorkingOrder, note: str) -> None:
         if _LAST_KEEP_LOGGED.get(side) != cur.price_cents:
@@ -723,9 +717,6 @@ def reconcile_quotes(
         off = price_off(cur.price_cents, int(target_price))
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
-            # if we’re “close enough”, don’t accumulate pending reprices
-            _PENDING_TARGET[side]["price"] = None
-            _PENDING_TARGET[side]["count"] = 0
             return
 
         if not can_requote(cur):
@@ -733,31 +724,7 @@ def reconcile_quotes(
             keep(side, cur, f"cooldown age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off}")
             return
 
-        # ✅ Micro #6: require the target to persist for TARGET_CONFIRM_LOOPS loops
-        if TARGET_CONFIRM_LOOPS <= 1:
-            cancel(side, f"reprice(off_by={off})")
-            place(side, int(target_price))
-            return
-
-        pend_price = _PENDING_TARGET[side]["price"]
-        pend_count = int(_PENDING_TARGET[side]["count"] or 0)
-
-        if pend_price != int(target_price):
-            _PENDING_TARGET[side]["price"] = int(target_price)
-            _PENDING_TARGET[side]["count"] = 1
-            keep(side, cur, f"pending_reprice target@{target_price} confirm=1/{TARGET_CONFIRM_LOOPS} off_by={off}")
-            return
-
-        # same as last loop
-        pend_count += 1
-        _PENDING_TARGET[side]["count"] = pend_count
-
-        if pend_count < TARGET_CONFIRM_LOOPS:
-            keep(side, cur, f"pending_reprice target@{target_price} confirm={pend_count}/{TARGET_CONFIRM_LOOPS} off_by={off}")
-            return
-
-        # confirmed → reprice
-        cancel(side, f"reprice_confirmed({pend_count}/{TARGET_CONFIRM_LOOPS}) off_by={off}")
+        cancel(side, f"reprice(off_by={off})")
         place(side, int(target_price))
 
     maintain("buy", target_bid)
@@ -781,8 +748,8 @@ def main():
     log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
     log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
     log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
+    log.info("TIGHT_JOIN: ENABLE_JOIN_TIGHT_SPREAD=%s", ENABLE_JOIN_TIGHT_SPREAD)
     log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
-    log.info("TARGET_DEBOUNCE: TARGET_CONFIRM_LOOPS=%d", TARGET_CONFIRM_LOOPS)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -808,13 +775,9 @@ def main():
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
                 _LAST_KEEP_LOGGED["sell"] = None
-                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _PENDING_TARGET
+                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS
                 NO_TARGET_SINCE_TS = None
                 NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
-                _PENDING_TARGET = {
-                    "buy": {"price": None, "count": 0},
-                    "sell": {"price": None, "count": 0},
-                }
 
                 # reset ask cache on roll to avoid carrying stale ask across markets
                 _YES_ASK_CACHE["ask"] = None
@@ -854,7 +817,7 @@ def main():
                         DRY_RUN,
                     )
 
-            # reconcile every loop (timers need time progression even if target doesn't "change")
+            # ✅ reconcile every loop (timers need time progression even if target doesn't "change")
             reconcile_quotes(
                 market_ticker=mkt,
                 target_bid=tb,
