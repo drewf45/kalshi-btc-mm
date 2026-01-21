@@ -3,7 +3,6 @@ import json
 import time
 import base64
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
@@ -93,8 +92,8 @@ ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "tr
 # ✅ Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 
-# ✅ Micro #5 (THIS CHANGE): make real REST order placement/cancel possible when DRY_RUN=False
-POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
+# ✅ Micro #6 (THIS CHANGE): require a new target price to persist for N loops before repricing
+TARGET_CONFIRM_LOOPS = int(getenv_first(["TARGET_CONFIRM_LOOPS"], "2"))
 
 # -----------------------------
 # Logging
@@ -215,10 +214,6 @@ def request_json(
             except Exception:
                 text_head = (resp.text or "")[:200]
                 raise RuntimeError(f"HTTP {resp.status_code} {path}: {{'_non_json': True, '_text_head': {text_head!r}}}")
-
-        # Some endpoints *can* return empty bodies (rare). Handle gracefully.
-        if not resp.content:
-            return {}
 
         try:
             return resp.json()
@@ -552,45 +547,6 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     return (bid, ask, f"ok(spread={spread})")
 
 # -----------------------------
-# ✅ Micro #5: real order entry + cancel (only used when DRY_RUN=False)
-# -----------------------------
-def create_order(
-    market_ticker: str,
-    action: str,   # "buy" or "sell"
-    yes_price: int,
-    count: int,
-) -> str:
-    """
-    Places a limit order on YES side via POST /portfolio/orders.
-    Returns order_id.
-    """
-    payload = {
-        "ticker": market_ticker,
-        "side": "yes",
-        "action": action,
-        "count": int(count),
-        "type": "limit",
-        "yes_price": int(yes_price),
-        "client_order_id": f"{market_ticker}:{action}:{yes_price}:{uuid.uuid4()}",
-    }
-    if POST_ONLY:
-        payload["post_only"] = True
-
-    resp = request_json("POST", "/portfolio/orders", json_body=payload)
-    order = (resp or {}).get("order") or {}
-    oid = order.get("order_id") or order.get("id")
-    if not oid:
-        raise RuntimeError(f"Create order returned no order_id: {resp}")
-    return str(oid)
-
-
-def cancel_order(order_id: str) -> None:
-    """
-    Cancels/reduces an order to zero via DELETE /portfolio/orders/{order_id}.
-    """
-    request_json("DELETE", f"/portfolio/orders/{order_id}")
-
-# -----------------------------
 # Order management (DRY_RUN now, real later)
 # -----------------------------
 @dataclass
@@ -599,8 +555,6 @@ class WorkingOrder:
     price_cents: int
     qty: int
     created_ts: float
-    # ✅ Micro #5: track server order id when live
-    order_id: Optional[str] = None
 
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
@@ -612,6 +566,12 @@ NO_TARGET_SINCE_TS: Optional[float] = None
 # ✅ Micro #4: per-side missing timers + light log suppression
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
+
+# ✅ Micro #6: track candidate targets per-side; require confirmation before repricing
+_PENDING_TARGET: Dict[str, Dict[str, Any]] = {
+    "buy": {"price": None, "count": 0},
+    "sell": {"price": None, "count": 0},
+}
 
 
 def reconcile_quotes(
@@ -634,10 +594,10 @@ def reconcile_quotes(
       - If one side becomes None, do NOT instantly cancel that side.
       - Hold it for SIDE_HOLD_SECONDS, unless it becomes unsafe (cross/lock risk).
 
-    ✅ Micro #5:
-      - When dry_run=False and ENABLE_TRADING=True, actually POST/DELETE orders.
+    ✅ Micro #6:
+      - Before repricing, require the new target to persist TARGET_CONFIRM_LOOPS times.
     """
-    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
+    global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS, _PENDING_TARGET
 
     now = time.time()
 
@@ -653,44 +613,20 @@ def reconcile_quotes(
         cur = WORKING[side]
         if cur is None:
             return
-
         log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
-
-        # ✅ Micro #5: real cancel when live
-        if (not dry_run) and ENABLE_TRADING and cur.order_id:
-            try:
-                cancel_order(cur.order_id)
-                log.info(f"[LIVE] canceled order_id={cur.order_id}")
-            except Exception as e:
-                # If cancel fails, we still clear local state to avoid runaway loops,
-                # but we log loudly so you can investigate.
-                log.error(f"[LIVE] cancel failed order_id={cur.order_id}: {e}")
-
         WORKING[side] = None
         _LAST_KEEP_LOGGED[side] = None
+        # reset pending target when we cancel
+        _PENDING_TARGET[side]["price"] = None
+        _PENDING_TARGET[side]["count"] = 0
 
     def place(side: str, price: int) -> None:
         log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
-
-        order_id: Optional[str] = None
-
-        # ✅ Micro #5: real place when live
-        if (not dry_run) and ENABLE_TRADING:
-            try:
-                order_id = create_order(
-                    market_ticker=market_ticker,
-                    action=side,          # side is "buy" or "sell"
-                    yes_price=int(price),
-                    count=int(qty),
-                )
-                log.info(f"[LIVE] placed {side} order_id={order_id} yes_price={price} qty={qty} post_only={POST_ONLY}")
-            except Exception as e:
-                # If live placement fails, do NOT pretend it's working.
-                log.error(f"[LIVE] place failed side={side} price={price} qty={qty}: {e}")
-                order_id = None
-
-        WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now, order_id=order_id)
+        WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now)
         _LAST_KEEP_LOGGED[side] = None
+        # reset pending target after placing
+        _PENDING_TARGET[side]["price"] = None
+        _PENDING_TARGET[side]["count"] = 0
 
     def keep(side: str, cur: WorkingOrder, note: str) -> None:
         if _LAST_KEEP_LOGGED.get(side) != cur.price_cents:
@@ -787,6 +723,9 @@ def reconcile_quotes(
         off = price_off(cur.price_cents, int(target_price))
         if off < REPRICE_IF_OFF_BY_CENTS:
             keep(side, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
+            # if we’re “close enough”, don’t accumulate pending reprices
+            _PENDING_TARGET[side]["price"] = None
+            _PENDING_TARGET[side]["count"] = 0
             return
 
         if not can_requote(cur):
@@ -794,7 +733,31 @@ def reconcile_quotes(
             keep(side, cur, f"cooldown age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off}")
             return
 
-        cancel(side, f"reprice(off_by={off})")
+        # ✅ Micro #6: require the target to persist for TARGET_CONFIRM_LOOPS loops
+        if TARGET_CONFIRM_LOOPS <= 1:
+            cancel(side, f"reprice(off_by={off})")
+            place(side, int(target_price))
+            return
+
+        pend_price = _PENDING_TARGET[side]["price"]
+        pend_count = int(_PENDING_TARGET[side]["count"] or 0)
+
+        if pend_price != int(target_price):
+            _PENDING_TARGET[side]["price"] = int(target_price)
+            _PENDING_TARGET[side]["count"] = 1
+            keep(side, cur, f"pending_reprice target@{target_price} confirm=1/{TARGET_CONFIRM_LOOPS} off_by={off}")
+            return
+
+        # same as last loop
+        pend_count += 1
+        _PENDING_TARGET[side]["count"] = pend_count
+
+        if pend_count < TARGET_CONFIRM_LOOPS:
+            keep(side, cur, f"pending_reprice target@{target_price} confirm={pend_count}/{TARGET_CONFIRM_LOOPS} off_by={off}")
+            return
+
+        # confirmed → reprice
+        cancel(side, f"reprice_confirmed({pend_count}/{TARGET_CONFIRM_LOOPS}) off_by={off}")
         place(side, int(target_price))
 
     maintain("buy", target_bid)
@@ -819,7 +782,7 @@ def main():
     log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
     log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
     log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
-    log.info("LIVE_ORDER_ENTRY: POST_ONLY=%s", POST_ONLY)
+    log.info("TARGET_DEBOUNCE: TARGET_CONFIRM_LOOPS=%d", TARGET_CONFIRM_LOOPS)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -845,9 +808,13 @@ def main():
                 WORKING["sell"] = None
                 _LAST_KEEP_LOGGED["buy"] = None
                 _LAST_KEEP_LOGGED["sell"] = None
-                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS
+                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _PENDING_TARGET
                 NO_TARGET_SINCE_TS = None
                 NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
+                _PENDING_TARGET = {
+                    "buy": {"price": None, "count": 0},
+                    "sell": {"price": None, "count": 0},
+                }
 
                 # reset ask cache on roll to avoid carrying stale ask across markets
                 _YES_ASK_CACHE["ask"] = None
@@ -887,7 +854,7 @@ def main():
                         DRY_RUN,
                     )
 
-            # ✅ Micro #4: reconcile every loop (timers need time progression even if target doesn't "change")
+            # reconcile every loop (timers need time progression even if target doesn't "change")
             reconcile_quotes(
                 market_ticker=mkt,
                 target_bid=tb,
