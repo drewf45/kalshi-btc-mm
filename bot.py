@@ -44,7 +44,10 @@ def parse_bool(v: str, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-API_BASE = getenv_first(["KALSHI_API_BASE", "KALSHI_BASE_URL"], "https://trading-api.kalshi.com").rstrip("/")
+API_BASE = getenv_first(
+    ["KALSHI_API_BASE", "KALSHI_BASE_URL"],
+    "https://trading-api.kalshi.com",
+).rstrip("/")
 API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2")
 
 SERIES = getenv_first(["SERIES", "SERIES_TICKER"], "KXBTC15M").strip()
@@ -74,7 +77,7 @@ MIN_REQUOTE_SECONDS = float(getenv_first(["MIN_REQUOTE_SECONDS"], "3.0"))
 # Only reprice if we are "meaningfully" off target
 REPRICE_IF_OFF_BY_CENTS = int(getenv_first(["REPRICE_IF_OFF_BY_CENTS"], "2"))
 
-# When BOTH sides are None, hold existing orders instead of canceling immediately
+# When BOTH targets are None, hold existing orders instead of canceling immediately
 HOLD_ON_SKIP = parse_bool(getenv_first(["HOLD_ON_SKIP"], "true"), default=True)
 
 # Only cancel after BOTH targets have been None continuously for this long
@@ -86,13 +89,13 @@ ASK_CACHE_TTL_SECONDS = float(getenv_first(["ASK_CACHE_TTL_SECONDS"], "5.0"))
 # Micro #2: fallback to /markets/{ticker} when ask missing (throttled)
 MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"], "5.0"))
 
-# Micro #3: allow one-sided quoting when spread is tight
+# Micro #3: allow one-sided quoting when spread is tight (kept as a toggle, but Change #2 forces skip anyway)
 ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
 
-# ✅ Micro change: join best bid/ask when spread is too tight to step inside (e.g., 1-cent spread)
+# Micro: join best bid/ask when spread is too tight to step inside (kept as a toggle, but Change #2 forces skip anyway)
 ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"], "true"), default=True)
 
-# ✅ Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
+# Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 
 # -----------------------------
@@ -505,8 +508,7 @@ def compute_target_yes_quotes(yes_bid: Optional[int], yes_ask: Optional[int]) ->
     spread = yes_ask - yes_bid
 
     # =========================================================
-    # CHANGE #2:
-    # Require MIN_SPREAD_CENTS before quoting anything.
+    # CHANGE #2: hard gate — do NOT quote unless spread >= MIN_SPREAD_CENTS
     # =========================================================
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
@@ -540,10 +542,8 @@ class WorkingOrder:
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
 
-# Track when we entered "both sides missing" state
 NO_TARGET_SINCE_TS: Optional[float] = None
 
-# ✅ Micro #4: per-side missing timers + light log suppression
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 _LAST_SIDE_HOLD_LOG_TS: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
@@ -556,16 +556,8 @@ def reconcile_quotes(
     dry_run: bool,
     yes_bid: Optional[int],
     yes_ask: Optional[int],
-    # =========================================================
-    # CHANGE #3 (ONLY):
-    # If we're skipping because spread is too tight, cancel now.
-    # (Do NOT "hold stale quotes" for 10s in tight spread.)
-    # =========================================================
     skip_reason: Optional[str] = None,
 ) -> None:
-    """
-    Maintain at most ONE working buy (target_bid) and at most ONE working sell (target_ask).
-    """
     global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
 
     now = time.time()
@@ -605,10 +597,12 @@ def reconcile_quotes(
             return int(cur.price_cents) >= int(yes_ask)
         return False
 
-    # --- BOTH missing: global HOLD/CANCEL logic ---
+    # BOTH missing: global HOLD/CANCEL logic
     both_missing = (target_bid is None) and (target_ask is None)
     if both_missing:
-        # CHANGE #3: if skip is due to tight spread, cancel immediately (avoid stale quotes)
+        # =========================================================
+        # CHANGE #3: immediate cancel on "spread_too_tight" skips
+        # =========================================================
         if isinstance(skip_reason, str) and skip_reason.startswith("spread_too_tight"):
             cancel("buy", f"tight_spread_exit({skip_reason})")
             cancel("sell", f"tight_spread_exit({skip_reason})")
@@ -634,7 +628,7 @@ def reconcile_quotes(
     else:
         NO_TARGET_SINCE_TS = None
 
-    # --- Micro #4: per-side hold when a single side is missing ---
+    # per-side hold when a single side is missing
     if target_bid is not None:
         NO_TARGET_SIDE_SINCE_TS["buy"] = None
     if target_ask is not None:
@@ -672,7 +666,7 @@ def reconcile_quotes(
     if target_ask is None:
         handle_missing_side("sell")
 
-    # --- Normal maintain logic for sides that have targets ---
+    # maintain logic for sides that have targets
     def maintain(side: str, target_price: Optional[int]) -> None:
         if target_price is None:
             return
@@ -684,24 +678,15 @@ def reconcile_quotes(
 
         off = price_off(cur.price_cents, int(target_price))
 
+        # Note: compute_target_yes_quotes() already blocks tight spreads, but keep this safe.
         tight_mode = (
             (yes_bid is not None and yes_ask is not None)
             and ((yes_ask - yes_bid) < MIN_SPREAD_CENTS)
         )
 
-        tight_join_mode = (
-            ENABLE_JOIN_TIGHT_SPREAD
-            and tight_mode
-            and (
-                (side == "buy" and int(target_price) == int(yes_bid))
-                or (side == "sell" and int(target_price) == int(yes_ask))
-            )
-        )
-
         if tight_mode:
             if off == 0:
-                note = "join_mode exact_match" if tight_join_mode else "tight_mode exact_match"
-                keep(side, cur, note)
+                keep(side, cur, "tight_mode exact_match")
                 return
 
         if off < REPRICE_IF_OFF_BY_CENTS:
@@ -727,8 +712,100 @@ def main():
         "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s",
         API_BASE, API_PREFIX, SERIES,
         EVENT_TICKER or "<auto>", MARKET_TICKER_OVERRIDE or "<none>",
-        POLL, DRY_RUN, ENABLE_TRADING
+        POLL, DRY_RUN, ENABLE_TRADING,
     )
     log.info("QUOTE_PARAMS: TICK_CENTS=%d EDGE_CENTS=%d MIN_SPREAD_CENTS=%d", TICK_CENTS, EDGE_CENTS, MIN_SPREAD_CENTS)
+    # IMPORTANT: keep this format string on ONE LINE to avoid Render copy/paste breaking it.
     log.info(
-        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE
+        "ORDER_PARAMS: ORDER_QTY=%d MIN_REQUOTE_SECONDS=%.2f REPRICE_IF_OFF_BY_CENTS=%d HOLD_ON_SKIP=%s CANCEL_IF_NO_TARGET_SECONDS=%.2f",
+        ORDER_QTY, MIN_REQUOTE_SECONDS, REPRICE_IF_OFF_BY_CENTS, HOLD_ON_SKIP, CANCEL_IF_NO_TARGET_SECONDS,
+    )
+    log.info("ASK_CACHE: ASK_CACHE_TTL_SECONDS=%.2f", ASK_CACHE_TTL_SECONDS)
+    log.info("MARKET_FALLBACK: MARKET_FALLBACK_MIN_SECONDS=%.2f", MARKET_FALLBACK_MIN_SECONDS)
+    log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
+    log.info("TIGHT_JOIN: ENABLE_JOIN_TIGHT_SPREAD=%s", ENABLE_JOIN_TIGHT_SPREAD)
+    log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
+
+    last_market: Optional[str] = None
+    last_yes_bid: Optional[int] = None
+    last_yes_ask: Optional[int] = None
+    last_tb: Optional[int] = None
+    last_ta: Optional[int] = None
+    last_why: Optional[str] = None
+
+    while True:
+        try:
+            mkt = roll_active_market()
+
+            market_changed = (mkt != last_market)
+            if market_changed:
+                last_market = mkt
+                last_yes_bid = None
+                last_yes_ask = None
+                last_tb = None
+                last_ta = None
+                last_why = None
+
+                WORKING["buy"] = None
+                WORKING["sell"] = None
+                _LAST_KEEP_LOGGED["buy"] = None
+                _LAST_KEEP_LOGGED["sell"] = None
+                global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS
+                NO_TARGET_SINCE_TS = None
+                NO_TARGET_SIDE_SINCE_TS = {"buy": None, "sell": None}
+
+                _YES_ASK_CACHE["ask"] = None
+                _YES_ASK_CACHE["ts"] = 0.0
+
+                global _LAST_MARKET_FALLBACK_TS
+                _LAST_MARKET_FALLBACK_TS = 0.0
+
+                log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
+
+            ob = fetch_orderbook(mkt)
+            yes_bid, yes_ask = get_yes_bid_ask(ob, mkt)
+
+            quote_changed = (yes_bid != last_yes_bid) or (yes_ask != last_yes_ask) or market_changed
+            if quote_changed:
+                last_yes_bid, last_yes_ask = yes_bid, yes_ask
+                if yes_bid is None and yes_ask is None:
+                    log.info("[QUOTE] %s YES bid=None ask=None → SKIP (empty)", mkt)
+                else:
+                    log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
+
+            tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
+
+            target_changed = (tb != last_tb) or (ta != last_ta) or (why != last_why) or market_changed
+            if target_changed:
+                last_tb, last_ta, last_why = tb, ta, why
+                if tb is None and ta is None:
+                    log.info("[TARGET] %s → SKIP (%s)", mkt, why)
+                else:
+                    log.info(
+                        "[TARGET] %s YES-only would_quote: bid@%s ask@%s (%s) DRY_RUN=%s",
+                        mkt,
+                        str(tb) if tb is not None else "None",
+                        str(ta) if ta is not None else "None",
+                        why,
+                        DRY_RUN,
+                    )
+
+            reconcile_quotes(
+                market_ticker=mkt,
+                target_bid=tb,
+                target_ask=ta,
+                qty=ORDER_QTY,
+                dry_run=DRY_RUN,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                skip_reason=why if (tb is None and ta is None) else None,
+            )
+
+        except Exception as e:
+            log.error("[LOOPERR] %s", e)
+
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()
