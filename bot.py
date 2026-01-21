@@ -105,6 +105,10 @@ ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"],
 # Micro #4: per-side hysteresis (don’t instantly cancel the missing side)
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 
+# --- LIVE ORDER FLAGS (micro add; defaults safe for market making) ---
+POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
+SELL_POSITION_CAPPED = parse_bool(getenv_first(["SELL_POSITION_CAPPED"], "true"), default=True)
+
 # -----------------------------
 # Logging
 # -----------------------------
@@ -226,11 +230,72 @@ def request_json(
                 text_head = (resp.text or "")[:200]
                 raise RuntimeError(f"HTTP {resp.status_code} {path}: {{'_non_json': True, '_text_head': {text_head!r}}}")
 
+        # Some DELETEs may return 204 with empty body; tolerate that and return {}
+        if resp.status_code == 204:
+            return {}
+
         try:
             return resp.json()
         except Exception:
             text_head = (resp.text or "")[:200]
             raise RuntimeError(f"Bad JSON response for {path}: {text_head!r}")
+
+# -----------------------------
+# LIVE ORDER FUNCTIONS (MICRO CHANGE)
+# -----------------------------
+def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
+    """
+    Kalshi responses vary slightly across endpoints; handle common shapes.
+    """
+    if not isinstance(resp, dict):
+        return None
+    if isinstance(resp.get("order_id"), str):
+        return resp["order_id"]
+    o = resp.get("order")
+    if isinstance(o, dict) and isinstance(o.get("order_id"), str):
+        return o["order_id"]
+    # sometimes nested under "result" etc.
+    for k in ("result", "data"):
+        v = resp.get(k)
+        if isinstance(v, dict) and isinstance(v.get("order_id"), str):
+            return v["order_id"]
+        if isinstance(v, dict):
+            oo = v.get("order")
+            if isinstance(oo, dict) and isinstance(oo.get("order_id"), str):
+                return oo["order_id"]
+    return None
+
+
+def create_order_yes(market_ticker: str, action: str, yes_price: int, count: int) -> str:
+    """
+    Posts a real LIMIT order on YES side.
+    Endpoint: POST /portfolio/orders  (under API_PREFIX)  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/orders/create-order?utm_source=chatgpt.com)
+    """
+    payload: Dict[str, Any] = {
+        "ticker": market_ticker,
+        "type": "limit",
+        "action": action,        # "buy" or "sell"
+        "side": "yes",
+        "count": int(count),
+        "yes_price": int(yes_price),  # cents 1-99
+        "post_only": bool(POST_ONLY),
+    }
+    if action.lower() == "sell":
+        payload["sell_position_capped"] = bool(SELL_POSITION_CAPPED)
+
+    resp = request_json("POST", "/portfolio/orders", json_body=payload)
+    oid = _extract_order_id(resp)
+    if not oid:
+        raise RuntimeError(f"Create order succeeded but no order_id found in response: {resp}")
+    return oid
+
+
+def cancel_order(order_id: str) -> None:
+    """
+    Cancels (reduces remaining to zero).
+    Endpoint: DELETE /portfolio/orders/{order_id}  [oai_citation:3‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/quick_start_create_order?utm_source=chatgpt.com)
+    """
+    request_json("DELETE", f"/portfolio/orders/{order_id}")
 
 # -----------------------------
 # Rolling via /markets ONLY
@@ -534,6 +599,7 @@ class WorkingOrder:
     price_cents: int
     qty: int
     created_ts: float
+    order_id: Optional[str] = None   # <-- MICRO: store live order id for cancel
 
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
@@ -577,13 +643,36 @@ def reconcile_quotes(
         cur = WORKING[side]
         if cur is None:
             return
+
         log.info(f"[OM] {market_ticker} {side.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}")
+
+        # MICRO: actually cancel on Kalshi when live
+        if (not dry_run) and ENABLE_TRADING:
+            if not cur.order_id:
+                log.warning("[OM] %s %s CANCEL skipped (missing order_id) — clearing local state", market_ticker, side.upper())
+            else:
+                cancel_order(cur.order_id)
+
         WORKING[side] = None
         _LAST_KEEP_LOGGED[side] = None
 
     def place(side: str, price: int) -> None:
         log.info(f"[OM] {market_ticker} {side.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
-        WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now)
+
+        oid: Optional[str] = None
+        # MICRO: actually post on Kalshi when live
+        if (not dry_run) and ENABLE_TRADING:
+            action = "buy" if side == "buy" else "sell"
+            oid = create_order_yes(
+                market_ticker=market_ticker,
+                action=action,
+                yes_price=int(price),
+                count=int(qty),
+            )
+            log.info("[OM] %s %s LIVE order posted order_id=%s price=%s qty=%s post_only=%s",
+                     market_ticker, side.upper(), oid, price, qty, POST_ONLY)
+
+        WORKING[side] = WorkingOrder(side=side, price_cents=price, qty=qty, created_ts=now, order_id=oid)
         _LAST_KEEP_LOGGED[side] = None
 
     def keep(side: str, cur: WorkingOrder, note: str) -> None:
@@ -798,6 +887,7 @@ def main():
     log.info("TIGHT_MODE: ENABLE_ONE_SIDED_TIGHT=%s", ENABLE_ONE_SIDED_TIGHT)
     log.info("TIGHT_JOIN: ENABLE_JOIN_TIGHT_SPREAD=%s", ENABLE_JOIN_TIGHT_SPREAD)
     log.info("SIDE_HOLD: SIDE_HOLD_SECONDS=%.2f", SIDE_HOLD_SECONDS)
+    log.info("LIVE_FLAGS: POST_ONLY=%s SELL_POSITION_CAPPED=%s", POST_ONLY, SELL_POSITION_CAPPED)
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
