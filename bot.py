@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: distinguish skip reasons (tight_spread vs no_edge_buffer)
+# MICRO CHANGE: do NOT reset last_intended_price on SKIP (preserve intent continuity)
 
 import os
 import time
@@ -200,7 +200,6 @@ def main():
                     state = ("skip", "empty")
                     sleep_for = cfg.empty_poll_seconds
                 elif bid is not None and ask is not None:
-                    # MICRO CHANGE: split reasons
                     if (ask - bid) < 2:
                         state = ("skip", "tight_spread")
                     elif (ask - (bid + cfg.improve_ticks)) < 2:
@@ -210,7 +209,7 @@ def main():
                 else:
                     state = ("skip", "other")
 
-                last_intended_price = None
+                # MICRO CHANGE: do not reset last_intended_price on skips
 
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
