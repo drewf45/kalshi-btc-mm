@@ -18,7 +18,6 @@ load_dotenv()
 
 
 def getenv_first(keys: List[str], default: str = "") -> str:
-    """Return the first non-empty env var among keys."""
     for k in keys:
         v = os.getenv(k)
         if v is not None and str(v).strip() != "":
@@ -27,10 +26,6 @@ def getenv_first(keys: List[str], default: str = "") -> str:
 
 
 def getenv_by_prefix(prefixes: List[str]) -> str:
-    """
-    Return the value of the first env var whose NAME starts with any of the prefixes.
-    Useful when Render UI truncates names like KALSHI_PRIVATE_KEY_PEM...
-    """
     for name, value in os.environ.items():
         for p in prefixes:
             if name.startswith(p) and str(value).strip() != "":
@@ -51,25 +46,20 @@ def parse_bool(v: str, default: bool = False) -> bool:
 API_BASE = getenv_first(["KALSHI_API_BASE", "KALSHI_BASE_URL"], "https://trading-api.kalshi.com").rstrip("/")
 API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2")
 
-# ✅ your Render uses SERIES_TICKER
 SERIES = getenv_first(["SERIES", "SERIES_TICKER"], "KXBTC15M").strip()
 
-# event-first
 EVENT_TICKER = getenv_first(["EVENT_TICKER", "EVENT"], "").strip()
 MARKET_TICKER_OVERRIDE = getenv_first(["MARKET_TICKER", "MARKET"], "").strip()
 
-# ✅ your Render uses POLL_SECONDS
 POLL = float(getenv_first(["POLL", "POLL_SECONDS"], "2.0"))
 ROLL_CHECK_MIN_SECONDS = float(getenv_first(["ROLL_CHECK_MIN_SECONDS"], "30.0"))
 
 DRY_RUN = parse_bool(getenv_first(["DRY_RUN"], "true"), default=True)
 ENABLE_TRADING = parse_bool(getenv_first(["ENABLE_TRADING"], "true"), default=True)
 
-# backoff for 429s
 BACKOFF_START = float(getenv_first(["BACKOFF_START"], "1.0"))
 BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 
-# quoting knobs (safe defaults; tune later)
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 
@@ -81,25 +71,21 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message
 log = logging.getLogger("kalshi-bot")
 
 # -----------------------------
-# ✅ Micro-change: Credential discovery + diagnostics
+# Credentials + diagnostics
 # -----------------------------
-# Key ID: support old + possible variants
 KALSHI_KEY_ID = getenv_first(
     ["KALSHI_KEY_ID", "KALSHI_API_KEY_ID", "KALSHI_ACCESS_KEY", "KALSHI_API_KEY"],
     ""
 ).strip()
 
-# Private key: support exact names + "prefix" names like KALSHI_PRIVATE_KEY_PEM_B64
 KALSHI_PRIVATE_KEY_RAW = getenv_first(
     ["KALSHI_PRIVATE_KEY_B64", "KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY"],
     ""
 ).strip()
 
 if not KALSHI_PRIVATE_KEY_RAW:
-    # prefix match catches names like "KALSHI_PRIVATE_KEY_PEM_B64"
     KALSHI_PRIVATE_KEY_RAW = getenv_by_prefix(["KALSHI_PRIVATE_KEY_PEM", "KALSHI_PRIVATE_KEY_B64"]).strip()
 
-# Safe diagnostics: show what the runtime process actually has (names only)
 _detected_kalshi_keys = env_keys_with_prefix("KALSHI_")
 log.info("[ENV] Detected KALSHI_* keys: %s", _detected_kalshi_keys if _detected_kalshi_keys else "<none>")
 
@@ -108,10 +94,8 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
         "Missing Kalshi credentials at runtime.\n"
         f"Detected KALSHI_* keys: {_detected_kalshi_keys}\n"
         "Expected one of:\n"
-        "  - KALSHI_KEY_ID or KALSHI_API_KEY_ID (or KALSHI_ACCESS_KEY / KALSHI_API_KEY)\n"
+        "  - KALSHI_KEY_ID or KALSHI_API_KEY_ID\n"
         "  - KALSHI_PRIVATE_KEY_B64 or KALSHI_PRIVATE_KEY_PEM (or any env starting with KALSHI_PRIVATE_KEY_PEM)\n"
-        "\n"
-        "If your keys appear in Render UI but NOT in the detected list above, they are set on a different service/environment."
     )
 
 # -----------------------------
@@ -122,25 +106,17 @@ def now_ms() -> int:
 
 
 def load_private_key_from_env(raw: str) -> Any:
-    """
-    Supports:
-      - PEM text directly (contains 'BEGIN' + 'PRIVATE KEY')
-      - base64-encoded PEM (common in env vars)
-    """
     s = raw.strip()
-
-    # PEM text already
     if "BEGIN" in s and "PRIVATE KEY" in s:
         return serialization.load_pem_private_key(s.encode("utf-8"), password=None)
 
-    # base64 -> PEM bytes
     try:
         key_bytes = base64.b64decode(s)
         return serialization.load_pem_private_key(key_bytes, password=None)
     except Exception as e:
         raise RuntimeError(
             "Could not parse private key. Provide PEM text in KALSHI_PRIVATE_KEY_PEM "
-            "or base64 PEM in KALSHI_PRIVATE_KEY_B64 (or PEM-prefixed variant)."
+            "or base64 PEM in KALSHI_PRIVATE_KEY_B64."
         ) from e
 
 
@@ -179,7 +155,6 @@ def request_json(
     params = params or {}
     body_str = "" if json_body is None else json.dumps(json_body, separators=(",", ":"), sort_keys=True)
 
-    # Sign the exact path+query
     if params:
         req = requests.Request(method.upper(), url, params=params, data=body_str)
         prepped = req.prepare()
@@ -231,6 +206,95 @@ def _parse_dt_to_ts(s: Any) -> float:
         return 0.0
 
 
+def pick_open_market(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Return the best open market object (not just ticker) so we can also read event_ticker.
+    """
+    now = time.time()
+    open_markets = []
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        status = str(m.get("status", "")).lower()
+        if status in ("open", "active", "trading"):
+            open_markets.append(m)
+
+    candidates = open_markets if open_markets else [m for m in markets if isinstance(m, dict)]
+    if not candidates:
+        return None
+
+    def score(m: Dict[str, Any]) -> Tuple[int, float]:
+        status = str(m.get("status", "")).lower()
+        is_open = status in ("open", "active", "trading")
+        close_ts = 0.0
+        for k in ("close_time", "end_time", "expiration_time", "settlement_time"):
+            if k in m:
+                close_ts = max(close_ts, _parse_dt_to_ts(m.get(k)))
+        if close_ts > 0:
+            dtc = close_ts - now
+            if dtc >= 0:
+                return (2 if is_open else 1, -dtc)
+        return (1 if is_open else 0, -1e18)
+
+    return sorted(candidates, key=score, reverse=True)[0]
+
+
+def fetch_events_for_series(series_ticker: str, limit: int = 250) -> List[Dict[str, Any]]:
+    # attempt #1 (some hosts have it)
+    try:
+        data = request_json("GET", f"/series/{series_ticker}/events", params={"limit": limit})
+        events = data.get("events") or data.get("data") or data.get("results") or []
+        if isinstance(events, list) and events:
+            return events
+    except Exception as e:
+        log.warning("[EVENTS] series endpoint failed: %s", e)
+
+    # attempt #2 (some hosts support /events listing)
+    data = request_json("GET", "/events", params={"series_ticker": series_ticker, "limit": limit})
+    events = data.get("events") or data.get("data") or data.get("results") or []
+    return events if isinstance(events, list) else []
+
+
+# ✅ MICRO-CHANGE: fallback resolver via /markets?series_ticker=...
+def resolve_event_and_market_via_markets(series_ticker: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Fallback path when /series/{series}/events and /events?series_ticker fail (as on elections host).
+    We ask /markets for the series, pick an open market, then read event_ticker off the market payload.
+    """
+    # try a couple param names defensively
+    param_sets = [
+        {"series_ticker": series_ticker, "limit": 200},
+        {"series": series_ticker, "limit": 200},
+        {"series_ticker": series_ticker, "status": "open", "limit": 200},
+    ]
+
+    last_err = None
+    for params in param_sets:
+        try:
+            data = request_json("GET", "/markets", params=params)
+            markets = data.get("markets") or data.get("data") or data.get("results") or []
+            if not isinstance(markets, list) or not markets:
+                continue
+
+            best = pick_open_market(markets)
+            if not best:
+                continue
+
+            # log one-time keys so you can see what field names exist
+            log.info("[MARKETS] Sample market keys: %s", sorted(list(best.keys())))
+
+            mkt_ticker = best.get("ticker") or best.get("market_ticker")
+            evt_ticker = best.get("event_ticker") or best.get("event") or best.get("eventTicker")
+
+            return (evt_ticker, mkt_ticker)
+        except Exception as e:
+            last_err = e
+            continue
+
+    log.warning("[MARKETS] Could not resolve via /markets fallback: %s", last_err)
+    return (None, None)
+
+
 def pick_active_event(events: List[Dict[str, Any]]) -> Optional[str]:
     now = time.time()
 
@@ -263,24 +327,8 @@ def pick_active_event(events: List[Dict[str, Any]]) -> Optional[str]:
     return best.get("ticker") or best.get("event_ticker")
 
 
-def fetch_events_for_series(series_ticker: str, limit: int = 200) -> List[Dict[str, Any]]:
-    # attempt #1
-    try:
-        data = request_json("GET", f"/series/{series_ticker}/events", params={"limit": limit})
-        events = data.get("events") or data.get("data") or data.get("results") or []
-        if isinstance(events, list) and events:
-            return events
-    except Exception as e:
-        log.warning("[EVENTS] series endpoint failed: %s", e)
-
-    # attempt #2
-    data = request_json("GET", "/events", params={"series_ticker": series_ticker, "limit": limit})
-    events = data.get("events") or data.get("data") or data.get("results") or []
-    return events if isinstance(events, list) else []
-
-
 def roll_active_event() -> str:
-    global _last_roll_ts, _active_event_ticker
+    global _last_roll_ts, _active_event_ticker, _active_market_ticker
 
     if EVENT_TICKER:
         if _active_event_ticker != EVENT_TICKER:
@@ -292,51 +340,29 @@ def roll_active_event() -> str:
     if _active_event_ticker and (now - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
         return _active_event_ticker
 
-    events = fetch_events_for_series(SERIES, limit=250)
-    if not events:
-        raise RuntimeError(f"No events returned for series {SERIES}. Check API_BASE/API_PREFIX and series ticker.")
+    # try normal path first
+    try:
+        events = fetch_events_for_series(SERIES, limit=250)
+        if events:
+            picked = pick_active_event(events)
+            if picked:
+                _active_event_ticker = picked
+                _last_roll_ts = time.time()
+                log.info("[ROLL] Series=%s → Active event → %s", SERIES, _active_event_ticker)
+                return _active_event_ticker
+    except Exception as e:
+        log.warning("[ROLL] event listing path failed: %s", e)
 
-    picked = pick_active_event(events)
-    if not picked:
-        raise RuntimeError(f"Could not pick an active event for series {SERIES} (events={len(events)})")
+    # ✅ fallback to /markets listing
+    evt, mkt = resolve_event_and_market_via_markets(SERIES)
+    if not evt:
+        raise RuntimeError(f"Could not auto-resolve active EVENT for series {SERIES} (events endpoints failed, markets fallback failed).")
 
-    _active_event_ticker = picked
+    _active_event_ticker = evt
+    _active_market_ticker = mkt  # optional cache if we got it
     _last_roll_ts = time.time()
-    log.info("[ROLL] Series=%s → Active event → %s", SERIES, _active_event_ticker)
+    log.info("[ROLL] (fallback) Series=%s → Active event → %s (via markets)", SERIES, _active_event_ticker)
     return _active_event_ticker
-
-
-def pick_open_market(markets: List[Dict[str, Any]]) -> Optional[str]:
-    now = time.time()
-    open_markets = []
-    for m in markets:
-        if not isinstance(m, dict):
-            continue
-        status = str(m.get("status", "")).lower()
-        if status in ("open", "active", "trading"):
-            open_markets.append(m)
-
-    if not open_markets:
-        for m in markets:
-            t = m.get("ticker") or m.get("market_ticker")
-            if t:
-                return t
-        return None
-
-    def score(m: Dict[str, Any]) -> Tuple[int, float]:
-        close_ts = 0.0
-        for k in ("close_time", "end_time", "expiration_time", "settlement_time"):
-            if k in m:
-                close_ts = max(close_ts, _parse_dt_to_ts(m.get(k)))
-        if close_ts <= 0:
-            return (1, -1e18)
-        dtc = close_ts - now
-        if dtc < 0:
-            return (1, -1e12 + dtc)
-        return (1, -dtc)
-
-    best = sorted(open_markets, key=score, reverse=True)[0]
-    return best.get("ticker") or best.get("market_ticker")
 
 
 def roll_active_market() -> str:
@@ -348,6 +374,10 @@ def roll_active_market() -> str:
         _active_market_ticker = MARKET_TICKER_OVERRIDE
         return _active_market_ticker
 
+    # if fallback already discovered a market, use it
+    if _active_market_ticker and (time.time() - _last_roll_ts) < ROLL_CHECK_MIN_SECONDS:
+        return _active_market_ticker
+
     event_ticker = roll_active_event()
 
     data = request_json("GET", f"/events/{event_ticker}/markets", params={"limit": 200})
@@ -355,9 +385,13 @@ def roll_active_market() -> str:
     if not isinstance(markets, list) or not markets:
         raise RuntimeError(f"No markets returned for event {event_ticker}. Response keys={list(data.keys())}")
 
-    picked = pick_open_market(markets)
-    if not picked:
+    best = pick_open_market(markets)
+    if not best:
         raise RuntimeError(f"Could not pick a market for event {event_ticker} (markets={len(markets)})")
+
+    picked = best.get("ticker") or best.get("market_ticker")
+    if not picked:
+        raise RuntimeError(f"Picked market missing ticker fields for event {event_ticker}")
 
     if _active_market_ticker != picked:
         log.info("[ROLL] Event=%s → Active market → %s", event_ticker, picked)
