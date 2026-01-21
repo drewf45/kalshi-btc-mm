@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: parse_yes_book() now handles orderbook responses that are a list (prevents "'list' object has no attribute 'get'")
+# MICRO CHANGE: when orderbook parses as empty, log response shape ONCE per active market to map JSON structure
 
 import os
 import time
@@ -77,35 +77,6 @@ def load_config() -> BotConfig:
 
 
 # -----------------------------
-# Auth / signing (kept for later trading wiring)
-# -----------------------------
-def load_private_key(b64: str):
-    return serialization.load_pem_private_key(base64.b64decode(b64), password=None)
-
-
-def canonical_json(obj):
-    return "" if obj is None else json.dumps(obj, separators=(",", ":"), sort_keys=True)
-
-
-def sign_request(priv, ts, method, path_qs, body):
-    msg = f"{ts}{method}{path_qs}{body}".encode()
-    sig = priv.sign(msg, padding.PKCS1v15(), hashes.SHA256())
-    return base64.b64encode(sig).decode()
-
-
-def headers(cfg, priv, method, path_qs, body):
-    ts = str(int(time.time() * 1000))
-    body_str = canonical_json(body) if method != "GET" else ""
-    sig = sign_request(priv, ts, method, path_qs, body_str)
-    return {
-        "KALSHI-ACCESS-KEY": cfg.api_key_id,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig,
-        "Content-Type": "application/json",
-    }
-
-
-# -----------------------------
 # HTTP helpers
 # -----------------------------
 def public_get(cfg, session: requests.Session, path, params=None):
@@ -171,22 +142,15 @@ def best_price(levels, want):
 
 
 def parse_yes_book(ob: Any):
-    """
-    MICRO CHANGE: Kalshi may return a list at the top-level for orderbook.
-    We safely coerce list -> first dict item.
-    """
+    # handle list -> first dict
     if isinstance(ob, list):
         if not ob:
             return None, None
-        if isinstance(ob[0], dict):
-            ob = ob[0]
-        else:
-            return None, None
+        ob = ob[0] if isinstance(ob[0], dict) else None
 
     if not isinstance(ob, dict):
         return None, None
 
-    # Some responses may be {"orderbook": {...}}; others may already be {...}
     container = ob.get("orderbook", ob)
     if not isinstance(container, dict):
         return None, None
@@ -222,6 +186,31 @@ def is_rate_limited(err: Exception) -> bool:
     return ("429" in s) or ("too_many_requests" in s)
 
 
+def log_orderbook_shape_once(active: str, ob: Any):
+    """
+    MICRO CHANGE: lightweight shape log (no spam). Call only once per active ticker.
+    """
+    try:
+        if isinstance(ob, list):
+            log.info(f"[OBSHAPE] {active} top=list len={len(ob)}")
+            if ob and isinstance(ob[0], dict):
+                log.info(f"[OBSHAPE] {active} first_keys={list(ob[0].keys())[:20]}")
+                # if nested orderbook exists, show its keys
+                if "orderbook" in ob[0] and isinstance(ob[0]["orderbook"], dict):
+                    log.info(f"[OBSHAPE] {active} orderbook_keys={list(ob[0]['orderbook'].keys())[:20]}")
+            return
+
+        if isinstance(ob, dict):
+            log.info(f"[OBSHAPE] {active} top=dict keys={list(ob.keys())[:25]}")
+            if "orderbook" in ob and isinstance(ob["orderbook"], dict):
+                log.info(f"[OBSHAPE] {active} orderbook_keys={list(ob['orderbook'].keys())[:25]}")
+            return
+
+        log.info(f"[OBSHAPE] {active} top={type(ob).__name__}")
+    except Exception as e:
+        log.info(f"[OBSHAPE] {active} failed_to_log_shape: {e}")
+
+
 # -----------------------------
 # Main loop
 # -----------------------------
@@ -236,6 +225,9 @@ def main():
     last_market_refresh_ts: float = 0.0
     last_rl_log_ts: float = 0.0
 
+    # MICRO CHANGE: track shape logging per active ticker
+    shape_logged_for_active: Optional[str] = None
+
     while True:
         sleep_for = cfg.poll_seconds
 
@@ -247,10 +239,17 @@ def main():
                 if ticker != active:
                     active = ticker
                     last_state = None
+                    shape_logged_for_active = None  # reset on roll
                     log.info(f"[ROLL] Active market → {active}")
 
             ob = public_get(cfg, session, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
+
+            # MICRO CHANGE: if empty, log shape once per active ticker
+            if bid is None and ask is None and shape_logged_for_active != active:
+                log_orderbook_shape_once(active, ob)
+                shape_logged_for_active = active
+
             price = choose_price(bid, ask, cfg.improve_ticks, cfg.max_buy_price, cfg.min_edge_cents)
 
             if price is None:
