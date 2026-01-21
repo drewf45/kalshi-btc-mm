@@ -1,6 +1,6 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-# MICRO CHANGE: only log when quote state changes (no repeated SKIP spam)
+# MICRO CHANGE: adaptive sleep — slow poll when YES book is empty
 
 import os
 import time
@@ -44,6 +44,7 @@ class BotConfig:
     private_key_b64: str
     series_ticker: str
     poll_seconds: float
+    empty_poll_seconds: float
     enable_trading: bool
     dry_run: bool
     base_size: int
@@ -59,6 +60,7 @@ def load_config() -> BotConfig:
         private_key_b64=os.environ["KALSHI_PRIVATE_KEY_PEM_BASE64"],
         series_ticker=os.environ["SERIES_TICKER"],
         poll_seconds=float(os.getenv("POLL_SECONDS", "1")),
+        empty_poll_seconds=float(os.getenv("EMPTY_POLL_SECONDS", "5")),  # MICRO CHANGE
         enable_trading=env_bool("ENABLE_TRADING", False),
         dry_run=env_bool("DRY_RUN", True),
         base_size=env_int("BASE_SIZE", 1),
@@ -169,15 +171,17 @@ def main():
     log.info(f"SERIES={cfg.series_ticker} DRY_RUN={cfg.dry_run}")
 
     active = None
-    last_state: Optional[Tuple] = None  # MICRO CHANGE: track last quote state
+    last_state: Optional[Tuple] = None
 
     while True:
+        sleep_for = cfg.poll_seconds  # default
+
         try:
             ticker = resolve_active_market(cfg)
             if ticker != active:
                 active = ticker
                 log.info(f"[ROLL] Active market → {active}")
-                last_state = None  # reset on roll
+                last_state = None
 
             ob = public_get(cfg, f"/trade-api/v2/markets/{active}/orderbook")
             bid, ask = parse_yes_book(ob)
@@ -186,6 +190,7 @@ def main():
             if price is None:
                 if bid is None and ask is None:
                     state = ("skip", "empty")
+                    sleep_for = cfg.empty_poll_seconds  # MICRO CHANGE
                 elif bid is not None and ask is not None:
                     state = ("skip", "tight")
                 else:
@@ -194,6 +199,7 @@ def main():
                 if state != last_state:
                     log.info(f"[QUOTE] {active} YES bid={bid} ask={ask} → SKIP ({state[1]})")
                     last_state = state
+                time.sleep(sleep_for)
                 continue
 
             state = ("quote", price)
@@ -206,7 +212,7 @@ def main():
         except Exception as e:
             log.error(f"[LOOPERR] {e}")
 
-        time.sleep(cfg.poll_seconds)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
