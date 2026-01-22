@@ -151,9 +151,18 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # -----------------------------
 # Signing helpers
 # -----------------------------
+# ✅ Monotonic timestamp fix (ONLY CHANGE):
+# Ensure the epoch-ms timestamp used for signing never goes backwards.
+_LAST_TS_MS: int = 0
+
+
 def now_ms() -> int:
-    # ✅ FIX: Kalshi expects epoch SECONDS in KALSHI-ACCESS-TIMESTAMP (not milliseconds)
-    return int(time.time())
+    global _LAST_TS_MS
+    ts = int(time.time() * 1000)
+    if ts <= _LAST_TS_MS:
+        ts = _LAST_TS_MS + 1
+    _LAST_TS_MS = ts
+    return ts
 
 
 def load_private_key_from_env(raw: str) -> Any:
@@ -296,8 +305,6 @@ def cancel_order_live(order_id: str) -> None:
         request_json("DELETE", f"/portfolio/orders/{order_id}")
     except Exception as e:
         msg = str(e)
-        # Typical payload in your logs:
-        # HTTP 404 /portfolio/orders/<id>: {'_non_json': True, '_text_head': '{"error":{"code":"not_found"...}}'}
         if "HTTP 404" in msg and "not_found" in msg:
             log.info("[OM] CANCEL already-gone order_id=%s (ignoring 404 not_found)", order_id)
             return
