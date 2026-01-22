@@ -1,36 +1,14 @@
 # bot.py
 # Kalshi YES-only rolling 15m market maker
-#
-# NOTE: The ONLY intentional behavioral change in this version is:
-#   - Monotonic timestamp for signing/headers (never goes backwards)
-#
-# Env vars used (prefix KALSHI_ matches your logs):
-#   KALSHI_API_BASE (default https://api.elections.kalshi.com)
-#   KALSHI_API_KEY_ID
-#   KALSHI_PRIVATE_KEY_PEM_BASE64  (BASE64 of full PEM file contents)
-#
-# Optional:
-#   API_PREFIX (default /trade-api/v2)
-#   SERIES (default KXBTC15M)
-#   EVENT_TICKER (default auto)
-#   MARKET_OVERRIDE (default none)
-#   POLL_SECONDS (default 1.5)
-#   DRY_RUN (default false)
-#   ENABLE_TRADING (default true)
-#   POST_ONLY (default true)
-#   ORDER_QTY (default 1)
-#   MIN_SPREAD (default 3)  # in cents
-#   EDGE (default 1)        # in cents off best bid/ask
-#   MAX_YES (default 99)
-#   MIN_YES (default 1)
-#   LOG_LEVEL (default INFO)
+# Uses /markets?series=XYZ to discover current market and rolls automatically.
 
 import os
-import json
 import time
+import json
 import base64
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
 
@@ -43,12 +21,15 @@ from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 # Logging
 # -----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("kalshi-bot")
 
 
 # -----------------------------
-# Helpers / Env
+# Env helpers
 # -----------------------------
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -57,436 +38,431 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    return default if not v else int(v)
+    return default if v is None or v.strip() == "" else int(v)
 
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    return default if not v else float(v)
+    return default if v is None or v.strip() == "" else float(v)
 
 
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    return default if v is None else str(v)
+    return default if v is None else v.strip()
 
 
-def keys_with_prefix(prefix: str) -> List[str]:
-    return sorted([k for k in os.environ.keys() if k.startswith(prefix)])
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
 
 
 # -----------------------------
-# Monotonic timestamp (THE FIX)
+# Monotonic ms timestamp (FIX)
 # -----------------------------
-_LAST_TS_MS = 0
+_last_ms = 0
+
 
 def now_ms_monotonic() -> int:
     """
-    Kalshi signatures include a timestamp.
-    If the clock steps backwards (NTP/time sync), the API can reject signatures.
-    This ensures timestamps are strictly non-decreasing and will never go backwards.
+    Returns a strictly-increasing millisecond timestamp.
+    This prevents signature failures if system time jitters backward or repeats.
     """
-    global _LAST_TS_MS
+    global _last_ms
     ms = int(time.time() * 1000)
-    if ms <= _LAST_TS_MS:
-        ms = _LAST_TS_MS + 1
-    _LAST_TS_MS = ms
+    if ms <= _last_ms:
+        ms = _last_ms + 1
+    _last_ms = ms
     return ms
 
 
+def iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 # -----------------------------
-# Auth / Client
+# Config
 # -----------------------------
+API_BASE = env_str("KALSHI_API_BASE", "https://api.elections.kalshi.com")
+API_PREFIX = env_str("KALSHI_API_PREFIX", "/trade-api/v2")
+
+KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY_PEM_BASE64 = env_str("KALSHI_PRIVATE_KEY_PEM_BASE64", "")
+
+SERIES = env_str("KALSHI_SERIES", "KXBTC15M")
+EVENT_TICKER = env_str("KALSHI_EVENT_TICKER", "")  # blank = auto
+MARKET_OVERRIDE = env_str("KALSHI_MARKET_TICKER", "")  # blank = auto
+
+POLL_SECONDS = env_float("POLL_SECONDS", 1.5)
+
+DRY_RUN = env_bool("DRY_RUN", True)
+ENABLE_TRADING = env_bool("ENABLE_TRADING", False)
+POST_ONLY = env_bool("POST_ONLY", True)
+
+ORDER_QTY = env_int("ORDER_QTY", 1)
+
+MIN_SPREAD_CENTS = env_int("MIN_SPREAD_CENTS", 3)
+EDGE_CENTS = env_int("EDGE_CENTS", 1)
+MAX_TAKE_CENTS = env_int("MAX_TAKE_CENTS", 98)
+MIN_TAKE_CENTS = env_int("MIN_TAKE_CENTS", 2)
+
+# Safety
+MAX_ORDERS_PER_LOOP = env_int("MAX_ORDERS_PER_LOOP", 2)
+
+
+# -----------------------------
+# Kalshi signing + client
+# -----------------------------
+def load_private_key_from_base64(b64_pem: str):
+    if not b64_pem:
+        raise RuntimeError("Missing KALSHI_PRIVATE_KEY_PEM_BASE64")
+    pem_bytes = base64.b64decode(b64_pem.encode("utf-8"))
+    return serialization.load_pem_private_key(pem_bytes, password=None)
+
+
 @dataclass
-class KalshiConfig:
-    api_base: str
-    api_prefix: str
-    key_id: str
-    private_key_pem_b64: str
-
-
 class KalshiClient:
-    def __init__(self, cfg: KalshiConfig):
-        self.cfg = cfg
-        self.session = requests.Session()
-        self._private_key = self._load_private_key(cfg.private_key_pem_b64)
+    base: str
+    prefix: str
+    key_id: str
+    private_key: Any
+    session: requests.Session
 
-    @staticmethod
-    def _load_private_key(pem_b64: str):
-        if not pem_b64 or pem_b64.strip() == "":
-            raise RuntimeError("Missing KALSHI_PRIVATE_KEY_PEM_BASE64 env var")
-
-        try:
-            pem_bytes = base64.b64decode(pem_b64)
-        except Exception as e:
-            raise RuntimeError(f"KALSHI_PRIVATE_KEY_PEM_BASE64 is not valid base64: {e}")
-
-        try:
-            return serialization.load_pem_private_key(pem_bytes, password=None)
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load PEM private key. "
-                "Make sure you base64-encoded the FULL PEM contents (including BEGIN/END lines). "
-                f"Underlying error: {e}"
-            )
-
-    def _sign(self, message: bytes) -> str:
-        # Common Kalshi approach is RSA + SHA256. Keep the exact primitive stable.
-        sig = self._private_key.sign(
-            message,
-            asy_padding.PKCS1v15(),
+    def _sign(self, timestamp_ms: str, method: str, path_and_query: str) -> str:
+        """
+        Kalshi signature: RSA-PSS(SHA256) over: "{ts}{METHOD}{path_with_query}"
+        """
+        payload = f"{timestamp_ms}{method.upper()}{path_and_query}".encode("utf-8")
+        sig = self.private_key.sign(
+            payload,
+            asy_padding.PSS(
+                mgf=asy_padding.MGF1(hashes.SHA256()),
+                salt_length=asy_padding.PSS.MAX_LENGTH,
+            ),
             hashes.SHA256(),
         )
-        return base64.b64encode(sig).decode("ascii")
+        return base64.b64encode(sig).decode("utf-8")
 
-    def _headers(self, method: str, path: str, body: str) -> Dict[str, str]:
-        ts = str(now_ms_monotonic())  # <-- monotonic timestamp used here
-        # Canonical signing string: timestamp + method + path + body
-        # (Do not “improve” this unless you confirm the exact scheme you used yesterday.)
-        msg = (ts + method.upper() + path + body).encode("utf-8")
-        sig = self._sign(msg)
-        return {
-            "Content-Type": "application/json",
-            "KALSHI-ACCESS-KEY": self.cfg.key_id,
-            "KALSHI-ACCESS-SIGNATURE": sig,
-            "KALSHI-ACCESS-TIMESTAMP": ts,
-        }
-
-    def request_json(self, method: str, endpoint: str, params: Optional[Dict[str, Any]] = None,
-                     payload: Optional[Dict[str, Any]] = None, timeout: float = 20.0) -> Any:
-        # endpoint should already include api_prefix like "/trade-api/v2/..."
-        if not endpoint.startswith("/"):
-            endpoint = "/" + endpoint
-
-        path = endpoint
+    def request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Any = None) -> Any:
         if params:
             qs = urlencode(params)
-            path = f"{endpoint}?{qs}"
+            path_q = f"{path}?{qs}"
+        else:
+            path_q = path
 
-        url = self.cfg.api_base.rstrip("/") + path
-        body = "" if payload is None else json.dumps(payload, separators=(",", ":"))
+        url = f"{self.base}{self.prefix}{path_q}"
 
-        headers = self._headers(method, path, body)
+        # ---- ONLY CHANGE: monotonic timestamp used for signing ----
+        ts_ms = str(now_ms_monotonic())
 
-        try:
-            resp = self.session.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                data=None if payload is None else body,
-                timeout=timeout,
-            )
-        except Exception as e:
-            raise RuntimeError(f"HTTP request failed: {method} {path}: {e}")
+        headers = {
+            "Content-Type": "application/json",
+            "Kalshi-Access-Key": self.key_id,
+            "Kalshi-Access-Timestamp": ts_ms,
+            "Kalshi-Access-Signature": self._sign(ts_ms, method, f"{self.prefix}{path_q}"),
+        }
 
-        text = resp.text or ""
-        if resp.status_code >= 400:
-            # Keep a short head for logs
-            head = text[:300]
-            raise RuntimeError(f"HTTP {resp.status_code} {path}: {head}")
+        log.debug(f"[REQ] {method.upper()} {self.prefix}{path_q}")
+        r = self.session.request(method=method.upper(), url=url, headers=headers, json=json_body, timeout=20)
 
-        if not text:
+        if r.status_code >= 400:
+            text_head = r.text[:300]
+            try:
+                j = r.json()
+                raise RuntimeError(f"HTTP {r.status_code} {path_q}: {j}")
+            except Exception:
+                raise RuntimeError(f"HTTP {r.status_code} {path_q}: {{'_non_json': True, '_text_head': {text_head!r}}}")
+
+        if r.text.strip() == "":
             return None
-        try:
-            return resp.json()
-        except Exception:
-            return {"_non_json": True, "_text_head": text[:500]}
+        return r.json()
+
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("GET", path, params=params)
+
+    def post(self, path: str, json_body: Any) -> Any:
+        return self.request("POST", path, json_body=json_body)
+
+    def delete(self, path: str, json_body: Any = None) -> Any:
+        return self.request("DELETE", path, json_body=json_body)
 
 
 # -----------------------------
-# Market discovery / quoting
+# Market selection / quoting
 # -----------------------------
-@dataclass
-class MarketRef:
-    event_ticker: str
-    market_ticker: str
-
-
-def pick_active_market_from_series_markets(series: str, markets: List[Dict[str, Any]]) -> Optional[MarketRef]:
+def pick_active_market_from_markets(markets: List[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
     """
-    Given /markets?series=..., pick the most relevant active market.
-    Strategy:
-      - Keep only tickers that start with the series prefix
-      - Prefer those with status 'active' if present
-      - Then pick the latest by lexicographic ticker (works with your KXBTC15M-26JAN.... pattern)
+    Returns (event_ticker, market_ticker) for the first open-ish market we can trade.
     """
     if not markets:
         return None
 
-    candidates = []
+    # Try to prefer open markets; fallback to first entry
+    openish = []
     for m in markets:
-        t = m.get("ticker") or m.get("market_ticker") or ""
-        if not t.startswith(series + "-"):
-            continue
         status = (m.get("status") or "").lower()
-        candidates.append((status, t, m))
+        if status in ("open", "active"):
+            openish.append(m)
 
-    if not candidates:
-        return None
+    candidates = openish if openish else markets
 
-    # prefer active
-    actives = [c for c in candidates if c[0] == "active"]
-    pool = actives if actives else candidates
+    # Prefer highest volume / liquidity if present
+    def score(m: Dict[str, Any]) -> float:
+        return float(m.get("volume") or 0) + float(m.get("open_interest") or 0)
 
-    # Choose "latest" ticker
-    pool.sort(key=lambda x: x[1])
-    chosen = pool[-1][2]
+    candidates = sorted(candidates, key=score, reverse=True)
 
-    market_ticker = chosen.get("ticker") or chosen.get("market_ticker")
-    event_ticker = chosen.get("event_ticker") or chosen.get("eventTicker") or ""
-    # If event_ticker isn't present, derive by stripping the trailing "-XX" segment
-    if not event_ticker and market_ticker and "-" in market_ticker:
-        event_ticker = "-".join(market_ticker.split("-")[:-1])
-
-    if not market_ticker or not event_ticker:
-        return None
-    return MarketRef(event_ticker=event_ticker, market_ticker=market_ticker)
+    m0 = candidates[0]
+    return (m0.get("event_ticker") or "", m0.get("ticker") or "")
 
 
 def parse_yes_bid_ask_from_market_obj(m: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     """
-    Tries multiple shapes because Kalshi payloads can vary.
-    We want YES best bid and YES best ask (in cents).
+    Attempts to extract YES best bid/ask from a market object (from /markets).
+    Different API shapes exist; we try common fields.
     """
-    # Common “flat” keys:
-    for bid_key, ask_key in [
-        ("yes_bid", "yes_ask"),
-        ("yesBid", "yesAsk"),
-        ("best_yes_bid", "best_yes_ask"),
-        ("bestYesBid", "bestYesAsk"),
-    ]:
-        b = m.get(bid_key)
-        a = m.get(ask_key)
-        if b is not None or a is not None:
+    # Common shapes seen in Kalshi responses
+    for bid_key in ("yes_bid", "best_yes_bid", "yesBestBid"):
+        if bid_key in m and m[bid_key] is not None:
             try:
-                b2 = None if b is None else int(b)
-                a2 = None if a is None else int(a)
-                return b2, a2
+                yes_bid = int(m[bid_key])
+                break
             except Exception:
-                pass
+                yes_bid = None
+                break
+    else:
+        yes_bid = None
 
-    # Sometimes nested:
-    # m["yes"]["bid"] / m["yes"]["ask"]
-    yes = m.get("yes")
-    if isinstance(yes, dict):
-        b = yes.get("bid")
-        a = yes.get("ask")
+    for ask_key in ("yes_ask", "best_yes_ask", "yesBestAsk"):
+        if ask_key in m and m[ask_key] is not None:
+            try:
+                yes_ask = int(m[ask_key])
+                break
+            except Exception:
+                yes_ask = None
+                break
+    else:
+        yes_ask = None
+
+    return yes_bid, yes_ask
+
+
+def parse_yes_bid_ask_from_orderbook(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Parses best YES bid and best YES ask from /markets/{ticker}/orderbook.
+    Expected: ob["orderbook"]["yes"]["bids"] / ["asks"] in price-level format.
+    We handle a few shapes defensively.
+    """
+    yes_bid = None
+    yes_ask = None
+
+    book = ob.get("orderbook") or ob.get("book") or ob
+    yes = book.get("yes") if isinstance(book, dict) else None
+    if not isinstance(yes, dict):
+        return None, None
+
+    bids = yes.get("bids") or []
+    asks = yes.get("asks") or []
+
+    def first_price(levels):
+        if not levels:
+            return None
+        lvl0 = levels[0]
+        # Could be {"price": 52, "quantity": 10} or [52, 10]
+        if isinstance(lvl0, dict):
+            p = lvl0.get("price")
+            return None if p is None else int(p)
+        if isinstance(lvl0, (list, tuple)) and len(lvl0) >= 1:
+            return int(lvl0[0])
+        return None
+
+    yes_bid = first_price(bids)
+    yes_ask = first_price(asks)
+    return yes_bid, yes_ask
+
+
+# -----------------------------
+# Orders
+# -----------------------------
+def place_order(client: KalshiClient, ticker: str, side: str, price: int, qty: int) -> Any:
+    side = side.upper()
+    price = clamp(int(price), 1, 99)
+    qty = max(1, int(qty))
+
+    if DRY_RUN or not ENABLE_TRADING:
+        log.info(f"[OM] {ticker} {side} PLACE @{price} qty={qty} DRY_RUN={DRY_RUN}")
+        return None
+
+    body = {
+        "ticker": ticker,
+        "side": side,  # BUY/SELL
+        "type": "limit",
+        "price": price,
+        "count": qty,
+        "post_only": bool(POST_ONLY),
+    }
+    return client.post("/portfolio/orders", body)
+
+
+def cancel_all_orders(client: KalshiClient, ticker: Optional[str] = None) -> None:
+    if DRY_RUN or not ENABLE_TRADING:
+        log.info(f"[OM] {ticker or '*'} ROLL detected → cleared working orders (DRY_RUN={DRY_RUN})")
+        return
+    # Best-effort cancel open orders; optionally filter by ticker
+    resp = client.get("/portfolio/orders", params={"limit": 200, "status": "open"})
+    orders = (resp or {}).get("orders") or []
+    for o in orders:
+        if ticker and o.get("ticker") != ticker:
+            continue
+        oid = o.get("order_id") or o.get("id")
+        if not oid:
+            continue
         try:
-            b2 = None if b is None else int(b)
-            a2 = None if a is None else int(a)
-            if b2 is not None or a2 is not None:
-                return b2, a2
-        except Exception:
-            pass
-
-    return None, None
+            client.delete(f"/portfolio/orders/{oid}")
+        except Exception as e:
+            log.warning(f"[OM] cancel failed order_id={oid}: {e}")
 
 
 # -----------------------------
-# Orders (simple OM)
+# Auth self-test
 # -----------------------------
-@dataclass
-class WorkingOrder:
-    side: str  # "buy" or "sell"
-    price: int
-    qty: int
-    order_id: Optional[str] = None
-
-
-class OrderManager:
-    def __init__(self):
-        self.buy: Optional[WorkingOrder] = None
-        self.sell: Optional[WorkingOrder] = None
-
-    def clear(self):
-        self.buy = None
-        self.sell = None
+def self_test_auth(client: KalshiClient) -> bool:
+    try:
+        client.get("/portfolio/balance")
+        return True
+    except Exception as e:
+        log.error(f"[AUTH] Self-test failed → trading disabled: {e}")
+        return False
 
 
 # -----------------------------
-# Strategy params
+# Main loop
 # -----------------------------
-API_BASE = env_str("KALSHI_API_BASE", "https://api.elections.kalshi.com").rstrip("/")
-API_PREFIX = env_str("API_PREFIX", "/trade-api/v2")
-SERIES = env_str("SERIES", "KXBTC15M")
-EVENT_TICKER = env_str("EVENT_TICKER", "").strip() or "<auto>"
-MARKET_OVERRIDE = env_str("MARKET_OVERRIDE", "").strip() or "<none>"
-
-POLL_SECONDS = env_float("POLL_SECONDS", 1.5)
-
-DRY_RUN = env_bool("DRY_RUN", False)
-ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
-POST_ONLY = env_bool("POST_ONLY", True)
-
-ORDER_QTY = env_int("ORDER_QTY", 1)
-MIN_SPREAD = env_int("MIN_SPREAD", 3)
-EDGE = env_int("EDGE", 1)
-
-MIN_YES = env_int("MIN_YES", 1)
-MAX_YES = env_int("MAX_YES", 99)
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    log.info("[ENV] Detected KALSHI_* keys: %s", keys_with_prefix("KALSHI_"))
-
-    key_id = env_str("KALSHI_API_KEY_ID", "").strip()
-    pk_b64 = env_str("KALSHI_PRIVATE_KEY_PEM_BASE64", "").strip()
-
-    cfg = KalshiConfig(
-        api_base=API_BASE,
-        api_prefix=API_PREFIX,
-        key_id=key_id,
-        private_key_pem_b64=pk_b64,
-    )
-
-    client = KalshiClient(cfg)
+def main() -> None:
+    # env visibility
+    kalshi_keys = sorted([k for k in os.environ.keys() if k.startswith("KALSHI_")])
+    log.info(f"[ENV] Detected KALSHI_* keys: {kalshi_keys}")
 
     log.info(
-        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
-        API_BASE, API_PREFIX, SERIES, EVENT_TICKER, MARKET_OVERRIDE, POLL_SECONDS, DRY_RUN, ENABLE_TRADING, POST_ONLY
+        f"API_BASE={API_BASE} API_PREFIX={API_PREFIX} "
+        f"SERIES={SERIES} EVENT_TICKER={'<auto>' if not EVENT_TICKER else EVENT_TICKER} "
+        f"MARKET_OVERRIDE={'<none>' if not MARKET_OVERRIDE else MARKET_OVERRIDE} "
+        f"POLL={POLL_SECONDS}s DRY_RUN={DRY_RUN} ENABLE_TRADING={ENABLE_TRADING} POST_ONLY={POST_ONLY}"
     )
 
-    om = OrderManager()
-    active: Optional[MarketRef] = None
+    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY_PEM_BASE64:
+        raise RuntimeError("Missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PEM_BASE64")
+
+    private_key = load_private_key_from_base64(KALSHI_PRIVATE_KEY_PEM_BASE64)
+    sess = requests.Session()
+    client = KalshiClient(base=API_BASE, prefix=API_PREFIX, key_id=KALSHI_API_KEY_ID, private_key=private_key, session=sess)
+
+    # auth gate (don’t trade if auth fails)
+    authed = self_test_auth(client)
+    trading_enabled = ENABLE_TRADING and authed
+
+    active_event = ""
+    active_market = ""
 
     while True:
         try:
-            # 1) Find active market (rolling)
-            if MARKET_OVERRIDE != "<none>":
-                # Derive event ticker from market if needed
-                mkt = MARKET_OVERRIDE
-                evt = "-".join(mkt.split("-")[:-1]) if "-" in mkt else mkt
-                new_active = MarketRef(event_ticker=evt, market_ticker=mkt)
+            # Determine market
+            if MARKET_OVERRIDE:
+                new_event = EVENT_TICKER or "<manual>"
+                new_market = MARKET_OVERRIDE
             else:
-                resp = client.request_json(
-                    "GET",
-                    f"{API_PREFIX}/markets",
-                    params={"series": SERIES},
-                )
-
-                markets = resp.get("markets") if isinstance(resp, dict) else None
-                if not isinstance(markets, list):
-                    markets = []
-
-                picked = pick_active_market_from_series_markets(SERIES, markets)
+                params = {"series": SERIES}
+                if EVENT_TICKER:
+                    params["event_ticker"] = EVENT_TICKER
+                resp = client.get("/markets", params=params)
+                markets = (resp or {}).get("markets") or (resp or {}).get("data") or []
+                picked = pick_active_market_from_markets(markets)
                 if not picked:
-                    log.warning("[ROLL] Series=%s → could not pick active market (no markets)", SERIES)
+                    log.warning(f"[ROLL] Series={SERIES} could not pick active market (no markets)")
                     time.sleep(POLL_SECONDS)
                     continue
-                new_active = picked
+                new_event, new_market = picked
 
-            # If changed → clear OM state
-            if (active is None) or (new_active.market_ticker != active.market_ticker):
-                active = new_active
-                log.info("[ROLL] Series=%s → Active event=%s market=%s (via /markets)", SERIES, active.event_ticker, active.market_ticker)
-                om.clear()
-                log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", active.market_ticker, DRY_RUN)
+            # Roll detection
+            if new_market != active_market:
+                active_event, active_market = new_event, new_market
+                log.info(f"[ROLL] Series={SERIES} → Active event={active_event} market={active_market} (via /markets)")
+                cancel_all_orders(client, ticker=active_market)
 
-            # 2) Fetch market detail (quotes)
-            mkt_detail = client.request_json("GET", f"{API_PREFIX}/markets/{active.market_ticker}")
-            market_obj = mkt_detail.get("market") if isinstance(mkt_detail, dict) else None
-            if not isinstance(market_obj, dict):
-                market_obj = {}
+            # Quote extraction
+            yes_bid = None
+            yes_ask = None
 
-            yes_bid, yes_ask = parse_yes_bid_ask_from_market_obj(market_obj)
+            # First: try from /markets list entry (fast)
+            if not MARKET_OVERRIDE:
+                # We already have the markets list in scope only inside that branch; re-fetch minimal for safety
+                resp = client.get("/markets", params={"ticker": active_market})
+                ms = (resp or {}).get("markets") or (resp or {}).get("data") or []
+                if ms and isinstance(ms, list):
+                    yes_bid, yes_ask = parse_yes_bid_ask_from_market_obj(ms[0])
+
+            # Fallback: orderbook
             if yes_bid is None or yes_ask is None:
-                # fallback: sometimes /markets response has more fields than /markets/{ticker} depending on endpoint version
-                log.info("[FALLBACK] %s /markets/{ticker} returned no usable yes bid/ask fields", active.market_ticker)
-                # try to locate it from series list payload
-                resp2 = client.request_json("GET", f"{API_PREFIX}/markets", params={"series": SERIES})
-                markets2 = resp2.get("markets") if isinstance(resp2, dict) else []
-                if isinstance(markets2, list):
-                    match = next((m for m in markets2 if (m.get("ticker") == active.market_ticker)), None)
-                    if isinstance(match, dict):
-                        yes_bid, yes_ask = parse_yes_bid_ask_from_market_obj(match)
+                try:
+                    ob = client.get(f"/markets/{active_market}/orderbook")
+                    b2, a2 = parse_yes_bid_ask_from_orderbook(ob or {})
+                    if yes_bid is None:
+                        yes_bid = b2
+                    if yes_ask is None:
+                        yes_ask = a2
+                except Exception:
+                    pass
 
-            log.info("[QUOTE] %s YES bid=%s ask=%s", active.market_ticker, yes_bid, yes_ask)
+            if yes_ask is None:
+                log.info(f"[FALLBACK] {active_market} /markets returned no usable yes_ask fields")
 
-            # 3) Decide if we should quote
+            log.info(f"[QUOTE] {active_market} YES bid={yes_bid} ask={yes_ask}")
+
+            # Need both sides
             if yes_bid is None or yes_ask is None:
-                log.info("[TARGET] %s → SKIP (missing_bid_or_ask)", active.market_ticker)
+                log.info(f"[TARGET] {active_market} → SKIP (missing_bid_or_ask)")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            spread = yes_ask - yes_bid
-            if spread < MIN_SPREAD:
-                log.info("[TARGET] %s → SKIP (spread_too_tight(%s))", active.market_ticker, spread)
+            spread = int(yes_ask) - int(yes_bid)
+            if spread < MIN_SPREAD_CENTS:
+                log.info(f"[TARGET] {active_market} → SKIP (spread_too_tight({spread}))")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # clamp and compute our target prices
-            buy_px = max(MIN_YES, min(MAX_YES, yes_bid + EDGE))
-            sell_px = max(MIN_YES, min(MAX_YES, yes_ask - EDGE))
+            # Maker prices inside the spread
+            buy_px = clamp(int(yes_bid) + EDGE_CENTS, MIN_TAKE_CENTS, MAX_TAKE_CENTS)
+            sell_px = clamp(int(yes_ask) - EDGE_CENTS, MIN_TAKE_CENTS, MAX_TAKE_CENTS)
 
-            # sanity
-            if buy_px >= sell_px:
-                log.info("[TARGET] %s → SKIP (spread_ok_not_stable(%s) %s>=%s)", active.market_ticker, spread, buy_px, sell_px)
+            # Ensure still a spread after edge
+            if sell_px <= buy_px:
+                log.info(f"[TARGET] {active_market} → SKIP (spread_ok_not_stable({buy_px}) {sell_px})")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # dry-run preview
             log.info(
-                "[MM] %s target BUY@%s / SELL@%s (bid=%s ask=%s spread=%s) qty=%s DRY_RUN=%s",
-                active.market_ticker, buy_px, sell_px, yes_bid, yes_ask, spread, ORDER_QTY, DRY_RUN
+                f"[TARGET] {active_market} YES-only would_quote: bid@{buy_px} ask@{sell_px} "
+                f"(ok_spread={sell_px - buy_px}) DRY_RUN={DRY_RUN}"
             )
 
-            if not ENABLE_TRADING:
-                time.sleep(POLL_SECONDS)
-                continue
+            # Place orders (best-effort; cap per loop)
+            n = 0
+            if trading_enabled and n < MAX_ORDERS_PER_LOOP:
+                place_order(client, active_market, "BUY", buy_px, ORDER_QTY)
+                n += 1
+            elif not trading_enabled:
+                # still log what we would do
+                place_order(client, active_market, "BUY", buy_px, ORDER_QTY)
 
-            # 4) Place orders (simple, no modify/cancel in this "baseline" version)
-            # If you already have working orders in state, don’t re-place every loop.
-            # (Keeps behavior stable and avoids thrash until we inspect fills.)
-            if om.buy is None:
-                place_order(client, active.market_ticker, "buy", buy_px, ORDER_QTY, post_only=POST_ONLY, dry_run=DRY_RUN)
-                om.buy = WorkingOrder(side="buy", price=buy_px, qty=ORDER_QTY)
-
-            if om.sell is None:
-                place_order(client, active.market_ticker, "sell", sell_px, ORDER_QTY, post_only=POST_ONLY, dry_run=DRY_RUN)
-                om.sell = WorkingOrder(side="sell", price=sell_px, qty=ORDER_QTY)
+            if trading_enabled and n < MAX_ORDERS_PER_LOOP:
+                place_order(client, active_market, "SELL", sell_px, ORDER_QTY)
+                n += 1
+            elif not trading_enabled:
+                place_order(client, active_market, "SELL", sell_px, ORDER_QTY)
 
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
-            log.error("[LOOPERR] %s", repr(e))
+            log.error(f"[LOOPERR] {repr(e)}")
             time.sleep(POLL_SECONDS)
-
-
-def place_order(client: KalshiClient, market_ticker: str, side: str, price: int, qty: int,
-                post_only: bool, dry_run: bool):
-    """
-    Places a YES order on the given market.
-    This assumes the market is YES/NO and that price is in cents.
-    """
-    payload = {
-        "ticker": market_ticker,
-        "side": side.upper(),     # BUY / SELL
-        "type": "limit",
-        "price": price,
-        "count": qty,
-        "yes": True,              # YES-only
-    }
-    if post_only:
-        payload["post_only"] = True
-
-    if dry_run:
-        log.info("[ORDER] DRY_RUN %s %s @%s x%s (post_only=%s)", market_ticker, side.upper(), price, qty, post_only)
-        return
-
-    # Endpoint your logs showed: /portfolio/orders (non_json True etc)
-    resp = client.request_json("POST", f"{API_PREFIX}/portfolio/orders", payload=payload)
-    log.info("[ORDER] %s %s PLACE @%s qty=%s resp=%s", market_ticker, side.upper(), price, qty, summarize(resp))
-
-
-def summarize(x: Any) -> str:
-    try:
-        s = json.dumps(x, separators=(",", ":"), ensure_ascii=False)
-        if len(s) > 240:
-            return s[:240] + "…"
-        return s
-    except Exception:
-        return str(x)[:240]
 
 
 if __name__ == "__main__":
