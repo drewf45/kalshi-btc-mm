@@ -152,7 +152,8 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # Signing helpers
 # -----------------------------
 def now_ms() -> int:
-    return int(time.time() * 1000)
+    # ✅ FIX: Kalshi expects epoch SECONDS in KALSHI-ACCESS-TIMESTAMP (not milliseconds)
+    return int(time.time())
 
 
 def load_private_key_from_env(raw: str) -> Any:
@@ -174,13 +175,9 @@ PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
 def sign_message(message: str) -> str:
-    # ✅ ONLY CHANGE: use RSA-PSS (not PKCS1v15) to avoid INCORRECT_API_KEY_SIGNATURE
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
-        asy_padding.PSS(
-            mgf=asy_padding.MGF1(hashes.SHA256()),
-            salt_length=asy_padding.PSS.MAX_LENGTH,
-        ),
+        asy_padding.PKCS1v15(),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
