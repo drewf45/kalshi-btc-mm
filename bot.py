@@ -315,11 +315,9 @@ def get_portfolio_snapshot() -> Dict[str, Any]:
     snap: Dict[str, Any] = {"ts": time.time()}
     data = request_json("GET", "/portfolio/balance")
 
-    # Try a few likely shapes without assuming exact schema
     bal = data.get("balance") if isinstance(data, dict) else None
     d = bal if isinstance(bal, dict) else (data if isinstance(data, dict) else {})
 
-    # Common-ish fields
     cash = d.get("cash") or d.get("cash_balance") or d.get("available_cash") or d.get("available")
     equity = d.get("equity") or d.get("portfolio_value") or d.get("total_value") or d.get("total_balance")
     pnl = d.get("pnl") or d.get("profit_loss") or d.get("profit_and_loss")
@@ -377,8 +375,6 @@ def cancel_order_live(order_id: str) -> None:
         _auth_ok("cancel_order")
     except Exception as e:
         msg = str(e)
-        # Typical payload in your logs:
-        # HTTP 404 /portfolio/orders/<id>: {'_non_json': True, '_text_head': '{"error":{"code":"not_found"...}}'}
         if "HTTP 404" in msg and "not_found" in msg:
             log.info("[OM] CANCEL already-gone order_id=%s (ignoring 404 not_found)", order_id)
             return
@@ -954,6 +950,8 @@ def reconcile_quotes(
 # Main loop
 # -----------------------------
 def main():
+    global ENABLE_TRADING  # <-- FIX: must be declared before any use in this function
+
     log.info(
         "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
         API_BASE,
@@ -968,7 +966,6 @@ def main():
     )
 
     # Auth trust gate: if we're live (not DRY_RUN) and trading enabled, prove we can sign.
-    global ENABLE_TRADING
     if (not DRY_RUN) and ENABLE_TRADING:
         ok = auth_self_test()
         if not ok:
@@ -1034,7 +1031,6 @@ def main():
                         cash = snap.get("cash")
                         pnl = snap.get("pnl")
 
-                        # Try to compute a simple "since start" delta if equity is numeric
                         def _to_float(x: Any) -> Optional[float]:
                             try:
                                 if x is None:
@@ -1113,7 +1109,6 @@ def main():
             )
 
         except Exception as e:
-            # If auth is broken, fail-closed after threshold; keep looping but no more posting.
             if _err_is_auth(e):
                 _auth_fail("MAIN_LOOP", e)
             log.error("[LOOPERR] %s", e)
