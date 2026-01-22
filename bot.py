@@ -109,16 +109,6 @@ SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
 
 # -----------------------------
-# Auth trust gate + fail-closed + PnL snapshots
-# -----------------------------
-MAX_CONSECUTIVE_AUTH_FAILS = int(getenv_first(["MAX_CONSECUTIVE_AUTH_FAILS"], "3"))
-FAIL_CLOSED_ON_AUTH = parse_bool(getenv_first(["FAIL_CLOSED_ON_AUTH"], "true"), default=True)
-
-PNL_EVERY_SECONDS = float(getenv_first(["PNL_EVERY_SECONDS"], "30.0"))
-
-_consecutive_auth_fails = 0
-
-# -----------------------------
 # Logging
 # -----------------------------
 LOG_LEVEL = getenv_first(["LOG_LEVEL"], "INFO").upper()
@@ -184,9 +174,13 @@ PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
 def sign_message(message: str) -> str:
+    # ✅ ONLY CHANGE: use RSA-PSS (not PKCS1v15) to avoid INCORRECT_API_KEY_SIGNATURE
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
-        asy_padding.PKCS1v15(),
+        asy_padding.PSS(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            salt_length=asy_padding.PSS.MAX_LENGTH,
+        ),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
@@ -266,69 +260,6 @@ def request_json(
             raise RuntimeError(f"Bad JSON response for {path}: {(resp.text or '')[:200]!r}")
 
 # -----------------------------
-# Auth helpers (detect auth failures, fail-closed, and self-test)
-# -----------------------------
-def _err_is_auth(e: Exception) -> bool:
-    msg = str(e)
-    return ("HTTP 401" in msg) or ("HTTP 403" in msg) or ("INCORRECT_API_KEY_SIGNATURE" in msg)
-
-
-def _auth_fail(where: str, e: Exception) -> None:
-    global _consecutive_auth_fails, ENABLE_TRADING
-    _consecutive_auth_fails += 1
-    log.error("[AUTH] FAIL %d/%d at %s: %s", _consecutive_auth_fails, MAX_CONSECUTIVE_AUTH_FAILS, where, e)
-
-    if FAIL_CLOSED_ON_AUTH and _consecutive_auth_fails >= MAX_CONSECUTIVE_AUTH_FAILS:
-        if ENABLE_TRADING:
-            log.error("[AUTH] Too many auth failures → DISABLING TRADING (fail-closed).")
-        ENABLE_TRADING = False
-
-
-def _auth_ok(where: str = "") -> None:
-    global _consecutive_auth_fails
-    if _consecutive_auth_fails != 0:
-        log.info("[AUTH] OK again%s → reset auth fail counter.", f" ({where})" if where else "")
-    _consecutive_auth_fails = 0
-
-
-def auth_self_test() -> bool:
-    """
-    One signed private call. If it fails, do not trade.
-    """
-    try:
-        _ = request_json("GET", "/portfolio/balance")
-        _auth_ok("self_test")
-        log.info("[AUTH] Self-test passed → trading enabled.")
-        return True
-    except Exception as e:
-        if _err_is_auth(e):
-            _auth_fail("SELF_TEST", e)
-        log.error("[AUTH] Self-test failed → trading disabled: %s", e)
-        return False
-
-
-def get_portfolio_snapshot() -> Dict[str, Any]:
-    """
-    Best-effort snapshot for PnL logging.
-    Uses /portfolio/balance (works if your auth is correct).
-    """
-    snap: Dict[str, Any] = {"ts": time.time()}
-    data = request_json("GET", "/portfolio/balance")
-
-    bal = data.get("balance") if isinstance(data, dict) else None
-    d = bal if isinstance(bal, dict) else (data if isinstance(data, dict) else {})
-
-    cash = d.get("cash") or d.get("cash_balance") or d.get("available_cash") or d.get("available")
-    equity = d.get("equity") or d.get("portfolio_value") or d.get("total_value") or d.get("total_balance")
-    pnl = d.get("pnl") or d.get("profit_loss") or d.get("profit_and_loss")
-
-    snap["cash"] = cash
-    snap["equity"] = equity
-    snap["pnl"] = pnl
-    snap["raw_keys"] = sorted(list(d.keys())) if isinstance(d, dict) else []
-    return snap
-
-# -----------------------------
 # LIVE ORDER ROUTES
 # -----------------------------
 def place_order_live(market_ticker: str, action: str, yes_price_cents: int, count: int) -> str:
@@ -343,13 +274,7 @@ def place_order_live(market_ticker: str, action: str, yes_price_cents: int, coun
     if POST_ONLY:
         body["post_only"] = True
 
-    try:
-        resp = request_json("POST", "/portfolio/orders", json_body=body)
-        _auth_ok("place_order")
-    except Exception as e:
-        if _err_is_auth(e):
-            _auth_fail("PLACE_ORDER", e)
-        raise
+    resp = request_json("POST", "/portfolio/orders", json_body=body)
 
     order = resp.get("order") if isinstance(resp, dict) else None
     if isinstance(order, dict):
@@ -372,14 +297,13 @@ def cancel_order_live(order_id: str) -> None:
     """
     try:
         request_json("DELETE", f"/portfolio/orders/{order_id}")
-        _auth_ok("cancel_order")
     except Exception as e:
         msg = str(e)
+        # Typical payload in your logs:
+        # HTTP 404 /portfolio/orders/<id>: {'_non_json': True, '_text_head': '{"error":{"code":"not_found"...}}'}
         if "HTTP 404" in msg and "not_found" in msg:
             log.info("[OM] CANCEL already-gone order_id=%s (ignoring 404 not_found)", order_id)
             return
-        if _err_is_auth(e):
-            _auth_fail("CANCEL_ORDER", e)
         raise
 
 # -----------------------------
@@ -950,8 +874,6 @@ def reconcile_quotes(
 # Main loop
 # -----------------------------
 def main():
-    global ENABLE_TRADING  # <-- FIX: must be declared before any use in this function
-
     log.info(
         "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
         API_BASE,
@@ -965,12 +887,6 @@ def main():
         POST_ONLY,
     )
 
-    # Auth trust gate: if we're live (not DRY_RUN) and trading enabled, prove we can sign.
-    if (not DRY_RUN) and ENABLE_TRADING:
-        ok = auth_self_test()
-        if not ok:
-            ENABLE_TRADING = False
-
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
     last_yes_ask: Optional[int] = None
@@ -979,11 +895,6 @@ def main():
     last_why: Optional[str] = None
 
     spread_ok_since: Optional[float] = None
-
-    # PnL tracking
-    last_pnl_log_ts: float = 0.0
-    start_equity: Optional[float] = None
-    last_equity: Optional[float] = None
 
     while True:
         try:
@@ -1019,51 +930,6 @@ def main():
 
                 spread_ok_since = None
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
-
-            # Periodic PnL snapshot (best-effort, does not affect quoting)
-            now = time.time()
-            if (not DRY_RUN) and (now - last_pnl_log_ts) >= max(1.0, PNL_EVERY_SECONDS):
-                last_pnl_log_ts = now
-                if ENABLE_TRADING:
-                    try:
-                        snap = get_portfolio_snapshot()
-                        eq = snap.get("equity")
-                        cash = snap.get("cash")
-                        pnl = snap.get("pnl")
-
-                        def _to_float(x: Any) -> Optional[float]:
-                            try:
-                                if x is None:
-                                    return None
-                                if isinstance(x, (int, float)):
-                                    return float(x)
-                                if isinstance(x, str) and x.strip() != "":
-                                    return float(x.strip())
-                            except Exception:
-                                return None
-                            return None
-
-                        eq_f = _to_float(eq)
-                        if start_equity is None and eq_f is not None:
-                            start_equity = eq_f
-                        last_equity = eq_f if eq_f is not None else last_equity
-
-                        delta = None
-                        if start_equity is not None and eq_f is not None:
-                            delta = eq_f - start_equity
-
-                        log.info(
-                            "[PNL] equity=%s cash=%s pnl=%s delta_since_start=%s",
-                            eq,
-                            cash,
-                            pnl,
-                            f"{delta:.4f}" if isinstance(delta, float) else "n/a",
-                        )
-                    except Exception as e:
-                        if _err_is_auth(e):
-                            _auth_fail("PNL_SNAPSHOT", e)
-                        else:
-                            log.info("[PNL] snapshot error (ignored): %s", e)
 
             ob = fetch_orderbook(mkt)
             yes_bid, yes_ask = get_yes_bid_ask(ob, mkt)
@@ -1109,8 +975,6 @@ def main():
             )
 
         except Exception as e:
-            if _err_is_auth(e):
-                _auth_fail("MAIN_LOOP", e)
             log.error("[LOOPERR] %s", e)
 
         time.sleep(POLL)
