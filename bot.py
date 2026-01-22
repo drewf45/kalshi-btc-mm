@@ -151,18 +151,9 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # -----------------------------
 # Signing helpers
 # -----------------------------
-# ✅ CHANGE #1 (timestamp fix): monotonic ms so it never goes backwards
-_LAST_TS_MS = 0
-
-
 def now_ms() -> int:
-    global _LAST_TS_MS
-    # wall-clock epoch ms
-    ts = time.time_ns() // 1_000_000
-    if ts <= _LAST_TS_MS:
-        ts = _LAST_TS_MS + 1
-    _LAST_TS_MS = ts
-    return int(ts)
+    # epoch milliseconds
+    return int(time.time() * 1000)
 
 
 def load_private_key_from_env(raw: str) -> Any:
@@ -184,21 +175,28 @@ PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
 def sign_message(message: str) -> str:
-    # ✅ CHANGE #2 (auth fix): Kalshi uses RSA-PSS (not PKCS1v15)
+    # ✅ FIX: Kalshi requires RSA-PSS + SHA256 (not PKCS1v15)
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
         asy_padding.PSS(
             mgf=asy_padding.MGF1(hashes.SHA256()),
-            salt_length=asy_padding.PSS.MAX_LENGTH,
+            salt_length=asy_padding.PSS.DIGEST_LENGTH,
         ),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
 
 
-def build_signature_headers(method: str, path_with_query: str, body: str) -> Dict[str, str]:
+def build_signature_headers(method: str, path_with_query: str) -> Dict[str, str]:
+    """
+    ✅ FIX: Kalshi signature message is:
+      timestamp + METHOD + path_without_query
+    - Do NOT include query params
+    - Do NOT include body
+    """
     ts = str(now_ms())
-    payload = ts + method.upper() + path_with_query + body
+    path_wo_query = path_with_query.split("?", 1)[0]
+    payload = ts + method.upper() + path_wo_query
     return {
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": sign_message(payload),
@@ -236,10 +234,8 @@ def request_json(
         )
         prepped = req.prepare()
 
-        signed_path = prepped.path_url
-        body_for_sig = "" if not body_bytes else body_bytes.decode("utf-8")
-
-        headers = build_signature_headers(method, signed_path, body_for_sig)
+        signed_path = prepped.path_url  # includes prefix + query (if any)
+        headers = build_signature_headers(method, signed_path)
         prepped.headers.update(headers)
 
         resp = session.send(prepped, timeout=20)
