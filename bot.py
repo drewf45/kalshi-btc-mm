@@ -151,17 +151,18 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # -----------------------------
 # Signing helpers
 # -----------------------------
-# ✅ ONLY CHANGE: monotonic timestamp so it never goes backwards (fixes signature failures from clock drift)
-_LAST_TS_MS: int = 0
+# ✅ CHANGE #1 (timestamp fix): monotonic ms so it never goes backwards
+_LAST_TS_MS = 0
 
 
 def now_ms() -> int:
     global _LAST_TS_MS
-    ts = int(time.time() * 1000)
+    # wall-clock epoch ms
+    ts = time.time_ns() // 1_000_000
     if ts <= _LAST_TS_MS:
         ts = _LAST_TS_MS + 1
     _LAST_TS_MS = ts
-    return ts
+    return int(ts)
 
 
 def load_private_key_from_env(raw: str) -> Any:
@@ -183,9 +184,13 @@ PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
 def sign_message(message: str) -> str:
+    # ✅ CHANGE #2 (auth fix): Kalshi uses RSA-PSS (not PKCS1v15)
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
-        asy_padding.PKCS1v15(),
+        asy_padding.PSS(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            salt_length=asy_padding.PSS.MAX_LENGTH,
+        ),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
