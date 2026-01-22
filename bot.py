@@ -152,7 +152,16 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # Signing helpers
 # -----------------------------
 def now_ms() -> int:
-    return int(time.time() * 1000)
+    # ✅ monotonic timestamp fix: never allow the ms timestamp to go backwards
+    global _LAST_TS_MS
+    t = int(time.time() * 1000)
+    if t <= _LAST_TS_MS:
+        t = _LAST_TS_MS + 1
+    _LAST_TS_MS = t
+    return t
+
+
+_LAST_TS_MS: int = 0
 
 
 def load_private_key_from_env(raw: str) -> Any:
@@ -174,13 +183,9 @@ PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
 def sign_message(message: str) -> str:
-    # ✅ ONLY CHANGE: Kalshi expects RSA-PSS signatures (not PKCS1v15)
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
-        asy_padding.PSS(
-            mgf=asy_padding.MGF1(hashes.SHA256()),
-            salt_length=asy_padding.PSS.MAX_LENGTH,
-        ),
+        asy_padding.PKCS1v15(),
         hashes.SHA256(),
     )
     return base64.b64encode(sig).decode("utf-8")
@@ -299,6 +304,8 @@ def cancel_order_live(order_id: str) -> None:
         request_json("DELETE", f"/portfolio/orders/{order_id}")
     except Exception as e:
         msg = str(e)
+        # Typical payload in your logs:
+        # HTTP 404 /portfolio/orders/<id>: {'_non_json': True, '_text_head': '{"error":{"code":"not_found"...}}'}
         if "HTTP 404" in msg and "not_found" in msg:
             log.info("[OM] CANCEL already-gone order_id=%s (ignoring 404 not_found)", order_id)
             return
