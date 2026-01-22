@@ -151,17 +151,17 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # -----------------------------
 # Signing helpers
 # -----------------------------
+# ✅ ONLY CHANGE: monotonic timestamp for signing (never goes backwards / never repeats)
+_LAST_TS_MS: int = 0
+
+
 def now_ms() -> int:
-    # ✅ monotonic timestamp fix: never allow the ms timestamp to go backwards
     global _LAST_TS_MS
     t = int(time.time() * 1000)
     if t <= _LAST_TS_MS:
         t = _LAST_TS_MS + 1
     _LAST_TS_MS = t
     return t
-
-
-_LAST_TS_MS: int = 0
 
 
 def load_private_key_from_env(raw: str) -> Any:
