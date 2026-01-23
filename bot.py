@@ -67,7 +67,7 @@ BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
 
-# ✅ B-player default: participate at 2¢ (join-only); still skips 1¢ unless you set MIN_SPREAD_CENTS=1
+# ✅ B-player default: participate at 2¢ via join-only; still skips 1¢ unless MIN_SPREAD_CENTS=1
 MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "2"))
 
 # --- Safety / Patience gates ---
@@ -113,6 +113,9 @@ SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 # Live flags (optional)
 POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
 
+# ✅ NEW: post-only anti-cross safety buffer (in cents)
+POST_ONLY_BUFFER_CENTS = int(getenv_first(["POST_ONLY_BUFFER_CENTS"], "1"))
+
 # -----------------------------
 # Logging
 # -----------------------------
@@ -157,7 +160,6 @@ if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_RAW:
 # Signing helpers
 # -----------------------------
 def now_ms() -> int:
-    # epoch milliseconds
     return int(time.time() * 1000)
 
 
@@ -180,7 +182,6 @@ PRIVATE_KEY = load_private_key_from_env(KALSHI_PRIVATE_KEY_RAW)
 
 
 def sign_message(message: str) -> str:
-    # ✅ FIX: Kalshi requires RSA-PSS + SHA256 (not PKCS1v15)
     sig = PRIVATE_KEY.sign(
         message.encode("utf-8"),
         asy_padding.PSS(
@@ -193,12 +194,6 @@ def sign_message(message: str) -> str:
 
 
 def build_signature_headers(method: str, path_with_query: str) -> Dict[str, str]:
-    """
-    ✅ FIX: Kalshi signature message is:
-      timestamp + METHOD + path_without_query
-    - Do NOT include query params
-    - Do NOT include body
-    """
     ts = str(now_ms())
     path_wo_query = path_with_query.split("?", 1)[0]
     payload = ts + method.upper() + path_wo_query
@@ -239,7 +234,7 @@ def request_json(
         )
         prepped = req.prepare()
 
-        signed_path = prepped.path_url  # includes prefix + query (if any)
+        signed_path = prepped.path_url
         headers = build_signature_headers(method, signed_path)
         prepped.headers.update(headers)
 
@@ -273,10 +268,32 @@ def request_json(
 # -----------------------------
 # LIVE ORDER ROUTES
 # -----------------------------
+def _clamp(p: int) -> int:
+    return max(1, min(99, int(p)))
+
+
+def _post_only_safe_price(action: str, price: int, yes_bid: Optional[int], yes_ask: Optional[int]) -> int:
+    """
+    ✅ NEW: pre-guard against post-only cross using our latest observed book.
+    - buy must be <= (ask - buffer)
+    - sell must be >= (bid + buffer)
+    """
+    p = _clamp(price)
+    b = POST_ONLY_BUFFER_CENTS
+    if not POST_ONLY or b <= 0:
+        return p
+
+    if action == "buy" and yes_ask is not None:
+        p = min(p, _clamp(int(yes_ask) - b))
+    if action == "sell" and yes_bid is not None:
+        p = max(p, _clamp(int(yes_bid) + b))
+    return _clamp(p)
+
+
 def place_order_live(market_ticker: str, action: str, yes_price_cents: int, count: int) -> str:
     body: Dict[str, Any] = {
         "ticker": market_ticker,
-        "action": action,          # "buy" or "sell"
+        "action": action,
         "type": "limit",
         "side": "yes",
         "count": int(count),
@@ -301,11 +318,6 @@ def place_order_live(market_ticker: str, action: str, yes_price_cents: int, coun
 
 
 def cancel_order_live(order_id: str) -> None:
-    """
-    IMPORTANT FIX:
-    Exchange may return 404 if the order is already filled/canceled/expired.
-    We treat 404 not_found as success so the bot doesn't spam LOOPERR forever.
-    """
     try:
         request_json("DELETE", f"/portfolio/orders/{order_id}")
     except Exception as e:
@@ -431,7 +443,6 @@ def roll_active_market() -> str:
 # Orderbook parsing (robust)
 # -----------------------------
 def _price_from_level(lvl: Any) -> Optional[int]:
-    # Supports [price, qty] or {"price":..., ...} or {"yes_price":...}
     try:
         if isinstance(lvl, list) and len(lvl) >= 1:
             return int(lvl[0])
@@ -469,13 +480,6 @@ def _best_ask(levels: Any) -> Optional[int]:
 
 
 def _extract_side_books(side_obj: Any) -> Tuple[Any, Any]:
-    """
-    Returns (bids, asks) lists in many possible shapes:
-      - list (assume it's bids list, asks unknown)
-      - {"bids":[...], "asks":[...]}
-      - {"bid":[...], "ask":[...]}
-      - {"buy":[...], "sell":[...]} (rare)
-    """
     if isinstance(side_obj, dict):
         bids = side_obj.get("bids") or side_obj.get("bid") or side_obj.get("buy")
         asks = side_obj.get("asks") or side_obj.get("ask") or side_obj.get("sell")
@@ -506,7 +510,7 @@ def _get_cached_yes_ask() -> Optional[int]:
 
 
 _LAST_MARKET_FALLBACK_TS: float = 0.0
-_LAST_FALLBACK_LOG_TS: Dict[str, float] = {}  # per-market throttle for spammy fallback logs
+_LAST_FALLBACK_LOG_TS: Dict[str, float] = {}
 
 
 def fetch_market(market_ticker: str) -> Dict[str, Any]:
@@ -570,13 +574,6 @@ def _market_top_of_book_yes(market_payload: Dict[str, Any]) -> Tuple[Optional[in
 
 
 def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tuple[Optional[int], Optional[int]]:
-    """
-    ✅ FIX: orderbook JSON shape varies.
-    We now support:
-      - orderbook.yes as list (bids)
-      - orderbook.yes as dict {bids:[...], asks:[...]}
-      - infer complement: yes_ask = 100 - no_best_bid ; yes_bid = 100 - no_best_ask
-    """
     ob = orderbook_payload.get("orderbook") if isinstance(orderbook_payload, dict) else None
     if not isinstance(ob, dict):
         return (None, None)
@@ -590,13 +587,11 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
     yes_bid = _best_bid(yes_bids)
     yes_ask = _best_ask(yes_asks)
 
-    # If we don't have YES ask, try infer from NO best bid (classic complement)
     if yes_ask is None:
         no_best_bid = _best_bid(no_bids)
         if no_best_bid is not None:
             yes_ask = 100 - int(no_best_bid)
 
-    # If we don't have YES bid, try infer from NO best ask (complement)
     if yes_bid is None:
         no_best_ask = _best_ask(no_asks)
         if no_best_ask is not None:
@@ -631,7 +626,6 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
             )
             return (yes_bid, int(fb_ask))
 
-        # throttle the spammy "no usable yes_ask fields" line
         last = float(_LAST_FALLBACK_LOG_TS.get(market_ticker, 0.0))
         if (now - last) >= 5.0:
             log.info("[FALLBACK] %s /markets returned no usable yes_ask fields", market_ticker)
@@ -670,8 +664,6 @@ def compute_target_yes_quotes(
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
 
-    # ✅ B-player behavior: for tight-but-acceptable spreads, JOIN (do not tighten)
-    # This prevents "no_room_after_edge" on 2¢ spreads when TICK=1/EDGE=1.
     if ENABLE_JOIN_TIGHT_SPREAD and spread <= JOIN_ONLY_MAX_SPREAD_CENTS:
         bid = clamp_price(int(yes_bid))
         ask = clamp_price(int(yes_ask))
@@ -679,7 +671,6 @@ def compute_target_yes_quotes(
             return (None, None, "join_locked_or_crossed")
         return (bid, ask, f"join(spread={spread})")
 
-    # Otherwise, tighten inside the spread (normal market making)
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
@@ -699,7 +690,7 @@ def compute_target_yes_quotes(
 # -----------------------------
 @dataclass
 class WorkingOrder:
-    side: str                 # "buy" or "sell" (action)
+    side: str
     price_cents: int
     qty: int
     created_ts: float
@@ -757,22 +748,68 @@ def reconcile_quotes(
         WORKING[side_key] = None
         _LAST_KEEP_LOGGED[side_key] = None
 
+    def _is_post_only_cross_error(e: Exception) -> bool:
+        s = str(e).lower()
+        return ("invalid_order" in s) and ("post only cross" in s or "post_only_cross" in s or "post-only cross" in s)
+
     def place(side_key: str, price: int) -> None:
-        log.info(f"[OM] {market_ticker} {side_key.upper()} PLACE @{price} qty={qty} DRY_RUN={dry_run}")
+        # ✅ NEW: pre-guard price vs current observed book to reduce POST_ONLY rejects
+        p = int(price)
+        p = _post_only_safe_price(side_key, p, yes_bid=yes_bid, yes_ask=yes_ask)
+
+        log.info(f"[OM] {market_ticker} {side_key.upper()} PLACE @{p} qty={qty} DRY_RUN={dry_run}")
 
         order_id = None
         if (not dry_run) and ENABLE_TRADING:
-            order_id = place_order_live(
-                market_ticker=market_ticker,
-                action=side_key,  # "buy" or "sell"
-                yes_price_cents=int(price),
-                count=int(qty),
-            )
-            log.info(f"[OM] {market_ticker} {side_key.upper()} POSTED order_id={order_id} @ {price} qty={qty}")
+            try:
+                order_id = place_order_live(
+                    market_ticker=market_ticker,
+                    action=side_key,
+                    yes_price_cents=int(p),
+                    count=int(qty),
+                )
+                log.info(f"[OM] {market_ticker} {side_key.upper()} POSTED order_id={order_id} @ {p} qty={qty}")
+
+            except Exception as e:
+                # ✅ NEW: handle post-only cross as a soft failure + retry once with 1 more tick of safety
+                if POST_ONLY and _is_post_only_cross_error(e):
+                    bump = max(1, POST_ONLY_BUFFER_CENTS)
+                    p2 = p - bump if side_key == "buy" else p + bump
+                    p2 = _clamp(p2)
+
+                    log.info(
+                        "[OM] %s %s POST_ONLY_CROSS @%d → retry @%d",
+                        market_ticker,
+                        side_key.upper(),
+                        p,
+                        p2,
+                    )
+                    try:
+                        order_id = place_order_live(
+                            market_ticker=market_ticker,
+                            action=side_key,
+                            yes_price_cents=int(p2),
+                            count=int(qty),
+                        )
+                        log.info(f"[OM] {market_ticker} {side_key.upper()} POSTED order_id={order_id} @ {p2} qty={qty}")
+                        p = p2
+                    except Exception as e2:
+                        if _is_post_only_cross_error(e2):
+                            log.info(
+                                "[OM] %s %s SKIP (post_only_cross even after retry) target=%d retry=%d",
+                                market_ticker,
+                                side_key.upper(),
+                                p,
+                                p2,
+                            )
+                            return
+                        raise
+                else:
+                    raise
 
         WORKING[side_key] = WorkingOrder(
             side=side_key,
-            price_cents=int(price),
+            price_cents=int(p),
             qty=int(qty),
             created_ts=now,
             order_id=order_id,
@@ -955,7 +992,7 @@ def reconcile_quotes(
             keep(side_key, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
 
-        # ✅ FIX (B-player anti-churn): during cooldown, KEEP (do not cancel)
+        # ✅ B-player anti-churn: during cooldown, KEEP (do not cancel)
         if not can_requote(cur):
             age = now - cur.created_ts
             keep(side_key, cur, f"cooldown(age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off})")
@@ -972,7 +1009,7 @@ def reconcile_quotes(
 # -----------------------------
 def main():
     log.info(
-        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.1fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
+        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.2fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
         API_BASE,
         API_PREFIX,
         SERIES,
