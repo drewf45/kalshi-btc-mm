@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
+# ✅ CHANGE: reuse one Session (avoid creating a new Session every request)
+HTTP_SESSION = requests.Session()
+
 # -----------------------------
 # Env / Config
 # -----------------------------
@@ -231,7 +234,6 @@ def request_json(
         body_bytes = body_str.encode("utf-8")
 
     backoff = BACKOFF_START
-    session = requests.Session()
 
     while True:
         req = requests.Request(
@@ -246,7 +248,8 @@ def request_json(
         headers = build_signature_headers(method, signed_path)
         prepped.headers.update(headers)
 
-        resp = session.send(prepped, timeout=20)
+        # ✅ CHANGE: use global HTTP_SESSION
+        resp = HTTP_SESSION.send(prepped, timeout=20)
 
         if resp.status_code == 429:
             log.warning("[429] %s backing off %.1fs", path, backoff)
@@ -371,6 +374,54 @@ def is_order_open(order_id: str) -> bool:
         log.warning("[INV] is_order_open probe failed for %s: %s", oid, e)
         return True
     return False
+
+
+# ✅ CHANGE: roll cleanup helpers
+def cancel_working_orders_for_market(market_ticker: str, dry_run: bool) -> None:
+    """
+    Best-effort cancel of any locally-tracked working orders for a given market.
+    Safe to call on roll / shutdown.
+    """
+    for sk in ("buy", "sell"):
+        cur = WORKING.get(sk)
+        if cur is None:
+            continue
+        if cur.order_id and (not dry_run) and ENABLE_TRADING:
+            try:
+                log.info(
+                    "[ROLLCXL] %s %s cancel order_id=%s @%d",
+                    market_ticker, sk.upper(), cur.order_id, cur.price_cents
+                )
+                cancel_order_live(cur.order_id)
+            except Exception as e:
+                log.warning(
+                    "[ROLLCXL] %s %s cancel failed order_id=%s: %s",
+                    market_ticker, sk.upper(), cur.order_id, e
+                )
+
+
+def cancel_open_orders_for_market(market_ticker: str, dry_run: bool) -> None:
+    """
+    Best-effort: cancel ALL open orders in portfolio that match market_ticker.
+    Useful if the process restarted and WORKING is empty but orders still exist.
+    """
+    if dry_run or (not ENABLE_TRADING):
+        return
+    try:
+        for o in fetch_open_orders(limit=200):
+            oo = o.get("order") if isinstance(o, dict) and isinstance(o.get("order"), dict) else (o if isinstance(o, dict) else {})
+            if not oo:
+                continue
+            t = oo.get("ticker") or oo.get("market_ticker")
+            oid = oo.get("order_id") or oo.get("id")
+            if t and oid and str(t) == str(market_ticker):
+                try:
+                    log.info("[ROLLCXL] cancel stray open order market=%s order_id=%s", market_ticker, oid)
+                    cancel_order_live(str(oid))
+                except Exception as e:
+                    log.warning("[ROLLCXL] failed cancel stray order_id=%s: %s", oid, e)
+    except Exception as e:
+        log.warning("[ROLLCXL] open-order cleanup failed: %s", e)
 
 # -----------------------------
 # Rolling via /markets ONLY
@@ -1302,6 +1353,12 @@ def main():
 
             market_changed = (mkt != last_market)
             if market_changed:
+                # ✅ CHANGE: save old ticker BEFORE overwriting, cancel old orders live
+                prev_market = last_market
+                if prev_market is not None:
+                    cancel_working_orders_for_market(prev_market, DRY_RUN)
+                    cancel_open_orders_for_market(prev_market, DRY_RUN)
+
                 last_market = mkt
                 last_yes_bid = None
                 last_yes_ask = None
