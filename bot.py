@@ -428,20 +428,61 @@ def roll_active_market() -> str:
     return _active_market_ticker
 
 # -----------------------------
-# Orderbook parsing (binary)
+# Orderbook parsing (robust)
 # -----------------------------
-def best_bid_from_side(side: Any) -> Optional[int]:
-    if not isinstance(side, list) or not side:
-        return None
-    best = None
-    for lvl in side:
+def _price_from_level(lvl: Any) -> Optional[int]:
+    # Supports [price, qty] or {"price":..., ...} or {"yes_price":...}
+    try:
         if isinstance(lvl, list) and len(lvl) >= 1:
-            try:
-                p = int(lvl[0])
-                best = p if best is None else max(best, p)
-            except Exception:
-                continue
+            return int(lvl[0])
+        if isinstance(lvl, dict):
+            for k in ("price", "yes_price", "p"):
+                if k in lvl and lvl.get(k) is not None:
+                    return int(lvl.get(k))
+    except Exception:
+        return None
+    return None
+
+
+def _best_bid(levels: Any) -> Optional[int]:
+    if not isinstance(levels, list) or not levels:
+        return None
+    best: Optional[int] = None
+    for lvl in levels:
+        p = _price_from_level(lvl)
+        if p is None:
+            continue
+        best = p if best is None else max(best, p)
     return best
+
+
+def _best_ask(levels: Any) -> Optional[int]:
+    if not isinstance(levels, list) or not levels:
+        return None
+    best: Optional[int] = None
+    for lvl in levels:
+        p = _price_from_level(lvl)
+        if p is None:
+            continue
+        best = p if best is None else min(best, p)
+    return best
+
+
+def _extract_side_books(side_obj: Any) -> Tuple[Any, Any]:
+    """
+    Returns (bids, asks) lists in many possible shapes:
+      - list (assume it's bids list, asks unknown)
+      - {"bids":[...], "asks":[...]}
+      - {"bid":[...], "ask":[...]}
+      - {"buy":[...], "sell":[...]} (rare)
+    """
+    if isinstance(side_obj, dict):
+        bids = side_obj.get("bids") or side_obj.get("bid") or side_obj.get("buy")
+        asks = side_obj.get("asks") or side_obj.get("ask") or side_obj.get("sell")
+        return bids, asks
+    if isinstance(side_obj, list):
+        return side_obj, None
+    return None, None
 
 
 _YES_ASK_CACHE: Dict[str, Any] = {"ask": None, "ts": 0.0}
@@ -465,6 +506,7 @@ def _get_cached_yes_ask() -> Optional[int]:
 
 
 _LAST_MARKET_FALLBACK_TS: float = 0.0
+_LAST_FALLBACK_LOG_TS: Dict[str, float] = {}  # per-market throttle for spammy fallback logs
 
 
 def fetch_market(market_ticker: str) -> Dict[str, Any]:
@@ -509,32 +551,59 @@ def _market_top_of_book_yes(market_payload: Dict[str, Any]) -> Tuple[Optional[in
         or d.get("yes_bid")
         or d.get("best_yes_bid")
         or d.get("yes_bid_price")
+        or d.get("yes_bid_price_cents")
+        or d.get("yes_bid_cents")
         or d.get("best_bid_yes")
+        or d.get("yesBid")
     )
     yes_ask = _to_cents(
         d.get("yes_ask_dollars")
         or d.get("yes_ask")
         or d.get("best_yes_ask")
         or d.get("yes_ask_price")
+        or d.get("yes_ask_price_cents")
+        or d.get("yes_ask_cents")
         or d.get("best_ask_yes")
+        or d.get("yesAsk")
     )
     return (yes_bid, yes_ask)
 
 
 def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    ✅ FIX: orderbook JSON shape varies.
+    We now support:
+      - orderbook.yes as list (bids)
+      - orderbook.yes as dict {bids:[...], asks:[...]}
+      - infer complement: yes_ask = 100 - no_best_bid ; yes_bid = 100 - no_best_ask
+    """
     ob = orderbook_payload.get("orderbook") if isinstance(orderbook_payload, dict) else None
     if not isinstance(ob, dict):
         return (None, None)
 
-    yes = ob.get("yes")
-    no = ob.get("no")
+    yes_obj = ob.get("yes")
+    no_obj = ob.get("no")
 
-    yes_bid = best_bid_from_side(yes)
-    no_bid = best_bid_from_side(no)
+    yes_bids, yes_asks = _extract_side_books(yes_obj)
+    no_bids, no_asks = _extract_side_books(no_obj)
 
-    if no_bid is not None:
-        yes_ask = 100 - int(no_bid)
-        _cache_yes_ask(yes_ask)
+    yes_bid = _best_bid(yes_bids)
+    yes_ask = _best_ask(yes_asks)
+
+    # If we don't have YES ask, try infer from NO best bid (classic complement)
+    if yes_ask is None:
+        no_best_bid = _best_bid(no_bids)
+        if no_best_bid is not None:
+            yes_ask = 100 - int(no_best_bid)
+
+    # If we don't have YES bid, try infer from NO best ask (complement)
+    if yes_bid is None:
+        no_best_ask = _best_ask(no_asks)
+        if no_best_ask is not None:
+            yes_bid = 100 - int(no_best_ask)
+
+    if yes_ask is not None:
+        _cache_yes_ask(int(yes_ask))
         return (yes_bid, yes_ask)
 
     cached = _get_cached_yes_ask()
@@ -561,10 +630,18 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
                 fb_ask,
             )
             return (yes_bid, int(fb_ask))
-        else:
+
+        # throttle the spammy "no usable yes_ask fields" line
+        last = float(_LAST_FALLBACK_LOG_TS.get(market_ticker, 0.0))
+        if (now - last) >= 5.0:
             log.info("[FALLBACK] %s /markets returned no usable yes_ask fields", market_ticker)
+            _LAST_FALLBACK_LOG_TS[market_ticker] = now
+
     except Exception as e:
-        log.info("[FALLBACK] %s /markets error: %s", market_ticker, e)
+        last = float(_LAST_FALLBACK_LOG_TS.get(market_ticker, 0.0))
+        if (now - last) >= 5.0:
+            log.info("[FALLBACK] %s /markets error: %s", market_ticker, e)
+            _LAST_FALLBACK_LOG_TS[market_ticker] = now
 
     return (yes_bid, None)
 
@@ -947,6 +1024,9 @@ def main():
 
                 global _LAST_MARKET_FALLBACK_TS
                 _LAST_MARKET_FALLBACK_TS = 0.0
+
+                global _LAST_FALLBACK_LOG_TS
+                _LAST_FALLBACK_LOG_TS = {}
 
                 spread_ok_since = None
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
