@@ -66,7 +66,9 @@ BACKOFF_MAX = float(getenv_first(["BACKOFF_MAX"], "16.0"))
 
 TICK_CENTS = int(getenv_first(["TICK_CENTS"], "1"))
 EDGE_CENTS = int(getenv_first(["EDGE_CENTS"], "1"))
-MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "3"))
+
+# ✅ B-player default: participate at 2¢ (join-only); still skips 1¢ unless you set MIN_SPREAD_CENTS=1
+MIN_SPREAD_CENTS = int(getenv_first(["MIN_SPREAD_CENTS"], "2"))
 
 # --- Safety / Patience gates ---
 ENTER_OK_SECONDS = float(getenv_first(["ENTER_OK_SECONDS"], "3.0"))
@@ -101,6 +103,9 @@ MARKET_FALLBACK_MIN_SECONDS = float(getenv_first(["MARKET_FALLBACK_MIN_SECONDS"]
 # Micro #3 toggles
 ENABLE_ONE_SIDED_TIGHT = parse_bool(getenv_first(["ENABLE_ONE_SIDED_TIGHT"], "true"), default=True)
 ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"], "true"), default=True)
+
+# ✅ Join-only threshold for tight spreads (B-player)
+JOIN_ONLY_MAX_SPREAD_CENTS = int(getenv_first(["JOIN_ONLY_MAX_SPREAD_CENTS"], "2"))
 
 # Micro #4: per-side hysteresis
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
@@ -588,6 +593,16 @@ def compute_target_yes_quotes(
     if spread < MIN_SPREAD_CENTS:
         return (None, None, f"spread_too_tight({spread})")
 
+    # ✅ B-player behavior: for tight-but-acceptable spreads, JOIN (do not tighten)
+    # This prevents "no_room_after_edge" on 2¢ spreads when TICK=1/EDGE=1.
+    if ENABLE_JOIN_TIGHT_SPREAD and spread <= JOIN_ONLY_MAX_SPREAD_CENTS:
+        bid = clamp_price(int(yes_bid))
+        ask = clamp_price(int(yes_ask))
+        if bid >= ask:
+            return (None, None, "join_locked_or_crossed")
+        return (bid, ask, f"join(spread={spread})")
+
+    # Otherwise, tighten inside the spread (normal market making)
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
@@ -863,9 +878,10 @@ def reconcile_quotes(
             keep(side_key, cur, f"off_by={off}<thresh({REPRICE_IF_OFF_BY_CENTS})")
             return
 
+        # ✅ FIX (B-player anti-churn): during cooldown, KEEP (do not cancel)
         if not can_requote(cur):
             age = now - cur.created_ts
-            cancel(side_key, f"cooldown_but_stale(off_by={off} age={age:.2f}s)")
+            keep(side_key, cur, f"cooldown(age={age:.2f}s<{MIN_REQUOTE_SECONDS:.2f}s off_by={off})")
             return
 
         cancel(side_key, f"reprice(off_by={off})")
