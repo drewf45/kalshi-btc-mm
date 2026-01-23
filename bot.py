@@ -117,6 +117,14 @@ POST_ONLY = parse_bool(getenv_first(["POST_ONLY"], "true"), default=True)
 POST_ONLY_BUFFER_CENTS = int(getenv_first(["POST_ONLY_BUFFER_CENTS"], "1"))
 
 # -----------------------------
+# Inventory / Reconciliation (NEW)
+# -----------------------------
+MAX_NET_YES_CONTRACTS = int(getenv_first(["MAX_NET_YES_CONTRACTS"], "2"))  # hard cap
+INVENTORY_SKEW_CENTS = int(getenv_first(["INVENTORY_SKEW_CENTS"], "1"))    # 0..3 recommended
+ORDER_STATUS_POLL_SECONDS = float(getenv_first(["ORDER_STATUS_POLL_SECONDS"], "1.0"))
+PAUSE_ON_UNKNOWN_SECONDS = float(getenv_first(["PAUSE_ON_UNKNOWN_SECONDS"], "10.0"))
+
+# -----------------------------
 # Logging
 # -----------------------------
 LOG_LEVEL = getenv_first(["LOG_LEVEL"], "INFO").upper()
@@ -323,7 +331,8 @@ def cancel_order_live(order_id: str) -> None:
     except Exception as e:
         msg = str(e)
         if "HTTP 404" in msg and "not_found" in msg:
-            log.info("[OM] CANCEL already-gone order_id=%s (ignoring 404 not_found)", order_id)
+            # 404 is ambiguous (could be filled/canceled/expired). Do NOT silently ignore.
+            log.warning("[OM] CANCEL got 404 for order_id=%s (state ambiguous; will reconcile)", order_id)
             return
         raise
 
@@ -699,6 +708,18 @@ class WorkingOrder:
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
+
+# -----------------------------
+# Inventory tracking (NEW)
+# NET_YES: + = long YES, - = short YES (often shows as NO exposure in UI)
+# -----------------------------
+NET_YES: int = 0
+
+# Track last-seen filled count per order_id so we only apply deltas
+_ORDER_LAST_FILLED: Dict[str, int] = {}
+
+# Throttle polling per order_id
+_LAST_ORDER_STATUS_POLL_TS: Dict[str, float] = {}
 
 NO_TARGET_SINCE_TS: Optional[float] = None
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
