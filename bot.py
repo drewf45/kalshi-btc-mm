@@ -282,7 +282,7 @@ def _clamp(p: int) -> int:
 
 def _post_only_safe_price(action: str, price: int, yes_bid: Optional[int], yes_ask: Optional[int]) -> int:
     """
-    ✅ NEW: pre-guard against post-only cross using our latest observed book.
+    ✅ pre-guard against post-only cross using our latest observed book.
     - buy must be <= (ask - buffer)
     - sell must be >= (bid + buffer)
     """
@@ -335,6 +335,11 @@ def cancel_order_live(order_id: str) -> None:
             log.warning("[OM] CANCEL got 404 for order_id=%s (state ambiguous; will reconcile)", order_id)
             return
         raise
+
+
+def fetch_order_status(order_id: str) -> Dict[str, Any]:
+    # Kalshi: GET /portfolio/orders/{order_id}
+    return request_json("GET", f"/portfolio/orders/{order_id}")
 
 # -----------------------------
 # Rolling via /markets ONLY
@@ -659,6 +664,169 @@ def clamp_price(p: int) -> int:
     return max(1, min(99, p))
 
 
+# -----------------------------
+# Inventory tracking (NEW)
+# NET_YES: + = long YES, - = short YES (often shows as NO exposure in UI)
+# -----------------------------
+NET_YES: int = 0
+_ORDER_LAST_FILLED: Dict[str, int] = {}
+_LAST_ORDER_STATUS_POLL_TS: Dict[str, float] = {}
+_UNKNOWN_UNTIL_TS: float = 0.0
+
+
+def _extract_order_obj(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    o = payload.get("order")
+    return o if isinstance(o, dict) else payload
+
+
+def _extract_filled_count(order_obj: Dict[str, Any]) -> int:
+    # Try a bunch of likely keys; default 0
+    for k in ("filled_count", "filled", "fill_count", "filledContracts", "filled_contracts"):
+        v = order_obj.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except Exception:
+            continue
+    # Some APIs nest fills; keep it simple (0) if not present
+    return 0
+
+
+def _extract_status(order_obj: Dict[str, Any]) -> str:
+    s = order_obj.get("status") or order_obj.get("state") or order_obj.get("order_status")
+    return str(s or "").lower()
+
+
+def _should_poll_order(order_id: str, now: float) -> bool:
+    if ORDER_STATUS_POLL_SECONDS <= 0:
+        return True
+    last = float(_LAST_ORDER_STATUS_POLL_TS.get(order_id, 0.0))
+    return (now - last) >= ORDER_STATUS_POLL_SECONDS
+
+
+def _mark_polled(order_id: str, now: float) -> None:
+    _LAST_ORDER_STATUS_POLL_TS[order_id] = now
+
+
+def _apply_fill_delta(side_key: str, order_id: str, new_filled: int) -> None:
+    global NET_YES
+    prev = int(_ORDER_LAST_FILLED.get(order_id, 0))
+    delta = int(new_filled) - prev
+    if delta <= 0:
+        _ORDER_LAST_FILLED[order_id] = int(new_filled)
+        return
+
+    # buy fills increase NET_YES, sell fills decrease NET_YES
+    if side_key == "buy":
+        NET_YES += delta
+    elif side_key == "sell":
+        NET_YES -= delta
+
+    _ORDER_LAST_FILLED[order_id] = int(new_filled)
+    log.info("[INV] fill_delta side=%s order_id=%s delta=%d NET_YES=%d", side_key, order_id, delta, NET_YES)
+
+
+def reconcile_order_status_for_working(side_key: str, cur: "WorkingOrder", now: float) -> None:
+    """
+    Poll the order status (throttled) and:
+      - apply incremental filled deltas to NET_YES
+      - clear WORKING slot if order is no longer open
+      - on ambiguous 404, pause quoting temporarily (PAUSE_ON_UNKNOWN_SECONDS)
+    """
+    global _UNKNOWN_UNTIL_TS
+
+    if DRY_RUN or (not ENABLE_TRADING) or (not cur.order_id):
+        return
+
+    oid = str(cur.order_id)
+
+    if not _should_poll_order(oid, now):
+        return
+
+    _mark_polled(oid, now)
+
+    try:
+        payload = fetch_order_status(oid)
+        order_obj = _extract_order_obj(payload)
+        status = _extract_status(order_obj)
+        filled = _extract_filled_count(order_obj)
+
+        _apply_fill_delta(side_key, oid, filled)
+
+        # If order is no longer working, clear it so we can replace
+        # (status strings vary, so treat anything not "open" / "resting" / "active" as done)
+        if status and status not in ("open", "resting", "active", "placed", "pending"):
+            log.info("[INV] order_done side=%s order_id=%s status=%s filled=%d → clear WORKING", side_key, oid, status, filled)
+            WORKING[side_key] = None
+            _LAST_KEEP_LOGGED[side_key] = None
+            return
+
+    except Exception as e:
+        s = str(e).lower()
+        if "http 404" in s and "not_found" in s:
+            # Ambiguous: could be filled/canceled/expired but not returned. Pause briefly and let it settle.
+            _UNKNOWN_UNTIL_TS = max(_UNKNOWN_UNTIL_TS, now + max(0.0, PAUSE_ON_UNKNOWN_SECONDS))
+            log.warning(
+                "[INV] order_status_404 side=%s order_id=%s → pause %.1fs (UNKNOWN_UNTIL=%.3f)",
+                side_key,
+                oid,
+                PAUSE_ON_UNKNOWN_SECONDS,
+                _UNKNOWN_UNTIL_TS,
+            )
+            return
+        raise
+
+
+def apply_inventory_gates_and_skew(
+    bid: Optional[int],
+    ask: Optional[int],
+) -> Tuple[Optional[int], Optional[int], str]:
+    """
+    Apply:
+      - hard caps: MAX_NET_YES_CONTRACTS
+      - skew: INVENTORY_SKEW_CENTS
+    Returns updated (bid, ask, note).
+    """
+    note_parts = []
+
+    # Hard cap gates
+    if MAX_NET_YES_CONTRACTS > 0:
+        if NET_YES >= MAX_NET_YES_CONTRACTS:
+            bid = None
+            note_parts.append(f"cap_long_yes(net={NET_YES}>=max={MAX_NET_YES_CONTRACTS})")
+        if NET_YES <= -MAX_NET_YES_CONTRACTS:
+            ask = None
+            note_parts.append(f"cap_short_yes(net={NET_YES}<=-max={MAX_NET_YES_CONTRACTS})")
+
+    # Skew (only if both present; if one side gated out, we just keep the other)
+    if INVENTORY_SKEW_CENTS and bid is not None and ask is not None:
+        k = max(0, min(3, int(INVENTORY_SKEW_CENTS)))
+
+        # magnitude: 1..3 per contract, capped
+        mag = min(6, abs(int(NET_YES)) * k)  # cap skew so it doesn't explode
+        if mag > 0:
+            if NET_YES > 0:
+                # long YES → discourage more buys (lower bid), encourage sells (lower ask)
+                bid = clamp_price(int(bid) - mag)
+                ask = clamp_price(int(ask) - mag)
+                note_parts.append(f"skew_long_yes(-{mag})")
+            elif NET_YES < 0:
+                # short YES → encourage buys (higher bid), discourage sells (higher ask)
+                bid = clamp_price(int(bid) + mag)
+                ask = clamp_price(int(ask) + mag)
+                note_parts.append(f"skew_short_yes(+{mag})")
+
+            if bid is not None and ask is not None and bid >= ask:
+                # If skew collapsed spread, back off to safe no-quote
+                return (None, None, "inv_skew_locked_or_crossed")
+
+    note = " ".join(note_parts) if note_parts else "inv_ok"
+    return (bid, ask, note)
+
+
 def compute_target_yes_quotes(
     yes_bid: Optional[int],
     yes_ask: Optional[int],
@@ -678,7 +846,8 @@ def compute_target_yes_quotes(
         ask = clamp_price(int(yes_ask))
         if bid >= ask:
             return (None, None, "join_locked_or_crossed")
-        return (bid, ask, f"join(spread={spread})")
+        bid, ask, inv_note = apply_inventory_gates_and_skew(bid, ask)
+        return (bid, ask, f"join(spread={spread}) {inv_note}")
 
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
@@ -692,7 +861,11 @@ def compute_target_yes_quotes(
     if bid >= ask:
         return (None, None, "no_room_after_edge")
 
-    return (bid, ask, f"ok(spread={spread})")
+    bid, ask, inv_note = apply_inventory_gates_and_skew(bid, ask)
+    if bid is None and ask is None:
+        return (None, None, f"inv_gated({inv_note})")
+
+    return (bid, ask, f"ok(spread={spread}) {inv_note}")
 
 # -----------------------------
 # Order management
@@ -708,18 +881,6 @@ class WorkingOrder:
 
 WORKING: Dict[str, Optional[WorkingOrder]] = {"buy": None, "sell": None}
 _LAST_KEEP_LOGGED: Dict[str, Optional[int]] = {"buy": None, "sell": None}
-
-# -----------------------------
-# Inventory tracking (NEW)
-# NET_YES: + = long YES, - = short YES (often shows as NO exposure in UI)
-# -----------------------------
-NET_YES: int = 0
-
-# Track last-seen filled count per order_id so we only apply deltas
-_ORDER_LAST_FILLED: Dict[str, int] = {}
-
-# Throttle polling per order_id
-_LAST_ORDER_STATUS_POLL_TS: Dict[str, float] = {}
 
 NO_TARGET_SINCE_TS: Optional[float] = None
 NO_TARGET_SIDE_SINCE_TS: Dict[str, Optional[float]] = {"buy": None, "sell": None}
@@ -743,8 +904,24 @@ def reconcile_quotes(
 ) -> None:
     global NO_TARGET_SINCE_TS, NO_TARGET_SIDE_SINCE_TS, _LAST_SIDE_HOLD_LOG_TS
     global TIGHT_SPREAD_SINCE_TS, NOT_STABLE_SINCE_TS, UNSAFE_SINCE_TS
+    global _UNKNOWN_UNTIL_TS
 
     now = time.time()
+
+    # ✅ Inventory reconciliation first (throttled)
+    try:
+        for sk in ("buy", "sell"):
+            cur = WORKING.get(sk)
+            if cur is not None:
+                reconcile_order_status_for_working(sk, cur, now)
+    except Exception as e:
+        log.warning("[INV] reconcile_order_status error: %s", e)
+
+    # ✅ Pause if order states are ambiguous (404 window)
+    if (not dry_run) and ENABLE_TRADING and _UNKNOWN_UNTIL_TS > 0 and now < _UNKNOWN_UNTIL_TS:
+        remaining = _UNKNOWN_UNTIL_TS - now
+        log.warning("[INV] PAUSE quoting due to unknown order state: %.2fs remaining", remaining)
+        return
 
     def price_off(cur_price: int, target_price: int) -> int:
         return abs(int(cur_price) - int(target_price))
@@ -774,7 +951,7 @@ def reconcile_quotes(
         return ("invalid_order" in s) and ("post only cross" in s or "post_only_cross" in s or "post-only cross" in s)
 
     def place(side_key: str, price: int) -> None:
-        # ✅ NEW: pre-guard price vs current observed book to reduce POST_ONLY rejects
+        # ✅ pre-guard price vs current observed book to reduce POST_ONLY rejects
         p = int(price)
         p = _post_only_safe_price(side_key, p, yes_bid=yes_bid, yes_ask=yes_ask)
 
@@ -792,7 +969,7 @@ def reconcile_quotes(
                 log.info(f"[OM] {market_ticker} {side_key.upper()} POSTED order_id={order_id} @ {p} qty={qty}")
 
             except Exception as e:
-                # ✅ NEW: handle post-only cross as a soft failure + retry once with 1 more tick of safety
+                # ✅ handle post-only cross as a soft failure + retry once with 1 more tick of safety
                 if POST_ONLY and _is_post_only_cross_error(e):
                     bump = max(1, POST_ONLY_BUFFER_CENTS)
                     p2 = p - bump if side_key == "buy" else p + bump
@@ -836,6 +1013,10 @@ def reconcile_quotes(
             order_id=order_id,
         )
         _LAST_KEEP_LOGGED[side_key] = None
+
+        # Initialize last-filled tracking so first poll doesn't double-count
+        if order_id:
+            _ORDER_LAST_FILLED.setdefault(str(order_id), 0)
 
     def keep(side_key: str, cur: WorkingOrder, note: str) -> None:
         if _LAST_KEEP_LOGGED.get(side_key) != cur.price_cents:
@@ -1041,6 +1222,13 @@ def main():
         ENABLE_TRADING,
         POST_ONLY,
     )
+    log.info(
+        "[INV] MAX_NET_YES_CONTRACTS=%d INVENTORY_SKEW_CENTS=%d ORDER_STATUS_POLL_SECONDS=%.2f PAUSE_ON_UNKNOWN_SECONDS=%.2f",
+        MAX_NET_YES_CONTRACTS,
+        INVENTORY_SKEW_CENTS,
+        ORDER_STATUS_POLL_SECONDS,
+        PAUSE_ON_UNKNOWN_SECONDS,
+    )
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -1050,6 +1238,7 @@ def main():
     last_why: Optional[str] = None
 
     spread_ok_since: Optional[float] = None
+    last_inv_log_ts: float = 0.0
 
     while True:
         try:
@@ -1086,6 +1275,10 @@ def main():
                 global _LAST_FALLBACK_LOG_TS
                 _LAST_FALLBACK_LOG_TS = {}
 
+                global _LAST_ORDER_STATUS_POLL_TS, _UNKNOWN_UNTIL_TS
+                _LAST_ORDER_STATUS_POLL_TS = {}
+                _UNKNOWN_UNTIL_TS = 0.0
+
                 spread_ok_since = None
                 log.info("[OM] %s ROLL detected → cleared working orders (DRY_RUN=%s)", mkt, DRY_RUN)
 
@@ -1096,6 +1289,12 @@ def main():
             if quote_changed:
                 last_yes_bid, last_yes_ask = yes_bid, yes_ask
                 log.info("[QUOTE] %s YES bid=%s ask=%s", mkt, yes_bid, yes_ask)
+
+            # Periodic inventory log
+            now = time.time()
+            if (now - last_inv_log_ts) >= 10.0:
+                log.info("[INV] NET_YES=%d (cap=%d)", NET_YES, MAX_NET_YES_CONTRACTS)
+                last_inv_log_ts = now
 
             tb, ta, why = compute_target_yes_quotes(yes_bid, yes_ask)
 
