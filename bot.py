@@ -325,21 +325,52 @@ def place_order_live(market_ticker: str, action: str, yes_price_cents: int, coun
     raise RuntimeError(f"Order placed but could not find order_id in response: {resp}")
 
 
-def cancel_order_live(order_id: str) -> None:
+def cancel_order_live(order_id: str) -> str:
+    """
+    Returns:
+      - "canceled"  : cancel request accepted
+      - "not_found" : 404 not_found (ambiguous) -> caller must reconcile
+    """
     try:
         request_json("DELETE", f"/portfolio/orders/{order_id}")
+        return "canceled"
     except Exception as e:
-        msg = str(e)
-        if "HTTP 404" in msg and "not_found" in msg:
-            # 404 is ambiguous (could be filled/canceled/expired). Do NOT silently ignore.
+        msg = str(e).lower()
+        if ("http 404" in msg) and ("not_found" in msg):
             log.warning("[OM] CANCEL got 404 for order_id=%s (state ambiguous; will reconcile)", order_id)
-            return
+            return "not_found"
         raise
 
 
 def fetch_order_status(order_id: str) -> Dict[str, Any]:
     # Kalshi: GET /portfolio/orders/{order_id}
     return request_json("GET", f"/portfolio/orders/{order_id}")
+
+
+def fetch_open_orders(limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Used only for reconciliation when order state is ambiguous.
+    """
+    data = request_json("GET", "/portfolio/orders", params={"limit": int(limit), "status": "open"})
+    orders = data.get("orders") or data.get("data") or data.get("results") or []
+    return orders if isinstance(orders, list) else []
+
+
+def is_order_open(order_id: str) -> bool:
+    oid = str(order_id)
+    try:
+        for o in fetch_open_orders(limit=200):
+            if not isinstance(o, dict):
+                continue
+            oo = o.get("order") if isinstance(o.get("order"), dict) else o
+            got = oo.get("order_id") or oo.get("id")
+            if got is not None and str(got) == oid:
+                return True
+    except Exception as e:
+        # Conservative: if probe fails, assume it *might* be open.
+        log.warning("[INV] is_order_open probe failed for %s: %s", oid, e)
+        return True
+    return False
 
 # -----------------------------
 # Rolling via /markets ONLY
@@ -940,11 +971,36 @@ def reconcile_quotes(
             f"[OM] {market_ticker} {side_key.upper()} CANCEL @{cur.price_cents} ({reason}) DRY_RUN={dry_run}"
         )
 
+        cancel_status = "canceled"
         if (not dry_run) and ENABLE_TRADING and cur.order_id:
-            cancel_order_live(cur.order_id)
+            cancel_status = cancel_order_live(cur.order_id)
 
-        WORKING[side_key] = None
-        _LAST_KEEP_LOGGED[side_key] = None
+        if cancel_status == "canceled":
+            WORKING[side_key] = None
+            _LAST_KEEP_LOGGED[side_key] = None
+            return
+
+        # 404 not_found (ambiguous): DO NOT clear local state yet.
+        # Pause briefly, then reconcile using open-orders probe.
+        global _UNKNOWN_UNTIL_TS
+        _UNKNOWN_UNTIL_TS = max(_UNKNOWN_UNTIL_TS, now + max(0.0, PAUSE_ON_UNKNOWN_SECONDS))
+
+        if cur.order_id and (not is_order_open(cur.order_id)):
+            log.info(
+                "[OM] %s %s CANCEL 404 but order not open → treat as gone; clear WORKING",
+                market_ticker,
+                side_key.upper(),
+            )
+            WORKING[side_key] = None
+            _LAST_KEEP_LOGGED[side_key] = None
+            return
+
+        log.warning(
+            "[OM] %s %s CANCEL 404 and order still appears OPEN → KEEP local state; will retry via reconcile",
+            market_ticker,
+            side_key.upper(),
+        )
+        return
 
     def _is_post_only_cross_error(e: Exception) -> bool:
         s = str(e).lower()
