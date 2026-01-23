@@ -488,13 +488,26 @@ def roll_active_market() -> str:
 # Orderbook parsing (robust)
 # -----------------------------
 def _price_from_level(lvl: Any) -> Optional[int]:
+    # ✅ PATCH: accept cents OR dollars (float/str) and normalize to cents
+    def _to_cents_local(v: Any) -> Optional[int]:
+        try:
+            if v is None:
+                return None
+            fx = float(str(v).strip())
+            cents = int(round(fx * 100)) if fx <= 1.0 else int(round(fx))
+            if 1 <= cents <= 99:
+                return cents
+            return None
+        except Exception:
+            return None
+
     try:
         if isinstance(lvl, list) and len(lvl) >= 1:
-            return int(lvl[0])
+            return _to_cents_local(lvl[0])
         if isinstance(lvl, dict):
-            for k in ("price", "yes_price", "p"):
+            for k in ("price", "yes_price", "p", "price_dollars", "yes_price_dollars"):
                 if k in lvl and lvl.get(k) is not None:
-                    return int(lvl.get(k))
+                    return _to_cents_local(lvl.get(k))
     except Exception:
         return None
     return None
@@ -629,11 +642,20 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
     yes_bids, yes_asks = _extract_side_books(yes_obj)
     no_bids, no_asks = _extract_side_books(no_obj)
 
+    # ✅ PATCH: also support *_dollars arrays that Kalshi returns on this endpoint
+    yes_bids_dollars = ob.get("yes_dollars")
+    no_bids_dollars = ob.get("no_dollars")
+
     yes_bid = _best_bid(yes_bids)
     yes_ask = _best_ask(yes_asks)
 
+    if yes_bid is None:
+        yes_bid = _best_bid(yes_bids_dollars)
+
     if yes_ask is None:
         no_best_bid = _best_bid(no_bids)
+        if no_best_bid is None:
+            no_best_bid = _best_bid(no_bids_dollars)
         if no_best_bid is not None:
             yes_ask = 100 - int(no_best_bid)
 
