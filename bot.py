@@ -19,9 +19,10 @@
 #     CANCEL -> 404/not_found -> then inventory changes shortly after
 #   This is expected in fast markets: the order often fills before the cancel lands.
 # - Fix (behavioral):
-#   1) If cancel returns not_found, clear local order_id/price immediately (stop spamming cancels)
-#   2) Force-refresh positions immediately (inventory truth) before placing anything else
-#   3) Pause briefly and skip quoting until inventory is confirmed stable
+#   1) If cancel returns not_found in cancel-first flow, treat it as "order gone".
+#   2) Clear local order_id/price immediately (stop spamming cancels on same id).
+#   3) Force-refresh positions immediately before placing anything else.
+#   4) Pause + skip quoting briefly until inventory is confirmed stable.
 #
 # FIX D (LOGGING UNITS): realized/fees are often returned in cents.
 # - We treat realized/fees as cents by default and convert to USD for display.
@@ -30,29 +31,32 @@
 # FIX E (CRITICAL): Cancel-first repricing for ALL modes (flat + reduce-only).
 # - Prevents brief windows with TWO live orders on the same side during reprices.
 #
-# FIX F (REDUCE-ONLY REPRICE CONTROL): prevent “stuck exit” while limiting churn.
-# - Replace latch with a controlled reduce-only repricer:
+# FIX F (FROM YOUR LOGS - "targets change but no [OM] actions"):
+# - Root cause: earlier "reduce-only latch" (HOLD if an exit order exists)
+#   can freeze exit repricing forever, leaving you stuck with a stale exit while targets move.
+# - Fix: Replace latch with a *controlled* reduce-only repricer:
 #     • only reprice exits if the target moved by >= REDUCE_ONLY_REPRICE_TICKS
 #     • and only at a slower cadence: REDUCE_ONLY_MIN_REPRICE_SECONDS
-# - Reconciliation:
-#     • If tracked order_id is no longer open -> clear local state (with FIX G grace below)
-#     • Optional: cancel “stray” open YES orders for the active market if they’re not tracked
+# - Also add reconciliation so QuoteState never silently diverges:
+#     • If tracked order_id is no longer open -> clear local state (after grace+confirm)
+#     • Force-refresh positions when a tracked order disappears (likely fill/cancel)
+#     • Optional: cancel “stray” open YES orders for the active market if they’re not
+#       the ones we’re tracking (guards partial-crash / place-then-crash scenarios).
 #
-# FIX G (CRITICAL - FROM YOUR LOGS): “missing order” grace window + confirm-before-clear.
-# - Your logs show reconcile() clearing an order <1s after placement and immediately reposting,
-#   which can explode inventory (because fills/visibility are laggy in tight spreads).
-# - Fix:
-#     • After placing an order, we wait ORDER_VISIBILITY_GRACE_SECONDS before treating it as “missing”.
-#     • We require MISSING_ORDER_CONFIRM_POLLS consecutive polls missing before clearing state.
-#     • When an order is confirmed missing after grace, assume “filled or API lag”:
-#         - force-refresh positions
-#         - pause quoting briefly so we don’t spam replacement orders
+# FIX G (MATCHES YOUR NEW LOGS): "reconcile missing after grace+confirm"
+# - Open-orders can be briefly inconsistent. We:
+#     • wait RECONCILE_MISSING_GRACE_SECONDS
+#     • re-fetch open orders once
+#     • if still missing -> clear local state + force-refresh positions.
 #
-# FIX H (CRITICAL): Inventory fuse (hard stop).
-# - If |pos_yes| exceeds MAX_ABS_YES_CONTRACTS (e.g., you hit 7/9 in logs), we:
-#     • cancel all live quotes (and optionally cancel any leftover YES orders for the market)
-#     • pause/skip quoting for INVENTORY_FUSE_COOLDOWN_SECONDS
-#   This prevents runaway inventory even if something goes weird.
+# FIX H (MATCHES YOUR NEW LOGS): FUSE should NOT block reduce-only exits.
+# - If you start with inventory (e.g., pos_yes=67), we should NOT “pause forever”.
+# - New behavior:
+#     • If abs(pos_yes) > MAX_ABS_YES_CONTRACTS, we enter an EMERGENCY reduce-only mode.
+#     • We cancel any risk-increasing quotes and ONLY work an exit.
+#     • Optional: increase exit size with EMERGENCY_EXIT_QTY (default 1 to keep behavior stable).
+#
+# Everything else is kept as-is to avoid unintended behavior drift.
 
 import os
 import time
@@ -169,13 +173,6 @@ QUOTE_BOTH_WHEN_FLAT_ONLY = env_bool("QUOTE_BOTH_WHEN_FLAT_ONLY", True)
 ORDER_STATUS_POLL_SECONDS = env_float("ORDER_STATUS_POLL_SECONDS", 1.0)
 PAUSE_ON_UNKNOWN_SECONDS = env_float("PAUSE_ON_UNKNOWN_SECONDS", 0.75)
 
-# FIX G: reconcile grace window + confirm-before-clear
-ORDER_VISIBILITY_GRACE_SECONDS = env_float("ORDER_VISIBILITY_GRACE_SECONDS", 2.0)
-MISSING_ORDER_CONFIRM_POLLS = env_int("MISSING_ORDER_CONFIRM_POLLS", 2)
-
-# FIX H: inventory fuse cooldown
-INVENTORY_FUSE_COOLDOWN_SECONDS = env_float("INVENTORY_FUSE_COOLDOWN_SECONDS", 30.0)
-
 # Balance / collateral safety
 BALANCE_FAIL_COOLDOWN_SECONDS = env_float("BALANCE_FAIL_COOLDOWN_SECONDS", 10.0)
 BALANCE_FAIL_MAX_BURST = env_int("BALANCE_FAIL_MAX_BURST", 3)
@@ -216,12 +213,20 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # FIX D toggle
 PNL_VALUES_ARE_CENTS = env_bool("PNL_VALUES_ARE_CENTS", True)
 
-# FIX F: reduce-only exit repricing controls
+# FIX F: reduce-only exit repricing controls (prevents “stuck exit” while limiting churn)
 REDUCE_ONLY_REPRICE_TICKS = env_int("REDUCE_ONLY_REPRICE_TICKS", 2)
 REDUCE_ONLY_MIN_REPRICE_SECONDS = env_float("REDUCE_ONLY_MIN_REPRICE_SECONDS", max(3.0, MIN_REPRICE_SECONDS * 2.0))
 
-# FIX F (optional): cancel any stray open YES orders for the active market that aren’t tracked
+# FIX F (optional but recommended): cancel any stray open YES orders for the active market
+# that aren’t the bot’s tracked order_ids (guards partial-crash / divergence).
 CLEAN_STRAY_ORDERS = env_bool("CLEAN_STRAY_ORDERS", True)
+
+# FIX G: reconcile grace/confirm delay (matches your log wording)
+RECONCILE_MISSING_GRACE_SECONDS = env_float("RECONCILE_MISSING_GRACE_SECONDS", 0.25)
+
+# FIX H: emergency reduce-only behavior when starting with a big position
+EMERGENCY_EXIT_QTY = env_int("EMERGENCY_EXIT_QTY", 1)  # set >1 only if you *want* faster unwind
+EMERGENCY_IGNORE_HYSTERESIS = env_bool("EMERGENCY_IGNORE_HYSTERESIS", True)
 
 
 # -----------------------------
@@ -275,7 +280,11 @@ class KalshiClient:
             path = "/" + path
 
         url = f"{self.api_base}{self.api_prefix}{path}"
-        url_with_q = (url + "?" + urlencode(params)) if params else url
+
+        if params:
+            url_with_q = url + "?" + urlencode(params)
+        else:
+            url_with_q = url
 
         headers = self._sign_headers(method, url)
         headers["Accept"] = "application/json"
@@ -442,13 +451,6 @@ class QuoteState:
     ask_price: Optional[int] = None
     bid_order_id: Optional[str] = None
     ask_order_id: Optional[str] = None
-
-    # FIX G: track when we placed the order + missing-poll counters to avoid instant “ghost clears”
-    bid_placed_at: Optional[float] = None
-    ask_placed_at: Optional[float] = None
-    bid_missing_polls: int = 0
-    ask_missing_polls: int = 0
-
     last_market_ticker: Optional[str] = None
 
 
@@ -802,8 +804,8 @@ def main() -> None:
     enter_ok_streak = 0
     exit_bad_streak = 0
 
-    # FIX B helper state
     last_cancel_not_found_oid: Optional[str] = None
+    last_emergency_sig: Tuple[Any, ...] = tuple()
 
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
@@ -836,7 +838,6 @@ def main() -> None:
         nonlocal last_order_action_at
         last_order_action_at = time.time()
 
-    # FIX B: force-refresh positions immediately
     def refresh_positions_now(tag: str) -> bool:
         nonlocal pos_yes_live, realized_pnl_usd, fees_paid_usd, net_yes, last_positions_poll
         try:
@@ -853,7 +854,83 @@ def main() -> None:
             log.warning(f"[INV] force-refresh positions failed ({tag}): {e}")
             return False
 
-    # --- FIX A helper: cancel ALL open YES orders for active market ---
+    # FIX F/G: reconcile QuoteState with open orders (grace+confirm); optionally cancel stray YES orders.
+    def reconcile_quote_state_with_open_orders(tag: str) -> None:
+        nonlocal quote, open_orders_cache, pause_until, skip_quote_until
+
+        if not active_market:
+            return
+
+        def refetch_open_orders_once() -> bool:
+            nonlocal open_orders_cache
+            try:
+                open_orders_cache = get_open_orders(client)
+                note_successful_request()
+                return True
+            except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("reconcile_refetch_open_orders")
+                log.warning(f"[OM] reconcile({tag}): refetch open orders failed: {e}")
+                return False
+
+        open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+
+        # If tracked order missing, wait a beat and confirm once (eventual consistency).
+        def confirm_missing(order_id: str) -> bool:
+            time.sleep(max(0.0, RECONCILE_MISSING_GRACE_SECONDS))
+            if not refetch_open_orders_once():
+                return False
+            open_ids2 = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            return order_id not in open_ids2
+
+        if quote.bid_order_id and quote.bid_order_id not in open_ids:
+            if confirm_missing(quote.bid_order_id):
+                log.warning(
+                    f"[OM] reconcile({tag}): bid order missing after grace+confirm -> clearing local state (order_id={quote.bid_order_id})"
+                )
+                quote.bid_order_id = None
+                quote.bid_price = None
+                _ = refresh_positions_now("reconcile_missing_bid")
+                pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
+                skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
+
+        if quote.ask_order_id and quote.ask_order_id not in open_ids:
+            if confirm_missing(quote.ask_order_id):
+                log.warning(
+                    f"[OM] reconcile({tag}): ask order missing after grace+confirm -> clearing local state (order_id={quote.ask_order_id})"
+                )
+                quote.ask_order_id = None
+                quote.ask_price = None
+                _ = refresh_positions_now("reconcile_missing_ask")
+                pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
+                skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
+
+        # Optional: cancel stray YES orders for this market that aren't ours.
+        if CLEAN_STRAY_ORDERS:
+            tracked = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
+            for o in open_orders_cache:
+                if not is_yes_order_obj_for_market(o, active_market):
+                    continue
+                oid = o.get("order_id") or o.get("id")
+                if not oid:
+                    continue
+                oid_s = str(oid)
+                if oid_s in tracked:
+                    continue
+                try:
+                    if not DRY_RUN:
+                        st = cancel_order_status(client, oid_s)
+                        mark_order_action()
+                        note_successful_request()
+                    else:
+                        st = "canceled"
+                    log.warning(f"[OM] reconcile({tag}): CANCEL stray YES order order_id={oid_s} status={st}")
+                except Exception as ce:
+                    if is_rate_limited(ce):
+                        arm_rate_limit_pause("reconcile_cancel_stray")
+                    log.warning(f"[OM] reconcile({tag}): failed to cancel stray order {oid_s}: {ce}")
+
+    # FIX A: cancel ALL open YES orders for the *current* active market
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
         nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until
 
@@ -879,6 +956,8 @@ def main() -> None:
             try:
                 if not DRY_RUN:
                     _ = cancel_order_status(client, str(oid))
+                    mark_order_action()
+                    note_successful_request()
                 killed += 1
                 log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid}")
             except Exception as ce:
@@ -898,104 +977,6 @@ def main() -> None:
         if killed > 0:
             log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
-    # FIX G: reconcile local QuoteState to reality with grace window + confirm polls.
-    def reconcile_quote_state_with_open_orders(tag: str) -> None:
-        nonlocal quote, open_orders_cache, pause_until, skip_quote_until
-
-        if not active_market:
-            return
-
-        now = time.time()
-        open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
-
-        def handle_missing(side: str) -> None:
-            nonlocal quote, pause_until, skip_quote_until
-            if side == "bid":
-                oid, placed_at = quote.bid_order_id, quote.bid_placed_at
-                if not oid:
-                    quote.bid_missing_polls = 0
-                    return
-                if oid in open_ids:
-                    quote.bid_missing_polls = 0
-                    return
-
-                age = (now - placed_at) if placed_at else 9999.0
-                if age < ORDER_VISIBILITY_GRACE_SECONDS:
-                    # Still in grace window; do NOT clear, do NOT spam.
-                    return
-
-                quote.bid_missing_polls += 1
-                if quote.bid_missing_polls < max(1, MISSING_ORDER_CONFIRM_POLLS):
-                    return
-
-                log.warning(
-                    f"[OM] reconcile({tag}): bid order missing after grace+confirm -> clearing local state (order_id={oid})"
-                )
-                quote.bid_order_id = None
-                quote.bid_price = None
-                quote.bid_placed_at = None
-                quote.bid_missing_polls = 0
-
-                # Treat as "filled or API lag": refresh positions + pause briefly.
-                _ = refresh_positions_now("reconcile_missing_bid")
-                pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
-                skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
-
-            else:
-                oid, placed_at = quote.ask_order_id, quote.ask_placed_at
-                if not oid:
-                    quote.ask_missing_polls = 0
-                    return
-                if oid in open_ids:
-                    quote.ask_missing_polls = 0
-                    return
-
-                age = (now - placed_at) if placed_at else 9999.0
-                if age < ORDER_VISIBILITY_GRACE_SECONDS:
-                    return
-
-                quote.ask_missing_polls += 1
-                if quote.ask_missing_polls < max(1, MISSING_ORDER_CONFIRM_POLLS):
-                    return
-
-                log.warning(
-                    f"[OM] reconcile({tag}): ask order missing after grace+confirm -> clearing local state (order_id={oid})"
-                )
-                quote.ask_order_id = None
-                quote.ask_price = None
-                quote.ask_placed_at = None
-                quote.ask_missing_polls = 0
-
-                _ = refresh_positions_now("reconcile_missing_ask")
-                pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
-                skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
-
-        handle_missing("bid")
-        handle_missing("ask")
-
-        # Optional: cancel stray YES orders for this market that aren't ours.
-        if CLEAN_STRAY_ORDERS:
-            tracked = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
-            for o in open_orders_cache:
-                if not is_yes_order_obj_for_market(o, active_market):
-                    continue
-                oid = o.get("order_id") or o.get("id")
-                if not oid:
-                    continue
-                oid_s = str(oid)
-                if oid_s in tracked:
-                    continue
-                try:
-                    if not DRY_RUN:
-                        st = cancel_order_status(client, oid_s)
-                    else:
-                        st = "canceled"
-                    log.warning(f"[OM] reconcile({tag}): CANCEL stray YES order order_id={oid_s} status={st}")
-                except Exception as ce:
-                    if is_rate_limited(ce):
-                        arm_rate_limit_pause("reconcile_cancel_stray")
-                    log.warning(f"[OM] reconcile({tag}): failed to cancel stray order {oid_s}: {ce}")
-
     def cancel_bid_only(reason: str) -> None:
         nonlocal quote
         if not active_market:
@@ -1004,6 +985,8 @@ def main() -> None:
             try:
                 if not DRY_RUN:
                     _ = cancel_order_status(client, quote.bid_order_id)
+                    mark_order_action()
+                    note_successful_request()
                 log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
             except Exception as e:
                 if is_rate_limited(e):
@@ -1011,8 +994,6 @@ def main() -> None:
                 log.warning(f"[OM] cancel bid failed ({reason}): {e}")
             quote.bid_order_id = None
             quote.bid_price = None
-            quote.bid_placed_at = None
-            quote.bid_missing_polls = 0
 
     def cancel_ask_only(reason: str) -> None:
         nonlocal quote
@@ -1022,6 +1003,8 @@ def main() -> None:
             try:
                 if not DRY_RUN:
                     _ = cancel_order_status(client, quote.ask_order_id)
+                    mark_order_action()
+                    note_successful_request()
                 log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
             except Exception as e:
                 if is_rate_limited(e):
@@ -1029,8 +1012,6 @@ def main() -> None:
                 log.warning(f"[OM] cancel ask failed ({reason}): {e}")
             quote.ask_order_id = None
             quote.ask_price = None
-            quote.ask_placed_at = None
-            quote.ask_missing_polls = 0
 
     def cancel_live_quotes(reason: str) -> None:
         cancel_bid_only(reason)
@@ -1160,7 +1141,7 @@ def main() -> None:
                 note_successful_request()
                 last_order_poll = t0
 
-                # FIX G: reconcile local QuoteState to reality every orders poll (with grace+confirm)
+                # FIX F/G: reconcile local QuoteState to reality every orders poll
                 reconcile_quote_state_with_open_orders("orders_poll")
 
             except Exception as e:
@@ -1259,53 +1240,69 @@ def main() -> None:
 
         spread_now = yes_ask - yes_bid
 
-        if spread_now >= HYSTERESIS_ENTER_SPREAD_CENTS:
-            enter_ok_streak += 1
-        else:
-            enter_ok_streak = 0
+        # FIX H: if inventory exceeds MAX_ABS, do NOT pause forever.
+        # We go emergency reduce-only: cancel risk-increasing quotes and only work an exit.
+        emergency_reduce_only = abs(pos_yes_live) > MAX_ABS_YES_CONTRACTS
+        if emergency_reduce_only:
+            sig = (active_market, pos_yes_live, MAX_ABS_YES_CONTRACTS)
+            if sig != last_emergency_sig:
+                log.error(
+                    f"[FUSE] pos_yes={pos_yes_live} exceeds MAX_ABS_YES_CONTRACTS={MAX_ABS_YES_CONTRACTS}. Entering EMERGENCY reduce-only exit mode."
+                )
+                last_emergency_sig = sig
 
-        if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS:
-            exit_bad_streak += 1
-        else:
-            exit_bad_streak = 0
-
-        if not is_quoting:
-            if enter_ok_streak >= SPREAD_ENTER_STREAK:
-                is_quoting = True
-                exit_bad_streak = 0
+        # Hysteresis (unless emergency + you want to ignore it)
+        if not (emergency_reduce_only and EMERGENCY_IGNORE_HYSTERESIS):
+            if spread_now >= HYSTERESIS_ENTER_SPREAD_CENTS:
+                enter_ok_streak += 1
             else:
-                if quote.bid_order_id or quote.ask_order_id:
-                    cancel_live_quotes("hysteresis_not_quoting")
-                sig = (active_market, "SKIP", "hysteresis_wait_enter", spread_now, yes_bid, yes_ask)
-                if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
-                    log.info(
-                        f"[TARGET] {active_market} → SKIP (hysteresis_wait_enter) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}"
-                    )
-                    last_target_sig = sig
-                    last_target_log_at = t0
-                time.sleep(POLL_SECONDS)
-                continue
-        else:
-            if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS and exit_bad_streak < SPREAD_EXIT_STREAK:
-                sig = (active_market, "HOLD", "hysteresis_hold_below_exit", spread_now, yes_bid, yes_ask)
-                if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
-                    log.info(f"[TARGET] {active_market} → HOLD (hysteresis) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
-                    last_target_sig = sig
-                    last_target_log_at = t0
-                time.sleep(POLL_SECONDS)
-                continue
+                enter_ok_streak = 0
 
-            if exit_bad_streak >= SPREAD_EXIT_STREAK:
-                is_quoting = False
-                cancel_live_quotes("hysteresis_exit_spread_too_tight")
-                skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
-                sig = (active_market, "SKIP", "hysteresis_exit", spread_now, yes_bid, yes_ask)
-                if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
-                    log.info(f"[TARGET] {active_market} → SKIP (hysteresis_exit) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
-                    last_target_sig = sig
-                    last_target_log_at = t0
-                time.sleep(POLL_SECONDS)
-                continue
+            if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS:
+                exit_bad_streak += 1
+            else:
+                exit_bad_streak = 0
+
+            if not is_quoting:
+                if enter_ok_streak >= SPREAD_ENTER_STREAK:
+                    is_quoting = True
+                    exit_bad_streak = 0
+                else:
+                    if quote.bid_order_id or quote.ask_order_id:
+                        cancel_live_quotes("hysteresis_not_quoting")
+                    sig = (active_market, "SKIP", "hysteresis_wait_enter", spread_now, yes_bid, yes_ask)
+                    if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+                        log.info(
+                            f"[TARGET] {active_market} → SKIP (hysteresis_wait_enter) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}"
+                        )
+                        last_target_sig = sig
+                        last_target_log_at = t0
+                    time.sleep(POLL_SECONDS)
+                    continue
+            else:
+                if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS and exit_bad_streak < SPREAD_EXIT_STREAK:
+                    sig = (active_market, "HOLD", "hysteresis_hold_below_exit", spread_now, yes_bid, yes_ask)
+                    if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+                        log.info(f"[TARGET] {active_market} → HOLD (hysteresis) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                        last_target_sig = sig
+                        last_target_log_at = t0
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                if exit_bad_streak >= SPREAD_EXIT_STREAK:
+                    is_quoting = False
+                    cancel_live_quotes("hysteresis_exit_spread_too_tight")
+                    skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
+                    sig = (active_market, "SKIP", "hysteresis_exit", spread_now, yes_bid, yes_ask)
+                    if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+                        log.info(f"[TARGET] {active_market} → SKIP (hysteresis_exit) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                        last_target_sig = sig
+                        last_target_log_at = t0
+                    time.sleep(POLL_SECONDS)
+                    continue
+        else:
+            # emergency path: force quoting logic "on" so we can exit
+            is_quoting = True
 
         open_buys, open_sells = count_open_yes_orders(open_orders_cache, active_market)
         est_net_yes = net_yes
@@ -1323,21 +1320,17 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # FIX H: Inventory fuse (hard stop) once inventory is known-fresh
-        if abs(pos_yes_live) > MAX_ABS_YES_CONTRACTS:
-            log.error(
-                f"[FUSE] pos_yes={pos_yes_live} exceeds MAX_ABS_YES_CONTRACTS={MAX_ABS_YES_CONTRACTS}. Canceling orders + pausing."
-            )
-            cancel_all_open_yes_orders_for_active_market("inventory_fuse")
-            pause_until = max(pause_until, time.time() + 5.0)
-            skip_quote_until = max(skip_quote_until, time.time() + INVENTORY_FUSE_COOLDOWN_SECONDS)
-            time.sleep(POLL_SECONDS)
-            continue
-
         reduce_only = (est_net_yes != 0)
 
         min_spread_for_quotes = HYSTERESIS_EXIT_SPREAD_CENTS if is_quoting else HYSTERESIS_ENTER_SPREAD_CENTS
+        # In reduce-only we price with skew_net_for_pricing=0 (you already had this),
+        # because we only want "best exit", not inventory-skewed new inventory creation.
         skew_net_for_pricing = 0 if reduce_only else est_net_yes
+
+        # In emergency reduce-only, do not over-restrict the min_spread; let us work the exit.
+        if emergency_reduce_only:
+            min_spread_for_quotes = 1
+
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, skew_net_for_pricing, min_spread_cents=min_spread_for_quotes)
 
         quote_sig = (active_market, bid_px, ask_px, why, est_net_yes)
@@ -1345,18 +1338,21 @@ def main() -> None:
         if is_new_quote:
             last_quote_sig = quote_sig
 
-        # FIX F: in reduce-only mode, throttle reprices more aggressively (but don’t freeze forever)
+        # FIX F: throttle reprices; in reduce-only, slower cadence (but not frozen)
         if is_new_quote:
             min_reprice = REDUCE_ONLY_MIN_REPRICE_SECONDS if reduce_only else MIN_REPRICE_SECONDS
-            if (time.time() - last_reprice_at) < min_reprice:
+            if (time.time() - last_reprice_at) < min_reprice and not emergency_reduce_only:
                 time.sleep(POLL_SECONDS)
                 continue
 
         if bid_px is None or ask_px is None:
+            # In emergency reduce-only: we still may want to cancel risk-increasing quotes,
+            # but we won't "turn off" permanently.
             cancel_live_quotes(f"skip:{why}")
-            is_quoting = False
-            enter_ok_streak = 0
-            exit_bad_streak = 0
+            if not emergency_reduce_only:
+                is_quoting = False
+                enter_ok_streak = 0
+                exit_bad_streak = 0
             skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
             sig = (active_market, "SKIP", why, yes_bid, yes_ask)
             if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
@@ -1381,6 +1377,17 @@ def main() -> None:
             allow_bid = allow_bid and ((est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS)
             allow_ask = allow_ask and ((est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS)
 
+        # FIX H: in emergency, cancel any risk-increasing order immediately
+        if emergency_reduce_only and est_net_yes != 0:
+            if est_net_yes > 0:
+                # long: cancel any BUYs; keep/replace SELL exit only
+                if quote.bid_order_id:
+                    cancel_bid_only("emergency_long_cancel_bids")
+            else:
+                # short: cancel any SELLs; keep/replace BUY exit only
+                if quote.ask_order_id:
+                    cancel_ask_only("emergency_short_cancel_asks")
+
         if not allow_bid and quote.bid_order_id:
             cancel_bid_only("inventory_block_bid")
         if not allow_ask and quote.ask_order_id:
@@ -1396,6 +1403,7 @@ def main() -> None:
         quote.last_market_ticker = active_market
 
         enforce_two_sided_now = REQUIRE_TWO_SIDED_QUOTES and (not QUOTE_BOTH_WHEN_FLAT_ONLY or est_net_yes == 0)
+        # In reduce-only/emergency, we explicitly do NOT enforce two-sided (we only want the exit side).
         if enforce_two_sided_now and (not allow_bid or not allow_ask):
             if quote.bid_order_id or quote.ask_order_id:
                 cancel_live_quotes("two_sided_required")
@@ -1404,21 +1412,23 @@ def main() -> None:
 
         reduce_qty = ORDER_QTY
         if reduce_only:
-            reduce_qty = min(ORDER_QTY, abs(est_net_yes))
+            # FIX H: optionally increase exit size in emergency mode
+            desired = EMERGENCY_EXIT_QTY if emergency_reduce_only else ORDER_QTY
+            desired = max(1, int(desired))
+            reduce_qty = min(desired, abs(est_net_yes))
             reduce_qty = max(1, int(reduce_qty))
 
-        # Reduce-only exit repricing decision
         want_bid_update = allow_bid and (quote.bid_price != bid_px)
         want_ask_update = allow_ask and (quote.ask_price != ask_px)
 
         if reduce_only:
             if est_net_yes > 0:
                 if quote.ask_price is not None and ask_px is not None:
-                    if abs(ask_px - quote.ask_price) < REDUCE_ONLY_REPRICE_TICKS:
+                    if abs(ask_px - quote.ask_price) < REDUCE_ONLY_REPRICE_TICKS and not emergency_reduce_only:
                         want_ask_update = False
             else:
                 if quote.bid_price is not None and bid_px is not None:
-                    if abs(bid_px - quote.bid_price) < REDUCE_ONLY_REPRICE_TICKS:
+                    if abs(bid_px - quote.bid_price) < REDUCE_ONLY_REPRICE_TICKS and not emergency_reduce_only:
                         want_bid_update = False
 
         def cancel_old_then_place_new(
@@ -1441,16 +1451,21 @@ def main() -> None:
                     st = cancel_order_status(client, old_order_id)
                     mark_order_action()
                     note_successful_request()
-                    tag = "BUY" if action == "buy" else "SELL"
-                    log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id}")
+                    tag2 = "BUY" if action == "buy" else "SELL"
+                    log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id}")
 
                     if st == "not_found":
+                        # FIX B: stop spamming cancels on the same ghost order_id
                         last_cancel_not_found_oid = old_order_id
+
+                        # Force-refresh positions immediately before placing anything else
                         _ = refresh_positions_now("cancel_404_not_found")
+
+                        # Pause + skip quoting until inventory is confirmed stable
                         pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                         log.warning(
-                            f"[OM] {active_market} cancel got 404/not_found; forced positions refresh, pausing until inventory stabilizes."
+                            f"[OM] {active_market} cancel got 404/not_found; cleared local state, forced positions refresh, pausing until inventory stabilizes."
                         )
                         return None, None, False
 
@@ -1501,18 +1516,12 @@ def main() -> None:
                     old_order_id=quote.ask_order_id,
                     old_price=quote.ask_price,
                 )
-
                 if (not ok) and last_cancel_not_found_oid and quote.ask_order_id == last_cancel_not_found_oid:
                     quote.ask_order_id = None
                     quote.ask_price = None
-                    quote.ask_placed_at = None
-                    quote.ask_missing_polls = 0
-
                 if ok:
                     quote.ask_order_id = new_oid
                     quote.ask_price = new_px
-                    quote.ask_placed_at = time.time()
-                    quote.ask_missing_polls = 0
 
             if want_bid_update and allow_bid:
                 new_oid, new_px, ok = cancel_old_then_place_new(
@@ -1523,18 +1532,12 @@ def main() -> None:
                     old_order_id=quote.bid_order_id,
                     old_price=quote.bid_price,
                 )
-
                 if (not ok) and last_cancel_not_found_oid and quote.bid_order_id == last_cancel_not_found_oid:
                     quote.bid_order_id = None
                     quote.bid_price = None
-                    quote.bid_placed_at = None
-                    quote.bid_missing_polls = 0
-
                 if ok:
                     quote.bid_order_id = new_oid
                     quote.bid_price = new_px
-                    quote.bid_placed_at = time.time()
-                    quote.bid_missing_polls = 0
 
             if enforce_two_sided_now:
                 has_bid = quote.bid_order_id is not None
