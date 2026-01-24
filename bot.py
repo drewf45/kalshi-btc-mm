@@ -49,6 +49,16 @@
 #     • re-fetch open orders once
 #     • if still missing -> clear local state + force-refresh positions.
 #
+# FIX G2 (CRITICAL): Open-orders visibility grace (prevents “POSTED then missing” spam).
+# - Your log shows repeated:
+#     POSTED -> reconcile says "missing" -> clear local -> POSTED again -> ...
+#   This can happen if /portfolio/orders?status=open lags order visibility by 1–3 seconds.
+# - Fix:
+#     • Track timestamp of each POSTED order_id.
+#     • If reconcile sees it "missing" but it's younger than ORDERS_VISIBILITY_GRACE_SECONDS,
+#       DO NOTHING (do not clear, do not re-place). Let it propagate.
+#     • Only treat it as missing after it ages past the visibility grace.
+#
 # FIX H (MATCHES YOUR NEW LOGS): FUSE should NOT block reduce-only exits.
 # - If you start with inventory (e.g., pos_yes=-6), we should NOT “pause forever”.
 # - New behavior:
@@ -228,7 +238,10 @@ REDUCE_ONLY_MIN_REPRICE_SECONDS = env_float("REDUCE_ONLY_MIN_REPRICE_SECONDS", m
 CLEAN_STRAY_ORDERS = env_bool("CLEAN_STRAY_ORDERS", True)
 
 # FIX G: reconcile grace/confirm delay (matches your log wording)
-RECONCILE_MISSING_GRACE_SECONDS = env_float("RECONCILE_MISSING_GRACE_SECONDS", 0.25)
+RECONCILE_MISSING_GRACE_SECONDS = env_float("RECONCILE_MISSING_GRACE_SECONDS", 0.75)
+
+# FIX G2 (CRITICAL): open-orders visibility grace (prevents “POSTED then missing” spam / flip-through-zero)
+ORDERS_VISIBILITY_GRACE_SECONDS = env_float("ORDERS_VISIBILITY_GRACE_SECONDS", 3.0)
 
 # FIX H: emergency reduce-only behavior when starting with a big position
 EMERGENCY_EXIT_QTY = env_int("EMERGENCY_EXIT_QTY", 1)  # set >1 only if you *want* faster unwind
@@ -750,7 +763,6 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
     Tries many likely keys to find best YES bid/ask in cents.
     If the API doesn't provide them, returns (None, None).
     """
-    # Some APIs wrap as {"market": {...}}
     if "market" in m and isinstance(m["market"], dict):
         m = m["market"]
 
@@ -782,7 +794,6 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
             except Exception:
                 pass
 
-    # Sometimes they provide best NO bid -> infer YES ask = 100 - no_bid
     if ask is None:
         for k in ("no_bid", "best_no_bid", "best_no_bid_price", "no_bid_price"):
             if k in m:
@@ -852,6 +863,9 @@ def main() -> None:
     pause_until = 0.0
 
     open_orders_cache: List[Dict[str, Any]] = []
+
+    # Track when we POSTED each order_id (open-orders endpoint can lag).
+    order_posted_ts: Dict[str, float] = {}  # order_id -> epoch seconds
 
     last_spot_skip_log_at = 0.0
     last_spot_skip_msg = ""
@@ -944,9 +958,9 @@ def main() -> None:
                 arm_rate_limit_pause("market_snapshot")
             return last_market_snapshot or {}
 
-    # FIX F/G: reconcile QuoteState with open orders (grace+confirm); optionally cancel stray YES orders.
+    # FIX F/G/G2: reconcile QuoteState with open orders; avoid "POSTED then missing" churn; optionally cancel stray YES orders.
     def reconcile_quote_state_with_open_orders(tag: str) -> None:
-        nonlocal quote, open_orders_cache, pause_until, skip_quote_until
+        nonlocal quote, open_orders_cache, pause_until, skip_quote_until, order_posted_ts
 
         if not active_market:
             return
@@ -965,6 +979,12 @@ def main() -> None:
 
         open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
 
+        def recently_posted(oid: str) -> bool:
+            ts = order_posted_ts.get(oid)
+            if ts is None:
+                return False
+            return (time.time() - ts) < ORDERS_VISIBILITY_GRACE_SECONDS
+
         def confirm_missing(order_id: str) -> bool:
             time.sleep(max(0.0, RECONCILE_MISSING_GRACE_SECONDS))
             if not refetch_open_orders_once():
@@ -973,10 +993,19 @@ def main() -> None:
             return order_id not in open_ids2
 
         if quote.bid_order_id and quote.bid_order_id not in open_ids:
+            if recently_posted(quote.bid_order_id):
+                age = time.time() - order_posted_ts.get(quote.bid_order_id, time.time())
+                log.warning(
+                    f"[OM] reconcile({tag}): bid not visible yet; waiting visibility_grace "
+                    f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={quote.bid_order_id})"
+                )
+                return
+
             if confirm_missing(quote.bid_order_id):
                 log.warning(
                     f"[OM] reconcile({tag}): bid order missing after grace+confirm -> clearing local state (order_id={quote.bid_order_id})"
                 )
+                order_posted_ts.pop(quote.bid_order_id, None)
                 quote.bid_order_id = None
                 quote.bid_price = None
                 _ = refresh_positions_now("reconcile_missing_bid")
@@ -984,10 +1013,19 @@ def main() -> None:
                 skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
 
         if quote.ask_order_id and quote.ask_order_id not in open_ids:
+            if recently_posted(quote.ask_order_id):
+                age = time.time() - order_posted_ts.get(quote.ask_order_id, time.time())
+                log.warning(
+                    f"[OM] reconcile({tag}): ask not visible yet; waiting visibility_grace "
+                    f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={quote.ask_order_id})"
+                )
+                return
+
             if confirm_missing(quote.ask_order_id):
                 log.warning(
                     f"[OM] reconcile({tag}): ask order missing after grace+confirm -> clearing local state (order_id={quote.ask_order_id})"
                 )
+                order_posted_ts.pop(quote.ask_order_id, None)
                 quote.ask_order_id = None
                 quote.ask_price = None
                 _ = refresh_positions_now("reconcile_missing_ask")
@@ -1012,6 +1050,7 @@ def main() -> None:
                         note_successful_request()
                     else:
                         st = "canceled"
+                    order_posted_ts.pop(oid_s, None)
                     log.warning(f"[OM] reconcile({tag}): CANCEL stray YES order order_id={oid_s} status={st}")
                 except Exception as ce:
                     if is_rate_limited(ce):
@@ -1020,7 +1059,7 @@ def main() -> None:
 
     # FIX A: cancel ALL open YES orders for the *current* active market
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
-        nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until
+        nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until, order_posted_ts
 
         if not active_market:
             return
@@ -1047,6 +1086,7 @@ def main() -> None:
                     mark_order_action()
                     note_successful_request()
                 killed += 1
+                order_posted_ts.pop(str(oid), None)
                 log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid}")
             except Exception as ce:
                 if is_rate_limited(ce):
@@ -1066,7 +1106,7 @@ def main() -> None:
             log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
     def cancel_bid_only(reason: str) -> None:
-        nonlocal quote
+        nonlocal quote, order_posted_ts
         if not active_market:
             return
         if quote.bid_order_id:
@@ -1080,11 +1120,12 @@ def main() -> None:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_bid_only")
                 log.warning(f"[OM] cancel bid failed ({reason}): {e}")
+            order_posted_ts.pop(quote.bid_order_id, None)
             quote.bid_order_id = None
             quote.bid_price = None
 
     def cancel_ask_only(reason: str) -> None:
-        nonlocal quote
+        nonlocal quote, order_posted_ts
         if not active_market:
             return
         if quote.ask_order_id:
@@ -1098,6 +1139,7 @@ def main() -> None:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_ask_only")
                 log.warning(f"[OM] cancel ask failed ({reason}): {e}")
+            order_posted_ts.pop(quote.ask_order_id, None)
             quote.ask_order_id = None
             quote.ask_price = None
 
@@ -1530,6 +1572,7 @@ def main() -> None:
                     note_successful_request()
                     tag2 = "BUY" if action == "buy" else "SELL"
                     log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id}")
+                    order_posted_ts.pop(old_order_id, None)
 
                     if st == "not_found":
                         last_cancel_not_found_oid = old_order_id
@@ -1555,6 +1598,7 @@ def main() -> None:
                 new_oid = place_order(client, payload)
                 mark_order_action()
                 note_successful_request()
+                order_posted_ts[new_oid] = time.time()
                 log.info(f"[OM] {active_market} {action.upper()} POSTED order_id={new_oid} @ {new_price} qty={new_qty}")
                 return new_oid, new_price, True
             except Exception as e:
@@ -1580,7 +1624,6 @@ def main() -> None:
                 continue
 
             last_reprice_at = time.time()
-            last_reprice_at = time.time()
 
             if want_ask_update and allow_ask:
                 new_oid, new_px, ok = cancel_old_then_place_new(
@@ -1592,6 +1635,7 @@ def main() -> None:
                     old_price=quote.ask_price,
                 )
                 if (not ok) and last_cancel_not_found_oid and quote.ask_order_id == last_cancel_not_found_oid:
+                    order_posted_ts.pop(quote.ask_order_id, None)
                     quote.ask_order_id = None
                     quote.ask_price = None
                 if ok:
@@ -1608,6 +1652,7 @@ def main() -> None:
                     old_price=quote.bid_price,
                 )
                 if (not ok) and last_cancel_not_found_oid and quote.bid_order_id == last_cancel_not_found_oid:
+                    order_posted_ts.pop(quote.bid_order_id, None)
                     quote.bid_order_id = None
                     quote.bid_price = None
                 if ok:
