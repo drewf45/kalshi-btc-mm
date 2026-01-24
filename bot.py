@@ -15,11 +15,15 @@
 #   3) Reset QuoteState + hysteresis so we start clean.
 #
 # FIX B (FROM YOUR LOGS): 404/not_found on cancel is usually "already filled".
-# - In fast markets, orders can fill before the cancel lands.
-# - Fix (behavioral, reduce-only cancel-first path):
-#   1) If cancel returns not_found, clear local order_id/price immediately
-#   2) Force-refresh positions immediately (inventory truth) before placing anything else
-#   3) Pause briefly and skip quoting until inventory is confirmed stable
+# - Your logs show:
+#     CANCEL -> 404/not_found -> then inventory changes shortly after
+#   This is expected in fast markets: the order often fills before the cancel lands.
+# - Fix (behavioral):
+#   1) If cancel returns not_found in reduce-only mode, clear local order_id/price
+#      immediately (stop spamming cancels on the same id).
+#   2) Force-refresh positions immediately (inventory truth) before placing anything
+#      else.
+#   3) Pause briefly and skip quoting until inventory is confirmed stable.
 #
 # FIX C (REDUCE-ONLY LATCH): When not flat, do not churn exits like a market maker.
 # - When pos_yes != 0, the bot is in "reduce-only" mode (exit mode).
@@ -31,6 +35,12 @@
 # FIX D (LOGGING UNITS): realized/fees are often returned in cents.
 # - We treat realized/fees as cents by default and convert to USD for display.
 #   Toggle with env var: PNL_VALUES_ARE_CENTS (default True)
+#
+# FIX E (CRITICAL): Cancel-first repricing for ALL modes (flat + reduce-only).
+# - Your live log showed pos_yes jumping to -2 while flat due to place-first-then-cancel
+#   creating a brief window with TWO SELLs live. If both fill before the old cancels,
+#   you can flip through zero.
+# - Fix: repricing ALWAYS cancels the old order first, then places the new order.
 #
 # Everything else is kept as-is to avoid unintended behavior drift.
 
@@ -1320,7 +1330,7 @@ def main() -> None:
                     mark_order_action()
                     note_successful_request()
                     tag = "BUY" if action == "buy" else "SELL"
-                    log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reduce-only reprice cancel-first) order_id={old_order_id}")
+                    log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id}")
 
                     if st == "not_found":
                         # FIX B: stop spamming cancels on the same ghost order_id
@@ -1333,7 +1343,7 @@ def main() -> None:
                         pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                         log.warning(
-                            f"[OM] {active_market} cancel got 404/not_found in reduce-only; cleared local state, forced positions refresh, pausing until inventory stabilizes."
+                            f"[OM] {active_market} cancel got 404/not_found; cleared local state, forced positions refresh, pausing until inventory stabilizes."
                         )
                         return None, None, False
 
@@ -1376,7 +1386,8 @@ def main() -> None:
             last_reprice_at = time.time()
 
             if want_ask_update and allow_ask:
-                fn = cancel_old_then_place_new if reduce_only else place_new_then_cancel_old
+                # FIX E: always cancel-first (no place-first windows)
+                fn = cancel_old_then_place_new
                 new_oid, new_px, ok = fn(
                     side="ask",
                     action="sell",
@@ -1395,7 +1406,8 @@ def main() -> None:
                     quote.ask_price = new_px
 
             if want_bid_update and allow_bid:
-                fn = cancel_old_then_place_new if reduce_only else place_new_then_cancel_old
+                # FIX E: always cancel-first (no place-first windows)
+                fn = cancel_old_then_place_new
                 new_oid, new_px, ok = fn(
                     side="bid",
                     action="buy",
