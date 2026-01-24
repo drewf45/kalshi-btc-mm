@@ -15,6 +15,12 @@
 #     • Do NOT place/reprice the other side in the same iteration
 #     • Wait for positions refresh + stability before doing anything else
 #
+# LOGGING DIAGNOSTICS (NEW, ONLY): Adds high-signal logs to debug:
+#   (A) OMSNP reconcile snapshot lines when open-list != detail
+#   (B) LIFE order lifecycle tracking (posted -> seen in open-list -> seen in detail)
+#   (C) BOOTSTATE banner on startup to show inherited open orders + position
+#   (D) Open-list seen markers (LIFE open-list first-seen)
+#
 # Everything else is kept as-is.
 
 import os
@@ -201,6 +207,73 @@ MARKET_SNAPSHOT_TTL_SECONDS = env_float("MARKET_SNAPSHOT_TTL_SECONDS", 1.0)
 # Extra debug
 STATE_LOG_SECONDS = env_float("STATE_LOG_SECONDS", 1.5)
 RECONCILE_DEBUG_THROTTLE_SECONDS = env_float("RECONCILE_DEBUG_THROTTLE_SECONDS", 5.0)
+
+# -----------------------------
+# NEW: Logging / diagnostics toggles (ONLY ADDITIONS)
+# -----------------------------
+LOG_RECONCILE_SNAPSHOT = env_bool("LOG_RECONCILE_SNAPSHOT", True)
+LOG_ORDER_LIFECYCLE = env_bool("LOG_ORDER_LIFECYCLE", True)
+LOG_STARTUP_INHERITED_STATE = env_bool("LOG_STARTUP_INHERITED_STATE", True)
+
+# NEW: Order lifecycle tracking (posted -> seen open-list/detail -> terminal)
+order_life: Dict[str, Dict[str, Any]] = {}
+
+
+def _life(oid: str) -> Dict[str, Any]:
+    if oid not in order_life:
+        order_life[oid] = {
+            "posted_ts": None,
+            "posted_px": None,
+            "posted_action": None,
+            "first_seen_open_ts": None,
+            "first_seen_detail_ts": None,
+            "last_seen_open_ts": None,
+            "last_detail_status": None,
+            "last_detail_remaining": None,
+            "last_detail_px": None,
+            "terminal": None,
+        }
+    return order_life[oid]
+
+
+def _mark_open_seen(oid: str) -> None:
+    if not LOG_ORDER_LIFECYCLE:
+        return
+    m = _life(oid)
+    now = time.time()
+    m["last_seen_open_ts"] = now
+    if m["first_seen_open_ts"] is None:
+        m["first_seen_open_ts"] = now
+        log.info(f"[LIFE] open-list first-seen order_id={oid}")
+
+
+def _mark_detail_seen(oid: str, detail: Dict[str, Any]) -> None:
+    if not LOG_ORDER_LIFECYCLE:
+        return
+    m = _life(oid)
+    now = time.time()
+    if m["first_seen_detail_ts"] is None:
+        m["first_seen_detail_ts"] = now
+        log.info(f"[LIFE] detail first-seen order_id={oid}")
+
+    base = detail.get("order") if isinstance(detail.get("order"), dict) else detail
+    st = base.get("status")
+    rem = base.get("remaining_count")
+    px = base.get("yes_price") or base.get("price")
+
+    m["last_detail_status"] = st
+    m["last_detail_remaining"] = rem
+    m["last_detail_px"] = px
+
+
+def _life_banner(oid: str) -> str:
+    m = order_life.get(oid) or {}
+    return (
+        f"life(posted_ts={m.get('posted_ts')}, posted_px={m.get('posted_px')}, posted_action={m.get('posted_action')}, "
+        f"open_first={m.get('first_seen_open_ts')}, detail_first={m.get('first_seen_detail_ts')}, "
+        f"last_open={m.get('last_seen_open_ts')}, detail_status={m.get('last_detail_status')}, "
+        f"rem={m.get('last_detail_remaining')}, detail_px={m.get('last_detail_px')}, terminal={m.get('terminal')})"
+    )
 
 
 # -----------------------------
@@ -926,24 +999,33 @@ def main() -> None:
 
         open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
 
+        # NEW: lifecycle open-list seen markers
+        if LOG_ORDER_LIFECYCLE:
+            for oid in open_ids:
+                _mark_open_seen(oid)
+
         def recently_posted(oid: str) -> bool:
             ts = order_posted_ts.get(oid)
             if ts is None:
                 return False
             return (time.time() - ts) < ORDERS_VISIBILITY_GRACE_SECONDS
 
-        def verify_exists_via_detail(oid: str) -> Optional[bool]:
+        # NEW (tri-state preserved): (exists?, detail)
+        def verify_detail(oid: str) -> Tuple[Optional[bool], Optional[Dict[str, Any]]]:
             if not USE_ORDER_DETAIL_FOR_RECONCILE:
-                return None
+                return None, None
             try:
-                detail = get_order_by_id(client, oid)
+                detail = get_order_by_id(client, oid)  # None means 404/not_found
                 note_successful_request()
-                return detail is not None
+                if detail is not None:
+                    _mark_detail_seen(oid, detail)
+                    return True, detail
+                return False, None
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("reconcile_order_detail")
                 log.warning(f"[OM] reconcile({tag}): order-detail lookup failed for {oid}: {e}")
-                return None
+                return None, None
 
         def clear_local_and_pause(which: str, oid: str) -> None:
             nonlocal pause_until, skip_quote_until
@@ -977,12 +1059,24 @@ def main() -> None:
                         f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={oid})"
                     )
                 else:
-                    exists = verify_exists_via_detail(oid)
+                    exists, _detail = verify_detail(oid)
                     if exists is True:
+                        if LOG_RECONCILE_SNAPSHOT:
+                            age = time.time() - order_posted_ts.get(oid, time.time())
+                            log.info(
+                                f"[OMSNP] {active_market} {tag} bid_missing_openlist keep_local "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                            )
                         log.warning(
                             f"[OM] reconcile({tag}): bid missing in open-list but EXISTS via order-detail; keeping local state (order_id={oid})"
                         )
                     elif exists is False:
+                        if LOG_RECONCILE_SNAPSHOT:
+                            age = time.time() - order_posted_ts.get(oid, time.time())
+                            log.info(
+                                f"[OMSNP] {active_market} {tag} bid_missing_openlist detail_404 -> clear_pause "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                            )
                         log.warning(
                             f"[OM] reconcile({tag}): bid missing (404 via order-detail) -> clearing local state (order_id={oid})"
                         )
@@ -1003,12 +1097,24 @@ def main() -> None:
                         f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={oid})"
                     )
                 else:
-                    exists = verify_exists_via_detail(oid)
+                    exists, _detail = verify_detail(oid)
                     if exists is True:
+                        if LOG_RECONCILE_SNAPSHOT:
+                            age = time.time() - order_posted_ts.get(oid, time.time())
+                            log.info(
+                                f"[OMSNP] {active_market} {tag} ask_missing_openlist keep_local "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                            )
                         log.warning(
                             f"[OM] reconcile({tag}): ask missing in open-list but EXISTS via order-detail; keeping local state (order_id={oid})"
                         )
                     elif exists is False:
+                        if LOG_RECONCILE_SNAPSHOT:
+                            age = time.time() - order_posted_ts.get(oid, time.time())
+                            log.info(
+                                f"[OMSNP] {active_market} {tag} ask_missing_openlist detail_404 -> clear_pause "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                            )
                         log.warning(
                             f"[OM] reconcile({tag}): ask missing (404 via order-detail) -> clearing local state (order_id={oid})"
                         )
@@ -1038,6 +1144,9 @@ def main() -> None:
                     else:
                         st = "canceled"
                     order_posted_ts.pop(oid_s, None)
+                    if LOG_ORDER_LIFECYCLE:
+                        m = _life(oid_s)
+                        m["terminal"] = f"stray_cancel:{st}"
                     log.warning(f"[OM] reconcile({tag}): CANCEL stray YES order order_id={oid_s} status={st}")
                 except Exception as ce:
                     if is_rate_limited(ce):
@@ -1073,6 +1182,9 @@ def main() -> None:
                     note_successful_request()
                 killed += 1
                 order_posted_ts.pop(str(oid), None)
+                if LOG_ORDER_LIFECYCLE:
+                    m = _life(str(oid))
+                    m["terminal"] = f"bootstrap_cancel:{reason}"
                 log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid}")
             except Exception as ce:
                 if is_rate_limited(ce):
@@ -1112,7 +1224,10 @@ def main() -> None:
                 log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={oid} status={st}")
 
                 if st == "not_found":
-                    # CHANGE 1: clear local immediately, then refresh/pause
+                    if LOG_ORDER_LIFECYCLE:
+                        m = _life(oid)
+                        m["terminal"] = "cancel_not_found"
+                    # CHANGE 1
                     order_posted_ts.pop(oid, None)
                     quote.bid_order_id = None
                     quote.bid_price = None
@@ -1128,7 +1243,6 @@ def main() -> None:
                     arm_rate_limit_pause("cancel_bid_only")
                 log.warning(f"[OM] cancel bid failed ({reason}) order_id={oid} @ {old_px}: {e}")
             finally:
-                # normal cleanup
                 order_posted_ts.pop(oid, None)
                 quote.bid_order_id = None
                 quote.bid_price = None
@@ -1150,7 +1264,10 @@ def main() -> None:
                 log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={oid} status={st}")
 
                 if st == "not_found":
-                    # CHANGE 1: clear local immediately, then refresh/pause
+                    if LOG_ORDER_LIFECYCLE:
+                        m = _life(oid)
+                        m["terminal"] = "cancel_not_found"
+                    # CHANGE 1
                     order_posted_ts.pop(oid, None)
                     quote.ask_order_id = None
                     quote.ask_price = None
@@ -1166,7 +1283,6 @@ def main() -> None:
                     arm_rate_limit_pause("cancel_ask_only")
                 log.warning(f"[OM] cancel ask failed ({reason}) order_id={oid} @ {old_px}: {e}")
             finally:
-                # normal cleanup
                 order_posted_ts.pop(oid, None)
                 quote.ask_order_id = None
                 quote.ask_price = None
@@ -1235,6 +1351,19 @@ def main() -> None:
         log.info(f"[INV] initial positions: market={active_market} pos_yes={pos_yes_live}")
     except Exception as e:
         log.warning(f"[INV] initial positions fetch failed: {e}")
+
+    # NEW: Startup inherited state banner (ONLY LOGGING)
+    if LOG_STARTUP_INHERITED_STATE and active_market:
+        try:
+            oo = get_open_orders(client)
+            note_successful_request()
+            ids = open_order_ids_for_market_yes(oo, active_market)
+            log.warning(
+                f"[BOOTSTATE] inherited market={active_market} pos_yes={pos_yes_live} open_yes_orders={len(ids)} "
+                f"ids={ids[:10]}{'...' if len(ids) > 10 else ''}"
+            )
+        except Exception as e:
+            log.warning(f"[BOOTSTATE] failed to fetch inherited open orders: {e}")
 
     while True:
         t0 = time.time()
@@ -1604,12 +1733,13 @@ def main() -> None:
                     tag2 = "BUY" if action == "buy" else "SELL"
                     log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id} status={st}")
                     order_posted_ts.pop(old_order_id, None)
+                    if LOG_ORDER_LIFECYCLE:
+                        m = _life(old_order_id)
+                        m["terminal"] = f"reprice_cancel:{st}"
 
-                    # CHANGE 1 (core): not_found => assume order already filled/gone => clear local + refresh + pause
                     if st == "not_found":
                         last_cancel_not_found_oid = old_order_id
 
-                        # Immediately clear local state for THAT side
                         if side == "bid":
                             quote.bid_order_id = None
                             quote.bid_price = None
@@ -1638,6 +1768,15 @@ def main() -> None:
                 mark_order_action()
                 note_successful_request()
                 order_posted_ts[new_oid] = time.time()
+
+                # NEW: lifecycle on POSTED (ONLY LOGGING)
+                if LOG_ORDER_LIFECYCLE:
+                    m = _life(new_oid)
+                    m["posted_ts"] = order_posted_ts[new_oid]
+                    m["posted_px"] = new_price
+                    m["posted_action"] = action
+                    log.info(f"[LIFE] posted order_id={new_oid} action={action} px={new_price} qty={new_qty}")
+
                 log.info(f"[OM] {active_market} {action.upper()} POSTED order_id={new_oid} @ {new_price} qty={new_qty}")
                 return new_oid, new_price, True
             except Exception as e:
@@ -1664,7 +1803,6 @@ def main() -> None:
 
             last_reprice_at = time.time()
 
-            # CHANGE 2: if cancel-first hits not_found on one side, ABORT rest of order actions this iteration
             abort_iteration = False
 
             if want_ask_update and allow_ask:
@@ -1677,7 +1815,6 @@ def main() -> None:
                     old_price=quote.ask_price,
                 )
 
-                # If this call hit not_found, cancel_old_then_place_new already cleared local state + paused.
                 if last_cancel_not_found_oid is not None:
                     abort_iteration = True
                 elif ok:
