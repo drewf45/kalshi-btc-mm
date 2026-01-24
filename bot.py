@@ -782,4 +782,18 @@ def main() -> None:
                     log.warning(f"[OM] {active_market} SELL place failed: {e}")
             else:
                 quote.ask_price = ask_px
-                log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY
+                log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
+
+        # THROTTLED TARGET LOG
+        sig = (active_market, bid_px, ask_px, why)
+        if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+            log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
+            last_target_sig = sig
+            last_target_log_at = t0
+
+        dt = time.time() - t0
+        time.sleep(max(0.0, POLL_SECONDS - dt))
+
+
+if __name__ == "__main__":
+    main()
