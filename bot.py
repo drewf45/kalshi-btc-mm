@@ -2,19 +2,32 @@
 # Kalshi rolling 15m BTC market-maker (YES-side quoting with synthetic asks)
 #
 # -----------------------------
-# NOTES / WHAT CHANGED (MICRO FIX)
+# NOTES / WHAT CHANGED (FIXES)
 # -----------------------------
-# MICRO FIX (CRITICAL): Cancel "ghost" open orders on boot + market roll.
-# - Root cause of your flip-through-zero: bot only tracks order_ids in memory.
-#   After restart, old open orders can still exist on Kalshi, unknown to the bot.
-#   When you place a new reduce-only exit, you can briefly have TWO exits live.
-#   If both fill => you flip long -> short (or short -> long).
+# FIX A (CRITICAL): Cancel "ghost" open orders on boot + on market roll.
+# - Root cause of flip-through-zero: the bot tracks order_ids in memory only.
+#   After a restart, old open orders can still exist on Kalshi, unknown to the bot.
+#   If you place a new reduce-only exit while an old exit is still live, you can
+#   briefly have TWO exits. If both fill => you flip long->short (or short->long).
 # - Fix: On startup and every time the active market changes, we:
 #   1) GET /portfolio/orders?status=open
 #   2) Cancel ALL open YES orders for the active market ticker
-#   3) Reset QuoteState and hysteresis so we start clean.
+#   3) Reset QuoteState + hysteresis so we start clean.
 #
-# Everything else is kept as-is from your current version.
+# FIX B (FROM YOUR LOGS): reduce-only cancel-first returning 404/not_found
+# - Your logs show repeated:
+#     BUY CANCEL @64 ... -> 404/not_found -> "assume filled" -> PAUSE
+#   but the bot kept trying to cancel the same order_id again and again.
+# - Fix: If cancel returns not_found in reduce-only mode:
+#   1) Clear the local order_id/price (so we don't spam cancel forever)
+#   2) Pause + skip quoting until positions refresh (inventory becomes known again)
+#
+# FIX C (LOGGING UNITS): realized/fees are cents by default
+# - Your earlier note: realized/unrealized/fees in your logs were in cents.
+# - We now treat realized/fees as cents by default and convert to USD for display.
+#   Toggle with env var: PNL_VALUES_ARE_CENTS (default True)
+#
+# Everything else is kept as-is to avoid unintended behavior drift.
 
 import os
 import time
@@ -165,8 +178,11 @@ MAX_INV_STALENESS_SECONDS = env_float("MAX_INV_STALENESS_SECONDS", DEFAULT_MAX_I
 # Coinbase spot endpoint
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
-# MICRO FIX toggle
+# FIX A toggle
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
+
+# FIX C toggle
+PNL_VALUES_ARE_CENTS = env_bool("PNL_VALUES_ARE_CENTS", True)
 
 
 # -----------------------------
@@ -511,6 +527,13 @@ def parse_position_for_market(
                 if fees is not None:
                     break
 
+        # FIX C: treat realized/fees as cents by default, convert to USD for display
+        if PNL_VALUES_ARE_CENTS:
+            if realized is not None:
+                realized = realized / 100.0
+            if fees is not None:
+                fees = fees / 100.0
+
         return pos_yes, realized, fees
 
     return 0, None, None
@@ -720,6 +743,9 @@ def main() -> None:
     enter_ok_streak = 0
     exit_bad_streak = 0
 
+    # FIX B helper state: capture a not_found cancel so caller can clear quote state
+    last_cancel_not_found_oid: Optional[str] = None
+
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ("code" in s and "insufficient_balance" in s)
@@ -751,7 +777,7 @@ def main() -> None:
         nonlocal last_order_action_at
         last_order_action_at = time.time()
 
-    # --- MICRO FIX helper: cancel ALL open YES orders for active market ---
+    # --- FIX A helper: cancel ALL open YES orders for active market ---
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
         nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until
 
@@ -784,14 +810,12 @@ def main() -> None:
                     arm_rate_limit_pause("bootstrap_cancel")
                 log.warning(f"[BOOT] cancel leftover failed: {ce}")
 
-        # Reset local quote state so we don't reference dead ids
         quote = QuoteState()
         quote.last_market_ticker = active_market
         is_quoting = False
         enter_ok_streak = 0
         exit_bad_streak = 0
 
-        # Give the book/positions a moment to settle after mass-cancel
         skip_quote_until = max(skip_quote_until, time.time() + 1.0)
         pause_until = max(pause_until, time.time() + 0.5)
 
@@ -874,14 +898,14 @@ def main() -> None:
             active_market_obj = mobj
             log.info(f"[ROLL] Series={SERIES_TICKER} → Active event={active_event} market={active_market} (via /markets series_ticker)")
 
-        # MICRO FIX: when market changes, cancel leftover open orders for NEW market
+        # FIX A: when market changes, cancel leftover open orders for NEW market
         if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market and prev_market != active_market:
             cancel_all_open_yes_orders_for_active_market("market_roll_bootstrap")
 
     refresh_active_market()
     last_meta_refresh = time.time()
 
-    # MICRO FIX: on boot, always clean any leftovers for the active market
+    # FIX A: on boot, always clean any leftovers for the active market
     if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market:
         cancel_all_open_yes_orders_for_active_market("startup_bootstrap")
 
@@ -896,8 +920,7 @@ def main() -> None:
     except Exception as e:
         log.warning(f"[INV] initial positions fetch failed: {e}")
 
-    # ---- Main loop (UNCHANGED from your version below this point) ----
-    # (Kept identical to avoid unintended behavior drift.)
+    # ---- Main loop ----
     while True:
         t0 = time.time()
 
@@ -1246,7 +1269,9 @@ def main() -> None:
             old_order_id: Optional[str],
             old_price: Optional[int],
         ) -> Tuple[Optional[str], Optional[int], bool]:
-            nonlocal skip_quote_until
+            nonlocal skip_quote_until, pause_until, last_cancel_not_found_oid
+
+            last_cancel_not_found_oid = None
 
             if not ENABLE_TRADING or DRY_RUN:
                 return None, new_price, True
@@ -1260,8 +1285,12 @@ def main() -> None:
                     log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reduce-only reprice cancel-first) order_id={old_order_id}")
 
                     if st == "not_found":
+                        # FIX B: stop spamming cancels on the same ghost order_id
+                        last_cancel_not_found_oid = old_order_id
+                        # Pause until positions refresh so inventory is known again
+                        pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
-                        log.warning(f"[OM] {active_market} cancel got 404/not_found in reduce-only; assume filled. Pausing until positions refresh.")
+                        log.warning(f"[OM] {active_market} cancel got 404/not_found in reduce-only; clearing local order state and pausing until positions refresh.")
                         return None, None, False
 
                 except Exception as ce:
@@ -1310,6 +1339,11 @@ def main() -> None:
                     old_order_id=quote.ask_order_id,
                     old_price=quote.ask_price,
                 )
+                # FIX B: clear local ask state if cancel returned not_found
+                if (not ok) and last_cancel_not_found_oid and quote.ask_order_id == last_cancel_not_found_oid:
+                    quote.ask_order_id = None
+                    quote.ask_price = None
+
                 if ok:
                     quote.ask_order_id = new_oid
                     quote.ask_price = new_px
@@ -1324,6 +1358,11 @@ def main() -> None:
                     old_order_id=quote.bid_order_id,
                     old_price=quote.bid_price,
                 )
+                # FIX B: clear local bid state if cancel returned not_found
+                if (not ok) and last_cancel_not_found_oid and quote.bid_order_id == last_cancel_not_found_oid:
+                    quote.bid_order_id = None
+                    quote.bid_price = None
+
                 if ok:
                     quote.bid_order_id = new_oid
                     quote.bid_price = new_px
