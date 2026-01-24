@@ -25,22 +25,24 @@
 #      else.
 #   3) Pause briefly and skip quoting until inventory is confirmed stable.
 #
-# FIX C (REDUCE-ONLY LATCH): When not flat, do not churn exits like a market maker.
-# - When pos_yes != 0, the bot is in "reduce-only" mode (exit mode).
-# - In exit mode we should:
-#   • maintain ONE exit order (buy-to-cover if short, sell-to-exit if long)
-#   • avoid rapid cancel/reprice loops that can race fills/position updates
-# - Fix: if an exit order already exists, HOLD it and wait for positions refresh.
-#
 # FIX D (LOGGING UNITS): realized/fees are often returned in cents.
 # - We treat realized/fees as cents by default and convert to USD for display.
 #   Toggle with env var: PNL_VALUES_ARE_CENTS (default True)
 #
 # FIX E (CRITICAL): Cancel-first repricing for ALL modes (flat + reduce-only).
-# - Your live log showed pos_yes jumping to -2 while flat due to place-first-then-cancel
-#   creating a brief window with TWO SELLs live. If both fill before the old cancels,
-#   you can flip through zero.
-# - Fix: repricing ALWAYS cancels the old order first, then places the new order.
+# - Prevents brief windows with TWO live orders on the same side during reprices.
+#
+# FIX F (FROM YOUR LOGS - "targets change but no [OM] actions"):
+# - Root cause: the earlier "reduce-only latch" (HOLD if an exit order exists)
+#   can freeze exit repricing forever, leaving you stuck (pos_yes=-1) with a stale
+#   exit order while targets move.
+# - Fix: Replace the latch with a *controlled* reduce-only repricer:
+#     • only reprice exits if the target moved by >= REDUCE_ONLY_REPRICE_TICKS
+#     • and only at a slower cadence: REDUCE_ONLY_MIN_REPRICE_SECONDS
+# - Also add reconciliation so QuoteState never silently diverges:
+#     • If the tracked order_id is no longer open -> clear local state immediately.
+#     • Optional: cancel “stray” open YES orders for the active market if they’re not
+#       the ones we’re tracking (guards partial-crash / place-then-crash scenarios).
 #
 # Everything else is kept as-is to avoid unintended behavior drift.
 
@@ -198,6 +200,14 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
 # FIX D toggle
 PNL_VALUES_ARE_CENTS = env_bool("PNL_VALUES_ARE_CENTS", True)
+
+# FIX F: reduce-only exit repricing controls (prevents “stuck exit” while limiting churn)
+REDUCE_ONLY_REPRICE_TICKS = env_int("REDUCE_ONLY_REPRICE_TICKS", 2)
+REDUCE_ONLY_MIN_REPRICE_SECONDS = env_float("REDUCE_ONLY_MIN_REPRICE_SECONDS", max(3.0, MIN_REPRICE_SECONDS * 2.0))
+
+# FIX F (optional but recommended): cancel any stray open YES orders for the active market
+# that aren’t the bot’s tracked order_ids (guards partial-crash / divergence).
+CLEAN_STRAY_ORDERS = env_bool("CLEAN_STRAY_ORDERS", True)
 
 
 # -----------------------------
@@ -686,6 +696,23 @@ def count_open_yes_orders(open_orders: List[Dict[str, Any]], market_ticker: str)
     return buys, sells
 
 
+def open_order_ids_for_market_yes(open_orders: List[Dict[str, Any]], market_ticker: str) -> List[str]:
+    ids: List[str] = []
+    for o in open_orders:
+        if str(o.get("ticker")) != str(market_ticker):
+            continue
+        if str(o.get("side", "")).lower() != "yes":
+            continue
+        oid = o.get("order_id") or o.get("id")
+        if oid:
+            ids.append(str(oid))
+    return ids
+
+
+def is_yes_order_obj_for_market(o: Dict[str, Any], market_ticker: str) -> bool:
+    return str(o.get("ticker")) == str(market_ticker) and str(o.get("side", "")).lower() == "yes"
+
+
 # -----------------------------
 # Main loop
 # -----------------------------
@@ -808,6 +835,49 @@ def main() -> None:
                 arm_rate_limit_pause(f"positions_force_{tag}")
             log.warning(f"[INV] force-refresh positions failed ({tag}): {e}")
             return False
+
+    # FIX F: keep QuoteState consistent with open_orders_cache.
+    def reconcile_quote_state_with_open_orders(tag: str) -> None:
+        nonlocal quote, open_orders_cache
+
+        if not active_market:
+            return
+
+        open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+
+        # If we think we have a live order but it's not open anymore, clear it.
+        if quote.bid_order_id and quote.bid_order_id not in open_ids:
+            log.warning(f"[OM] reconcile({tag}): bid order no longer open -> clearing local state (order_id={quote.bid_order_id})")
+            quote.bid_order_id = None
+            quote.bid_price = None
+
+        if quote.ask_order_id and quote.ask_order_id not in open_ids:
+            log.warning(f"[OM] reconcile({tag}): ask order no longer open -> clearing local state (order_id={quote.ask_order_id})")
+            quote.ask_order_id = None
+            quote.ask_price = None
+
+        # Optional: cancel stray YES orders for this market that aren't ours.
+        if CLEAN_STRAY_ORDERS:
+            tracked = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
+            for o in open_orders_cache:
+                if not is_yes_order_obj_for_market(o, active_market):
+                    continue
+                oid = o.get("order_id") or o.get("id")
+                if not oid:
+                    continue
+                oid_s = str(oid)
+                if oid_s in tracked:
+                    continue
+                try:
+                    if not DRY_RUN:
+                        st = cancel_order_status(client, oid_s)
+                    else:
+                        st = "canceled"
+                    log.warning(f"[OM] reconcile({tag}): CANCEL stray YES order order_id={oid_s} status={st}")
+                except Exception as ce:
+                    if is_rate_limited(ce):
+                        arm_rate_limit_pause("reconcile_cancel_stray")
+                    log.warning(f"[OM] reconcile({tag}): failed to cancel stray order {oid_s}: {ce}")
 
     # --- FIX A helper: cancel ALL open YES orders for active market ---
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
@@ -1013,6 +1083,10 @@ def main() -> None:
                 open_orders_cache = get_open_orders(client)
                 note_successful_request()
                 last_order_poll = t0
+
+                # FIX F: reconcile local QuoteState to reality every orders poll
+                reconcile_quote_state_with_open_orders("orders_poll")
+
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("open_orders")
@@ -1174,6 +1248,7 @@ def main() -> None:
             continue
 
         reduce_only = (est_net_yes != 0)
+
         min_spread_for_quotes = HYSTERESIS_EXIT_SPREAD_CENTS if is_quoting else HYSTERESIS_ENTER_SPREAD_CENTS
         skew_net_for_pricing = 0 if reduce_only else est_net_yes
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, skew_net_for_pricing, min_spread_cents=min_spread_for_quotes)
@@ -1183,9 +1258,12 @@ def main() -> None:
         if is_new_quote:
             last_quote_sig = quote_sig
 
-        if is_new_quote and (time.time() - last_reprice_at) < MIN_REPRICE_SECONDS:
-            time.sleep(POLL_SECONDS)
-            continue
+        # FIX F: in reduce-only mode, throttle reprices more aggressively (but don’t freeze forever)
+        if is_new_quote:
+            min_reprice = REDUCE_ONLY_MIN_REPRICE_SECONDS if reduce_only else MIN_REPRICE_SECONDS
+            if (time.time() - last_reprice_at) < min_reprice:
+                time.sleep(POLL_SECONDS)
+                continue
 
         if bid_px is None or ask_px is None:
             cancel_live_quotes(f"skip:{why}")
@@ -1242,18 +1320,25 @@ def main() -> None:
             reduce_qty = min(ORDER_QTY, abs(est_net_yes))
             reduce_qty = max(1, int(reduce_qty))
 
-        # FIX C: reduce-only latch — if an exit order exists, HOLD it (no reprice churn)
+        # -----------------------------
+        # FIX F: Reduce-only exit repricing decision:
+        # - We DO allow repricing, but only if the target moved enough (ticks threshold).
+        # - This prevents “stuck at stale exit” while avoiding micro-churn.
+        # -----------------------------
         want_bid_update = allow_bid and (quote.bid_price != bid_px)
         want_ask_update = allow_ask and (quote.ask_price != ask_px)
+
         if reduce_only:
             if est_net_yes > 0:
-                # exiting long via SELL: if we already have an ask order, hold it
-                if quote.ask_order_id is not None:
-                    want_ask_update = False
+                # exiting long via SELL; only reprice if moved enough
+                if quote.ask_price is not None and ask_px is not None:
+                    if abs(ask_px - quote.ask_price) < REDUCE_ONLY_REPRICE_TICKS:
+                        want_ask_update = False
             else:
-                # exiting short via BUY: if we already have a bid order, hold it
-                if quote.bid_order_id is not None:
-                    want_bid_update = False
+                # exiting short via BUY; only reprice if moved enough
+                if quote.bid_price is not None and bid_px is not None:
+                    if abs(bid_px - quote.bid_price) < REDUCE_ONLY_REPRICE_TICKS:
+                        want_bid_update = False
 
         def place_new_then_cancel_old(
             side: str,
@@ -1386,7 +1471,7 @@ def main() -> None:
             last_reprice_at = time.time()
 
             if want_ask_update and allow_ask:
-                # FIX E: always cancel-first (no place-first windows)
+                # FIX E: always cancel-first
                 fn = cancel_old_then_place_new
                 new_oid, new_px, ok = fn(
                     side="ask",
@@ -1406,7 +1491,7 @@ def main() -> None:
                     quote.ask_price = new_px
 
             if want_bid_update and allow_bid:
-                # FIX E: always cancel-first (no place-first windows)
+                # FIX E: always cancel-first
                 fn = cancel_old_then_place_new
                 new_oid, new_px, ok = fn(
                     side="bid",
