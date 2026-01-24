@@ -4,7 +4,10 @@
 # FIXES in this version:
 # 1) MAX_SPREAD_CENTS: if spread is too wide (default 30c), skip quoting entirely.
 #    This prevents nonsense targets like bid@2 ask@98 when the book is basically empty.
-# 2) Throttle [TARGET] logs so you don't spam every 0.20s.
+# 2) Throttle [TARGET] logs so you don't spam every 0.20s (default 10s, env override).
+# 3) IMPORTANT SAFETY: whenever we SKIP quoting (no bid/ask, spot-guard, spread too wide/tight, etc.),
+#    we CANCEL any live quotes we previously posted for that market so we don't leave stale orders resting.
+# 4) Keep an open-orders cache between polls so inventory/allow logic doesn't flip-flop on empty list.
 #
 # Notes:
 # - Uses GET /markets?series_ticker=... to auto-roll
@@ -105,7 +108,11 @@ ORDER_QTY = env_int("ORDER_QTY", 1)
 IMPROVE_CENTS = env_int("IMPROVE_CENTS", 1)
 NO_IMPROVE_MAX_SPREAD_CENTS = env_int("NO_IMPROVE_MAX_SPREAD_CENTS", 4)  # <= spread: join, don't improve
 MIN_SPREAD_CENTS = env_int("MIN_SPREAD_CENTS", 2)  # if spread < this, skip
-MAX_SPREAD_CENTS = env_int("MAX_SPREAD_CENTS", 30)  # NEW: if spread > this, skip (prevents 2/98 nonsense)
+MAX_SPREAD_CENTS = env_int("MAX_SPREAD_CENTS", 30)  # if spread > this, skip (prevents 2/98 nonsense)
+
+# Log throttles
+TARGET_LOG_THROTTLE_SECONDS = env_float("TARGET_LOG_THROTTLE_SECONDS", 10.0)
+SPOT_SKIP_LOG_THROTTLE_SECONDS = env_float("SPOT_SKIP_LOG_THROTTLE_SECONDS", 2.0)
 
 # Inventory control (simple)
 MAX_NET_YES_CONTRACTS = env_int("MAX_NET_YES_CONTRACTS", 2)
@@ -409,7 +416,6 @@ def compute_quotes(
     if spread < MIN_SPREAD_CENTS:
         return None, None, f"spread_too_tight({spread})"
 
-    # NEW: if spread is absurd, do NOT quote at all
     if spread > MAX_SPREAD_CENTS:
         return None, None, f"spread_too_wide({spread}>{MAX_SPREAD_CENTS})"
 
@@ -480,6 +486,8 @@ def main() -> None:
              MAX_NET_YES_CONTRACTS, INVENTORY_SKEW_CENTS, ORDER_STATUS_POLL_SECONDS, PAUSE_ON_UNKNOWN_SECONDS)
     log.info("[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d MIN_SPREAD_CENTS=%d MAX_SPREAD_CENTS=%d IMPROVE_CENTS=%d",
              NO_IMPROVE_MAX_SPREAD_CENTS, MIN_SPREAD_CENTS, MAX_SPREAD_CENTS, IMPROVE_CENTS)
+    log.info("[LOG] TARGET_LOG_THROTTLE_SECONDS=%.1f SPOT_SKIP_LOG_THROTTLE_SECONDS=%.1f",
+             TARGET_LOG_THROTTLE_SECONDS, SPOT_SKIP_LOG_THROTTLE_SECONDS)
     log.info("[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.1f META_REFRESH=%.1f SPOT_GUARD_NEAR_CLOSE_SECONDS=%.1f",
              ENABLE_SPOT_GUARD, SPOT_POLL_SECONDS, CLOSEOUT_SECONDS, SPOT_RESOLVED_BUFFER_USD, META_REFRESH_SECONDS, SPOT_GUARD_NEAR_CLOSE_SECONDS)
 
@@ -503,12 +511,49 @@ def main() -> None:
     last_order_poll = 0.0
     pause_until = 0.0
 
+    # caches
+    open_orders_cache: List[Dict[str, Any]] = []
+
     # Throttles
     last_spot_skip_log_at = 0.0
     last_spot_skip_msg = ""
 
     last_target_log_at = 0.0
     last_target_sig: Tuple[Any, ...] = tuple()
+
+    def cancel_live_quotes(reason: str) -> None:
+        """Cancel any currently tracked live bid/ask orders (if any) and clear local quote state."""
+        nonlocal quote
+        if not active_market:
+            return
+
+        cancelled_any = False
+
+        if quote.bid_order_id:
+            try:
+                if not DRY_RUN:
+                    cancel_order(client, quote.bid_order_id)
+                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
+            except Exception as e:
+                log.warning(f"[OM] cancel bid failed ({reason}): {e}")
+            quote.bid_order_id = None
+            quote.bid_price = None
+            cancelled_any = True
+
+        if quote.ask_order_id:
+            try:
+                if not DRY_RUN:
+                    cancel_order(client, quote.ask_order_id)
+                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
+            except Exception as e:
+                log.warning(f"[OM] cancel ask failed ({reason}): {e}")
+            quote.ask_order_id = None
+            quote.ask_price = None
+            cancelled_any = True
+
+        if cancelled_any:
+            # keep last_market_ticker so we still know what market we were on
+            pass
 
     def refresh_active_market() -> None:
         nonlocal active_event, active_market, active_market_obj
@@ -565,52 +610,44 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = close_ts - int(time.time())
 
+        # Closeout hard-stop: cancel everything right before close
         if secs_to_close is not None and secs_to_close <= CLOSEOUT_SECONDS:
-            if quote.bid_order_id:
-                try:
-                    if not DRY_RUN:
-                        cancel_order(client, quote.bid_order_id)
-                    log.info(f"[OM] {active_market} BUY CANCEL (closeout) order_id={quote.bid_order_id}")
-                except Exception as e:
-                    log.warning(f"[OM] cancel bid failed: {e}")
-                quote.bid_order_id = None
-            if quote.ask_order_id:
-                try:
-                    if not DRY_RUN:
-                        cancel_order(client, quote.ask_order_id)
-                    log.info(f"[OM] {active_market} SELL CANCEL (closeout) order_id={quote.ask_order_id}")
-                except Exception as e:
-                    log.warning(f"[OM] cancel ask failed: {e}")
-                quote.ask_order_id = None
+            cancel_live_quotes("closeout")
             time.sleep(POLL_SECONDS)
             continue
 
+        # Spot guard near close: also cancel (don’t leave quotes up)
         if ENABLE_SPOT_GUARD and spot_usd is not None and secs_to_close is not None and secs_to_close <= SPOT_GUARD_NEAR_CLOSE_SECONDS:
             lo, hi = market_bounds_usd(active_market_obj)
+
             if lo is not None and abs(spot_usd - lo) <= SPOT_RESOLVED_BUFFER_USD:
+                cancel_live_quotes("spot_guard_floor")
                 msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of floor {lo:.2f} (t_close={secs_to_close}s)"
-                if (t0 - last_spot_skip_log_at) >= 2.0 or msg != last_spot_skip_msg:
-                    log.info(msg)
-                    last_spot_skip_log_at = t0
-                    last_spot_skip_msg = msg
-                time.sleep(POLL_SECONDS)
-                continue
-            if hi is not None and abs(spot_usd - hi) <= SPOT_RESOLVED_BUFFER_USD:
-                msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of cap {hi:.2f} (t_close={secs_to_close}s)"
-                if (t0 - last_spot_skip_log_at) >= 2.0 or msg != last_spot_skip_msg:
+                if (t0 - last_spot_skip_log_at) >= SPOT_SKIP_LOG_THROTTLE_SECONDS or msg != last_spot_skip_msg:
                     log.info(msg)
                     last_spot_skip_log_at = t0
                     last_spot_skip_msg = msg
                 time.sleep(POLL_SECONDS)
                 continue
 
-        open_orders: List[Dict[str, Any]] = []
+            if hi is not None and abs(spot_usd - hi) <= SPOT_RESOLVED_BUFFER_USD:
+                cancel_live_quotes("spot_guard_cap")
+                msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of cap {hi:.2f} (t_close={secs_to_close}s)"
+                if (t0 - last_spot_skip_log_at) >= SPOT_SKIP_LOG_THROTTLE_SECONDS or msg != last_spot_skip_msg:
+                    log.info(msg)
+                    last_spot_skip_log_at = t0
+                    last_spot_skip_msg = msg
+                time.sleep(POLL_SECONDS)
+                continue
+
+        # Poll open orders (cache persists between polls)
         if (t0 - last_order_poll) >= ORDER_STATUS_POLL_SECONDS:
             try:
-                open_orders = get_open_orders(client)
+                open_orders_cache = get_open_orders(client)
                 last_order_poll = t0
             except Exception as e:
                 pause_until = time.time() + PAUSE_ON_UNKNOWN_SECONDS
+                cancel_live_quotes("unknown_order_state_pause")
                 log.warning(f"[INV] PAUSE quoting due to unknown order state: {PAUSE_ON_UNKNOWN_SECONDS:.2f}s remaining ({e})")
                 time.sleep(POLL_SECONDS)
                 continue
@@ -619,6 +656,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # Orderbook
         try:
             ob = client.request("GET", f"/markets/{active_market}/orderbook")
         except Exception as e:
@@ -628,22 +666,23 @@ def main() -> None:
 
         yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
         if yes_bid is None or yes_ask is None:
-            # throttle this too (don’t spam)
-            sig = (active_market, "no_yes_bid_or_ask")
-            if sig != last_target_sig or (t0 - last_target_log_at) >= 2.0:
+            cancel_live_quotes("no_yes_bid_or_ask")
+            sig = (active_market, "SKIP", "no_yes_bid_or_ask")
+            if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                 log.info(f"[TARGET] {active_market} → SKIP (no_yes_bid_or_ask)")
                 last_target_sig = sig
                 last_target_log_at = t0
             time.sleep(POLL_SECONDS)
             continue
 
-        open_buys, open_sells = count_open_yes_orders(open_orders, active_market)
+        open_buys, open_sells = count_open_yes_orders(open_orders_cache, active_market)
         est_net_yes = net_yes
 
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, est_net_yes)
         if bid_px is None or ask_px is None:
+            cancel_live_quotes(f"skip:{why}")
             sig = (active_market, "SKIP", why, yes_bid, yes_ask)
-            if sig != last_target_sig or (t0 - last_target_log_at) >= 2.0:
+            if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                 log.info(f"[TARGET] {active_market} → SKIP ({why}) best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
                 last_target_sig = sig
                 last_target_log_at = t0
@@ -653,21 +692,15 @@ def main() -> None:
         allow_bid = (est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS
         allow_ask = (est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS
 
+        # If inventory says "no", pull that side’s quote off the book
+        if not allow_bid and quote.bid_order_id:
+            cancel_live_quotes("inventory_block_bid")  # cancels both, intentionally conservative
+        if not allow_ask and quote.ask_order_id:
+            cancel_live_quotes("inventory_block_ask")  # cancels both, intentionally conservative
+
+        # Market roll: cancel anything from prior market
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
-            if quote.bid_order_id:
-                try:
-                    if not DRY_RUN:
-                        cancel_order(client, quote.bid_order_id)
-                    log.info(f"[OM] {quote.last_market_ticker} BUY CANCEL (market_roll) order_id={quote.bid_order_id}")
-                except Exception:
-                    pass
-            if quote.ask_order_id:
-                try:
-                    if not DRY_RUN:
-                        cancel_order(client, quote.ask_order_id)
-                    log.info(f"[OM] {quote.last_market_ticker} SELL CANCEL (market_roll) order_id={quote.ask_order_id}")
-                except Exception:
-                    pass
+            cancel_live_quotes("market_roll")
             quote = QuoteState()
 
         quote.last_market_ticker = active_market
@@ -722,7 +755,7 @@ def main() -> None:
 
         # THROTTLED TARGET LOG
         sig = (active_market, bid_px, ask_px, why)
-        if sig != last_target_sig or (t0 - last_target_log_at) >= 2.0:
+        if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
             log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
             last_target_sig = sig
             last_target_log_at = t0
