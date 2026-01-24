@@ -24,6 +24,13 @@
 #    - Post-only-cross cooldown (POST_ONLY_CROSS_COOLDOWN_SECONDS) when exchange rejects for crossing
 #    - Successful requests slowly relax backoff (note_successful_request)
 #
+# D) Proper hysteresis for "spread_too_tight":
+#    - Use separate ENTER/EXIT thresholds so we don't flap cancel/place when spread oscillates.
+#      ENTER requires spread >= HYSTERESIS_ENTER_SPREAD_CENTS for SPREAD_ENTER_STREAK consecutive loops.
+#      Once quoting, we keep quotes live down to EXIT threshold; only EXIT after SPREAD_EXIT_STREAK loops
+#      with spread < HYSTERESIS_EXIT_SPREAD_CENTS.
+#    - If spread briefly dips below EXIT but hasn't met the EXIT streak yet, we HOLD (no cancel/reprice).
+#
 # Notes:
 # - Uses GET /markets?series_ticker=... to auto-roll
 # - Uses GET /markets/{ticker}/orderbook
@@ -127,6 +134,12 @@ IMPROVE_CENTS = env_int("IMPROVE_CENTS", 1)
 NO_IMPROVE_MAX_SPREAD_CENTS = env_int("NO_IMPROVE_MAX_SPREAD_CENTS", 4)  # <= spread: join, don't improve
 MIN_SPREAD_CENTS = env_int("MIN_SPREAD_CENTS", 2)  # if spread < this, skip
 MAX_SPREAD_CENTS = env_int("MAX_SPREAD_CENTS", 30)  # if spread > this, skip (prevents 2/98 nonsense)
+
+# Proper hysteresis (ADDED)
+HYSTERESIS_ENTER_SPREAD_CENTS = env_int("HYSTERESIS_ENTER_SPREAD_CENTS", MIN_SPREAD_CENTS)
+HYSTERESIS_EXIT_SPREAD_CENTS = env_int("HYSTERESIS_EXIT_SPREAD_CENTS", max(1, MIN_SPREAD_CENTS - 1))
+SPREAD_ENTER_STREAK = env_int("SPREAD_ENTER_STREAK", 2)
+SPREAD_EXIT_STREAK = env_int("SPREAD_EXIT_STREAK", 2)
 
 # Log throttles
 TARGET_LOG_THROTTLE_SECONDS = env_float("TARGET_LOG_THROTTLE_SECONDS", 10.0)
@@ -468,10 +481,11 @@ def compute_quotes(
     yes_bid: int,
     yes_ask: int,
     net_yes: int,
+    min_spread_cents: int = MIN_SPREAD_CENTS,  # (ADDED) allow hysteresis override
 ) -> Tuple[Optional[int], Optional[int], str]:
     spread = yes_ask - yes_bid
 
-    if spread < MIN_SPREAD_CENTS:
+    if spread < min_spread_cents:
         return None, None, f"spread_too_tight({spread})"
 
     if spread > MAX_SPREAD_CENTS:
@@ -544,6 +558,8 @@ def main() -> None:
              MAX_NET_YES_CONTRACTS, INVENTORY_SKEW_CENTS, ORDER_STATUS_POLL_SECONDS, PAUSE_ON_UNKNOWN_SECONDS)
     log.info("[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d MIN_SPREAD_CENTS=%d MAX_SPREAD_CENTS=%d IMPROVE_CENTS=%d",
              NO_IMPROVE_MAX_SPREAD_CENTS, MIN_SPREAD_CENTS, MAX_SPREAD_CENTS, IMPROVE_CENTS)
+    log.info("[HYST] ENTER=%dc EXIT=%dc ENTER_STREAK=%d EXIT_STREAK=%d",
+             HYSTERESIS_ENTER_SPREAD_CENTS, HYSTERESIS_EXIT_SPREAD_CENTS, SPREAD_ENTER_STREAK, SPREAD_EXIT_STREAK)
     log.info("[LOG] TARGET_LOG_THROTTLE_SECONDS=%.1f SPOT_SKIP_LOG_THROTTLE_SECONDS=%.1f",
              TARGET_LOG_THROTTLE_SECONDS, SPOT_SKIP_LOG_THROTTLE_SECONDS)
     log.info("[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.1f META_REFRESH=%.1f SPOT_GUARD_NEAR_CLOSE_SECONDS=%.1f",
@@ -595,6 +611,11 @@ def main() -> None:
     last_order_action_at = 0.0
     last_reprice_at = 0.0
     last_quote_sig: Tuple[Any, ...] = tuple()
+
+    # Proper hysteresis state (ADDED)
+    is_quoting = False
+    enter_ok_streak = 0
+    exit_bad_streak = 0
 
     # --- Helpers (rate-limit / errors) ---
     def is_insufficient_balance(e: Exception) -> bool:
@@ -847,10 +868,65 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # --- Proper hysteresis gate (ADDED) ---
+        spread_now = yes_ask - yes_bid
+
+        if spread_now >= HYSTERESIS_ENTER_SPREAD_CENTS:
+            enter_ok_streak += 1
+        else:
+            enter_ok_streak = 0
+
+        if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS:
+            exit_bad_streak += 1
+        else:
+            exit_bad_streak = 0
+
+        if not is_quoting:
+            if enter_ok_streak >= SPREAD_ENTER_STREAK:
+                is_quoting = True
+                exit_bad_streak = 0
+            else:
+                # Not quoting yet: keep clean (cancel any tracked live quotes) and SKIP quietly
+                if quote.bid_order_id or quote.ask_order_id:
+                    cancel_live_quotes("hysteresis_not_quoting")
+                sig = (active_market, "SKIP", "hysteresis_wait_enter", spread_now, yes_bid, yes_ask)
+                if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+                    log.info(f"[TARGET] {active_market} → SKIP (hysteresis_wait_enter) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                    last_target_sig = sig
+                    last_target_log_at = t0
+                time.sleep(POLL_SECONDS)
+                continue
+        else:
+            # Already quoting: if we briefly dip below EXIT threshold but haven't met exit streak, HOLD (no cancel/reprice)
+            if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS and exit_bad_streak < SPREAD_EXIT_STREAK:
+                sig = (active_market, "HOLD", "hysteresis_hold_below_exit", spread_now, yes_bid, yes_ask)
+                if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+                    log.info(f"[TARGET] {active_market} → HOLD (hysteresis) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                    last_target_sig = sig
+                    last_target_log_at = t0
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Exit quoting only after streak
+            if exit_bad_streak >= SPREAD_EXIT_STREAK:
+                is_quoting = False
+                cancel_live_quotes("hysteresis_exit_spread_too_tight")
+                skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
+                sig = (active_market, "SKIP", "hysteresis_exit", spread_now, yes_bid, yes_ask)
+                if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+                    log.info(f"[TARGET] {active_market} → SKIP (hysteresis_exit) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                    last_target_sig = sig
+                    last_target_log_at = t0
+                time.sleep(POLL_SECONDS)
+                continue
+        # --- end hysteresis gate ---
+
         open_buys, open_sells = count_open_yes_orders(open_orders_cache, active_market)
         est_net_yes = net_yes
 
-        bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, est_net_yes)
+        # Hysteresis-aware min spread: once quoting, allow down to EXIT threshold without forcing skip/cancel
+        min_spread_for_quotes = HYSTERESIS_EXIT_SPREAD_CENTS if is_quoting else HYSTERESIS_ENTER_SPREAD_CENTS
+        bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, est_net_yes, min_spread_cents=min_spread_for_quotes)
 
         # Churn guard: only allow repricing so often
         quote_sig = (active_market, bid_px, ask_px, why, est_net_yes)
@@ -864,6 +940,9 @@ def main() -> None:
 
         if bid_px is None or ask_px is None:
             cancel_live_quotes(f"skip:{why}")
+            is_quoting = False  # (ADDED) if compute_quotes says skip for any reason, drop quoting state
+            enter_ok_streak = 0
+            exit_bad_streak = 0
             skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
             sig = (active_market, "SKIP", why, yes_bid, yes_ask)
             if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
@@ -884,6 +963,9 @@ def main() -> None:
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
             cancel_live_quotes("market_roll")
             quote = QuoteState()
+            is_quoting = False  # (ADDED) reset hysteresis on roll
+            enter_ok_streak = 0
+            exit_bad_streak = 0
 
         quote.last_market_ticker = active_market
 
