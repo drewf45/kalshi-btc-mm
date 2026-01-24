@@ -12,6 +12,7 @@
 # ADDITIONAL SAFETY PATCHES (this request):
 # A) "insufficient_balance" circuit breaker: if SELL or BUY fails due to insufficient balance,
 #    cancel the other side immediately and cool down for N seconds.
+#    If it happens BALANCE_FAIL_MAX_BURST times in a row, extend cooldown.
 # B) Optional "atomic two-sided quoting": if enabled, do not leave one-sided exposure;
 #    place ask then bid, and if either fails, cancel the other side.
 #
@@ -300,13 +301,10 @@ def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Opti
         for lvl in levels:
             price = None
 
-            # Common format: [price, qty]
             if isinstance(lvl, list) and len(lvl) >= 1:
                 price = lvl[0]
-            # Sometimes: {"price": x, "quantity": y}
             elif isinstance(lvl, dict):
                 price = lvl.get("price") or lvl.get("yes_price") or lvl.get("no_price")
-            # Rare: just a number
             elif isinstance(lvl, (int, float)):
                 price = lvl
 
@@ -324,7 +322,6 @@ def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Opti
     no_bid = max_bid(no_levels)
     yes_ask = (100 - no_bid) if no_bid is not None else None
 
-    # sanity clamp
     if yes_bid is not None:
         yes_bid = max(1, min(99, yes_bid))
     if yes_ask is not None:
@@ -427,8 +424,6 @@ def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
 
 
 def cancel_order(client: KalshiClient, order_id: str) -> None:
-    # 404 is normal if the order already filled/canceled/expired between our polls.
-    # Treat 404 as success to avoid noisy warnings.
     try:
         client.request("DELETE", f"/portfolio/orders/{order_id}")
     except RuntimeError as e:
@@ -578,8 +573,6 @@ def main() -> None:
         if not active_market:
             return
 
-        cancelled_any = False
-
         if quote.bid_order_id:
             try:
                 if not DRY_RUN:
@@ -589,7 +582,6 @@ def main() -> None:
                 log.warning(f"[OM] cancel bid failed ({reason}): {e}")
             quote.bid_order_id = None
             quote.bid_price = None
-            cancelled_any = True
 
         if quote.ask_order_id:
             try:
@@ -600,19 +592,31 @@ def main() -> None:
                 log.warning(f"[OM] cancel ask failed ({reason}): {e}")
             quote.ask_order_id = None
             quote.ask_price = None
-            cancelled_any = True
-
-        if cancelled_any:
-            # keep last_market_ticker so we still know what market we were on
-            pass
 
     # Helpers (ADDED)
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ('"code":"insufficient_balance"' in s) or ('"code": "insufficient_balance"' in s)
 
+    def trip_balance_circuit(reason: str) -> None:
+        """Cancel both sides and enter cooldown; enforce burst escalation."""
+        nonlocal balance_fail_burst, balance_fail_until
+        cancel_live_quotes(reason)
+
+        balance_fail_burst += 1
+
+        cooldown = BALANCE_FAIL_COOLDOWN_SECONDS
+        if balance_fail_burst >= BALANCE_FAIL_MAX_BURST:
+            cooldown = max(cooldown, BALANCE_FAIL_COOLDOWN_SECONDS * 5)
+            log.warning(f"[BAL] balance_fail_burst={balance_fail_burst} reached max={BALANCE_FAIL_MAX_BURST}; extending cooldown to {cooldown:.1f}s")
+
+        balance_fail_until = time.time() + cooldown
+        log.warning(f"[BAL] cooldown active for {cooldown:.1f}s ({reason})")
+
     def cancel_bid_only(reason: str) -> None:
         nonlocal quote
+        if not active_market:
+            return
         if quote.bid_order_id:
             try:
                 if not DRY_RUN:
@@ -625,6 +629,8 @@ def main() -> None:
 
     def cancel_ask_only(reason: str) -> None:
         nonlocal quote
+        if not active_market:
+            return
         if quote.ask_order_id:
             try:
                 if not DRY_RUN:
@@ -690,13 +696,11 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = close_ts - int(time.time())
 
-        # Closeout hard-stop: cancel everything right before close
         if secs_to_close is not None and secs_to_close <= CLOSEOUT_SECONDS:
             cancel_live_quotes("closeout")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Spot guard near close: also cancel (don’t leave quotes up)
         if ENABLE_SPOT_GUARD and spot_usd is not None and secs_to_close is not None and secs_to_close <= SPOT_GUARD_NEAR_CLOSE_SECONDS:
             lo, hi = market_bounds_usd(active_market_obj)
 
@@ -720,7 +724,6 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-        # Poll open orders (cache persists between polls)
         if (t0 - last_order_poll) >= ORDER_STATUS_POLL_SECONDS:
             try:
                 open_orders_cache = get_open_orders(client)
@@ -741,7 +744,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Orderbook
         try:
             ob = client.request("GET", f"/markets/{active_market}/orderbook")
         except Exception as e:
@@ -777,13 +779,11 @@ def main() -> None:
         allow_bid = (est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS
         allow_ask = (est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS
 
-        # If inventory says "no", pull that side’s quote off the book
         if not allow_bid and quote.bid_order_id:
-            cancel_live_quotes("inventory_block_bid")  # cancels both, intentionally conservative
+            cancel_live_quotes("inventory_block_bid")
         if not allow_ask and quote.ask_order_id:
-            cancel_live_quotes("inventory_block_ask")  # cancels both, intentionally conservative
+            cancel_live_quotes("inventory_block_ask")
 
-        # Market roll: cancel anything from prior market
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
             cancel_live_quotes("market_roll")
             quote = QuoteState()
@@ -794,9 +794,7 @@ def main() -> None:
         # ATOMIC TWO-SIDED QUOTING (ADDED / REPLACED BID+ASK BLOCK)
         # -----------------------------
 
-        # If we require two-sided quotes, only quote when BOTH sides are allowed.
         if REQUIRE_TWO_SIDED_QUOTES and (not allow_bid or not allow_ask):
-            # If either side is blocked, cancel both so we don't drift into one-sided exposure.
             if quote.bid_order_id or quote.ask_order_id:
                 cancel_live_quotes("two_sided_required")
             time.sleep(POLL_SECONDS)
@@ -806,7 +804,6 @@ def main() -> None:
         want_ask_update = allow_ask and (quote.ask_price != ask_px)
 
         if want_bid_update or want_ask_update:
-            # Cancel only the side(s) we intend to replace
             if want_bid_update and quote.bid_order_id:
                 try:
                     if not DRY_RUN:
@@ -841,13 +838,9 @@ def main() -> None:
                         placed_ask = True
                         log.info(f"[OM] {active_market} SELL POSTED order_id={oid} @ {ask_px} qty={ORDER_QTY}")
                     except Exception as e:
-                        # If we can't place the ASK, do NOT place the BID (avoid one-sided)
                         if is_insufficient_balance(e):
-                            balance_fail_burst += 1
-                            balance_fail_until = time.time() + BALANCE_FAIL_COOLDOWN_SECONDS
-                            cancel_bid_only("ask_insufficient_balance")
-                            cancel_ask_only("ask_insufficient_balance")
-                            log.warning(f"[OM] {active_market} SELL place failed: {e} (cooldown {BALANCE_FAIL_COOLDOWN_SECONDS}s)")
+                            trip_balance_circuit("ask_insufficient_balance")
+                            log.warning(f"[OM] {active_market} SELL place failed: {e}")
                             time.sleep(POLL_SECONDS)
                             continue
                         else:
@@ -868,13 +861,11 @@ def main() -> None:
                         placed_bid = True
                         log.info(f"[OM] {active_market} BUY POSTED order_id={oid} @ {bid_px} qty={ORDER_QTY}")
                     except Exception as e:
-                        # If bid fails and we just placed ask, cancel ask so we don't become one-sided
                         if placed_ask:
                             cancel_ask_only("bid_failed_atomic")
                         if is_insufficient_balance(e):
-                            balance_fail_burst += 1
-                            balance_fail_until = time.time() + BALANCE_FAIL_COOLDOWN_SECONDS
-                            log.warning(f"[OM] {active_market} BUY place failed: {e} (cooldown {BALANCE_FAIL_COOLDOWN_SECONDS}s)")
+                            trip_balance_circuit("bid_insufficient_balance")
+                            log.warning(f"[OM] {active_market} BUY place failed: {e}")
                             time.sleep(POLL_SECONDS)
                             continue
                         else:
@@ -890,8 +881,11 @@ def main() -> None:
                 has_ask = quote.ask_order_id is not None
                 if has_bid != has_ask:
                     cancel_live_quotes("atomic_two_sided_enforce")
+                else:
+                    # Both sides good: reset burst on success (ADDED)
+                    if has_bid and has_ask:
+                        balance_fail_burst = 0
 
-        # THROTTLED TARGET LOG
         sig = (active_market, bid_px, ask_px, why)
         if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
             log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
