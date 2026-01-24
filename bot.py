@@ -2,100 +2,20 @@
 # Kalshi rolling 15m BTC market-maker (YES contract side, two-sided quoting when flat; reduce-only exits when not flat)
 #
 # -----------------------------
-# NOTES / WHAT CHANGED (FIXES)
+# NOTES / WHAT CHANGED (MICRO)
 # -----------------------------
-# FIX A (CRITICAL): Cancel "ghost" open orders on boot + on market roll.
-# - Root cause of flip-through-zero: the bot tracks order_ids in memory only.
-#   After a restart, old open orders can still exist on Kalshi, unknown to the bot.
-#   If you place a new exit while an old exit is still live, you can briefly have
-#   TWO exits. If both fill => you flip long->short (or short->long).
-# - Fix: On startup and every time the active market changes, we:
-#   1) GET /portfolio/orders?status=open
-#   2) Cancel ALL open YES orders for the active market ticker
-#   3) Reset QuoteState + hysteresis so we start clean.
+# CHANGE 1 (NEW): If a cancel returns 404/not_found ANYWHERE (including cancel_bid_only/cancel_ask_only
+#                 and cancel-first repricing), treat it as "order likely filled / already gone":
+#     • Immediately clear local order_id/price for that side
+#     • Force-refresh positions right away
+#     • Pause + skip quoting briefly until inventory is confirmed stable
 #
-# FIX B (FROM YOUR LOGS): 404/not_found on cancel is usually "already filled".
-# - Your logs show:
-#     CANCEL -> 404/not_found -> then inventory changes shortly after
-#   This is expected in fast markets: the order often fills before the cancel lands.
-# - Fix (behavioral):
-#   1) If cancel returns not_found in cancel-first flow, treat it as "order gone".
-#   2) Clear local order_id/price immediately (stop spamming cancels on same id).
-#   3) Force-refresh positions immediately before placing anything else.
-#   4) Pause + skip quoting briefly until inventory is confirmed stable.
+# CHANGE 2 (CRITICAL, NEW): In cancel-first repricing, if we hit not_found on one side,
+#                           ABORT the rest of order actions for that loop iteration.
+#     • Do NOT place/reprice the other side in the same iteration
+#     • Wait for positions refresh + stability before doing anything else
 #
-# FIX D (LOGGING UNITS): realized/fees are often returned in cents.
-# - We treat realized/fees as cents by default and convert to USD for display.
-#   Toggle with env var: PNL_VALUES_ARE_CENTS (default True)
-#
-# FIX E (CRITICAL): Cancel-first repricing for ALL modes (flat + reduce-only).
-# - Prevents brief windows with TWO live orders on the same side during reprices.
-#
-# FIX F (FROM YOUR LOGS - "targets change but no [OM] actions"):
-# - Root cause: earlier "reduce-only latch" (HOLD if an exit order exists)
-#   can freeze exit repricing forever, leaving you stuck with a stale exit while targets move.
-# - Fix: Replace latch with a *controlled* reduce-only repricer:
-#     • only reprice exits if the target moved by >= REDUCE_ONLY_REPRICE_TICKS
-#     • and only at a slower cadence: REDUCE_ONLY_MIN_REPRICE_SECONDS
-# - Also add reconciliation so QuoteState never silently diverges:
-#     • If tracked order_id is no longer open -> clear local state (after grace+confirm)
-#     • Force-refresh positions when a tracked order disappears (likely fill/cancel)
-#     • Optional: cancel “stray” open YES orders for the active market if they’re not
-#       the ones we’re tracking (guards partial-crash / place-then-crash scenarios).
-#
-# FIX G (MATCHES YOUR NEW LOGS): "reconcile missing after grace+confirm"
-# - Open-orders can be briefly inconsistent. We:
-#     • wait RECONCILE_MISSING_GRACE_SECONDS
-#     • re-fetch open orders once
-#     • if still missing -> clear local state + force-refresh positions.
-#
-# FIX G2 (CRITICAL): Open-orders visibility grace (prevents “POSTED then missing” spam).
-# - Your log shows repeated:
-#     POSTED -> reconcile says "missing" -> clear local -> POSTED again -> ...
-#   This can happen if /portfolio/orders?status=open lags order visibility by 1–3+ seconds.
-# - Fix:
-#     • Track timestamp of each POSTED order_id.
-#     • If reconcile sees it "missing" but it's younger than ORDERS_VISIBILITY_GRACE_SECONDS,
-#       DO NOTHING (do not clear, do not re-place). Let it propagate.
-#     • Only treat it as missing after it ages past the visibility grace.
-#
-# FIX G3 (CRITICAL, MATCHES YOUR CURRENT LOG): Do NOT use the bulk "open orders list"
-# as the source of truth for a specific order_id.
-# - Your logs show orders remaining "not visible yet" then "missing after grace+confirm",
-#   even though they can still exist or fill. Clearing local state + re-posting can stack fills and flip.
-# - Fix:
-#     • When reconcile thinks a tracked order is "missing", we verify via the ORDER-DETAIL endpoint:
-#           GET /portfolio/orders/{order_id}
-#       If detail exists -> KEEP the local state (open-list lag suspected).
-#       If detail is 404 -> treat it as truly gone -> clear state + force-refresh positions.
-#   Toggle with env var: USE_ORDER_DETAIL_FOR_RECONCILE (default True)
-#
-# FIX H (MATCHES YOUR NEW LOGS): FUSE should NOT block reduce-only exits.
-# - If you start with inventory (e.g., pos_yes=-6), we should NOT “pause forever”.
-# - New behavior:
-#     • If abs(pos_yes) > MAX_ABS_YES_CONTRACTS, we enter an EMERGENCY reduce-only mode.
-#     • We cancel any risk-increasing quotes and ONLY work an exit.
-#     • Optional: increase exit size with EMERGENCY_EXIT_QTY (default 1 to keep behavior stable).
-#
-# FIX I (MATCHES YOUR CURRENT LOG): orderbook can be missing one side -> "no_yes_bid_or_ask".
-# - Your run shows: SKIP(no_yes_bid_or_ask). That happens when:
-#     • yes_bid is missing, OR
-#     • no_bid is missing (so yes_ask = 100 - no_bid can’t be computed).
-# - Fix: Optional fallback to /markets/{ticker} snapshot to obtain best bid/ask (if provided)
-#   before giving up. Toggle with ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT (default True).
-# - Added debug:
-#     • [OB] used market-snapshot fallback: yes_bid=.. yes_ask=..
-#
-# -----------------------------
-# MICRO CHANGE (NEW) — based on your 2026-01-24 log
-# -----------------------------
-# CHANGE 1: If cancel returns not_found ANYWHERE (including cancel_bid_only/cancel_ask_only),
-#           treat it as "filled" and immediately force-refresh positions + pause.
-# CHANGE 2 (CRITICAL): If cancel-first reprice hits not_found on one side, ABORT the rest
-#           of order actions for that loop iteration (do not place/reprice the other side)
-#           until inventory is confirmed stable.
-#
-# Everything else is kept as-is to avoid unintended behavior drift.
+# Everything else is kept as-is.
 
 import os
 import time
@@ -246,35 +166,35 @@ MAX_INV_STALENESS_SECONDS = env_float("MAX_INV_STALENESS_SECONDS", DEFAULT_MAX_I
 # Coinbase spot endpoint
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
-# FIX A toggle
+# Bootstrap cleanup toggle
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# FIX D toggle
+# PnL unit toggle (cents -> USD)
 PNL_VALUES_ARE_CENTS = env_bool("PNL_VALUES_ARE_CENTS", True)
 
-# FIX F: reduce-only exit repricing controls
+# reduce-only exit repricing controls
 REDUCE_ONLY_REPRICE_TICKS = env_int("REDUCE_ONLY_REPRICE_TICKS", 2)
 REDUCE_ONLY_MIN_REPRICE_SECONDS = env_float(
     "REDUCE_ONLY_MIN_REPRICE_SECONDS", max(3.0, MIN_REPRICE_SECONDS * 2.0)
 )
 
-# FIX F optional: cancel any stray open YES orders for the active market
+# cancel any stray open YES orders for the active market
 CLEAN_STRAY_ORDERS = env_bool("CLEAN_STRAY_ORDERS", True)
 
-# FIX G: reconcile grace/confirm delay
+# reconcile grace/confirm delay
 RECONCILE_MISSING_GRACE_SECONDS = env_float("RECONCILE_MISSING_GRACE_SECONDS", 0.75)
 
-# FIX G2: open-orders visibility grace
+# open-orders visibility grace
 ORDERS_VISIBILITY_GRACE_SECONDS = env_float("ORDERS_VISIBILITY_GRACE_SECONDS", 3.0)
 
-# FIX G3: verify missing orders via order-detail endpoint
+# verify missing orders via order-detail endpoint
 USE_ORDER_DETAIL_FOR_RECONCILE = env_bool("USE_ORDER_DETAIL_FOR_RECONCILE", True)
 
-# FIX H: emergency reduce-only behavior when starting with a big position
+# emergency reduce-only behavior when starting with a big position
 EMERGENCY_EXIT_QTY = env_int("EMERGENCY_EXIT_QTY", 1)  # set >1 only if you *want* faster unwind
 EMERGENCY_IGNORE_HYSTERESIS = env_bool("EMERGENCY_IGNORE_HYSTERESIS", True)
 
-# FIX I: orderbook best-bid/ask fallback
+# orderbook best-bid/ask fallback
 ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT = env_bool("ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT", True)
 MARKET_SNAPSHOT_TTL_SECONDS = env_float("MARKET_SNAPSHOT_TTL_SECONDS", 1.0)
 
@@ -625,7 +545,7 @@ def parse_position_for_market(
                 if fees is not None:
                     break
 
-        # FIX D: treat realized/fees as cents by default, convert to USD for display
+        # Treat realized/fees as cents by default, convert to USD for display
         if PNL_VALUES_ARE_CENTS:
             if realized is not None:
                 realized = realized / 100.0
@@ -689,10 +609,6 @@ def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
 
 
 def get_order_by_id(client: KalshiClient, order_id: str) -> Optional[Dict[str, Any]]:
-    """
-    FIX G3: Verify a specific order_id via the order-detail endpoint.
-    Returns order dict if found; returns None if 404/not_found; raises for other errors.
-    """
     try:
         return client.request("GET", f"/portfolio/orders/{order_id}")
     except RuntimeError as e:
@@ -801,7 +717,7 @@ def is_yes_order_obj_for_market(o: Dict[str, Any], market_ticker: str) -> bool:
 
 
 # -----------------------------
-# FIX I: market snapshot fallback
+# Market snapshot fallback
 # -----------------------------
 def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     if "market" in m and isinstance(m["market"], dict):
@@ -931,7 +847,7 @@ def main() -> None:
     last_cancel_not_found_oid: Optional[str] = None
     last_emergency_sig: Tuple[Any, ...] = tuple()
 
-    # FIX I cache
+    # market snapshot cache
     last_market_snapshot_at = 0.0
     last_market_snapshot: Dict[str, Any] = {}
 
@@ -986,7 +902,6 @@ def main() -> None:
             log.warning(f"[INV] force-refresh positions failed ({tag}): {e}")
             return False
 
-    # FIX I: fetch market snapshot (cached)
     def get_market_snapshot() -> Dict[str, Any]:
         nonlocal last_market_snapshot_at, last_market_snapshot
         now = time.time()
@@ -1003,14 +918,12 @@ def main() -> None:
                 arm_rate_limit_pause("market_snapshot")
             return last_market_snapshot or {}
 
-    # FIX F/G/G2/G3: reconcile QuoteState with open orders; avoid "POSTED then missing" churn; verify missing via detail endpoint; optionally cancel strays.
     def reconcile_quote_state_with_open_orders(tag: str) -> None:
         nonlocal quote, open_orders_cache, pause_until, skip_quote_until, order_posted_ts, last_reconcile_dbg_at
 
         if not active_market:
             return
 
-        # Open-list ids (used for stray cleanup + quick visibility checks; NOT a source of truth for "does my order exist")
         open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
 
         def recently_posted(oid: str) -> bool:
@@ -1020,12 +933,6 @@ def main() -> None:
             return (time.time() - ts) < ORDERS_VISIBILITY_GRACE_SECONDS
 
         def verify_exists_via_detail(oid: str) -> Optional[bool]:
-            """
-            Returns:
-              True  -> order exists (do NOT clear local state)
-              False -> order is truly missing (404)
-              None  -> couldn't verify (error / rate limit)
-            """
             if not USE_ORDER_DETAIL_FOR_RECONCILE:
                 return None
             try:
@@ -1052,7 +959,6 @@ def main() -> None:
             pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
             skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
 
-        # Debug snapshot (throttled)
         now = time.time()
         if (now - last_reconcile_dbg_at) >= RECONCILE_DEBUG_THROTTLE_SECONDS:
             log.info(
@@ -1061,7 +967,6 @@ def main() -> None:
             )
             last_reconcile_dbg_at = now
 
-        # ----- BID side -----
         if quote.bid_order_id:
             oid = quote.bid_order_id
             if oid not in open_ids:
@@ -1072,7 +977,6 @@ def main() -> None:
                         f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={oid})"
                     )
                 else:
-                    # FIX G3: verify via detail endpoint before clearing
                     exists = verify_exists_via_detail(oid)
                     if exists is True:
                         log.warning(
@@ -1084,13 +988,11 @@ def main() -> None:
                         )
                         clear_local_and_pause("bid", oid)
                     else:
-                        # could not verify; be conservative: do NOT clear, but pause briefly
                         pause_until = max(pause_until, time.time() + min(0.5, PAUSE_ON_UNKNOWN_SECONDS))
                         log.warning(
                             f"[OM] reconcile({tag}): bid missing in open-list; could not verify via detail -> pausing briefly (order_id={oid})"
                         )
 
-        # ----- ASK side -----
         if quote.ask_order_id:
             oid = quote.ask_order_id
             if oid not in open_ids:
@@ -1117,7 +1019,6 @@ def main() -> None:
                             f"[OM] reconcile({tag}): ask missing in open-list; could not verify via detail -> pausing briefly (order_id={oid})"
                         )
 
-        # ----- Stray cleanup -----
         if CLEAN_STRAY_ORDERS and active_market:
             tracked = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
             for o in open_orders_cache:
@@ -1143,7 +1044,6 @@ def main() -> None:
                         arm_rate_limit_pause("reconcile_cancel_stray")
                     log.warning(f"[OM] reconcile({tag}): failed to cancel stray order {oid_s}: {ce}")
 
-    # FIX A: cancel ALL open YES orders for the *current* active market
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
         nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until, order_posted_ts
 
@@ -1191,8 +1091,11 @@ def main() -> None:
         if killed > 0:
             log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
+    # -----------------------------
+    # CHANGE 1 applied here too:
+    # cancel_*_only treats not_found as likely fill -> refresh + pause
+    # -----------------------------
     def cancel_bid_only(reason: str) -> None:
-        # CHANGE 1: treat cancel not_found as likely fill -> force refresh + pause
         nonlocal quote, order_posted_ts, pause_until, skip_quote_until
         if not active_market:
             return
@@ -1220,7 +1123,6 @@ def main() -> None:
             quote.bid_price = None
 
     def cancel_ask_only(reason: str) -> None:
-        # CHANGE 1: treat cancel not_found as likely fill -> force refresh + pause
         nonlocal quote, order_posted_ts, pause_until, skip_quote_until
         if not active_market:
             return
@@ -1312,7 +1214,6 @@ def main() -> None:
     except Exception as e:
         log.warning(f"[INV] initial positions fetch failed: {e}")
 
-    # ---- Main loop ----
     while True:
         t0 = time.time()
 
@@ -1433,7 +1334,6 @@ def main() -> None:
 
         yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
 
-        # FIX I: fallback to /markets/{ticker} snapshot if orderbook is missing a side
         used_snapshot_fallback = False
         if ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT and (yes_bid is None or yes_ask is None):
             snap = get_market_snapshot()
@@ -1683,6 +1583,7 @@ def main() -> None:
                     log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id} status={st}")
                     order_posted_ts.pop(old_order_id, None)
 
+                    # CHANGE 1 (core): not_found => assume order already filled/gone => refresh + pause
                     if st == "not_found":
                         last_cancel_not_found_oid = old_order_id
                         _ = refresh_positions_now("cancel_404_not_found")
@@ -1732,7 +1633,7 @@ def main() -> None:
 
             last_reprice_at = time.time()
 
-            # CHANGE 2: if cancel-first returns not_found, ABORT the rest of order actions this iteration
+            # CHANGE 2: if cancel-first hits not_found on one side, ABORT rest of order actions this iteration
             abort_iteration = False
 
             if want_ask_update and allow_ask:
@@ -1748,7 +1649,7 @@ def main() -> None:
                     order_posted_ts.pop(quote.ask_order_id, None)
                     quote.ask_order_id = None
                     quote.ask_price = None
-                    abort_iteration = True  # <-- NEW
+                    abort_iteration = True
                 if ok:
                     quote.ask_order_id = new_oid
                     quote.ask_price = new_px
@@ -1770,7 +1671,7 @@ def main() -> None:
                     order_posted_ts.pop(quote.bid_order_id, None)
                     quote.bid_order_id = None
                     quote.bid_price = None
-                    abort_iteration = True  # <-- NEW
+                    abort_iteration = True
                 if ok:
                     quote.bid_order_id = new_oid
                     quote.bid_price = new_px
@@ -1794,7 +1695,6 @@ def main() -> None:
             last_target_sig = sig
             last_target_log_at = t0
 
-        # Debug state (throttled)
         if (t0 - last_state_log_at) >= STATE_LOG_SECONDS:
             b_vis = quote.bid_order_id is not None and quote.bid_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
             a_vis = quote.ask_order_id is not None and quote.ask_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
