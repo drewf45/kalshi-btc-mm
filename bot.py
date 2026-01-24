@@ -86,6 +86,15 @@
 # - Added debug:
 #     • [OB] used market-snapshot fallback: yes_bid=.. yes_ask=..
 #
+# -----------------------------
+# MICRO CHANGE (NEW) — based on your 2026-01-24 log
+# -----------------------------
+# CHANGE 1: If cancel returns not_found ANYWHERE (including cancel_bid_only/cancel_ask_only),
+#           treat it as "filled" and immediately force-refresh positions + pause.
+# CHANGE 2 (CRITICAL): If cancel-first reprice hits not_found on one side, ABORT the rest
+#           of order actions for that loop iteration (do not place/reprice the other side)
+#           until inventory is confirmed stable.
+#
 # Everything else is kept as-is to avoid unintended behavior drift.
 
 import os
@@ -1183,7 +1192,8 @@ def main() -> None:
             log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
     def cancel_bid_only(reason: str) -> None:
-        nonlocal quote, order_posted_ts
+        # CHANGE 1: treat cancel not_found as likely fill -> force refresh + pause
+        nonlocal quote, order_posted_ts, pause_until, skip_quote_until
         if not active_market:
             return
         if quote.bid_order_id:
@@ -1195,6 +1205,12 @@ def main() -> None:
                 else:
                     st = "canceled"
                 log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id} status={st}")
+
+                if st == "not_found":
+                    _ = refresh_positions_now("cancel_bid_only_404_not_found")
+                    pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
+                    skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
+                    log.warning(f"[OM] {active_market} cancel_bid_only got 404/not_found; pausing until inventory stabilizes.")
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_bid_only")
@@ -1204,7 +1220,8 @@ def main() -> None:
             quote.bid_price = None
 
     def cancel_ask_only(reason: str) -> None:
-        nonlocal quote, order_posted_ts
+        # CHANGE 1: treat cancel not_found as likely fill -> force refresh + pause
+        nonlocal quote, order_posted_ts, pause_until, skip_quote_until
         if not active_market:
             return
         if quote.ask_order_id:
@@ -1216,6 +1233,12 @@ def main() -> None:
                 else:
                     st = "canceled"
                 log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id} status={st}")
+
+                if st == "not_found":
+                    _ = refresh_positions_now("cancel_ask_only_404_not_found")
+                    pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
+                    skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
+                    log.warning(f"[OM] {active_market} cancel_ask_only got 404/not_found; pausing until inventory stabilizes.")
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_ask_only")
@@ -1709,6 +1732,9 @@ def main() -> None:
 
             last_reprice_at = time.time()
 
+            # CHANGE 2: if cancel-first returns not_found, ABORT the rest of order actions this iteration
+            abort_iteration = False
+
             if want_ask_update and allow_ask:
                 new_oid, new_px, ok = cancel_old_then_place_new(
                     side="ask",
@@ -1722,9 +1748,14 @@ def main() -> None:
                     order_posted_ts.pop(quote.ask_order_id, None)
                     quote.ask_order_id = None
                     quote.ask_price = None
+                    abort_iteration = True  # <-- NEW
                 if ok:
                     quote.ask_order_id = new_oid
                     quote.ask_price = new_px
+
+            if abort_iteration:
+                time.sleep(POLL_SECONDS)
+                continue
 
             if want_bid_update and allow_bid:
                 new_oid, new_px, ok = cancel_old_then_place_new(
@@ -1739,9 +1770,14 @@ def main() -> None:
                     order_posted_ts.pop(quote.bid_order_id, None)
                     quote.bid_order_id = None
                     quote.bid_price = None
+                    abort_iteration = True  # <-- NEW
                 if ok:
                     quote.bid_order_id = new_oid
                     quote.bid_price = new_px
+
+            if abort_iteration:
+                time.sleep(POLL_SECONDS)
+                continue
 
             if enforce_two_sided_now:
                 has_bid = quote.bid_order_id is not None
