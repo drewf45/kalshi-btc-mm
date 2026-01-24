@@ -16,6 +16,14 @@
 # B) Optional "atomic two-sided quoting": if enabled, do not leave one-sided exposure;
 #    place ask then bid, and if either fails, cancel the other side.
 #
+# C) Rate-limit + churn safety (THIS CHANGESET):
+#    - HTTP 429 backoff with exponential cooldown (rl_until/rl_backoff)
+#    - Skip-quote cooldown after SKIPs (prevents cancel/retry storms)
+#    - Min reprice interval (MIN_REPRICE_SECONDS) to stop repricing every tick
+#    - Min order-action gap (MIN_ORDER_ACTION_GAP_SECONDS) to prevent cancel/place bursts
+#    - Post-only-cross cooldown (POST_ONLY_CROSS_COOLDOWN_SECONDS) when exchange rejects for crossing
+#    - Successful requests slowly relax backoff (note_successful_request)
+#
 # Notes:
 # - Uses GET /markets?series_ticker=... to auto-roll
 # - Uses GET /markets/{ticker}/orderbook
@@ -137,6 +145,16 @@ PAUSE_ON_UNKNOWN_SECONDS = env_float("PAUSE_ON_UNKNOWN_SECONDS", 0.75)
 BALANCE_FAIL_COOLDOWN_SECONDS = env_float("BALANCE_FAIL_COOLDOWN_SECONDS", 10.0)
 BALANCE_FAIL_MAX_BURST = env_int("BALANCE_FAIL_MAX_BURST", 3)
 REQUIRE_TWO_SIDED_QUOTES = env_bool("REQUIRE_TWO_SIDED_QUOTES", True)
+
+# Rate-limit + churn control (ADDED)
+MIN_REPRICE_SECONDS = env_float("MIN_REPRICE_SECONDS", 1.25)
+MIN_ORDER_ACTION_GAP_SECONDS = env_float("MIN_ORDER_ACTION_GAP_SECONDS", 0.35)
+
+RATE_LIMIT_BACKOFF_START_SECONDS = env_float("RATE_LIMIT_BACKOFF_START_SECONDS", 0.75)
+RATE_LIMIT_BACKOFF_MAX_SECONDS = env_float("RATE_LIMIT_BACKOFF_MAX_SECONDS", 8.0)
+
+POST_ONLY_CROSS_COOLDOWN_SECONDS = env_float("POST_ONLY_CROSS_COOLDOWN_SECONDS", 2.0)
+SPREAD_SKIP_COOLDOWN_SECONDS = env_float("SPREAD_SKIP_COOLDOWN_SECONDS", 1.5)
 
 # Spot guard
 ENABLE_SPOT_GUARD = env_bool("ENABLE_SPOT_GUARD", True)
@@ -532,6 +550,9 @@ def main() -> None:
              ENABLE_SPOT_GUARD, SPOT_POLL_SECONDS, CLOSEOUT_SECONDS, SPOT_RESOLVED_BUFFER_USD, META_REFRESH_SECONDS, SPOT_GUARD_NEAR_CLOSE_SECONDS)
     log.info("[BAL] REQUIRE_TWO_SIDED_QUOTES=%s BALANCE_FAIL_COOLDOWN_SECONDS=%.1f BALANCE_FAIL_MAX_BURST=%d",
              REQUIRE_TWO_SIDED_QUOTES, BALANCE_FAIL_COOLDOWN_SECONDS, BALANCE_FAIL_MAX_BURST)
+    log.info("[RL] MIN_REPRICE_SECONDS=%.2f MIN_ORDER_ACTION_GAP_SECONDS=%.2f RL_BACKOFF_START=%.2f RL_BACKOFF_MAX=%.2f POST_ONLY_CROSS_COOLDOWN_SECONDS=%.2f SPREAD_SKIP_COOLDOWN_SECONDS=%.2f",
+             MIN_REPRICE_SECONDS, MIN_ORDER_ACTION_GAP_SECONDS, RATE_LIMIT_BACKOFF_START_SECONDS, RATE_LIMIT_BACKOFF_MAX_SECONDS,
+             POST_ONLY_CROSS_COOLDOWN_SECONDS, SPREAD_SKIP_COOLDOWN_SECONDS)
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -567,6 +588,14 @@ def main() -> None:
     balance_fail_burst = 0
     balance_fail_until = 0.0
 
+    # Rate-limit / churn guards (ADDED)
+    rl_until = 0.0
+    rl_backoff = RATE_LIMIT_BACKOFF_START_SECONDS
+    skip_quote_until = 0.0
+    last_order_action_at = 0.0
+    last_reprice_at = 0.0
+    last_quote_sig: Tuple[Any, ...] = tuple()
+
     def cancel_live_quotes(reason: str) -> None:
         """Cancel any currently tracked live bid/ask orders (if any) and clear local quote state."""
         nonlocal quote
@@ -579,6 +608,8 @@ def main() -> None:
                     cancel_order(client, quote.bid_order_id)
                 log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
             except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("cancel_live_quotes/bid")
                 log.warning(f"[OM] cancel bid failed ({reason}): {e}")
             quote.bid_order_id = None
             quote.bid_price = None
@@ -589,6 +620,8 @@ def main() -> None:
                     cancel_order(client, quote.ask_order_id)
                 log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
             except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("cancel_live_quotes/ask")
                 log.warning(f"[OM] cancel ask failed ({reason}): {e}")
             quote.ask_order_id = None
             quote.ask_price = None
@@ -597,6 +630,35 @@ def main() -> None:
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ('"code":"insufficient_balance"' in s) or ('"code": "insufficient_balance"' in s)
+
+    def is_rate_limited(e: Exception) -> bool:
+        s = str(e)
+        return ("HTTP 429" in s) or ("too_many_requests" in s)
+
+    def is_post_only_cross(e: Exception) -> bool:
+        s = str(e)
+        return ("post only cross" in s) or ("post_only cross" in s)
+
+    def arm_rate_limit_pause(tag: str) -> None:
+        """Exponential backoff; also forces a quoting cooldown window."""
+        nonlocal rl_until, rl_backoff, skip_quote_until
+        now = time.time()
+        rl_until = now + rl_backoff
+        skip_quote_until = max(skip_quote_until, rl_until)
+        log.warning(f"[RL] {tag}: backing off {rl_backoff:.2f}s")
+        rl_backoff = min(RATE_LIMIT_BACKOFF_MAX_SECONDS, rl_backoff * 2.0)
+
+    def note_successful_request() -> None:
+        """Slowly relax backoff after successes."""
+        nonlocal rl_backoff
+        rl_backoff = max(RATE_LIMIT_BACKOFF_START_SECONDS, rl_backoff * 0.9)
+
+    def can_do_order_action() -> bool:
+        return (time.time() - last_order_action_at) >= MIN_ORDER_ACTION_GAP_SECONDS
+
+    def mark_order_action() -> None:
+        nonlocal last_order_action_at
+        last_order_action_at = time.time()
 
     def trip_balance_circuit(reason: str) -> None:
         """Cancel both sides and enter cooldown; enforce burst escalation."""
@@ -623,6 +685,8 @@ def main() -> None:
                     cancel_order(client, quote.bid_order_id)
                 log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
             except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("cancel_bid_only")
                 log.warning(f"[OM] cancel bid failed ({reason}): {e}")
             quote.bid_order_id = None
             quote.bid_price = None
@@ -637,6 +701,8 @@ def main() -> None:
                     cancel_order(client, quote.ask_order_id)
                 log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
             except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("cancel_ask_only")
                 log.warning(f"[OM] cancel ask failed ({reason}): {e}")
             quote.ask_order_id = None
             quote.ask_price = None
@@ -659,6 +725,7 @@ def main() -> None:
         }
 
         resp = client.request("GET", "/markets", params=params)
+        note_successful_request()
         markets = resp.get("markets", [])
         if not markets:
             raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
@@ -680,6 +747,8 @@ def main() -> None:
             try:
                 refresh_active_market()
             except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("refresh_active_market")
                 log.warning(f"[ROLL] refresh failed: {e}")
             last_meta_refresh = t0
 
@@ -727,8 +796,11 @@ def main() -> None:
         if (t0 - last_order_poll) >= ORDER_STATUS_POLL_SECONDS:
             try:
                 open_orders_cache = get_open_orders(client)
+                note_successful_request()
                 last_order_poll = t0
             except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("open_orders")
                 pause_until = time.time() + PAUSE_ON_UNKNOWN_SECONDS
                 cancel_live_quotes("unknown_order_state_pause")
                 log.warning(f"[INV] PAUSE quoting due to unknown order state: {PAUSE_ON_UNKNOWN_SECONDS:.2f}s remaining ({e})")
@@ -744,9 +816,21 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # Rate-limit / cooldown gates (ADDED)
+        if time.time() < rl_until:
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if time.time() < skip_quote_until:
+            time.sleep(POLL_SECONDS)
+            continue
+
         try:
             ob = client.request("GET", f"/markets/{active_market}/orderbook")
+            note_successful_request()
         except Exception as e:
+            if is_rate_limited(e):
+                arm_rate_limit_pause("orderbook")
             log.warning(f"[OB] {active_market} orderbook fetch failed: {e}")
             time.sleep(POLL_SECONDS)
             continue
@@ -754,6 +838,7 @@ def main() -> None:
         yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
         if yes_bid is None or yes_ask is None:
             cancel_live_quotes("no_yes_bid_or_ask")
+            skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
             sig = (active_market, "SKIP", "no_yes_bid_or_ask")
             if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                 log.info(f"[TARGET] {active_market} → SKIP (no_yes_bid_or_ask)")
@@ -766,8 +851,20 @@ def main() -> None:
         est_net_yes = net_yes
 
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, est_net_yes)
+
+        # Churn guard: only allow repricing so often (ADDED)
+        quote_sig = (active_market, bid_px, ask_px, why, est_net_yes)
+        is_new_quote = (quote_sig != last_quote_sig)
+        if is_new_quote:
+            last_quote_sig = quote_sig
+
+        if is_new_quote and (time.time() - last_reprice_at) < MIN_REPRICE_SECONDS:
+            time.sleep(POLL_SECONDS)
+            continue
+
         if bid_px is None or ask_px is None:
             cancel_live_quotes(f"skip:{why}")
+            skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
             sig = (active_market, "SKIP", why, yes_bid, yes_ask)
             if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                 log.info(f"[TARGET] {active_market} → SKIP ({why}) best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
@@ -804,12 +901,22 @@ def main() -> None:
         want_ask_update = allow_ask and (quote.ask_price != ask_px)
 
         if want_bid_update or want_ask_update:
+            if not can_do_order_action():
+                time.sleep(POLL_SECONDS)
+                continue
+
+            last_reprice_at = time.time()
+
             if want_bid_update and quote.bid_order_id:
                 try:
                     if not DRY_RUN:
                         cancel_order(client, quote.bid_order_id)
+                        mark_order_action()
+                        note_successful_request()
                     log.info(f"[OM] {active_market} BUY CANCEL @{quote.bid_price} (reprice) order_id={quote.bid_order_id}")
                 except Exception as e:
+                    if is_rate_limited(e):
+                        arm_rate_limit_pause("cancel_bid_reprice")
                     log.warning(f"[OM] cancel bid failed: {e}")
                 quote.bid_order_id = None
                 quote.bid_price = None
@@ -818,8 +925,12 @@ def main() -> None:
                 try:
                     if not DRY_RUN:
                         cancel_order(client, quote.ask_order_id)
+                        mark_order_action()
+                        note_successful_request()
                     log.info(f"[OM] {active_market} SELL CANCEL @{quote.ask_price} (reprice) order_id={quote.ask_order_id}")
                 except Exception as e:
+                    if is_rate_limited(e):
+                        arm_rate_limit_pause("cancel_ask_reprice")
                     log.warning(f"[OM] cancel ask failed: {e}")
                 quote.ask_order_id = None
                 quote.ask_price = None
@@ -833,18 +944,32 @@ def main() -> None:
                     try:
                         payload = build_yes_order_payload(active_market, "sell", ask_px, ORDER_QTY, POST_ONLY)
                         oid = place_order(client, payload)
+                        mark_order_action()
+                        note_successful_request()
                         quote.ask_order_id = oid
                         quote.ask_price = ask_px
                         placed_ask = True
                         log.info(f"[OM] {active_market} SELL POSTED order_id={oid} @ {ask_px} qty={ORDER_QTY}")
                     except Exception as e:
+                        if is_rate_limited(e):
+                            arm_rate_limit_pause("place_ask")
+                            time.sleep(POLL_SECONDS)
+                            continue
+
+                        if is_post_only_cross(e):
+                            cancel_bid_only("ask_post_only_cross_cleanup")
+                            skip_quote_until = time.time() + POST_ONLY_CROSS_COOLDOWN_SECONDS
+                            log.warning(f"[OM] {active_market} SELL place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}")
+                            time.sleep(POLL_SECONDS)
+                            continue
+
                         if is_insufficient_balance(e):
                             trip_balance_circuit("ask_insufficient_balance")
                             log.warning(f"[OM] {active_market} SELL place failed: {e}")
                             time.sleep(POLL_SECONDS)
                             continue
-                        else:
-                            log.warning(f"[OM] {active_market} SELL place failed: {e}")
+
+                        log.warning(f"[OM] {active_market} SELL place failed: {e}")
                 else:
                     quote.ask_price = ask_px
                     placed_ask = True
@@ -856,20 +981,35 @@ def main() -> None:
                     try:
                         payload = build_yes_order_payload(active_market, "buy", bid_px, ORDER_QTY, POST_ONLY)
                         oid = place_order(client, payload)
+                        mark_order_action()
+                        note_successful_request()
                         quote.bid_order_id = oid
                         quote.bid_price = bid_px
                         placed_bid = True
                         log.info(f"[OM] {active_market} BUY POSTED order_id={oid} @ {bid_px} qty={ORDER_QTY}")
                     except Exception as e:
+                        if is_rate_limited(e):
+                            arm_rate_limit_pause("place_bid")
+                            time.sleep(POLL_SECONDS)
+                            continue
+
+                        if is_post_only_cross(e):
+                            cancel_ask_only("bid_post_only_cross_cleanup")
+                            skip_quote_until = time.time() + POST_ONLY_CROSS_COOLDOWN_SECONDS
+                            log.warning(f"[OM] {active_market} BUY place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}")
+                            time.sleep(POLL_SECONDS)
+                            continue
+
                         if placed_ask:
                             cancel_ask_only("bid_failed_atomic")
+
                         if is_insufficient_balance(e):
                             trip_balance_circuit("bid_insufficient_balance")
                             log.warning(f"[OM] {active_market} BUY place failed: {e}")
                             time.sleep(POLL_SECONDS)
                             continue
-                        else:
-                            log.warning(f"[OM] {active_market} BUY place failed: {e}")
+
+                        log.warning(f"[OM] {active_market} BUY place failed: {e}")
                 else:
                     quote.bid_price = bid_px
                     placed_bid = True
