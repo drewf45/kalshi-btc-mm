@@ -1,6 +1,11 @@
 # bot.py
 # Kalshi rolling 15m BTC market-maker (YES-side quoting with synthetic asks)
 #
+# FIX in this version:
+# - Your bot was getting stuck in a SPOT guard “skip loop” and spamming logs every 0.20s.
+# - Now the SPOT guard only blocks quoting when the market is CLOSE to settling
+#   (default: last 90 seconds), and the skip log is throttled.
+#
 # Key features:
 # - Auto-rolls to the active market in a series via GET /markets?series_ticker=...
 # - Reads orderbook via GET /markets/{ticker}/orderbook (Kalshi provides bids only)
@@ -9,13 +14,12 @@
 # - Cancels/reprices when targets move
 # - Inventory skew + max net inventory guard (simple, uses local + open orders only)
 # - Spot guard near resolution bounds (optional; uses Coinbase spot)
-# - Correct Kalshi request signing (RSA-PSS) per docs:
+# - Correct Kalshi request signing (RSA-PSS):
 #   signature_message = f"{timestamp_ms}{method}{path_without_query}"
 
 import os
 import time
 import base64
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -102,7 +106,7 @@ POST_ONLY = env_bool("POST_ONLY", True)
 ORDER_QTY = env_int("ORDER_QTY", 1)
 IMPROVE_CENTS = env_int("IMPROVE_CENTS", 1)
 NO_IMPROVE_MAX_SPREAD_CENTS = env_int("NO_IMPROVE_MAX_SPREAD_CENTS", 4)  # <= spread: join, don't improve
-MIN_SPREAD_CENTS = env_int("MIN_SPREAD_CENTS", 2)  # if spread < this, skip (or will be invalid)
+MIN_SPREAD_CENTS = env_int("MIN_SPREAD_CENTS", 2)  # if spread < this, skip
 
 # Inventory control (simple)
 MAX_NET_YES_CONTRACTS = env_int("MAX_NET_YES_CONTRACTS", 2)
@@ -118,6 +122,9 @@ ENABLE_SPOT_GUARD = env_bool("ENABLE_SPOT_GUARD", True)
 SPOT_POLL_SECONDS = env_float("SPOT_POLL_SECONDS", 12.0)
 SPOT_RESOLVED_BUFFER_USD = env_float("SPOT_RESOLVED_BUFFER_USD", 75.0)
 CLOSEOUT_SECONDS = env_float("CLOSEOUT_SECONDS", 20.0)
+
+# NEW: only enforce spot guard close to settlement (prevents “always skipping”)
+SPOT_GUARD_NEAR_CLOSE_SECONDS = env_float("SPOT_GUARD_NEAR_CLOSE_SECONDS", 90.0)
 
 # Coinbase spot endpoint
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
@@ -142,12 +149,7 @@ class KalshiClient:
 
     def _sign_headers(self, method: str, full_url: str) -> Dict[str, str]:
         """
-        Per Kalshi docs:
-          signature_message = f"{timestamp_ms}{method}{path_without_query}"
-          headers:
-            KALSHI-ACCESS-KEY
-            KALSHI-ACCESS-SIGNATURE (base64)
-            KALSHI-ACCESS-TIMESTAMP (ms)
+        signature_message = f"{timestamp_ms}{method}{path_without_query}"
         IMPORTANT: path must EXCLUDE query string.
         """
         ts = str(now_ms())
@@ -185,7 +187,6 @@ class KalshiClient:
         url = f"{self.api_base}{self.api_prefix}{path}"
 
         if params:
-            # Query is appended to URL, but signature must be based on path WITHOUT query.
             url_with_q = url + "?" + urlencode(params)
         else:
             url_with_q = url
@@ -215,19 +216,12 @@ class KalshiClient:
 # Market selection / parsing
 # -----------------------------
 def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Choose the market that is currently active:
-    - Prefer open_time <= now < close_time
-    - Else pick soonest close_time in the future
-    Returns (event_ticker, market_ticker, market_obj)
-    """
     now_ts = int(time.time())
 
     def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
         v = obj.get(key)
         if v is None:
             return None
-        # docs typically use unix seconds
         try:
             return int(v)
         except Exception:
@@ -235,15 +229,13 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
     candidates = []
     for m in markets:
-        status = m.get("status", "").lower()
+        status = str(m.get("status", "")).lower()
         if status and status != "open":
             continue
         ot = get_ts(m, "open_time") or get_ts(m, "open_ts") or get_ts(m, "open_timestamp")
         ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
-        # if timestamps missing, still allow, but sort last
         candidates.append((ot, ct, m))
 
-    # Active first
     active = []
     future = []
     for ot, ct, m in candidates:
@@ -259,7 +251,6 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         future.sort(key=lambda x: x[0])
         chosen = future[0][1]
     else:
-        # fallback: first
         chosen = markets[0] if markets else {}
         if not chosen:
             raise RuntimeError("No markets available to pick from.")
@@ -270,21 +261,10 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
     if not market_ticker or not event_ticker:
         raise RuntimeError(f"Could not determine event/market ticker from market object: {chosen}")
 
-    return event_ticker, market_ticker, chosen
+    return str(event_ticker), str(market_ticker), chosen
 
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Kalshi orderbook endpoint returns BIDS ONLY for YES and NO:
-      orderbook: { yes: [[price, qty?], ...], no: [[price, qty?], ...] }
-
-    Synthetic asks:
-      YES ask = 100 - best NO bid
-      NO ask  = 100 - best YES bid
-
-    We quote YES side, so return:
-      yes_best_bid, yes_best_ask
-    """
     orderbook = ob.get("orderbook") or ob
     yes_bids = orderbook.get("yes") or []
     no_bids = orderbook.get("no") or []
@@ -305,12 +285,11 @@ def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Opti
     yes_bid = best_price(yes_bids)
     no_bid = best_price(no_bids)
     yes_ask = (100 - no_bid) if no_bid is not None else None
-
     return yes_bid, yes_ask
 
 
 # -----------------------------
-# Spot guard
+# Spot guard helpers
 # -----------------------------
 def fetch_btc_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optional[float]:
     try:
@@ -326,10 +305,9 @@ def fetch_btc_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optio
 
 
 def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Try common keys Kalshi uses for range markets.
-    We only use this if present; otherwise spot guard becomes a no-op.
-    """
+    lo = None
+    hi = None
+
     for lo_key in ("floor_strike", "lower_strike", "strike_lower", "floor"):
         if lo_key in market_obj:
             try:
@@ -337,8 +315,6 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
                 break
             except Exception:
                 lo = None
-    else:
-        lo = None
 
     for hi_key in ("cap_strike", "upper_strike", "strike_upper", "cap"):
         if hi_key in market_obj:
@@ -347,10 +323,18 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
                 break
             except Exception:
                 hi = None
-    else:
-        hi = None
 
     return lo, hi
+
+
+def extract_close_ts(market_obj: Dict[str, Any]) -> Optional[int]:
+    for k in ("close_time", "close_ts", "close_timestamp"):
+        if k in market_obj:
+            try:
+                return int(market_obj[k])
+            except Exception:
+                pass
+    return None
 
 
 # -----------------------------
@@ -372,11 +356,6 @@ def build_yes_order_payload(
     count: int,
     post_only: bool,
 ) -> Dict[str, Any]:
-    """
-    Create order body per Kalshi v2:
-      ticker, action, side, type, count, yes_price/no_price, (post_only)
-    We trade YES side only -> side="yes" and yes_price=<cents>
-    """
     body: Dict[str, Any] = {
         "ticker": market_ticker,
         "action": action,
@@ -399,7 +378,6 @@ def safe_int(v: Any) -> Optional[int]:
 
 def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
     resp = client.request("GET", "/portfolio/orders", params={"status": "open", "limit": 200})
-    # docs usually return {"orders":[...], ...}
     return resp.get("orders", resp if isinstance(resp, list) else [])
 
 
@@ -409,7 +387,6 @@ def cancel_order(client: KalshiClient, order_id: str) -> None:
 
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
-    # docs commonly return {"order": {"order_id": "..."}}
     if isinstance(resp, dict):
         if "order" in resp and isinstance(resp["order"], dict) and resp["order"].get("order_id"):
             return str(resp["order"]["order_id"])
@@ -426,18 +403,12 @@ def compute_quotes(
     yes_ask: int,
     net_yes: int,
 ) -> Tuple[Optional[int], Optional[int], str]:
-    """
-    Returns (bid_px, ask_px, reason)
-    - Improve by 1c only if spread > NO_IMPROVE_MAX_SPREAD_CENTS, else join.
-    - Apply inventory skew: long YES -> shift both down; short -> shift both up.
-    """
     spread = yes_ask - yes_bid
     if spread < MIN_SPREAD_CENTS:
         return None, None, f"spread_too_tight({spread})"
     if yes_bid >= yes_ask:
         return None, None, "crossed_or_invalid"
 
-    # base quote
     if spread <= NO_IMPROVE_MAX_SPREAD_CENTS:
         bid = yes_bid
         ask = yes_ask
@@ -447,21 +418,17 @@ def compute_quotes(
         ask = max(yes_ask - IMPROVE_CENTS, yes_bid + 1)
         why = "improve"
 
-    # inventory skew
     if net_yes != 0:
         skew = INVENTORY_SKEW_CENTS * abs(net_yes)
         if net_yes > 0:
-            # long YES: make buying less aggressive, selling more aggressive
             bid -= skew
             ask -= skew
             why += f" skew_long_yes({-abs(net_yes)})"
         else:
-            # short YES: make buying more aggressive, selling less aggressive
             bid += skew
             ask += skew
             why += f" skew_short_yes({abs(net_yes)})"
 
-    # clamp bounds
     bid = max(1, min(99, bid))
     ask = max(1, min(99, ask))
     if bid >= ask:
@@ -470,10 +437,6 @@ def compute_quotes(
 
 
 def count_open_yes_orders(open_orders: List[Dict[str, Any]], market_ticker: str) -> Tuple[int, int]:
-    """
-    Count open YES buys/sells in this market (to help avoid stacking).
-    Returns (open_buys, open_sells)
-    """
     buys = 0
     sells = 0
     for o in open_orders:
@@ -509,8 +472,8 @@ def main() -> None:
     log.info("[INV] MAX_NET_YES_CONTRACTS=%d INVENTORY_SKEW_CENTS=%d ORDER_STATUS_POLL_SECONDS=%.2f PAUSE_ON_UNKNOWN_SECONDS=%.2f",
              MAX_NET_YES_CONTRACTS, INVENTORY_SKEW_CENTS, ORDER_STATUS_POLL_SECONDS, PAUSE_ON_UNKNOWN_SECONDS)
     log.info("[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d (<= this spread: join, do not improve)", NO_IMPROVE_MAX_SPREAD_CENTS)
-    log.info("[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.1f META_REFRESH=%.1f",
-             ENABLE_SPOT_GUARD, SPOT_POLL_SECONDS, CLOSEOUT_SECONDS, SPOT_RESOLVED_BUFFER_USD, META_REFRESH_SECONDS)
+    log.info("[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.1f META_REFRESH=%.1f SPOT_GUARD_NEAR_CLOSE_SECONDS=%.1f",
+             ENABLE_SPOT_GUARD, SPOT_POLL_SECONDS, CLOSEOUT_SECONDS, SPOT_RESOLVED_BUFFER_USD, META_REFRESH_SECONDS, SPOT_GUARD_NEAR_CLOSE_SECONDS)
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -532,6 +495,10 @@ def main() -> None:
     last_order_poll = 0.0
     pause_until = 0.0
 
+    # NEW: throttle spot-skip logging
+    last_spot_skip_log_at = 0.0
+    last_spot_skip_msg = ""
+
     def refresh_active_market() -> None:
         nonlocal active_event, active_market, active_market_obj
 
@@ -546,7 +513,7 @@ def main() -> None:
             "series_ticker": SERIES_TICKER,
             "status": "open",
             "limit": 200,
-            "mve_filter": "exclude",  # avoid multivariate markets hijacking series searches
+            "mve_filter": "exclude",
         }
 
         resp = client.request("GET", "/markets", params=params)
@@ -561,14 +528,12 @@ def main() -> None:
 
         log.info(f"[ROLL] Series={SERIES_TICKER} → Active event={active_event} market={active_market} (via /markets series_ticker)")
 
-    # Initial roll
     refresh_active_market()
     last_meta_refresh = time.time()
 
     while True:
         t0 = time.time()
 
-        # Refresh market selection periodically
         if (t0 - last_meta_refresh) >= META_REFRESH_SECONDS:
             try:
                 refresh_active_market()
@@ -580,64 +545,65 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Spot poll (optional)
+        # spot poll
         if ENABLE_SPOT_GUARD and (t0 - last_spot_poll) >= SPOT_POLL_SECONDS:
             spot_usd = fetch_btc_spot_usd(http)
             last_spot_poll = t0
 
-        # Closeout guard near close time (if we have timestamps)
-        close_ts = None
-        for k in ("close_time", "close_ts", "close_timestamp"):
-            if k in active_market_obj:
-                try:
-                    close_ts = int(active_market_obj[k])
-                    break
-                except Exception:
-                    pass
+        close_ts = extract_close_ts(active_market_obj)
+        secs_to_close: Optional[int] = None
         if close_ts is not None:
             secs_to_close = close_ts - int(time.time())
-            if secs_to_close <= CLOSEOUT_SECONDS:
-                # Cancel our working orders and wait for roll
-                if quote.bid_order_id:
-                    try:
-                        if not DRY_RUN:
-                            cancel_order(client, quote.bid_order_id)
-                        log.info(f"[OM] {active_market} BUY CANCEL (closeout) order_id={quote.bid_order_id}")
-                    except Exception as e:
-                        log.warning(f"[OM] cancel bid failed: {e}")
-                    quote.bid_order_id = None
-                if quote.ask_order_id:
-                    try:
-                        if not DRY_RUN:
-                            cancel_order(client, quote.ask_order_id)
-                        log.info(f"[OM] {active_market} SELL CANCEL (closeout) order_id={quote.ask_order_id}")
-                    except Exception as e:
-                        log.warning(f"[OM] cancel ask failed: {e}")
-                    quote.ask_order_id = None
 
-                time.sleep(POLL_SECONDS)
-                continue
+        # closeout hard-stop (always)
+        if secs_to_close is not None and secs_to_close <= CLOSEOUT_SECONDS:
+            if quote.bid_order_id:
+                try:
+                    if not DRY_RUN:
+                        cancel_order(client, quote.bid_order_id)
+                    log.info(f"[OM] {active_market} BUY CANCEL (closeout) order_id={quote.bid_order_id}")
+                except Exception as e:
+                    log.warning(f"[OM] cancel bid failed: {e}")
+                quote.bid_order_id = None
+            if quote.ask_order_id:
+                try:
+                    if not DRY_RUN:
+                        cancel_order(client, quote.ask_order_id)
+                    log.info(f"[OM] {active_market} SELL CANCEL (closeout) order_id={quote.ask_order_id}")
+                except Exception as e:
+                    log.warning(f"[OM] cancel ask failed: {e}")
+                quote.ask_order_id = None
 
-        # Spot resolved-buffer guard (only if we can read bounds)
-        if ENABLE_SPOT_GUARD and spot_usd is not None:
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # SPOT resolved-buffer guard ONLY near close (prevents getting stuck skipping all the time)
+        if ENABLE_SPOT_GUARD and spot_usd is not None and secs_to_close is not None and secs_to_close <= SPOT_GUARD_NEAR_CLOSE_SECONDS:
             lo, hi = market_bounds_usd(active_market_obj)
             if lo is not None and abs(spot_usd - lo) <= SPOT_RESOLVED_BUFFER_USD:
-                log.info(f"[SPOT] skip: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of floor {lo:.2f}")
+                msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of floor {lo:.2f} (t_close={secs_to_close}s)"
+                if (t0 - last_spot_skip_log_at) >= 2.0 or msg != last_spot_skip_msg:
+                    log.info(msg)
+                    last_spot_skip_log_at = t0
+                    last_spot_skip_msg = msg
                 time.sleep(POLL_SECONDS)
                 continue
             if hi is not None and abs(spot_usd - hi) <= SPOT_RESOLVED_BUFFER_USD:
-                log.info(f"[SPOT] skip: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of cap {hi:.2f}")
+                msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of cap {hi:.2f} (t_close={secs_to_close}s)"
+                if (t0 - last_spot_skip_log_at) >= 2.0 or msg != last_spot_skip_msg:
+                    log.info(msg)
+                    last_spot_skip_log_at = t0
+                    last_spot_skip_msg = msg
                 time.sleep(POLL_SECONDS)
                 continue
 
-        # Poll open orders for safety / inventory-ish context
+        # Poll open orders for safety / inventory context
         open_orders: List[Dict[str, Any]] = []
         if (t0 - last_order_poll) >= ORDER_STATUS_POLL_SECONDS:
             try:
                 open_orders = get_open_orders(client)
                 last_order_poll = t0
             except Exception as e:
-                # If we can't confirm state, pause quoting
                 pause_until = time.time() + PAUSE_ON_UNKNOWN_SECONDS
                 log.warning(f"[INV] PAUSE quoting due to unknown order state: {PAUSE_ON_UNKNOWN_SECONDS:.2f}s remaining ({e})")
                 time.sleep(POLL_SECONDS)
@@ -662,10 +628,8 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Simple inventory cap: if we're already max long, stop bidding; if max short, stop asking.
         open_buys, open_sells = count_open_yes_orders(open_orders, active_market)
-        est_net_yes = net_yes  # local estimate; you can wire in real positions later
-        # also consider open orders as "pending" exposure
+        est_net_yes = net_yes
         est_pending_long = open_buys
         est_pending_short = open_sells
 
@@ -675,15 +639,11 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Inventory hard stops
         allow_bid = (est_net_yes + est_pending_long) < MAX_NET_YES_CONTRACTS
         allow_ask = (est_net_yes - est_pending_short) > -MAX_NET_YES_CONTRACTS
 
-        log.debug(f"[QUOTE] {active_market} YES bid={yes_bid} ask={yes_ask} → target bid@{bid_px} ask@{ask_px} ({why})")
-
         # If market changed, clear state (and try to cancel lingering orders)
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
-            # best-effort cancels
             if quote.bid_order_id:
                 try:
                     if not DRY_RUN:
@@ -702,10 +662,9 @@ def main() -> None:
 
         quote.last_market_ticker = active_market
 
-        # Reprice / (re)place BID
+        # BID
         if allow_bid:
             if quote.bid_price != bid_px:
-                # cancel old
                 if quote.bid_order_id:
                     try:
                         if not DRY_RUN:
@@ -715,7 +674,6 @@ def main() -> None:
                         log.warning(f"[OM] cancel bid failed: {e}")
                     quote.bid_order_id = None
 
-                # place new
                 if ENABLE_TRADING and not DRY_RUN:
                     try:
                         payload = build_yes_order_payload(active_market, "buy", bid_px, ORDER_QTY, POST_ONLY)
@@ -729,7 +687,6 @@ def main() -> None:
                     quote.bid_price = bid_px
                     log.info(f"[OM] {active_market} BUY PLACE @ {bid_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
         else:
-            # not allowed to bid: ensure no bid order working
             if quote.bid_order_id:
                 try:
                     if not DRY_RUN:
@@ -740,10 +697,9 @@ def main() -> None:
                 quote.bid_order_id = None
                 quote.bid_price = None
 
-        # Reprice / (re)place ASK
+        # ASK
         if allow_ask:
             if quote.ask_price != ask_px:
-                # cancel old
                 if quote.ask_order_id:
                     try:
                         if not DRY_RUN:
@@ -753,7 +709,6 @@ def main() -> None:
                         log.warning(f"[OM] cancel ask failed: {e}")
                     quote.ask_order_id = None
 
-                # place new
                 if ENABLE_TRADING and not DRY_RUN:
                     try:
                         payload = build_yes_order_payload(active_market, "sell", ask_px, ORDER_QTY, POST_ONLY)
@@ -767,7 +722,6 @@ def main() -> None:
                     quote.ask_price = ask_px
                     log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
         else:
-            # not allowed to ask: ensure no ask order working
             if quote.ask_order_id:
                 try:
                     if not DRY_RUN:
@@ -778,10 +732,8 @@ def main() -> None:
                 quote.ask_order_id = None
                 quote.ask_price = None
 
-        # Target log (matches your style)
         log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
 
-        # sleep
         dt = time.time() - t0
         time.sleep(max(0.0, POLL_SECONDS - dt))
 
