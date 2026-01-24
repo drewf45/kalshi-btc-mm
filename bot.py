@@ -15,15 +15,11 @@
 #   3) Reset QuoteState + hysteresis so we start clean.
 #
 # FIX B (FROM YOUR LOGS): 404/not_found on cancel is usually "already filled".
-# - Your logs show:
-#     CANCEL -> 404/not_found -> then inventory changes shortly after
-#   This is expected in fast markets: the order often fills before the cancel lands.
-# - Fix (behavioral):
-#   1) If cancel returns not_found in reduce-only mode, clear local order_id/price
-#      immediately (stop spamming cancels on the same id).
-#   2) Force-refresh positions immediately (inventory truth) before placing anything
-#      else.
-#   3) Pause briefly and skip quoting until inventory is confirmed stable.
+# - In fast markets, orders can fill before the cancel lands.
+# - Fix (behavioral, reduce-only cancel-first path):
+#   1) If cancel returns not_found, clear local order_id/price immediately
+#   2) Force-refresh positions immediately (inventory truth) before placing anything else
+#   3) Pause briefly and skip quoting until inventory is confirmed stable
 #
 # FIX C (REDUCE-ONLY LATCH): When not flat, do not churn exits like a market maker.
 # - When pos_yes != 0, the bot is in "reduce-only" mode (exit mode).
@@ -1330,7 +1326,6 @@ def main() -> None:
                         # FIX B: stop spamming cancels on the same ghost order_id
                         last_cancel_not_found_oid = old_order_id
 
-                        # Clear local order state ASAP (caller will clear via last_cancel_not_found_oid match)
                         # Force-refresh positions immediately before placing anything else
                         _ = refresh_positions_now("cancel_404_not_found")
 
