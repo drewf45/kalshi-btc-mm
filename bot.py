@@ -794,6 +794,7 @@ def reconcile_order_status_for_working(side_key: str, cur: "WorkingOrder", now: 
       - on ambiguous 404, pause quoting temporarily (PAUSE_ON_UNKNOWN_SECONDS)
     """
     global _UNKNOWN_UNTIL_TS
+    global WORKING, _LAST_KEEP_LOGGED  # ✅ MICRO CHANGE: allow clearing from here
 
     if DRY_RUN or (not ENABLE_TRADING) or (not cur.order_id):
         return
@@ -824,7 +825,19 @@ def reconcile_order_status_for_working(side_key: str, cur: "WorkingOrder", now: 
     except Exception as e:
         s = str(e).lower()
         if "http 404" in s and "not_found" in s:
-            # Ambiguous: could be filled/canceled/expired but not returned. Pause briefly and let it settle.
+            # ✅ MICRO CHANGE:
+            # If the order is NOT in open-orders, treat it as gone immediately (no pause).
+            if not is_order_open(oid):
+                log.info(
+                    "[INV] order_status_404 side=%s order_id=%s but order not open → clear WORKING (no pause)",
+                    side_key,
+                    oid,
+                )
+                WORKING[side_key] = None
+                _LAST_KEEP_LOGGED[side_key] = None
+                return
+
+            # Otherwise truly ambiguous: pause briefly and let it settle.
             _UNKNOWN_UNTIL_TS = max(_UNKNOWN_UNTIL_TS, now + max(0.0, PAUSE_ON_UNKNOWN_SECONDS))
             log.warning(
                 "[INV] order_status_404 side=%s order_id=%s → pause %.1fs (UNKNOWN_UNTIL=%.3f)",
