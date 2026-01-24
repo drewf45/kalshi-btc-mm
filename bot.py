@@ -107,6 +107,10 @@ ENABLE_JOIN_TIGHT_SPREAD = parse_bool(getenv_first(["ENABLE_JOIN_TIGHT_SPREAD"],
 # ✅ Join-only threshold for tight spreads (B-player)
 JOIN_ONLY_MAX_SPREAD_CENTS = int(getenv_first(["JOIN_ONLY_MAX_SPREAD_CENTS"], "2"))
 
+# ✅ NEW MICRO: never "improve" when spread is still small; just join.
+# This reduces pickoff/adverse selection in 3–4¢ regimes.
+NO_IMPROVE_MAX_SPREAD_CENTS = int(getenv_first(["NO_IMPROVE_MAX_SPREAD_CENTS"], "4"))
+
 # Micro #4: per-side hysteresis
 SIDE_HOLD_SECONDS = float(getenv_first(["SIDE_HOLD_SECONDS"], "5.0"))
 
@@ -902,6 +906,16 @@ def compute_target_yes_quotes(
         bid, ask, inv_note = apply_inventory_gates_and_skew(bid, ask)
         return (bid, ask, f"join(spread={spread}) {inv_note}")
 
+    # ✅ MICRO FIX: for small-but-not-join spreads, do NOT improve.
+    # Just join the best bid/ask to reduce adverse selection.
+    if NO_IMPROVE_MAX_SPREAD_CENTS > 0 and spread <= NO_IMPROVE_MAX_SPREAD_CENTS:
+        bid = clamp_price(int(yes_bid))
+        ask = clamp_price(int(yes_ask))
+        if bid >= ask:
+            return (None, None, "no_improve_join_locked_or_crossed")
+        bid, ask, inv_note = apply_inventory_gates_and_skew(bid, ask)
+        return (bid, ask, f"no_improve_join(spread={spread}) {inv_note}")
+
     bid = clamp_price(yes_bid + TICK_CENTS)
     ask = clamp_price(yes_ask - TICK_CENTS)
 
@@ -1306,6 +1320,10 @@ def main():
         INVENTORY_SKEW_CENTS,
         ORDER_STATUS_POLL_SECONDS,
         PAUSE_ON_UNKNOWN_SECONDS,
+    )
+    log.info(
+        "[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d (<= this spread: join, do not improve)",
+        NO_IMPROVE_MAX_SPREAD_CENTS,
     )
 
     last_market: Optional[str] = None
