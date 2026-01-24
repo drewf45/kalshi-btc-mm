@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
+# ✅ MICRO CHANGE #1: reuse one HTTP session (latency + fewer TLS handshakes)
+_HTTP = requests.Session()
+
 # -----------------------------
 # Env / Config
 # -----------------------------
@@ -259,7 +262,6 @@ def request_json(
         body_bytes = body_str.encode("utf-8")
 
     backoff = BACKOFF_START
-    session = requests.Session()
 
     while True:
         req = requests.Request(
@@ -274,7 +276,8 @@ def request_json(
         headers = build_signature_headers(method, signed_path)
         prepped.headers.update(headers)
 
-        resp = session.send(prepped, timeout=20)
+        # ✅ MICRO CHANGE #1: use shared session
+        resp = _HTTP.send(prepped, timeout=20)
 
         if resp.status_code == 429:
             log.warning("[429] %s backing off %.1fs", path, backoff)
@@ -388,8 +391,8 @@ def parse_strike_usd_from_market(market_payload: Dict[str, Any]) -> Optional[flo
     if not blob:
         return None
 
-    # Grab all dollar-ish numbers like $105,000 or 105,000
-    nums = re.findall(r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})+)", blob)
+    # ✅ MICRO CHANGE #3: allow comma and non-comma strikes (e.g., 105,000 OR 105000)
+    nums = re.findall(r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})", blob)
     if not nums:
         return None
 
@@ -857,6 +860,10 @@ def get_yes_bid_ask(orderbook_payload: Dict[str, Any], market_ticker: str) -> Tu
             no_best_bid = _best_bid(no_bids_dollars)
         if no_best_bid is not None:
             yes_ask = 100 - int(no_best_bid)
+
+    # ✅ MICRO CHANGE #2: if NO side is empty, implied YES ask is unknowable -> don't spam /markets fallback
+    if yes_ask is None and (not no_bids) and (not no_bids_dollars):
+        return (yes_bid, None)
 
     if yes_bid is None:
         no_best_ask = _best_ask(no_asks)
