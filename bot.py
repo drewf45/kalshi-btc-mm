@@ -2,11 +2,10 @@
 # Kalshi rolling 15m BTC market-maker (YES-side quoting with synthetic asks)
 #
 # -----------------------------
-# NOTES / WHAT CHANGED
+# NOTES / WHAT CHANGED (TWO FIXES)
 # -----------------------------
 # FIX #1 (CRITICAL): Reduce-only repricing is now CANCEL-FIRST then PLACE,
-#                    WITH "404 cancel" protection to prevent flip-through-zero
-#                    AND prevent endless cancel spam.
+#                    WITH "404 cancel" protection to prevent flip-through-zero.
 #   - When inventory != 0, we are in reduce-only mode (exit inventory).
 #   - Previously, place-first-then-cancel could momentarily leave TWO exit orders live
 #     (old exit + new exit). If both fill quickly, you can overshoot through zero and flip.
@@ -14,16 +13,11 @@
 #     If cancel fails, we do NOT place a second exit. Safe > quoted.
 #   - Additional safety: if cancel returns 404/not_found (order already gone),
 #     we assume it may have FILLED and PAUSE until positions refresh before placing a new exit.
-#   - Also: on 404/not_found we CLEAR local order state for that side (so we don't spam-cancel
-#     the same stale order_id forever).
 #
 # FIX #2 (CRITICAL): Inventory freshness guard (prevents acting on stale positions)
 #   - If positions data is older than MAX_INV_STALENESS_SECONDS, we cancel quotes and skip.
 #   - IMPORTANT: default MAX_INV_STALENESS_SECONDS is set relative to POSITIONS_POLL_SECONDS
 #     so it won't constantly self-trigger (can be overridden via env).
-#
-# FIX #3: env_float tolerates comma decimals + leading-dot decimals
-#   - Accepts ",75" / "0,75" / ".75" / "-.75" by normalizing to a valid float string.
 #
 # Everything else is kept as-is from your current version.
 
@@ -68,24 +62,9 @@ def env_int(name: str, default: int) -> int:
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if v is None:
+    if v is None or str(v).strip() == "":
         return default
-    s = str(v).strip()
-    if s == "":
-        return default
-
-    # ✅ FIX #3: tolerate commas + leading-dot decimals
-    # ",75" -> "0.75"   "0,75" -> "0.75"   ".75" -> "0.75"   "-.75" -> "-0.75"
-    s = s.replace(",", ".")
-    if s.startswith("."):
-        s = "0" + s
-    if s.startswith("-."):
-        s = "-0." + s[2:]
-
-    try:
-        return float(s)
-    except ValueError:
-        raise ValueError(f"Invalid float for {name}={v!r} (normalized={s!r})")
+    return float(v)
 
 
 def getenv_first(keys: List[str], default: str = "") -> str:
@@ -1288,7 +1267,7 @@ def main() -> None:
                 return None, None, False
 
         # FIX #1: Reduce-only repricing uses CANCEL-FIRST then PLACE,
-        #         and if cancel==404 we PAUSE until positions refresh AND clear local order state.
+        #         and if cancel==404 we PAUSE until positions refresh.
         def cancel_old_then_place_new(
             side: str,
             action: str,
@@ -1311,13 +1290,12 @@ def main() -> None:
                     tag = "BUY" if action == "buy" else "SELL"
                     log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reduce-only reprice cancel-first) order_id={old_order_id}")
 
-                    # ✅ CRITICAL: If cancel says 404/not_found, the order is already gone.
-                    # Clear local state for that side to prevent endless cancel spam,
-                    # then pause until positions refresh confirms the fill.
+                    # If cancel says 404/not_found, order was already gone (often filled).
+                    # Do NOT place another exit until positions refresh.
                     if st == "not_found":
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                         log.warning(f"[OM] {active_market} cancel got 404/not_found in reduce-only; assume filled. Pausing until positions refresh.")
-                        return None, None, True  # <-- ok=True so caller clears quote.{side}_order_id/price
+                        return None, None, False
 
                 except Exception as ce:
                     if is_rate_limited(ce):
