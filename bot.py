@@ -1175,8 +1175,9 @@ def main() -> None:
                 allow_ask = False
                 why += " reduce_only(short_exit)"
         else:
-            allow_bid = (0 + open_buys + ORDER_QTY) <= MAX_ABS_YES_CONTRACTS
-            allow_ask = (0 - open_sells - ORDER_QTY) >= -MAX_ABS_YES_CONTRACTS
+            # FIX: include current position in absolute-cap checks (prevents pos_yes exceeding MAX_ABS_YES_CONTRACTS)
+            allow_bid = (est_net_yes + open_buys + ORDER_QTY) <= MAX_ABS_YES_CONTRACTS
+            allow_ask = (est_net_yes - open_sells - ORDER_QTY) >= -MAX_ABS_YES_CONTRACTS
             allow_bid = allow_bid and ((est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS)
             allow_ask = allow_ask and ((est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS)
 
