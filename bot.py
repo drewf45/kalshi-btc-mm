@@ -4,37 +4,22 @@
 # -----------------------------
 # NOTES / WHAT CHANGED (TWO FIXES)
 # -----------------------------
-# FIX #1 (CRITICAL): Reduce-only repricing is now CANCEL-FIRST then PLACE
+# FIX #1 (CRITICAL): Reduce-only repricing is now CANCEL-FIRST then PLACE,
+#                    WITH "404 cancel" protection to prevent flip-through-zero.
 #   - When inventory != 0, we are in reduce-only mode (exit inventory).
-#   - Previously, "place-first-then-cancel" could momentarily leave TWO exit orders live
-#     (old exit + new exit). If both fill quickly, you can OVERSHOOT through zero and flip short/long.
-#   - Now: in reduce-only mode ONLY, we cancel the old exit order first, then place the new exit.
-#     If placement fails, you're temporarily unquoted but SAFE (no double-exit).
+#   - Previously, place-first-then-cancel could momentarily leave TWO exit orders live
+#     (old exit + new exit). If both fill quickly, you can overshoot through zero and flip.
+#   - Now: in reduce-only ONLY, we cancel the old exit order first, then place the new exit.
+#     If cancel fails, we do NOT place a second exit. Safe > quoted.
+#   - Additional safety: if cancel returns 404/not_found (order already gone),
+#     we assume it may have FILLED and PAUSE until positions refresh before placing a new exit.
 #
 # FIX #2 (CRITICAL): Inventory freshness guard (prevents acting on stale positions)
-#   - Positions are polled on an interval. If you flatten quickly but your last positions poll is stale,
-#     the bot can still *think* it's long and keep selling, flipping short.
-#   - Added MAX_INV_STALENESS_SECONDS. If positions are older than this threshold:
-#       - cancel_live_quotes("inv_stale")
-#       - skip quoting until positions are fresh again
-#   - Also: we do an INITIAL positions fetch at startup so last_positions_poll is sane immediately.
+#   - If positions data is older than MAX_INV_STALENESS_SECONDS, we cancel quotes and skip.
+#   - IMPORTANT: default MAX_INV_STALENESS_SECONDS is set relative to POSITIONS_POLL_SECONDS
+#     so it won't constantly self-trigger (can be overridden via env).
 #
 # Everything else is kept as-is from your current version.
-#
-# -----------------------------
-# Existing Features (kept)
-# -----------------------------
-# - Auto-roll via /markets?series_ticker=...
-# - Orderbook parsing YES bid + synthetic YES ask from NO bid
-# - Spread filters + hysteresis gate
-# - Spot guard near close
-# - Inventory caps + reduce-only behavior
-# - Place-first-then-cancel repricing (still used when FLAT market-making)
-# - Rate-limit backoff + churn control
-# - P&L snapshot logging
-#
-# IMPORTANT DISCLAIMER:
-# This is trading code. Use at your own risk. Always test in DRY_RUN first.
 
 import os
 import time
@@ -174,13 +159,14 @@ CLOSEOUT_SECONDS = env_float("CLOSEOUT_SECONDS", 20.0)
 SPOT_GUARD_NEAR_CLOSE_SECONDS = env_float("SPOT_GUARD_NEAR_CLOSE_SECONDS", 90.0)
 
 # Inventory / P&L polling
-# (You can override these in env; fix #2 depends on this being reasonably frequent.)
 POSITIONS_POLL_SECONDS = env_float("POSITIONS_POLL_SECONDS", 3.0)
 FILLS_POLL_SECONDS = env_float("FILLS_POLL_SECONDS", 3.0)
 PNL_LOG_THROTTLE_SECONDS = env_float("PNL_LOG_THROTTLE_SECONDS", 10.0)
 
 # FIX #2: inventory staleness guard
-MAX_INV_STALENESS_SECONDS = env_float("MAX_INV_STALENESS_SECONDS", 0.9)
+# Default is relative to positions poll so it doesn't self-trigger.
+DEFAULT_MAX_INV_STALENESS_SECONDS = max(2.0, POSITIONS_POLL_SECONDS * 2.0)
+MAX_INV_STALENESS_SECONDS = env_float("MAX_INV_STALENESS_SECONDS", DEFAULT_MAX_INV_STALENESS_SECONDS)
 
 # Coinbase spot endpoint
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
@@ -592,10 +578,7 @@ def update_entry_from_fills_for_market(
         if px is None:
             continue
 
-        ts = extract_fill_ts_ms(f)
-        if ts is None:
-            ts = 0
-
+        ts = extract_fill_ts_ms(f) or 0
         if ts > best_ts:
             best_ts = ts
             best_px = px
@@ -608,13 +591,21 @@ def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
     return resp.get("orders", resp if isinstance(resp, list) else [])
 
 
-def cancel_order(client: KalshiClient, order_id: str) -> None:
+# --- NEW: cancel returns a status so reduce-only logic can react to 404 correctly ---
+def cancel_order_status(client: KalshiClient, order_id: str) -> str:
+    """
+    Returns:
+      - "canceled"   : cancel succeeded
+      - "not_found"  : 404/not_found (order already gone; may have filled)
+    Raises for other errors.
+    """
     try:
         client.request("DELETE", f"/portfolio/orders/{order_id}")
+        return "canceled"
     except RuntimeError as e:
         msg = str(e)
-        if ("HTTP 404" in msg) or ('"code":"not_found"' in msg) or ('"code": "not_found"' in msg):
-            return
+        if ("HTTP 404" in msg) or ("not_found" in msg):
+            return "not_found"
         raise
 
 
@@ -723,8 +714,8 @@ def main() -> None:
     log.info("[RL] MIN_REPRICE_SECONDS=%.2f MIN_ORDER_ACTION_GAP_SECONDS=%.2f RL_BACKOFF_START=%.2f RL_BACKOFF_MAX=%.2f POST_ONLY_CROSS_COOLDOWN_SECONDS=%.2f SPREAD_SKIP_COOLDOWN_SECONDS=%.2f",
              MIN_REPRICE_SECONDS, MIN_ORDER_ACTION_GAP_SECONDS, RATE_LIMIT_BACKOFF_START_SECONDS, RATE_LIMIT_BACKOFF_MAX_SECONDS,
              POST_ONLY_CROSS_COOLDOWN_SECONDS, SPREAD_SKIP_COOLDOWN_SECONDS)
-    log.info("[PNL] POSITIONS_POLL_SECONDS=%.2f FILLS_POLL_SECONDS=%.2f PNL_LOG_THROTTLE_SECONDS=%.1f MAX_INV_STALENESS_SECONDS=%.2f",
-             POSITIONS_POLL_SECONDS, FILLS_POLL_SECONDS, PNL_LOG_THROTTLE_SECONDS, MAX_INV_STALENESS_SECONDS)
+    log.info("[PNL] POSITIONS_POLL_SECONDS=%.2f FILLS_POLL_SECONDS=%.2f PNL_LOG_THROTTLE_SECONDS=%.1f MAX_INV_STALENESS_SECONDS=%.2f (default=%.2f)",
+             POSITIONS_POLL_SECONDS, FILLS_POLL_SECONDS, PNL_LOG_THROTTLE_SECONDS, MAX_INV_STALENESS_SECONDS, DEFAULT_MAX_INV_STALENESS_SECONDS)
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -791,15 +782,15 @@ def main() -> None:
     # --- Helpers (rate-limit / errors) ---
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
-        return ("insufficient_balance" in s) or ('"code":"insufficient_balance"' in s) or ('"code": "insufficient_balance"' in s)
+        return ("insufficient_balance" in s) or ("code" in s and "insufficient_balance" in s)
 
     def is_rate_limited(e: Exception) -> bool:
         s = str(e)
         return ("HTTP 429" in s) or ("too_many_requests" in s)
 
     def is_post_only_cross(e: Exception) -> bool:
-        s = str(e)
-        return ("post only cross" in s) or ("post_only cross" in s)
+        s = str(e).lower()
+        return ("post only" in s and "cross" in s) or ("post_only" in s and "cross" in s)
 
     def arm_rate_limit_pause(tag: str) -> None:
         nonlocal rl_until, rl_backoff, skip_quote_until
@@ -827,7 +818,7 @@ def main() -> None:
         if quote.bid_order_id:
             try:
                 if not DRY_RUN:
-                    cancel_order(client, quote.bid_order_id)
+                    _ = cancel_order_status(client, quote.bid_order_id)
                 log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
             except Exception as e:
                 if is_rate_limited(e):
@@ -843,7 +834,7 @@ def main() -> None:
         if quote.ask_order_id:
             try:
                 if not DRY_RUN:
-                    cancel_order(client, quote.ask_order_id)
+                    _ = cancel_order_status(client, quote.ask_order_id)
                 log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
             except Exception as e:
                 if is_rate_limited(e):
@@ -861,7 +852,6 @@ def main() -> None:
         cancel_live_quotes(reason)
 
         balance_fail_burst += 1
-
         cooldown = BALANCE_FAIL_COOLDOWN_SECONDS
         if balance_fail_burst >= BALANCE_FAIL_MAX_BURST:
             cooldown = max(cooldown, BALANCE_FAIL_COOLDOWN_SECONDS * 5)
@@ -903,7 +893,7 @@ def main() -> None:
     refresh_active_market()
     last_meta_refresh = time.time()
 
-    # FIX #2: do an initial positions fetch so inventory isn't "stale" on boot
+    # FIX #2: initial positions fetch so inventory isn't stale on boot
     try:
         positions = get_positions(client)
         note_successful_request()
@@ -913,7 +903,6 @@ def main() -> None:
         log.info(f"[INV] initial positions: market={active_market} pos_yes={pos_yes_live}")
     except Exception as e:
         log.warning(f"[INV] initial positions fetch failed: {e}")
-        # leave last_positions_poll at 0; staleness guard will cancel quotes until it succeeds
 
     while True:
         t0 = time.time()
@@ -1021,19 +1010,7 @@ def main() -> None:
                     arm_rate_limit_pause("fills")
                 log.warning(f"[INV] fills fetch failed: {e}")
 
-        if time.time() < pause_until:
-            time.sleep(POLL_SECONDS)
-            continue
-
-        if time.time() < balance_fail_until:
-            time.sleep(POLL_SECONDS)
-            continue
-
-        if time.time() < rl_until:
-            time.sleep(POLL_SECONDS)
-            continue
-
-        if time.time() < skip_quote_until:
+        if time.time() < pause_until or time.time() < balance_fail_until or time.time() < rl_until or time.time() < skip_quote_until:
             time.sleep(POLL_SECONDS)
             continue
 
@@ -1138,13 +1115,14 @@ def main() -> None:
         open_buys, open_sells = count_open_yes_orders(open_orders_cache, active_market)
         est_net_yes = net_yes
 
-        # FIX #2: Inventory freshness guard (prevents flip-through-zero on stale pos)
-        if (t0 - last_positions_poll) > MAX_INV_STALENESS_SECONDS:
+        # FIX #2: Inventory freshness guard
+        inv_age = (t0 - last_positions_poll) if last_positions_poll > 0 else 9999.0
+        if inv_age > MAX_INV_STALENESS_SECONDS:
             cancel_live_quotes("inv_stale")
             skip_quote_until = max(skip_quote_until, time.time() + SPREAD_SKIP_COOLDOWN_SECONDS)
             sig = (active_market, "SKIP", "inv_stale")
             if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
-                log.warning(f"[INV] stale positions: age={(t0 - last_positions_poll):.2f}s > {MAX_INV_STALENESS_SECONDS:.2f}s; canceling quotes")
+                log.warning(f"[INV] stale positions: age={inv_age:.2f}s > {MAX_INV_STALENESS_SECONDS:.2f}s; canceling quotes")
                 log.info(f"[TARGET] {active_market} → SKIP (inv_stale)")
                 last_target_sig = sig
                 last_target_log_at = t0
@@ -1153,8 +1131,6 @@ def main() -> None:
 
         # NEW: absolute cap + reduce-only mode
         reduce_only = (est_net_yes != 0)
-        if abs(est_net_yes) >= MAX_ABS_YES_CONTRACTS:
-            pass
 
         # Hysteresis-aware min spread
         min_spread_for_quotes = HYSTERESIS_EXIT_SPREAD_CENTS if is_quoting else HYSTERESIS_ENTER_SPREAD_CENTS
@@ -1246,6 +1222,8 @@ def main() -> None:
             old_order_id: Optional[str],
             old_price: Optional[int],
         ) -> Tuple[Optional[str], Optional[int], bool]:
+            nonlocal skip_quote_until
+
             if not ENABLE_TRADING or DRY_RUN:
                 return None, new_price, True
 
@@ -1258,7 +1236,7 @@ def main() -> None:
 
                 if old_order_id:
                     try:
-                        cancel_order(client, old_order_id)
+                        _ = cancel_order_status(client, old_order_id)
                         mark_order_action()
                         note_successful_request()
                         tag = "BUY" if action == "buy" else "SELL"
@@ -1276,9 +1254,6 @@ def main() -> None:
                     return None, None, False
 
                 if is_post_only_cross(e):
-                    nonlocal_skip = True  # (keeps structure; actual cooldown below)
-                    _ = nonlocal_skip
-                    nonlocal skip_quote_until
                     skip_quote_until = time.time() + POST_ONLY_CROSS_COOLDOWN_SECONDS
                     log.warning(f"[OM] {active_market} {action.upper()} place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}")
                     return None, None, False
@@ -1291,7 +1266,8 @@ def main() -> None:
                 log.warning(f"[OM] {active_market} {action.upper()} place failed: {e}")
                 return None, None, False
 
-        # FIX #1: Reduce-only repricing uses CANCEL-FIRST then PLACE (prevents double-exit overshoot)
+        # FIX #1: Reduce-only repricing uses CANCEL-FIRST then PLACE,
+        #         and if cancel==404 we PAUSE until positions refresh.
         def cancel_old_then_place_new(
             side: str,
             action: str,
@@ -1301,17 +1277,26 @@ def main() -> None:
             old_price: Optional[int],
         ) -> Tuple[Optional[str], Optional[int], bool]:
             nonlocal skip_quote_until
+
             if not ENABLE_TRADING or DRY_RUN:
                 return None, new_price, True
 
             # Cancel old first (if cancel fails, do NOT place a second exit)
             if old_order_id:
                 try:
-                    cancel_order(client, old_order_id)
+                    st = cancel_order_status(client, old_order_id)
                     mark_order_action()
                     note_successful_request()
                     tag = "BUY" if action == "buy" else "SELL"
                     log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reduce-only reprice cancel-first) order_id={old_order_id}")
+
+                    # If cancel says 404/not_found, order was already gone (often filled).
+                    # Do NOT place another exit until positions refresh.
+                    if st == "not_found":
+                        skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
+                        log.warning(f"[OM] {active_market} cancel got 404/not_found in reduce-only; assume filled. Pausing until positions refresh.")
+                        return None, None, False
+
                 except Exception as ce:
                     if is_rate_limited(ce):
                         arm_rate_limit_pause(f"cancel_old_{side}")
