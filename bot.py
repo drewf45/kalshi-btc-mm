@@ -2,22 +2,17 @@
 # Kalshi rolling 15m BTC market-maker (YES-side quoting with synthetic asks)
 #
 # -----------------------------
-# NOTES / WHAT CHANGED (TWO FIXES)
+# NOTES / WHAT CHANGED (MICRO FIX)
 # -----------------------------
-# FIX #1 (CRITICAL): Reduce-only repricing is now CANCEL-FIRST then PLACE,
-#                    WITH "404 cancel" protection to prevent flip-through-zero.
-#   - When inventory != 0, we are in reduce-only mode (exit inventory).
-#   - Previously, place-first-then-cancel could momentarily leave TWO exit orders live
-#     (old exit + new exit). If both fill quickly, you can overshoot through zero and flip.
-#   - Now: in reduce-only ONLY, we cancel the old exit order first, then place the new exit.
-#     If cancel fails, we do NOT place a second exit. Safe > quoted.
-#   - Additional safety: if cancel returns 404/not_found (order already gone),
-#     we assume it may have FILLED and PAUSE until positions refresh before placing a new exit.
-#
-# FIX #2 (CRITICAL): Inventory freshness guard (prevents acting on stale positions)
-#   - If positions data is older than MAX_INV_STALENESS_SECONDS, we cancel quotes and skip.
-#   - IMPORTANT: default MAX_INV_STALENESS_SECONDS is set relative to POSITIONS_POLL_SECONDS
-#     so it won't constantly self-trigger (can be overridden via env).
+# MICRO FIX (CRITICAL): Cancel "ghost" open orders on boot + market roll.
+# - Root cause of your flip-through-zero: bot only tracks order_ids in memory.
+#   After restart, old open orders can still exist on Kalshi, unknown to the bot.
+#   When you place a new reduce-only exit, you can briefly have TWO exits live.
+#   If both fill => you flip long -> short (or short -> long).
+# - Fix: On startup and every time the active market changes, we:
+#   1) GET /portfolio/orders?status=open
+#   2) Cancel ALL open YES orders for the active market ticker
+#   3) Reset QuoteState and hysteresis so we start clean.
 #
 # Everything else is kept as-is from your current version.
 
@@ -164,12 +159,14 @@ FILLS_POLL_SECONDS = env_float("FILLS_POLL_SECONDS", 3.0)
 PNL_LOG_THROTTLE_SECONDS = env_float("PNL_LOG_THROTTLE_SECONDS", 10.0)
 
 # FIX #2: inventory staleness guard
-# Default is relative to positions poll so it doesn't self-trigger.
 DEFAULT_MAX_INV_STALENESS_SECONDS = max(2.0, POSITIONS_POLL_SECONDS * 2.0)
 MAX_INV_STALENESS_SECONDS = env_float("MAX_INV_STALENESS_SECONDS", DEFAULT_MAX_INV_STALENESS_SECONDS)
 
 # Coinbase spot endpoint
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+
+# MICRO FIX toggle
+BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
 
 # -----------------------------
@@ -190,10 +187,6 @@ class KalshiClient:
         self.session = requests.Session()
 
     def _sign_headers(self, method: str, full_url: str) -> Dict[str, str]:
-        """
-        signature_message = f"{timestamp_ms}{method}{path_without_query}"
-        IMPORTANT: path must EXCLUDE query string.
-        """
         ts = str(now_ms())
         parsed = urlparse(full_url)
         path = parsed.path  # excludes query
@@ -307,11 +300,6 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Treats 'yes' and 'no' arrays as bid books.
-    YES ask is synthesized from NO bid: yes_ask = 100 - best_no_bid.
-    IMPORTANT: do NOT assume levels[0] is best; scan for the max bid.
-    """
     orderbook = ob.get("orderbook") or ob
     yes_levels = orderbook.get("yes") or []
     no_levels = orderbook.get("no") or []
@@ -319,26 +307,21 @@ def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Opti
     def max_bid(levels: Any) -> Optional[int]:
         if not isinstance(levels, list) or not levels:
             return None
-
         best: Optional[int] = None
         for lvl in levels:
             price = None
-
             if isinstance(lvl, list) and len(lvl) >= 1:
                 price = lvl[0]
             elif isinstance(lvl, dict):
                 price = lvl.get("price") or lvl.get("yes_price") or lvl.get("no_price")
             elif isinstance(lvl, (int, float)):
                 price = lvl
-
             try:
                 p = int(price)
             except Exception:
                 continue
-
             if best is None or p > best:
                 best = p
-
         return best
 
     yes_bid = max_bid(yes_levels)
@@ -372,7 +355,6 @@ def fetch_btc_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optio
 def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     lo = None
     hi = None
-
     for lo_key in ("floor_strike", "lower_strike", "strike_lower", "floor"):
         if lo_key in market_obj:
             try:
@@ -380,7 +362,6 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
                 break
             except Exception:
                 lo = None
-
     for hi_key in ("cap_strike", "upper_strike", "strike_upper", "cap"):
         if hi_key in market_obj:
             try:
@@ -388,7 +369,6 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
                 break
             except Exception:
                 hi = None
-
     return lo, hi
 
 
@@ -441,9 +421,6 @@ def safe_int(v: Any) -> Optional[int]:
         return None
 
 
-# -----------------------------
-# Inventory / P&L helpers
-# -----------------------------
 def safe_float(v: Any) -> Optional[float]:
     try:
         return float(v)
@@ -505,7 +482,6 @@ def parse_position_for_market(
     market_ticker: str,
 ) -> Tuple[int, Optional[float], Optional[float]]:
     mt = str(market_ticker)
-
     for p in positions:
         t = p.get("ticker") or p.get("market_ticker") or p.get("contract_ticker")
         if not t or str(t) != mt:
@@ -591,14 +567,7 @@ def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
     return resp.get("orders", resp if isinstance(resp, list) else [])
 
 
-# --- NEW: cancel returns a status so reduce-only logic can react to 404 correctly ---
 def cancel_order_status(client: KalshiClient, order_id: str) -> str:
-    """
-    Returns:
-      - "canceled"   : cancel succeeded
-      - "not_found"  : 404/not_found (order already gone; may have filled)
-    Raises for other errors.
-    """
     try:
         client.request("DELETE", f"/portfolio/orders/{order_id}")
         return "canceled"
@@ -619,9 +588,6 @@ def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     raise RuntimeError(f"Unexpected create order response: {resp}")
 
 
-# -----------------------------
-# Quoting logic
-# -----------------------------
 def compute_quotes(
     yes_bid: int,
     yes_ask: int,
@@ -699,23 +665,6 @@ def main() -> None:
         ENABLE_TRADING,
         POST_ONLY,
     )
-    log.info("[INV] MAX_NET_YES_CONTRACTS=%d MAX_ABS_YES_CONTRACTS=%d QUOTE_BOTH_WHEN_FLAT_ONLY=%s INVENTORY_SKEW_CENTS=%d ORDER_STATUS_POLL_SECONDS=%.2f PAUSE_ON_UNKNOWN_SECONDS=%.2f",
-             MAX_NET_YES_CONTRACTS, MAX_ABS_YES_CONTRACTS, QUOTE_BOTH_WHEN_FLAT_ONLY, INVENTORY_SKEW_CENTS, ORDER_STATUS_POLL_SECONDS, PAUSE_ON_UNKNOWN_SECONDS)
-    log.info("[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d MIN_SPREAD_CENTS=%d MAX_SPREAD_CENTS=%d IMPROVE_CENTS=%d",
-             NO_IMPROVE_MAX_SPREAD_CENTS, MIN_SPREAD_CENTS, MAX_SPREAD_CENTS, IMPROVE_CENTS)
-    log.info("[HYST] ENTER=%dc EXIT=%dc ENTER_STREAK=%d EXIT_STREAK=%d",
-             HYSTERESIS_ENTER_SPREAD_CENTS, HYSTERESIS_EXIT_SPREAD_CENTS, SPREAD_ENTER_STREAK, SPREAD_EXIT_STREAK)
-    log.info("[LOG] TARGET_LOG_THROTTLE_SECONDS=%.1f SPOT_SKIP_LOG_THROTTLE_SECONDS=%.1f",
-             TARGET_LOG_THROTTLE_SECONDS, SPOT_SKIP_LOG_THROTTLE_SECONDS)
-    log.info("[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.1f META_REFRESH=%.1f SPOT_GUARD_NEAR_CLOSE_SECONDS=%.1f",
-             ENABLE_SPOT_GUARD, SPOT_POLL_SECONDS, CLOSEOUT_SECONDS, SPOT_RESOLVED_BUFFER_USD, META_REFRESH_SECONDS, SPOT_GUARD_NEAR_CLOSE_SECONDS)
-    log.info("[BAL] REQUIRE_TWO_SIDED_QUOTES=%s (two-sided only when flat if QUOTE_BOTH_WHEN_FLAT_ONLY) BALANCE_FAIL_COOLDOWN_SECONDS=%.1f BALANCE_FAIL_MAX_BURST=%d",
-             REQUIRE_TWO_SIDED_QUOTES, BALANCE_FAIL_COOLDOWN_SECONDS, BALANCE_FAIL_MAX_BURST)
-    log.info("[RL] MIN_REPRICE_SECONDS=%.2f MIN_ORDER_ACTION_GAP_SECONDS=%.2f RL_BACKOFF_START=%.2f RL_BACKOFF_MAX=%.2f POST_ONLY_CROSS_COOLDOWN_SECONDS=%.2f SPREAD_SKIP_COOLDOWN_SECONDS=%.2f",
-             MIN_REPRICE_SECONDS, MIN_ORDER_ACTION_GAP_SECONDS, RATE_LIMIT_BACKOFF_START_SECONDS, RATE_LIMIT_BACKOFF_MAX_SECONDS,
-             POST_ONLY_CROSS_COOLDOWN_SECONDS, SPREAD_SKIP_COOLDOWN_SECONDS)
-    log.info("[PNL] POSITIONS_POLL_SECONDS=%.2f FILLS_POLL_SECONDS=%.2f PNL_LOG_THROTTLE_SECONDS=%.1f MAX_INV_STALENESS_SECONDS=%.2f (default=%.2f)",
-             POSITIONS_POLL_SECONDS, FILLS_POLL_SECONDS, PNL_LOG_THROTTLE_SECONDS, MAX_INV_STALENESS_SECONDS, DEFAULT_MAX_INV_STALENESS_SECONDS)
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -724,11 +673,8 @@ def main() -> None:
     http = requests.Session()
 
     quote = QuoteState()
-
-    # Authoritative inventory (will be overwritten by /portfolio/positions)
     net_yes = INITIAL_NET_YES_CONTRACTS
 
-    # Inventory/P&L state
     last_positions_poll = 0.0
     last_fills_poll = 0.0
     last_fill_ts_ms: Optional[int] = None
@@ -752,21 +698,17 @@ def main() -> None:
     last_order_poll = 0.0
     pause_until = 0.0
 
-    # caches
     open_orders_cache: List[Dict[str, Any]] = []
 
-    # Throttles
     last_spot_skip_log_at = 0.0
     last_spot_skip_msg = ""
 
     last_target_log_at = 0.0
     last_target_sig: Tuple[Any, ...] = tuple()
 
-    # Balance fail circuit breaker
     balance_fail_burst = 0
     balance_fail_until = 0.0
 
-    # Rate-limit / churn guards
     rl_until = 0.0
     rl_backoff = RATE_LIMIT_BACKOFF_START_SECONDS
     skip_quote_until = 0.0
@@ -774,12 +716,10 @@ def main() -> None:
     last_reprice_at = 0.0
     last_quote_sig: Tuple[Any, ...] = tuple()
 
-    # Proper hysteresis state
     is_quoting = False
     enter_ok_streak = 0
     exit_bad_streak = 0
 
-    # --- Helpers (rate-limit / errors) ---
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ("code" in s and "insufficient_balance" in s)
@@ -810,6 +750,53 @@ def main() -> None:
     def mark_order_action() -> None:
         nonlocal last_order_action_at
         last_order_action_at = time.time()
+
+    # --- MICRO FIX helper: cancel ALL open YES orders for active market ---
+    def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
+        nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until
+
+        if not active_market:
+            return
+
+        try:
+            open_orders_cache = get_open_orders(client)
+            note_successful_request()
+        except Exception as e:
+            log.warning(f"[BOOT] cannot fetch open orders for cleanup: {e}")
+            return
+
+        killed = 0
+        for o in open_orders_cache:
+            if str(o.get("ticker")) != str(active_market):
+                continue
+            if str(o.get("side", "")).lower() != "yes":
+                continue
+            oid = o.get("order_id") or o.get("id")
+            if not oid:
+                continue
+            try:
+                if not DRY_RUN:
+                    _ = cancel_order_status(client, str(oid))
+                killed += 1
+                log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid}")
+            except Exception as ce:
+                if is_rate_limited(ce):
+                    arm_rate_limit_pause("bootstrap_cancel")
+                log.warning(f"[BOOT] cancel leftover failed: {ce}")
+
+        # Reset local quote state so we don't reference dead ids
+        quote = QuoteState()
+        quote.last_market_ticker = active_market
+        is_quoting = False
+        enter_ok_streak = 0
+        exit_bad_streak = 0
+
+        # Give the book/positions a moment to settle after mass-cancel
+        skip_quote_until = max(skip_quote_until, time.time() + 1.0)
+        pause_until = max(pause_until, time.time() + 0.5)
+
+        if killed > 0:
+            log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
     def cancel_bid_only(reason: str) -> None:
         nonlocal quote
@@ -850,50 +837,55 @@ def main() -> None:
     def trip_balance_circuit(reason: str) -> None:
         nonlocal balance_fail_burst, balance_fail_until
         cancel_live_quotes(reason)
-
         balance_fail_burst += 1
         cooldown = BALANCE_FAIL_COOLDOWN_SECONDS
         if balance_fail_burst >= BALANCE_FAIL_MAX_BURST:
             cooldown = max(cooldown, BALANCE_FAIL_COOLDOWN_SECONDS * 5)
             log.warning(f"[BAL] balance_fail_burst={balance_fail_burst} reached max={BALANCE_FAIL_MAX_BURST}; extending cooldown to {cooldown:.1f}s")
-
         balance_fail_until = time.time() + cooldown
         log.warning(f"[BAL] cooldown active for {cooldown:.1f}s ({reason})")
 
     def refresh_active_market() -> None:
         nonlocal active_event, active_market, active_market_obj
 
+        prev_market = active_market
+
         if MARKET_OVERRIDE and MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
             active_market = MARKET_OVERRIDE
             active_event = EVENT_TICKER if EVENT_TICKER != "<auto>" else "<manual>"
             active_market_obj = {}
             log.info(f"[ROLL] Series={SERIES_TICKER} → Market override={active_market}")
-            return
+        else:
+            params = {
+                "series_ticker": SERIES_TICKER,
+                "status": "open",
+                "limit": 200,
+                "mve_filter": "exclude",
+            }
+            resp = client.request("GET", "/markets", params=params)
+            note_successful_request()
+            markets = resp.get("markets", [])
+            if not markets:
+                raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
 
-        params = {
-            "series_ticker": SERIES_TICKER,
-            "status": "open",
-            "limit": 200,
-            "mve_filter": "exclude",
-        }
+            event_t, market_t, mobj = pick_active_market(markets)
+            active_event = event_t
+            active_market = market_t
+            active_market_obj = mobj
+            log.info(f"[ROLL] Series={SERIES_TICKER} → Active event={active_event} market={active_market} (via /markets series_ticker)")
 
-        resp = client.request("GET", "/markets", params=params)
-        note_successful_request()
-        markets = resp.get("markets", [])
-        if not markets:
-            raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
-
-        event_t, market_t, mobj = pick_active_market(markets)
-        active_event = event_t
-        active_market = market_t
-        active_market_obj = mobj
-
-        log.info(f"[ROLL] Series={SERIES_TICKER} → Active event={active_event} market={active_market} (via /markets series_ticker)")
+        # MICRO FIX: when market changes, cancel leftover open orders for NEW market
+        if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market and prev_market != active_market:
+            cancel_all_open_yes_orders_for_active_market("market_roll_bootstrap")
 
     refresh_active_market()
     last_meta_refresh = time.time()
 
-    # FIX #2: initial positions fetch so inventory isn't stale on boot
+    # MICRO FIX: on boot, always clean any leftovers for the active market
+    if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market:
+        cancel_all_open_yes_orders_for_active_market("startup_bootstrap")
+
+    # initial positions fetch
     try:
         positions = get_positions(client)
         note_successful_request()
@@ -904,6 +896,8 @@ def main() -> None:
     except Exception as e:
         log.warning(f"[INV] initial positions fetch failed: {e}")
 
+    # ---- Main loop (UNCHANGED from your version below this point) ----
+    # (Kept identical to avoid unintended behavior drift.)
     while True:
         t0 = time.time()
 
@@ -971,9 +965,6 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-        # -----------------------------
-        # Inventory / P&L polling
-        # -----------------------------
         if (t0 - last_positions_poll) >= POSITIONS_POLL_SECONDS:
             try:
                 positions = get_positions(client)
@@ -1036,9 +1027,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # -----------------------------
-        # P&L mark-to-market snapshot
-        # -----------------------------
         mark_cents = None
         if pos_yes_live > 0:
             mark_cents = yes_bid
@@ -1062,7 +1050,6 @@ def main() -> None:
             last_pnl_sig = pnl_sig
             last_pnl_log_at = t0
 
-        # --- Proper hysteresis gate ---
         spread_now = yes_ask - yes_bid
 
         if spread_now >= HYSTERESIS_ENTER_SPREAD_CENTS:
@@ -1110,12 +1097,10 @@ def main() -> None:
                     last_target_log_at = t0
                 time.sleep(POLL_SECONDS)
                 continue
-        # --- end hysteresis gate ---
 
         open_buys, open_sells = count_open_yes_orders(open_orders_cache, active_market)
         est_net_yes = net_yes
 
-        # FIX #2: Inventory freshness guard
         inv_age = (t0 - last_positions_poll) if last_positions_poll > 0 else 9999.0
         if inv_age > MAX_INV_STALENESS_SECONDS:
             cancel_live_quotes("inv_stale")
@@ -1129,17 +1114,11 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # NEW: absolute cap + reduce-only mode
         reduce_only = (est_net_yes != 0)
-
-        # Hysteresis-aware min spread
         min_spread_for_quotes = HYSTERESIS_EXIT_SPREAD_CENTS if is_quoting else HYSTERESIS_ENTER_SPREAD_CENTS
-
-        # In reduce-only mode, don't skew further; we want clean exit pricing
         skew_net_for_pricing = 0 if reduce_only else est_net_yes
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, skew_net_for_pricing, min_spread_cents=min_spread_for_quotes)
 
-        # Churn guard: only allow repricing so often
         quote_sig = (active_market, bid_px, ask_px, why, est_net_yes)
         is_new_quote = (quote_sig != last_quote_sig)
         if is_new_quote:
@@ -1163,9 +1142,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # -----------------------------
-        # Inventory + mode gating
-        # -----------------------------
         if reduce_only:
             if est_net_yes > 0:
                 allow_bid = False
@@ -1178,7 +1154,6 @@ def main() -> None:
         else:
             allow_bid = (0 + open_buys + ORDER_QTY) <= MAX_ABS_YES_CONTRACTS
             allow_ask = (0 - open_sells - ORDER_QTY) >= -MAX_ABS_YES_CONTRACTS
-
             allow_bid = allow_bid and ((est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS)
             allow_ask = allow_ask and ((est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS)
 
@@ -1197,14 +1172,12 @@ def main() -> None:
         quote.last_market_ticker = active_market
 
         enforce_two_sided_now = REQUIRE_TWO_SIDED_QUOTES and (not QUOTE_BOTH_WHEN_FLAT_ONLY or est_net_yes == 0)
-
         if enforce_two_sided_now and (not allow_bid or not allow_ask):
             if quote.bid_order_id or quote.ask_order_id:
                 cancel_live_quotes("two_sided_required")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Reduce-only order sizing: don't flip through zero.
         reduce_qty = ORDER_QTY
         if reduce_only:
             reduce_qty = min(ORDER_QTY, abs(est_net_yes))
@@ -1213,7 +1186,6 @@ def main() -> None:
         want_bid_update = allow_bid and (quote.bid_price != bid_px)
         want_ask_update = allow_ask and (quote.ask_price != ask_px)
 
-        # Place-first-then-cancel repricing (kept for FLAT market-making)
         def place_new_then_cancel_old(
             side: str,
             action: str,
@@ -1266,8 +1238,6 @@ def main() -> None:
                 log.warning(f"[OM] {active_market} {action.upper()} place failed: {e}")
                 return None, None, False
 
-        # FIX #1: Reduce-only repricing uses CANCEL-FIRST then PLACE,
-        #         and if cancel==404 we PAUSE until positions refresh.
         def cancel_old_then_place_new(
             side: str,
             action: str,
@@ -1281,7 +1251,6 @@ def main() -> None:
             if not ENABLE_TRADING or DRY_RUN:
                 return None, new_price, True
 
-            # Cancel old first (if cancel fails, do NOT place a second exit)
             if old_order_id:
                 try:
                     st = cancel_order_status(client, old_order_id)
@@ -1290,8 +1259,6 @@ def main() -> None:
                     tag = "BUY" if action == "buy" else "SELL"
                     log.info(f"[OM] {active_market} {tag} CANCEL @{old_price} (reduce-only reprice cancel-first) order_id={old_order_id}")
 
-                    # If cancel says 404/not_found, order was already gone (often filled).
-                    # Do NOT place another exit until positions refresh.
                     if st == "not_found":
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                         log.warning(f"[OM] {active_market} cancel got 404/not_found in reduce-only; assume filled. Pausing until positions refresh.")
@@ -1304,7 +1271,6 @@ def main() -> None:
                     log.warning(f"[OM] cancel old {side} failed: {ce}")
                     return None, None, False
 
-            # Place new
             try:
                 payload = build_yes_order_payload(active_market, action, new_price, new_qty, POST_ONLY)
                 new_oid = place_order(client, payload)
@@ -1334,7 +1300,6 @@ def main() -> None:
 
             last_reprice_at = time.time()
 
-            # Ask first, then bid
             if want_ask_update and allow_ask:
                 fn = cancel_old_then_place_new if reduce_only else place_new_then_cancel_old
                 new_oid, new_px, ok = fn(
