@@ -9,7 +9,7 @@
 #    we CANCEL any live quotes we previously posted for that market so we don't leave stale orders resting.
 # 4) Keep an open-orders cache between polls so inventory/allow logic doesn't flip-flop on empty list.
 #
-# ADDITIONAL SAFETY PATCHES (this request):
+# ADDITIONAL SAFETY PATCHES:
 # A) "insufficient_balance" circuit breaker: if SELL or BUY fails due to insufficient balance,
 #    cancel the other side immediately and cool down for N seconds.
 #    If it happens BALANCE_FAIL_MAX_BURST times in a row, extend cooldown.
@@ -141,7 +141,7 @@ INITIAL_NET_YES_CONTRACTS = env_int("INITIAL_NET_YES_CONTRACTS", 0)
 ORDER_STATUS_POLL_SECONDS = env_float("ORDER_STATUS_POLL_SECONDS", 1.0)
 PAUSE_ON_UNKNOWN_SECONDS = env_float("PAUSE_ON_UNKNOWN_SECONDS", 0.75)
 
-# Balance / collateral safety (ADDED)
+# Balance / collateral safety
 BALANCE_FAIL_COOLDOWN_SECONDS = env_float("BALANCE_FAIL_COOLDOWN_SECONDS", 10.0)
 BALANCE_FAIL_MAX_BURST = env_int("BALANCE_FAIL_MAX_BURST", 3)
 REQUIRE_TWO_SIDED_QUOTES = env_bool("REQUIRE_TWO_SIDED_QUOTES", True)
@@ -584,7 +584,7 @@ def main() -> None:
     last_target_log_at = 0.0
     last_target_sig: Tuple[Any, ...] = tuple()
 
-    # Balance fail circuit breaker (ADDED)
+    # Balance fail circuit breaker
     balance_fail_burst = 0
     balance_fail_until = 0.0
 
@@ -596,37 +596,7 @@ def main() -> None:
     last_reprice_at = 0.0
     last_quote_sig: Tuple[Any, ...] = tuple()
 
-    def cancel_live_quotes(reason: str) -> None:
-        """Cancel any currently tracked live bid/ask orders (if any) and clear local quote state."""
-        nonlocal quote
-        if not active_market:
-            return
-
-        if quote.bid_order_id:
-            try:
-                if not DRY_RUN:
-                    cancel_order(client, quote.bid_order_id)
-                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
-            except Exception as e:
-                if is_rate_limited(e):
-                    arm_rate_limit_pause("cancel_live_quotes/bid")
-                log.warning(f"[OM] cancel bid failed ({reason}): {e}")
-            quote.bid_order_id = None
-            quote.bid_price = None
-
-        if quote.ask_order_id:
-            try:
-                if not DRY_RUN:
-                    cancel_order(client, quote.ask_order_id)
-                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
-            except Exception as e:
-                if is_rate_limited(e):
-                    arm_rate_limit_pause("cancel_live_quotes/ask")
-                log.warning(f"[OM] cancel ask failed ({reason}): {e}")
-            quote.ask_order_id = None
-            quote.ask_price = None
-
-    # Helpers (ADDED)
+    # --- Helpers (rate-limit / errors) ---
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ('"code":"insufficient_balance"' in s) or ('"code": "insufficient_balance"' in s)
@@ -659,6 +629,36 @@ def main() -> None:
     def mark_order_action() -> None:
         nonlocal last_order_action_at
         last_order_action_at = time.time()
+
+    def cancel_live_quotes(reason: str) -> None:
+        """Cancel any currently tracked live bid/ask orders (if any) and clear local quote state."""
+        nonlocal quote
+        if not active_market:
+            return
+
+        if quote.bid_order_id:
+            try:
+                if not DRY_RUN:
+                    cancel_order(client, quote.bid_order_id)
+                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
+            except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("cancel_live_quotes/bid")
+                log.warning(f"[OM] cancel bid failed ({reason}): {e}")
+            quote.bid_order_id = None
+            quote.bid_price = None
+
+        if quote.ask_order_id:
+            try:
+                if not DRY_RUN:
+                    cancel_order(client, quote.ask_order_id)
+                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
+            except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("cancel_live_quotes/ask")
+                log.warning(f"[OM] cancel ask failed ({reason}): {e}")
+            quote.ask_order_id = None
+            quote.ask_price = None
 
     def trip_balance_circuit(reason: str) -> None:
         """Cancel both sides and enter cooldown; enforce burst escalation."""
@@ -811,12 +811,12 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Balance cooldown gate (ADDED)
+        # Balance cooldown gate
         if time.time() < balance_fail_until:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Rate-limit / cooldown gates (ADDED)
+        # Rate-limit / cooldown gates
         if time.time() < rl_until:
             time.sleep(POLL_SECONDS)
             continue
@@ -852,7 +852,7 @@ def main() -> None:
 
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, est_net_yes)
 
-        # Churn guard: only allow repricing so often (ADDED)
+        # Churn guard: only allow repricing so often
         quote_sig = (active_market, bid_px, ask_px, why, est_net_yes)
         is_new_quote = (quote_sig != last_quote_sig)
         if is_new_quote:
@@ -888,9 +888,8 @@ def main() -> None:
         quote.last_market_ticker = active_market
 
         # -----------------------------
-        # ATOMIC TWO-SIDED QUOTING (ADDED / REPLACED BID+ASK BLOCK)
+        # ATOMIC TWO-SIDED QUOTING
         # -----------------------------
-
         if REQUIRE_TWO_SIDED_QUOTES and (not allow_bid or not allow_ask):
             if quote.bid_order_id or quote.ask_order_id:
                 cancel_live_quotes("two_sided_required")
@@ -1022,7 +1021,6 @@ def main() -> None:
                 if has_bid != has_ask:
                     cancel_live_quotes("atomic_two_sided_enforce")
                 else:
-                    # Both sides good: reset burst on success (ADDED)
                     if has_bid and has_ask:
                         balance_fail_burst = 0
 
