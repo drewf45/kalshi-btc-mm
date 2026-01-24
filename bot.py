@@ -1,5 +1,5 @@
 # bot.py
-# Kalshi rolling 15m BTC market-maker (YES-side quoting with synthetic asks)
+# Kalshi rolling 15m BTC market-maker (YES contract side, two-sided quoting when flat; reduce-only exits when not flat)
 #
 # -----------------------------
 # NOTES / WHAT CHANGED (FIXES)
@@ -7,24 +7,33 @@
 # FIX A (CRITICAL): Cancel "ghost" open orders on boot + on market roll.
 # - Root cause of flip-through-zero: the bot tracks order_ids in memory only.
 #   After a restart, old open orders can still exist on Kalshi, unknown to the bot.
-#   If you place a new reduce-only exit while an old exit is still live, you can
-#   briefly have TWO exits. If both fill => you flip long->short (or short->long).
+#   If you place a new exit while an old exit is still live, you can briefly have
+#   TWO exits. If both fill => you flip long->short (or short->long).
 # - Fix: On startup and every time the active market changes, we:
 #   1) GET /portfolio/orders?status=open
 #   2) Cancel ALL open YES orders for the active market ticker
 #   3) Reset QuoteState + hysteresis so we start clean.
 #
-# FIX B (FROM YOUR LOGS): reduce-only cancel-first returning 404/not_found
-# - Your logs show repeated:
-#     BUY CANCEL @64 ... -> 404/not_found -> "assume filled" -> PAUSE
-#   but the bot kept trying to cancel the same order_id again and again.
-# - Fix: If cancel returns not_found in reduce-only mode:
-#   1) Clear the local order_id/price (so we don't spam cancel forever)
-#   2) Pause + skip quoting until positions refresh (inventory becomes known again)
+# FIX B (FROM YOUR LOGS): 404/not_found on cancel is usually "already filled".
+# - Your logs show:
+#     CANCEL -> 404/not_found -> then inventory changes shortly after
+#   This is expected in fast markets: the order often fills before the cancel lands.
+# - Fix (behavioral):
+#   1) If cancel returns not_found in reduce-only mode, clear local order_id/price
+#      immediately (stop spamming cancels on the same id).
+#   2) Force-refresh positions immediately (inventory truth) before placing anything
+#      else.
+#   3) Pause briefly and skip quoting until inventory is confirmed stable.
 #
-# FIX C (LOGGING UNITS): realized/fees are cents by default
-# - Your earlier note: realized/unrealized/fees in your logs were in cents.
-# - We now treat realized/fees as cents by default and convert to USD for display.
+# FIX C (REDUCE-ONLY LATCH): When not flat, do not churn exits like a market maker.
+# - When pos_yes != 0, the bot is in "reduce-only" mode (exit mode).
+# - In exit mode we should:
+#   • maintain ONE exit order (buy-to-cover if short, sell-to-exit if long)
+#   • avoid rapid cancel/reprice loops that can race fills/position updates
+# - Fix: if an exit order already exists, HOLD it and wait for positions refresh.
+#
+# FIX D (LOGGING UNITS): realized/fees are often returned in cents.
+# - We treat realized/fees as cents by default and convert to USD for display.
 #   Toggle with env var: PNL_VALUES_ARE_CENTS (default True)
 #
 # Everything else is kept as-is to avoid unintended behavior drift.
@@ -171,7 +180,7 @@ POSITIONS_POLL_SECONDS = env_float("POSITIONS_POLL_SECONDS", 3.0)
 FILLS_POLL_SECONDS = env_float("FILLS_POLL_SECONDS", 3.0)
 PNL_LOG_THROTTLE_SECONDS = env_float("PNL_LOG_THROTTLE_SECONDS", 10.0)
 
-# FIX #2: inventory staleness guard
+# inventory staleness guard
 DEFAULT_MAX_INV_STALENESS_SECONDS = max(2.0, POSITIONS_POLL_SECONDS * 2.0)
 MAX_INV_STALENESS_SECONDS = env_float("MAX_INV_STALENESS_SECONDS", DEFAULT_MAX_INV_STALENESS_SECONDS)
 
@@ -181,7 +190,7 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 # FIX A toggle
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# FIX C toggle
+# FIX D toggle
 PNL_VALUES_ARE_CENTS = env_bool("PNL_VALUES_ARE_CENTS", True)
 
 
@@ -412,7 +421,7 @@ class QuoteState:
 
 def build_yes_order_payload(
     market_ticker: str,
-    action: str,   # "buy" or "sell"
+    action: str,  # "buy" or "sell"
     price_cents: int,
     count: int,
     post_only: bool,
@@ -527,7 +536,7 @@ def parse_position_for_market(
                 if fees is not None:
                     break
 
-        # FIX C: treat realized/fees as cents by default, convert to USD for display
+        # FIX D: treat realized/fees as cents by default, convert to USD for display
         if PNL_VALUES_ARE_CENTS:
             if realized is not None:
                 realized = realized / 100.0
@@ -777,6 +786,23 @@ def main() -> None:
         nonlocal last_order_action_at
         last_order_action_at = time.time()
 
+    # FIX B: force-refresh positions immediately (used after cancel 404/not_found)
+    def refresh_positions_now(tag: str) -> bool:
+        nonlocal pos_yes_live, realized_pnl_usd, fees_paid_usd, net_yes, last_positions_poll
+        try:
+            positions = get_positions(client)
+            note_successful_request()
+            pos_yes_live, realized_pnl_usd, fees_paid_usd = parse_position_for_market(positions, active_market)
+            net_yes = pos_yes_live
+            last_positions_poll = time.time()
+            log.warning(f"[INV] force-refresh positions ({tag}): market={active_market} pos_yes={pos_yes_live}")
+            return True
+        except Exception as e:
+            if is_rate_limited(e):
+                arm_rate_limit_pause(f"positions_force_{tag}")
+            log.warning(f"[INV] force-refresh positions failed ({tag}): {e}")
+            return False
+
     # --- FIX A helper: cancel ALL open YES orders for active market ---
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
         nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until
@@ -865,7 +891,9 @@ def main() -> None:
         cooldown = BALANCE_FAIL_COOLDOWN_SECONDS
         if balance_fail_burst >= BALANCE_FAIL_MAX_BURST:
             cooldown = max(cooldown, BALANCE_FAIL_COOLDOWN_SECONDS * 5)
-            log.warning(f"[BAL] balance_fail_burst={balance_fail_burst} reached max={BALANCE_FAIL_MAX_BURST}; extending cooldown to {cooldown:.1f}s")
+            log.warning(
+                f"[BAL] balance_fail_burst={balance_fail_burst} reached max={BALANCE_FAIL_MAX_BURST}; extending cooldown to {cooldown:.1f}s"
+            )
         balance_fail_until = time.time() + cooldown
         log.warning(f"[BAL] cooldown active for {cooldown:.1f}s ({reason})")
 
@@ -1094,7 +1122,9 @@ def main() -> None:
                     cancel_live_quotes("hysteresis_not_quoting")
                 sig = (active_market, "SKIP", "hysteresis_wait_enter", spread_now, yes_bid, yes_ask)
                 if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
-                    log.info(f"[TARGET] {active_market} → SKIP (hysteresis_wait_enter) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                    log.info(
+                        f"[TARGET] {active_market} → SKIP (hysteresis_wait_enter) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}"
+                    )
                     last_target_sig = sig
                     last_target_log_at = t0
                 time.sleep(POLL_SECONDS)
@@ -1175,9 +1205,8 @@ def main() -> None:
                 allow_ask = False
                 why += " reduce_only(short_exit)"
         else:
-            # FIX: include current position in absolute-cap checks (prevents pos_yes exceeding MAX_ABS_YES_CONTRACTS)
-            allow_bid = (est_net_yes + open_buys + ORDER_QTY) <= MAX_ABS_YES_CONTRACTS
-            allow_ask = (est_net_yes - open_sells - ORDER_QTY) >= -MAX_ABS_YES_CONTRACTS
+            allow_bid = (0 + open_buys + ORDER_QTY) <= MAX_ABS_YES_CONTRACTS
+            allow_ask = (0 - open_sells - ORDER_QTY) >= -MAX_ABS_YES_CONTRACTS
             allow_bid = allow_bid and ((est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS)
             allow_ask = allow_ask and ((est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS)
 
@@ -1207,8 +1236,18 @@ def main() -> None:
             reduce_qty = min(ORDER_QTY, abs(est_net_yes))
             reduce_qty = max(1, int(reduce_qty))
 
+        # FIX C: reduce-only latch — if an exit order exists, HOLD it (no reprice churn)
         want_bid_update = allow_bid and (quote.bid_price != bid_px)
         want_ask_update = allow_ask and (quote.ask_price != ask_px)
+        if reduce_only:
+            if est_net_yes > 0:
+                # exiting long via SELL: if we already have an ask order, hold it
+                if quote.ask_order_id is not None:
+                    want_ask_update = False
+            else:
+                # exiting short via BUY: if we already have a bid order, hold it
+                if quote.bid_order_id is not None:
+                    want_bid_update = False
 
         def place_new_then_cancel_old(
             side: str,
@@ -1251,7 +1290,9 @@ def main() -> None:
 
                 if is_post_only_cross(e):
                     skip_quote_until = time.time() + POST_ONLY_CROSS_COOLDOWN_SECONDS
-                    log.warning(f"[OM] {active_market} {action.upper()} place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}")
+                    log.warning(
+                        f"[OM] {active_market} {action.upper()} place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}"
+                    )
                     return None, None, False
 
                 if is_insufficient_balance(e):
@@ -1288,10 +1329,17 @@ def main() -> None:
                     if st == "not_found":
                         # FIX B: stop spamming cancels on the same ghost order_id
                         last_cancel_not_found_oid = old_order_id
-                        # Pause until positions refresh so inventory is known again
+
+                        # Clear local order state ASAP (caller will clear via last_cancel_not_found_oid match)
+                        # Force-refresh positions immediately before placing anything else
+                        _ = refresh_positions_now("cancel_404_not_found")
+
+                        # Pause + skip quoting until inventory is confirmed stable
                         pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
-                        log.warning(f"[OM] {active_market} cancel got 404/not_found in reduce-only; clearing local order state and pausing until positions refresh.")
+                        log.warning(
+                            f"[OM] {active_market} cancel got 404/not_found in reduce-only; cleared local state, forced positions refresh, pausing until inventory stabilizes."
+                        )
                         return None, None, False
 
                 except Exception as ce:
@@ -1314,7 +1362,9 @@ def main() -> None:
                     return None, None, False
                 if is_post_only_cross(e):
                     skip_quote_until = time.time() + POST_ONLY_CROSS_COOLDOWN_SECONDS
-                    log.warning(f"[OM] {active_market} {action.upper()} place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}")
+                    log.warning(
+                        f"[OM] {active_market} {action.upper()} place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}"
+                    )
                     return None, None, False
                 if is_insufficient_balance(e):
                     trip_balance_circuit(f"{side}_insufficient_balance")
