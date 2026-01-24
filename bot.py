@@ -36,6 +36,8 @@
 # - Uses GET /markets/{ticker}/orderbook
 # - Kalshi orderbook is treated as "bids" for YES/NO; YES ask is synthesized from NO bid:
 #     yes_ask ~= 100 - best_no_bid
+# - Market selection is liquidity-aware (ADDED): when refreshing, scan up to N candidate markets and
+#   pick the first one with a usable orderbook (yes_bid + synthetic yes_ask) AND spread within bounds.
 # - POST /portfolio/orders, DELETE /portfolio/orders/{id}
 # - RSA-PSS signing:
 #     signature_message = f"{timestamp_ms}{method}{path_without_query}"
@@ -312,6 +314,78 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         raise RuntimeError(f"Could not determine event/market ticker from market object: {chosen}")
 
     return str(event_ticker), str(market_ticker), chosen
+
+
+# (ADDED) Liquidity-aware picker: scan a few candidates and choose one that can actually quote
+def pick_liquid_market(
+    client: KalshiClient,
+    markets: List[Dict[str, Any]],
+    max_checks: int = 8,
+    min_spread: int = MIN_SPREAD_CENTS,
+    max_spread: int = MAX_SPREAD_CENTS,
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Prefer an ACTIVE market whose orderbook yields (yes_bid, yes_ask) and spread within bounds.
+    Falls back to pick_active_market if none found quickly.
+    """
+    now_ts = int(time.time())
+
+    def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
+        v = obj.get(key)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    # candidates: active first (soonest close), then future (soonest close)
+    candidates: List[Tuple[int, int, Dict[str, Any]]] = []
+    for m in markets:
+        status = str(m.get("status", "")).lower()
+        if status and status != "open":
+            continue
+
+        ot = get_ts(m, "open_time") or get_ts(m, "open_ts") or get_ts(m, "open_timestamp")
+        ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
+        if ct is None:
+            continue
+
+        is_active = (ot is not None and ot <= now_ts < ct)
+        candidates.append((0 if is_active else 1, ct, m))
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+
+    checks = 0
+    for _, _, m in candidates:
+        if checks >= max_checks:
+            break
+
+        market_ticker = m.get("ticker") or m.get("market_ticker")
+        event_ticker = m.get("event_ticker") or m.get("event", {}).get("ticker") or m.get("event_ticker")
+        if not market_ticker or not event_ticker:
+            continue
+
+        checks += 1
+        try:
+            ob = client.request("GET", f"/markets/{market_ticker}/orderbook")
+            yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
+            if yes_bid is None or yes_ask is None:
+                continue
+
+            if yes_bid >= yes_ask:
+                continue
+
+            spread = yes_ask - yes_bid
+            if spread < min_spread or spread > max_spread:
+                continue
+
+            return str(event_ticker), str(market_ticker), m
+
+        except Exception:
+            continue
+
+    return pick_active_market(markets)
 
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
@@ -751,7 +825,9 @@ def main() -> None:
         if not markets:
             raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
 
-        event_t, market_t, mobj = pick_active_market(markets)
+        # (CHANGED) choose a market that actually has a usable orderbook + spread within bounds
+        event_t, market_t, mobj = pick_liquid_market(client, markets, max_checks=8)
+
         active_event = event_t
         active_market = market_t
         active_market_obj = mobj
