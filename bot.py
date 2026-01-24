@@ -1,21 +1,19 @@
 # bot.py
 # Kalshi rolling 15m BTC market-maker (YES-side quoting with synthetic asks)
 #
-# FIX in this version:
-# - Your bot was getting stuck in a SPOT guard “skip loop” and spamming logs every 0.20s.
-# - Now the SPOT guard only blocks quoting when the market is CLOSE to settling
-#   (default: last 90 seconds), and the skip log is throttled.
+# FIXES in this version:
+# 1) MAX_SPREAD_CENTS: if spread is too wide (default 30c), skip quoting entirely.
+#    This prevents nonsense targets like bid@2 ask@98 when the book is basically empty.
+# 2) Throttle [TARGET] logs so you don't spam every 0.20s.
 #
-# Key features:
-# - Auto-rolls to the active market in a series via GET /markets?series_ticker=...
-# - Reads orderbook via GET /markets/{ticker}/orderbook (Kalshi provides bids only)
-#   and synthesizes YES ask from NO bid: yes_ask = 100 - best_no_bid
-# - Places POST-ONLY limit orders via POST /portfolio/orders
-# - Cancels/reprices when targets move
-# - Inventory skew + max net inventory guard (simple, uses local + open orders only)
-# - Spot guard near resolution bounds (optional; uses Coinbase spot)
-# - Correct Kalshi request signing (RSA-PSS):
-#   signature_message = f"{timestamp_ms}{method}{path_without_query}"
+# Notes:
+# - Uses GET /markets?series_ticker=... to auto-roll
+# - Uses GET /markets/{ticker}/orderbook
+# - Kalshi orderbook is treated as "bids" for YES/NO; YES ask is synthesized from NO bid:
+#     yes_ask ~= 100 - best_no_bid
+# - POST /portfolio/orders, DELETE /portfolio/orders/{id}
+# - RSA-PSS signing:
+#     signature_message = f"{timestamp_ms}{method}{path_without_query}"
 
 import os
 import time
@@ -107,6 +105,7 @@ ORDER_QTY = env_int("ORDER_QTY", 1)
 IMPROVE_CENTS = env_int("IMPROVE_CENTS", 1)
 NO_IMPROVE_MAX_SPREAD_CENTS = env_int("NO_IMPROVE_MAX_SPREAD_CENTS", 4)  # <= spread: join, don't improve
 MIN_SPREAD_CENTS = env_int("MIN_SPREAD_CENTS", 2)  # if spread < this, skip
+MAX_SPREAD_CENTS = env_int("MAX_SPREAD_CENTS", 30)  # NEW: if spread > this, skip (prevents 2/98 nonsense)
 
 # Inventory control (simple)
 MAX_NET_YES_CONTRACTS = env_int("MAX_NET_YES_CONTRACTS", 2)
@@ -122,8 +121,6 @@ ENABLE_SPOT_GUARD = env_bool("ENABLE_SPOT_GUARD", True)
 SPOT_POLL_SECONDS = env_float("SPOT_POLL_SECONDS", 12.0)
 SPOT_RESOLVED_BUFFER_USD = env_float("SPOT_RESOLVED_BUFFER_USD", 75.0)
 CLOSEOUT_SECONDS = env_float("CLOSEOUT_SECONDS", 20.0)
-
-# NEW: only enforce spot guard close to settlement (prevents “always skipping”)
 SPOT_GUARD_NEAR_CLOSE_SECONDS = env_float("SPOT_GUARD_NEAR_CLOSE_SECONDS", 90.0)
 
 # Coinbase spot endpoint
@@ -265,6 +262,10 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Treats 'yes' and 'no' arrays as best bids.
+    YES ask is synthesized from NO bid: yes_ask = 100 - best_no_bid.
+    """
     orderbook = ob.get("orderbook") or ob
     yes_bids = orderbook.get("yes") or []
     no_bids = orderbook.get("no") or []
@@ -404,8 +405,14 @@ def compute_quotes(
     net_yes: int,
 ) -> Tuple[Optional[int], Optional[int], str]:
     spread = yes_ask - yes_bid
+
     if spread < MIN_SPREAD_CENTS:
         return None, None, f"spread_too_tight({spread})"
+
+    # NEW: if spread is absurd, do NOT quote at all
+    if spread > MAX_SPREAD_CENTS:
+        return None, None, f"spread_too_wide({spread}>{MAX_SPREAD_CENTS})"
+
     if yes_bid >= yes_ask:
         return None, None, "crossed_or_invalid"
 
@@ -471,7 +478,8 @@ def main() -> None:
     )
     log.info("[INV] MAX_NET_YES_CONTRACTS=%d INVENTORY_SKEW_CENTS=%d ORDER_STATUS_POLL_SECONDS=%.2f PAUSE_ON_UNKNOWN_SECONDS=%.2f",
              MAX_NET_YES_CONTRACTS, INVENTORY_SKEW_CENTS, ORDER_STATUS_POLL_SECONDS, PAUSE_ON_UNKNOWN_SECONDS)
-    log.info("[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d (<= this spread: join, do not improve)", NO_IMPROVE_MAX_SPREAD_CENTS)
+    log.info("[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d MIN_SPREAD_CENTS=%d MAX_SPREAD_CENTS=%d IMPROVE_CENTS=%d",
+             NO_IMPROVE_MAX_SPREAD_CENTS, MIN_SPREAD_CENTS, MAX_SPREAD_CENTS, IMPROVE_CENTS)
     log.info("[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.1f META_REFRESH=%.1f SPOT_GUARD_NEAR_CLOSE_SECONDS=%.1f",
              ENABLE_SPOT_GUARD, SPOT_POLL_SECONDS, CLOSEOUT_SECONDS, SPOT_RESOLVED_BUFFER_USD, META_REFRESH_SECONDS, SPOT_GUARD_NEAR_CLOSE_SECONDS)
 
@@ -495,9 +503,12 @@ def main() -> None:
     last_order_poll = 0.0
     pause_until = 0.0
 
-    # NEW: throttle spot-skip logging
+    # Throttles
     last_spot_skip_log_at = 0.0
     last_spot_skip_msg = ""
+
+    last_target_log_at = 0.0
+    last_target_sig: Tuple[Any, ...] = tuple()
 
     def refresh_active_market() -> None:
         nonlocal active_event, active_market, active_market_obj
@@ -545,7 +556,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # spot poll
         if ENABLE_SPOT_GUARD and (t0 - last_spot_poll) >= SPOT_POLL_SECONDS:
             spot_usd = fetch_btc_spot_usd(http)
             last_spot_poll = t0
@@ -555,7 +565,6 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = close_ts - int(time.time())
 
-        # closeout hard-stop (always)
         if secs_to_close is not None and secs_to_close <= CLOSEOUT_SECONDS:
             if quote.bid_order_id:
                 try:
@@ -573,11 +582,9 @@ def main() -> None:
                 except Exception as e:
                     log.warning(f"[OM] cancel ask failed: {e}")
                 quote.ask_order_id = None
-
             time.sleep(POLL_SECONDS)
             continue
 
-        # SPOT resolved-buffer guard ONLY near close (prevents getting stuck skipping all the time)
         if ENABLE_SPOT_GUARD and spot_usd is not None and secs_to_close is not None and secs_to_close <= SPOT_GUARD_NEAR_CLOSE_SECONDS:
             lo, hi = market_bounds_usd(active_market_obj)
             if lo is not None and abs(spot_usd - lo) <= SPOT_RESOLVED_BUFFER_USD:
@@ -597,7 +604,6 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-        # Poll open orders for safety / inventory context
         open_orders: List[Dict[str, Any]] = []
         if (t0 - last_order_poll) >= ORDER_STATUS_POLL_SECONDS:
             try:
@@ -613,7 +619,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Read orderbook
         try:
             ob = client.request("GET", f"/markets/{active_market}/orderbook")
         except Exception as e:
@@ -622,27 +627,32 @@ def main() -> None:
             continue
 
         yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
-
         if yes_bid is None or yes_ask is None:
-            log.info(f"[TARGET] {active_market} → SKIP (no_yes_bid_or_ask)")
+            # throttle this too (don’t spam)
+            sig = (active_market, "no_yes_bid_or_ask")
+            if sig != last_target_sig or (t0 - last_target_log_at) >= 2.0:
+                log.info(f"[TARGET] {active_market} → SKIP (no_yes_bid_or_ask)")
+                last_target_sig = sig
+                last_target_log_at = t0
             time.sleep(POLL_SECONDS)
             continue
 
         open_buys, open_sells = count_open_yes_orders(open_orders, active_market)
         est_net_yes = net_yes
-        est_pending_long = open_buys
-        est_pending_short = open_sells
 
         bid_px, ask_px, why = compute_quotes(yes_bid, yes_ask, est_net_yes)
         if bid_px is None or ask_px is None:
-            log.info(f"[TARGET] {active_market} → SKIP ({why})")
+            sig = (active_market, "SKIP", why, yes_bid, yes_ask)
+            if sig != last_target_sig or (t0 - last_target_log_at) >= 2.0:
+                log.info(f"[TARGET] {active_market} → SKIP ({why}) best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
+                last_target_sig = sig
+                last_target_log_at = t0
             time.sleep(POLL_SECONDS)
             continue
 
-        allow_bid = (est_net_yes + est_pending_long) < MAX_NET_YES_CONTRACTS
-        allow_ask = (est_net_yes - est_pending_short) > -MAX_NET_YES_CONTRACTS
+        allow_bid = (est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS
+        allow_ask = (est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS
 
-        # If market changed, clear state (and try to cancel lingering orders)
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
             if quote.bid_order_id:
                 try:
@@ -663,76 +673,59 @@ def main() -> None:
         quote.last_market_ticker = active_market
 
         # BID
-        if allow_bid:
-            if quote.bid_price != bid_px:
-                if quote.bid_order_id:
-                    try:
-                        if not DRY_RUN:
-                            cancel_order(client, quote.bid_order_id)
-                        log.info(f"[OM] {active_market} BUY CANCEL @{quote.bid_price} (reprice) order_id={quote.bid_order_id}")
-                    except Exception as e:
-                        log.warning(f"[OM] cancel bid failed: {e}")
-                    quote.bid_order_id = None
-
-                if ENABLE_TRADING and not DRY_RUN:
-                    try:
-                        payload = build_yes_order_payload(active_market, "buy", bid_px, ORDER_QTY, POST_ONLY)
-                        oid = place_order(client, payload)
-                        quote.bid_order_id = oid
-                        quote.bid_price = bid_px
-                        log.info(f"[OM] {active_market} BUY POSTED order_id={oid} @ {bid_px} qty={ORDER_QTY}")
-                    except Exception as e:
-                        log.warning(f"[OM] {active_market} BUY place failed: {e}")
-                else:
-                    quote.bid_price = bid_px
-                    log.info(f"[OM] {active_market} BUY PLACE @ {bid_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
-        else:
+        if allow_bid and quote.bid_price != bid_px:
             if quote.bid_order_id:
                 try:
                     if not DRY_RUN:
                         cancel_order(client, quote.bid_order_id)
-                    log.info(f"[OM] {active_market} BUY CANCEL (inv_cap) order_id={quote.bid_order_id}")
+                    log.info(f"[OM] {active_market} BUY CANCEL @{quote.bid_price} (reprice) order_id={quote.bid_order_id}")
                 except Exception as e:
                     log.warning(f"[OM] cancel bid failed: {e}")
                 quote.bid_order_id = None
-                quote.bid_price = None
+
+            if ENABLE_TRADING and not DRY_RUN:
+                try:
+                    payload = build_yes_order_payload(active_market, "buy", bid_px, ORDER_QTY, POST_ONLY)
+                    oid = place_order(client, payload)
+                    quote.bid_order_id = oid
+                    quote.bid_price = bid_px
+                    log.info(f"[OM] {active_market} BUY POSTED order_id={oid} @ {bid_px} qty={ORDER_QTY}")
+                except Exception as e:
+                    log.warning(f"[OM] {active_market} BUY place failed: {e}")
+            else:
+                quote.bid_price = bid_px
+                log.info(f"[OM] {active_market} BUY PLACE @ {bid_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
 
         # ASK
-        if allow_ask:
-            if quote.ask_price != ask_px:
-                if quote.ask_order_id:
-                    try:
-                        if not DRY_RUN:
-                            cancel_order(client, quote.ask_order_id)
-                        log.info(f"[OM] {active_market} SELL CANCEL @{quote.ask_price} (reprice) order_id={quote.ask_order_id}")
-                    except Exception as e:
-                        log.warning(f"[OM] cancel ask failed: {e}")
-                    quote.ask_order_id = None
-
-                if ENABLE_TRADING and not DRY_RUN:
-                    try:
-                        payload = build_yes_order_payload(active_market, "sell", ask_px, ORDER_QTY, POST_ONLY)
-                        oid = place_order(client, payload)
-                        quote.ask_order_id = oid
-                        quote.ask_price = ask_px
-                        log.info(f"[OM] {active_market} SELL POSTED order_id={oid} @ {ask_px} qty={ORDER_QTY}")
-                    except Exception as e:
-                        log.warning(f"[OM] {active_market} SELL place failed: {e}")
-                else:
-                    quote.ask_price = ask_px
-                    log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
-        else:
+        if allow_ask and quote.ask_price != ask_px:
             if quote.ask_order_id:
                 try:
                     if not DRY_RUN:
                         cancel_order(client, quote.ask_order_id)
-                    log.info(f"[OM] {active_market} SELL CANCEL (inv_cap) order_id={quote.ask_order_id}")
+                    log.info(f"[OM] {active_market} SELL CANCEL @{quote.ask_price} (reprice) order_id={quote.ask_order_id}")
                 except Exception as e:
                     log.warning(f"[OM] cancel ask failed: {e}")
                 quote.ask_order_id = None
-                quote.ask_price = None
 
-        log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
+            if ENABLE_TRADING and not DRY_RUN:
+                try:
+                    payload = build_yes_order_payload(active_market, "sell", ask_px, ORDER_QTY, POST_ONLY)
+                    oid = place_order(client, payload)
+                    quote.ask_order_id = oid
+                    quote.ask_price = ask_px
+                    log.info(f"[OM] {active_market} SELL POSTED order_id={oid} @ {ask_px} qty={ORDER_QTY}")
+                except Exception as e:
+                    log.warning(f"[OM] {active_market} SELL place failed: {e}")
+            else:
+                quote.ask_price = ask_px
+                log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
+
+        # THROTTLED TARGET LOG
+        sig = (active_market, bid_px, ask_px, why)
+        if sig != last_target_sig or (t0 - last_target_log_at) >= 2.0:
+            log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
+            last_target_sig = sig
+            last_target_log_at = t0
 
         dt = time.time() - t0
         time.sleep(max(0.0, POLL_SECONDS - dt))
