@@ -44,7 +44,10 @@
 #   and waits POST_ONLY_CROSS_COOLDOWN_SECONDS before trying again.
 #
 # IMPORTANT DISCLAIMER:
-# This bot still does NOT compute true inventory from fills/positions; net_yes is static unless you add that endpoint.
+# This bot now DOES compute inventory + basic P&L:
+# - Inventory from /portfolio/positions (best-effort parsing)
+# - Realized/fees from positions if available
+# - Unrealized MTM using best bid/ask + simple entry from recent fills
 
 import os
 import time
@@ -178,6 +181,11 @@ SPOT_POLL_SECONDS = env_float("SPOT_POLL_SECONDS", 12.0)
 SPOT_RESOLVED_BUFFER_USD = env_float("SPOT_RESOLVED_BUFFER_USD", 75.0)
 CLOSEOUT_SECONDS = env_float("CLOSEOUT_SECONDS", 20.0)
 SPOT_GUARD_NEAR_CLOSE_SECONDS = env_float("SPOT_GUARD_NEAR_CLOSE_SECONDS", 90.0)
+
+# Inventory / P&L polling (ADDED)
+POSITIONS_POLL_SECONDS = env_float("POSITIONS_POLL_SECONDS", 3.0)
+FILLS_POLL_SECONDS = env_float("FILLS_POLL_SECONDS", 3.0)
+PNL_LOG_THROTTLE_SECONDS = env_float("PNL_LOG_THROTTLE_SECONDS", 10.0)
 
 # Coinbase spot endpoint
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
@@ -452,6 +460,177 @@ def safe_int(v: Any) -> Optional[int]:
         return None
 
 
+# -----------------------------
+# Inventory / P&L helpers (ADDED)
+# -----------------------------
+def safe_float(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def get_positions(client: KalshiClient) -> List[Dict[str, Any]]:
+    """
+    Fetch positions from Kalshi. Schema varies slightly across versions;
+    we defensively handle common shapes.
+    """
+    resp = client.request("GET", "/portfolio/positions", params={"limit": 200})
+    if isinstance(resp, dict):
+        for k in ("positions", "market_positions", "portfolio_positions"):
+            if k in resp and isinstance(resp[k], list):
+                return resp[k]
+    if isinstance(resp, list):
+        return resp
+    return []
+
+
+def get_fills(client: KalshiClient, min_ts_ms: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Fetch fills. We optionally pass min_ts to get only recent fills.
+    """
+    params: Dict[str, Any] = {"limit": int(limit)}
+    if min_ts_ms is not None and min_ts_ms > 0:
+        params["min_ts"] = int(min_ts_ms)
+    resp = client.request("GET", "/portfolio/fills", params=params)
+    if isinstance(resp, dict):
+        for k in ("fills", "executions"):
+            if k in resp and isinstance(resp[k], list):
+                return resp[k]
+    if isinstance(resp, list):
+        return resp
+    return []
+
+
+def extract_fill_ts_ms(fill: Dict[str, Any]) -> Optional[int]:
+    for k in ("created_time", "created_ts", "timestamp", "ts", "time"):
+        if k in fill:
+            try:
+                v = fill[k]
+                iv = int(float(v))
+                if iv < 10_000_000_000:  # seconds -> ms
+                    return iv * 1000
+                return iv
+            except Exception:
+                continue
+    return None
+
+
+def extract_yes_price_cents(obj: Dict[str, Any]) -> Optional[int]:
+    for k in ("yes_price", "price", "fill_price", "execution_price"):
+        if k in obj:
+            try:
+                return int(obj[k])
+            except Exception:
+                continue
+    return None
+
+
+def parse_position_for_market(
+    positions: List[Dict[str, Any]],
+    market_ticker: str,
+) -> Tuple[int, Optional[float], Optional[float]]:
+    """
+    Returns:
+      pos_yes: int (net YES contracts, best effort)
+      realized_pnl_usd: Optional[float]
+      fees_paid_usd: Optional[float]
+    """
+    mt = str(market_ticker)
+
+    for p in positions:
+        t = p.get("ticker") or p.get("market_ticker") or p.get("contract_ticker")
+        if not t or str(t) != mt:
+            continue
+
+        pos_yes: Optional[int] = None
+        for k in ("position", "net_position", "yes_position", "net_yes_position", "qty", "count"):
+            if k in p:
+                try:
+                    pos_yes = int(p[k])
+                    break
+                except Exception:
+                    continue
+        if pos_yes is None:
+            pos_yes = 0
+
+        realized = None
+        fees = None
+        for k in ("realized_pnl", "realized_pnl_usd", "pnl_realized", "realized"):
+            if k in p:
+                realized = safe_float(p[k])
+                if realized is not None:
+                    break
+        for k in ("fees_paid", "fees_paid_usd", "fees", "fee_paid"):
+            if k in p:
+                fees = safe_float(p[k])
+                if fees is not None:
+                    break
+
+        return pos_yes, realized, fees
+
+    return 0, None, None
+
+
+def compute_unrealized_usd(pos_yes: int, entry_cents: Optional[int], mark_cents: Optional[int]) -> Optional[float]:
+    """
+    Unrealized P&L in USD for YES position, conservative mark:
+      - if long YES: mark at best YES bid
+      - if short YES: mark at best YES ask
+    P&L per contract is (mark - entry)/100.
+    """
+    if pos_yes == 0 or entry_cents is None or mark_cents is None:
+        return None
+    diff_cents = (mark_cents - entry_cents) * pos_yes
+    return diff_cents / 100.0
+
+
+def update_entry_from_fills_for_market(
+    fills: List[Dict[str, Any]],
+    market_ticker: str,
+    pos_yes: int,
+) -> Optional[int]:
+    """
+    For current net position, choose a usable "entry" from recent fills.
+    Given small inventory, using most recent opening-side fill is good enough.
+    """
+    mt = str(market_ticker)
+    if pos_yes == 0:
+        return None
+
+    want_action = "buy" if pos_yes > 0 else "sell"
+
+    best_ts = -1
+    best_px: Optional[int] = None
+
+    for f in fills:
+        t = f.get("ticker") or f.get("market_ticker") or f.get("contract_ticker")
+        if not t or str(t) != mt:
+            continue
+
+        side = str(f.get("side", "")).lower()
+        if side and side != "yes":
+            continue
+
+        action = str(f.get("action", "")).lower()
+        if action != want_action:
+            continue
+
+        px = extract_yes_price_cents(f)
+        if px is None:
+            continue
+
+        ts = extract_fill_ts_ms(f)
+        if ts is None:
+            ts = 0
+
+        if ts > best_ts:
+            best_ts = ts
+            best_px = px
+
+    return best_px
+
+
 def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
     resp = client.request("GET", "/portfolio/orders", params={"status": "open", "limit": 200})
     return resp.get("orders", resp if isinstance(resp, list) else [])
@@ -572,6 +751,8 @@ def main() -> None:
     log.info("[RL] MIN_REPRICE_SECONDS=%.2f MIN_ORDER_ACTION_GAP_SECONDS=%.2f RL_BACKOFF_START=%.2f RL_BACKOFF_MAX=%.2f POST_ONLY_CROSS_COOLDOWN_SECONDS=%.2f SPREAD_SKIP_COOLDOWN_SECONDS=%.2f",
              MIN_REPRICE_SECONDS, MIN_ORDER_ACTION_GAP_SECONDS, RATE_LIMIT_BACKOFF_START_SECONDS, RATE_LIMIT_BACKOFF_MAX_SECONDS,
              POST_ONLY_CROSS_COOLDOWN_SECONDS, SPREAD_SKIP_COOLDOWN_SECONDS)
+    log.info("[PNL] POSITIONS_POLL_SECONDS=%.1f FILLS_POLL_SECONDS=%.1f PNL_LOG_THROTTLE_SECONDS=%.1f",
+             POSITIONS_POLL_SECONDS, FILLS_POLL_SECONDS, PNL_LOG_THROTTLE_SECONDS)
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -580,7 +761,22 @@ def main() -> None:
     http = requests.Session()
 
     quote = QuoteState()
+
+    # Authoritative inventory (will be overwritten by /portfolio/positions)
     net_yes = INITIAL_NET_YES_CONTRACTS
+
+    # Inventory/P&L state (ADDED)
+    last_positions_poll = 0.0
+    last_fills_poll = 0.0
+    last_fill_ts_ms: Optional[int] = None
+
+    pos_yes_live = INITIAL_NET_YES_CONTRACTS
+    realized_pnl_usd: Optional[float] = None
+    fees_paid_usd: Optional[float] = None
+    entry_yes_cents: Optional[int] = None
+
+    last_pnl_log_at = 0.0
+    last_pnl_sig: Tuple[Any, ...] = tuple()
 
     last_meta_refresh = 0.0
     last_spot_poll = 0.0
@@ -831,6 +1027,45 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
+        # -----------------------------
+        # Inventory / P&L polling (ADDED)
+        # -----------------------------
+        if (t0 - last_positions_poll) >= POSITIONS_POLL_SECONDS:
+            try:
+                positions = get_positions(client)
+                note_successful_request()
+                pos_yes_live, realized_pnl_usd, fees_paid_usd = parse_position_for_market(positions, active_market)
+                net_yes = pos_yes_live  # <-- QUOTING USES REAL INVENTORY
+                last_positions_poll = t0
+            except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("positions")
+                log.warning(f"[INV] positions fetch failed: {e}")
+
+        if (t0 - last_fills_poll) >= FILLS_POLL_SECONDS:
+            try:
+                fills = get_fills(client, min_ts_ms=last_fill_ts_ms, limit=200)
+                note_successful_request()
+
+                max_ts = last_fill_ts_ms or 0
+                for f in fills:
+                    ts = extract_fill_ts_ms(f)
+                    if ts is not None and ts > max_ts:
+                        max_ts = ts
+                last_fill_ts_ms = max_ts if max_ts > 0 else last_fill_ts_ms
+
+                new_entry = update_entry_from_fills_for_market(fills, active_market, pos_yes_live)
+                if pos_yes_live == 0:
+                    entry_yes_cents = None
+                elif new_entry is not None:
+                    entry_yes_cents = new_entry
+
+                last_fills_poll = t0
+            except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("fills")
+                log.warning(f"[INV] fills fetch failed: {e}")
+
         if time.time() < pause_until:
             time.sleep(POLL_SECONDS)
             continue
@@ -870,6 +1105,32 @@ def main() -> None:
                 last_target_log_at = t0
             time.sleep(POLL_SECONDS)
             continue
+
+        # -----------------------------
+        # P&L mark-to-market snapshot (ADDED)
+        # -----------------------------
+        mark_cents = None
+        if pos_yes_live > 0:
+            mark_cents = yes_bid
+        elif pos_yes_live < 0:
+            mark_cents = yes_ask
+
+        unreal_usd = compute_unrealized_usd(pos_yes_live, entry_yes_cents, mark_cents)
+
+        pnl_sig = (active_market, pos_yes_live, entry_yes_cents, mark_cents, realized_pnl_usd, fees_paid_usd, unreal_usd)
+        if pnl_sig != last_pnl_sig or (t0 - last_pnl_log_at) >= PNL_LOG_THROTTLE_SECONDS:
+            log.info(
+                "[PNL] %s pos_yes=%d entry=%s mark=%s unreal=%s realized=%s fees=%s",
+                active_market,
+                pos_yes_live,
+                (f"{entry_yes_cents}c" if entry_yes_cents is not None else "n/a"),
+                (f"{mark_cents}c" if mark_cents is not None else "n/a"),
+                (f"${unreal_usd:.4f}" if unreal_usd is not None else "n/a"),
+                (f"${realized_pnl_usd:.4f}" if realized_pnl_usd is not None else "n/a"),
+                (f"${fees_paid_usd:.4f}" if fees_paid_usd is not None else "n/a"),
+            )
+            last_pnl_sig = pnl_sig
+            last_pnl_log_at = t0
 
         # --- Proper hysteresis gate (ADDED) ---
         spread_now = yes_ask - yes_bid
