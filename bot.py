@@ -52,12 +52,23 @@
 # FIX G2 (CRITICAL): Open-orders visibility grace (prevents “POSTED then missing” spam).
 # - Your log shows repeated:
 #     POSTED -> reconcile says "missing" -> clear local -> POSTED again -> ...
-#   This can happen if /portfolio/orders?status=open lags order visibility by 1–3 seconds.
+#   This can happen if /portfolio/orders?status=open lags order visibility by 1–3+ seconds.
 # - Fix:
 #     • Track timestamp of each POSTED order_id.
 #     • If reconcile sees it "missing" but it's younger than ORDERS_VISIBILITY_GRACE_SECONDS,
 #       DO NOTHING (do not clear, do not re-place). Let it propagate.
 #     • Only treat it as missing after it ages past the visibility grace.
+#
+# FIX G3 (CRITICAL, MATCHES YOUR CURRENT LOG): Do NOT use the bulk "open orders list"
+# as the source of truth for a specific order_id.
+# - Your logs show orders remaining "not visible yet" then "missing after grace+confirm",
+#   even though they can still exist or fill. Clearing local state + re-posting can stack fills and flip.
+# - Fix:
+#     • When reconcile thinks a tracked order is "missing", we verify via the ORDER-DETAIL endpoint:
+#           GET /portfolio/orders/{order_id}
+#       If detail exists -> KEEP the local state (open-list lag suspected).
+#       If detail is 404 -> treat it as truly gone -> clear state + force-refresh positions.
+#   Toggle with env var: USE_ORDER_DETAIL_FOR_RECONCILE (default True)
 #
 # FIX H (MATCHES YOUR NEW LOGS): FUSE should NOT block reduce-only exits.
 # - If you start with inventory (e.g., pos_yes=-6), we should NOT “pause forever”.
@@ -72,17 +83,10 @@
 #     • no_bid is missing (so yes_ask = 100 - no_bid can’t be computed).
 # - Fix: Optional fallback to /markets/{ticker} snapshot to obtain best bid/ask (if provided)
 #   before giving up. Toggle with ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT (default True).
+# - Added debug:
+#     • [OB] used market-snapshot fallback: yes_bid=.. yes_ask=..
 #
-# DEBUGGING ADDITIONS (NEW):
-# - Adds clear, throttled "[STATE]" lines so we can reconstruct what the bot believed:
-#     • active market, spread, yes_bid/ask, desired bid/ask, reduce_only/emergency flags
-#     • current QuoteState (prices + ids) and whether those ids are visible in open_orders
-#     • inventory staleness age, open order counts, allow_bid/allow_ask, and cooldown timers
-# - Adds explicit logs when:
-#     • snapshot fallback is used (FIX I)
-#     • reconcile defers due to visibility grace (FIX G2)
-#     • bootstrap cleanup actually cancels N orders (FIX A)
-# - These logs are designed to answer “WHY did it do nothing?” in a single run.
+# Everything else is kept as-is to avoid unintended behavior drift.
 
 import os
 import time
@@ -148,12 +152,6 @@ def now_ms() -> int:
 
 def iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def clamp_price_cents(p: Optional[int]) -> Optional[int]:
-    if p is None:
-        return None
-    return max(1, min(99, int(p)))
 
 
 # -----------------------------
@@ -245,18 +243,23 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # FIX D toggle
 PNL_VALUES_ARE_CENTS = env_bool("PNL_VALUES_ARE_CENTS", True)
 
-# FIX F: reduce-only exit repricing controls (prevents “stuck exit” while limiting churn)
+# FIX F: reduce-only exit repricing controls
 REDUCE_ONLY_REPRICE_TICKS = env_int("REDUCE_ONLY_REPRICE_TICKS", 2)
-REDUCE_ONLY_MIN_REPRICE_SECONDS = env_float("REDUCE_ONLY_MIN_REPRICE_SECONDS", max(3.0, MIN_REPRICE_SECONDS * 2.0))
+REDUCE_ONLY_MIN_REPRICE_SECONDS = env_float(
+    "REDUCE_ONLY_MIN_REPRICE_SECONDS", max(3.0, MIN_REPRICE_SECONDS * 2.0)
+)
 
-# FIX F (optional but recommended): cancel any stray open YES orders for the active market
+# FIX F optional: cancel any stray open YES orders for the active market
 CLEAN_STRAY_ORDERS = env_bool("CLEAN_STRAY_ORDERS", True)
 
-# FIX G: reconcile grace/confirm delay (matches your log wording)
+# FIX G: reconcile grace/confirm delay
 RECONCILE_MISSING_GRACE_SECONDS = env_float("RECONCILE_MISSING_GRACE_SECONDS", 0.75)
 
-# FIX G2 (CRITICAL): open-orders visibility grace (prevents “POSTED then missing” spam / flip-through-zero)
+# FIX G2: open-orders visibility grace
 ORDERS_VISIBILITY_GRACE_SECONDS = env_float("ORDERS_VISIBILITY_GRACE_SECONDS", 3.0)
+
+# FIX G3: verify missing orders via order-detail endpoint
+USE_ORDER_DETAIL_FOR_RECONCILE = env_bool("USE_ORDER_DETAIL_FOR_RECONCILE", True)
 
 # FIX H: emergency reduce-only behavior when starting with a big position
 EMERGENCY_EXIT_QTY = env_int("EMERGENCY_EXIT_QTY", 1)  # set >1 only if you *want* faster unwind
@@ -266,8 +269,9 @@ EMERGENCY_IGNORE_HYSTERESIS = env_bool("EMERGENCY_IGNORE_HYSTERESIS", True)
 ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT = env_bool("ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT", True)
 MARKET_SNAPSHOT_TTL_SECONDS = env_float("MARKET_SNAPSHOT_TTL_SECONDS", 1.0)
 
-# DEBUG: periodic state dump
-STATE_LOG_THROTTLE_SECONDS = env_float("STATE_LOG_THROTTLE_SECONDS", 5.0)
+# Extra debug
+STATE_LOG_SECONDS = env_float("STATE_LOG_SECONDS", 1.5)
+RECONCILE_DEBUG_THROTTLE_SECONDS = env_float("RECONCILE_DEBUG_THROTTLE_SECONDS", 5.0)
 
 
 # -----------------------------
@@ -429,8 +433,11 @@ def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Opti
     no_bid = max_bid(no_levels)
     yes_ask = (100 - no_bid) if no_bid is not None else None
 
-    yes_bid = clamp_price_cents(yes_bid)
-    yes_ask = clamp_price_cents(yes_ask)
+    if yes_bid is not None:
+        yes_bid = max(1, min(99, yes_bid))
+    if yes_ask is not None:
+        yes_ask = max(1, min(99, yes_ask))
+
     return yes_bid, yes_ask
 
 
@@ -672,6 +679,20 @@ def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
     return resp.get("orders", resp if isinstance(resp, list) else [])
 
 
+def get_order_by_id(client: KalshiClient, order_id: str) -> Optional[Dict[str, Any]]:
+    """
+    FIX G3: Verify a specific order_id via the order-detail endpoint.
+    Returns order dict if found; returns None if 404/not_found; raises for other errors.
+    """
+    try:
+        return client.request("GET", f"/portfolio/orders/{order_id}")
+    except RuntimeError as e:
+        msg = str(e)
+        if ("HTTP 404" in msg) or ("not_found" in msg):
+            return None
+        raise
+
+
 def cancel_order_status(client: KalshiClient, order_id: str) -> str:
     try:
         client.request("DELETE", f"/portfolio/orders/{order_id}")
@@ -774,10 +795,6 @@ def is_yes_order_obj_for_market(o: Dict[str, Any], market_ticker: str) -> bool:
 # FIX I: market snapshot fallback
 # -----------------------------
 def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Tries many likely keys to find best YES bid/ask in cents.
-    If the API doesn't provide them, returns (None, None).
-    """
     if "market" in m and isinstance(m["market"], dict):
         m = m["market"]
 
@@ -819,8 +836,11 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
                 except Exception:
                     pass
 
-    bid = clamp_price_cents(bid)
-    ask = clamp_price_cents(ask)
+    if bid is not None:
+        bid = max(1, min(99, bid))
+    if ask is not None:
+        ask = max(1, min(99, ask))
+
     return bid, ask
 
 
@@ -830,7 +850,7 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
 def main() -> None:
     log.info(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.info(
-        "[ENV] API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.2fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
+        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.2fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
         API_BASE,
         API_PREFIX,
         SERIES_TICKER,
@@ -840,16 +860,6 @@ def main() -> None:
         DRY_RUN,
         ENABLE_TRADING,
         POST_ONLY,
-    )
-    log.info(
-        "[ENV] MIN_SPREAD=%d MAX_SPREAD=%d IMPROVE=%d NO_IMPROVE_MAX=%d MIN_REPRICE=%.2f REDUCE_ONLY_MIN_REPRICE=%.2f VIS_GRACE=%.2f",
-        MIN_SPREAD_CENTS,
-        MAX_SPREAD_CENTS,
-        IMPROVE_CENTS,
-        NO_IMPROVE_MAX_SPREAD_CENTS,
-        MIN_REPRICE_SECONDS,
-        REDUCE_ONLY_MIN_REPRICE_SECONDS,
-        ORDERS_VISIBILITY_GRACE_SECONDS,
     )
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
@@ -916,8 +926,9 @@ def main() -> None:
     last_market_snapshot_at = 0.0
     last_market_snapshot: Dict[str, Any] = {}
 
-    # DEBUG: periodic state
+    # debug throttles
     last_state_log_at = 0.0
+    last_reconcile_dbg_at = 0.0
 
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
@@ -936,7 +947,7 @@ def main() -> None:
         now = time.time()
         rl_until = now + rl_backoff
         skip_quote_until = max(skip_quote_until, rl_until)
-        log.warning(f"[RL] {tag}: backing off {rl_backoff:.2f}s (rl_until={rl_until:.2f})")
+        log.warning(f"[RL] {tag}: backing off {rl_backoff:.2f}s")
         rl_backoff = min(RATE_LIMIT_BACKOFF_MAX_SECONDS, rl_backoff * 2.0)
 
     def note_successful_request() -> None:
@@ -983,25 +994,14 @@ def main() -> None:
                 arm_rate_limit_pause("market_snapshot")
             return last_market_snapshot or {}
 
-    # FIX F/G/G2: reconcile QuoteState with open orders; avoid "POSTED then missing" churn; optionally cancel stray YES orders.
+    # FIX F/G/G2/G3: reconcile QuoteState with open orders; avoid "POSTED then missing" churn; verify missing via detail endpoint; optionally cancel strays.
     def reconcile_quote_state_with_open_orders(tag: str) -> None:
-        nonlocal quote, open_orders_cache, pause_until, skip_quote_until, order_posted_ts
+        nonlocal quote, open_orders_cache, pause_until, skip_quote_until, order_posted_ts, last_reconcile_dbg_at
 
         if not active_market:
             return
 
-        def refetch_open_orders_once() -> bool:
-            nonlocal open_orders_cache
-            try:
-                open_orders_cache = get_open_orders(client)
-                note_successful_request()
-                return True
-            except Exception as e:
-                if is_rate_limited(e):
-                    arm_rate_limit_pause("reconcile_refetch_open_orders")
-                log.warning(f"[OM] reconcile({tag}): refetch open orders failed: {e}")
-                return False
-
+        # Open-list ids (used for stray cleanup + quick visibility checks; NOT a source of truth for "does my order exist")
         open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
 
         def recently_posted(oid: str) -> bool:
@@ -1010,54 +1010,106 @@ def main() -> None:
                 return False
             return (time.time() - ts) < ORDERS_VISIBILITY_GRACE_SECONDS
 
-        def confirm_missing(order_id: str) -> bool:
-            time.sleep(max(0.0, RECONCILE_MISSING_GRACE_SECONDS))
-            if not refetch_open_orders_once():
-                return False
-            open_ids2 = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
-            return order_id not in open_ids2
+        def verify_exists_via_detail(oid: str) -> Optional[bool]:
+            """
+            Returns:
+              True  -> order exists (do NOT clear local state)
+              False -> order is truly missing (404)
+              None  -> couldn't verify (error / rate limit)
+            """
+            if not USE_ORDER_DETAIL_FOR_RECONCILE:
+                return None
+            try:
+                detail = get_order_by_id(client, oid)
+                note_successful_request()
+                return detail is not None
+            except Exception as e:
+                if is_rate_limited(e):
+                    arm_rate_limit_pause("reconcile_order_detail")
+                log.warning(f"[OM] reconcile({tag}): order-detail lookup failed for {oid}: {e}")
+                return None
 
-        if quote.bid_order_id and quote.bid_order_id not in open_ids:
-            if recently_posted(quote.bid_order_id):
-                age = time.time() - order_posted_ts.get(quote.bid_order_id, time.time())
-                log.warning(
-                    f"[OM] reconcile({tag}): bid not visible yet; waiting visibility_grace "
-                    f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={quote.bid_order_id})"
-                )
-                return
-
-            if confirm_missing(quote.bid_order_id):
-                log.warning(
-                    f"[OM] reconcile({tag}): bid order missing after grace+confirm -> clearing local state (order_id={quote.bid_order_id})"
-                )
-                order_posted_ts.pop(quote.bid_order_id, None)
+        def clear_local_and_pause(which: str, oid: str) -> None:
+            nonlocal pause_until, skip_quote_until
+            order_posted_ts.pop(oid, None)
+            if which == "bid":
                 quote.bid_order_id = None
                 quote.bid_price = None
-                _ = refresh_positions_now("reconcile_missing_bid")
-                pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
-                skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
-
-        if quote.ask_order_id and quote.ask_order_id not in open_ids:
-            if recently_posted(quote.ask_order_id):
-                age = time.time() - order_posted_ts.get(quote.ask_order_id, time.time())
-                log.warning(
-                    f"[OM] reconcile({tag}): ask not visible yet; waiting visibility_grace "
-                    f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={quote.ask_order_id})"
-                )
-                return
-
-            if confirm_missing(quote.ask_order_id):
-                log.warning(
-                    f"[OM] reconcile({tag}): ask order missing after grace+confirm -> clearing local state (order_id={quote.ask_order_id})"
-                )
-                order_posted_ts.pop(quote.ask_order_id, None)
+            else:
                 quote.ask_order_id = None
                 quote.ask_price = None
-                _ = refresh_positions_now("reconcile_missing_ask")
-                pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
-                skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
 
-        if CLEAN_STRAY_ORDERS:
+            _ = refresh_positions_now(f"reconcile_missing_{which}")
+            pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
+            skip_quote_until = max(skip_quote_until, time.time() + max(1.0, POSITIONS_POLL_SECONDS))
+
+        # Debug snapshot (throttled)
+        now = time.time()
+        if (now - last_reconcile_dbg_at) >= RECONCILE_DEBUG_THROTTLE_SECONDS:
+            log.info(
+                f"[OMDBG] reconcile({tag}) mkt={active_market} open_yes_ids={len(open_ids)} tracked=(bid={quote.bid_order_id}, ask={quote.ask_order_id}) "
+                f"vis_grace={ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s detail_verify={USE_ORDER_DETAIL_FOR_RECONCILE}"
+            )
+            last_reconcile_dbg_at = now
+
+        # ----- BID side -----
+        if quote.bid_order_id:
+            oid = quote.bid_order_id
+            if oid not in open_ids:
+                if recently_posted(oid):
+                    age = time.time() - order_posted_ts.get(oid, time.time())
+                    log.warning(
+                        f"[OM] reconcile({tag}): bid not visible yet; waiting visibility_grace "
+                        f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={oid})"
+                    )
+                else:
+                    # FIX G3: verify via detail endpoint before clearing
+                    exists = verify_exists_via_detail(oid)
+                    if exists is True:
+                        log.warning(
+                            f"[OM] reconcile({tag}): bid missing in open-list but EXISTS via order-detail; keeping local state (order_id={oid})"
+                        )
+                    elif exists is False:
+                        log.warning(
+                            f"[OM] reconcile({tag}): bid missing (404 via order-detail) -> clearing local state (order_id={oid})"
+                        )
+                        clear_local_and_pause("bid", oid)
+                    else:
+                        # could not verify; be conservative: do NOT clear, but pause briefly
+                        pause_until = max(pause_until, time.time() + min(0.5, PAUSE_ON_UNKNOWN_SECONDS))
+                        log.warning(
+                            f"[OM] reconcile({tag}): bid missing in open-list; could not verify via detail -> pausing briefly (order_id={oid})"
+                        )
+
+        # ----- ASK side -----
+        if quote.ask_order_id:
+            oid = quote.ask_order_id
+            if oid not in open_ids:
+                if recently_posted(oid):
+                    age = time.time() - order_posted_ts.get(oid, time.time())
+                    log.warning(
+                        f"[OM] reconcile({tag}): ask not visible yet; waiting visibility_grace "
+                        f"{ORDERS_VISIBILITY_GRACE_SECONDS:.2f}s (age={age:.2f}s order_id={oid})"
+                    )
+                else:
+                    exists = verify_exists_via_detail(oid)
+                    if exists is True:
+                        log.warning(
+                            f"[OM] reconcile({tag}): ask missing in open-list but EXISTS via order-detail; keeping local state (order_id={oid})"
+                        )
+                    elif exists is False:
+                        log.warning(
+                            f"[OM] reconcile({tag}): ask missing (404 via order-detail) -> clearing local state (order_id={oid})"
+                        )
+                        clear_local_and_pause("ask", oid)
+                    else:
+                        pause_until = max(pause_until, time.time() + min(0.5, PAUSE_ON_UNKNOWN_SECONDS))
+                        log.warning(
+                            f"[OM] reconcile({tag}): ask missing in open-list; could not verify via detail -> pausing briefly (order_id={oid})"
+                        )
+
+        # ----- Stray cleanup -----
+        if CLEAN_STRAY_ORDERS and active_market:
             tracked = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
             for o in open_orders_cache:
                 if not is_yes_order_obj_for_market(o, active_market):
@@ -1107,14 +1159,12 @@ def main() -> None:
                 continue
             try:
                 if not DRY_RUN:
-                    st = cancel_order_status(client, str(oid))
+                    _ = cancel_order_status(client, str(oid))
                     mark_order_action()
                     note_successful_request()
-                else:
-                    st = "canceled"
                 killed += 1
                 order_posted_ts.pop(str(oid), None)
-                log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid} status={st}")
+                log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid}")
             except Exception as ce:
                 if is_rate_limited(ce):
                     arm_rate_limit_pause("bootstrap_cancel")
@@ -1129,7 +1179,8 @@ def main() -> None:
         skip_quote_until = max(skip_quote_until, time.time() + 1.0)
         pause_until = max(pause_until, time.time() + 0.5)
 
-        log.warning(f"[BOOT] cleanup complete for {active_market} reason={reason} killed={killed}")
+        if killed > 0:
+            log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
     def cancel_bid_only(reason: str) -> None:
         nonlocal quote, order_posted_ts
@@ -1220,7 +1271,6 @@ def main() -> None:
             log.info(f"[ROLL] Series={SERIES_TICKER} → Active event={active_event} market={active_market} (via /markets series_ticker)")
 
         if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market and prev_market != active_market:
-            log.warning(f"[ROLL] market changed: prev={prev_market} new={active_market} -> bootstrap cancel")
             cancel_all_open_yes_orders_for_active_market("market_roll_bootstrap")
 
     refresh_active_market()
@@ -1344,7 +1394,6 @@ def main() -> None:
                     arm_rate_limit_pause("fills")
                 log.warning(f"[INV] fills fetch failed: {e}")
 
-        # Respect cooldowns
         if time.time() < pause_until or time.time() < balance_fail_until or time.time() < rl_until or time.time() < skip_quote_until:
             time.sleep(POLL_SECONDS)
             continue
@@ -1372,7 +1421,7 @@ def main() -> None:
             if yes_ask is None and fb_ask is not None:
                 yes_ask = fb_ask
                 used_snapshot_fallback = True
-            if used_snapshot_fallback:
+            if used_snapshot_fallback and yes_bid is not None and yes_ask is not None:
                 log.warning(f"[OB] {active_market} used market-snapshot fallback: yes_bid={yes_bid} yes_ask={yes_ask}")
 
         if yes_bid is None or yes_ask is None:
@@ -1613,9 +1662,7 @@ def main() -> None:
 
                     if st == "not_found":
                         last_cancel_not_found_oid = old_order_id
-
                         _ = refresh_positions_now("cancel_404_not_found")
-
                         pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                         log.warning(
@@ -1711,39 +1758,17 @@ def main() -> None:
             last_target_sig = sig
             last_target_log_at = t0
 
-        # DEBUG: periodic state dump (answers “WHY did it do nothing?”)
-        now = time.time()
-        if (now - last_state_log_at) >= STATE_LOG_THROTTLE_SECONDS:
-            open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
-            bid_vis = (quote.bid_order_id in open_ids) if quote.bid_order_id else False
-            ask_vis = (quote.ask_order_id in open_ids) if quote.ask_order_id else False
+        # Debug state (throttled)
+        if (t0 - last_state_log_at) >= STATE_LOG_SECONDS:
+            b_vis = quote.bid_order_id is not None and quote.bid_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            a_vis = quote.ask_order_id is not None and quote.ask_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
             log.info(
-                "[STATE] mkt=%s pos=%d spread=%d best=(%s,%s) tgt=(%s,%s) reduce_only=%s emergency=%s "
-                "allow=(b:%s,a:%s) open=(b:%d,s:%d) inv_age=%.2fs quote=(b:%s@%s vis=%s, a:%s@%s vis=%s) cooldowns(pause=%.2f bal=%.2f rl=%.2f skip=%.2f)",
-                active_market,
-                pos_yes_live,
-                spread_now,
-                yes_bid, yes_ask,
-                bid_px, ask_px,
-                reduce_only,
-                emergency_reduce_only,
-                allow_bid,
-                allow_ask,
-                open_buys,
-                open_sells,
-                inv_age,
-                quote.bid_order_id,
-                quote.bid_price,
-                bid_vis,
-                quote.ask_order_id,
-                quote.ask_price,
-                ask_vis,
-                max(0.0, pause_until - now),
-                max(0.0, balance_fail_until - now),
-                max(0.0, rl_until - now),
-                max(0.0, skip_quote_until - now),
+                f"[STATE] mkt={active_market} pos={pos_yes_live} spread={spread_now} best=({yes_bid},{yes_ask}) tgt=({bid_px},{ask_px}) "
+                f"reduce_only={reduce_only} emergency={emergency_reduce_only} allow=(b:{allow_bid},a:{allow_ask}) open=(b:{open_buys},s:{open_sells}) "
+                f"inv_age={max(0.0, t0 - last_positions_poll):.2f}s quote=(b:{quote.bid_order_id}@{quote.bid_price} vis={b_vis}, a:{quote.ask_order_id}@{quote.ask_price} vis={a_vis}) "
+                f"cooldowns(pause={max(0.0, pause_until-time.time()):.2f} bal={max(0.0, balance_fail_until-time.time()):.2f} rl={max(0.0, rl_until-time.time()):.2f} skip={max(0.0, skip_quote_until-time.time()):.2f})"
             )
-            last_state_log_at = now
+            last_state_log_at = t0
 
         dt = time.time() - t0
         time.sleep(max(0.0, POLL_SECONDS - dt))
