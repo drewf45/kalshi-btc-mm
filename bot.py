@@ -270,29 +270,52 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     """
-    Treats 'yes' and 'no' arrays as best bids.
+    Treats 'yes' and 'no' arrays as bid books.
     YES ask is synthesized from NO bid: yes_ask = 100 - best_no_bid.
+    IMPORTANT: do NOT assume levels[0] is best; scan for the max bid.
     """
     orderbook = ob.get("orderbook") or ob
-    yes_bids = orderbook.get("yes") or []
-    no_bids = orderbook.get("no") or []
+    yes_levels = orderbook.get("yes") or []
+    no_levels = orderbook.get("no") or []
 
-    def best_price(levels: Any) -> Optional[int]:
-        if not levels or not isinstance(levels, list):
+    def max_bid(levels: Any) -> Optional[int]:
+        if not isinstance(levels, list) or not levels:
             return None
-        top = levels[0]
-        if isinstance(top, list) and len(top) >= 1:
-            try:
-                return int(top[0])
-            except Exception:
-                return None
-        if isinstance(top, (int, float)):
-            return int(top)
-        return None
 
-    yes_bid = best_price(yes_bids)
-    no_bid = best_price(no_bids)
+        best: Optional[int] = None
+        for lvl in levels:
+            price = None
+
+            # Common format: [price, qty]
+            if isinstance(lvl, list) and len(lvl) >= 1:
+                price = lvl[0]
+            # Sometimes: {"price": x, "quantity": y}
+            elif isinstance(lvl, dict):
+                price = lvl.get("price") or lvl.get("yes_price") or lvl.get("no_price")
+            # Rare: just a number
+            elif isinstance(lvl, (int, float)):
+                price = lvl
+
+            try:
+                p = int(price)
+            except Exception:
+                continue
+
+            if best is None or p > best:
+                best = p
+
+        return best
+
+    yes_bid = max_bid(yes_levels)
+    no_bid = max_bid(no_levels)
     yes_ask = (100 - no_bid) if no_bid is not None else None
+
+    # sanity clamp
+    if yes_bid is not None:
+        yes_bid = max(1, min(99, yes_bid))
+    if yes_ask is not None:
+        yes_ask = max(1, min(99, yes_ask))
+
     return yes_bid, yes_ask
 
 
