@@ -73,7 +73,16 @@
 # - Fix: Optional fallback to /markets/{ticker} snapshot to obtain best bid/ask (if provided)
 #   before giving up. Toggle with ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT (default True).
 #
-# Everything else is kept as-is to avoid unintended behavior drift.
+# DEBUGGING ADDITIONS (NEW):
+# - Adds clear, throttled "[STATE]" lines so we can reconstruct what the bot believed:
+#     • active market, spread, yes_bid/ask, desired bid/ask, reduce_only/emergency flags
+#     • current QuoteState (prices + ids) and whether those ids are visible in open_orders
+#     • inventory staleness age, open order counts, allow_bid/allow_ask, and cooldown timers
+# - Adds explicit logs when:
+#     • snapshot fallback is used (FIX I)
+#     • reconcile defers due to visibility grace (FIX G2)
+#     • bootstrap cleanup actually cancels N orders (FIX A)
+# - These logs are designed to answer “WHY did it do nothing?” in a single run.
 
 import os
 import time
@@ -139,6 +148,12 @@ def now_ms() -> int:
 
 def iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def clamp_price_cents(p: Optional[int]) -> Optional[int]:
+    if p is None:
+        return None
+    return max(1, min(99, int(p)))
 
 
 # -----------------------------
@@ -250,6 +265,9 @@ EMERGENCY_IGNORE_HYSTERESIS = env_bool("EMERGENCY_IGNORE_HYSTERESIS", True)
 # FIX I: orderbook best-bid/ask fallback
 ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT = env_bool("ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT", True)
 MARKET_SNAPSHOT_TTL_SECONDS = env_float("MARKET_SNAPSHOT_TTL_SECONDS", 1.0)
+
+# DEBUG: periodic state dump
+STATE_LOG_THROTTLE_SECONDS = env_float("STATE_LOG_THROTTLE_SECONDS", 5.0)
 
 
 # -----------------------------
@@ -411,11 +429,8 @@ def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Opti
     no_bid = max_bid(no_levels)
     yes_ask = (100 - no_bid) if no_bid is not None else None
 
-    if yes_bid is not None:
-        yes_bid = max(1, min(99, yes_bid))
-    if yes_ask is not None:
-        yes_ask = max(1, min(99, yes_ask))
-
+    yes_bid = clamp_price_cents(yes_bid)
+    yes_ask = clamp_price_cents(yes_ask)
     return yes_bid, yes_ask
 
 
@@ -804,11 +819,8 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
                 except Exception:
                     pass
 
-    if bid is not None:
-        bid = max(1, min(99, bid))
-    if ask is not None:
-        ask = max(1, min(99, ask))
-
+    bid = clamp_price_cents(bid)
+    ask = clamp_price_cents(ask)
     return bid, ask
 
 
@@ -818,7 +830,7 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
 def main() -> None:
     log.info(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.info(
-        "API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.2fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
+        "[ENV] API_BASE=%s API_PREFIX=%s SERIES=%s EVENT_TICKER=%s MARKET_OVERRIDE=%s POLL=%.2fs DRY_RUN=%s ENABLE_TRADING=%s POST_ONLY=%s",
         API_BASE,
         API_PREFIX,
         SERIES_TICKER,
@@ -828,6 +840,16 @@ def main() -> None:
         DRY_RUN,
         ENABLE_TRADING,
         POST_ONLY,
+    )
+    log.info(
+        "[ENV] MIN_SPREAD=%d MAX_SPREAD=%d IMPROVE=%d NO_IMPROVE_MAX=%d MIN_REPRICE=%.2f REDUCE_ONLY_MIN_REPRICE=%.2f VIS_GRACE=%.2f",
+        MIN_SPREAD_CENTS,
+        MAX_SPREAD_CENTS,
+        IMPROVE_CENTS,
+        NO_IMPROVE_MAX_SPREAD_CENTS,
+        MIN_REPRICE_SECONDS,
+        REDUCE_ONLY_MIN_REPRICE_SECONDS,
+        ORDERS_VISIBILITY_GRACE_SECONDS,
     )
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
@@ -894,6 +916,9 @@ def main() -> None:
     last_market_snapshot_at = 0.0
     last_market_snapshot: Dict[str, Any] = {}
 
+    # DEBUG: periodic state
+    last_state_log_at = 0.0
+
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ("code" in s and "insufficient_balance" in s)
@@ -911,7 +936,7 @@ def main() -> None:
         now = time.time()
         rl_until = now + rl_backoff
         skip_quote_until = max(skip_quote_until, rl_until)
-        log.warning(f"[RL] {tag}: backing off {rl_backoff:.2f}s")
+        log.warning(f"[RL] {tag}: backing off {rl_backoff:.2f}s (rl_until={rl_until:.2f})")
         rl_backoff = min(RATE_LIMIT_BACKOFF_MAX_SECONDS, rl_backoff * 2.0)
 
     def note_successful_request() -> None:
@@ -1082,12 +1107,14 @@ def main() -> None:
                 continue
             try:
                 if not DRY_RUN:
-                    _ = cancel_order_status(client, str(oid))
+                    st = cancel_order_status(client, str(oid))
                     mark_order_action()
                     note_successful_request()
+                else:
+                    st = "canceled"
                 killed += 1
                 order_posted_ts.pop(str(oid), None)
-                log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid}")
+                log.info(f"[BOOT] {active_market} CANCEL leftover YES order ({reason}) order_id={oid} status={st}")
             except Exception as ce:
                 if is_rate_limited(ce):
                     arm_rate_limit_pause("bootstrap_cancel")
@@ -1102,8 +1129,7 @@ def main() -> None:
         skip_quote_until = max(skip_quote_until, time.time() + 1.0)
         pause_until = max(pause_until, time.time() + 0.5)
 
-        if killed > 0:
-            log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
+        log.warning(f"[BOOT] cleanup complete for {active_market} reason={reason} killed={killed}")
 
     def cancel_bid_only(reason: str) -> None:
         nonlocal quote, order_posted_ts
@@ -1112,10 +1138,12 @@ def main() -> None:
         if quote.bid_order_id:
             try:
                 if not DRY_RUN:
-                    _ = cancel_order_status(client, quote.bid_order_id)
+                    st = cancel_order_status(client, quote.bid_order_id)
                     mark_order_action()
                     note_successful_request()
-                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id}")
+                else:
+                    st = "canceled"
+                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id} status={st}")
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_bid_only")
@@ -1131,10 +1159,12 @@ def main() -> None:
         if quote.ask_order_id:
             try:
                 if not DRY_RUN:
-                    _ = cancel_order_status(client, quote.ask_order_id)
+                    st = cancel_order_status(client, quote.ask_order_id)
                     mark_order_action()
                     note_successful_request()
-                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id}")
+                else:
+                    st = "canceled"
+                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id} status={st}")
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_ask_only")
@@ -1190,6 +1220,7 @@ def main() -> None:
             log.info(f"[ROLL] Series={SERIES_TICKER} → Active event={active_event} market={active_market} (via /markets series_ticker)")
 
         if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market and prev_market != active_market:
+            log.warning(f"[ROLL] market changed: prev={prev_market} new={active_market} -> bootstrap cancel")
             cancel_all_open_yes_orders_for_active_market("market_roll_bootstrap")
 
     refresh_active_market()
@@ -1313,6 +1344,7 @@ def main() -> None:
                     arm_rate_limit_pause("fills")
                 log.warning(f"[INV] fills fetch failed: {e}")
 
+        # Respect cooldowns
         if time.time() < pause_until or time.time() < balance_fail_until or time.time() < rl_until or time.time() < skip_quote_until:
             time.sleep(POLL_SECONDS)
             continue
@@ -1330,13 +1362,18 @@ def main() -> None:
         yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
 
         # FIX I: fallback to /markets/{ticker} snapshot if orderbook is missing a side
+        used_snapshot_fallback = False
         if ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT and (yes_bid is None or yes_ask is None):
             snap = get_market_snapshot()
             fb_bid, fb_ask = _extract_best_from_market_snapshot(snap)
             if yes_bid is None and fb_bid is not None:
                 yes_bid = fb_bid
+                used_snapshot_fallback = True
             if yes_ask is None and fb_ask is not None:
                 yes_ask = fb_ask
+                used_snapshot_fallback = True
+            if used_snapshot_fallback:
+                log.warning(f"[OB] {active_market} used market-snapshot fallback: yes_bid={yes_bid} yes_ask={yes_ask}")
 
         if yes_bid is None or yes_ask is None:
             cancel_live_quotes("no_yes_bid_or_ask")
@@ -1571,7 +1608,7 @@ def main() -> None:
                     mark_order_action()
                     note_successful_request()
                     tag2 = "BUY" if action == "buy" else "SELL"
-                    log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id}")
+                    log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id} status={st}")
                     order_posted_ts.pop(old_order_id, None)
 
                     if st == "not_found":
@@ -1673,6 +1710,40 @@ def main() -> None:
             log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
             last_target_sig = sig
             last_target_log_at = t0
+
+        # DEBUG: periodic state dump (answers “WHY did it do nothing?”)
+        now = time.time()
+        if (now - last_state_log_at) >= STATE_LOG_THROTTLE_SECONDS:
+            open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            bid_vis = (quote.bid_order_id in open_ids) if quote.bid_order_id else False
+            ask_vis = (quote.ask_order_id in open_ids) if quote.ask_order_id else False
+            log.info(
+                "[STATE] mkt=%s pos=%d spread=%d best=(%s,%s) tgt=(%s,%s) reduce_only=%s emergency=%s "
+                "allow=(b:%s,a:%s) open=(b:%d,s:%d) inv_age=%.2fs quote=(b:%s@%s vis=%s, a:%s@%s vis=%s) cooldowns(pause=%.2f bal=%.2f rl=%.2f skip=%.2f)",
+                active_market,
+                pos_yes_live,
+                spread_now,
+                yes_bid, yes_ask,
+                bid_px, ask_px,
+                reduce_only,
+                emergency_reduce_only,
+                allow_bid,
+                allow_ask,
+                open_buys,
+                open_sells,
+                inv_age,
+                quote.bid_order_id,
+                quote.bid_price,
+                bid_vis,
+                quote.ask_order_id,
+                quote.ask_price,
+                ask_vis,
+                max(0.0, pause_until - now),
+                max(0.0, balance_fail_until - now),
+                max(0.0, rl_until - now),
+                max(0.0, skip_quote_until - now),
+            )
+            last_state_log_at = now
 
         dt = time.time() - t0
         time.sleep(max(0.0, POLL_SECONDS - dt))
