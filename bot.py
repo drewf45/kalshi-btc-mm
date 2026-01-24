@@ -1567,7 +1567,10 @@ def main() -> None:
             old_order_id: Optional[str],
             old_price: Optional[int],
         ) -> Tuple[Optional[str], Optional[int], bool]:
-            nonlocal skip_quote_until, pause_until, last_cancel_not_found_oid
+            # NOTE: only change here vs your paste:
+            #   - on cancel not_found: IMMEDIATELY clear local quote state for that side (CHANGE 1)
+            #   - caller no longer needs to guess which oid hit 404 (simpler + safer for CHANGE 2)
+            nonlocal skip_quote_until, pause_until, last_cancel_not_found_oid, quote, order_posted_ts
 
             last_cancel_not_found_oid = None
 
@@ -1583,9 +1586,18 @@ def main() -> None:
                     log.info(f"[OM] {active_market} {tag2} CANCEL @{old_price} (reprice cancel-first) order_id={old_order_id} status={st}")
                     order_posted_ts.pop(old_order_id, None)
 
-                    # CHANGE 1 (core): not_found => assume order already filled/gone => refresh + pause
+                    # CHANGE 1 (core): not_found => assume order already filled/gone => clear local + refresh + pause
                     if st == "not_found":
                         last_cancel_not_found_oid = old_order_id
+
+                        # Immediately clear local state for THAT side
+                        if side == "bid":
+                            quote.bid_order_id = None
+                            quote.bid_price = None
+                        else:
+                            quote.ask_order_id = None
+                            quote.ask_price = None
+
                         _ = refresh_positions_now("cancel_404_not_found")
                         pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                         skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
@@ -1645,12 +1657,11 @@ def main() -> None:
                     old_order_id=quote.ask_order_id,
                     old_price=quote.ask_price,
                 )
-                if (not ok) and last_cancel_not_found_oid and quote.ask_order_id == last_cancel_not_found_oid:
-                    order_posted_ts.pop(quote.ask_order_id, None)
-                    quote.ask_order_id = None
-                    quote.ask_price = None
+
+                # If this call hit not_found, cancel_old_then_place_new already cleared local state + paused.
+                if last_cancel_not_found_oid is not None:
                     abort_iteration = True
-                if ok:
+                elif ok:
                     quote.ask_order_id = new_oid
                     quote.ask_price = new_px
 
@@ -1667,12 +1678,10 @@ def main() -> None:
                     old_order_id=quote.bid_order_id,
                     old_price=quote.bid_price,
                 )
-                if (not ok) and last_cancel_not_found_oid and quote.bid_order_id == last_cancel_not_found_oid:
-                    order_posted_ts.pop(quote.bid_order_id, None)
-                    quote.bid_order_id = None
-                    quote.bid_price = None
+
+                if last_cancel_not_found_oid is not None:
                     abort_iteration = True
-                if ok:
+                elif ok:
                     quote.bid_order_id = new_oid
                     quote.bid_price = new_px
 
