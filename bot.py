@@ -413,7 +413,15 @@ def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
 
 
 def cancel_order(client: KalshiClient, order_id: str) -> None:
-    client.request("DELETE", f"/portfolio/orders/{order_id}")
+    # 404 is normal if the order already filled/canceled/expired between our polls.
+    # Treat 404 as success to avoid noisy warnings.
+    try:
+        client.request("DELETE", f"/portfolio/orders/{order_id}")
+    except RuntimeError as e:
+        msg = str(e)
+        if ("HTTP 404" in msg) or ('"code":"not_found"' in msg) or ('"code": "not_found"' in msg):
+            return
+        raise
 
 
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
@@ -774,18 +782,4 @@ def main() -> None:
                     log.warning(f"[OM] {active_market} SELL place failed: {e}")
             else:
                 quote.ask_price = ask_px
-                log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY_RUN}")
-
-        # THROTTLED TARGET LOG
-        sig = (active_market, bid_px, ask_px, why)
-        if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
-            log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
-            last_target_sig = sig
-            last_target_log_at = t0
-
-        dt = time.time() - t0
-        time.sleep(max(0.0, POLL_SECONDS - dt))
-
-
-if __name__ == "__main__":
-    main()
+                log.info(f"[OM] {active_market} SELL PLACE @ {ask_px} qty={ORDER_QTY} DRY_RUN={DRY
