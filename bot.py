@@ -3,6 +3,7 @@ import json
 import time
 import base64
 import logging
+import re  # ✅ NEW
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
@@ -127,6 +128,29 @@ MAX_NET_YES_CONTRACTS = int(getenv_first(["MAX_NET_YES_CONTRACTS"], "2"))  # har
 INVENTORY_SKEW_CENTS = int(getenv_first(["INVENTORY_SKEW_CENTS"], "1"))    # 0..3 recommended
 ORDER_STATUS_POLL_SECONDS = float(getenv_first(["ORDER_STATUS_POLL_SECONDS"], "1.0"))
 PAUSE_ON_UNKNOWN_SECONDS = float(getenv_first(["PAUSE_ON_UNKNOWN_SECONDS"], "10.0"))
+
+# -----------------------------
+# Spot / Closeout Guard (NEW)
+# -----------------------------
+ENABLE_SPOT_GUARD = parse_bool(getenv_first(["ENABLE_SPOT_GUARD"], "true"), default=True)
+
+# Poll spot about every N seconds (your "every 12 or so")
+SPOT_POLL_SECONDS = float(getenv_first(["SPOT_POLL_SECONDS"], "12.0"))
+
+# Start canceling & stop quoting this many seconds before market close
+CLOSEOUT_SECONDS = float(getenv_first(["CLOSEOUT_SECONDS"], "20.0"))
+
+# If |spot - strike| >= this, treat market as "decided" and skip/cancel to avoid pickoff
+SPOT_RESOLVED_BUFFER_USD = float(getenv_first(["SPOT_RESOLVED_BUFFER_USD"], "75.0"))
+
+# Public spot endpoint (no API key needed)
+BTC_SPOT_URL = getenv_first(
+    ["BTC_SPOT_URL"],
+    "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+).strip()
+
+# How often to refetch /markets/{ticker} to read close_time + title/subtitle for strike parsing
+MARKET_META_REFRESH_SECONDS = float(getenv_first(["MARKET_META_REFRESH_SECONDS"], "30.0"))
 
 # -----------------------------
 # Logging
@@ -276,6 +300,177 @@ def request_json(
             return resp.json()
         except Exception:
             raise RuntimeError(f"Bad JSON response for {path}: {(resp.text or '')[:200]!r}")
+
+# -----------------------------
+# Spot / Closeout Guard helpers (NEW)
+# -----------------------------
+_LAST_SPOT_TS: float = 0.0
+_LAST_SPOT_USD: Optional[float] = None
+
+_LAST_META_TS: Dict[str, float] = {}
+_MARKET_META_CACHE: Dict[str, Dict[str, Any]] = {}
+_MARKET_STRIKE_CACHE: Dict[str, Optional[float]] = {}
+
+
+def fetch_btc_spot_usd() -> Optional[float]:
+    """
+    Fetch BTC-USD spot from a public endpoint.
+    Default: Coinbase spot { data: { amount: "xxxx.xx" } }
+    """
+    try:
+        r = requests.get(BTC_SPOT_URL, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+
+        # Coinbase format
+        amt = (((j or {}).get("data") or {}).get("amount"))
+        if amt is not None:
+            return float(str(amt))
+
+        # Generic fallbacks
+        for k in ("price", "spot", "last", "amount"):
+            if k in (j or {}):
+                return float(str(j[k]))
+
+        return None
+    except Exception as e:
+        log.warning("[SPOT] failed: %s", e)
+        return None
+
+
+def get_spot_cached() -> Optional[float]:
+    global _LAST_SPOT_TS, _LAST_SPOT_USD
+    now = time.time()
+    if _LAST_SPOT_USD is not None and (now - _LAST_SPOT_TS) < max(1.0, SPOT_POLL_SECONDS):
+        return _LAST_SPOT_USD
+
+    spot = fetch_btc_spot_usd()
+    if spot is not None:
+        _LAST_SPOT_USD = float(spot)
+        _LAST_SPOT_TS = now
+    return _LAST_SPOT_USD
+
+
+def get_market_meta_cached(market_ticker: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    last = float(_LAST_META_TS.get(market_ticker, 0.0))
+    if market_ticker in _MARKET_META_CACHE and (now - last) < max(1.0, MARKET_META_REFRESH_SECONDS):
+        return _MARKET_META_CACHE[market_ticker]
+
+    try:
+        mp = fetch_market(market_ticker)
+        _MARKET_META_CACHE[market_ticker] = mp
+        _LAST_META_TS[market_ticker] = now
+        return mp
+    except Exception as e:
+        log.warning("[META] fetch_market failed for %s: %s", market_ticker, e)
+        return _MARKET_META_CACHE.get(market_ticker)
+
+
+def parse_strike_usd_from_market(market_payload: Dict[str, Any]) -> Optional[float]:
+    """
+    Best-effort: extract a dollar strike from title/subtitle/rules.
+    Works for many 'above $X' style markets.
+    """
+    if not isinstance(market_payload, dict):
+        return None
+
+    m = market_payload.get("market")
+    d = m if isinstance(m, dict) else market_payload
+
+    text_parts = []
+    for k in ("title", "subtitle", "rules_primary", "rules", "description"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            text_parts.append(v.strip())
+
+    blob = " | ".join(text_parts)
+    if not blob:
+        return None
+
+    # Grab all dollar-ish numbers like $105,000 or 105,000
+    nums = re.findall(r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})+)", blob)
+    if not nums:
+        return None
+
+    # Use the first big number as the strike (heuristic)
+    strike = float(nums[0].replace(",", ""))
+    if strike <= 0:
+        return None
+    return strike
+
+
+def seconds_to_close_from_meta(market_payload: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(market_payload, dict):
+        return None
+    m = market_payload.get("market")
+    d = m if isinstance(m, dict) else market_payload
+
+    close_ts = 0.0
+    for k in ("close_time", "end_time", "expiration_time", "settlement_time"):
+        if k in d:
+            close_ts = max(close_ts, _parse_dt_to_ts(d.get(k)))
+    if close_ts <= 0:
+        return None
+    return close_ts - time.time()
+
+
+def cancel_all_working(market_ticker: str, reason: str, dry_run: bool) -> None:
+    """
+    A) Immediate cancel of both sides (bypasses the 'hold' timers).
+    """
+    for side_key in ("buy", "sell"):
+        cur = WORKING.get(side_key)
+        if cur is None:
+            continue
+        log.info(
+            "[OM] %s %s CANCEL_IMMEDIATE @%s (%s) DRY_RUN=%s",
+            market_ticker,
+            side_key.upper(),
+            cur.price_cents,
+            reason,
+            dry_run,
+        )
+        if (not dry_run) and ENABLE_TRADING and cur.order_id:
+            _ = cancel_order_live(cur.order_id)
+        WORKING[side_key] = None
+        _LAST_KEEP_LOGGED[side_key] = None
+
+
+def should_force_exit(market_ticker: str) -> Tuple[bool, str]:
+    """
+    Decide if we should stop quoting + cancel orders.
+    Priority:
+      1) closeout window (seconds_to_close <= CLOSEOUT_SECONDS)
+      2) spot-resolved (abs(spot - strike) >= SPOT_RESOLVED_BUFFER_USD)
+    """
+    if not ENABLE_SPOT_GUARD:
+        return (False, "")
+
+    mp = get_market_meta_cached(market_ticker)
+    if not mp:
+        return (False, "")
+
+    stc = seconds_to_close_from_meta(mp)
+    if stc is not None and stc <= max(0.0, CLOSEOUT_SECONDS):
+        return (True, f"closeout_window(stc={stc:.1f}s<=CLOSEOUT_SECONDS={CLOSEOUT_SECONDS:.1f}s)")
+
+    # strike cache
+    if market_ticker not in _MARKET_STRIKE_CACHE:
+        _MARKET_STRIKE_CACHE[market_ticker] = parse_strike_usd_from_market(mp)
+
+    strike = _MARKET_STRIKE_CACHE.get(market_ticker)
+    if strike is None:
+        return (False, "")
+
+    spot = get_spot_cached()
+    if spot is None:
+        return (False, "")
+
+    if abs(float(spot) - float(strike)) >= max(0.0, SPOT_RESOLVED_BUFFER_USD):
+        return (True, f"spot_resolved(|spot-strike|={abs(spot-strike):.0f}>=BUFFER={SPOT_RESOLVED_BUFFER_USD:.0f})")
+
+    return (False, "")
 
 # -----------------------------
 # LIVE ORDER ROUTES
@@ -1338,6 +1533,14 @@ def main():
         "[MICRO] NO_IMPROVE_MAX_SPREAD_CENTS=%d (<= this spread: join, do not improve)",
         NO_IMPROVE_MAX_SPREAD_CENTS,
     )
+    log.info(
+        "[SPOT] ENABLE_SPOT_GUARD=%s SPOT_POLL_SECONDS=%.1f CLOSEOUT_SECONDS=%.1f SPOT_RESOLVED_BUFFER_USD=%.0f META_REFRESH=%.1f",
+        ENABLE_SPOT_GUARD,
+        SPOT_POLL_SECONDS,
+        CLOSEOUT_SECONDS,
+        SPOT_RESOLVED_BUFFER_USD,
+        MARKET_META_REFRESH_SECONDS,
+    )
 
     last_market: Optional[str] = None
     last_yes_bid: Optional[int] = None
@@ -1393,6 +1596,14 @@ def main():
 
             ob = fetch_orderbook(mkt)
             yes_bid, yes_ask = get_yes_bid_ask(ob, mkt)
+
+            # ✅ NEW: closeout/spot guard → cancel immediately + skip quoting (A)
+            force_exit, exit_reason = should_force_exit(mkt)
+            if force_exit:
+                cancel_all_working(mkt, exit_reason, DRY_RUN)
+                log.info("[TARGET] %s → SKIP (%s)", mkt, exit_reason)
+                time.sleep(POLL)
+                continue
 
             quote_changed = (yes_bid != last_yes_bid) or (yes_ask != last_yes_ask) or market_changed
             if quote_changed:
