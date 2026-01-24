@@ -1100,54 +1100,76 @@ def main() -> None:
         if not active_market:
             return
         if quote.bid_order_id:
+            oid = quote.bid_order_id
+            old_px = quote.bid_price
             try:
                 if not DRY_RUN:
-                    st = cancel_order_status(client, quote.bid_order_id)
+                    st = cancel_order_status(client, oid)
                     mark_order_action()
                     note_successful_request()
                 else:
                     st = "canceled"
-                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={quote.bid_order_id} status={st}")
+                log.info(f"[OM] {active_market} BUY CANCEL ({reason}) order_id={oid} status={st}")
 
                 if st == "not_found":
+                    # CHANGE 1: clear local immediately, then refresh/pause
+                    order_posted_ts.pop(oid, None)
+                    quote.bid_order_id = None
+                    quote.bid_price = None
+
                     _ = refresh_positions_now("cancel_bid_only_404_not_found")
                     pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                     skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                     log.warning(f"[OM] {active_market} cancel_bid_only got 404/not_found; pausing until inventory stabilizes.")
+                    return
+
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_bid_only")
-                log.warning(f"[OM] cancel bid failed ({reason}): {e}")
-            order_posted_ts.pop(quote.bid_order_id, None)
-            quote.bid_order_id = None
-            quote.bid_price = None
+                log.warning(f"[OM] cancel bid failed ({reason}) order_id={oid} @ {old_px}: {e}")
+            finally:
+                # normal cleanup
+                order_posted_ts.pop(oid, None)
+                quote.bid_order_id = None
+                quote.bid_price = None
 
     def cancel_ask_only(reason: str) -> None:
         nonlocal quote, order_posted_ts, pause_until, skip_quote_until
         if not active_market:
             return
         if quote.ask_order_id:
+            oid = quote.ask_order_id
+            old_px = quote.ask_price
             try:
                 if not DRY_RUN:
-                    st = cancel_order_status(client, quote.ask_order_id)
+                    st = cancel_order_status(client, oid)
                     mark_order_action()
                     note_successful_request()
                 else:
                     st = "canceled"
-                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={quote.ask_order_id} status={st}")
+                log.info(f"[OM] {active_market} SELL CANCEL ({reason}) order_id={oid} status={st}")
 
                 if st == "not_found":
+                    # CHANGE 1: clear local immediately, then refresh/pause
+                    order_posted_ts.pop(oid, None)
+                    quote.ask_order_id = None
+                    quote.ask_price = None
+
                     _ = refresh_positions_now("cancel_ask_only_404_not_found")
                     pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                     skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
                     log.warning(f"[OM] {active_market} cancel_ask_only got 404/not_found; pausing until inventory stabilizes.")
+                    return
+
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("cancel_ask_only")
-                log.warning(f"[OM] cancel ask failed ({reason}): {e}")
-            order_posted_ts.pop(quote.ask_order_id, None)
-            quote.ask_order_id = None
-            quote.ask_price = None
+                log.warning(f"[OM] cancel ask failed ({reason}) order_id={oid} @ {old_px}: {e}")
+            finally:
+                # normal cleanup
+                order_posted_ts.pop(oid, None)
+                quote.ask_order_id = None
+                quote.ask_price = None
 
     def cancel_live_quotes(reason: str) -> None:
         cancel_bid_only(reason)
@@ -1567,9 +1589,6 @@ def main() -> None:
             old_order_id: Optional[str],
             old_price: Optional[int],
         ) -> Tuple[Optional[str], Optional[int], bool]:
-            # NOTE: only change here vs your paste:
-            #   - on cancel not_found: IMMEDIATELY clear local quote state for that side (CHANGE 1)
-            #   - caller no longer needs to guess which oid hit 404 (simpler + safer for CHANGE 2)
             nonlocal skip_quote_until, pause_until, last_cancel_not_found_oid, quote, order_posted_ts
 
             last_cancel_not_found_oid = None
