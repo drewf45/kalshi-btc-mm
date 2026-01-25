@@ -1998,4 +1998,32 @@ def main() -> None:
             if enforce_two_sided_now:
                 has_bid = quote.bid_order_id is not None
                 has_ask = quote.ask_order_id is not None
-               
+                if has_bid != has_ask:
+                    cancel_live_quotes("atomic_two_sided_enforce")
+                else:
+                    if has_bid and has_ask:
+                        balance_fail_burst = 0
+
+        sig = (active_market, bid_px, ask_px, why)
+        if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
+            log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
+            last_target_sig = sig
+            last_target_log_at = t0
+
+        if (t0 - last_state_log_at) >= STATE_LOG_SECONDS:
+            b_vis = quote.bid_order_id is not None and quote.bid_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            a_vis = quote.ask_order_id is not None and quote.ask_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            log.info(
+                f"[STATE] mkt={active_market} pos={pos_yes_live} spread={spread_now} best=({yes_bid},{yes_ask}) tgt=({bid_px},{ask_px}) "
+                f"reduce_only={reduce_only} emergency={emergency_reduce_only} allow=(b:{allow_bid},a:{allow_ask}) open=(b:{open_buys},s:{open_sells}) "
+                f"inv_age={max(0.0, t0 - last_positions_poll):.2f}s quote=(b:{quote.bid_order_id}@{quote.bid_price} vis={b_vis}, a:{quote.ask_order_id}@{quote.ask_price} vis={a_vis}) "
+                f"cooldowns(pause={max(0.0, pause_until-time.time()):.2f} bal={max(0.0, balance_fail_until-time.time()):.2f} rl={max(0.0, rl_until-time.time()):.2f} skip={max(0.0, skip_quote_until-time.time()):.2f})"
+            )
+            last_state_log_at = t0
+
+        dt = time.time() - t0
+        time.sleep(max(0.0, POLL_SECONDS - dt))
+
+
+if __name__ == "__main__":
+    main()
