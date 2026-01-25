@@ -25,6 +25,15 @@
 #     • Kalshi expects status in {resting, canceled, executed} for that endpoint.
 #     • Bot now uses status="resting" so open order reconciliation matches reality.
 #
+# CHANGE 5 (NEW, OPTIONAL): LONG_ONLY mode (conservative):
+#     • When flat, do NOT place asks (prevents going short).
+#     • Asks are only allowed in reduce-only mode when net_yes > 0 (exiting a long).
+#
+# CHANGE 6 (FIX): Prevent self-cancel churn from "inventory_block_*":
+#     • When computing open_buys/open_sells for allow_* limits, EXCLUDE our own tracked quote orders.
+#     • This prevents the bot from counting its own resting quotes against itself and canceling immediately
+#       when both sides are visible and aligned with local QuoteState.
+#
 # LOGGING DIAGNOSTICS (NEW, ONLY): Adds high-signal logs to debug:
 #   (A) OMSNP reconcile snapshot lines when open-list != detail
 #   (B) LIFE order lifecycle tracking (posted -> seen in open-list -> seen in detail)
@@ -143,6 +152,9 @@ INITIAL_NET_YES_CONTRACTS = env_int("INITIAL_NET_YES_CONTRACTS", 0)
 # Absolute cap + reduce-only & two-sided-flat-only
 MAX_ABS_YES_CONTRACTS = env_int("MAX_ABS_YES_CONTRACTS", 1)
 QUOTE_BOTH_WHEN_FLAT_ONLY = env_bool("QUOTE_BOTH_WHEN_FLAT_ONLY", True)
+
+# NEW: Conservative long-only mode (prevents shorts when flat)
+LONG_ONLY = env_bool("LONG_ONLY", False)
 
 # Order-state safety
 ORDER_STATUS_POLL_SECONDS = env_float("ORDER_STATUS_POLL_SECONDS", 1.0)
@@ -774,6 +786,31 @@ def count_open_yes_orders(open_orders: List[Dict[str, Any]], market_ticker: str)
         if str(o.get("ticker")) != market_ticker:
             continue
         if str(o.get("side", "")).lower() != "yes":
+            continue
+        action = str(o.get("action", "")).lower()
+        if action == "buy":
+            buys += safe_int(o.get("remaining_count") or o.get("count") or 0) or 0
+        elif action == "sell":
+            sells += safe_int(o.get("remaining_count") or o.get("count") or 0) or 0
+    return buys, sells
+
+
+# CHANGE 6: Exclude our own tracked quote orders when computing "open" for allow_* gating.
+def count_open_yes_orders_excluding_ids(
+    open_orders: List[Dict[str, Any]],
+    market_ticker: str,
+    exclude_ids: "set[str]",
+) -> Tuple[int, int]:
+    buys = 0
+    sells = 0
+    mt = str(market_ticker)
+    for o in open_orders:
+        if str(o.get("ticker")) != mt:
+            continue
+        if str(o.get("side", "")).lower() != "yes":
+            continue
+        oid = o.get("order_id") or o.get("id")
+        if oid and str(oid) in exclude_ids:
             continue
         action = str(o.get("action", "")).lower()
         if action == "buy":
@@ -1679,7 +1716,13 @@ def main() -> None:
         else:
             is_quoting = True
 
-        open_buys, open_sells = count_open_yes_orders(open_orders_cache, active_market)
+        # "All" open counts (unchanged) for visibility/logging.
+        open_buys_all, open_sells_all = count_open_yes_orders(open_orders_cache, active_market)
+
+        # CHANGE 6: "Other" open counts for allow_* gating (exclude our own tracked orders).
+        exclude_ids = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
+        open_buys, open_sells = count_open_yes_orders_excluding_ids(open_orders_cache, active_market, exclude_ids)
+
         est_net_yes = net_yes
 
         inv_age = (t0 - last_positions_poll) if last_positions_poll > 0 else 9999.0
@@ -1746,6 +1789,10 @@ def main() -> None:
             allow_bid = allow_bid and ((est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS)
             allow_ask = allow_ask and ((est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS)
 
+            # CHANGE 5: Long-only prevents placing asks while flat (no new shorts).
+            if LONG_ONLY:
+                allow_ask = False
+
         if emergency_reduce_only and est_net_yes != 0:
             if est_net_yes > 0:
                 if quote.bid_order_id:
@@ -1768,7 +1815,11 @@ def main() -> None:
 
         quote.last_market_ticker = active_market
 
+        # CHANGE 5: If LONG_ONLY and flat, do not enforce "two-sided required" (we intentionally quote one-sided).
         enforce_two_sided_now = REQUIRE_TWO_SIDED_QUOTES and (not QUOTE_BOTH_WHEN_FLAT_ONLY or est_net_yes == 0)
+        if LONG_ONLY and est_net_yes == 0:
+            enforce_two_sided_now = False
+
         if enforce_two_sided_now and (not allow_bid or not allow_ask):
             if quote.bid_order_id or quote.ask_order_id:
                 cancel_live_quotes("two_sided_required")
@@ -1951,7 +2002,7 @@ def main() -> None:
             a_vis = quote.ask_order_id is not None and quote.ask_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
             log.info(
                 f"[STATE] mkt={active_market} pos={pos_yes_live} spread={spread_now} best=({yes_bid},{yes_ask}) tgt=({bid_px},{ask_px}) "
-                f"reduce_only={reduce_only} emergency={emergency_reduce_only} allow=(b:{allow_bid},a:{allow_ask}) open=(b:{open_buys},s:{open_sells}) "
+                f"reduce_only={reduce_only} emergency={emergency_reduce_only} allow=(b:{allow_bid},a:{allow_ask}) open=(b:{open_buys_all},s:{open_sells_all}) "
                 f"inv_age={max(0.0, t0 - last_positions_poll):.2f}s quote=(b:{quote.bid_order_id}@{quote.bid_price} vis={b_vis}, a:{quote.ask_order_id}@{quote.ask_price} vis={a_vis}) "
                 f"cooldowns(pause={max(0.0, pause_until-time.time()):.2f} bal={max(0.0, balance_fail_until-time.time()):.2f} rl={max(0.0, rl_until-time.time()):.2f} skip={max(0.0, skip_quote_until-time.time()):.2f})"
             )
