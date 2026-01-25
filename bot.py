@@ -10,7 +10,7 @@
 # - Chooses YES or NO based on:
 #     • p_model >= PROB_MIN (default 0.85)
 #     • edge_net >= EDGE_MIN (default 0.02)   [fee-aware via FEE_CENTS_PER_CONTRACT]
-#     • ask_price <= MAX_ENTRY_PRICE_CENTS (default 97)
+#     • entry_price <= MAX_ENTRY_PRICE_CENTS (default 97)
 # - Sizes the bet as BANKROLL_FRACTION of AVAILABLE balance (default 5%),
 #   with caps and safe fallbacks.
 # - After placing the trade, it does NOTHING until the position resolves/clears.
@@ -92,25 +92,6 @@ def clamp_int(x: int, lo: int, hi: int) -> int:
 
 
 # -----------------------------
-# ISO time parsing  (ADDED - minimal change)
-# -----------------------------
-def iso_to_unix_seconds(iso_ts: Optional[str]) -> Optional[int]:
-    """
-    Convert ISO-8601 like '2026-01-25T19:00:00Z' or with offset into unix seconds.
-    Returns None if missing/invalid.
-    """
-    if not iso_ts:
-        return None
-    try:
-        s = str(iso_ts).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return int(datetime.fromisoformat(s).timestamp())
-    except Exception:
-        return None
-
-
-# -----------------------------
 # Config (keep your existing names for Kalshi + series)
 # -----------------------------
 API_BASE = getenv_first(["KALSHI_API_BASE"], "https://api.elections.kalshi.com").rstrip("/")
@@ -150,7 +131,7 @@ CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
 # Edge / model gates
 PROB_MIN = env_float("PROB_MIN", 0.85)
 EDGE_MIN = env_float("EDGE_MIN", 0.02)                            # 2 cents in probability-price terms
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 97)      # don't buy at 98-99 by default
+MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 97)      # don't buy/pay above this (maker uses postable entry price)
 FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)     # set if you want fee-aware edge gate
 
 # Probability model: sigma in USD per sqrt(second) for last-minute BTC movement
@@ -170,6 +151,10 @@ CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
 # Diagnostics
 LOG_DECISIONS = env_bool("LOG_DECISIONS", True)
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 2.0)
+
+# --- NEW: book/log handling (additive only) ---
+JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)                       # maker aggressiveness: 0=join bid, 1=improve by 1 (if still post-only)
+OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)   # rate-limit "no usable book" warnings
 
 
 # -----------------------------
@@ -253,20 +238,14 @@ class KalshiClient:
 def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
     now_ts = int(time.time())
 
-    # CHANGED: accept ints OR ISO strings for time fields
     def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
         v = obj.get(key)
         if v is None:
             return None
-        # numeric already?
         try:
             return int(v)
         except Exception:
-            pass
-        # ISO timestamp?
-        if isinstance(v, str) and ("T" in v):
-            return iso_to_unix_seconds(v)
-        return None
+            return None
 
     candidates = []
     for m in markets:
@@ -305,37 +284,13 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
     return str(event_ticker), str(market_ticker), chosen
 
 
-# CHANGED: close_time may be ISO; normalize to unix seconds
 def extract_close_ts(market_obj: Dict[str, Any]) -> Optional[int]:
-    # try numeric fields first
-    for k in ("close_ts", "close_timestamp"):
+    for k in ("close_time", "close_ts", "close_timestamp"):
         if k in market_obj:
             try:
                 return int(market_obj[k])
             except Exception:
                 pass
-
-    # close_time is often ISO (e.g., "...Z")
-    if "close_time" in market_obj:
-        v = market_obj.get("close_time")
-        # if it's numeric-looking, still allow
-        try:
-            return int(v)
-        except Exception:
-            pass
-        if isinstance(v, str) and ("T" in v):
-            return iso_to_unix_seconds(v)
-
-    # sometimes APIs use expiration_time instead
-    if "expiration_time" in market_obj:
-        v = market_obj.get("expiration_time")
-        try:
-            return int(v)
-        except Exception:
-            pass
-        if isinstance(v, str) and ("T" in v):
-            return iso_to_unix_seconds(v)
-
     return None
 
 
@@ -376,12 +331,10 @@ def fetch_btc_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optio
 
 
 def _norm_cdf(x: float) -> float:
-    # Standard normal CDF via erf
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def prob_yes_in_range(mean: float, lo: Optional[float], hi: Optional[float], sd: float) -> float:
-    # YES if settlement in [lo, hi]. If only one side present, treat as >=lo or <=hi.
     if sd <= 0:
         sd = 1e-9
     if lo is None and hi is None:
@@ -393,7 +346,6 @@ def prob_yes_in_range(mean: float, lo: Optional[float], hi: Optional[float], sd:
     if lo is not None:
         z = (lo - mean) / sd
         return max(0.0, min(1.0, 1.0 - _norm_cdf(z)))
-    # hi only
     z = (hi - mean) / sd
     return max(0.0, min(1.0, _norm_cdf(z)))
 
@@ -402,7 +354,6 @@ def prob_yes_in_range(mean: float, lo: Optional[float], hi: Optional[float], sd:
 # Orderbook parsing (YES and NO best bid/ask)
 # -----------------------------
 def _best_from_levels(levels: Any, want: str) -> Optional[int]:
-    # want="bid" -> max price; want="ask" -> min price
     if not isinstance(levels, list) or not levels:
         return None
     best: Optional[int] = None
@@ -435,7 +386,8 @@ def _best_from_levels(levels: Any, want: str) -> Optional[int]:
 def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Returns: (yes_bid, yes_ask, no_bid, no_ask) in cents.
-    Handles common Kalshi shapes and derives missing NO from YES when needed.
+    Unlike the earlier strict version, this does NOT require all 4 to exist.
+    It returns whatever it can parse/derive.
     """
     if not isinstance(ob, dict):
         return None, None, None, None
@@ -454,33 +406,29 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
             no_bid = _best_from_levels(n.get("bids", n.get("buy")), "bid")
             no_ask = _best_from_levels(n.get("asks", n.get("sell")), "ask")
 
-    # Shape B: orderbook: { yes:[...], no:[...] } where lists are bid ladders (best bid); derive asks via complement
+    # Shape B: orderbook: { yes:[...], no:[...] } where lists are bid ladders (best bid)
     if isinstance(root, dict) and (isinstance(root.get("yes"), list) or isinstance(root.get("no"), list)):
         if yes_bid is None and isinstance(root.get("yes"), list):
             yes_bid = _best_from_levels(root.get("yes"), "bid")
         if no_bid is None and isinstance(root.get("no"), list):
             no_bid = _best_from_levels(root.get("no"), "bid")
 
-    # Derive missing asks by complement when possible
-    # In a binary market: no_ask ~= 100 - yes_bid ; yes_ask ~= 100 - no_bid
+    # Derive missing asks/bids by complement where possible
     if yes_ask is None and no_bid is not None:
         yes_ask = clamp_int(100 - no_bid, 1, 99)
     if no_ask is None and yes_bid is not None:
         no_ask = clamp_int(100 - yes_bid, 1, 99)
 
-    # Derive missing bids by complement when possible
     if yes_bid is None and no_ask is not None:
         yes_bid = clamp_int(100 - no_ask, 1, 99)
     if no_bid is None and yes_ask is not None:
         no_bid = clamp_int(100 - yes_ask, 1, 99)
 
-    # Sanity: crossed/locked => treat missing
-    if yes_bid is not None and yes_ask is not None and yes_bid >= yes_ask:
-        # end-of-window can look locked; still tradable sometimes but dangerous for this strategy
-        return None, None, None, None
-
-    if no_bid is not None and no_ask is not None and no_bid >= no_ask:
-        return None, None, None, None
+    # If book looks locked/crossed, drop the "ask" side (still keep bids; maker can still post)
+    if yes_bid is not None and yes_ask is not None and yes_ask <= yes_bid:
+        yes_ask = None
+    if no_bid is not None and no_ask is not None and no_ask <= no_bid:
+        no_ask = None
 
     return yes_bid, yes_ask, no_bid, no_ask
 
@@ -489,7 +437,6 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
 # Orders / portfolio helpers
 # -----------------------------
 def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
-    # status must be "resting"
     resp = client.request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
     if isinstance(resp, dict):
         return resp.get("orders", [])
@@ -545,10 +492,6 @@ def parse_position_for_market(positions: List[Dict[str, Any]], market_ticker: st
 
 
 def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Tries to read portfolio balance in USD.
-    Returns: (available_usd, total_usd) or (None, None) if unknown.
-    """
     try:
         resp = client.request("GET", "/portfolio/balance")
     except Exception:
@@ -556,9 +499,6 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
     if not isinstance(resp, dict):
         return None, None
 
-    # Try common shapes
-    # - {"balance":{"available_balance":..., "balance":...}}
-    # - {"available_balance":..., "balance":...}
     base = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
 
     cand_available = [
@@ -649,11 +589,11 @@ def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> No
 # Late-snipe state machine
 # -----------------------------
 class SM:
-    IDLE = "IDLE"             # waiting for an active market; not armed
-    ARMED = "ARMED"           # within ENTRY_START_SECONDS window; gathering info
-    ORDER_WAIT = "ORDER_WAIT" # order placed; waiting fill / deadline management
-    HOLD = "HOLD"             # trade done; do nothing until position clears
-    ROLL = "ROLL"             # market changed; reconcile then go IDLE/ARMED
+    IDLE = "IDLE"
+    ARMED = "ARMED"
+    ORDER_WAIT = "ORDER_WAIT"
+    HOLD = "HOLD"
+    ROLL = "ROLL"
 
 
 @dataclass
@@ -662,22 +602,18 @@ class BotState:
     market: Optional[str] = None
     event: Optional[str] = None
 
-    # trade intent (for this market)
     traded_this_market: bool = False
-    side: Optional[str] = None          # "yes" or "no"
-    action: Optional[str] = None        # "buy"
-    target_price: Optional[int] = None  # cents
+    side: Optional[str] = None
+    action: Optional[str] = None
+    target_price: Optional[int] = None
     qty: int = 0
 
-    # live order tracking
     order_id: Optional[str] = None
     order_price: Optional[int] = None
-    order_side: Optional[str] = None    # yes/no
+    order_side: Optional[str] = None
 
-    # timers
     placed_at: float = 0.0
 
-    # model snapshots (debug)
     last_p_yes: Optional[float] = None
     last_edge_yes: Optional[float] = None
     last_edge_no: Optional[float] = None
@@ -686,9 +622,31 @@ class BotState:
 # -----------------------------
 # Decision logic
 # -----------------------------
-def compute_edge(p: float, ask_cents: int, fee_cents: int) -> float:
-    # edge in probability units (0..1). ask_cents are 1..99
-    return float(p) - float(ask_cents + fee_cents) / 100.0
+def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
+    return float(p) - float(price_cents + fee_cents) / 100.0
+
+
+def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int]:
+    """
+    For POST_ONLY buys: choose a price that will REST (not cross).
+    - If both bid+ask known, we can improve by JOIN_UP_CENTS but never cross: <= ask-1.
+    - If only bid known, join/improve relative to bid is fine (no ask to cross).
+    - If only ask known, use ask-1 (if possible).
+    """
+    if bid is None and ask is None:
+        return None
+    if bid is None:
+        px = int(ask) - 1
+        return clamp_int(px, 1, 99) if px >= 1 else None
+    if ask is None:
+        return clamp_int(int(bid), 1, 99)
+    # both known
+    max_rest = int(ask) - 1
+    if max_rest < 1:
+        return None
+    px = int(bid) + int(JOIN_UP_CENTS)
+    px = min(px, max_rest)
+    return clamp_int(px, 1, 99)
 
 
 def choose_trade(
@@ -696,57 +654,65 @@ def choose_trade(
     lo: Optional[float],
     hi: Optional[float],
     secs_to_close: int,
-    yes_bid: int,
-    yes_ask: int,
-    no_bid: int,
-    no_ask: int,
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+    no_bid: Optional[int],
+    no_ask: Optional[int],
 ) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], float]:
     """
     Returns:
       chosen_side ("yes"/"no") or None
-      chosen_ask_price
-      p_yes
-      p_no
-      chosen_edge
+      chosen_entry_price (what we will send as limit price)
+      p_yes, p_no, chosen_edge
     """
-    # model sd over remaining window (use secs_to_close, but clamp so it doesn't go weird)
     t_eff = max(5.0, float(min(secs_to_close, 120)))
     sd = SPOT_SIGMA_USD_PER_SQRT_SEC * math.sqrt(t_eff)
 
     p_yes = prob_yes_in_range(spot, lo, hi, sd)
     p_no = 1.0 - p_yes
 
-    edge_yes = compute_edge(p_yes, yes_ask, FEE_CENTS_PER_CONTRACT)
-    edge_no = compute_edge(p_no, no_ask, FEE_CENTS_PER_CONTRACT)
+    # Determine tradable entry prices
+    if POST_ONLY:
+        yes_px = postable_entry_price(yes_bid, yes_ask)
+        no_px = postable_entry_price(no_bid, no_ask)
+    else:
+        yes_px = yes_ask
+        no_px = no_ask
 
-    # Gates
-    ok_yes = (p_yes >= PROB_MIN) and (edge_yes >= EDGE_MIN) and (yes_ask <= MAX_ENTRY_PRICE_CENTS)
-    ok_no = (p_no >= PROB_MIN) and (edge_no >= EDGE_MIN) and (no_ask <= MAX_ENTRY_PRICE_CENTS)
+    edge_yes = compute_edge(p_yes, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
+    edge_no = compute_edge(p_no, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+
+    ok_yes = (
+        yes_px is not None
+        and (p_yes >= PROB_MIN)
+        and (edge_yes >= EDGE_MIN)
+        and (yes_px <= MAX_ENTRY_PRICE_CENTS)
+    )
+    ok_no = (
+        no_px is not None
+        and (p_no >= PROB_MIN)
+        and (edge_no >= EDGE_MIN)
+        and (no_px <= MAX_ENTRY_PRICE_CENTS)
+    )
 
     if ok_yes and ok_no:
-        # choose larger edge (or cheaper if tie)
         if edge_yes > edge_no + 1e-9:
-            return "yes", yes_ask, p_yes, p_no, edge_yes
+            return "yes", int(yes_px), p_yes, p_no, float(edge_yes)
         if edge_no > edge_yes + 1e-9:
-            return "no", no_ask, p_yes, p_no, edge_no
-        # tie-break: cheaper
-        if yes_ask <= no_ask:
-            return "yes", yes_ask, p_yes, p_no, edge_yes
-        return "no", no_ask, p_yes, p_no, edge_no
+            return "no", int(no_px), p_yes, p_no, float(edge_no)
+        if int(yes_px) <= int(no_px):
+            return "yes", int(yes_px), p_yes, p_no, float(edge_yes)
+        return "no", int(no_px), p_yes, p_no, float(edge_no)
 
     if ok_yes:
-        return "yes", yes_ask, p_yes, p_no, edge_yes
+        return "yes", int(yes_px), p_yes, p_no, float(edge_yes)
     if ok_no:
-        return "no", no_ask, p_yes, p_no, edge_no
+        return "no", int(no_px), p_yes, p_no, float(edge_no)
 
-    return None, None, p_yes, p_no, max(edge_yes, edge_no)
+    return None, None, p_yes, p_no, max(float(edge_yes), float(edge_no))
 
 
-def compute_qty_from_bankroll(available_usd: Optional[float], ask_cents: int) -> int:
-    """
-    Uses BANKROLL_FRACTION of available USD.
-    Cost per contract ≈ ask_cents/100 USD.
-    """
+def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int) -> int:
     if available_usd is None or available_usd <= 0:
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
 
@@ -754,7 +720,7 @@ def compute_qty_from_bankroll(available_usd: Optional[float], ask_cents: int) ->
         return 0
 
     stake_usd = max(0.0, float(available_usd) * float(BANKROLL_FRACTION))
-    cost_per = float(ask_cents) / 100.0
+    cost_per = float(entry_cents) / 100.0
     if cost_per <= 0:
         return 0
     qty = int(stake_usd // cost_per)
@@ -784,10 +750,10 @@ def main() -> None:
 
     last_meta = 0.0
     last_state_log = 0.0
+    last_ob_warn = 0.0
 
     def refresh_active_market() -> Tuple[str, str, Dict[str, Any]]:
         if MARKET_OVERRIDE and MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
-            # If overriding, we still need market object; fetch /markets/{ticker}
             mt = MARKET_OVERRIDE
             try:
                 snap = client.request("GET", f"/markets/{mt}")
@@ -806,15 +772,12 @@ def main() -> None:
         return ev, mt, mobj
 
     def reconcile_on_market_change(new_market: str) -> None:
-        # single-market policy: if rolling, cancel any strays for the new market (optional)
         if BOOTSTRAP_CANCEL_OPEN_ORDERS or CANCEL_ALL_STRAYS_ALWAYS:
             try:
                 cancel_all_strays_for_market(client, new_market)
             except Exception as e:
                 log.warning(f"[RECON] cancel strays failed: {e}")
 
-        # If we already have a position in ANY market, this bot is "HOLD" until it clears.
-        # But we can't scan all markets cheaply every loop; we at least check the active market position.
         try:
             pos = parse_position_for_market(get_positions(client), new_market)
         except Exception:
@@ -828,7 +791,6 @@ def main() -> None:
             log.warning(f"[RECON] found existing position in {new_market}: pos={pos}. Enter HOLD.")
             return
 
-        # If there are resting orders in the market, treat as ORDER_WAIT (inherited)
         try:
             oo = get_open_orders(client)
             any_for = False
@@ -839,7 +801,6 @@ def main() -> None:
                 if oid:
                     st.order_id = str(oid)
                     st.order_side = str(o.get("side", "")).lower() or None
-                    # price field depends on side
                     px = o.get("yes_price") if st.order_side == "yes" else o.get("no_price")
                     if px is None:
                         px = o.get("price")
@@ -853,13 +814,12 @@ def main() -> None:
             if any_for:
                 st.sm = SM.ORDER_WAIT
                 st.market = new_market
-                st.traded_this_market = True  # "a trade attempt exists"
+                st.traded_this_market = True
                 log.warning(f"[RECON] inherited resting order in {new_market}: order_id={st.order_id} side={st.order_side} px={st.order_price}")
                 return
         except Exception:
             pass
 
-        # Otherwise clean start
         st.sm = SM.IDLE
         st.market = new_market
         st.traded_this_market = False
@@ -868,7 +828,6 @@ def main() -> None:
         st.target_price = None
         st.qty = 0
 
-    # Initial market selection + reconcile
     ev, mt, mobj = refresh_active_market()
     active_market_obj = mobj or {}
     st.market = mt
@@ -879,7 +838,6 @@ def main() -> None:
     while True:
         now = time.time()
 
-        # refresh market selection
         if (now - last_meta) >= META_REFRESH_SECONDS:
             try:
                 ev2, mt2, mobj2 = refresh_active_market()
@@ -896,7 +854,6 @@ def main() -> None:
                     st.qty = 0
                     reconcile_on_market_change(mt2)
                 else:
-                    # update object (close_time/strikes can be in it)
                     if isinstance(mobj2, dict) and mobj2:
                         active_market_obj = mobj2
                 last_meta = now
@@ -908,20 +865,17 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Pull close time (CHANGED: handles ISO close_time)
         close_ts = extract_close_ts(active_market_obj)
         secs_to_close = None
         if close_ts is not None:
             secs_to_close = int(close_ts - int(time.time()))
 
-        # Position check
         pos = 0
         try:
             pos = parse_position_for_market(get_positions(client), st.market)
         except Exception as e:
             log.warning(f"[INV] positions fetch failed: {e}")
 
-        # If we have a position, we do nothing until it clears (SINGLE MARKET, SINGLE TRADE)
         if pos != 0:
             if st.sm != SM.HOLD:
                 st.sm = SM.HOLD
@@ -930,7 +884,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # If we think we have an order resting, monitor it; if it disappears and pos is still 0, treat as "done/skip"
         if st.sm == SM.ORDER_WAIT and st.order_id:
             try:
                 oo = get_open_orders(client)
@@ -939,15 +892,13 @@ def main() -> None:
                 alive = True
 
             if not alive:
-                # Either filled+settled instantly (unlikely) or canceled/expired/partial-then-canceled.
-                log.warning(f"[ORDER] order_id={st.order_id} no longer resting; pos={pos}. Mark traded_this_market=True and go HOLD/IDLE.")
+                log.warning(f"[ORDER] order_id={st.order_id} no longer resting; pos={pos}. Mark traded_this_market=True and go HOLD.")
                 st.order_id = None
-                st.sm = SM.HOLD  # conservative: stay out for this market
+                st.sm = SM.HOLD
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # If close is here and we want to cancel unfilled
             if secs_to_close is not None and secs_to_close <= 0 and CANCEL_UNFILLED_AT_CLOSE:
                 try:
                     if ENABLE_TRADING and not DRY_RUN:
@@ -961,30 +912,21 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Wait; optionally try taker at last second if enabled
-            if secs_to_close is not None and secs_to_close <= ENTRY_LAST_SECONDS and ALLOW_TAKER_AT_LAST and (not POST_ONLY):
-                # Convert to taker by cancel+replace at ask (cross) if still valid (recompute below would be better,
-                # but keep this simple: if we already placed, do not churn unless you enable this feature).
-                pass
-
             time.sleep(POLL_SECONDS)
             continue
 
-        # If we've already traded this market, stay out until market rolls
         if ONE_TRADE_PER_MARKET and st.traded_this_market:
             st.sm = SM.HOLD
             time.sleep(POLL_SECONDS)
             continue
 
-        # If we don't know time-to-close, we can't do late sniping reliably
         if secs_to_close is None:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.warning(f"[STATE] market={st.market} missing close_time/close_ts; cannot snipe. Waiting...")
+                log.warning(f"[STATE] market={st.market} missing close_ts; cannot snipe. Waiting...")
                 last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
 
-        # Not armed yet
         if secs_to_close > ENTRY_START_SECONDS:
             st.sm = SM.IDLE
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
@@ -993,12 +935,8 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Armed window
         st.sm = SM.ARMED
 
-        # Only evaluate/decide near decision window:
-        # - default "go time" at ENTRY_DECISION_SECONDS
-        # - last chance at ENTRY_LAST_SECONDS
         if secs_to_close > ENTRY_DECISION_SECONDS:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                 log.info(f"[STATE] {st.market} ARMED t_close={secs_to_close}s (decision at {ENTRY_DECISION_SECONDS}s)")
@@ -1007,20 +945,17 @@ def main() -> None:
             continue
 
         if secs_to_close < ENTRY_LAST_SECONDS:
-            # Too late (past last chance)
-            st.traded_this_market = True  # skip this market
+            st.traded_this_market = True
             log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s < {ENTRY_LAST_SECONDS}s).")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Fetch spot
         spot = fetch_btc_spot_usd(http)
         if spot is None:
             log.warning(f"[SPOT] failed; skipping this poll")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Fetch orderbook
         try:
             ob = client.request("GET", f"/markets/{st.market}/orderbook")
         except Exception as e:
@@ -1029,15 +964,10 @@ def main() -> None:
             continue
 
         yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
-        if any(v is None for v in (yes_bid, yes_ask, no_bid, no_ask)):
-            if LOG_DECISIONS:
-                log.warning(f"[OB] invalid/no book near close: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})")
-            time.sleep(POLL_SECONDS)
-            continue
 
         lo, hi = market_bounds_usd(active_market_obj)
 
-        chosen_side, chosen_ask, p_yes, p_no, chosen_edge = choose_trade(
+        chosen_side, chosen_px, p_yes, p_no, chosen_edge = choose_trade(
             spot=spot,
             lo=lo,
             hi=hi,
@@ -1048,44 +978,55 @@ def main() -> None:
             no_ask=no_ask,
         )
 
+        # compute edges for logging using the chosen pricing rules
+        if POST_ONLY:
+            yes_px_log = postable_entry_price(yes_bid, yes_ask)
+            no_px_log = postable_entry_price(no_bid, no_ask)
+        else:
+            yes_px_log = yes_ask
+            no_px_log = no_ask
+
         st.last_p_yes = p_yes
-        st.last_edge_yes = compute_edge(p_yes, yes_ask, FEE_CENTS_PER_CONTRACT)
-        st.last_edge_no = compute_edge(1.0 - p_yes, no_ask, FEE_CENTS_PER_CONTRACT)
+        st.last_edge_yes = compute_edge(p_yes, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
+        st.last_edge_no = compute_edge(1.0 - p_yes, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
 
         if LOG_DECISIONS:
             log.info(
                 f"[DECIDE] {st.market} t_close={secs_to_close}s spot={spot:.2f} range=({lo},{hi}) "
-                f"YES(bid={yes_bid},ask={yes_ask},p={p_yes:.4f},edge={st.last_edge_yes:.4f}) "
-                f"NO(bid={no_bid},ask={no_ask},p={p_no:.4f},edge={st.last_edge_no:.4f}) "
-                f"-> chosen={chosen_side} ask={chosen_ask} edge={chosen_edge:.4f}"
+                f"YES(bid={yes_bid},ask={yes_ask},entry={yes_px_log},p={p_yes:.4f},edge={st.last_edge_yes}) "
+                f"NO(bid={no_bid},ask={no_ask},entry={no_px_log},p={p_no:.4f},edge={st.last_edge_no}) "
+                f"-> chosen={chosen_side} entry={chosen_px} edge={chosen_edge:.4f}"
             )
 
-        if chosen_side is None or chosen_ask is None:
-            # keep watching within decision window
+        if chosen_side is None or chosen_px is None:
+            # only warn occasionally when book is unusable (avoid spam)
+            if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
+                log.warning(
+                    f"[OB] no usable entry near close: yes=(bid={yes_bid},ask={yes_ask}) no=(bid={no_bid},ask={no_ask}) POST_ONLY={POST_ONLY}"
+                )
+                last_ob_warn = now
             time.sleep(POLL_SECONDS)
             continue
 
-        # Size
         available_usd, total_usd = get_balance_usd(client)
-        qty = compute_qty_from_bankroll(available_usd, int(chosen_ask))
+        qty = compute_qty_from_bankroll(available_usd, int(chosen_px))
         if qty <= 0:
-            log.warning(f"[SKIP] {st.market} qty=0 (available={available_usd}, ask={chosen_ask})")
+            log.warning(f"[SKIP] {st.market} qty=0 (available={available_usd}, entry={chosen_px})")
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
-        # Place ONE order (buy chosen_side at chosen_ask)
         payload = build_order_payload(
             market_ticker=st.market,
             action="buy",
             side=chosen_side,
-            price_cents=int(chosen_ask),
+            price_cents=int(chosen_px),
             count=int(qty),
             post_only=POST_ONLY,
         )
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] would_place: market={st.market} buy {chosen_side} @ {chosen_ask} qty={qty}")
+            log.warning(f"[DRY] would_place: market={st.market} buy {chosen_side} @ {chosen_px} qty={qty}")
             st.traded_this_market = True
             st.sm = SM.HOLD
             time.sleep(POLL_SECONDS)
@@ -1094,24 +1035,21 @@ def main() -> None:
         try:
             oid = place_order(client, payload)
             st.order_id = oid
-            st.order_price = int(chosen_ask)
+            st.order_price = int(chosen_px)
             st.order_side = chosen_side
             st.placed_at = time.time()
             st.qty = qty
             st.side = chosen_side
-            st.target_price = int(chosen_ask)
-            st.traded_this_market = True  # we attempted our ONE trade
+            st.target_price = int(chosen_px)
+            st.traded_this_market = True
             st.sm = SM.ORDER_WAIT
-            log.warning(f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_ask} qty={qty} avail_usd={available_usd} total_usd={total_usd}")
+            log.warning(f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} avail_usd={available_usd} total_usd={total_usd}")
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
-            # if we failed to place, we keep watching until last window expires
             st.order_id = None
             time.sleep(POLL_SECONDS)
             continue
 
-        # Wait for fill up to FILL_WAIT_SECONDS, but do not churn. If unfilled and we reach ENTRY_LAST_SECONDS,
-        # optionally take (cross) only if you set POST_ONLY=False and ALLOW_TAKER_AT_LAST=True.
         while True:
             now2 = time.time()
             secs_to_close2 = int(close_ts - int(now2)) if close_ts is not None else None
@@ -1127,7 +1065,6 @@ def main() -> None:
                 st.sm = SM.HOLD
                 break
 
-            # Check if filled (position non-zero) or order gone
             try:
                 pos2 = parse_position_for_market(get_positions(client), st.market)
             except Exception:
@@ -1138,7 +1075,6 @@ def main() -> None:
                 st.sm = SM.HOLD
                 break
 
-            # Order still resting?
             alive = True
             try:
                 oo2 = get_open_orders(client)
@@ -1152,89 +1088,7 @@ def main() -> None:
                 st.sm = SM.HOLD
                 break
 
-            # Patience
             if (now2 - st.placed_at) >= float(FILL_WAIT_SECONDS):
-                # If taker allowed and we're at/inside ENTRY_LAST_SECONDS, optionally cross once.
-                if (
-                    ALLOW_TAKER_AT_LAST
-                    and (not POST_ONLY)
-                    and secs_to_close2 is not None
-                    and secs_to_close2 <= ENTRY_LAST_SECONDS
-                    and st.order_id
-                ):
-                    # cancel then cross at the ask (worst-case) ONCE if gates still hold
-                    try:
-                        _ = cancel_order_status(client, st.order_id)
-                    except Exception:
-                        pass
-
-                    # Recompute quickly
-                    spot2 = fetch_btc_spot_usd(http)
-                    if spot2 is None:
-                        log.warning("[TAKER] spot failed; giving up taker attempt")
-                        st.order_id = None
-                        st.sm = SM.HOLD
-                        break
-
-                    try:
-                        ob2 = client.request("GET", f"/markets/{st.market}/orderbook")
-                    except Exception as oe:
-                        log.warning(f"[TAKER] orderbook failed: {oe}")
-                        st.order_id = None
-                        st.sm = SM.HOLD
-                        break
-
-                    yb2, ya2, nb2, na2 = parse_best_yes_no(ob2)
-                    if any(v is None for v in (yb2, ya2, nb2, na2)):
-                        log.warning("[TAKER] invalid book; giving up taker attempt")
-                        st.order_id = None
-                        st.sm = SM.HOLD
-                        break
-
-                    chosen_side2, chosen_ask2, p_yes2, p_no2, chosen_edge2 = choose_trade(
-                        spot=spot2,
-                        lo=lo,
-                        hi=hi,
-                        secs_to_close=secs_to_close2,
-                        yes_bid=yb2,
-                        yes_ask=ya2,
-                        no_bid=nb2,
-                        no_ask=na2,
-                    )
-                    if chosen_side2 is None:
-                        log.warning("[TAKER] gates no longer pass; skipping")
-                        st.order_id = None
-                        st.sm = SM.HOLD
-                        break
-
-                    qty2 = compute_qty_from_bankroll(get_balance_usd(client)[0], int(chosen_ask2))
-                    qty2 = max(MIN_CONTRACTS, min(MAX_CONTRACTS, qty2))
-
-                    payload2 = build_order_payload(
-                        market_ticker=st.market,
-                        action="buy",
-                        side=chosen_side2,
-                        price_cents=int(chosen_ask2),   # crossing by sending at ask (POST_ONLY already False)
-                        count=int(qty2),
-                        post_only=False,
-                    )
-                    try:
-                        oid2 = place_order(client, payload2)
-                        st.order_id = oid2
-                        st.order_side = chosen_side2
-                        st.order_price = int(chosen_ask2)
-                        st.placed_at = time.time()
-                        log.warning(f"[TAKER] PLACED market={st.market} order_id={oid2} BUY {chosen_side2.upper()} @ {chosen_ask2} qty={qty2}")
-                        # after taker attempt, hold policy
-                        st.sm = SM.ORDER_WAIT
-                        continue
-                    except Exception as te:
-                        log.warning(f"[TAKER] place failed: {te}")
-                        st.order_id = None
-                        st.sm = SM.HOLD
-                        break
-
-                # Default: no more action; single-trade policy means we just hold out.
                 log.warning(f"[ORDER] still resting after {FILL_WAIT_SECONDS}s; staying out (single-trade policy). order_id={st.order_id}")
                 st.sm = SM.HOLD
                 break
