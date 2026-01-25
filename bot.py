@@ -45,6 +45,12 @@
 #     • If we already have a resting bid/ask quote, we do NOT add ORDER_QTY again
 #     • Prevents inventory_block_bid/ask from canceling perfectly valid two-sided quotes
 #
+# CHANGE 9 (NEW, DIAGNOSTICS): Deep orderbook & snapshot debug (high-signal, safe):
+#     • Logs request latency/status/len for /orderbook and /markets/{ticker} snapshot (no headers/signature)
+#     • Logs raw JSON (truncated) when enabled, plus parsed shape, top levels, and extracted best bid/ask
+#     • Logs exactly why the book is treated as invalid (missing keys, empty levels, crossed/locked, etc.)
+#     • Logs snapshot extraction candidates/keys when fallback is used
+#
 # LOGGING DIAGNOSTICS (NEW, ONLY): Adds high-signal logs to debug:
 #   (A) OMSNP reconcile snapshot lines when open-list != detail
 #   (B) LIFE order lifecycle tracking (posted -> seen in open-list -> seen in detail)
@@ -56,6 +62,7 @@
 import os
 import time
 import base64
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -245,6 +252,161 @@ LOG_RECONCILE_SNAPSHOT = env_bool("LOG_RECONCILE_SNAPSHOT", True)
 LOG_ORDER_LIFECYCLE = env_bool("LOG_ORDER_LIFECYCLE", True)
 LOG_STARTUP_INHERITED_STATE = env_bool("LOG_STARTUP_INHERITED_STATE", True)
 
+# -----------------------------
+# CHANGE 9: Deep orderbook debug toggles (ONLY ADDITIONS)
+# -----------------------------
+OB_DEBUG = env_bool("OB_DEBUG", False)
+OB_DEBUG_RAW_JSON = env_bool("OB_DEBUG_RAW_JSON", False)
+OB_DEBUG_LEVELS = env_int("OB_DEBUG_LEVELS", 10)
+OB_DEBUG_EVERY_POLL = env_bool("OB_DEBUG_EVERY_POLL", False)
+OB_DEBUG_TRUNCATE_CHARS = env_int("OB_DEBUG_TRUNCATE_CHARS", 3500)
+OB_DEBUG_FORCE_LOG_LEVEL = getenv_first(["OB_DEBUG_FORCE_LOG_LEVEL"], "").upper().strip()
+
+def _truncate(s: str, n: int) -> str:
+    s = "" if s is None else str(s)
+    if len(s) <= n:
+        return s
+    return s[:n] + f"...(truncated {len(s)-n} chars)"
+
+def _safe_json_dumps(obj: Any, n: int) -> str:
+    try:
+        txt = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception as e:
+        txt = f"<json_dumps_error:{e}> repr={repr(obj)}"
+    return _truncate(txt, n=n)
+
+def _force_ob_log_level_if_requested(logger: logging.Logger) -> None:
+    if not OB_DEBUG_FORCE_LOG_LEVEL:
+        return
+    try:
+        lvl = getattr(logging, OB_DEBUG_FORCE_LOG_LEVEL, None)
+        if isinstance(lvl, int):
+            logger.setLevel(lvl)
+    except Exception:
+        pass
+
+def _summarize_levels(levels: Any, max_levels: int) -> str:
+    if not isinstance(levels, list):
+        return f"type={type(levels).__name__} repr={_truncate(repr(levels), 250)}"
+    out = []
+    for i, lv in enumerate(levels[:max_levels]):
+        if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+            out.append(f"{i}:{lv[0]}x{lv[1]}")
+        elif isinstance(lv, dict):
+            p = lv.get("price", lv.get("p", lv.get("yes_price", lv.get("no_price"))))
+            q = lv.get("quantity", lv.get("qty", lv.get("q", lv.get("count"))))
+            out.append(f"{i}:{p}x{q} keys={list(lv.keys())[:6]}")
+        else:
+            out.append(f"{i}:{_truncate(repr(lv), 80)}")
+    extra = "" if len(levels) <= max_levels else f" (+{len(levels)-max_levels} more)"
+    return "[" + ", ".join(out) + "]" + extra
+
+def _extract_yes_best_bid_ask_debug(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
+    """
+    Tries multiple known orderbook shapes and returns (yes_best_bid, yes_best_ask, details).
+    This function is diagnostic-first: it records what it saw and why it chose a path.
+    """
+    details: Dict[str, Any] = {"root_keys": list(ob.keys())[:30]}
+    orderbook = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
+    details["orderbook_keys"] = list(orderbook.keys())[:30] if isinstance(orderbook, dict) else [type(orderbook).__name__]
+
+    yes_best_bid: Optional[int] = None
+    yes_best_ask: Optional[int] = None
+    invalid: List[str] = []
+
+    def _lvl_price(lv: Any) -> Optional[int]:
+        if isinstance(lv, (list, tuple)) and len(lv) >= 1:
+            try:
+                return int(lv[0])
+            except Exception:
+                return None
+        if isinstance(lv, dict):
+            for k in ("price", "yes_price", "p"):
+                if k in lv:
+                    try:
+                        return int(lv[k])
+                    except Exception:
+                        return None
+        if isinstance(lv, (int, float)):
+            try:
+                return int(lv)
+            except Exception:
+                return None
+        return None
+
+    def _best_bid_from_levels(levels: Any) -> Optional[int]:
+        if not isinstance(levels, list) or not levels:
+            return None
+        # Many books are sorted best-first. But be defensive and compute max.
+        best = None
+        for lv in levels:
+            p = _lvl_price(lv)
+            if p is None:
+                continue
+            best = p if best is None else max(best, p)
+        return best
+
+    def _best_ask_from_levels(levels: Any) -> Optional[int]:
+        if not isinstance(levels, list) or not levels:
+            return None
+        best = None
+        for lv in levels:
+            p = _lvl_price(lv)
+            if p is None:
+                continue
+            best = p if best is None else min(best, p)
+        return best
+
+    # Candidate A: {"orderbook":{"yes":{"bids":[...],"asks":[...]}, "no":{...}}}
+    if isinstance(orderbook, dict) and isinstance(orderbook.get("yes"), dict):
+        y = orderbook["yes"]
+        bids = y.get("bids", y.get("buy"))
+        asks = y.get("asks", y.get("sell"))
+        details["shape"] = "yes_dict_bids_asks"
+        details["yes_bids_count"] = len(bids) if isinstance(bids, list) else None
+        details["yes_asks_count"] = len(asks) if isinstance(asks, list) else None
+        if OB_DEBUG:
+            log.info(f"[OBDBG] shape=yes_dict bids={_summarize_levels(bids, OB_DEBUG_LEVELS)} asks={_summarize_levels(asks, OB_DEBUG_LEVELS)}")
+        yes_best_bid = _best_bid_from_levels(bids)
+        yes_best_ask = _best_ask_from_levels(asks)
+
+    # Candidate B (existing style): {"orderbook":{"yes":[...], "no":[...]}} where arrays are BID ladders.
+    if (yes_best_bid is None or yes_best_ask is None) and isinstance(orderbook, dict):
+        yes_levels = orderbook.get("yes")
+        no_levels = orderbook.get("no")
+        if isinstance(yes_levels, list) or isinstance(no_levels, list):
+            details.setdefault("shape_tried", []).append("yes_list_no_list_bid_derived_ask")
+            if OB_DEBUG:
+                log.info(f"[OBDBG] shape=yes_list/no_list yes={_summarize_levels(yes_levels, OB_DEBUG_LEVELS)} no={_summarize_levels(no_levels, OB_DEBUG_LEVELS)}")
+            yb = _best_bid_from_levels(yes_levels)
+            nb = _best_bid_from_levels(no_levels)
+            ya = (100 - nb) if nb is not None else None
+            if yes_best_bid is None:
+                yes_best_bid = yb
+            if yes_best_ask is None:
+                yes_best_ask = ya
+
+    # Clamp and validate
+    if yes_best_bid is not None:
+        yes_best_bid = max(1, min(99, int(yes_best_bid)))
+    if yes_best_ask is not None:
+        yes_best_ask = max(1, min(99, int(yes_best_ask)))
+
+    if yes_best_bid is None:
+        invalid.append("best_bid_missing")
+    if yes_best_ask is None:
+        invalid.append("best_ask_missing")
+
+    if yes_best_bid is not None and yes_best_ask is not None:
+        if yes_best_bid >= yes_best_ask:
+            invalid.append(f"crossed_or_locked(bid={yes_best_bid},ask={yes_best_ask})")
+
+    details["yes_best_bid"] = yes_best_bid
+    details["yes_best_ask"] = yes_best_ask
+    details["invalid_reasons"] = invalid
+    return yes_best_bid, yes_best_ask, details
+
+
 # NEW: Order lifecycle tracking (posted -> seen open-list/detail -> terminal)
 order_life: Dict[str, Dict[str, Any]] = {}
 
@@ -368,6 +530,8 @@ class KalshiClient:
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
+        # CHANGE 9: request timing + safe debug for orderbook/snapshot (NO headers/signature printed)
+        t0 = time.time()
         resp = self.session.request(
             method=method.upper(),
             url=url_with_q,
@@ -375,12 +539,27 @@ class KalshiClient:
             json=json_body,
             timeout=timeout,
         )
+        dt_ms = (time.time() - t0) * 1000.0
+
+        if OB_DEBUG:
+            _force_ob_log_level_if_requested(log)
+            is_ob = ("/orderbook" in path)
+            is_snap = (path.startswith("/markets/") and ("/orderbook" not in path) and method.upper() == "GET")
+            if is_ob or is_snap:
+                clen = len(resp.content) if resp.content is not None else 0
+                log.info(f"[OBHTTP] {method.upper()} {path} status={resp.status_code} latency_ms={dt_ms:.1f} len={clen}")
 
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code} {path}: {resp.text}")
 
         if resp.content:
-            return resp.json()
+            out = resp.json()
+            if OB_DEBUG:
+                is_ob = ("/orderbook" in path)
+                is_snap = (path.startswith("/markets/") and ("/orderbook" not in path) and method.upper() == "GET")
+                if (is_ob or is_snap) and OB_DEBUG_RAW_JSON:
+                    log.info(f"[OBRAW] {path} json={_safe_json_dumps(out, n=OB_DEBUG_TRUNCATE_CHARS)}")
+            return out
         return None
 
 
@@ -437,38 +616,22 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    orderbook = ob.get("orderbook") or ob
-    yes_levels = orderbook.get("yes") or []
-    no_levels = orderbook.get("no") or []
+    """
+    Existing behavior preserved, but now backed by the new diagnostic extractor:
+    - If the orderbook shape is bids/asks dict, we prefer that directly.
+    - Otherwise we fall back to old yes/no ladder logic (no_bid -> yes_ask).
+    """
+    if not isinstance(ob, dict):
+        return None, None
 
-    def max_bid(levels: Any) -> Optional[int]:
-        if not isinstance(levels, list) or not levels:
-            return None
-        best: Optional[int] = None
-        for lvl in levels:
-            price = None
-            if isinstance(lvl, list) and len(lvl) >= 1:
-                price = lvl[0]
-            elif isinstance(lvl, dict):
-                price = lvl.get("price") or lvl.get("yes_price") or lvl.get("no_price")
-            elif isinstance(lvl, (int, float)):
-                price = lvl
-            try:
-                p = int(price)
-            except Exception:
-                continue
-            if best is None or p > best:
-                best = p
-        return best
+    yes_bid, yes_ask, details = _extract_yes_best_bid_ask_debug(ob)
 
-    yes_bid = max_bid(yes_levels)
-    no_bid = max_bid(no_levels)
-    yes_ask = (100 - no_bid) if no_bid is not None else None
-
-    if yes_bid is not None:
-        yes_bid = max(1, min(99, yes_bid))
-    if yes_ask is not None:
-        yes_ask = max(1, min(99, yes_ask))
+    # CHANGE 9: always log a compact summary when enabled (or when invalid)
+    if OB_DEBUG and (OB_DEBUG_EVERY_POLL or (details.get("invalid_reasons") and len(details["invalid_reasons"]) > 0)):
+        log.info(
+            f"[OBDBG] extracted yes_bid={yes_bid} yes_ask={yes_ask} invalid={details.get('invalid_reasons')} "
+            f"root_keys={details.get('root_keys')} orderbook_keys={details.get('orderbook_keys')} shape={details.get('shape', details.get('shape_tried'))}"
+        )
 
     return yes_bid, yes_ask
 
@@ -882,6 +1045,12 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
     if ask is not None:
         ask = max(1, min(99, ask))
 
+    # CHANGE 9: snapshot extraction debug (only when enabled)
+    if OB_DEBUG and (bid is None or ask is None):
+        log.warning(
+            f"[OBDBG] snapshot_extract missing side: bid={bid} ask={ask} keys={list(m.keys())[:60]}"
+        )
+
     return bid, ask
 
 
@@ -902,6 +1071,12 @@ def main() -> None:
         ENABLE_TRADING,
         POST_ONLY,
     )
+
+    if OB_DEBUG:
+        _force_ob_log_level_if_requested(log)
+        log.warning(
+            f"[OBDBG] enabled: RAW_JSON={OB_DEBUG_RAW_JSON} LEVELS={OB_DEBUG_LEVELS} EVERY_POLL={OB_DEBUG_EVERY_POLL} TRUNC={OB_DEBUG_TRUNCATE_CHARS}"
+        )
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -1036,6 +1211,11 @@ def main() -> None:
             note_successful_request()
             last_market_snapshot = snap if isinstance(snap, dict) else {}
             last_market_snapshot_at = now
+
+            # CHANGE 9: compact snapshot debug when enabled
+            if OB_DEBUG and OB_DEBUG_EVERY_POLL and isinstance(last_market_snapshot, dict):
+                log.info(f"[OBDBG] snapshot_keys={list(last_market_snapshot.keys())[:40]}")
+
             return last_market_snapshot
         except Exception as e:
             if is_rate_limited(e):
@@ -1637,9 +1817,20 @@ def main() -> None:
         yes_bid, yes_ask = parse_orderbook_yes_bid_ask(ob)
 
         used_snapshot_fallback = False
+        snap = None
+
         if ORDERBOOK_FALLBACK_TO_MARKET_SNAPSHOT and (yes_bid is None or yes_ask is None):
             snap = get_market_snapshot()
             fb_bid, fb_ask = _extract_best_from_market_snapshot(snap)
+
+            # CHANGE 9: explicit fallback debug line with extracted values + key hints
+            if OB_DEBUG:
+                try:
+                    kk = list((snap.get("market") if isinstance(snap.get("market"), dict) else snap).keys())[:60] if isinstance(snap, dict) else []
+                except Exception:
+                    kk = []
+                log.warning(f"[OBDBG] fallback_attempt: ob_yes_bid={yes_bid} ob_yes_ask={yes_ask} fb_bid={fb_bid} fb_ask={fb_ask} snap_keys={kk}")
+
             if yes_bid is None and fb_bid is not None:
                 yes_bid = fb_bid
                 used_snapshot_fallback = True
