@@ -1,15 +1,15 @@
 # bot.py
 # Kalshi rolling 15m BTC late-snipe (SINGLE TRADE PER MARKET; NO MULTI-MARKET)
 #
-# WHAT THIS DOES (NEW STRATEGY):
+# WHAT THIS DOES:
 # - Watches the active KXBTC15M market.
 # - Starts "arming" at T-ENTRY_START_SECONDS (default 120s to close).
 # - Makes ONE decision trade near the end:
 #     • Default decision time is T-ENTRY_DECISION_SECONDS (default 60s to close).
 #     • Will keep checking until T-ENTRY_LAST_SECONDS (default 30s) if not yet traded.
 # - Chooses YES or NO based on:
-#     • p_model >= PROB_MIN (default 0.85)
-#     • edge_net >= EDGE_MIN (default 0.02)   [fee-aware via FEE_CENTS_PER_CONTRACT]
+#     • "winner" side probability >= PROB_MIN (default 0.85)
+#     • edge_net >= EDGE_MIN (default 0.01)   [fee-aware via FEE_CENTS_PER_CONTRACT]
 #     • entry_price <= MAX_ENTRY_PRICE_CENTS (default 97)
 # - Sizes the bet as BANKROLL_FRACTION of AVAILABLE balance (default 5%),
 #   with caps and safe fallbacks.
@@ -22,26 +22,31 @@
 # -----------------------------
 # NOTES / WHAT CHANGED (A-LEVEL ADDITIONS ONLY)
 # -----------------------------
-# A1) Market-implied probability + divergence gate:
+# A1) Market-implied probability (optional) + blending:
 #     - Compute p_mkt from orderbook (mid/complements) when USE_MARKET_IMPLIED=True
-#     - Require model disagreement vs market by MIN_DIVERGENCE (default 1.5c)
-#
-# A2) Blend model with market to avoid hero trades:
 #     - p_blend = alpha*p_model + (1-alpha)*p_mkt   (MODEL_BLEND_ALPHA default 0.75)
-#     - Edges computed off p_blend
+#     - Edges are computed off p_blend (reduces hero trades).
+#
+# A2) Divergence gate is now OPTIONAL (OFF by default):
+#     - REQUIRE_DIVERGENCE=False by default
+#     - If you turn it ON, the model must disagree with market by MIN_DIVERGENCE
 #
 # A3) Dynamic sigma (optional):
 #     - Estimate realized volatility from Coinbase Exchange 1-min candles
 #     - Sigma is clipped to [SIGMA_FLOOR, SIGMA_CEIL]
 #
-# A4) Basic book sanity:
-#     - Optional: require bid+ask for chosen side (REQUIRE_BOTH_SIDES_BOOK)
-#     - Optional: require spread <= MAX_SPREAD_CENTS_TO_TRADE when both sides present
+# A4) Basic book sanity (optional):
+#     - REQUIRE_BOTH_SIDES_BOOK: require bid+ask for chosen side
+#     - MAX_SPREAD_CENTS_TO_TRADE: if both exist, require spread <= threshold
+#
+# A5) "Pick the winner" behavior:
+#     - Bot does NOT prefer YES or NO.
+#     - It picks whichever side has >= PROB_MIN AND >= 1-cent edge (EDGE_MIN default 0.01).
+#     - If both qualify, it takes the higher edge.
 
 import os
 import time
 import base64
-import json
 import logging
 import math
 from dataclasses import dataclass
@@ -139,7 +144,7 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 # Bootstrap cleanup toggle (keep name)
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# -------------- NEW STRATEGY ENVs (additive only) --------------
+# -------------- STRATEGY ENVs (additive only) --------------
 # Timing
 ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 120)         # start monitoring hard at T-120
 ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)    # default "place" target is T-60
@@ -150,36 +155,38 @@ CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
 
 # Edge / model gates
 PROB_MIN = env_float("PROB_MIN", 0.85)
-EDGE_MIN = env_float("EDGE_MIN", 0.02)                            # 2 cents in probability-price terms
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 97)      # don't buy/pay above this (maker uses postable entry price)
-FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)     # set if you want fee-aware edge gate
+EDGE_MIN = env_float("EDGE_MIN", 0.01)                            # 1 cent in probability-price terms
+MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 97)      # don't buy/pay above this
+FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)     # fee-aware edge
 
 # Probability model: sigma in USD per sqrt(second) for last-minute BTC movement
-# Example: SIGMA=12 means ~12*sqrt(60)=~93 USD one-sigma over 60s.
 SPOT_SIGMA_USD_PER_SQRT_SEC = env_float("SPOT_SIGMA_USD_PER_SQRT_SEC", 12.0)
 
 # Bankroll sizing
-BANKROLL_FRACTION = env_float("BANKROLL_FRACTION", 0.05)          # 5% each time
+BANKROLL_FRACTION = env_float("BANKROLL_FRACTION", 0.05)
 MIN_CONTRACTS = env_int("MIN_CONTRACTS", 1)
-MAX_CONTRACTS = env_int("MAX_CONTRACTS", 50)                      # hard cap
-MIN_FREE_USD_TO_TRADE = env_float("MIN_FREE_USD_TO_TRADE", 5.0)   # if too low, skip
+MAX_CONTRACTS = env_int("MAX_CONTRACTS", 50)
+MIN_FREE_USD_TO_TRADE = env_float("MIN_FREE_USD_TO_TRADE", 5.0)
 
 # One-trade-only behavior
-ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)     # should always be True
+ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
 
 # Diagnostics
 LOG_DECISIONS = env_bool("LOG_DECISIONS", True)
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 2.0)
 
-# --- book/log handling (additive only) ---
-JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)                       # maker aggressiveness
-OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)   # rate-limit "no usable book" warnings
+# Book handling
+JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
+OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
 # -------------- A-LEVEL ADDITIONS (additive only) --------------
-USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)         # compute p_mkt from book
-MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.75)          # 1.0=model only, 0.0=market only
-MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)               # require model vs market mispricing
+USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
+MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.75)
+
+# Divergence gate is OPTIONAL now (default OFF)
+REQUIRE_DIVERGENCE = env_bool("REQUIRE_DIVERGENCE", False)
+MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)
 
 USE_DYNAMIC_SIGMA = env_bool("USE_DYNAMIC_SIGMA", True)
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
@@ -191,7 +198,6 @@ SIGMA_CEIL = env_float("SIGMA_CEIL", 40.0)
 MAX_SPREAD_CENTS_TO_TRADE = env_int("MAX_SPREAD_CENTS_TO_TRADE", 8)
 REQUIRE_BOTH_SIDES_BOOK = env_bool("REQUIRE_BOTH_SIDES_BOOK", False)
 
-# Light caching to avoid hammering candles endpoint
 SIGMA_REFRESH_SECONDS = env_float("SIGMA_REFRESH_SECONDS", 5.0)
 _last_sigma_ts: float = 0.0
 _last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
@@ -503,7 +509,6 @@ def realized_sigma_usd_per_sqrt_sec(session: requests.Session) -> Optional[float
     if not candles or len(candles) < 3:
         return None
 
-    # take last N minutes and sort oldest->newest
     take = candles[: max(3, int(CANDLES_LOOKBACK))]
     take_sorted = sorted(take, key=lambda x: float(x[0]))
 
@@ -633,7 +638,7 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
 
 
 # -----------------------------
-# A-LEVEL: market-implied probability
+# A-LEVEL: market-implied probability + book sanity
 # -----------------------------
 def implied_prob_from_book(
     yes_bid: Optional[int],
@@ -655,7 +660,6 @@ def implied_prob_from_book(
         return max(0.01, min(0.99, yes_bid / 100.0))
     if yes_ask is not None:
         return max(0.01, min(0.99, yes_ask / 100.0))
-
     return None
 
 
@@ -854,6 +858,7 @@ class BotState:
     last_p_mkt: Optional[float] = None
     last_div_yes: Optional[float] = None
     last_sigma: Optional[float] = None
+    last_p_yes_blend: Optional[float] = None
 
 
 # -----------------------------
@@ -892,33 +897,39 @@ def choose_trade(
     yes_ask: Optional[int],
     no_bid: Optional[int],
     no_ask: Optional[int],
-) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], float, Optional[float], Optional[float], Optional[float]]:
+) -> Tuple[
+    Optional[str], Optional[int],
+    float, float,
+    float, float,          # p_yes_blend, p_no_blend
+    Optional[float], Optional[float], float,  # p_mkt, div_yes, sigma_used
+    float, float           # edge_yes, edge_no (blend-based)
+]:
     """
     Returns:
       chosen_side ("yes"/"no") or None
       chosen_entry_price (limit price)
-      p_yes_model, p_no_model, chosen_edge (computed off blended prob)
+      p_yes_model, p_no_model
+      p_yes_blend, p_no_blend
       p_mkt (implied), div_yes (p_model - p_mkt), sigma_used
+      edge_yes, edge_no (computed off blended prob)
     """
     t_eff = max(5.0, float(min(secs_to_close, 120)))
-
-    sigma_used = get_sigma_cached(http)
-    sd = float(sigma_used) * math.sqrt(t_eff)
+    sigma_used = float(get_sigma_cached(http))
+    sd = sigma_used * math.sqrt(t_eff)
 
     p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
     p_no_model = 1.0 - p_yes_model
 
-    # Market-implied probability
     p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
 
-    # Blend
     if p_mkt is not None:
         p_yes_blend = float(MODEL_BLEND_ALPHA) * p_yes_model + (1.0 - float(MODEL_BLEND_ALPHA)) * float(p_mkt)
     else:
         p_yes_blend = p_yes_model
+    p_yes_blend = max(0.0, min(1.0, p_yes_blend))
     p_no_blend = 1.0 - p_yes_blend
 
-    # Determine tradable entry prices
+    # entry prices
     if POST_ONLY:
         yes_px = postable_entry_price(yes_bid, yes_ask)
         no_px = postable_entry_price(no_bid, no_ask)
@@ -926,28 +937,31 @@ def choose_trade(
         yes_px = yes_ask
         no_px = no_ask
 
-    # Spread sanity gates (only meaningful if both bid/ask exist)
     ok_book_yes = spread_ok(yes_bid, yes_ask)
     ok_book_no = spread_ok(no_bid, no_ask)
 
-    # Edges computed on blended probability
     edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
     edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
 
-    # Divergence gate (A-level)
     div_yes = None
-    div_no = None
     if p_mkt is not None:
         div_yes = p_yes_model - p_mkt
-        div_no = -div_yes  # (1-p_model)-(1-p_mkt) == p_mkt - p_model
 
+    # Optional divergence gating:
+    div_gate_yes = True
+    div_gate_no = True
+    if REQUIRE_DIVERGENCE and (div_yes is not None):
+        div_gate_yes = (div_yes >= MIN_DIVERGENCE)
+        div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
+
+    # "Pick winner" gating uses MODEL probability threshold (per your logic)
     ok_yes = (
         yes_px is not None
         and ok_book_yes
         and (p_yes_model >= PROB_MIN)
         and (edge_yes >= EDGE_MIN)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
-        and (div_yes is None or div_yes >= MIN_DIVERGENCE)
+        and div_gate_yes
     )
     ok_no = (
         no_px is not None
@@ -955,24 +969,26 @@ def choose_trade(
         and (p_no_model >= PROB_MIN)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
-        and (div_no is None or div_no >= MIN_DIVERGENCE)
+        and div_gate_no
     )
 
+    # Choose whichever qualifies; if both qualify, take higher edge
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
-            return "yes", int(yes_px), p_yes_model, p_no_model, float(edge_yes), p_mkt, div_yes, sigma_used
+            return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
         if edge_no > edge_yes + 1e-9:
-            return "no", int(no_px), p_yes_model, p_no_model, float(edge_no), p_mkt, div_yes, sigma_used
-        if int(yes_px) <= int(no_px):
-            return "yes", int(yes_px), p_yes_model, p_no_model, float(edge_yes), p_mkt, div_yes, sigma_used
-        return "no", int(no_px), p_yes_model, p_no_model, float(edge_no), p_mkt, div_yes, sigma_used
+            return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        # tie-break: pick the more probable side by model
+        if p_yes_model >= p_no_model:
+            return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
     if ok_yes:
-        return "yes", int(yes_px), p_yes_model, p_no_model, float(edge_yes), p_mkt, div_yes, sigma_used
+        return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
     if ok_no:
-        return "no", int(no_px), p_yes_model, p_no_model, float(edge_no), p_mkt, div_yes, sigma_used
+        return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
-    return None, None, p_yes_model, p_no_model, max(float(edge_yes), float(edge_no)), p_mkt, div_yes, sigma_used
+    return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
 
 def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int) -> int:
@@ -1000,7 +1016,9 @@ def main() -> None:
         f"[BOOTCFG] SERIES={SERIES_TICKER} MARKET_OVERRIDE={MARKET_OVERRIDE} "
         f"DRY_RUN={DRY_RUN} ENABLE_TRADING={ENABLE_TRADING} POST_ONLY={POST_ONLY} "
         f"ONE_TRADE_PER_MARKET={ONE_TRADE_PER_MARKET} BANKROLL_FRACTION={BANKROLL_FRACTION} "
-        f"USE_MARKET_IMPLIED={USE_MARKET_IMPLIED} MODEL_BLEND_ALPHA={MODEL_BLEND_ALPHA} MIN_DIVERGENCE={MIN_DIVERGENCE} "
+        f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY_PRICE_CENTS={MAX_ENTRY_PRICE_CENTS} FEE_CENTS_PER_CONTRACT={FEE_CENTS_PER_CONTRACT} "
+        f"USE_MARKET_IMPLIED={USE_MARKET_IMPLIED} MODEL_BLEND_ALPHA={MODEL_BLEND_ALPHA} "
+        f"REQUIRE_DIVERGENCE={REQUIRE_DIVERGENCE} MIN_DIVERGENCE={MIN_DIVERGENCE} "
         f"USE_DYNAMIC_SIGMA={USE_DYNAMIC_SIGMA}"
     )
 
@@ -1228,7 +1246,13 @@ def main() -> None:
         yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
         lo, hi = market_bounds_usd(active_market_obj)
 
-        chosen_side, chosen_px, p_yes, p_no, chosen_edge, p_mkt, div_yes, sigma_used = choose_trade(
+        (
+            chosen_side, chosen_px,
+            p_yes_model, p_no_model,
+            p_yes_blend, p_no_blend,
+            p_mkt, div_yes, sigma_used,
+            edge_yes, edge_no
+        ) = choose_trade(
             http=http,
             spot=spot,
             lo=lo,
@@ -1240,7 +1264,6 @@ def main() -> None:
             no_ask=no_ask,
         )
 
-        # logging prices (same as before)
         if POST_ONLY:
             yes_px_log = postable_entry_price(yes_bid, yes_ask)
             no_px_log = postable_entry_price(no_bid, no_ask)
@@ -1248,30 +1271,22 @@ def main() -> None:
             yes_px_log = yes_ask
             no_px_log = no_ask
 
-        st.last_p_yes = p_yes
+        st.last_p_yes = p_yes_model
         st.last_p_mkt = p_mkt
         st.last_div_yes = div_yes
         st.last_sigma = sigma_used
+        st.last_p_yes_blend = p_yes_blend
 
-        st.last_edge_yes = compute_edge(
-            (float(MODEL_BLEND_ALPHA) * p_yes + (1.0 - float(MODEL_BLEND_ALPHA)) * p_mkt) if (p_mkt is not None) else p_yes,
-            yes_px_log,
-            FEE_CENTS_PER_CONTRACT
-        ) if yes_px_log is not None else None
-
-        st.last_edge_no = compute_edge(
-            (1.0 - ((float(MODEL_BLEND_ALPHA) * p_yes + (1.0 - float(MODEL_BLEND_ALPHA)) * p_mkt) if (p_mkt is not None) else p_yes)),
-            no_px_log,
-            FEE_CENTS_PER_CONTRACT
-        ) if no_px_log is not None else None
+        st.last_edge_yes = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
+        st.last_edge_no = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
 
         if LOG_DECISIONS:
             log.info(
                 f"[DECIDE] {st.market} t_close={secs_to_close}s spot={spot:.2f} range=({lo},{hi}) sigma={sigma_used:.3f} "
-                f"p_mkt={p_mkt} div_yes={div_yes} "
-                f"YES(bid={yes_bid},ask={yes_ask},entry={yes_px_log},p={p_yes:.4f},edge={st.last_edge_yes}) "
-                f"NO(bid={no_bid},ask={no_ask},entry={no_px_log},p={p_no:.4f},edge={st.last_edge_no}) "
-                f"-> chosen={chosen_side} entry={chosen_px} edge={chosen_edge:.4f}"
+                f"p_mkt={p_mkt} div_yes={div_yes} p_yes_blend={p_yes_blend:.4f} "
+                f"YES(bid={yes_bid},ask={yes_ask},entry={yes_px_log},p={p_yes_model:.4f},edge={st.last_edge_yes}) "
+                f"NO(bid={no_bid},ask={no_ask},entry={no_px_log},p={p_no_model:.4f},edge={st.last_edge_no}) "
+                f"-> chosen={chosen_side} entry={chosen_px}"
             )
 
         if chosen_side is None or chosen_px is None:
@@ -1318,7 +1333,10 @@ def main() -> None:
             st.target_price = int(chosen_px)
             st.traded_this_market = True
             st.sm = SM.ORDER_WAIT
-            log.warning(f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} avail_usd={available_usd} total_usd={total_usd}")
+            log.warning(
+                f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} "
+                f"avail_usd={available_usd} total_usd={total_usd}"
+            )
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
             st.order_id = None
