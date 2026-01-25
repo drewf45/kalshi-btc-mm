@@ -26,9 +26,10 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -233,6 +234,99 @@ class KalshiClient:
 
 
 # -----------------------------
+# NEW: robust close_ts resolver (prevents "missing close_ts; waiting..." forever)
+# -----------------------------
+NY = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
+
+MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optional[int]:
+    """
+    Example ticker: KXBTC15M-26JAN251445-45
+      - Treats "26JAN251445" as DDMMMYYHHMM in America/New_York time.
+      - close = start + interval_minutes
+      - returns UTC epoch seconds
+    """
+    try:
+        parts = str(ticker).split("-")
+        if len(parts) < 2:
+            return None
+        dt_chunk = parts[1]  # "26JAN251445"
+
+        day = int(dt_chunk[0:2])
+        mon = MONTHS[dt_chunk[2:5].upper()]
+        yy = int(dt_chunk[5:7])
+        year = 2000 + yy
+        hh = int(dt_chunk[7:9])
+        mm = int(dt_chunk[9:11])
+
+        start_local = datetime(year, mon, day, hh, mm, tzinfo=NY)
+        close_local = start_local + timedelta(minutes=int(interval_minutes))
+        close_utc = close_local.astimezone(UTC)
+        return int(close_utc.timestamp())
+    except Exception:
+        return None
+
+
+def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
+    """
+    Tries multiple shapes:
+      - numeric close_ts/close_time/etc (seconds or ms)
+      - ISO close_time strings
+      - fallback: infer from market ticker encoding
+    Returns epoch seconds.
+    """
+    if not isinstance(market_obj, dict):
+        market_obj = {}
+
+    # 1) direct numeric timestamps (seconds or ms)
+    for k in (
+        "close_ts", "closeTs", "close_time_ts", "closeTimeTs", "close_timestamp", "closeTimestamp",
+        "close_time", "closeTime", "expiration_ts", "expirationTs"
+    ):
+        v = market_obj.get(k)
+        if isinstance(v, (int, float)):
+            vv = int(v)
+            return vv // 1000 if vv > 10_000_000_000 else vv
+
+    # 2) numeric nested candidates
+    for k in ("market", "data"):
+        sub = market_obj.get(k)
+        if isinstance(sub, dict):
+            for kk in ("close_ts", "close_time", "close_timestamp"):
+                v = sub.get(kk)
+                if isinstance(v, (int, float)):
+                    vv = int(v)
+                    return vv // 1000 if vv > 10_000_000_000 else vv
+
+    # 3) ISO time strings
+    for k in ("close_time", "closeTime", "close_datetime", "closeDateTime", "expiration_time", "expirationTime"):
+        v = market_obj.get(k)
+        if isinstance(v, str):
+            ts = _parse_iso_to_epoch_s(v)
+            if ts is not None:
+                return ts
+
+    # 4) fallback: infer from ticker
+    return infer_close_ts_from_ticker(ticker, interval_minutes=15)
+
+
+# -----------------------------
 # Market selection / parsing (keep same approach)
 # -----------------------------
 def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
@@ -243,7 +337,9 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         if v is None:
             return None
         try:
-            return int(v)
+            vv = int(v)
+            # normalize ms -> s
+            return vv // 1000 if vv > 10_000_000_000 else vv
         except Exception:
             return None
 
@@ -284,14 +380,9 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
     return str(event_ticker), str(market_ticker), chosen
 
 
-def extract_close_ts(market_obj: Dict[str, Any]) -> Optional[int]:
-    for k in ("close_time", "close_ts", "close_timestamp"):
-        if k in market_obj:
-            try:
-                return int(market_obj[k])
-            except Exception:
-                pass
-    return None
+def extract_close_ts(market_obj: Dict[str, Any], market_ticker: str) -> Optional[int]:
+    # NEW: use the robust resolver (includes ticker inference)
+    return resolve_close_ts(market_obj, market_ticker)
 
 
 def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
@@ -865,7 +956,8 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        close_ts = extract_close_ts(active_market_obj)
+        # NEW: robust close_ts resolution (includes ticker inference)
+        close_ts = extract_close_ts(active_market_obj, st.market)
         secs_to_close = None
         if close_ts is not None:
             secs_to_close = int(close_ts - int(time.time()))
@@ -920,10 +1012,12 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # NEW BEHAVIOR: if close_ts still missing even after inference, don't spin forever
         if secs_to_close is None:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.warning(f"[STATE] market={st.market} missing close_ts; cannot snipe. Waiting...")
+                log.warning(f"[STATE] market={st.market} missing close_ts (even after inference); forcing meta refresh...")
                 last_state_log = now
+            last_meta = 0.0  # force refresh_active_market() ASAP
             time.sleep(POLL_SECONDS)
             continue
 
@@ -1044,59 +1138,4 @@ def main() -> None:
             st.traded_this_market = True
             st.sm = SM.ORDER_WAIT
             log.warning(f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} avail_usd={available_usd} total_usd={total_usd}")
-        except Exception as e:
-            log.warning(f"[ORDER] place failed: {e}")
-            st.order_id = None
-            time.sleep(POLL_SECONDS)
-            continue
-
-        while True:
-            now2 = time.time()
-            secs_to_close2 = int(close_ts - int(now2)) if close_ts is not None else None
-
-            if secs_to_close2 is not None and secs_to_close2 <= 0:
-                if CANCEL_UNFILLED_AT_CLOSE and st.order_id:
-                    try:
-                        stc = cancel_order_status(client, st.order_id)
-                        log.warning(f"[ORDER] close passed; canceled order_id={st.order_id} status={stc}")
-                    except Exception as ce:
-                        log.warning(f"[ORDER] close cancel failed: {ce}")
-                st.order_id = None
-                st.sm = SM.HOLD
-                break
-
-            try:
-                pos2 = parse_position_for_market(get_positions(client), st.market)
-            except Exception:
-                pos2 = 0
-
-            if pos2 != 0:
-                log.warning(f"[FILL] market={st.market} pos_now={pos2} order_id={st.order_id} -> HOLD")
-                st.sm = SM.HOLD
-                break
-
-            alive = True
-            try:
-                oo2 = get_open_orders(client)
-                alive = any((str(o.get("order_id") or o.get("id")) == st.order_id) for o in oo2) if st.order_id else False
-            except Exception:
-                alive = True
-
-            if not alive:
-                log.warning(f"[ORDER] order_id={st.order_id} no longer resting; pos=0 -> HOLD (single-trade policy)")
-                st.order_id = None
-                st.sm = SM.HOLD
-                break
-
-            if (now2 - st.placed_at) >= float(FILL_WAIT_SECONDS):
-                log.warning(f"[ORDER] still resting after {FILL_WAIT_SECONDS}s; staying out (single-trade policy). order_id={st.order_id}")
-                st.sm = SM.HOLD
-                break
-
-            time.sleep(POLL_SECONDS)
-
-        time.sleep(POLL_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
+        except Exception as e
