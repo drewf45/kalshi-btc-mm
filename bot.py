@@ -1222,9 +1222,6 @@ def main() -> None:
                         arm_rate_limit_pause("reconcile_cancel_stray")
                     log.warning(f"[OM] reconcile({tag}): failed to cancel stray order {oid_s}: {ce}")
 
-    # --- everything below is unchanged from your paste ---
-    # (kept identical; only CHANGE 6 edits above + notes)
-
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
         nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until, order_posted_ts
 
@@ -2029,4 +2026,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()
