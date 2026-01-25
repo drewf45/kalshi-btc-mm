@@ -30,6 +30,11 @@
 #     • This prevents end-of-window "99/99" snapshot values from being interpreted as tradable quotes
 #     • Throttles fallback warnings to reduce log spam
 #
+# CHANGE 6 (CRITICAL, FIX): Reconcile "order-detail exists" semantics:
+#     • /portfolio/orders/{id} can return terminal orders (canceled/executed or remaining_count=0)
+#     • Treat ONLY status="resting" (and remaining_count>0 if present) as "alive"
+#     • If order-detail is terminal, clear local state + refresh positions + pause (same as 404 handling)
+#
 # LOGGING DIAGNOSTICS (NEW, ONLY): Adds high-signal logs to debug:
 #   (A) OMSNP reconcile snapshot lines when open-list != detail
 #   (B) LIFE order lifecycle tracking (posted -> seen in open-list -> seen in detail)
@@ -1043,17 +1048,44 @@ def main() -> None:
                 return False
             return (time.time() - ts) < ORDERS_VISIBILITY_GRACE_SECONDS
 
-        # NEW (tri-state preserved): (exists?, detail)
+        # CHANGE 6: detail parsing helpers (ONLY CHANGE in reconcile semantics)
+        def _detail_base(detail: Dict[str, Any]) -> Dict[str, Any]:
+            return detail.get("order") if isinstance(detail.get("order"), dict) else detail
+
+        def _detail_is_resting(detail: Dict[str, Any]) -> bool:
+            base = _detail_base(detail)
+            st = str(base.get("status", "")).lower().strip()
+            rem = safe_int(base.get("remaining_count"))
+            if st != "resting":
+                return False
+            if rem is not None and rem <= 0:
+                return False
+            return True
+
+        def _detail_status_banner(detail: Optional[Dict[str, Any]]) -> str:
+            if not detail:
+                return "detail=None"
+            base = _detail_base(detail)
+            return f"detail_status={base.get('status')} rem={base.get('remaining_count')} px={base.get('yes_price') or base.get('price')}"
+
+        # NEW (tri-state preserved): alive? (True/False/None), detail
         def verify_detail(oid: str) -> Tuple[Optional[bool], Optional[Dict[str, Any]]]:
             if not USE_ORDER_DETAIL_FOR_RECONCILE:
                 return None, None
             try:
                 detail = get_order_by_id(client, oid)  # None means 404/not_found
                 note_successful_request()
-                if detail is not None:
-                    _mark_detail_seen(oid, detail)
+
+                if detail is None:
+                    return False, None
+
+                _mark_detail_seen(oid, detail)
+
+                # CHANGE 6 (CRITICAL): only RESTING is "alive"; canceled/executed/rem=0 are terminal -> treat as missing
+                if _detail_is_resting(detail):
                     return True, detail
-                return False, None
+                return False, detail
+
             except Exception as e:
                 if is_rate_limited(e):
                     arm_rate_limit_pause("reconcile_order_detail")
@@ -1097,21 +1129,23 @@ def main() -> None:
                         if LOG_RECONCILE_SNAPSHOT:
                             age = time.time() - order_posted_ts.get(oid, time.time())
                             log.info(
-                                f"[OMSNP] {active_market} {tag} bid_missing_openlist keep_local "
-                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                                f"[OMSNP] {active_market} {tag} bid_missing_openlist keep_local(resting) "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
+                                f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
                         log.warning(
-                            f"[OM] reconcile({tag}): bid missing in open-list but EXISTS via order-detail; keeping local state (order_id={oid})"
+                            f"[OM] reconcile({tag}): bid missing in open-list but RESTING via order-detail; keeping local state (order_id={oid})"
                         )
                     elif exists is False:
                         if LOG_RECONCILE_SNAPSHOT:
                             age = time.time() - order_posted_ts.get(oid, time.time())
                             log.info(
-                                f"[OMSNP] {active_market} {tag} bid_missing_openlist detail_404 -> clear_pause "
-                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                                f"[OMSNP] {active_market} {tag} bid_missing_openlist detail_terminal_or_404 -> clear_pause "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
+                                f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
                         log.warning(
-                            f"[OM] reconcile({tag}): bid missing (404 via order-detail) -> clearing local state (order_id={oid})"
+                            f"[OM] reconcile({tag}): bid missing and not RESTING via order-detail -> clearing local state (order_id={oid})"
                         )
                         clear_local_and_pause("bid", oid)
                     else:
@@ -1135,21 +1169,23 @@ def main() -> None:
                         if LOG_RECONCILE_SNAPSHOT:
                             age = time.time() - order_posted_ts.get(oid, time.time())
                             log.info(
-                                f"[OMSNP] {active_market} {tag} ask_missing_openlist keep_local "
-                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                                f"[OMSNP] {active_market} {tag} ask_missing_openlist keep_local(resting) "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
+                                f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
                         log.warning(
-                            f"[OM] reconcile({tag}): ask missing in open-list but EXISTS via order-detail; keeping local state (order_id={oid})"
+                            f"[OM] reconcile({tag}): ask missing in open-list but RESTING via order-detail; keeping local state (order_id={oid})"
                         )
                     elif exists is False:
                         if LOG_RECONCILE_SNAPSHOT:
                             age = time.time() - order_posted_ts.get(oid, time.time())
                             log.info(
-                                f"[OMSNP] {active_market} {tag} ask_missing_openlist detail_404 -> clear_pause "
-                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} {_life_banner(oid)}"
+                                f"[OMSNP] {active_market} {tag} ask_missing_openlist detail_terminal_or_404 -> clear_pause "
+                                f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
+                                f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
                         log.warning(
-                            f"[OM] reconcile({tag}): ask missing (404 via order-detail) -> clearing local state (order_id={oid})"
+                            f"[OM] reconcile({tag}): ask missing and not RESTING via order-detail -> clearing local state (order_id={oid})"
                         )
                         clear_local_and_pause("ask", oid)
                     else:
@@ -1185,6 +1221,9 @@ def main() -> None:
                     if is_rate_limited(ce):
                         arm_rate_limit_pause("reconcile_cancel_stray")
                     log.warning(f"[OM] reconcile({tag}): failed to cancel stray order {oid_s}: {ce}")
+
+    # --- everything below is unchanged from your paste ---
+    # (kept identical; only CHANGE 6 edits above + notes)
 
     def cancel_all_open_yes_orders_for_active_market(reason: str) -> None:
         nonlocal quote, open_orders_cache, is_quoting, enter_ok_streak, exit_bad_streak, skip_quote_until, pause_until, order_posted_ts
