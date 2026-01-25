@@ -57,6 +57,14 @@
 #   (C) BOOTSTATE banner on startup to show inherited open orders + position
 #   (D) Open-list seen markers (LIFE open-list first-seen)
 #
+# -----------------------------
+# NEW (DIAGNOSTICS-ONLY): "Why can't I trade?" instrumentation
+# -----------------------------
+# DIAG A: Optional per-request HTTP timing for *all* endpoints (no headers/signature logged)
+# DIAG B: Richer error parsing (Kalshi error code/message extracted when possible)
+# DIAG C: Unified "BLOCKERS" logs that explicitly spell out *exactly* what is preventing order actions
+# DIAG D: "No-trade watchdog" warning if bot is quoting but hasn't taken an order action for N seconds
+#
 # Everything else is kept as-is.
 
 import os
@@ -262,6 +270,19 @@ OB_DEBUG_EVERY_POLL = env_bool("OB_DEBUG_EVERY_POLL", False)
 OB_DEBUG_TRUNCATE_CHARS = env_int("OB_DEBUG_TRUNCATE_CHARS", 3500)
 OB_DEBUG_FORCE_LOG_LEVEL = getenv_first(["OB_DEBUG_FORCE_LOG_LEVEL"], "").upper().strip()
 
+# -----------------------------
+# DIAGNOSTICS-ONLY toggles for "why can't I trade?"
+# -----------------------------
+DIAG_HTTP_ALL = env_bool("DIAG_HTTP_ALL", False)  # logs method/path/status/latency/len for *all* requests
+DIAG_HTTP_ERROR_BODY = env_bool("DIAG_HTTP_ERROR_BODY", True)
+DIAG_HTTP_TRUNCATE_CHARS = env_int("DIAG_HTTP_TRUNCATE_CHARS", 1400)
+
+DIAG_BLOCKERS = env_bool("DIAG_BLOCKERS", True)  # unified blockers logger
+DIAG_BLOCKER_THROTTLE_SECONDS = env_float("DIAG_BLOCKER_THROTTLE_SECONDS", 1.5)
+
+DIAG_NO_TRADE_WARN_SECONDS = env_float("DIAG_NO_TRADE_WARN_SECONDS", 20.0)  # watchdog while quoting
+DIAG_NO_TRADE_THROTTLE_SECONDS = env_float("DIAG_NO_TRADE_THROTTLE_SECONDS", 10.0)
+
 
 def _truncate(s: str, n: int) -> str:
     s = "" if s is None else str(s)
@@ -304,6 +325,26 @@ def _summarize_levels(levels: Any, max_levels: int) -> str:
             out.append(f"{i}:{_truncate(repr(lv), 80)}")
     extra = "" if len(levels) <= max_levels else f" (+{len(levels)-max_levels} more)"
     return "[" + ", ".join(out) + "]" + extra
+
+
+def _parse_kalshi_error_body(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Diagnostics-only: tries to parse Kalshi-style error payloads and extract (code, message).
+    Never throws.
+    """
+    if not text:
+        return None, None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            err = obj.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                msg = err.get("message")
+                return (str(code) if code is not None else None, str(msg) if msg is not None else None)
+    except Exception:
+        pass
+    return None, None
 
 
 def _extract_yes_best_bid_ask_debug(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
@@ -530,7 +571,7 @@ class KalshiClient:
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
-        # CHANGE 9: request timing + safe debug for orderbook/snapshot (NO headers/signature printed)
+        # CHANGE 9 / DIAG A: request timing + safe debug (NO headers/signature printed)
         t0 = time.time()
         resp = self.session.request(
             method=method.upper(),
@@ -541,6 +582,10 @@ class KalshiClient:
         )
         dt_ms = (time.time() - t0) * 1000.0
 
+        if DIAG_HTTP_ALL:
+            clen = len(resp.content) if resp.content is not None else 0
+            log.info(f"[HTTP] {method.upper()} {path} status={resp.status_code} latency_ms={dt_ms:.1f} len={clen}")
+
         if OB_DEBUG:
             _force_ob_log_level_if_requested(log)
             is_ob = ("/orderbook" in path)
@@ -550,7 +595,14 @@ class KalshiClient:
                 log.info(f"[OBHTTP] {method.upper()} {path} status={resp.status_code} latency_ms={dt_ms:.1f} len={clen}")
 
         if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code} {path}: {resp.text}")
+            body = resp.text or ""
+            code, msg = _parse_kalshi_error_body(body)
+            body_s = _truncate(body, DIAG_HTTP_TRUNCATE_CHARS) if DIAG_HTTP_ERROR_BODY else "<omitted>"
+            # Keep the prefix "HTTP {status} {path}:" so existing substring checks still work.
+            extra = ""
+            if code or msg:
+                extra = f" kalshi_error(code={code},message={msg})"
+            raise RuntimeError(f"HTTP {resp.status_code} {path}:{extra} body={body_s}")
 
         if resp.content:
             out = resp.json()
@@ -1070,6 +1122,17 @@ def main() -> None:
         POST_ONLY,
     )
 
+    # DIAGNOSTICS banner (only logs)
+    log.warning(
+        f"[BOOTCFG] DRY_RUN={DRY_RUN} ENABLE_TRADING={ENABLE_TRADING} POST_ONLY={POST_ONLY} "
+        f"REQUIRE_TWO_SIDED_QUOTES={REQUIRE_TWO_SIDED_QUOTES} QUOTE_BOTH_WHEN_FLAT_ONLY={QUOTE_BOTH_WHEN_FLAT_ONLY} "
+        f"BOOTSTRAP_CANCEL_OPEN_ORDERS={BOOTSTRAP_CANCEL_OPEN_ORDERS} DIAG_HTTP_ALL={DIAG_HTTP_ALL} DIAG_BLOCKERS={DIAG_BLOCKERS}"
+    )
+    if DRY_RUN:
+        log.error("[BOOTCFG] DRY_RUN=True -> bot will NEVER send real orders.")
+    if not ENABLE_TRADING:
+        log.error("[BOOTCFG] ENABLE_TRADING=False -> bot will compute quotes but will NOT place/cancel orders.")
+
     if OB_DEBUG:
         _force_ob_log_level_if_requested(log)
         log.warning(
@@ -1126,6 +1189,7 @@ def main() -> None:
     rl_backoff = RATE_LIMIT_BACKOFF_START_SECONDS
     skip_quote_until = 0.0
     last_order_action_at = 0.0
+    last_trade_action_at = time.time()  # DIAGNOSTICS-ONLY: watchdog uses this
     last_reprice_at = 0.0
     last_quote_sig: Tuple[Any, ...] = tuple()
 
@@ -1151,6 +1215,22 @@ def main() -> None:
 
     # CHANGE 7: abort flag if cancel_*_only hits 404/not_found (prevents posting new orders in same iteration)
     abort_iteration_now = False
+
+    # DIAGNOSTICS-ONLY throttles
+    last_blockers_log_at = 0.0
+    last_blockers_sig: Tuple[Any, ...] = tuple()
+    last_no_trade_log_at = 0.0
+
+    def diag_blockers(stage: str, blockers: List[str]) -> None:
+        nonlocal last_blockers_log_at, last_blockers_sig
+        if not DIAG_BLOCKERS:
+            return
+        sig = (stage, tuple(blockers))
+        now = time.time()
+        if sig != last_blockers_sig or (now - last_blockers_log_at) >= DIAG_BLOCKER_THROTTLE_SECONDS:
+            log.warning(f"[BLOCKERS] stage={stage} blockers={blockers if blockers else 'none'}")
+            last_blockers_sig = sig
+            last_blockers_log_at = now
 
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
@@ -1180,8 +1260,9 @@ def main() -> None:
         return (time.time() - last_order_action_at) >= MIN_ORDER_ACTION_GAP_SECONDS
 
     def mark_order_action() -> None:
-        nonlocal last_order_action_at
+        nonlocal last_order_action_at, last_trade_action_at
         last_order_action_at = time.time()
+        last_trade_action_at = last_order_action_at  # DIAGNOSTICS-ONLY: watchdog “no trade” timer
 
     def refresh_positions_now(tag: str) -> bool:
         nonlocal pos_yes_live, realized_pnl_usd, fees_paid_usd, net_yes, last_positions_poll
@@ -1692,6 +1773,7 @@ def main() -> None:
             last_meta_refresh = t0
 
         if not active_market:
+            diag_blockers("no_active_market", ["no_active_market"])
             time.sleep(POLL_SECONDS)
             continue
 
@@ -1705,6 +1787,7 @@ def main() -> None:
             secs_to_close = close_ts - int(time.time())
 
         if secs_to_close is not None and secs_to_close <= CLOSEOUT_SECONDS:
+            diag_blockers("closeout", [f"closeout(t_close={secs_to_close}s<= {CLOSEOUT_SECONDS}s)"])
             cancel_live_quotes("closeout")
             time.sleep(POLL_SECONDS)
             continue
@@ -1713,6 +1796,7 @@ def main() -> None:
             lo, hi = market_bounds_usd(active_market_obj)
 
             if lo is not None and abs(spot_usd - lo) <= SPOT_RESOLVED_BUFFER_USD:
+                diag_blockers("spot_guard", [f"spot_guard_floor(spot={spot_usd:.2f},floor={lo:.2f},buf={SPOT_RESOLVED_BUFFER_USD},t_close={secs_to_close}s)"])
                 cancel_live_quotes("spot_guard_floor")
                 msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of floor {lo:.2f} (t_close={secs_to_close}s)"
                 if (t0 - last_spot_skip_log_at) >= SPOT_SKIP_LOG_THROTTLE_SECONDS or msg != last_spot_skip_msg:
@@ -1723,6 +1807,7 @@ def main() -> None:
                 continue
 
             if hi is not None and abs(spot_usd - hi) <= SPOT_RESOLVED_BUFFER_USD:
+                diag_blockers("spot_guard", [f"spot_guard_cap(spot={spot_usd:.2f},cap={hi:.2f},buf={SPOT_RESOLVED_BUFFER_USD},t_close={secs_to_close}s)"])
                 cancel_live_quotes("spot_guard_cap")
                 msg = f"[SPOT] skip near close: spot {spot_usd:.2f} within {SPOT_RESOLVED_BUFFER_USD:.1f} of cap {hi:.2f} (t_close={secs_to_close}s)"
                 if (t0 - last_spot_skip_log_at) >= SPOT_SKIP_LOG_THROTTLE_SECONDS or msg != last_spot_skip_msg:
@@ -1743,6 +1828,7 @@ def main() -> None:
                     arm_rate_limit_pause("open_orders")
                 pause_until = time.time() + PAUSE_ON_UNKNOWN_SECONDS
                 cancel_live_quotes("unknown_order_state_pause")
+                diag_blockers("unknown_order_state", [f"open_orders_error({e})", f"pause({PAUSE_ON_UNKNOWN_SECONDS}s)"])
                 log.warning(f"[INV] PAUSE quoting due to unknown order state: {PAUSE_ON_UNKNOWN_SECONDS:.2f}s remaining ({e})")
                 time.sleep(POLL_SECONDS)
                 continue
@@ -1783,7 +1869,23 @@ def main() -> None:
                     arm_rate_limit_pause("fills")
                 log.warning(f"[INV] fills fetch failed: {e}")
 
-        if time.time() < pause_until or time.time() < balance_fail_until or time.time() < rl_until or time.time() < skip_quote_until:
+        # Unified blockers before we do any quoting work
+        blockers: List[str] = []
+        now = time.time()
+        if DRY_RUN:
+            blockers.append("DRY_RUN=True")
+        if not ENABLE_TRADING:
+            blockers.append("ENABLE_TRADING=False")
+        if now < pause_until:
+            blockers.append(f"pause_until({pause_until - now:.2f}s)")
+        if now < balance_fail_until:
+            blockers.append(f"balance_cooldown({balance_fail_until - now:.2f}s)")
+        if now < rl_until:
+            blockers.append(f"rate_limit_backoff({rl_until - now:.2f}s)")
+        if now < skip_quote_until:
+            blockers.append(f"skip_quote_until({skip_quote_until - now:.2f}s)")
+        if blockers and (now < pause_until or now < balance_fail_until or now < rl_until or now < skip_quote_until):
+            diag_blockers("cooldowns", blockers)
             time.sleep(POLL_SECONDS)
             continue
 
@@ -1793,6 +1895,7 @@ def main() -> None:
         except Exception as e:
             if is_rate_limited(e):
                 arm_rate_limit_pause("orderbook")
+            diag_blockers("orderbook_fetch_failed", [f"orderbook_error({e})"])
             log.warning(f"[OB] {active_market} orderbook fetch failed: {e}")
             time.sleep(POLL_SECONDS)
             continue
@@ -1841,6 +1944,7 @@ def main() -> None:
                         last_ob_fb_sig = fb_sig
 
         if yes_bid is None or yes_ask is None:
+            diag_blockers("no_book", [f"no_yes_bid_or_ask(yes_bid={yes_bid},yes_ask={yes_ask})"])
             cancel_live_quotes("no_yes_bid_or_ask")
             skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
             sig = (active_market, "SKIP", "no_yes_bid_or_ask")
@@ -1903,6 +2007,7 @@ def main() -> None:
                 else:
                     if quote.bid_order_id or quote.ask_order_id:
                         cancel_live_quotes("hysteresis_not_quoting")
+                    diag_blockers("hysteresis_wait_enter", [f"not_quoting(streak={enter_ok_streak}/{SPREAD_ENTER_STREAK},spread={spread_now})"])
                     sig = (active_market, "SKIP", "hysteresis_wait_enter", spread_now, yes_bid, yes_ask)
                     if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                         log.info(
@@ -1914,6 +2019,7 @@ def main() -> None:
                     continue
             else:
                 if spread_now < HYSTERESIS_EXIT_SPREAD_CENTS and exit_bad_streak < SPREAD_EXIT_STREAK:
+                    diag_blockers("hysteresis_hold", [f"hold_below_exit(spread={spread_now},bad_streak={exit_bad_streak}/{SPREAD_EXIT_STREAK})"])
                     sig = (active_market, "HOLD", "hysteresis_hold_below_exit", spread_now, yes_bid, yes_ask)
                     if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                         log.info(f"[TARGET] {active_market} → HOLD (hysteresis) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
@@ -1926,6 +2032,7 @@ def main() -> None:
                     is_quoting = False
                     cancel_live_quotes("hysteresis_exit_spread_too_tight")
                     skip_quote_until = time.time() + SPREAD_SKIP_COOLDOWN_SECONDS
+                    diag_blockers("hysteresis_exit", [f"exit_spread_too_tight(spread={spread_now},bad_streak={exit_bad_streak})"])
                     sig = (active_market, "SKIP", "hysteresis_exit", spread_now, yes_bid, yes_ask)
                     if sig != last_target_sig or (t0 - last_target_log_at) >= TARGET_LOG_THROTTLE_SECONDS:
                         log.info(f"[TARGET] {active_market} → SKIP (hysteresis_exit) spread={spread_now} best_yes_bid={yes_bid} best_yes_ask={yes_ask}")
@@ -1941,6 +2048,7 @@ def main() -> None:
 
         inv_age = (t0 - last_positions_poll) if last_positions_poll > 0 else 9999.0
         if inv_age > MAX_INV_STALENESS_SECONDS:
+            diag_blockers("inv_stale", [f"inv_stale(age={inv_age:.2f}s>{MAX_INV_STALENESS_SECONDS:.2f}s)"])
             cancel_live_quotes("inv_stale")
             skip_quote_until = max(skip_quote_until, time.time() + SPREAD_SKIP_COOLDOWN_SECONDS)
             sig = (active_market, "SKIP", "inv_stale")
@@ -1969,10 +2077,12 @@ def main() -> None:
         if is_new_quote:
             min_reprice = REDUCE_ONLY_MIN_REPRICE_SECONDS if reduce_only else MIN_REPRICE_SECONDS
             if (time.time() - last_reprice_at) < min_reprice and not emergency_reduce_only:
+                diag_blockers("min_reprice", [f"min_reprice(wait={min_reprice-(time.time()-last_reprice_at):.2f}s)"])
                 time.sleep(POLL_SECONDS)
                 continue
 
         if bid_px is None or ask_px is None:
+            diag_blockers("compute_quotes_skip", [f"skip:{why}"])
             cancel_live_quotes(f"skip:{why}")
             if not emergency_reduce_only:
                 is_quoting = False
@@ -2019,19 +2129,24 @@ def main() -> None:
 
         # CHANGE 7: if a cancel_*_only hit 404/not_found, abort this iteration before any further order actions
         if abort_iteration_now:
+            diag_blockers("abort_iteration_404", ["abort_iteration_now(cancel_*_only_404)"])
             time.sleep(POLL_SECONDS)
             continue
 
         if not allow_bid and quote.bid_order_id:
+            diag_blockers("inventory_block_bid", [f"allow_bid=False(open_buys={open_buys})"])
             cancel_bid_only("inventory_block_bid")
         if not allow_ask and quote.ask_order_id:
+            diag_blockers("inventory_block_ask", [f"allow_ask=False(open_sells={open_sells})"])
             cancel_ask_only("inventory_block_ask")
 
         if abort_iteration_now:
+            diag_blockers("abort_iteration_404", ["abort_iteration_now(after_inventory_block_cancel_404)"])
             time.sleep(POLL_SECONDS)
             continue
 
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
+            diag_blockers("market_roll", [f"market_roll({quote.last_market_ticker}->{active_market})"])
             cancel_live_quotes("market_roll")
             quote = QuoteState()
             is_quoting = False
@@ -2039,6 +2154,7 @@ def main() -> None:
             exit_bad_streak = 0
 
         if abort_iteration_now:
+            diag_blockers("abort_iteration_404", ["abort_iteration_now(after_market_roll_cancel_404)"])
             time.sleep(POLL_SECONDS)
             continue
 
@@ -2046,6 +2162,7 @@ def main() -> None:
 
         enforce_two_sided_now = REQUIRE_TWO_SIDED_QUOTES and (not QUOTE_BOTH_WHEN_FLAT_ONLY or est_net_yes == 0)
         if enforce_two_sided_now and (not allow_bid or not allow_ask):
+            diag_blockers("two_sided_required", [f"two_sided_required(allow_bid={allow_bid},allow_ask={allow_ask},pos={est_net_yes})"])
             if quote.bid_order_id or quote.ask_order_id:
                 cancel_live_quotes("two_sided_required")
             time.sleep(POLL_SECONDS)
@@ -2084,6 +2201,8 @@ def main() -> None:
             last_cancel_not_found_oid = None
 
             if not ENABLE_TRADING or DRY_RUN:
+                # DIAGNOSTICS-only: explicitly log why order actions are suppressed
+                diag_blockers("order_action_suppressed", [f"ENABLE_TRADING={ENABLE_TRADING}", f"DRY_RUN={DRY_RUN}"])
                 return None, new_price, True
 
             if old_order_id:
@@ -2146,11 +2265,13 @@ def main() -> None:
                     return None, None, False
                 if is_post_only_cross(e):
                     skip_quote_until = time.time() + POST_ONLY_CROSS_COOLDOWN_SECONDS
+                    diag_blockers("post_only_cross", [f"post_only_cross(cooldown={POST_ONLY_CROSS_COOLDOWN_SECONDS}s)", f"err={str(e)[:180]}"])
                     log.warning(
                         f"[OM] {active_market} {action.upper()} place failed (post-only-cross). Cooldown {POST_ONLY_CROSS_COOLDOWN_SECONDS:.1f}s: {e}"
                     )
                     return None, None, False
                 if is_insufficient_balance(e):
+                    diag_blockers("insufficient_balance", [f"{side}_insufficient_balance", f"err={str(e)[:220]}"])
                     trip_balance_circuit(f"{side}_insufficient_balance")
                     log.warning(f"[OM] {active_market} {action.upper()} place failed: {e}")
                     return None, None, False
@@ -2159,6 +2280,7 @@ def main() -> None:
 
         if want_bid_update or want_ask_update:
             if not can_do_order_action():
+                diag_blockers("min_action_gap", [f"MIN_ORDER_ACTION_GAP_SECONDS({MIN_ORDER_ACTION_GAP_SECONDS})"])
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -2183,6 +2305,7 @@ def main() -> None:
                     quote.ask_price = new_px
 
             if abort_iteration:
+                diag_blockers("abort_iteration_reprice_404", ["abort_iteration(cancel_first_not_found)"])
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -2203,6 +2326,7 @@ def main() -> None:
                     quote.bid_price = new_px
 
             if abort_iteration:
+                diag_blockers("abort_iteration_reprice_404", ["abort_iteration(cancel_first_not_found)"])
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -2210,6 +2334,7 @@ def main() -> None:
                 has_bid = quote.bid_order_id is not None
                 has_ask = quote.ask_order_id is not None
                 if has_bid != has_ask:
+                    diag_blockers("atomic_two_sided_enforce", [f"atomic_two_sided_enforce(has_bid={has_bid},has_ask={has_ask})"])
                     cancel_live_quotes("atomic_two_sided_enforce")
                 else:
                     if has_bid and has_ask:
@@ -2220,6 +2345,22 @@ def main() -> None:
             log.info(f"[TARGET] {active_market} → would_quote: bid@{bid_px} ask@{ask_px} ({why})")
             last_target_sig = sig
             last_target_log_at = t0
+
+        # DIAGNOSTICS watchdog: if we're quoting but haven't taken order action recently, scream with context.
+        if DIAG_BLOCKERS and is_quoting and ENABLE_TRADING and (not DRY_RUN):
+            now = time.time()
+            if (now - last_trade_action_at) >= DIAG_NO_TRADE_WARN_SECONDS and (now - last_no_trade_log_at) >= DIAG_NO_TRADE_THROTTLE_SECONDS:
+                b_open = quote.bid_order_id is not None
+                a_open = quote.ask_order_id is not None
+                log.warning(
+                    f"[NOTRADING] {active_market} quoting={is_quoting} but no order actions for {(now-last_trade_action_at):.1f}s. "
+                    f"pos={pos_yes_live} reduce_only={reduce_only} allow=(b:{allow_bid},a:{allow_ask}) "
+                    f"want_update=(b:{want_bid_update},a:{want_ask_update}) "
+                    f"best=({yes_bid},{yes_ask}) tgt=({bid_px},{ask_px}) "
+                    f"live_quote=(b:{quote.bid_order_id}@{quote.bid_price} present={b_open}, a:{quote.ask_order_id}@{quote.ask_price} present={a_open}) "
+                    f"cooldowns(pause={max(0.0,pause_until-now):.2f}s bal={max(0.0,balance_fail_until-now):.2f}s rl={max(0.0,rl_until-now):.2f}s skip={max(0.0,skip_quote_until-now):.2f}s)"
+                )
+                last_no_trade_log_at = now
 
         if (t0 - last_state_log_at) >= STATE_LOG_SECONDS:
             open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
@@ -2238,4 +2379,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main() 
