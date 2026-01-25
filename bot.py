@@ -808,12 +808,24 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
         m = m["market"]
 
     candidates_bid = [
-        "yes_bid", "best_yes_bid", "best_bid", "bid", "bid_price", "yes_bid_price",
-        "best_yes_bid_price", "best_yes_bid_cents",
+        "yes_bid",
+        "best_yes_bid",
+        "best_bid",
+        "bid",
+        "bid_price",
+        "yes_bid_price",
+        "best_yes_bid_price",
+        "best_yes_bid_cents",
     ]
     candidates_ask = [
-        "yes_ask", "best_yes_ask", "best_ask", "ask", "ask_price", "yes_ask_price",
-        "best_yes_ask_price", "best_yes_ask_cents",
+        "yes_ask",
+        "best_yes_ask",
+        "best_ask",
+        "ask",
+        "ask_price",
+        "yes_ask_price",
+        "best_yes_ask_price",
+        "best_yes_ask_cents",
     ]
 
     bid = None
@@ -1888,6 +1900,7 @@ def main() -> None:
                     old_price=quote.ask_price,
                 )
 
+                # CHANGE 2: if cancel returned not_found, abort the rest of the loop's order actions
                 if last_cancel_not_found_oid is not None:
                     abort_iteration = True
                 elif ok:
