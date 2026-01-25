@@ -92,6 +92,25 @@ def clamp_int(x: int, lo: int, hi: int) -> int:
 
 
 # -----------------------------
+# ISO time parsing  (ADDED - minimal change)
+# -----------------------------
+def iso_to_unix_seconds(iso_ts: Optional[str]) -> Optional[int]:
+    """
+    Convert ISO-8601 like '2026-01-25T19:00:00Z' or with offset into unix seconds.
+    Returns None if missing/invalid.
+    """
+    if not iso_ts:
+        return None
+    try:
+        s = str(iso_ts).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return None
+
+
+# -----------------------------
 # Config (keep your existing names for Kalshi + series)
 # -----------------------------
 API_BASE = getenv_first(["KALSHI_API_BASE"], "https://api.elections.kalshi.com").rstrip("/")
@@ -234,14 +253,20 @@ class KalshiClient:
 def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
     now_ts = int(time.time())
 
+    # CHANGED: accept ints OR ISO strings for time fields
     def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
         v = obj.get(key)
         if v is None:
             return None
+        # numeric already?
         try:
             return int(v)
         except Exception:
-            return None
+            pass
+        # ISO timestamp?
+        if isinstance(v, str) and ("T" in v):
+            return iso_to_unix_seconds(v)
+        return None
 
     candidates = []
     for m in markets:
@@ -280,13 +305,37 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
     return str(event_ticker), str(market_ticker), chosen
 
 
+# CHANGED: close_time may be ISO; normalize to unix seconds
 def extract_close_ts(market_obj: Dict[str, Any]) -> Optional[int]:
-    for k in ("close_time", "close_ts", "close_timestamp"):
+    # try numeric fields first
+    for k in ("close_ts", "close_timestamp"):
         if k in market_obj:
             try:
                 return int(market_obj[k])
             except Exception:
                 pass
+
+    # close_time is often ISO (e.g., "...Z")
+    if "close_time" in market_obj:
+        v = market_obj.get("close_time")
+        # if it's numeric-looking, still allow
+        try:
+            return int(v)
+        except Exception:
+            pass
+        if isinstance(v, str) and ("T" in v):
+            return iso_to_unix_seconds(v)
+
+    # sometimes APIs use expiration_time instead
+    if "expiration_time" in market_obj:
+        v = market_obj.get("expiration_time")
+        try:
+            return int(v)
+        except Exception:
+            pass
+        if isinstance(v, str) and ("T" in v):
+            return iso_to_unix_seconds(v)
+
     return None
 
 
@@ -859,7 +908,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Pull close time
+        # Pull close time (CHANGED: handles ISO close_time)
         close_ts = extract_close_ts(active_market_obj)
         secs_to_close = None
         if close_ts is not None:
@@ -930,7 +979,7 @@ def main() -> None:
         # If we don't know time-to-close, we can't do late sniping reliably
         if secs_to_close is None:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.warning(f"[STATE] market={st.market} missing close_ts; cannot snipe. Waiting...")
+                log.warning(f"[STATE] market={st.market} missing close_time/close_ts; cannot snipe. Waiting...")
                 last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
