@@ -21,6 +21,10 @@
 #     • If BOOTSTRAP_CANCEL_OPEN_ORDERS=False: adopt best live YES bid/ask into local QuoteState to avoid double-posting
 #     • Pause briefly after reconciliation to ensure inventory is stable before quoting
 #
+# CHANGE 4 (CRITICAL, FIX): Open-orders polling used an invalid status filter ("open") for /portfolio/orders.
+#     • Kalshi expects status in {resting, canceled, executed} for that endpoint.
+#     • Bot now uses status="resting" so open order reconciliation matches reality.
+#
 # LOGGING DIAGNOSTICS (NEW, ONLY): Adds high-signal logs to debug:
 #   (A) OMSNP reconcile snapshot lines when open-list != detail
 #   (B) LIFE order lifecycle tracking (posted -> seen in open-list -> seen in detail)
@@ -683,7 +687,8 @@ def update_entry_from_fills_for_market(
 
 
 def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
-    resp = client.request("GET", "/portfolio/orders", params={"status": "open", "limit": 200})
+    # CHANGE 4: status must be "resting" (not "open") for /portfolio/orders
+    resp = client.request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
     return resp.get("orders", resp if isinstance(resp, list) else [])
 
 
