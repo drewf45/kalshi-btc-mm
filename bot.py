@@ -262,11 +262,13 @@ OB_DEBUG_EVERY_POLL = env_bool("OB_DEBUG_EVERY_POLL", False)
 OB_DEBUG_TRUNCATE_CHARS = env_int("OB_DEBUG_TRUNCATE_CHARS", 3500)
 OB_DEBUG_FORCE_LOG_LEVEL = getenv_first(["OB_DEBUG_FORCE_LOG_LEVEL"], "").upper().strip()
 
+
 def _truncate(s: str, n: int) -> str:
     s = "" if s is None else str(s)
     if len(s) <= n:
         return s
     return s[:n] + f"...(truncated {len(s)-n} chars)"
+
 
 def _safe_json_dumps(obj: Any, n: int) -> str:
     try:
@@ -274,6 +276,7 @@ def _safe_json_dumps(obj: Any, n: int) -> str:
     except Exception as e:
         txt = f"<json_dumps_error:{e}> repr={repr(obj)}"
     return _truncate(txt, n=n)
+
 
 def _force_ob_log_level_if_requested(logger: logging.Logger) -> None:
     if not OB_DEBUG_FORCE_LOG_LEVEL:
@@ -284,6 +287,7 @@ def _force_ob_log_level_if_requested(logger: logging.Logger) -> None:
             logger.setLevel(lvl)
     except Exception:
         pass
+
 
 def _summarize_levels(levels: Any, max_levels: int) -> str:
     if not isinstance(levels, list):
@@ -301,10 +305,11 @@ def _summarize_levels(levels: Any, max_levels: int) -> str:
     extra = "" if len(levels) <= max_levels else f" (+{len(levels)-max_levels} more)"
     return "[" + ", ".join(out) + "]" + extra
 
+
 def _extract_yes_best_bid_ask_debug(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
     """
     Tries multiple known orderbook shapes and returns (yes_best_bid, yes_best_ask, details).
-    This function is diagnostic-first: it records what it saw and why it chose a path.
+    Diagnostic-first: records what it saw and why it chose a path.
     """
     details: Dict[str, Any] = {"root_keys": list(ob.keys())[:30]}
     orderbook = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
@@ -337,7 +342,6 @@ def _extract_yes_best_bid_ask_debug(ob: Dict[str, Any]) -> Tuple[Optional[int], 
     def _best_bid_from_levels(levels: Any) -> Optional[int]:
         if not isinstance(levels, list) or not levels:
             return None
-        # Many books are sorted best-first. But be defensive and compute max.
         best = None
         for lv in levels:
             p = _lvl_price(lv)
@@ -370,7 +374,7 @@ def _extract_yes_best_bid_ask_debug(ob: Dict[str, Any]) -> Tuple[Optional[int], 
         yes_best_bid = _best_bid_from_levels(bids)
         yes_best_ask = _best_ask_from_levels(asks)
 
-    # Candidate B (existing style): {"orderbook":{"yes":[...], "no":[...]}} where arrays are BID ladders.
+    # Candidate B: {"orderbook":{"yes":[...], "no":[...]}} where arrays are BID ladders; derive yes_ask from no_bid.
     if (yes_best_bid is None or yes_best_ask is None) and isinstance(orderbook, dict):
         yes_levels = orderbook.get("yes")
         no_levels = orderbook.get("no")
@@ -519,11 +523,7 @@ class KalshiClient:
             path = "/" + path
 
         url = f"{self.api_base}{self.api_prefix}{path}"
-
-        if params:
-            url_with_q = url + "?" + urlencode(params)
-        else:
-            url_with_q = url
+        url_with_q = url + "?" + urlencode(params) if params else url
 
         headers = self._sign_headers(method, url)
         headers["Accept"] = "application/json"
@@ -617,16 +617,14 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
 def parse_orderbook_yes_bid_ask(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     """
-    Existing behavior preserved, but now backed by the new diagnostic extractor:
-    - If the orderbook shape is bids/asks dict, we prefer that directly.
-    - Otherwise we fall back to old yes/no ladder logic (no_bid -> yes_ask).
+    Existing behavior preserved, but now backed by the diagnostic extractor.
     """
     if not isinstance(ob, dict):
         return None, None
 
     yes_bid, yes_ask, details = _extract_yes_best_bid_ask_debug(ob)
 
-    # CHANGE 9: always log a compact summary when enabled (or when invalid)
+    # CHANGE 9: log compact summary when enabled (or when invalid)
     if OB_DEBUG and (OB_DEBUG_EVERY_POLL or (details.get("invalid_reasons") and len(details["invalid_reasons"]) > 0)):
         log.info(
             f"[OBDBG] extracted yes_bid={yes_bid} yes_ask={yes_ask} invalid={details.get('invalid_reasons')} "
@@ -872,7 +870,9 @@ def update_entry_from_fills_for_market(
 def get_open_orders(client: KalshiClient) -> List[Dict[str, Any]]:
     # CHANGE 4: status must be "resting" (not "open") for /portfolio/orders
     resp = client.request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
-    return resp.get("orders", resp if isinstance(resp, list) else [])
+    if isinstance(resp, dict):
+        return resp.get("orders", [])
+    return resp if isinstance(resp, list) else []
 
 
 def get_order_by_id(client: KalshiClient, order_id: str) -> Optional[Dict[str, Any]]:
@@ -1047,9 +1047,7 @@ def _extract_best_from_market_snapshot(m: Dict[str, Any]) -> Tuple[Optional[int]
 
     # CHANGE 9: snapshot extraction debug (only when enabled)
     if OB_DEBUG and (bid is None or ask is None):
-        log.warning(
-            f"[OBDBG] snapshot_extract missing side: bid={bid} ask={ask} keys={list(m.keys())[:60]}"
-        )
+        log.warning(f"[OBDBG] snapshot_extract missing side: bid={bid} ask={ask} keys={list(m.keys())[:60]}")
 
     return bid, ask
 
@@ -1103,8 +1101,8 @@ def main() -> None:
     last_spot_poll = 0.0
     spot_usd: Optional[float] = None
 
-    active_event = None
-    active_market = None
+    active_event: Optional[str] = None
+    active_market: Optional[str] = None
     active_market_obj: Dict[str, Any] = {}
 
     last_order_poll = 0.0
@@ -1187,6 +1185,8 @@ def main() -> None:
 
     def refresh_positions_now(tag: str) -> bool:
         nonlocal pos_yes_live, realized_pnl_usd, fees_paid_usd, net_yes, last_positions_poll
+        if not active_market:
+            return False
         try:
             positions = get_positions(client)
             note_successful_request()
@@ -1203,6 +1203,8 @@ def main() -> None:
 
     def get_market_snapshot() -> Dict[str, Any]:
         nonlocal last_market_snapshot_at, last_market_snapshot
+        if not active_market:
+            return {}
         now = time.time()
         if (now - last_market_snapshot_at) <= MARKET_SNAPSHOT_TTL_SECONDS and last_market_snapshot:
             return last_market_snapshot
@@ -1212,7 +1214,6 @@ def main() -> None:
             last_market_snapshot = snap if isinstance(snap, dict) else {}
             last_market_snapshot_at = now
 
-            # CHANGE 9: compact snapshot debug when enabled
             if OB_DEBUG and OB_DEBUG_EVERY_POLL and isinstance(last_market_snapshot, dict):
                 log.info(f"[OBDBG] snapshot_keys={list(last_market_snapshot.keys())[:40]}")
 
@@ -1230,7 +1231,6 @@ def main() -> None:
 
         open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
 
-        # NEW: lifecycle open-list seen markers
         if LOG_ORDER_LIFECYCLE:
             for oid in open_ids:
                 _mark_open_seen(oid)
@@ -1241,7 +1241,6 @@ def main() -> None:
                 return False
             return (time.time() - ts) < ORDERS_VISIBILITY_GRACE_SECONDS
 
-        # CHANGE 6: detail parsing helpers (ONLY CHANGE in reconcile semantics)
         def _detail_base(detail: Dict[str, Any]) -> Dict[str, Any]:
             return detail.get("order") if isinstance(detail.get("order"), dict) else detail
 
@@ -1261,12 +1260,11 @@ def main() -> None:
             base = _detail_base(detail)
             return f"detail_status={base.get('status')} rem={base.get('remaining_count')} px={base.get('yes_price') or base.get('price')}"
 
-        # NEW (tri-state preserved): alive? (True/False/None), detail
         def verify_detail(oid: str) -> Tuple[Optional[bool], Optional[Dict[str, Any]]]:
             if not USE_ORDER_DETAIL_FOR_RECONCILE:
                 return None, None
             try:
-                detail = get_order_by_id(client, oid)  # None means 404/not_found
+                detail = get_order_by_id(client, oid)  # None => 404/not_found
                 note_successful_request()
 
                 if detail is None:
@@ -1274,7 +1272,6 @@ def main() -> None:
 
                 _mark_detail_seen(oid, detail)
 
-                # CHANGE 6 (CRITICAL): only RESTING is "alive"; canceled/executed/rem=0 are terminal -> treat as missing
                 if _detail_is_resting(detail):
                     return True, detail
                 return False, detail
@@ -1326,9 +1323,7 @@ def main() -> None:
                                 f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
                                 f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
-                        log.warning(
-                            f"[OM] reconcile({tag}): bid missing in open-list but RESTING via order-detail; keeping local state (order_id={oid})"
-                        )
+                        log.warning(f"[OM] reconcile({tag}): bid missing open-list but RESTING via detail; keeping local state ({oid})")
                     elif exists is False:
                         if LOG_RECONCILE_SNAPSHOT:
                             age = time.time() - order_posted_ts.get(oid, time.time())
@@ -1337,15 +1332,11 @@ def main() -> None:
                                 f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
                                 f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
-                        log.warning(
-                            f"[OM] reconcile({tag}): bid missing and not RESTING via order-detail -> clearing local state (order_id={oid})"
-                        )
+                        log.warning(f"[OM] reconcile({tag}): bid missing and not RESTING via detail -> clearing local state ({oid})")
                         clear_local_and_pause("bid", oid)
                     else:
                         pause_until = max(pause_until, time.time() + min(0.5, PAUSE_ON_UNKNOWN_SECONDS))
-                        log.warning(
-                            f"[OM] reconcile({tag}): bid missing in open-list; could not verify via detail -> pausing briefly (order_id={oid})"
-                        )
+                        log.warning(f"[OM] reconcile({tag}): bid missing; could not verify via detail -> pausing briefly ({oid})")
 
         if quote.ask_order_id:
             oid = quote.ask_order_id
@@ -1366,9 +1357,7 @@ def main() -> None:
                                 f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
                                 f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
-                        log.warning(
-                            f"[OM] reconcile({tag}): ask missing in open-list but RESTING via order-detail; keeping local state (order_id={oid})"
-                        )
+                        log.warning(f"[OM] reconcile({tag}): ask missing open-list but RESTING via detail; keeping local state ({oid})")
                     elif exists is False:
                         if LOG_RECONCILE_SNAPSHOT:
                             age = time.time() - order_posted_ts.get(oid, time.time())
@@ -1377,15 +1366,11 @@ def main() -> None:
                                 f"order_id={oid} age_posted={age:.2f}s open_yes_ids={len(open_ids)} "
                                 f"{_detail_status_banner(_detail)} {_life_banner(oid)}"
                             )
-                        log.warning(
-                            f"[OM] reconcile({tag}): ask missing and not RESTING via order-detail -> clearing local state (order_id={oid})"
-                        )
+                        log.warning(f"[OM] reconcile({tag}): ask missing and not RESTING via detail -> clearing local state ({oid})")
                         clear_local_and_pause("ask", oid)
                     else:
                         pause_until = max(pause_until, time.time() + min(0.5, PAUSE_ON_UNKNOWN_SECONDS))
-                        log.warning(
-                            f"[OM] reconcile({tag}): ask missing in open-list; could not verify via detail -> pausing briefly (order_id={oid})"
-                        )
+                        log.warning(f"[OM] reconcile({tag}): ask missing; could not verify via detail -> pausing briefly ({oid})")
 
         if CLEAN_STRAY_ORDERS and active_market:
             tracked = set([oid for oid in [quote.bid_order_id, quote.ask_order_id] if oid])
@@ -1466,8 +1451,8 @@ def main() -> None:
             log.warning(f"[BOOT] cleaned {killed} leftover open orders for {active_market} ({reason})")
 
     # -----------------------------
-    # CHANGE 1 applied here too:
-    # cancel_*_only treats not_found as likely fill -> refresh + pause
+    # CHANGE 1 + CHANGE 7 applied here:
+    # cancel_*_only treats not_found as likely fill -> refresh + pause + abort iteration
     # -----------------------------
     def cancel_bid_only(reason: str) -> None:
         nonlocal quote, order_posted_ts, pause_until, skip_quote_until, abort_iteration_now
@@ -1489,7 +1474,7 @@ def main() -> None:
                     if LOG_ORDER_LIFECYCLE:
                         m = _life(oid)
                         m["terminal"] = "cancel_not_found"
-                    # CHANGE 1
+
                     order_posted_ts.pop(oid, None)
                     quote.bid_order_id = None
                     quote.bid_price = None
@@ -1497,7 +1482,7 @@ def main() -> None:
                     _ = refresh_positions_now("cancel_bid_only_404_not_found")
                     pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                     skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
-                    # CHANGE 7: abort the rest of this iteration's order actions
+
                     abort_iteration_now = True
                     log.warning(f"[OM] {active_market} cancel_bid_only got 404/not_found; pausing until inventory stabilizes.")
                     return
@@ -1531,7 +1516,7 @@ def main() -> None:
                     if LOG_ORDER_LIFECYCLE:
                         m = _life(oid)
                         m["terminal"] = "cancel_not_found"
-                    # CHANGE 1
+
                     order_posted_ts.pop(oid, None)
                     quote.ask_order_id = None
                     quote.ask_price = None
@@ -1539,7 +1524,7 @@ def main() -> None:
                     _ = refresh_positions_now("cancel_ask_only_404_not_found")
                     pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                     skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
-                    # CHANGE 7: abort the rest of this iteration's order actions
+
                     abort_iteration_now = True
                     log.warning(f"[OM] {active_market} cancel_ask_only got 404/not_found; pausing until inventory stabilizes.")
                     return
@@ -1602,6 +1587,7 @@ def main() -> None:
         if BOOTSTRAP_CANCEL_OPEN_ORDERS and active_market and prev_market != active_market:
             cancel_all_open_yes_orders_for_active_market("market_roll_bootstrap")
 
+    # ---- boot selection + optional cancel
     refresh_active_market()
     last_meta_refresh = time.time()
 
@@ -1639,7 +1625,6 @@ def main() -> None:
             open_orders_cache = get_open_orders(client)
             note_successful_request()
 
-            # If we are NOT canceling on boot, adopt the best live YES bid/ask into QuoteState to avoid double-posting.
             if not BOOTSTRAP_CANCEL_OPEN_ORDERS:
                 best_bid_oid = None
                 best_bid_px = None
@@ -1672,16 +1657,13 @@ def main() -> None:
                     quote.ask_price = best_ask_px
 
                 quote.last_market_ticker = active_market
-
                 log.warning(
                     f"[BOOTRECON] adopted live orders: market={active_market} "
                     f"bid={quote.bid_order_id}@{quote.bid_price} ask={quote.ask_order_id}@{quote.ask_price}"
                 )
             else:
-                # If we DID cancel on boot, ensure local quote state is clean.
                 quote.last_market_ticker = active_market
 
-            # Reconcile local view against open-list (and optionally order-detail), then pause briefly for stability.
             reconcile_quote_state_with_open_orders("startup_reconcile")
             _ = refresh_positions_now("startup_reconcile")
             pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
@@ -1693,10 +1675,11 @@ def main() -> None:
         except Exception as e:
             log.warning(f"[BOOTRECON] failed: {e}")
 
+    # -----------------------------
+    # Main run loop
+    # -----------------------------
     while True:
-        # CHANGE 7: reset abort flag each iteration
         abort_iteration_now = False
-
         t0 = time.time()
 
         if (t0 - last_meta_refresh) >= META_REFRESH_SECONDS:
@@ -1823,7 +1806,6 @@ def main() -> None:
             snap = get_market_snapshot()
             fb_bid, fb_ask = _extract_best_from_market_snapshot(snap)
 
-            # CHANGE 9: explicit fallback debug line with extracted values + key hints
             if OB_DEBUG:
                 try:
                     kk = list((snap.get("market") if isinstance(snap.get("market"), dict) else snap).keys())[:60] if isinstance(snap, dict) else []
@@ -1971,7 +1953,6 @@ def main() -> None:
             continue
 
         reduce_only = (est_net_yes != 0)
-
         min_spread_for_quotes = HYSTERESIS_EXIT_SPREAD_CENTS if is_quoting else HYSTERESIS_ENTER_SPREAD_CENTS
         skew_net_for_pricing = 0 if reduce_only else est_net_yes
 
@@ -2046,7 +2027,6 @@ def main() -> None:
         if not allow_ask and quote.ask_order_id:
             cancel_ask_only("inventory_block_ask")
 
-        # CHANGE 7: abort after inventory-block cancels too (covers not_found mid-iteration)
         if abort_iteration_now:
             time.sleep(POLL_SECONDS)
             continue
@@ -2058,7 +2038,6 @@ def main() -> None:
             enter_ok_streak = 0
             exit_bad_streak = 0
 
-        # CHANGE 7: abort if market_roll cancels hit 404/not_found
         if abort_iteration_now:
             time.sleep(POLL_SECONDS)
             continue
@@ -2122,6 +2101,7 @@ def main() -> None:
                     if st == "not_found":
                         last_cancel_not_found_oid = old_order_id
 
+                        # CHANGE 1: clear local side state immediately + refresh positions + pause/skip
                         if side == "bid":
                             quote.bid_order_id = None
                             quote.bid_price = None
@@ -2151,7 +2131,6 @@ def main() -> None:
                 note_successful_request()
                 order_posted_ts[new_oid] = time.time()
 
-                # NEW: lifecycle on POSTED (ONLY LOGGING)
                 if LOG_ORDER_LIFECYCLE:
                     m = _life(new_oid)
                     m["posted_ts"] = order_posted_ts[new_oid]
@@ -2184,7 +2163,6 @@ def main() -> None:
                 continue
 
             last_reprice_at = time.time()
-
             abort_iteration = False
 
             if want_ask_update and allow_ask:
@@ -2244,8 +2222,9 @@ def main() -> None:
             last_target_log_at = t0
 
         if (t0 - last_state_log_at) >= STATE_LOG_SECONDS:
-            b_vis = quote.bid_order_id is not None and quote.bid_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
-            a_vis = quote.ask_order_id is not None and quote.ask_order_id in set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            open_ids = set(open_order_ids_for_market_yes(open_orders_cache, active_market))
+            b_vis = quote.bid_order_id is not None and quote.bid_order_id in open_ids
+            a_vis = quote.ask_order_id is not None and quote.ask_order_id in open_ids
             log.info(
                 f"[STATE] mkt={active_market} pos={pos_yes_live} spread={spread_now} best=({yes_bid},{yes_ask}) tgt=({bid_px},{ask_px}) "
                 f"reduce_only={reduce_only} emergency={emergency_reduce_only} allow=(b:{allow_bid},a:{allow_ask}) open=(b:{open_buys},s:{open_sells}) "
