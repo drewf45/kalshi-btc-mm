@@ -35,6 +35,16 @@
 #     • Treat ONLY status="resting" (and remaining_count>0 if present) as "alive"
 #     • If order-detail is terminal, clear local state + refresh positions + pause (same as 404 handling)
 #
+# CHANGE 7 (CRITICAL, NEW): Mid-iteration abort on cancel_*_only 404/not_found:
+#     • If cancel_bid_only / cancel_ask_only gets not_found, set an abort flag
+#     • The loop will NOT place any new orders in that same iteration
+#     • This makes the pause/skip gates effective immediately (prevents post-404 re-quoting in same tick)
+#
+# CHANGE 8 (CRITICAL, NEW): Fix "place -> instantly cancel" churn while flat:
+#     • Flat-mode allow logic now counts ORDER_QTY only when we need to PLACE a missing side
+#     • If we already have a resting bid/ask quote, we do NOT add ORDER_QTY again
+#     • Prevents inventory_block_bid/ask from canceling perfectly valid two-sided quotes
+#
 # LOGGING DIAGNOSTICS (NEW, ONLY): Adds high-signal logs to debug:
 #   (A) OMSNP reconcile snapshot lines when open-list != detail
 #   (B) LIFE order lifecycle tracking (posted -> seen in open-list -> seen in detail)
@@ -966,6 +976,9 @@ def main() -> None:
     last_ob_fb_sig: Tuple[Any, ...] = tuple()
     OB_FALLBACK_LOG_THROTTLE_SECONDS = 2.0
 
+    # CHANGE 7: abort flag if cancel_*_only hits 404/not_found (prevents posting new orders in same iteration)
+    abort_iteration_now = False
+
     def is_insufficient_balance(e: Exception) -> bool:
         s = str(e)
         return ("insufficient_balance" in s) or ("code" in s and "insufficient_balance" in s)
@@ -1277,7 +1290,7 @@ def main() -> None:
     # cancel_*_only treats not_found as likely fill -> refresh + pause
     # -----------------------------
     def cancel_bid_only(reason: str) -> None:
-        nonlocal quote, order_posted_ts, pause_until, skip_quote_until
+        nonlocal quote, order_posted_ts, pause_until, skip_quote_until, abort_iteration_now
         if not active_market:
             return
         if quote.bid_order_id:
@@ -1304,6 +1317,8 @@ def main() -> None:
                     _ = refresh_positions_now("cancel_bid_only_404_not_found")
                     pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                     skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
+                    # CHANGE 7: abort the rest of this iteration's order actions
+                    abort_iteration_now = True
                     log.warning(f"[OM] {active_market} cancel_bid_only got 404/not_found; pausing until inventory stabilizes.")
                     return
 
@@ -1317,7 +1332,7 @@ def main() -> None:
                 quote.bid_price = None
 
     def cancel_ask_only(reason: str) -> None:
-        nonlocal quote, order_posted_ts, pause_until, skip_quote_until
+        nonlocal quote, order_posted_ts, pause_until, skip_quote_until, abort_iteration_now
         if not active_market:
             return
         if quote.ask_order_id:
@@ -1344,6 +1359,8 @@ def main() -> None:
                     _ = refresh_positions_now("cancel_ask_only_404_not_found")
                     pause_until = max(pause_until, time.time() + PAUSE_ON_UNKNOWN_SECONDS)
                     skip_quote_until = max(skip_quote_until, time.time() + max(1.5, POSITIONS_POLL_SECONDS * 2.0))
+                    # CHANGE 7: abort the rest of this iteration's order actions
+                    abort_iteration_now = True
                     log.warning(f"[OM] {active_market} cancel_ask_only got 404/not_found; pausing until inventory stabilizes.")
                     return
 
@@ -1497,6 +1514,9 @@ def main() -> None:
             log.warning(f"[BOOTRECON] failed: {e}")
 
     while True:
+        # CHANGE 7: reset abort flag each iteration
+        abort_iteration_now = False
+
         t0 = time.time()
 
         if (t0 - last_meta_refresh) >= META_REFRESH_SECONDS:
@@ -1805,10 +1825,17 @@ def main() -> None:
                 allow_ask = False
                 why += " reduce_only(short_exit)"
         else:
-            allow_bid = (0 + open_buys + ORDER_QTY) <= MAX_ABS_YES_CONTRACTS
-            allow_ask = (0 - open_sells - ORDER_QTY) >= -MAX_ABS_YES_CONTRACTS
-            allow_bid = allow_bid and ((est_net_yes + open_buys) < MAX_NET_YES_CONTRACTS)
-            allow_ask = allow_ask and ((est_net_yes - open_sells) > -MAX_NET_YES_CONTRACTS)
+            # CHANGE 8 (CRITICAL): don't count ORDER_QTY twice when we already have a quote resting on that side.
+            have_bid = quote.bid_order_id is not None
+            have_ask = quote.ask_order_id is not None
+            bid_add = 0 if have_bid else ORDER_QTY
+            ask_add = 0 if have_ask else ORDER_QTY
+
+            allow_bid = (0 + open_buys + bid_add) <= MAX_ABS_YES_CONTRACTS
+            allow_ask = (0 - (open_sells + ask_add)) >= -MAX_ABS_YES_CONTRACTS
+
+            allow_bid = allow_bid and ((est_net_yes + open_buys + bid_add) < MAX_NET_YES_CONTRACTS)
+            allow_ask = allow_ask and ((est_net_yes - open_sells - ask_add) > -MAX_NET_YES_CONTRACTS)
 
         if emergency_reduce_only and est_net_yes != 0:
             if est_net_yes > 0:
@@ -1818,10 +1845,20 @@ def main() -> None:
                 if quote.ask_order_id:
                     cancel_ask_only("emergency_short_cancel_asks")
 
+        # CHANGE 7: if a cancel_*_only hit 404/not_found, abort this iteration before any further order actions
+        if abort_iteration_now:
+            time.sleep(POLL_SECONDS)
+            continue
+
         if not allow_bid and quote.bid_order_id:
             cancel_bid_only("inventory_block_bid")
         if not allow_ask and quote.ask_order_id:
             cancel_ask_only("inventory_block_ask")
+
+        # CHANGE 7: abort after inventory-block cancels too (covers not_found mid-iteration)
+        if abort_iteration_now:
+            time.sleep(POLL_SECONDS)
+            continue
 
         if quote.last_market_ticker and quote.last_market_ticker != active_market:
             cancel_live_quotes("market_roll")
@@ -1829,6 +1866,11 @@ def main() -> None:
             is_quoting = False
             enter_ok_streak = 0
             exit_bad_streak = 0
+
+        # CHANGE 7: abort if market_roll cancels hit 404/not_found
+        if abort_iteration_now:
+            time.sleep(POLL_SECONDS)
+            continue
 
         quote.last_market_ticker = active_market
 
