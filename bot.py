@@ -1138,4 +1138,59 @@ def main() -> None:
             st.traded_this_market = True
             st.sm = SM.ORDER_WAIT
             log.warning(f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} avail_usd={available_usd} total_usd={total_usd}")
-        except Exception as e
+        except Exception as e:
+            log.warning(f"[ORDER] place failed: {e}")
+            st.order_id = None
+            time.sleep(POLL_SECONDS)
+            continue
+
+        while True:
+            now2 = time.time()
+            secs_to_close2 = int(close_ts - int(now2)) if close_ts is not None else None
+
+            if secs_to_close2 is not None and secs_to_close2 <= 0:
+                if CANCEL_UNFILLED_AT_CLOSE and st.order_id:
+                    try:
+                        stc = cancel_order_status(client, st.order_id)
+                        log.warning(f"[ORDER] close passed; canceled order_id={st.order_id} status={stc}")
+                    except Exception as ce:
+                        log.warning(f"[ORDER] close cancel failed: {ce}")
+                st.order_id = None
+                st.sm = SM.HOLD
+                break
+
+            try:
+                pos2 = parse_position_for_market(get_positions(client), st.market)
+            except Exception:
+                pos2 = 0
+
+            if pos2 != 0:
+                log.warning(f"[FILL] market={st.market} pos_now={pos2} order_id={st.order_id} -> HOLD")
+                st.sm = SM.HOLD
+                break
+
+            alive = True
+            try:
+                oo2 = get_open_orders(client)
+                alive = any((str(o.get("order_id") or o.get("id")) == st.order_id) for o in oo2) if st.order_id else False
+            except Exception:
+                alive = True
+
+            if not alive:
+                log.warning(f"[ORDER] order_id={st.order_id} no longer resting; pos=0 -> HOLD (single-trade policy)")
+                st.order_id = None
+                st.sm = SM.HOLD
+                break
+
+            if (now2 - st.placed_at) >= float(FILL_WAIT_SECONDS):
+                log.warning(f"[ORDER] still resting after {FILL_WAIT_SECONDS}s; staying out (single-trade policy). order_id={st.order_id}")
+                st.sm = SM.HOLD
+                break
+
+            time.sleep(POLL_SECONDS)
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
