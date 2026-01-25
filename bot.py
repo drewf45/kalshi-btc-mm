@@ -18,6 +18,25 @@
 # IMPORTANT CONSTRAINT YOU GAVE:
 # - DO NOT change Kalshi posting/signing/keys/names logic. Kept intact.
 # - Everything else is free to change. This file is a rewrite around the SAME KalshiClient.
+#
+# -----------------------------
+# NOTES / WHAT CHANGED (A-LEVEL ADDITIONS ONLY)
+# -----------------------------
+# A1) Market-implied probability + divergence gate:
+#     - Compute p_mkt from orderbook (mid/complements) when USE_MARKET_IMPLIED=True
+#     - Require model disagreement vs market by MIN_DIVERGENCE (default 1.5c)
+#
+# A2) Blend model with market to avoid hero trades:
+#     - p_blend = alpha*p_model + (1-alpha)*p_mkt   (MODEL_BLEND_ALPHA default 0.75)
+#     - Edges computed off p_blend
+#
+# A3) Dynamic sigma (optional):
+#     - Estimate realized volatility from Coinbase Exchange 1-min candles
+#     - Sigma is clipped to [SIGMA_FLOOR, SIGMA_CEIL]
+#
+# A4) Basic book sanity:
+#     - Optional: require bid+ask for chosen side (REQUIRE_BOTH_SIDES_BOOK)
+#     - Optional: require spread <= MAX_SPREAD_CENTS_TO_TRADE when both sides present
 
 import os
 import time
@@ -126,7 +145,7 @@ ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 120)         # start monito
 ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)    # default "place" target is T-60
 ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 30)            # last chance to place at T-30
 FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 30)              # after placing, wait up to this long
-ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", False)      # if POST_ONLY prevents fill, optionally cross at ENTRY_LAST_SECONDS
+ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", False)      # (kept, not used here)
 CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
 
 # Edge / model gates
@@ -153,9 +172,29 @@ CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
 LOG_DECISIONS = env_bool("LOG_DECISIONS", True)
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 2.0)
 
-# --- NEW: book/log handling (additive only) ---
-JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)                       # maker aggressiveness: 0=join bid, 1=improve by 1 (if still post-only)
+# --- book/log handling (additive only) ---
+JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)                       # maker aggressiveness
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)   # rate-limit "no usable book" warnings
+
+# -------------- A-LEVEL ADDITIONS (additive only) --------------
+USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)         # compute p_mkt from book
+MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.75)          # 1.0=model only, 0.0=market only
+MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)               # require model vs market mispricing
+
+USE_DYNAMIC_SIGMA = env_bool("USE_DYNAMIC_SIGMA", True)
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+CANDLES_GRANULARITY_SEC = env_int("CANDLES_GRANULARITY_SEC", 60)
+CANDLES_LOOKBACK = env_int("CANDLES_LOOKBACK", 10)
+SIGMA_FLOOR = env_float("SIGMA_FLOOR", 6.0)
+SIGMA_CEIL = env_float("SIGMA_CEIL", 40.0)
+
+MAX_SPREAD_CENTS_TO_TRADE = env_int("MAX_SPREAD_CENTS_TO_TRADE", 8)
+REQUIRE_BOTH_SIDES_BOOK = env_bool("REQUIRE_BOTH_SIDES_BOOK", False)
+
+# Light caching to avoid hammering candles endpoint
+SIGMA_REFRESH_SECONDS = env_float("SIGMA_REFRESH_SECONDS", 5.0)
+_last_sigma_ts: float = 0.0
+_last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
 
 
 # -----------------------------
@@ -234,7 +273,7 @@ class KalshiClient:
 
 
 # -----------------------------
-# NEW: robust close_ts resolver (prevents "missing close_ts; waiting..." forever)
+# Robust close_ts resolver (prevents "missing close_ts; waiting..." forever)
 # -----------------------------
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -327,7 +366,7 @@ def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
 
 
 # -----------------------------
-# Market selection / parsing (keep same approach)
+# Market selection / parsing
 # -----------------------------
 def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
     now_ts = int(time.time())
@@ -338,7 +377,6 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
             return None
         try:
             vv = int(v)
-            # normalize ms -> s
             return vv // 1000 if vv > 10_000_000_000 else vv
         except Exception:
             return None
@@ -381,7 +419,6 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
 
 def extract_close_ts(market_obj: Dict[str, Any], market_ticker: str) -> Optional[int]:
-    # NEW: use the robust resolver (includes ticker inference)
     return resolve_close_ts(market_obj, market_ticker)
 
 
@@ -406,7 +443,7 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
 
 
 # -----------------------------
-# Spot + simple probability model
+# Spot + probability model
 # -----------------------------
 def fetch_btc_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optional[float]:
     try:
@@ -439,6 +476,78 @@ def prob_yes_in_range(mean: float, lo: Optional[float], hi: Optional[float], sd:
         return max(0.0, min(1.0, 1.0 - _norm_cdf(z)))
     z = (hi - mean) / sd
     return max(0.0, min(1.0, _norm_cdf(z)))
+
+
+# -----------------------------
+# A-LEVEL: dynamic sigma helpers
+# -----------------------------
+def fetch_coinbase_candles(session: requests.Session, granularity: int, timeout: float = 5.0) -> Optional[List[List[float]]]:
+    """
+    Coinbase Exchange candles endpoint returns: [ time, low, high, open, close, volume ]
+    Most recent first.
+    """
+    try:
+        params = {"granularity": int(granularity)}
+        r = session.get(COINBASE_CANDLES_URL, params=params, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def realized_sigma_usd_per_sqrt_sec(session: requests.Session) -> Optional[float]:
+    candles = fetch_coinbase_candles(session, CANDLES_GRANULARITY_SEC)
+    if not candles or len(candles) < 3:
+        return None
+
+    # take last N minutes and sort oldest->newest
+    take = candles[: max(3, int(CANDLES_LOOKBACK))]
+    take_sorted = sorted(take, key=lambda x: float(x[0]))
+
+    closes: List[float] = []
+    for c in take_sorted:
+        try:
+            closes.append(float(c[4]))
+        except Exception:
+            continue
+
+    if len(closes) < 3:
+        return None
+
+    diffs: List[float] = []
+    for i in range(1, len(closes)):
+        diffs.append(closes[i] - closes[i - 1])
+
+    if len(diffs) < 2:
+        return None
+
+    mean = sum(diffs) / len(diffs)
+    var = sum((x - mean) ** 2 for x in diffs) / max(1, (len(diffs) - 1))
+    sd_per_min = math.sqrt(max(0.0, var))
+
+    # sd_per_min ≈ sigma * sqrt(60)  => sigma = sd_per_min / sqrt(60)
+    sigma = sd_per_min / math.sqrt(60.0)
+    return float(sigma)
+
+
+def get_sigma_cached(http: requests.Session) -> float:
+    global _last_sigma_ts, _last_sigma_val
+    now = time.time()
+    if not USE_DYNAMIC_SIGMA:
+        return float(SPOT_SIGMA_USD_PER_SQRT_SEC)
+    if (now - _last_sigma_ts) < float(SIGMA_REFRESH_SECONDS):
+        return float(_last_sigma_val)
+
+    rs = realized_sigma_usd_per_sqrt_sec(http)
+    if rs is None or rs <= 0:
+        _last_sigma_val = float(SPOT_SIGMA_USD_PER_SQRT_SEC)
+    else:
+        _last_sigma_val = float(max(SIGMA_FLOOR, min(SIGMA_CEIL, rs)))
+    _last_sigma_ts = now
+    return float(_last_sigma_val)
 
 
 # -----------------------------
@@ -477,8 +586,7 @@ def _best_from_levels(levels: Any, want: str) -> Optional[int]:
 def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Returns: (yes_bid, yes_ask, no_bid, no_ask) in cents.
-    Unlike the earlier strict version, this does NOT require all 4 to exist.
-    It returns whatever it can parse/derive.
+    Returns whatever it can parse/derive.
     """
     if not isinstance(ob, dict):
         return None, None, None, None
@@ -487,7 +595,7 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
 
     yes_bid = yes_ask = no_bid = no_ask = None
 
-    # Shape A: orderbook: { yes: {bids:[...], asks:[...]}, no:{bids:[...], asks:[...]} }
+    # Shape A
     if isinstance(root, dict) and isinstance(root.get("yes"), dict):
         y = root.get("yes", {})
         n = root.get("no", {})
@@ -497,7 +605,7 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
             no_bid = _best_from_levels(n.get("bids", n.get("buy")), "bid")
             no_ask = _best_from_levels(n.get("asks", n.get("sell")), "ask")
 
-    # Shape B: orderbook: { yes:[...], no:[...] } where lists are bid ladders (best bid)
+    # Shape B
     if isinstance(root, dict) and (isinstance(root.get("yes"), list) or isinstance(root.get("no"), list)):
         if yes_bid is None and isinstance(root.get("yes"), list):
             yes_bid = _best_from_levels(root.get("yes"), "bid")
@@ -515,13 +623,46 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
     if no_bid is None and yes_ask is not None:
         no_bid = clamp_int(100 - yes_ask, 1, 99)
 
-    # If book looks locked/crossed, drop the "ask" side (still keep bids; maker can still post)
+    # If book looks locked/crossed, drop asks
     if yes_bid is not None and yes_ask is not None and yes_ask <= yes_bid:
         yes_ask = None
     if no_bid is not None and no_ask is not None and no_ask <= no_bid:
         no_ask = None
 
     return yes_bid, yes_ask, no_bid, no_ask
+
+
+# -----------------------------
+# A-LEVEL: market-implied probability
+# -----------------------------
+def implied_prob_from_book(
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+    no_bid: Optional[int],
+    no_ask: Optional[int],
+) -> Optional[float]:
+    # best: YES mid
+    if yes_bid is not None and yes_ask is not None and yes_ask > yes_bid:
+        return max(0.01, min(0.99, (yes_bid + yes_ask) / 200.0))
+
+    # next: NO mid, then complement
+    if no_bid is not None and no_ask is not None and no_ask > no_bid:
+        no_mid = (no_bid + no_ask) / 200.0
+        return max(0.01, min(0.99, 1.0 - no_mid))
+
+    # conservative single-sided
+    if yes_bid is not None:
+        return max(0.01, min(0.99, yes_bid / 100.0))
+    if yes_ask is not None:
+        return max(0.01, min(0.99, yes_ask / 100.0))
+
+    return None
+
+
+def spread_ok(bid: Optional[int], ask: Optional[int]) -> bool:
+    if bid is None or ask is None:
+        return not REQUIRE_BOTH_SIDES_BOOK
+    return (ask - bid) <= int(MAX_SPREAD_CENTS_TO_TRADE)
 
 
 # -----------------------------
@@ -709,6 +850,11 @@ class BotState:
     last_edge_yes: Optional[float] = None
     last_edge_no: Optional[float] = None
 
+    # A-level diagnostics
+    last_p_mkt: Optional[float] = None
+    last_div_yes: Optional[float] = None
+    last_sigma: Optional[float] = None
+
 
 # -----------------------------
 # Decision logic
@@ -720,9 +866,6 @@ def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
 def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int]:
     """
     For POST_ONLY buys: choose a price that will REST (not cross).
-    - If both bid+ask known, we can improve by JOIN_UP_CENTS but never cross: <= ask-1.
-    - If only bid known, join/improve relative to bid is fine (no ask to cross).
-    - If only ask known, use ask-1 (if possible).
     """
     if bid is None and ask is None:
         return None
@@ -731,7 +874,6 @@ def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int
         return clamp_int(px, 1, 99) if px >= 1 else None
     if ask is None:
         return clamp_int(int(bid), 1, 99)
-    # both known
     max_rest = int(ask) - 1
     if max_rest < 1:
         return None
@@ -741,6 +883,7 @@ def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int
 
 
 def choose_trade(
+    http: requests.Session,
     spot: float,
     lo: Optional[float],
     hi: Optional[float],
@@ -749,18 +892,31 @@ def choose_trade(
     yes_ask: Optional[int],
     no_bid: Optional[int],
     no_ask: Optional[int],
-) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], float]:
+) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[float], float, Optional[float], Optional[float], Optional[float]]:
     """
     Returns:
       chosen_side ("yes"/"no") or None
-      chosen_entry_price (what we will send as limit price)
-      p_yes, p_no, chosen_edge
+      chosen_entry_price (limit price)
+      p_yes_model, p_no_model, chosen_edge (computed off blended prob)
+      p_mkt (implied), div_yes (p_model - p_mkt), sigma_used
     """
     t_eff = max(5.0, float(min(secs_to_close, 120)))
-    sd = SPOT_SIGMA_USD_PER_SQRT_SEC * math.sqrt(t_eff)
 
-    p_yes = prob_yes_in_range(spot, lo, hi, sd)
-    p_no = 1.0 - p_yes
+    sigma_used = get_sigma_cached(http)
+    sd = float(sigma_used) * math.sqrt(t_eff)
+
+    p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
+    p_no_model = 1.0 - p_yes_model
+
+    # Market-implied probability
+    p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
+
+    # Blend
+    if p_mkt is not None:
+        p_yes_blend = float(MODEL_BLEND_ALPHA) * p_yes_model + (1.0 - float(MODEL_BLEND_ALPHA)) * float(p_mkt)
+    else:
+        p_yes_blend = p_yes_model
+    p_no_blend = 1.0 - p_yes_blend
 
     # Determine tradable entry prices
     if POST_ONLY:
@@ -770,37 +926,53 @@ def choose_trade(
         yes_px = yes_ask
         no_px = no_ask
 
-    edge_yes = compute_edge(p_yes, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
-    edge_no = compute_edge(p_no, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+    # Spread sanity gates (only meaningful if both bid/ask exist)
+    ok_book_yes = spread_ok(yes_bid, yes_ask)
+    ok_book_no = spread_ok(no_bid, no_ask)
+
+    # Edges computed on blended probability
+    edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
+    edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+
+    # Divergence gate (A-level)
+    div_yes = None
+    div_no = None
+    if p_mkt is not None:
+        div_yes = p_yes_model - p_mkt
+        div_no = -div_yes  # (1-p_model)-(1-p_mkt) == p_mkt - p_model
 
     ok_yes = (
         yes_px is not None
-        and (p_yes >= PROB_MIN)
+        and ok_book_yes
+        and (p_yes_model >= PROB_MIN)
         and (edge_yes >= EDGE_MIN)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
+        and (div_yes is None or div_yes >= MIN_DIVERGENCE)
     )
     ok_no = (
         no_px is not None
-        and (p_no >= PROB_MIN)
+        and ok_book_no
+        and (p_no_model >= PROB_MIN)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
+        and (div_no is None or div_no >= MIN_DIVERGENCE)
     )
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
-            return "yes", int(yes_px), p_yes, p_no, float(edge_yes)
+            return "yes", int(yes_px), p_yes_model, p_no_model, float(edge_yes), p_mkt, div_yes, sigma_used
         if edge_no > edge_yes + 1e-9:
-            return "no", int(no_px), p_yes, p_no, float(edge_no)
+            return "no", int(no_px), p_yes_model, p_no_model, float(edge_no), p_mkt, div_yes, sigma_used
         if int(yes_px) <= int(no_px):
-            return "yes", int(yes_px), p_yes, p_no, float(edge_yes)
-        return "no", int(no_px), p_yes, p_no, float(edge_no)
+            return "yes", int(yes_px), p_yes_model, p_no_model, float(edge_yes), p_mkt, div_yes, sigma_used
+        return "no", int(no_px), p_yes_model, p_no_model, float(edge_no), p_mkt, div_yes, sigma_used
 
     if ok_yes:
-        return "yes", int(yes_px), p_yes, p_no, float(edge_yes)
+        return "yes", int(yes_px), p_yes_model, p_no_model, float(edge_yes), p_mkt, div_yes, sigma_used
     if ok_no:
-        return "no", int(no_px), p_yes, p_no, float(edge_no)
+        return "no", int(no_px), p_yes_model, p_no_model, float(edge_no), p_mkt, div_yes, sigma_used
 
-    return None, None, p_yes, p_no, max(float(edge_yes), float(edge_no))
+    return None, None, p_yes_model, p_no_model, max(float(edge_yes), float(edge_no)), p_mkt, div_yes, sigma_used
 
 
 def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int) -> int:
@@ -827,7 +999,9 @@ def main() -> None:
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} MARKET_OVERRIDE={MARKET_OVERRIDE} "
         f"DRY_RUN={DRY_RUN} ENABLE_TRADING={ENABLE_TRADING} POST_ONLY={POST_ONLY} "
-        f"ONE_TRADE_PER_MARKET={ONE_TRADE_PER_MARKET} BANKROLL_FRACTION={BANKROLL_FRACTION}"
+        f"ONE_TRADE_PER_MARKET={ONE_TRADE_PER_MARKET} BANKROLL_FRACTION={BANKROLL_FRACTION} "
+        f"USE_MARKET_IMPLIED={USE_MARKET_IMPLIED} MODEL_BLEND_ALPHA={MODEL_BLEND_ALPHA} MIN_DIVERGENCE={MIN_DIVERGENCE} "
+        f"USE_DYNAMIC_SIGMA={USE_DYNAMIC_SIGMA}"
     )
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
@@ -884,7 +1058,6 @@ def main() -> None:
 
         try:
             oo = get_open_orders(client)
-            any_for = False
             for o in oo:
                 if str(o.get("ticker")) != str(new_market):
                     continue
@@ -900,14 +1073,11 @@ def main() -> None:
                     except Exception:
                         st.order_price = None
                     st.placed_at = time.time()
-                    any_for = True
-                    break
-            if any_for:
-                st.sm = SM.ORDER_WAIT
-                st.market = new_market
-                st.traded_this_market = True
-                log.warning(f"[RECON] inherited resting order in {new_market}: order_id={st.order_id} side={st.order_side} px={st.order_price}")
-                return
+                    st.sm = SM.ORDER_WAIT
+                    st.market = new_market
+                    st.traded_this_market = True
+                    log.warning(f"[RECON] inherited resting order in {new_market}: order_id={st.order_id} side={st.order_side} px={st.order_price}")
+                    return
         except Exception:
             pass
 
@@ -956,7 +1126,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # NEW: robust close_ts resolution (includes ticker inference)
         close_ts = extract_close_ts(active_market_obj, st.market)
         secs_to_close = None
         if close_ts is not None:
@@ -1012,12 +1181,11 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # NEW BEHAVIOR: if close_ts still missing even after inference, don't spin forever
         if secs_to_close is None:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                 log.warning(f"[STATE] market={st.market} missing close_ts (even after inference); forcing meta refresh...")
                 last_state_log = now
-            last_meta = 0.0  # force refresh_active_market() ASAP
+            last_meta = 0.0
             time.sleep(POLL_SECONDS)
             continue
 
@@ -1058,10 +1226,10 @@ def main() -> None:
             continue
 
         yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
-
         lo, hi = market_bounds_usd(active_market_obj)
 
-        chosen_side, chosen_px, p_yes, p_no, chosen_edge = choose_trade(
+        chosen_side, chosen_px, p_yes, p_no, chosen_edge, p_mkt, div_yes, sigma_used = choose_trade(
+            http=http,
             spot=spot,
             lo=lo,
             hi=hi,
@@ -1072,7 +1240,7 @@ def main() -> None:
             no_ask=no_ask,
         )
 
-        # compute edges for logging using the chosen pricing rules
+        # logging prices (same as before)
         if POST_ONLY:
             yes_px_log = postable_entry_price(yes_bid, yes_ask)
             no_px_log = postable_entry_price(no_bid, no_ask)
@@ -1081,19 +1249,32 @@ def main() -> None:
             no_px_log = no_ask
 
         st.last_p_yes = p_yes
-        st.last_edge_yes = compute_edge(p_yes, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
-        st.last_edge_no = compute_edge(1.0 - p_yes, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
+        st.last_p_mkt = p_mkt
+        st.last_div_yes = div_yes
+        st.last_sigma = sigma_used
+
+        st.last_edge_yes = compute_edge(
+            (float(MODEL_BLEND_ALPHA) * p_yes + (1.0 - float(MODEL_BLEND_ALPHA)) * p_mkt) if (p_mkt is not None) else p_yes,
+            yes_px_log,
+            FEE_CENTS_PER_CONTRACT
+        ) if yes_px_log is not None else None
+
+        st.last_edge_no = compute_edge(
+            (1.0 - ((float(MODEL_BLEND_ALPHA) * p_yes + (1.0 - float(MODEL_BLEND_ALPHA)) * p_mkt) if (p_mkt is not None) else p_yes)),
+            no_px_log,
+            FEE_CENTS_PER_CONTRACT
+        ) if no_px_log is not None else None
 
         if LOG_DECISIONS:
             log.info(
-                f"[DECIDE] {st.market} t_close={secs_to_close}s spot={spot:.2f} range=({lo},{hi}) "
+                f"[DECIDE] {st.market} t_close={secs_to_close}s spot={spot:.2f} range=({lo},{hi}) sigma={sigma_used:.3f} "
+                f"p_mkt={p_mkt} div_yes={div_yes} "
                 f"YES(bid={yes_bid},ask={yes_ask},entry={yes_px_log},p={p_yes:.4f},edge={st.last_edge_yes}) "
                 f"NO(bid={no_bid},ask={no_ask},entry={no_px_log},p={p_no:.4f},edge={st.last_edge_no}) "
                 f"-> chosen={chosen_side} entry={chosen_px} edge={chosen_edge:.4f}"
             )
 
         if chosen_side is None or chosen_px is None:
-            # only warn occasionally when book is unusable (avoid spam)
             if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
                 log.warning(
                     f"[OB] no usable entry near close: yes=(bid={yes_bid},ask={yes_ask}) no=(bid={no_bid},ask={no_ask}) POST_ONLY={POST_ONLY}"
