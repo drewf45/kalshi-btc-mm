@@ -43,6 +43,18 @@
 #     - Bot does NOT prefer YES or NO.
 #     - It picks whichever side has >= PROB_MIN AND >= 1-cent edge (EDGE_MIN default 0.01).
 #     - If both qualify, it takes the higher edge.
+#
+# -----------------------------
+# STRATEGY MICRO-CHANGES (THIS EDIT)
+# -----------------------------
+# S1) PROB gate now defaults to using BLENDED probability (p_yes_blend / p_no_blend)
+#     instead of raw model probability. Toggle via PROB_GATE_USE_BLEND.
+#
+# S2) Size is now EDGE-BASED + HARD-CAPPED:
+#     - Base fraction = BANKROLL_FRACTION (your usual, e.g. 0.05)
+#     - If edge_net is higher, fraction scales up (configurable)
+#     - BUT never exceeds BANKROLL_FRACTION_HARD_CAP (default 0.25)
+#     This prevents “bet the house” blowups while still letting you size up on A+ setups.
 
 import os
 import time
@@ -114,6 +126,10 @@ def iso_utc() -> str:
 
 def clamp_int(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(x)))
+
+
+def clamp_float(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(x)))
 
 
 # -----------------------------
@@ -201,6 +217,25 @@ REQUIRE_BOTH_SIDES_BOOK = env_bool("REQUIRE_BOTH_SIDES_BOOK", False)
 SIGMA_REFRESH_SECONDS = env_float("SIGMA_REFRESH_SECONDS", 5.0)
 _last_sigma_ts: float = 0.0
 _last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
+
+# -----------------------------
+# NEW STRATEGY ENVS (SIZING + PROB GATE)
+# -----------------------------
+# Use blended probability (default) for PROB_MIN gate
+PROB_GATE_USE_BLEND = env_bool("PROB_GATE_USE_BLEND", True)
+
+# Hard cap: even if you set BANKROLL_FRACTION=0.75, this stops it from nuking the account
+BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.25)
+
+# Edge-based sizing: fraction = base + slope * max(0, edge_net - start)
+# edge_net is in probability units (e.g. 0.02 means ~2 cents expected value vs price)
+EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.02)
+EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 2.5)
+
+# Optional “A+ tier” bump if BOTH prob and edge are very high
+A_PLUS_PROB = env_float("A_PLUS_PROB", 0.92)
+A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.15)
 
 
 # -----------------------------
@@ -904,15 +939,6 @@ def choose_trade(
     Optional[float], Optional[float], float,  # p_mkt, div_yes, sigma_used
     float, float           # edge_yes, edge_no (blend-based)
 ]:
-    """
-    Returns:
-      chosen_side ("yes"/"no") or None
-      chosen_entry_price (limit price)
-      p_yes_model, p_no_model
-      p_yes_blend, p_no_blend
-      p_mkt (implied), div_yes (p_model - p_mkt), sigma_used
-      edge_yes, edge_no (computed off blended prob)
-    """
     t_eff = max(5.0, float(min(secs_to_close, 120)))
     sigma_used = float(get_sigma_cached(http))
     sd = sigma_used * math.sqrt(t_eff)
@@ -954,11 +980,16 @@ def choose_trade(
         div_gate_yes = (div_yes >= MIN_DIVERGENCE)
         div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
 
-    # "Pick winner" gating uses MODEL probability threshold (per your logic)
+    # -----------------------------
+    # S1) Probability gate source
+    # -----------------------------
+    p_yes_gate = p_yes_blend if PROB_GATE_USE_BLEND else p_yes_model
+    p_no_gate = p_no_blend if PROB_GATE_USE_BLEND else p_no_model
+
     ok_yes = (
         yes_px is not None
         and ok_book_yes
-        and (p_yes_model >= PROB_MIN)
+        and (p_yes_gate >= PROB_MIN)
         and (edge_yes >= EDGE_MIN)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_yes
@@ -966,7 +997,7 @@ def choose_trade(
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_model >= PROB_MIN)
+        and (p_no_gate >= PROB_MIN)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
@@ -978,7 +1009,6 @@ def choose_trade(
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
         if edge_no > edge_yes + 1e-9:
             return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
-        # tie-break: pick the more probable side by model
         if p_yes_model >= p_no_model:
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
         return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
@@ -991,17 +1021,44 @@ def choose_trade(
     return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
 
-def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int) -> int:
+# -----------------------------
+# S2) Edge-based sizing (hard-capped)
+# -----------------------------
+def compute_fraction_for_trade(edge_net: float, p_gate: float) -> float:
+    """
+    edge_net: p - price (fee-aware), in probability units (0.01 ~ 1 cent EV).
+    p_gate: the probability used for gating (blend or model).
+    """
+    base = float(BANKROLL_FRACTION)
+
+    # A+ override: if it is VERY high prob and VERY high edge, jump to A_PLUS_FRACTION
+    if (p_gate >= float(A_PLUS_PROB)) and (edge_net >= float(A_PLUS_EDGE)):
+        frac = max(base, float(A_PLUS_FRACTION))
+    else:
+        # Smooth ramp: base + slope * max(0, edge - start)
+        bump = float(EDGE_SIZE_SLOPE) * max(0.0, float(edge_net) - float(EDGE_SIZE_START))
+        frac = base + bump
+
+    # Always cap (this is the “do not blow up” rule)
+    frac = min(frac, float(BANKROLL_FRACTION_HARD_CAP))
+    frac = clamp_float(frac, 0.0, 0.99)
+    return float(frac)
+
+
+def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, edge_net: float, p_gate: float) -> int:
     if available_usd is None or available_usd <= 0:
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
 
     if available_usd < MIN_FREE_USD_TO_TRADE:
         return 0
 
-    stake_usd = max(0.0, float(available_usd) * float(BANKROLL_FRACTION))
+    frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
+    stake_usd = max(0.0, float(available_usd) * float(frac))
+
     cost_per = float(entry_cents) / 100.0
     if cost_per <= 0:
         return 0
+
     qty = int(stake_usd // cost_per)
     qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
     return qty
@@ -1019,7 +1076,10 @@ def main() -> None:
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY_PRICE_CENTS={MAX_ENTRY_PRICE_CENTS} FEE_CENTS_PER_CONTRACT={FEE_CENTS_PER_CONTRACT} "
         f"USE_MARKET_IMPLIED={USE_MARKET_IMPLIED} MODEL_BLEND_ALPHA={MODEL_BLEND_ALPHA} "
         f"REQUIRE_DIVERGENCE={REQUIRE_DIVERGENCE} MIN_DIVERGENCE={MIN_DIVERGENCE} "
-        f"USE_DYNAMIC_SIGMA={USE_DYNAMIC_SIGMA}"
+        f"USE_DYNAMIC_SIGMA={USE_DYNAMIC_SIGMA} "
+        f"PROB_GATE_USE_BLEND={PROB_GATE_USE_BLEND} BANKROLL_FRACTION_HARD_CAP={BANKROLL_FRACTION_HARD_CAP} "
+        f"EDGE_SIZE_START={EDGE_SIZE_START} EDGE_SIZE_SLOPE={EDGE_SIZE_SLOPE} "
+        f"A_PLUS_PROB={A_PLUS_PROB} A_PLUS_EDGE={A_PLUS_EDGE} A_PLUS_FRACTION={A_PLUS_FRACTION}"
     )
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
@@ -1299,7 +1359,18 @@ def main() -> None:
             continue
 
         available_usd, total_usd = get_balance_usd(client)
-        qty = compute_qty_from_bankroll(available_usd, int(chosen_px))
+
+        # -----------------------------
+        # S2) Edge-based sizing inputs
+        # -----------------------------
+        if chosen_side == "yes":
+            edge_net = float(edge_yes)
+            p_gate = float(p_yes_blend) if PROB_GATE_USE_BLEND else float(p_yes_model)
+        else:
+            edge_net = float(edge_no)
+            p_gate = float(p_no_blend) if PROB_GATE_USE_BLEND else float(p_no_model)
+
+        qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate)
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0 (available={available_usd}, entry={chosen_px})")
             st.traded_this_market = True
@@ -1316,7 +1387,11 @@ def main() -> None:
         )
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] would_place: market={st.market} buy {chosen_side} @ {chosen_px} qty={qty}")
+            frac_dbg = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
+            log.warning(
+                f"[DRY] would_place: market={st.market} buy {chosen_side} @ {chosen_px} qty={qty} "
+                f"edge_net={edge_net:.4f} p_gate={p_gate:.4f} frac={frac_dbg:.4f}"
+            )
             st.traded_this_market = True
             st.sm = SM.HOLD
             time.sleep(POLL_SECONDS)
@@ -1333,8 +1408,10 @@ def main() -> None:
             st.target_price = int(chosen_px)
             st.traded_this_market = True
             st.sm = SM.ORDER_WAIT
+            frac_dbg = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
             log.warning(
                 f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} "
+                f"edge_net={edge_net:.4f} p_gate={p_gate:.4f} frac={frac_dbg:.4f} "
                 f"avail_usd={available_usd} total_usd={total_usd}"
             )
         except Exception as e:
@@ -1392,4 +1469,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()
