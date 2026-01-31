@@ -1309,3 +1309,4 @@ if __name__ == "__main__":
         # If it crashes, we WANT it to be loud in logs so we don't get "runs and nothing"
         log.exception(f"FATAL: bot crashed: {e}")
         raise
+ 
