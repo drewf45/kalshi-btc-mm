@@ -55,6 +55,21 @@
 #     - If edge_net is higher, fraction scales up (configurable)
 #     - BUT never exceeds BANKROLL_FRACTION_HARD_CAP (default 0.25)
 #     This prevents “bet the house” blowups while still letting you size up on A+ setups.
+#
+# -----------------------------
+# LOGIC FIX (ONLY CHANGE IN THIS VERSION)
+# -----------------------------
+# L1) Prevent "cheap long-shot" flips caused by market-implied blending:
+#     - Eligibility (PROB_MIN) is now ANCHORED to the MODEL probability for each side.
+#     - Blended probability can still be used for EDGE (pricing) if you want,
+#       but a side cannot qualify unless the MODEL itself says it's a winner.
+#     - This stops the bot from buying NO just because the book got weird and p_mkt dragged p_blend.
+#
+#     Concretely:
+#       ok_yes requires (p_yes_model >= PROB_MIN) AND (p_yes_gate >= PROB_MIN)
+#       ok_no  requires (p_no_model  >= PROB_MIN) AND (p_no_gate  >= PROB_MIN)
+#
+#     Everything else is unchanged.
 
 import os
 import time
@@ -931,9 +946,11 @@ def choose_trade(
     p_yes_gate = p_yes_blend if PROB_GATE_USE_BLEND else p_yes_model
     p_no_gate = p_no_blend if PROB_GATE_USE_BLEND else p_no_model
 
+    # ---- LOGIC FIX: anchor winner-prob gate to MODEL too ----
     ok_yes = (
         yes_px is not None
         and ok_book_yes
+        and (p_yes_model >= PROB_MIN)   # <— NEW: must be winner in the model
         and (p_yes_gate >= PROB_MIN)
         and (edge_yes >= EDGE_MIN)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
@@ -942,6 +959,7 @@ def choose_trade(
     ok_no = (
         no_px is not None
         and ok_book_no
+        and (p_no_model >= PROB_MIN)    # <— NEW: must be winner in the model
         and (p_no_gate >= PROB_MIN)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
