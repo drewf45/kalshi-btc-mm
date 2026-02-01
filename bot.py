@@ -6,11 +6,11 @@
 # - Starts "arming" at T-ENTRY_START_SECONDS (default 120s to close).
 # - Makes ONE decision trade near the end:
 #     • Default decision time is T-ENTRY_DECISION_SECONDS (default 60s to close).
-#     • Will keep checking until T-ENTRY_LAST_SECONDS (default 30s) if not yet traded.
+#     • Will keep checking until T-ENTRY_LAST_SECONDS (default 10s) if not yet traded.
 # - Chooses YES or NO based on:
 #     • "winner" side probability >= PROB_MIN (default 0.85)
 #     • edge_net >= EDGE_MIN (default 0.01)   [fee-aware via FEE_CENTS_PER_CONTRACT]
-#     • entry_price <= MAX_ENTRY_PRICE_CENTS (default 97)
+#     • entry_price <= MAX_ENTRY_PRICE_CENTS (default 99)
 # - Sizes the bet as BANKROLL_FRACTION of AVAILABLE balance (default 5%),
 #   with caps and safe fallbacks.
 # - After placing the trade, it does NOTHING until the position resolves/clears.
@@ -20,56 +20,13 @@
 # - Everything else is free to change. This file is a rewrite around the SAME KalshiClient.
 #
 # -----------------------------
-# NOTES / WHAT CHANGED (A-LEVEL ADDITIONS ONLY)
+# CHANGES IN THIS VERSION:
 # -----------------------------
-# A1) Market-implied probability (optional) + blending:
-#     - Compute p_mkt from orderbook (mid/complements) when USE_MARKET_IMPLIED=True
-#     - p_blend = alpha*p_model + (1-alpha)*p_mkt   (MODEL_BLEND_ALPHA default 0.75)
-#     - Edges are computed off p_blend (reduces hero trades).
-#
-# A2) Divergence gate is now OPTIONAL (OFF by default):
-#     - REQUIRE_DIVERGENCE=False by default
-#     - If you turn it ON, the model must disagree with market by MIN_DIVERGENCE
-#
-# A3) Dynamic sigma (optional):
-#     - Estimate realized volatility from Coinbase Exchange 1-min candles
-#     - Sigma is clipped to [SIGMA_FLOOR, SIGMA_CEIL]
-#
-# A4) Basic book sanity (optional):
-#     - REQUIRE_BOTH_SIDES_BOOK: require bid+ask for chosen side
-#     - MAX_SPREAD_CENTS_TO_TRADE: if both exist, require spread <= threshold
-#
-# A5) "Pick the winner" behavior:
-#     - Bot does NOT prefer YES or NO.
-#     - It picks whichever side has >= PROB_MIN AND >= 1-cent edge (EDGE_MIN default 0.01).
-#     - If both qualify, it takes the higher edge.
-#
-# -----------------------------
-# STRATEGY MICRO-CHANGES (THIS EDIT)
-# -----------------------------
-# S1) PROB gate now defaults to using BLENDED probability (p_yes_blend / p_no_blend)
-#     instead of raw model probability. Toggle via PROB_GATE_USE_BLEND.
-#
-# S2) Size is now EDGE-BASED + HARD-CAPPED:
-#     - Base fraction = BANKROLL_FRACTION (your usual, e.g. 0.05)
-#     - If edge_net is higher, fraction scales up (configurable)
-#     - BUT never exceeds BANKROLL_FRACTION_HARD_CAP (default 0.25)
-#     This prevents “bet the house” blowups while still letting you size up on A+ setups.
-#
-# -----------------------------
-# LOGIC FIX (ONLY CHANGE IN THIS VERSION)
-# -----------------------------
-# L1) Prevent "cheap long-shot" flips caused by market-implied blending:
-#     - Eligibility (PROB_MIN) is now ANCHORED to the MODEL probability for each side.
-#     - Blended probability can still be used for EDGE (pricing) if you want,
-#       but a side cannot qualify unless the MODEL itself says it's a winner.
-#     - This stops the bot from buying NO just because the book got weird and p_mkt dragged p_blend.
-#
-#     Concretely:
-#       ok_yes requires (p_yes_model >= PROB_MIN) AND (p_yes_gate >= PROB_MIN)
-#       ok_no  requires (p_no_model  >= PROB_MIN) AND (p_no_gate  >= PROB_MIN)
-#
-#     Everything else is unchanged.
+# 1. Simplified probability gate - only check MODEL probability, not blended
+# 2. Raised MAX_ENTRY_PRICE_CENTS default from 97 to 99
+# 3. Added high-certainty override at T<20s for 98%+ probable outcomes
+# 4. Extended decision window - ENTRY_LAST_SECONDS from 30s to 10s
+# 5. Added "last chance" taker mode at T<15s for high-probability setups
 
 import os
 import time
@@ -178,14 +135,14 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # -------------- STRATEGY ENVs (additive only) --------------
 ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 120)
 ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)
-ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 30)
+ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 10)  # CHANGED: was 30, now 10
 FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 30)
 ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", False)
 CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
 
 PROB_MIN = env_float("PROB_MIN", 0.85)
 EDGE_MIN = env_float("EDGE_MIN", 0.01)
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 97)
+MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 99)  # CHANGED: was 97, now 99
 FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = env_float("SPOT_SIGMA_USD_PER_SQRT_SEC", 12.0)
@@ -237,6 +194,15 @@ EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 2.5)
 A_PLUS_PROB = env_float("A_PLUS_PROB", 0.92)
 A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)
 A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.15)
+
+# NEW: High-certainty override settings
+HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.98)
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 20)
+HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
+
+# NEW: Last chance taker mode
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 15)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
 
 # Heartbeat (so you always see runtime output)
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
@@ -943,15 +909,12 @@ def choose_trade(
         div_gate_yes = (div_yes >= MIN_DIVERGENCE)
         div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
 
-    p_yes_gate = p_yes_blend if PROB_GATE_USE_BLEND else p_yes_model
-    p_no_gate = p_no_blend if PROB_GATE_USE_BLEND else p_no_model
-
-    # ---- LOGIC FIX: anchor winner-prob gate to MODEL too ----
+    # CHANGE 1: Simplified probability gate - only check MODEL probability
+    # (no longer checking blended probability for eligibility)
     ok_yes = (
         yes_px is not None
         and ok_book_yes
-        and (p_yes_model >= PROB_MIN)   # <— NEW: must be winner in the model
-        and (p_yes_gate >= PROB_MIN)
+        and (p_yes_model >= PROB_MIN)      # Only check model probability
         and (edge_yes >= EDGE_MIN)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_yes
@@ -959,12 +922,20 @@ def choose_trade(
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_model >= PROB_MIN)    # <— NEW: must be winner in the model
-        and (p_no_gate >= PROB_MIN)
+        and (p_no_model >= PROB_MIN)       # Only check model probability
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
     )
+
+    # CHANGE 3: High-certainty override at T<20s
+    if secs_to_close < HIGH_CERTAINTY_TIME_SEC:
+        if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= HIGH_CERTAINTY_MAX_PRICE:
+            ok_yes = True
+            log.info(f"[OVERRIDE] YES high-certainty override triggered (p_model={p_yes_model:.4f}, price={yes_px})")
+        if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= HIGH_CERTAINTY_MAX_PRICE:
+            ok_no = True
+            log.info(f"[OVERRIDE] NO high-certainty override triggered (p_model={p_no_model:.4f}, price={no_px})")
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -1032,6 +1003,8 @@ def main() -> None:
         f"PROB_GATE_USE_BLEND={PROB_GATE_USE_BLEND} BANKROLL_FRACTION_HARD_CAP={BANKROLL_FRACTION_HARD_CAP} "
         f"EDGE_SIZE_START={EDGE_SIZE_START} EDGE_SIZE_SLOPE={EDGE_SIZE_SLOPE} "
         f"A_PLUS_PROB={A_PLUS_PROB} A_PLUS_EDGE={A_PLUS_EDGE} A_PLUS_FRACTION={A_PLUS_FRACTION} "
+        f"HIGH_CERTAINTY_PROB={HIGH_CERTAINTY_PROB} HIGH_CERTAINTY_TIME_SEC={HIGH_CERTAINTY_TIME_SEC} "
+        f"LAST_CHANCE_TIME_SEC={LAST_CHANCE_TIME_SEC} LAST_CHANCE_MIN_PROB={LAST_CHANCE_MIN_PROB} "
         f"HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}"
     )
     log.warning("[HEARTBEAT] main() entered — worker is running")
@@ -1187,6 +1160,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # CHANGE 4: Extended decision window to T-10s instead of T-30s
         if secs_to_close < ENTRY_LAST_SECONDS:
             st.traded_this_market = True
             log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s < {ENTRY_LAST_SECONDS}s).")
@@ -1254,10 +1228,10 @@ def main() -> None:
 
         if chosen_side == "yes":
             edge_net = float(edge_yes)
-            p_gate = float(p_yes_blend) if PROB_GATE_USE_BLEND else float(p_yes_model)
+            p_gate = float(p_yes_model)  # Use model probability for sizing
         else:
             edge_net = float(edge_no)
-            p_gate = float(p_no_blend) if PROB_GATE_USE_BLEND else float(p_no_model)
+            p_gate = float(p_no_model)  # Use model probability for sizing
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate)
         if qty <= 0:
@@ -1266,13 +1240,19 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # CHANGE 5: Last chance taker mode - if we're very late and probability is high, allow taking liquidity
+        use_post_only = POST_ONLY
+        if secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
+            use_post_only = False
+            log.info(f"[LAST_CHANCE] Allowing taker order at T-{secs_to_close}s (p_model={p_gate:.4f})")
+
         payload = build_order_payload(
             market_ticker=st.market,
             action="buy",
             side=chosen_side,
             price_cents=int(chosen_px),
             count=int(qty),
-            post_only=POST_ONLY,
+            post_only=use_post_only,
         )
 
         frac_dbg = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
@@ -1280,7 +1260,7 @@ def main() -> None:
         if not ENABLE_TRADING or DRY_RUN:
             log.warning(
                 f"[DRY] would_place: market={st.market} buy {chosen_side} @ {chosen_px} qty={qty} "
-                f"edge_net={edge_net:.4f} p_gate={p_gate:.4f} frac={frac_dbg:.4f}"
+                f"edge_net={edge_net:.4f} p_gate={p_gate:.4f} frac={frac_dbg:.4f} post_only={use_post_only}"
             )
             st.traded_this_market = True
             st.sm = SM.HOLD
@@ -1294,7 +1274,7 @@ def main() -> None:
             log.warning(
                 f"[ORDER] PLACED market={st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px} qty={qty} "
                 f"edge_net={edge_net:.4f} p_gate={p_gate:.4f} frac={frac_dbg:.4f} "
-                f"avail_usd={available_usd} total_usd={total_usd}"
+                f"avail_usd={available_usd} total_usd={total_usd} post_only={use_post_only}"
             )
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
@@ -1309,4 +1289,3 @@ if __name__ == "__main__":
         # If it crashes, we WANT it to be loud in logs so we don't get "runs and nothing"
         log.exception(f"FATAL: bot crashed: {e}")
         raise
- 
