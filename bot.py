@@ -20,13 +20,17 @@
 # - Everything else is free to change. This file is a rewrite around the SAME KalshiClient.
 #
 # -----------------------------
-# CHANGES IN THIS VERSION:
+# CHANGES IN THIS VERSION (v3):
 # -----------------------------
 # 1. Simplified probability gate - only check MODEL probability, not blended
 # 2. Raised MAX_ENTRY_PRICE_CENTS default from 97 to 99
 # 3. Added high-certainty override at T<20s for 98%+ probable outcomes
 # 4. Extended decision window - ENTRY_LAST_SECONDS from 30s to 10s
 # 5. Added "last chance" taker mode at T<15s for high-probability setups
+# 6. **NEW**: Added BOUNDARY_BUFFER protection to prevent whipsaw losses
+# 7. **NEW**: Added balance/sizing debug logging
+# 8. **NEW**: Tightened high-certainty override to T<10s (was T<20s)
+# 9. **NEW**: Added late-entry probability boost (requires 90% at T<20s)
 
 import os
 import time
@@ -135,14 +139,14 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # -------------- STRATEGY ENVs (additive only) --------------
 ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 120)
 ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)
-ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 10)  # CHANGED: was 30, now 10
+ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 10)
 FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 30)
 ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", False)
 CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
 
 PROB_MIN = env_float("PROB_MIN", 0.85)
 EDGE_MIN = env_float("EDGE_MIN", 0.01)
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 99)  # CHANGED: was 97, now 99
+MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 99)
 FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = env_float("SPOT_SIGMA_USD_PER_SQRT_SEC", 12.0)
@@ -183,7 +187,7 @@ _last_sigma_ts: float = 0.0
 _last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
 
 # -----------------------------
-# NEW STRATEGY ENVS (SIZING + PROB GATE)
+# STRATEGY ENVS (SIZING + PROB GATE)
 # -----------------------------
 PROB_GATE_USE_BLEND = env_bool("PROB_GATE_USE_BLEND", True)
 BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.25)
@@ -195,14 +199,21 @@ A_PLUS_PROB = env_float("A_PLUS_PROB", 0.92)
 A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)
 A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.15)
 
-# NEW: High-certainty override settings
+# High-certainty override settings (TIGHTENED)
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.98)
-HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 20)
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 10)  # CHANGED: was 20, now 10
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
-# NEW: Last chance taker mode
+# Last chance taker mode
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 15)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
+
+# NEW: Whipsaw protection - don't enter if BTC too close to boundary
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 100.0)
+
+# NEW: Late entry requires higher probability
+LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.05)
+LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 20)
 
 # Heartbeat (so you always see runtime output)
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
@@ -909,12 +920,16 @@ def choose_trade(
         div_gate_yes = (div_yes >= MIN_DIVERGENCE)
         div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
 
-    # CHANGE 1: Simplified probability gate - only check MODEL probability
-    # (no longer checking blended probability for eligibility)
+    # NEW: Late entry probability boost
+    effective_prob_min = PROB_MIN
+    if secs_to_close < LATE_ENTRY_TIME_SEC:
+        effective_prob_min = PROB_MIN + LATE_ENTRY_PROB_BOOST
+        
+    # Simplified probability gate - only check MODEL probability
     ok_yes = (
         yes_px is not None
         and ok_book_yes
-        and (p_yes_model >= PROB_MIN)      # Only check model probability
+        and (p_yes_model >= effective_prob_min)
         and (edge_yes >= EDGE_MIN)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_yes
@@ -922,20 +937,35 @@ def choose_trade(
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_model >= PROB_MIN)       # Only check model probability
+        and (p_no_model >= effective_prob_min)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
     )
 
-    # CHANGE 3: High-certainty override at T<20s
+    # NEW: Boundary buffer protection - prevent whipsaw losses
+    if lo is not None and spot < (lo + BOUNDARY_BUFFER_USD):
+        if ok_yes:
+            log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to lower bound ${lo:.2f} (buffer=${BOUNDARY_BUFFER_USD}), blocking YES")
+        ok_yes = False
+    
+    if hi is not None and spot > (hi - BOUNDARY_BUFFER_USD):
+        if ok_no:
+            log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to upper bound ${hi:.2f} (buffer=${BOUNDARY_BUFFER_USD}), blocking NO")
+        ok_no = False
+
+    # High-certainty override (TIGHTENED to T<10s)
     if secs_to_close < HIGH_CERTAINTY_TIME_SEC:
-        if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= HIGH_CERTAINTY_MAX_PRICE:
+        # Re-check boundary buffer even for override
+        yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
+        no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
+        
+        if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= HIGH_CERTAINTY_MAX_PRICE and yes_boundary_ok:
             ok_yes = True
-            log.info(f"[OVERRIDE] YES high-certainty override triggered (p_model={p_yes_model:.4f}, price={yes_px})")
-        if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= HIGH_CERTAINTY_MAX_PRICE:
+            log.info(f"[OVERRIDE] YES high-certainty override triggered (p_model={p_yes_model:.4f}, price={yes_px}, spot_buffer=${spot-lo if lo else 'N/A'})")
+        if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= HIGH_CERTAINTY_MAX_PRICE and no_boundary_ok:
             ok_no = True
-            log.info(f"[OVERRIDE] NO high-certainty override triggered (p_model={p_no_model:.4f}, price={no_px})")
+            log.info(f"[OVERRIDE] NO high-certainty override triggered (p_model={p_no_model:.4f}, price={no_px}, spot_buffer=${hi-spot if hi else 'N/A'})")
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -970,9 +1000,11 @@ def compute_fraction_for_trade(edge_net: float, p_gate: float) -> float:
 
 def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, edge_net: float, p_gate: float) -> int:
     if available_usd is None or available_usd <= 0:
+        log.warning(f"[SIZE] available_usd is None or <=0, falling back to ORDER_QTY={ORDER_QTY}")
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
 
     if available_usd < MIN_FREE_USD_TO_TRADE:
+        log.warning(f"[SIZE] available_usd ${available_usd:.2f} < MIN_FREE_USD_TO_TRADE ${MIN_FREE_USD_TO_TRADE}, returning 0")
         return 0
 
     frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
@@ -980,10 +1012,15 @@ def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, 
 
     cost_per = float(entry_cents) / 100.0
     if cost_per <= 0:
+        log.warning(f"[SIZE] cost_per={cost_per} invalid, returning 0")
         return 0
 
     qty = int(stake_usd // cost_per)
     qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
+    
+    # NEW: Debug logging
+    log.warning(f"[SIZE_CALC] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} cost_per=${cost_per:.2f} qty={qty}")
+    
     return qty
 
 
@@ -1005,6 +1042,7 @@ def main() -> None:
         f"A_PLUS_PROB={A_PLUS_PROB} A_PLUS_EDGE={A_PLUS_EDGE} A_PLUS_FRACTION={A_PLUS_FRACTION} "
         f"HIGH_CERTAINTY_PROB={HIGH_CERTAINTY_PROB} HIGH_CERTAINTY_TIME_SEC={HIGH_CERTAINTY_TIME_SEC} "
         f"LAST_CHANCE_TIME_SEC={LAST_CHANCE_TIME_SEC} LAST_CHANCE_MIN_PROB={LAST_CHANCE_MIN_PROB} "
+        f"BOUNDARY_BUFFER_USD={BOUNDARY_BUFFER_USD} LATE_ENTRY_PROB_BOOST={LATE_ENTRY_PROB_BOOST} LATE_ENTRY_TIME_SEC={LATE_ENTRY_TIME_SEC} "
         f"HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}"
     )
     log.warning("[HEARTBEAT] main() entered — worker is running")
@@ -1160,7 +1198,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # CHANGE 4: Extended decision window to T-10s instead of T-30s
         if secs_to_close < ENTRY_LAST_SECONDS:
             st.traded_this_market = True
             log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s < {ENTRY_LAST_SECONDS}s).")
@@ -1207,8 +1244,14 @@ def main() -> None:
         if LOG_DECISIONS:
             edge_yes_log = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
             edge_no_log = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
+            
+            # NEW: Show boundary buffer status
+            yes_buffer = (spot - lo) if lo else None
+            no_buffer = (hi - spot) if hi else None
+            
             log.info(
-                f"[DECIDE] {st.market} t_close={secs_to_close}s spot={spot:.2f} range=({lo},{hi}) sigma={sigma_used:.3f} "
+                f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} range=({lo},{hi}) sigma={sigma_used:.3f} "
+                f"yes_buffer=${yes_buffer:.2f if yes_buffer else 'N/A'} no_buffer=${no_buffer:.2f if no_buffer else 'N/A'} "
                 f"p_mkt={p_mkt} div_yes={div_yes} p_yes_blend={p_yes_blend:.4f} "
                 f"YES(bid={yes_bid},ask={yes_ask},entry={yes_px_log},p={p_yes_model:.4f},edge={edge_yes_log}) "
                 f"NO(bid={no_bid},ask={no_ask},entry={no_px_log},p={p_no_model:.4f},edge={edge_no_log}) "
@@ -1228,10 +1271,13 @@ def main() -> None:
 
         if chosen_side == "yes":
             edge_net = float(edge_yes)
-            p_gate = float(p_yes_model)  # Use model probability for sizing
+            p_gate = float(p_yes_model)
         else:
             edge_net = float(edge_no)
-            p_gate = float(p_no_model)  # Use model probability for sizing
+            p_gate = float(p_no_model)
+
+        # NEW: Debug balance BEFORE sizing calculation
+        log.warning(f"[SIZE_DEBUG] available_usd=${available_usd} total_usd=${total_usd} entry={chosen_px}¢ edge={edge_net:.4f} p_gate={p_gate:.4f}")
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate)
         if qty <= 0:
@@ -1240,7 +1286,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # CHANGE 5: Last chance taker mode - if we're very late and probability is high, allow taking liquidity
+        # Last chance taker mode
         use_post_only = POST_ONLY
         if secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
             use_post_only = False
