@@ -29,7 +29,7 @@ class Config:
     """Bot configuration - edit these values"""
     
     # API Configuration
-    KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com")
+    KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com/trade-api/v2")
     KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
     KALSHI_PRIVATE_KEY_PEM_BASE64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_BASE64")
     
@@ -183,9 +183,11 @@ class KalshiClient:
         """Generate JWT for API authentication"""
         now = int(time.time())
         payload = {
+            "sub": self.api_key_id,
             "iss": self.api_key_id,
             "iat": now,
-            "exp": now + 300  # 5 minute expiry
+            "exp": now + 300,  # 5 minute expiry
+            "aud": "kalshi.com"
         }
         
         return jwt.encode(
