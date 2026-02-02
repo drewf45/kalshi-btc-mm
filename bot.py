@@ -29,7 +29,7 @@ class Config:
     """Bot configuration - edit these values"""
     
     # API Configuration
-    KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
+    KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com")
     KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
     KALSHI_PRIVATE_KEY_PEM_BASE64 = os.getenv("KALSHI_PRIVATE_KEY_PEM_BASE64")
     
@@ -161,7 +161,7 @@ class KalshiClient:
     """Kalshi API client with authentication"""
     
     def __init__(self):
-        self.base_url = Config.KALSHI_API_BASE
+        self.base_url = Config.KALSHI_API_BASE.strip()
         self.api_key_id = Config.KALSHI_API_KEY_ID
         self.private_key = self._load_private_key()
         self.session = requests.Session()
