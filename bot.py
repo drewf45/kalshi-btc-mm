@@ -1,22 +1,22 @@
 # bot.py
-# Kalshi rolling 15m BTC aggressive strategy with DUMP capability
+# Kalshi rolling 15m BTC SCALPER - Trade every market with edge
 #
-# WHAT THIS DOES:
-# - Arms at T-600s (10 minutes before close) 
-# - Trades aggressively (60% prob, 1.5% edge, up to 85¢ entry)
-# - Monitors position continuously
-# - DUMPS position if probability flips or price moves dangerously
-# - Sizes positions at 10% of bankroll with Kelly scaling
+# STRATEGY:
+# - Arms at T-360s (6 minutes before close) for early edge capture
+# - Trades aggressively: 55% prob, 1% edge, up to 90¢ entry
+# - Scales bankroll UP on wins, pulls back on losses
+# - DUMPS fast if probability flips or drawdown hits limits
+# - Session-level loss limits to protect capital
 #
-# CHANGES FROM ORIGINAL:
-# - Changed ENTRY_START_SECONDS from 120 -> 600 (10 min early arming)
-# - Changed PROB_MIN from 0.85 -> 0.60 (trade more)
-# - Changed EDGE_MIN from 0.01 -> 0.015 (1.5%)
-# - Changed MAX_ENTRY_PRICE from 99 -> 85¢
-# - Changed BANKROLL_FRACTION from 0.05 -> 0.10 (10%)
-# - Added DUMP logic with multiple exit triggers
-# - Added continuous position monitoring in HOLD state
-# - Removed "one decision" constraint - now checks continuously while armed
+# KEY SETTINGS:
+# - ENTRY_START_SECONDS=360 (6 min window)
+# - ENTRY_LAST_SECONDS=30 (trade until 30s before close)
+# - PROB_MIN=0.55 (trade more markets)
+# - EDGE_MIN=0.01 (1% minimum edge)
+# - MAX_ENTRY_PRICE=90¢ (allow higher entries)
+# - BANKROLL_FRACTION=0.15 (15% base sizing)
+# - Bankroll scaling: increase on wins, decrease on losses
+# - Session loss limit: stop trading if down too much
 
 import os
 import time
@@ -122,25 +122,39 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# -------------- AGGRESSIVE STRATEGY ENVs --------------
-ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 600)  # CHANGED: 10 min early
+# -------------- SCALPER STRATEGY ENVs --------------
+ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 360)  # 6 min before close
 ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)
-ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 45)  # Stop new entries at 45s
-FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 30)
+ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 30)  # Trade until 30s before close
+FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 20)
 ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", True)
 CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
 
-PROB_MIN = env_float("PROB_MIN", 0.60)  # CHANGED: Lower threshold
-EDGE_MIN = env_float("EDGE_MIN", 0.015)  # CHANGED: 1.5% edge
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 85)  # CHANGED: Max 85¢
+PROB_MIN = env_float("PROB_MIN", 0.55)  # Lower threshold = more trades
+EDGE_MIN = env_float("EDGE_MIN", 0.01)  # 1% minimum edge
+MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 90)  # Allow up to 90¢
 FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = env_float("SPOT_SIGMA_USD_PER_SQRT_SEC", 12.0)
 
-BANKROLL_FRACTION = env_float("BANKROLL_FRACTION", 0.10)  # CHANGED: 10% per trade
+BANKROLL_FRACTION = env_float("BANKROLL_FRACTION", 0.15)  # 15% base per trade
 MIN_CONTRACTS = env_int("MIN_CONTRACTS", 1)
-MAX_CONTRACTS = env_int("MAX_CONTRACTS", 50)
+MAX_CONTRACTS = env_int("MAX_CONTRACTS", 100)  # Allow bigger positions
 MIN_FREE_USD_TO_TRADE = env_float("MIN_FREE_USD_TO_TRADE", 5.0)
+
+# -------------- BANKROLL SCALING (scale up on wins, down on losses) --------------
+ENABLE_BANKROLL_SCALING = env_bool("ENABLE_BANKROLL_SCALING", True)
+SCALING_WIN_MULTIPLIER = env_float("SCALING_WIN_MULTIPLIER", 1.25)  # +25% after win
+SCALING_LOSS_MULTIPLIER = env_float("SCALING_LOSS_MULTIPLIER", 0.70)  # -30% after loss
+SCALING_MIN_FRACTION = env_float("SCALING_MIN_FRACTION", 0.05)  # Floor at 5%
+SCALING_MAX_FRACTION = env_float("SCALING_MAX_FRACTION", 0.35)  # Cap at 35%
+
+# -------------- SESSION LOSS LIMITS (stop trading if losing too much) --------------
+ENABLE_SESSION_LIMITS = env_bool("ENABLE_SESSION_LIMITS", True)
+SESSION_MAX_LOSS_USD = env_float("SESSION_MAX_LOSS_USD", 50.0)  # Stop if down $50
+SESSION_MAX_LOSS_PERCENT = env_float("SESSION_MAX_LOSS_PERCENT", 0.20)  # Or 20% of starting
+SESSION_CONSECUTIVE_LOSSES_LIMIT = env_int("SESSION_CONSECUTIVE_LOSSES_LIMIT", 5)  # Pause after 5 losses
+SESSION_COOLDOWN_MINUTES = env_int("SESSION_COOLDOWN_MINUTES", 15)  # Cooldown after limit hit
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
@@ -151,14 +165,18 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (NEW) --------------
+# -------------- DUMP CONFIGURATION (aggressive exits) --------------
 ENABLE_DUMP = env_bool("ENABLE_DUMP", True)
-DUMP_PROB_FLIP = env_float("DUMP_PROB_FLIP", 0.45)  # Exit if prob drops below 45%
-DUMP_PROB_DROP_PERCENT = env_float("DUMP_PROB_DROP_PERCENT", 0.20)  # Exit if -20% drop
-DUMP_MARKET_FLIP_THRESHOLD = env_float("DUMP_MARKET_FLIP_THRESHOLD", 0.30)
-DUMP_MIN_TIME_REMAINING = env_int("DUMP_MIN_TIME_REMAINING", 30)  # Never dump <30s
+DUMP_PROB_FLIP = env_float("DUMP_PROB_FLIP", 0.40)  # Exit if prob drops below 40%
+DUMP_PROB_DROP_PERCENT = env_float("DUMP_PROB_DROP_PERCENT", 0.15)  # Exit on 15% drop (faster exit)
+DUMP_MARKET_FLIP_THRESHOLD = env_float("DUMP_MARKET_FLIP_THRESHOLD", 0.35)
+DUMP_MIN_TIME_REMAINING = env_int("DUMP_MIN_TIME_REMAINING", 20)  # Can dump closer to settlement
 DUMP_ON_PRICE_DANGER = env_bool("DUMP_ON_PRICE_DANGER", True)
-DUMP_PRICE_SIGMA_MULTIPLIER = env_float("DUMP_PRICE_SIGMA_MULTIPLIER", 1.5)
+DUMP_PRICE_SIGMA_MULTIPLIER = env_float("DUMP_PRICE_SIGMA_MULTIPLIER", 1.2)  # More sensitive
+
+# -------------- SMART DUMP (cut losses, let winners ride) --------------
+DUMP_IF_LOSING_CENTS = env_int("DUMP_IF_LOSING_CENTS", 15)  # Dump if underwater by 15¢+
+DUMP_PROTECT_PROFIT_CENTS = env_int("DUMP_PROTECT_PROFIT_CENTS", 10)  # Lock in 10¢+ profit
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -183,25 +201,25 @@ _last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
 
 # -------------- SIZING + PROB GATE --------------
 PROB_GATE_USE_BLEND = env_bool("PROB_GATE_USE_BLEND", True)
-BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.25)
+BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.40)  # Allow up to 40%
 
-EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.02)
-EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 2.5)
+EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.015)  # Start scaling earlier
+EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 3.0)  # Steeper scaling
 
-A_PLUS_PROB = env_float("A_PLUS_PROB", 0.92)
-A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)
-A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.15)
+A_PLUS_PROB = env_float("A_PLUS_PROB", 0.85)  # Lower bar for A+ trades
+A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.025)
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.25)  # Go bigger on A+ setups
 
-HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.98)
-HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 10)
+HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
-LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 15)
-LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 100.0)
-LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.05)
-LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 20)
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 75.0)  # Tighter buffer
+LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.03)
+LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 30)
 
 # Heartbeat
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
@@ -805,6 +823,143 @@ class SM:
     HOLD = "HOLD"  # Now actively monitors for dump conditions
     DUMPED = "DUMPED"  # NEW: Position was dumped early
     ROLL = "ROLL"
+    COOLDOWN = "COOLDOWN"  # Paused due to session limits
+
+
+@dataclass
+class SessionState:
+    """Track session-level P&L and scaling"""
+    starting_balance_usd: float = 0.0
+    current_pnl_usd: float = 0.0
+
+    # Win/loss tracking
+    wins: int = 0
+    losses: int = 0
+    consecutive_losses: int = 0
+    consecutive_wins: int = 0
+
+    # Bankroll scaling
+    current_fraction: float = BANKROLL_FRACTION  # Dynamic fraction
+
+    # Trade history (last N for analysis)
+    recent_trades: List[Dict[str, Any]] = None
+
+    # Session limits
+    is_paused: bool = False
+    pause_until: float = 0.0  # Unix timestamp
+    pause_reason: Optional[str] = None
+
+    # Markets traded this session
+    markets_traded: int = 0
+
+    def __post_init__(self):
+        if self.recent_trades is None:
+            self.recent_trades = []
+
+    def record_trade(self, market: str, side: str, entry_price: int, exit_price: Optional[int],
+                     qty: int, pnl_cents: int, was_dump: bool = False):
+        """Record a completed trade and update scaling"""
+        pnl_usd = pnl_cents / 100.0
+        self.current_pnl_usd += pnl_usd
+        self.markets_traded += 1
+
+        trade = {
+            "market": market,
+            "side": side,
+            "entry": entry_price,
+            "exit": exit_price,
+            "qty": qty,
+            "pnl_cents": pnl_cents,
+            "pnl_usd": pnl_usd,
+            "was_dump": was_dump,
+            "ts": time.time(),
+        }
+        self.recent_trades.append(trade)
+        if len(self.recent_trades) > 50:
+            self.recent_trades = self.recent_trades[-50:]
+
+        if pnl_cents > 0:
+            self.wins += 1
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            self._scale_up()
+        else:
+            self.losses += 1
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+            self._scale_down()
+
+        self._check_session_limits()
+
+        log.warning(
+            f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} total=${self.current_pnl_usd:.2f} "
+            f"W/L={self.wins}/{self.losses} streak={self.consecutive_wins}W/{self.consecutive_losses}L "
+            f"fraction={self.current_fraction:.2%}"
+        )
+
+    def _scale_up(self):
+        """Increase bankroll fraction after win"""
+        if not ENABLE_BANKROLL_SCALING:
+            return
+        new_frac = self.current_fraction * SCALING_WIN_MULTIPLIER
+        self.current_fraction = min(new_frac, SCALING_MAX_FRACTION)
+
+    def _scale_down(self):
+        """Decrease bankroll fraction after loss"""
+        if not ENABLE_BANKROLL_SCALING:
+            return
+        new_frac = self.current_fraction * SCALING_LOSS_MULTIPLIER
+        self.current_fraction = max(new_frac, SCALING_MIN_FRACTION)
+
+    def _check_session_limits(self):
+        """Check if we should pause trading"""
+        if not ENABLE_SESSION_LIMITS:
+            return
+
+        # Check absolute loss limit
+        if self.current_pnl_usd <= -SESSION_MAX_LOSS_USD:
+            self._pause(f"max_loss_${SESSION_MAX_LOSS_USD}")
+            return
+
+        # Check percentage loss limit
+        if self.starting_balance_usd > 0:
+            pct_loss = -self.current_pnl_usd / self.starting_balance_usd
+            if pct_loss >= SESSION_MAX_LOSS_PERCENT:
+                self._pause(f"max_loss_{SESSION_MAX_LOSS_PERCENT:.0%}")
+                return
+
+        # Check consecutive losses
+        if self.consecutive_losses >= SESSION_CONSECUTIVE_LOSSES_LIMIT:
+            self._pause(f"consecutive_losses_{self.consecutive_losses}")
+            return
+
+    def _pause(self, reason: str):
+        """Pause trading for cooldown period"""
+        self.is_paused = True
+        self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
+        self.pause_reason = reason
+        # Reset fraction to minimum after hitting limits
+        self.current_fraction = SCALING_MIN_FRACTION
+        log.warning(f"[SESSION] PAUSED: {reason} - cooldown until {datetime.fromtimestamp(self.pause_until)}")
+
+    def check_can_trade(self) -> Tuple[bool, Optional[str]]:
+        """Check if we can trade. Returns (can_trade, reason_if_not)"""
+        if not self.is_paused:
+            return True, None
+
+        if time.time() >= self.pause_until:
+            self.is_paused = False
+            self.pause_reason = None
+            self.consecutive_losses = 0  # Reset streak after cooldown
+            log.warning("[SESSION] Cooldown ended, resuming trading")
+            return True, None
+
+        remaining = int(self.pause_until - time.time())
+        return False, f"paused:{self.pause_reason} ({remaining}s remaining)"
+
+    def get_current_fraction(self) -> float:
+        """Get the current bankroll fraction to use"""
+        return self.current_fraction
 
 
 @dataclass
@@ -829,6 +984,7 @@ class BotState:
     entry_model_prob: Optional[float] = None
     entry_market_prob: Optional[float] = None
     entry_spot_price: Optional[float] = None
+    entry_price_cents: Optional[int] = None  # Track entry price for P&L
     entry_time: float = 0.0
 
     last_p_yes: Optional[float] = None
@@ -1051,8 +1207,10 @@ def should_dump_position(
     return False, None
 
 
-def compute_fraction_for_trade(edge_net: float, p_gate: float) -> float:
-    base = float(BANKROLL_FRACTION)
+def compute_fraction_for_trade(edge_net: float, p_gate: float, session_fraction: Optional[float] = None) -> float:
+    """Compute position sizing fraction based on edge, probability, and session state"""
+    # Use session-adjusted fraction if provided, otherwise use default
+    base = session_fraction if session_fraction is not None else float(BANKROLL_FRACTION)
 
     if (p_gate >= float(A_PLUS_PROB)) and (edge_net >= float(A_PLUS_EDGE)):
         frac = max(base, float(A_PLUS_FRACTION))
@@ -1065,11 +1223,18 @@ def compute_fraction_for_trade(edge_net: float, p_gate: float) -> float:
     return float(frac)
 
 
-def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, edge_net: float, p_gate: float) -> int:
+def compute_qty_from_bankroll(
+    available_usd: Optional[float],
+    entry_cents: int,
+    edge_net: float,
+    p_gate: float,
+    session: Optional[SessionState] = None
+) -> int:
+    """Compute order quantity based on bankroll, edge, and session state"""
     if entry_cents is None or entry_cents <= 0:
         log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to ORDER_QTY={ORDER_QTY}")
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
-        
+
     if available_usd is None or available_usd <= 0:
         log.warning(f"[SIZE] available_usd is None or <=0, falling back to ORDER_QTY={ORDER_QTY}")
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
@@ -1078,25 +1243,28 @@ def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, 
         log.warning(f"[SIZE] available_usd ${available_usd:.2f} < MIN_FREE_USD_TO_TRADE ${MIN_FREE_USD_TO_TRADE}, returning 0")
         return 0
 
-    frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
+    # Get session-adjusted fraction if available
+    session_fraction = session.get_current_fraction() if session else None
+    frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate, session_fraction=session_fraction)
     stake_usd = max(0.0, float(available_usd) * float(frac))
 
     cost_per = float(entry_cents) / 100.0
-    
+
     if cost_per <= 0.0:
         log.warning(f"[SIZE] cost_per={cost_per} invalid, returning ORDER_QTY={ORDER_QTY}")
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
 
     qty = int(stake_usd // cost_per)
     qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
-    
-    log.info(f"[SIZE] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} qty={qty}")
-    
+
+    session_info = f" (session_frac={session_fraction:.2%})" if session_fraction else ""
+    log.info(f"[SIZE] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} qty={qty}{session_info}")
+
     return qty
 
 
 # -----------------------------
-# Main (MODIFIED FOR CONTINUOUS MONITORING + DUMP)
+# Main (SCALPER with session tracking)
 # -----------------------------
 def main() -> None:
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
@@ -1106,7 +1274,16 @@ def main() -> None:
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
     )
-    log.warning("[HEARTBEAT] main() entered — worker is running")
+    log.warning(
+        f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
+        f"loss_mult={SCALING_LOSS_MULTIPLIER} min={SCALING_MIN_FRACTION:.0%} max={SCALING_MAX_FRACTION:.0%}"
+    )
+    log.warning(
+        f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} max_loss=${SESSION_MAX_LOSS_USD} "
+        f"max_loss_pct={SESSION_MAX_LOSS_PERCENT:.0%} consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} "
+        f"cooldown={SESSION_COOLDOWN_MINUTES}min"
+    )
+    log.warning("[HEARTBEAT] main() entered — SCALPER is running")
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
@@ -1115,7 +1292,17 @@ def main() -> None:
     http = requests.Session()
 
     st = BotState()
+    session = SessionState()
     active_market_obj: Dict[str, Any] = {}
+
+    # Initialize session with starting balance
+    try:
+        av, tot = get_balance_usd(client)
+        if av is not None:
+            session.starting_balance_usd = av
+            log.warning(f"[SESSION] Starting balance: ${av:.2f}")
+    except Exception as e:
+        log.warning(f"[SESSION] Could not fetch starting balance: {e}")
 
     last_meta = 0.0
     last_state_log = 0.0
@@ -1182,14 +1369,59 @@ def main() -> None:
         now = time.time()
 
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
-            log.warning(f"[HEARTBEAT] alive market={st.market} sm={st.sm} traded={st.traded_this_market}")
+            log.warning(
+                f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
+                f"SESSION: pnl=${session.current_pnl_usd:.2f} W/L={session.wins}/{session.losses} "
+                f"frac={session.current_fraction:.1%} paused={session.is_paused}"
+            )
             last_heartbeat = now
 
         if (now - last_meta) >= META_REFRESH_SECONDS:
             try:
                 ev2, mt2, mobj2 = refresh_active_market()
                 if mt2 != st.market:
-                    log.warning(f"[ROLL] {st.market} -> {mt2}")
+                    old_market = st.market
+                    log.warning(f"[ROLL] {old_market} -> {mt2}")
+
+                    # Record P&L for settled position (if we had one)
+                    if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
+                        # Try to determine settlement result
+                        try:
+                            old_mkt_data = client.request("GET", f"/markets/{old_market}")
+                            old_mkt_obj = old_mkt_data.get("market", old_mkt_data) if isinstance(old_mkt_data, dict) else {}
+                            result = old_mkt_obj.get("result", "").lower()
+
+                            # Calculate P&L based on settlement
+                            if result == "yes":
+                                # YES paid 100, NO paid 0
+                                if st.side == "yes":
+                                    pnl_cents = (100 - st.entry_price_cents) * st.qty
+                                else:
+                                    pnl_cents = -st.entry_price_cents * st.qty
+                            elif result == "no":
+                                # YES paid 0, NO paid 100
+                                if st.side == "yes":
+                                    pnl_cents = -st.entry_price_cents * st.qty
+                                else:
+                                    pnl_cents = (100 - st.entry_price_cents) * st.qty
+                            else:
+                                # Unknown result, assume loss equal to entry
+                                pnl_cents = -st.entry_price_cents * st.qty
+                                log.warning(f"[ROLL] Unknown settlement result '{result}' for {old_market}")
+
+                            session.record_trade(
+                                market=old_market,
+                                side=st.side,
+                                entry_price=st.entry_price_cents,
+                                exit_price=100 if (result == st.side) else 0,
+                                qty=st.qty,
+                                pnl_cents=pnl_cents,
+                                was_dump=False,
+                            )
+                            log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
+                        except Exception as e:
+                            log.warning(f"[ROLL] Could not determine settlement for {old_market}: {e}")
+
                     st.event = ev2
                     st.market = mt2
                     active_market_obj = mobj2 or {}
@@ -1199,6 +1431,7 @@ def main() -> None:
                     st.side = None
                     st.target_price = None
                     st.qty = 0
+                    st.entry_price_cents = None
                     reconcile_on_market_change(mt2)
                 else:
                     if isinstance(mobj2, dict) and mobj2:
@@ -1260,7 +1493,13 @@ def main() -> None:
                         
                         if should_dump:
                             log.warning(f"[DUMP] Triggering dump: {dump_reason}")
-                            
+
+                            # Estimate exit price (use current bid/ask)
+                            if st.side == "yes":
+                                exit_price_cents = yes_bid if yes_bid else 50
+                            else:
+                                exit_price_cents = no_bid if no_bid else 50
+
                             # Place opposing market order to exit
                             try:
                                 exit_side = "no" if st.side == "yes" else "yes"
@@ -1272,16 +1511,34 @@ def main() -> None:
                                     count=abs(pos),
                                     post_only=False,
                                 )
-                                
+
                                 if not DRY_RUN:
                                     oid = place_order(client, exit_payload)
                                     log.warning(f"[DUMP] Placed exit order {oid} BUY {exit_side} qty={abs(pos)}")
+
+                                    # Record P&L for dump (entry cost - exit value)
+                                    if st.entry_price_cents is not None:
+                                        # For YES: paid entry_price, selling at exit_price
+                                        # For NO: paid entry_price, selling at exit_price
+                                        # P&L = (exit_price - entry_price) * qty for winning side
+                                        # But on dump we're usually losing, so:
+                                        pnl_cents = (exit_price_cents - st.entry_price_cents) * abs(pos)
+                                        session.record_trade(
+                                            market=st.market,
+                                            side=st.side,
+                                            entry_price=st.entry_price_cents,
+                                            exit_price=exit_price_cents,
+                                            qty=abs(pos),
+                                            pnl_cents=pnl_cents,
+                                            was_dump=True,
+                                        )
                                 else:
                                     log.warning(f"[DRY] Would dump: BUY {exit_side} qty={abs(pos)}")
-                                
+
                                 st.sm = SM.DUMPED
                                 st.side = None
-                                
+                                st.entry_price_cents = None
+
                             except Exception as e:
                                 log.error(f"[DUMP] Failed to place exit order: {e}")
                         
@@ -1384,6 +1641,16 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # Check session limits before trading
+        can_trade, pause_reason = session.check_can_trade()
+        if not can_trade:
+            st.sm = SM.COOLDOWN
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.warning(f"[SESSION] Trading paused: {pause_reason}")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
         available_usd, total_usd = get_balance_usd(client)
 
         if chosen_side == "yes":
@@ -1393,7 +1660,7 @@ def main() -> None:
             edge_net = float(edge_no)
             p_gate = float(p_no_blend)
 
-        qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate)
+        qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
@@ -1415,7 +1682,7 @@ def main() -> None:
         )
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty}")
+            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty} (session_frac={session.current_fraction:.2%})")
             st.traded_this_market = True
             st.sm = SM.HOLD
             time.sleep(POLL_SECONDS)
@@ -1429,11 +1696,13 @@ def main() -> None:
             st.entry_model_prob = p_yes_model
             st.entry_market_prob = p_mkt
             st.entry_spot_price = spot
+            st.entry_price_cents = int(chosen_px)  # Track entry price for P&L
             st.entry_time = now
-            
+            st.qty = qty
+
             log.warning(
                 f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
-                f"edge={edge_net:.4f} p_gate={p_gate:.4f}"
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f} session_frac={session.current_fraction:.2%}"
             )
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
