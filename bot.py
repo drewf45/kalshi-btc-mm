@@ -26,6 +26,7 @@
 # 10. **NEW**: Added safety checks to prevent division by zero in sizing
 # 11. **NEW**: Added None checks in ticker parsing to prevent crashes
 # 12. **NEW**: Added try/catch around choose_trade to prevent market-end crashes
+# 13. **NEW**: Fixed f-string formatting bug in logging
 
 import os
 import time
@@ -1258,12 +1259,15 @@ def main() -> None:
             edge_yes_log = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
             edge_no_log = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
             
+            # FORMATTING FIX: Pre-format buffer strings to avoid f-string ternary issues
             yes_buffer = (spot - lo) if lo else None
             no_buffer = (hi - spot) if hi else None
+            yes_buffer_str = f"${yes_buffer:.2f}" if yes_buffer is not None else "N/A"
+            no_buffer_str = f"${no_buffer:.2f}" if no_buffer is not None else "N/A"
             
             log.info(
                 f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} range=({lo},{hi}) sigma={sigma_used:.3f} "
-                f"yes_buffer=${yes_buffer:.2f if yes_buffer else 'N/A'} no_buffer=${no_buffer:.2f if no_buffer else 'N/A'} "
+                f"yes_buffer={yes_buffer_str} no_buffer={no_buffer_str} "
                 f"p_mkt={p_mkt} div_yes={div_yes} p_yes_blend={p_yes_blend:.4f} "
                 f"YES(bid={yes_bid},ask={yes_ask},entry={yes_px_log},p={p_yes_model:.4f},edge={edge_yes_log}) "
                 f"NO(bid={no_bid},ask={no_ask},entry={no_px_log},p={p_no_model:.4f},edge={edge_no_log}) "
