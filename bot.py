@@ -17,7 +17,6 @@
 # - Added DUMP logic with multiple exit triggers
 # - Added continuous position monitoring in HOLD state
 # - Removed "one decision" constraint - now checks continuously while armed
-# - ADDED DEBUG LOGGING FOR URL CONSTRUCTION
 
 import os
 import time
@@ -209,7 +208,7 @@ HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 
 # -----------------------------
-# Kalshi API client (RSA-PSS signing)  **WITH DEBUG**
+# Kalshi API client (RSA-PSS signing)  **UNCHANGED**
 # -----------------------------
 class KalshiClient:
     def __init__(self, api_base: str, api_prefix: str, key_id: str, private_key_pem_b64: str):
@@ -224,9 +223,6 @@ class KalshiClient:
         self.private_key = serialization.load_pem_private_key(pem_bytes, password=None)
 
         self.session = requests.Session()
-        
-        # DEBUG: Print what we initialized with
-        print(f"DEBUG INIT: api_base={self.api_base} api_prefix={self.api_prefix}", flush=True)
 
     def _sign_headers(self, method: str, full_url: str) -> Dict[str, str]:
         ts = str(now_ms())
@@ -263,9 +259,6 @@ class KalshiClient:
 
         url = f"{self.api_base}{self.api_prefix}{path}"
         url_with_q = url + "?" + urlencode(params) if params else url
-        
-        # DEBUG: Print the constructed URL
-        print(f"DEBUG URL: base={self.api_base} prefix={self.api_prefix} path={path} -> full={url_with_q}", flush=True)
 
         headers = self._sign_headers(method, url)
         headers["Accept"] = "application/json"
@@ -848,9 +841,609 @@ class BotState:
     last_p_yes_blend: Optional[float] = None
 
 
-# [REST OF THE CODE CONTINUES WITH CHOOSE_TRADE, SHOULD_DUMP, COMPUTE FUNCTIONS, AND MAIN - TRUNCATED FOR LENGTH]
-# THE REMAINING CODE IS IDENTICAL TO THE PREVIOUS VERSION
+# -----------------------------
+# Decision logic (MODIFIED FOR CONTINUOUS TRADING + DUMP)
+# -----------------------------
+def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
+    return float(p) - float(price_cents + fee_cents) / 100.0
 
-# Due to character limit, I'll note that the rest of the functions (choose_trade, should_dump_position, 
-# compute_fraction_for_trade, compute_qty_from_bankroll, and main) remain exactly the same as the 
-# previous version I provided. The ONLY changes are the two print() debug statements added to KalshiClient.
+
+def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int]:
+    if bid is None and ask is None:
+        return None
+    if bid is None:
+        px = int(ask) - 1
+        return clamp_int(px, 1, 99) if px >= 1 else None
+    if ask is None:
+        return clamp_int(int(bid), 1, 99)
+    max_rest = int(ask) - 1
+    if max_rest < 1:
+        return None
+    px = int(bid) + int(JOIN_UP_CENTS)
+    px = min(px, max_rest)
+    return clamp_int(px, 1, 99)
+
+
+def choose_trade(
+    http: requests.Session,
+    spot: float,
+    lo: Optional[float],
+    hi: Optional[float],
+    secs_to_close: int,
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+    no_bid: Optional[int],
+    no_ask: Optional[int],
+) -> Tuple[
+    Optional[str], Optional[int],
+    float, float,
+    float, float,
+    Optional[float], Optional[float], float,
+    float, float
+]:
+    t_eff = max(5.0, float(min(secs_to_close, 120)))
+    sigma_used = float(get_sigma_cached(http))
+    sd = sigma_used * math.sqrt(t_eff)
+
+    p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
+    p_no_model = 1.0 - p_yes_model
+
+    p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
+
+    if p_mkt is not None:
+        p_yes_blend = float(MODEL_BLEND_ALPHA) * p_yes_model + (1.0 - float(MODEL_BLEND_ALPHA)) * float(p_mkt)
+    else:
+        p_yes_blend = p_yes_model
+    p_yes_blend = max(0.0, min(1.0, p_yes_blend))
+    p_no_blend = 1.0 - p_yes_blend
+
+    if POST_ONLY:
+        yes_px = postable_entry_price(yes_bid, yes_ask)
+        no_px = postable_entry_price(no_bid, no_ask)
+    else:
+        yes_px = yes_ask
+        no_px = no_ask
+
+    ok_book_yes = spread_ok(yes_bid, yes_ask)
+    ok_book_no = spread_ok(no_bid, no_ask)
+
+    edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
+    edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+
+    div_yes = None
+    if p_mkt is not None:
+        div_yes = p_yes_model - p_mkt
+
+    div_gate_yes = True
+    div_gate_no = True
+    if REQUIRE_DIVERGENCE and (div_yes is not None):
+        div_gate_yes = (div_yes >= MIN_DIVERGENCE)
+        div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
+
+    # MODIFIED: Use blended probability for gating
+    effective_prob_min = PROB_MIN
+    if secs_to_close < LATE_ENTRY_TIME_SEC:
+        effective_prob_min = PROB_MIN + LATE_ENTRY_PROB_BOOST
+        
+    ok_yes = (
+        yes_px is not None
+        and ok_book_yes
+        and (p_yes_blend >= effective_prob_min)  # Use blend for gate
+        and (edge_yes >= EDGE_MIN)
+        and (yes_px <= MAX_ENTRY_PRICE_CENTS)
+        and div_gate_yes
+    )
+    ok_no = (
+        no_px is not None
+        and ok_book_no
+        and (p_no_blend >= effective_prob_min)  # Use blend for gate
+        and (edge_no >= EDGE_MIN)
+        and (no_px <= MAX_ENTRY_PRICE_CENTS)
+        and div_gate_no
+    )
+
+    # Boundary buffer protection
+    if lo is not None and spot < (lo + BOUNDARY_BUFFER_USD):
+        if ok_yes:
+            log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to lower bound ${lo:.2f}, blocking YES")
+        ok_yes = False
+    
+    if hi is not None and spot > (hi - BOUNDARY_BUFFER_USD):
+        if ok_no:
+            log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to upper bound ${hi:.2f}, blocking NO")
+        ok_no = False
+
+    # High-certainty override
+    if secs_to_close < HIGH_CERTAINTY_TIME_SEC:
+        yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
+        no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
+        
+        if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= HIGH_CERTAINTY_MAX_PRICE and yes_boundary_ok:
+            ok_yes = True
+            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_model:.4f}, price={yes_px})")
+        if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= HIGH_CERTAINTY_MAX_PRICE and no_boundary_ok:
+            ok_no = True
+            log.info(f"[OVERRIDE] NO high-certainty (p={p_no_model:.4f}, price={no_px})")
+
+    if ok_yes and ok_no:
+        if edge_yes > edge_no + 1e-9:
+            return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        if edge_no > edge_yes + 1e-9:
+            return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        if p_yes_model >= p_no_model:
+            return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+    if ok_yes:
+        return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+    if ok_no:
+        return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+    return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+
+# NEW: Dump decision logic
+def should_dump_position(
+    st: BotState,
+    p_yes_blend: float,
+    p_no_blend: float,
+    p_mkt: Optional[float],
+    spot: float,
+    lo: Optional[float],
+    hi: Optional[float],
+    sigma: float,
+    secs_to_close: int,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Check if we should dump our position
+    Returns: (should_dump, reason)
+    """
+    if not ENABLE_DUMP:
+        return False, None
+        
+    if secs_to_close < DUMP_MIN_TIME_REMAINING:
+        return False, "too_close_to_settlement"
+    
+    if st.entry_model_prob is None:
+        return False, "no_entry_data"
+    
+    # Determine current probability for our side
+    if st.side == "yes":
+        current_prob = p_yes_blend
+        entry_prob = st.entry_model_prob
+    else:
+        current_prob = p_no_blend
+        entry_prob = 1.0 - st.entry_model_prob
+    
+    # TRIGGER 1: Probability flipped below threshold
+    if current_prob < DUMP_PROB_FLIP:
+        return True, f"prob_flip_{current_prob:.3f}"
+    
+    # TRIGGER 2: Probability dropped significantly
+    prob_drop = entry_prob - current_prob
+    if prob_drop > DUMP_PROB_DROP_PERCENT:
+        return True, f"prob_drop_{prob_drop:.3f}"
+    
+    # TRIGGER 3: Market probability flipped
+    if USE_MARKET_IMPLIED and p_mkt is not None:
+        market_prob = p_mkt if st.side == "yes" else (1.0 - p_mkt)
+        if market_prob < DUMP_MARKET_FLIP_THRESHOLD:
+            return True, f"market_flip_{market_prob:.3f}"
+    
+    # TRIGGER 4: Bitcoin price danger zone
+    if DUMP_ON_PRICE_DANGER:
+        if st.side == "yes":
+            # We bet BTC will be ABOVE threshold
+            if lo is not None:
+                danger_price = lo - (sigma * DUMP_PRICE_SIGMA_MULTIPLIER)
+                if spot < danger_price:
+                    distance = lo - spot
+                    return True, f"price_danger_YES_${distance:.0f}_below"
+        
+        elif st.side == "no":
+            # We bet BTC will be BELOW threshold
+            if hi is not None:
+                danger_price = hi + (sigma * DUMP_PRICE_SIGMA_MULTIPLIER)
+                if spot > danger_price:
+                    distance = spot - hi
+                    return True, f"price_danger_NO_${distance:.0f}_above"
+    
+    return False, None
+
+
+def compute_fraction_for_trade(edge_net: float, p_gate: float) -> float:
+    base = float(BANKROLL_FRACTION)
+
+    if (p_gate >= float(A_PLUS_PROB)) and (edge_net >= float(A_PLUS_EDGE)):
+        frac = max(base, float(A_PLUS_FRACTION))
+    else:
+        bump = float(EDGE_SIZE_SLOPE) * max(0.0, float(edge_net) - float(EDGE_SIZE_START))
+        frac = base + bump
+
+    frac = min(frac, float(BANKROLL_FRACTION_HARD_CAP))
+    frac = clamp_float(frac, 0.0, 0.99)
+    return float(frac)
+
+
+def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, edge_net: float, p_gate: float) -> int:
+    if entry_cents is None or entry_cents <= 0:
+        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+        
+    if available_usd is None or available_usd <= 0:
+        log.warning(f"[SIZE] available_usd is None or <=0, falling back to ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+
+    if available_usd < MIN_FREE_USD_TO_TRADE:
+        log.warning(f"[SIZE] available_usd ${available_usd:.2f} < MIN_FREE_USD_TO_TRADE ${MIN_FREE_USD_TO_TRADE}, returning 0")
+        return 0
+
+    frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate)
+    stake_usd = max(0.0, float(available_usd) * float(frac))
+
+    cost_per = float(entry_cents) / 100.0
+    
+    if cost_per <= 0.0:
+        log.warning(f"[SIZE] cost_per={cost_per} invalid, returning ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+
+    qty = int(stake_usd // cost_per)
+    qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
+    
+    log.info(f"[SIZE] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} qty={qty}")
+    
+    return qty
+
+
+# -----------------------------
+# Main (MODIFIED FOR CONTINUOUS MONITORING + DUMP)
+# -----------------------------
+def main() -> None:
+    log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
+    log.warning(
+        f"[BOOTCFG] SERIES={SERIES_TICKER} ARM_TIME={ENTRY_START_SECONDS}s "
+        f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
+        f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
+        f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
+    )
+    log.warning("[HEARTBEAT] main() entered — worker is running")
+
+    if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
+        raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
+
+    client = KalshiClient(API_BASE, API_PREFIX, API_KEY_ID, PRIVATE_KEY_PEM_B64)
+    http = requests.Session()
+
+    st = BotState()
+    active_market_obj: Dict[str, Any] = {}
+
+    last_meta = 0.0
+    last_state_log = 0.0
+    last_ob_warn = 0.0
+    last_heartbeat = 0.0
+
+    def refresh_active_market() -> Tuple[str, str, Dict[str, Any]]:
+        if MARKET_OVERRIDE and MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
+            mt = MARKET_OVERRIDE
+            try:
+                snap = client.request("GET", f"/markets/{mt}")
+                mobj = snap.get("market") if isinstance(snap, dict) and isinstance(snap.get("market"), dict) else (snap if isinstance(snap, dict) else {})
+            except Exception:
+                mobj = {}
+            ev = EVENT_TICKER if EVENT_TICKER != "<auto>" else "<manual>"
+            return ev, mt, mobj
+
+        params = {"series_ticker": SERIES_TICKER, "status": "open", "limit": 200}
+        resp = client.request("GET", "/markets", params=params)
+        markets = resp.get("markets", []) if isinstance(resp, dict) else []
+        if not markets:
+            raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
+        ev, mt, mobj = pick_active_market(markets)
+        return ev, mt, mobj
+
+    def reconcile_on_market_change(new_market: str) -> None:
+        if BOOTSTRAP_CANCEL_OPEN_ORDERS or CANCEL_ALL_STRAYS_ALWAYS:
+            try:
+                cancel_all_strays_for_market(client, new_market)
+            except Exception as e:
+                log.warning(f"[RECON] cancel strays failed: {e}")
+
+        try:
+            pos = parse_position_for_market(get_positions(client), new_market)
+        except Exception:
+            pos = 0
+
+        if pos != 0:
+            st.sm = SM.HOLD
+            st.market = new_market
+            st.traded_this_market = True
+            st.order_id = None
+            # Determine which side we're holding
+            st.side = "yes" if pos > 0 else "no"
+            log.warning(f"[RECON] found existing position in {new_market}: pos={pos} side={st.side}. Enter HOLD.")
+            return
+
+        st.sm = SM.IDLE
+        st.market = new_market
+        st.traded_this_market = False
+        st.order_id = None
+        st.side = None
+        st.target_price = None
+        st.qty = 0
+
+    ev, mt, mobj = refresh_active_market()
+    active_market_obj = mobj or {}
+    st.market = mt
+    st.event = ev
+    reconcile_on_market_change(mt)
+    last_meta = time.time()
+
+    while True:
+        now = time.time()
+
+        if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
+            log.warning(f"[HEARTBEAT] alive market={st.market} sm={st.sm} traded={st.traded_this_market}")
+            last_heartbeat = now
+
+        if (now - last_meta) >= META_REFRESH_SECONDS:
+            try:
+                ev2, mt2, mobj2 = refresh_active_market()
+                if mt2 != st.market:
+                    log.warning(f"[ROLL] {st.market} -> {mt2}")
+                    st.event = ev2
+                    st.market = mt2
+                    active_market_obj = mobj2 or {}
+                    st.sm = SM.ROLL
+                    st.traded_this_market = False
+                    st.order_id = None
+                    st.side = None
+                    st.target_price = None
+                    st.qty = 0
+                    reconcile_on_market_change(mt2)
+                else:
+                    if isinstance(mobj2, dict) and mobj2:
+                        active_market_obj = mobj2
+                last_meta = now
+            except Exception as e:
+                log.warning(f"[ROLL] refresh failed: {e}")
+                last_meta = now
+
+        if not st.market:
+            time.sleep(POLL_SECONDS)
+            continue
+
+        close_ts = extract_close_ts(active_market_obj, st.market)
+        secs_to_close = None
+        if close_ts is not None:
+            secs_to_close = int(close_ts - int(time.time()))
+
+        pos = 0
+        try:
+            pos = parse_position_for_market(get_positions(client), st.market)
+        except Exception as e:
+            log.warning(f"[INV] positions fetch failed: {e}")
+
+        # MODIFIED: In HOLD state, check for dump conditions
+        if pos != 0:
+            if st.sm != SM.HOLD:
+                st.sm = SM.HOLD
+                st.traded_this_market = True
+                st.side = "yes" if pos > 0 else "no"
+                log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side}")
+            
+            # Check dump conditions continuously
+            if ENABLE_DUMP and secs_to_close is not None:
+                spot = fetch_btc_spot_usd(http)
+                if spot is not None:
+                    try:
+                        ob = client.request("GET", f"/markets/{st.market}/orderbook")
+                        yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
+                        lo, hi = market_bounds_usd(active_market_obj)
+                        
+                        # Recalculate probabilities
+                        sigma_used = get_sigma_cached(http)
+                        t_eff = max(5.0, float(min(secs_to_close, 120)))
+                        sd = sigma_used * math.sqrt(t_eff)
+                        p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
+                        p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask)
+                        
+                        if p_mkt is not None:
+                            p_yes_blend = MODEL_BLEND_ALPHA * p_yes_model + (1.0 - MODEL_BLEND_ALPHA) * p_mkt
+                        else:
+                            p_yes_blend = p_yes_model
+                        p_no_blend = 1.0 - p_yes_blend
+                        
+                        should_dump, dump_reason = should_dump_position(
+                            st, p_yes_blend, p_no_blend, p_mkt,
+                            spot, lo, hi, sigma_used, secs_to_close
+                        )
+                        
+                        if should_dump:
+                            log.warning(f"[DUMP] Triggering dump: {dump_reason}")
+                            
+                            # Place opposing market order to exit
+                            try:
+                                exit_side = "no" if st.side == "yes" else "yes"
+                                exit_payload = build_order_payload(
+                                    market_ticker=st.market,
+                                    action="buy",
+                                    side=exit_side,
+                                    price_cents=99,  # Market order
+                                    count=abs(pos),
+                                    post_only=False,
+                                )
+                                
+                                if not DRY_RUN:
+                                    oid = place_order(client, exit_payload)
+                                    log.warning(f"[DUMP] Placed exit order {oid} BUY {exit_side} qty={abs(pos)}")
+                                else:
+                                    log.warning(f"[DRY] Would dump: BUY {exit_side} qty={abs(pos)}")
+                                
+                                st.sm = SM.DUMPED
+                                st.side = None
+                                
+                            except Exception as e:
+                                log.error(f"[DUMP] Failed to place exit order: {e}")
+                        
+                    except Exception as e:
+                        log.warning(f"[DUMP] Check failed: {e}")
+            
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if ONE_TRADE_PER_MARKET and st.traded_this_market:
+            st.sm = SM.HOLD
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if secs_to_close is None:
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.warning(f"[STATE] market={st.market} missing close_ts")
+                last_state_log = now
+            last_meta = 0.0
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # MODIFIED: Arm early (600s instead of 120s)
+        if secs_to_close > ENTRY_START_SECONDS:
+            st.sm = SM.IDLE
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.info(f"[STATE] {st.market} IDLE t_close={secs_to_close}s (arming at {ENTRY_START_SECONDS}s)")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        st.sm = SM.ARMED
+
+        # MODIFIED: Stop checking continuously once we're <45s to close
+        if secs_to_close < ENTRY_LAST_SECONDS:
+            st.traded_this_market = True
+            log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        spot = fetch_btc_spot_usd(http)
+        if spot is None:
+            log.warning(f"[SPOT] failed; skipping this poll")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        try:
+            ob = client.request("GET", f"/markets/{st.market}/orderbook")
+        except Exception as e:
+            log.warning(f"[OB] fetch failed: {e}")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
+        lo, hi = market_bounds_usd(active_market_obj)
+
+        try:
+            (
+                chosen_side, chosen_px,
+                p_yes_model, p_no_model,
+                p_yes_blend, p_no_blend,
+                p_mkt, div_yes, sigma_used,
+                edge_yes, edge_no
+            ) = choose_trade(
+                http=http,
+                spot=spot,
+                lo=lo,
+                hi=hi,
+                secs_to_close=secs_to_close,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+            )
+        except Exception as e:
+            log.warning(f"[DECIDE] choose_trade failed: {e}")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if LOG_DECISIONS:
+            yes_px_log = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
+            no_px_log = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
+            edge_yes_log = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
+            edge_no_log = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
+            
+            yes_buffer_str = f"${spot-lo:.2f}" if lo else "N/A"
+            no_buffer_str = f"${hi-spot:.2f}" if hi else "N/A"
+            
+            log.info(
+                f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} "
+                f"yes_buffer={yes_buffer_str} no_buffer={no_buffer_str} "
+                f"p_yes_blend={p_yes_blend:.4f} p_no_blend={p_no_blend:.4f} "
+                f"YES(edge={edge_yes_log:.4f}) NO(edge={edge_no_log:.4f}) -> {chosen_side}@{chosen_px}"
+            )
+
+        if chosen_side is None or chosen_px is None:
+            if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
+                log.warning(f"[OB] no usable entry: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})")
+                last_ob_warn = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        available_usd, total_usd = get_balance_usd(client)
+
+        if chosen_side == "yes":
+            edge_net = float(edge_yes)
+            p_gate = float(p_yes_blend)
+        else:
+            edge_net = float(edge_no)
+            p_gate = float(p_no_blend)
+
+        qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate)
+        if qty <= 0:
+            log.warning(f"[SKIP] {st.market} qty=0")
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
+
+        use_post_only = POST_ONLY
+        if secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
+            use_post_only = False
+            log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+
+        payload = build_order_payload(
+            market_ticker=st.market,
+            action="buy",
+            side=chosen_side,
+            price_cents=int(chosen_px),
+            count=int(qty),
+            post_only=use_post_only,
+        )
+
+        if not ENABLE_TRADING or DRY_RUN:
+            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty}")
+            st.traded_this_market = True
+            st.sm = SM.HOLD
+            time.sleep(POLL_SECONDS)
+            continue
+
+        try:
+            oid = place_order(client, payload)
+            st.traded_this_market = True
+            st.sm = SM.HOLD
+            st.side = chosen_side
+            st.entry_model_prob = p_yes_model
+            st.entry_market_prob = p_mkt
+            st.entry_spot_price = spot
+            st.entry_time = now
+            
+            log.warning(
+                f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f}"
+            )
+        except Exception as e:
+            log.warning(f"[ORDER] place failed: {e}")
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.exception(f"FATAL: bot crashed: {e}")
+        raise
