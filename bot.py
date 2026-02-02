@@ -20,17 +20,12 @@
 # - Everything else is free to change. This file is a rewrite around the SAME KalshiClient.
 #
 # -----------------------------
-# CHANGES IN THIS VERSION (v3):
+# CHANGES IN THIS VERSION (v4 - CRASH FIXES):
 # -----------------------------
-# 1. Simplified probability gate - only check MODEL probability, not blended
-# 2. Raised MAX_ENTRY_PRICE_CENTS default from 97 to 99
-# 3. Added high-certainty override at T<20s for 98%+ probable outcomes
-# 4. Extended decision window - ENTRY_LAST_SECONDS from 30s to 10s
-# 5. Added "last chance" taker mode at T<15s for high-probability setups
-# 6. **NEW**: Added BOUNDARY_BUFFER protection to prevent whipsaw losses
-# 7. **NEW**: Added balance/sizing debug logging
-# 8. **NEW**: Tightened high-certainty override to T<10s (was T<20s)
-# 9. **NEW**: Added late-entry probability boost (requires 90% at T<20s)
+# 1-9: All previous changes from v3
+# 10. **NEW**: Added safety checks to prevent division by zero in sizing
+# 11. **NEW**: Added None checks in ticker parsing to prevent crashes
+# 12. **NEW**: Added try/catch around choose_trade to prevent market-end crashes
 
 import os
 import time
@@ -201,17 +196,17 @@ A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.15)
 
 # High-certainty override settings (TIGHTENED)
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.98)
-HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 10)  # CHANGED: was 20, now 10
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 10)
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
 # Last chance taker mode
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 15)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
 
-# NEW: Whipsaw protection - don't enter if BTC too close to boundary
+# Whipsaw protection
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 100.0)
 
-# NEW: Late entry requires higher probability
+# Late entry requires higher probability
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.05)
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 20)
 
@@ -317,6 +312,11 @@ def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
 
 
 def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optional[int]:
+    # SAFETY FIX: Check for None/empty ticker
+    if not ticker or ticker is None:
+        log.warning(f"[TICKER] infer_close_ts received None/empty ticker")
+        return None
+        
     try:
         parts = str(ticker).split("-")
         if len(parts) < 2:
@@ -334,7 +334,8 @@ def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optio
         close_local = start_local + timedelta(minutes=int(interval_minutes))
         close_utc = close_local.astimezone(UTC)
         return int(close_utc.timestamp())
-    except Exception:
+    except Exception as e:
+        log.warning(f"[TICKER] Failed to parse ticker '{ticker}': {e}")
         return None
 
 
@@ -920,7 +921,7 @@ def choose_trade(
         div_gate_yes = (div_yes >= MIN_DIVERGENCE)
         div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
 
-    # NEW: Late entry probability boost
+    # Late entry probability boost
     effective_prob_min = PROB_MIN
     if secs_to_close < LATE_ENTRY_TIME_SEC:
         effective_prob_min = PROB_MIN + LATE_ENTRY_PROB_BOOST
@@ -943,7 +944,7 @@ def choose_trade(
         and div_gate_no
     )
 
-    # NEW: Boundary buffer protection - prevent whipsaw losses
+    # Boundary buffer protection - prevent whipsaw losses
     if lo is not None and spot < (lo + BOUNDARY_BUFFER_USD):
         if ok_yes:
             log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to lower bound ${lo:.2f} (buffer=${BOUNDARY_BUFFER_USD}), blocking YES")
@@ -999,6 +1000,11 @@ def compute_fraction_for_trade(edge_net: float, p_gate: float) -> float:
 
 
 def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, edge_net: float, p_gate: float) -> int:
+    # SAFETY FIX: Check for invalid entry_cents
+    if entry_cents is None or entry_cents <= 0:
+        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+        
     if available_usd is None or available_usd <= 0:
         log.warning(f"[SIZE] available_usd is None or <=0, falling back to ORDER_QTY={ORDER_QTY}")
         return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
@@ -1011,14 +1017,15 @@ def compute_qty_from_bankroll(available_usd: Optional[float], entry_cents: int, 
     stake_usd = max(0.0, float(available_usd) * float(frac))
 
     cost_per = float(entry_cents) / 100.0
-    if cost_per <= 0:
-        log.warning(f"[SIZE] cost_per={cost_per} invalid, returning 0")
-        return 0
+    
+    # SAFETY FIX: Double-check cost_per before division
+    if cost_per <= 0.0:
+        log.warning(f"[SIZE] cost_per={cost_per} invalid (entry_cents={entry_cents}), returning ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
 
     qty = int(stake_usd // cost_per)
     qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
     
-    # NEW: Debug logging
     log.warning(f"[SIZE_CALC] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} cost_per=${cost_per:.2f} qty={qty}")
     
     return qty
@@ -1220,23 +1227,29 @@ def main() -> None:
         yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
         lo, hi = market_bounds_usd(active_market_obj)
 
-        (
-            chosen_side, chosen_px,
-            p_yes_model, p_no_model,
-            p_yes_blend, p_no_blend,
-            p_mkt, div_yes, sigma_used,
-            edge_yes, edge_no
-        ) = choose_trade(
-            http=http,
-            spot=spot,
-            lo=lo,
-            hi=hi,
-            secs_to_close=secs_to_close,
-            yes_bid=yes_bid,
-            yes_ask=yes_ask,
-            no_bid=no_bid,
-            no_ask=no_ask,
-        )
+        # SAFETY FIX: Wrap choose_trade in try/catch to prevent crashes at market end
+        try:
+            (
+                chosen_side, chosen_px,
+                p_yes_model, p_no_model,
+                p_yes_blend, p_no_blend,
+                p_mkt, div_yes, sigma_used,
+                edge_yes, edge_no
+            ) = choose_trade(
+                http=http,
+                spot=spot,
+                lo=lo,
+                hi=hi,
+                secs_to_close=secs_to_close,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+            )
+        except Exception as e:
+            log.warning(f"[DECIDE] choose_trade failed: {e}, skipping this poll")
+            time.sleep(POLL_SECONDS)
+            continue
 
         yes_px_log = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
         no_px_log = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
@@ -1245,7 +1258,6 @@ def main() -> None:
             edge_yes_log = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
             edge_no_log = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
             
-            # NEW: Show boundary buffer status
             yes_buffer = (spot - lo) if lo else None
             no_buffer = (hi - spot) if hi else None
             
@@ -1276,7 +1288,6 @@ def main() -> None:
             edge_net = float(edge_no)
             p_gate = float(p_no_model)
 
-        # NEW: Debug balance BEFORE sizing calculation
         log.warning(f"[SIZE_DEBUG] available_usd=${available_usd} total_usd=${total_usd} entry={chosen_px}¢ edge={edge_net:.4f} p_gate={p_gate:.4f}")
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate)
@@ -1332,6 +1343,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # If it crashes, we WANT it to be loud in logs so we don't get "runs and nothing"
         log.exception(f"FATAL: bot crashed: {e}")
         raise
