@@ -100,7 +100,7 @@ def clamp_float(x: float, lo: float, hi: float) -> float:
 # -----------------------------
 # Config (MODIFIED FOR AGGRESSIVE STRATEGY)
 # -----------------------------
-API_BASE = getenv_first(["KALSHI_API_BASE"], "https://api.elections.kalshi.com").rstrip("/")
+API_BASE = getenv_first(["KALSHI_API_BASE"], "https://trading-api.kalshi.com").rstrip("/")
 API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2").rstrip("/")
 API_KEY_ID = getenv_first(["KALSHI_API_KEY_ID"], "")
 PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
