@@ -179,6 +179,17 @@ DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
 DUMP_ON_PRICE_DANGER = True
 DUMP_PRICE_SIGMA_MULTIPLIER = 1.5  # Less sensitive to price swings
 
+# -------------- DUMP GRACE / SETTLING PERIOD (anti-jostle) --------------
+DUMP_GRACE_PERIOD_SECONDS = 60    # No dumps at all for 60s after entry
+DUMP_SETTLING_PERIOD_SECONDS = 120  # Use relaxed thresholds for 120s after entry
+DUMP_SETTLING_PROB_FLIP = 0.20      # During settling: only dump if prob below 20%
+DUMP_SETTLING_PROB_DROP = 0.50      # During settling: only dump on 50%+ drop
+DUMP_SETTLING_MARKET_FLIP = 0.20    # During settling: only dump if market prob < 20%
+DUMP_NEAR_5050_ENTRY_THRESHOLD = 0.65  # Entry p_gate below this = "near 50/50"
+DUMP_NEAR_5050_PROB_FLIP = 0.25     # Near 50/50 entries: only dump below 25%
+DUMP_NEAR_5050_PROB_DROP = 0.40     # Near 50/50 entries: only dump on 40%+ drop
+DUMP_NEAR_5050_MARKET_FLIP = 0.25   # Near 50/50 entries: market flip threshold
+
 # -------------- SMART DUMP (cut losses, let winners ride) --------------
 DUMP_IF_LOSING_CENTS = 25  # Dump if underwater by 25¢+ (more room)
 DUMP_PROTECT_PROFIT_CENTS = 15  # Lock in 15¢+ profit
@@ -1161,7 +1172,7 @@ def choose_trade(
     return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
 
-# NEW: Dump decision logic
+# NEW: Dump decision logic (with grace period / settling logic)
 def should_dump_position(
     st: BotState,
     p_yes_blend: float,
@@ -1174,18 +1185,48 @@ def should_dump_position(
     secs_to_close: int,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Check if we should dump our position
+    Check if we should dump our position.
+    Uses grace period + settling period to avoid dumping during early market jostling.
     Returns: (should_dump, reason)
     """
     if not ENABLE_DUMP:
         return False, None
-        
+
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
-    
+
     if st.entry_model_prob is None:
         return False, "no_entry_data"
-    
+
+    # --- GRACE PERIOD: no dumps at all for N seconds after entry ---
+    time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 9999
+    if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
+        return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
+
+    # --- Determine thresholds based on settling period and entry conditions ---
+    in_settling = time_in_trade < DUMP_SETTLING_PERIOD_SECONDS
+
+    # Was this a near-50/50 entry? Check the entry gate probability
+    entry_p_gate = st.entry_model_prob if st.side == "yes" else (1.0 - st.entry_model_prob)
+    near_5050_entry = entry_p_gate < DUMP_NEAR_5050_ENTRY_THRESHOLD
+
+    # Pick thresholds: settling > near_5050 > normal
+    if in_settling:
+        thresh_flip = DUMP_SETTLING_PROB_FLIP
+        thresh_drop = DUMP_SETTLING_PROB_DROP
+        thresh_mkt_flip = DUMP_SETTLING_MARKET_FLIP
+        phase = "settling"
+    elif near_5050_entry:
+        thresh_flip = DUMP_NEAR_5050_PROB_FLIP
+        thresh_drop = DUMP_NEAR_5050_PROB_DROP
+        thresh_mkt_flip = DUMP_NEAR_5050_MARKET_FLIP
+        phase = "near5050"
+    else:
+        thresh_flip = DUMP_PROB_FLIP
+        thresh_drop = DUMP_PROB_DROP_PERCENT
+        thresh_mkt_flip = DUMP_MARKET_FLIP_THRESHOLD
+        phase = "normal"
+
     # Determine current probability for our side
     if st.side == "yes":
         current_prob = p_yes_blend
@@ -1193,40 +1234,38 @@ def should_dump_position(
     else:
         current_prob = p_no_blend
         entry_prob = 1.0 - st.entry_model_prob
-    
+
     # TRIGGER 1: Probability flipped below threshold
-    if current_prob < DUMP_PROB_FLIP:
-        return True, f"prob_flip_{current_prob:.3f}"
-    
+    if current_prob < thresh_flip:
+        return True, f"prob_flip_{current_prob:.3f}(<{thresh_flip}_{phase})"
+
     # TRIGGER 2: Probability dropped significantly
     prob_drop = entry_prob - current_prob
-    if prob_drop > DUMP_PROB_DROP_PERCENT:
-        return True, f"prob_drop_{prob_drop:.3f}"
-    
+    if prob_drop > thresh_drop:
+        return True, f"prob_drop_{prob_drop:.3f}(>{thresh_drop}_{phase})"
+
     # TRIGGER 3: Market probability flipped
     if USE_MARKET_IMPLIED and p_mkt is not None:
         market_prob = p_mkt if st.side == "yes" else (1.0 - p_mkt)
-        if market_prob < DUMP_MARKET_FLIP_THRESHOLD:
-            return True, f"market_flip_{market_prob:.3f}"
-    
-    # TRIGGER 4: Bitcoin price danger zone
+        if market_prob < thresh_mkt_flip:
+            return True, f"market_flip_{market_prob:.3f}(<{thresh_mkt_flip}_{phase})"
+
+    # TRIGGER 4: Bitcoin price danger zone (always active - no grace for this)
     if DUMP_ON_PRICE_DANGER:
         if st.side == "yes":
-            # We bet BTC will be ABOVE threshold
             if lo is not None:
                 danger_price = lo - (sigma * DUMP_PRICE_SIGMA_MULTIPLIER)
                 if spot < danger_price:
                     distance = lo - spot
                     return True, f"price_danger_YES_${distance:.0f}_below"
-        
+
         elif st.side == "no":
-            # We bet BTC will be BELOW threshold
             if hi is not None:
                 danger_price = hi + (sigma * DUMP_PRICE_SIGMA_MULTIPLIER)
                 if spot > danger_price:
                     distance = spot - hi
                     return True, f"price_danger_NO_${distance:.0f}_above"
-    
+
     return False, None
 
 
@@ -1296,6 +1335,10 @@ def main() -> None:
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
+    )
+    log.warning(
+        f"[BOOTCFG] DUMP_GRACE={DUMP_GRACE_PERIOD_SECONDS}s DUMP_SETTLING={DUMP_SETTLING_PERIOD_SECONDS}s "
+        f"NEAR5050_THRESHOLD={DUMP_NEAR_5050_ENTRY_THRESHOLD}"
     )
     log.warning(
         f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
@@ -1529,7 +1572,21 @@ def main() -> None:
                             st, p_yes_blend, p_no_blend, p_mkt,
                             spot, lo, hi, sigma_used, secs_to_close
                         )
-                        
+
+                        # Log dump check status periodically
+                        if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                            time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
+                            our_prob = p_yes_blend if st.side == "yes" else p_no_blend
+                            phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else (
+                                "settling" if time_in_trade < DUMP_SETTLING_PERIOD_SECONDS else "normal"
+                            )
+                            log.info(
+                                f"[HOLD] {st.market} {st.side.upper()} pos={pos} "
+                                f"held={time_in_trade:.0f}s phase={phase} "
+                                f"our_p={our_prob:.3f} dump={dump_reason or 'none'}"
+                            )
+                            last_state_log = now
+
                         if should_dump:
                             log.warning(f"[DUMP] Triggering dump: {dump_reason}")
 
