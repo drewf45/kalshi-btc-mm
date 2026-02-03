@@ -237,6 +237,15 @@ BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 75.0)  # Tighter buffer
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.03)
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 30)
 
+# -------------- TREND TRACKING (know what BTC is doing) --------------
+TREND_WINDOW_MINUTES = 60          # Look back 60 min (~4 markets)
+TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
+TREND_STRONG_THRESHOLD = 100.0     # $100+ move in window = strong trend
+TREND_MODERATE_THRESHOLD = 50.0    # $50+ move = moderate trend
+TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against strong trend
+TREND_AGAINST_BLOCK = True         # Block trades against strong trend entirely
+TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading with trend
+
 # Heartbeat
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
@@ -996,6 +1005,98 @@ class SessionState:
         return self.current_fraction
 
 
+class SpotTrend:
+    """
+    Tracks BTC spot price over a rolling window to detect trends.
+    Helps the bot avoid trading against strong momentum.
+    """
+    def __init__(self, window_minutes: int = TREND_WINDOW_MINUTES,
+                 sample_interval: int = TREND_SAMPLE_INTERVAL_SECONDS):
+        self.window_seconds = window_minutes * 60
+        self.sample_interval = sample_interval
+        self.samples: List[Tuple[float, float]] = []  # (timestamp, spot_price)
+        self.last_sample_time: float = 0.0
+
+    def record(self, spot: float) -> None:
+        """Record a spot price sample (rate-limited by sample_interval)"""
+        now = time.time()
+        if (now - self.last_sample_time) < self.sample_interval:
+            return
+        self.samples.append((now, spot))
+        self.last_sample_time = now
+        # Prune old samples outside the window
+        cutoff = now - self.window_seconds
+        self.samples = [(t, p) for t, p in self.samples if t >= cutoff]
+
+    def get_trend(self) -> Tuple[float, str, int]:
+        """
+        Returns: (move_usd, direction, num_samples)
+        - move_usd: price change from oldest to newest sample (positive = up)
+        - direction: "up", "down", or "flat"
+        - num_samples: how many data points we have
+        """
+        if len(self.samples) < 2:
+            return 0.0, "flat", len(self.samples)
+
+        oldest_price = self.samples[0][1]
+        newest_price = self.samples[-1][1]
+        move = newest_price - oldest_price
+
+        if abs(move) >= TREND_STRONG_THRESHOLD:
+            direction = "strong_up" if move > 0 else "strong_down"
+        elif abs(move) >= TREND_MODERATE_THRESHOLD:
+            direction = "up" if move > 0 else "down"
+        else:
+            direction = "flat"
+
+        return move, direction, len(self.samples)
+
+    def get_window_minutes(self) -> float:
+        """How many minutes of data we actually have"""
+        if len(self.samples) < 2:
+            return 0.0
+        return (self.samples[-1][0] - self.samples[0][0]) / 60.0
+
+    def trade_alignment(self, side: str, lo: Optional[float], hi: Optional[float],
+                        spot: float) -> str:
+        """
+        Check if a proposed trade aligns with the trend.
+        Returns: "with", "against", or "neutral"
+
+        Logic:
+        - YES bet = we think BTC will stay ABOVE lo (or in range)
+        - NO bet = we think BTC will stay BELOW hi (or in range)
+        - If BTC is trending UP strongly and we want NO → against trend
+        - If BTC is trending DOWN strongly and we want YES → against trend
+        """
+        move, direction, _ = self.get_trend()
+
+        if direction == "flat":
+            return "neutral"
+
+        trending_up = "up" in direction
+        trending_down = "down" in direction
+
+        if side == "yes" and trending_down:
+            return "against"
+        if side == "no" and trending_up:
+            return "against"
+        if side == "yes" and trending_up:
+            return "with"
+        if side == "no" and trending_down:
+            return "with"
+
+        return "neutral"
+
+    def summary(self) -> str:
+        """Short string for logging"""
+        move, direction, n = self.get_trend()
+        mins = self.get_window_minutes()
+        if n < 2:
+            return "trend=N/A(warming)"
+        return f"trend={direction}(${move:+.0f}/{mins:.0f}min/{n}pts)"
+
+
 @dataclass
 class BotState:
     sm: str = SM.IDLE
@@ -1349,6 +1450,11 @@ def main() -> None:
         f"consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} cooldown={SESSION_COOLDOWN_MINUTES}min "
         f"balance_check_delay={BALANCE_CHECK_DELAY_SECONDS}s"
     )
+    log.warning(
+        f"[BOOTCFG] TREND: window={TREND_WINDOW_MINUTES}min strong=${TREND_STRONG_THRESHOLD} "
+        f"moderate=${TREND_MODERATE_THRESHOLD} block_against={TREND_AGAINST_BLOCK} "
+        f"edge_boost={TREND_AGAINST_EDGE_BOOST} edge_discount={TREND_WITH_EDGE_DISCOUNT}"
+    )
     log.warning("[HEARTBEAT] main() entered — SCALPER is running")
 
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
@@ -1359,6 +1465,7 @@ def main() -> None:
 
     st = BotState()
     session = SessionState()
+    trend = SpotTrend()
     active_market_obj: Dict[str, Any] = {}
 
     # Initialize session with starting balance
@@ -1441,7 +1548,8 @@ def main() -> None:
                 f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
                 f"SESSION: daily_pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
                 f"W/L={session.total_wins}/{session.total_losses} "
-                f"frac={session.current_fraction:.1%} paused={session.is_paused}"
+                f"frac={session.current_fraction:.1%} paused={session.is_paused} | "
+                f"{trend.summary()}"
             )
             last_heartbeat = now
 
@@ -1550,6 +1658,7 @@ def main() -> None:
             if ENABLE_DUMP and secs_to_close is not None:
                 spot = fetch_btc_spot_usd(http)
                 if spot is not None:
+                    trend.record(spot)
                     try:
                         ob = client.request("GET", f"/markets/{st.market}/orderbook")
                         yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
@@ -1676,6 +1785,8 @@ def main() -> None:
             continue
 
         spot = fetch_btc_spot_usd(http)
+        if spot is not None:
+            trend.record(spot)
         if spot is None:
             log.warning(f"[SPOT] failed; skipping this poll")
             time.sleep(POLL_SECONDS)
@@ -1729,7 +1840,8 @@ def main() -> None:
                 f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} "
                 f"yes_buffer={yes_buffer_str} no_buffer={no_buffer_str} "
                 f"p_yes_blend={p_yes_blend:.4f} p_no_blend={p_no_blend:.4f} "
-                f"YES(edge={edge_yes_str}) NO(edge={edge_no_str}) -> {chosen_side}@{chosen_px}"
+                f"YES(edge={edge_yes_str}) NO(edge={edge_no_str}) -> {chosen_side}@{chosen_px} "
+                f"| {trend.summary()}"
             )
 
         if chosen_side is None or chosen_px is None:
@@ -1738,6 +1850,47 @@ def main() -> None:
                 last_ob_warn = now
             time.sleep(POLL_SECONDS)
             continue
+
+        # --- TREND CHECK: don't fight strong momentum ---
+        alignment = trend.trade_alignment(chosen_side, lo, hi, spot)
+        trend_move, trend_dir, trend_n = trend.get_trend()
+
+        if chosen_side == "yes":
+            edge_for_trend = float(edge_yes)
+        else:
+            edge_for_trend = float(edge_no)
+
+        if alignment == "against" and "strong" in trend_dir:
+            if TREND_AGAINST_BLOCK:
+                log.warning(
+                    f"[TREND] BLOCKED {chosen_side.upper()} — against {trend_dir} "
+                    f"(${trend_move:+.0f} over {trend.get_window_minutes():.0f}min). "
+                    f"Edge={edge_for_trend:.4f} not enough to fight momentum."
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+            elif edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
+                log.warning(
+                    f"[TREND] SKIPPED {chosen_side.upper()} — against {trend_dir} "
+                    f"(${trend_move:+.0f}), edge={edge_for_trend:.4f} < "
+                    f"{EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+        elif alignment == "against":
+            # Moderate trend — require extra edge but don't block
+            if edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
+                log.warning(
+                    f"[TREND] SKIPPED {chosen_side.upper()} — against moderate {trend_dir} "
+                    f"(${trend_move:+.0f}), edge={edge_for_trend:.4f} < "
+                    f"{EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+            else:
+                log.info(f"[TREND] Trading {chosen_side.upper()} against {trend_dir} — edge {edge_for_trend:.4f} sufficient")
+        elif alignment == "with":
+            log.info(f"[TREND] Trading WITH {trend_dir} ({chosen_side.upper()}) — {trend.summary()}")
 
         # Check session limits before trading
         can_trade, pause_reason = session.check_can_trade()
