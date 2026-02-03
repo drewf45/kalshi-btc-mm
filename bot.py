@@ -1628,15 +1628,17 @@ def main() -> None:
             no_px_log = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
             edge_yes_log = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
             edge_no_log = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
-            
+
             yes_buffer_str = f"${spot-lo:.2f}" if lo else "N/A"
             no_buffer_str = f"${hi-spot:.2f}" if hi else "N/A"
-            
+            edge_yes_str = f"{edge_yes_log:.4f}" if edge_yes_log is not None else "N/A"
+            edge_no_str = f"{edge_no_log:.4f}" if edge_no_log is not None else "N/A"
+
             log.info(
                 f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} "
                 f"yes_buffer={yes_buffer_str} no_buffer={no_buffer_str} "
                 f"p_yes_blend={p_yes_blend:.4f} p_no_blend={p_no_blend:.4f} "
-                f"YES(edge={edge_yes_log:.4f}) NO(edge={edge_no_log:.4f}) -> {chosen_side}@{chosen_px}"
+                f"YES(edge={edge_yes_str}) NO(edge={edge_no_str}) -> {chosen_side}@{chosen_px}"
             )
 
         if chosen_side is None or chosen_px is None:
