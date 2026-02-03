@@ -156,10 +156,10 @@ SCALING_MAX_FRACTION = 0.35  # Cap at 35%
 
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
-SESSION_MAX_LOSS_USD = 50.0  # Stop if down $50
-SESSION_MAX_LOSS_PERCENT = 0.20  # Or 20% of starting
-SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 losses
-SESSION_COOLDOWN_MINUTES = 15  # Cooldown after limit hit
+DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
+SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one market
+SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
+BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
@@ -811,133 +811,173 @@ class SM:
 
 @dataclass
 class SessionState:
-    """Track session-level P&L and scaling"""
-    starting_balance_usd: float = 0.0
-    current_pnl_usd: float = 0.0
+    """Track daily P&L from real balance, reset per-market stats on each roll"""
+    # Daily tracking (persists across markets, only resets on bot restart)
+    starting_balance_usd: float = 0.0  # Balance when bot started
+    current_balance_usd: float = 0.0   # Last known real balance from API
+    daily_pnl_usd: float = 0.0         # True P&L = current_balance - starting_balance
+    total_markets: int = 0
+    total_wins: int = 0
+    total_losses: int = 0
 
-    # Win/loss tracking
-    wins: int = 0
-    losses: int = 0
+    # Per-market tracking (resets on each market roll)
+    market_wins: int = 0
+    market_losses: int = 0
     consecutive_losses: int = 0
     consecutive_wins: int = 0
-
-    # Bankroll scaling
-    current_fraction: float = BANKROLL_FRACTION  # Dynamic fraction
-
-    # Trade history (last N for analysis)
-    recent_trades: List[Dict[str, Any]] = None
+    current_fraction: float = BANKROLL_FRACTION
 
     # Session limits
     is_paused: bool = False
-    pause_until: float = 0.0  # Unix timestamp
+    pause_until: float = 0.0
     pause_reason: Optional[str] = None
+    is_daily_stopped: bool = False  # HARD STOP - never unpauses
 
-    # Markets traded this session
-    markets_traded: int = 0
+    # Balance refresh
+    pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
+
+    # Trade history
+    recent_trades: List[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.recent_trades is None:
             self.recent_trades = []
 
+    def reset_for_new_market(self):
+        """Reset per-market state on each market roll. Daily state persists."""
+        self.market_wins = 0
+        self.market_losses = 0
+        self.consecutive_losses = 0
+        self.consecutive_wins = 0
+        self.current_fraction = BANKROLL_FRACTION  # Reset to base fraction
+        # Clear per-market pause (but NOT daily hard stop)
+        if not self.is_daily_stopped:
+            self.is_paused = False
+            self.pause_reason = None
+        log.warning(
+            f"[SESSION] Market reset: fraction={self.current_fraction:.2%} "
+            f"daily_pnl=${self.daily_pnl_usd:.2f} W/L={self.total_wins}/{self.total_losses}"
+        )
+
+    def update_balance(self, balance_usd: float):
+        """Update true P&L from actual account balance"""
+        self.current_balance_usd = balance_usd
+        self.daily_pnl_usd = balance_usd - self.starting_balance_usd
+        log.warning(
+            f"[SESSION] Balance update: ${balance_usd:.2f} "
+            f"(started=${self.starting_balance_usd:.2f}, daily_pnl=${self.daily_pnl_usd:.2f})"
+        )
+        # Check daily hard stop
+        self._check_daily_stop()
+
+    def schedule_balance_check(self):
+        """Schedule a balance check after settlement"""
+        self.pending_balance_check_at = time.time() + BALANCE_CHECK_DELAY_SECONDS
+        log.info(f"[SESSION] Balance check scheduled in {BALANCE_CHECK_DELAY_SECONDS}s")
+
+    def needs_balance_check(self) -> bool:
+        """Check if it's time to fetch balance"""
+        return self.pending_balance_check_at > 0 and time.time() >= self.pending_balance_check_at
+
+    def clear_balance_check(self):
+        self.pending_balance_check_at = 0.0
+
     def record_trade(self, market: str, side: str, entry_price: int, exit_price: Optional[int],
                      qty: int, pnl_cents: int, was_dump: bool = False):
-        """Record a completed trade and update scaling"""
+        """Record a completed trade"""
         pnl_usd = pnl_cents / 100.0
-        self.current_pnl_usd += pnl_usd
-        self.markets_traded += 1
+        self.total_markets += 1
 
         trade = {
-            "market": market,
-            "side": side,
-            "entry": entry_price,
-            "exit": exit_price,
-            "qty": qty,
-            "pnl_cents": pnl_cents,
-            "pnl_usd": pnl_usd,
-            "was_dump": was_dump,
-            "ts": time.time(),
+            "market": market, "side": side, "entry": entry_price,
+            "exit": exit_price, "qty": qty, "pnl_cents": pnl_cents,
+            "pnl_usd": pnl_usd, "was_dump": was_dump, "ts": time.time(),
         }
         self.recent_trades.append(trade)
         if len(self.recent_trades) > 50:
             self.recent_trades = self.recent_trades[-50:]
 
         if pnl_cents > 0:
-            self.wins += 1
+            self.total_wins += 1
+            self.market_wins += 1
             self.consecutive_wins += 1
             self.consecutive_losses = 0
             self._scale_up()
         else:
-            self.losses += 1
+            self.total_losses += 1
+            self.market_losses += 1
             self.consecutive_losses += 1
             self.consecutive_wins = 0
             self._scale_down()
 
-        self._check_session_limits()
+        # Check consecutive loss limit (per-market)
+        self._check_consecutive_limit()
+
+        # Schedule balance check to get true P&L
+        self.schedule_balance_check()
 
         log.warning(
-            f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} total=${self.current_pnl_usd:.2f} "
-            f"W/L={self.wins}/{self.losses} streak={self.consecutive_wins}W/{self.consecutive_losses}L "
+            f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
+            f"W/L={self.total_wins}/{self.total_losses} "
+            f"streak={self.consecutive_wins}W/{self.consecutive_losses}L "
             f"fraction={self.current_fraction:.2%}"
         )
 
     def _scale_up(self):
-        """Increase bankroll fraction after win"""
         if not ENABLE_BANKROLL_SCALING:
             return
         new_frac = self.current_fraction * SCALING_WIN_MULTIPLIER
         self.current_fraction = min(new_frac, SCALING_MAX_FRACTION)
 
     def _scale_down(self):
-        """Decrease bankroll fraction after loss"""
         if not ENABLE_BANKROLL_SCALING:
             return
         new_frac = self.current_fraction * SCALING_LOSS_MULTIPLIER
         self.current_fraction = max(new_frac, SCALING_MIN_FRACTION)
 
-    def _check_session_limits(self):
-        """Check if we should pause trading"""
+    def _check_daily_stop(self):
+        """HARD STOP: never lose more than 75% of starting balance"""
+        if not ENABLE_SESSION_LIMITS or self.starting_balance_usd <= 0:
+            return
+        loss_pct = -self.daily_pnl_usd / self.starting_balance_usd
+        if loss_pct >= DAILY_MAX_LOSS_PERCENT:
+            self.is_daily_stopped = True
+            self.is_paused = True
+            self.pause_reason = f"DAILY_HARD_STOP_lost_{loss_pct:.0%}"
+            log.warning(
+                f"[SESSION] DAILY HARD STOP: lost {loss_pct:.0%} of starting balance "
+                f"(${self.starting_balance_usd:.2f} -> ${self.current_balance_usd:.2f}). "
+                f"Bot will NOT trade until restart."
+            )
+
+    def _check_consecutive_limit(self):
+        """Pause on consecutive losses within a market (temporary cooldown)"""
         if not ENABLE_SESSION_LIMITS:
             return
-
-        # Check absolute loss limit
-        if self.current_pnl_usd <= -SESSION_MAX_LOSS_USD:
-            self._pause(f"max_loss_${SESSION_MAX_LOSS_USD}")
-            return
-
-        # Check percentage loss limit
-        if self.starting_balance_usd > 0:
-            pct_loss = -self.current_pnl_usd / self.starting_balance_usd
-            if pct_loss >= SESSION_MAX_LOSS_PERCENT:
-                self._pause(f"max_loss_{SESSION_MAX_LOSS_PERCENT:.0%}")
-                return
-
-        # Check consecutive losses
         if self.consecutive_losses >= SESSION_CONSECUTIVE_LOSSES_LIMIT:
-            self._pause(f"consecutive_losses_{self.consecutive_losses}")
-            return
-
-    def _pause(self, reason: str):
-        """Pause trading for cooldown period"""
-        self.is_paused = True
-        self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
-        self.pause_reason = reason
-        # Reset fraction to minimum after hitting limits
-        self.current_fraction = SCALING_MIN_FRACTION
-        log.warning(f"[SESSION] PAUSED: {reason} - cooldown until {datetime.fromtimestamp(self.pause_until)}")
+            self.is_paused = True
+            self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
+            self.pause_reason = f"consecutive_losses_{self.consecutive_losses}"
+            self.current_fraction = SCALING_MIN_FRACTION
+            log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
 
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
-        """Check if we can trade. Returns (can_trade, reason_if_not)"""
+        """Check if we can trade"""
+        # Daily hard stop is permanent until restart
+        if self.is_daily_stopped:
+            return False, f"DAILY_HARD_STOP (lost 75%+ of starting balance)"
+
         if not self.is_paused:
             return True, None
 
-        if time.time() >= self.pause_until:
+        if self.pause_until > 0 and time.time() >= self.pause_until:
             self.is_paused = False
             self.pause_reason = None
-            self.consecutive_losses = 0  # Reset streak after cooldown
+            self.consecutive_losses = 0
             log.warning("[SESSION] Cooldown ended, resuming trading")
             return True, None
 
-        remaining = int(self.pause_until - time.time())
+        remaining = int(self.pause_until - time.time()) if self.pause_until > 0 else 0
         return False, f"paused:{self.pause_reason} ({remaining}s remaining)"
 
     def get_current_fraction(self) -> float:
@@ -1262,9 +1302,9 @@ def main() -> None:
         f"loss_mult={SCALING_LOSS_MULTIPLIER} min={SCALING_MIN_FRACTION:.0%} max={SCALING_MAX_FRACTION:.0%}"
     )
     log.warning(
-        f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} max_loss=${SESSION_MAX_LOSS_USD} "
-        f"max_loss_pct={SESSION_MAX_LOSS_PERCENT:.0%} consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} "
-        f"cooldown={SESSION_COOLDOWN_MINUTES}min"
+        f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
+        f"consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} cooldown={SESSION_COOLDOWN_MINUTES}min "
+        f"balance_check_delay={BALANCE_CHECK_DELAY_SECONDS}s"
     )
     log.warning("[HEARTBEAT] main() entered — SCALPER is running")
 
@@ -1283,7 +1323,9 @@ def main() -> None:
         av, tot = get_balance_usd(client)
         if av is not None:
             session.starting_balance_usd = av
-            log.warning(f"[SESSION] Starting balance: ${av:.2f}")
+            session.current_balance_usd = av
+            session.daily_pnl_usd = 0.0
+            log.warning(f"[SESSION] Starting balance: ${av:.2f} (75% hard stop at ${av * 0.25:.2f})")
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
 
@@ -1354,10 +1396,21 @@ def main() -> None:
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
             log.warning(
                 f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
-                f"SESSION: pnl=${session.current_pnl_usd:.2f} W/L={session.wins}/{session.losses} "
+                f"SESSION: daily_pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
+                f"W/L={session.total_wins}/{session.total_losses} "
                 f"frac={session.current_fraction:.1%} paused={session.is_paused}"
             )
             last_heartbeat = now
+
+        # Check if we need to fetch balance after settlement
+        if session.needs_balance_check():
+            try:
+                bal, _ = get_balance_usd(client)
+                if bal is not None:
+                    session.update_balance(bal)
+                session.clear_balance_check()
+            except Exception as e:
+                log.warning(f"[SESSION] Balance check failed: {e}")
 
         if (now - last_meta) >= META_REFRESH_SECONDS:
             try:
@@ -1404,6 +1457,9 @@ def main() -> None:
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
                         except Exception as e:
                             log.warning(f"[ROLL] Could not determine settlement for {old_market}: {e}")
+
+                    # Reset per-market session state (keeps daily P&L intact)
+                    session.reset_for_new_market()
 
                     st.event = ev2
                     st.market = mt2
