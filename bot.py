@@ -734,55 +734,19 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
         log.warning(f"[BALANCE] Response not dict: {type(resp)} = {resp}")
         return None, None
 
-    # Log raw response once to understand structure
-    log.info(f"[BALANCE] Raw API response keys: {list(resp.keys())}")
+    # Kalshi API returns: {'balance': 2512, 'portfolio_value': 0, 'updated_ts': ...}
+    # balance is in CENTS, need to convert to dollars
+    balance_cents = resp.get("balance")
+    portfolio_cents = resp.get("portfolio_value", 0)
 
-    base = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
+    if balance_cents is not None:
+        available_usd = float(balance_cents) / 100.0
+        total_usd = float(balance_cents + portfolio_cents) / 100.0
+        log.info(f"[BALANCE] {balance_cents}¢ available (${available_usd:.2f}), portfolio={portfolio_cents}¢")
+        return available_usd, total_usd
 
-    # Kalshi API returns balance in cents, need to convert to dollars
-    cand_available = [
-        "available_balance",
-        "available",
-        "available_cash",
-        "available_funds",
-        "free_collateral",
-        "available_collateral",
-        "payout",  # Kalshi uses this
-    ]
-    cand_total = [
-        "balance",
-        "total_balance",
-        "total",
-        "equity",
-        "account_value",
-    ]
-
-    av = None
-    tot = None
-
-    for k in cand_available:
-        if k in base:
-            try:
-                raw_val = base[k]
-                # Kalshi returns cents as integer, convert to dollars
-                av = float(raw_val) / 100.0 if isinstance(raw_val, int) and raw_val > 100 else float(raw_val)
-                log.info(f"[BALANCE] Found available: {k}={raw_val} -> ${av:.2f}")
-                break
-            except Exception:
-                pass
-    for k in cand_total:
-        if k in base:
-            try:
-                raw_val = base[k]
-                tot = float(raw_val) / 100.0 if isinstance(raw_val, int) and raw_val > 100 else float(raw_val)
-                break
-            except Exception:
-                pass
-
-    if av is None:
-        log.warning(f"[BALANCE] Could not find available balance in response: {base}")
-
-    return av, tot
+    log.warning(f"[BALANCE] Could not find 'balance' in response: {resp}")
+    return None, None
 
 
 def build_order_payload(
