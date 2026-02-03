@@ -127,39 +127,39 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# -------------- SCALPER STRATEGY ENVs --------------
-ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 360)  # 6 min before close
-ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)
-ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 30)  # Trade until 30s before close
-FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 20)
-ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", True)
-CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
+# -------------- SCALPER STRATEGY (HARDWIRED) --------------
+ENTRY_START_SECONDS = 360  # 6 min before close - HARDWIRED
+ENTRY_DECISION_SECONDS = 60
+ENTRY_LAST_SECONDS = 30  # Trade until 30s before close - HARDWIRED
+FILL_WAIT_SECONDS = 20
+ALLOW_TAKER_AT_LAST = True
+CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = env_float("PROB_MIN", 0.55)  # Lower threshold = more trades
-EDGE_MIN = env_float("EDGE_MIN", 0.01)  # 1% minimum edge
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 90)  # Allow up to 90¢
-FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)
+PROB_MIN = 0.55  # Lower threshold = more trades - HARDWIRED
+EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
+MAX_ENTRY_PRICE_CENTS = 90  # Allow up to 90¢ - HARDWIRED
+FEE_CENTS_PER_CONTRACT = 0
 
-SPOT_SIGMA_USD_PER_SQRT_SEC = env_float("SPOT_SIGMA_USD_PER_SQRT_SEC", 12.0)
+SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
-BANKROLL_FRACTION = env_float("BANKROLL_FRACTION", 0.15)  # 15% base per trade
-MIN_CONTRACTS = env_int("MIN_CONTRACTS", 1)
-MAX_CONTRACTS = env_int("MAX_CONTRACTS", 100)  # Allow bigger positions
-MIN_FREE_USD_TO_TRADE = env_float("MIN_FREE_USD_TO_TRADE", 5.0)
+BANKROLL_FRACTION = 0.15  # 15% base per trade - HARDWIRED
+MIN_CONTRACTS = 1
+MAX_CONTRACTS = 100  # Allow bigger positions
+MIN_FREE_USD_TO_TRADE = 5.0
 
-# -------------- BANKROLL SCALING (scale up on wins, down on losses) --------------
-ENABLE_BANKROLL_SCALING = env_bool("ENABLE_BANKROLL_SCALING", True)
-SCALING_WIN_MULTIPLIER = env_float("SCALING_WIN_MULTIPLIER", 1.25)  # +25% after win
-SCALING_LOSS_MULTIPLIER = env_float("SCALING_LOSS_MULTIPLIER", 0.70)  # -30% after loss
-SCALING_MIN_FRACTION = env_float("SCALING_MIN_FRACTION", 0.05)  # Floor at 5%
-SCALING_MAX_FRACTION = env_float("SCALING_MAX_FRACTION", 0.35)  # Cap at 35%
+# -------------- BANKROLL SCALING (HARDWIRED) --------------
+ENABLE_BANKROLL_SCALING = True
+SCALING_WIN_MULTIPLIER = 1.25  # +25% after win
+SCALING_LOSS_MULTIPLIER = 0.70  # -30% after loss
+SCALING_MIN_FRACTION = 0.05  # Floor at 5%
+SCALING_MAX_FRACTION = 0.35  # Cap at 35%
 
-# -------------- SESSION LOSS LIMITS (stop trading if losing too much) --------------
-ENABLE_SESSION_LIMITS = env_bool("ENABLE_SESSION_LIMITS", True)
-SESSION_MAX_LOSS_USD = env_float("SESSION_MAX_LOSS_USD", 50.0)  # Stop if down $50
-SESSION_MAX_LOSS_PERCENT = env_float("SESSION_MAX_LOSS_PERCENT", 0.20)  # Or 20% of starting
-SESSION_CONSECUTIVE_LOSSES_LIMIT = env_int("SESSION_CONSECUTIVE_LOSSES_LIMIT", 5)  # Pause after 5 losses
-SESSION_COOLDOWN_MINUTES = env_int("SESSION_COOLDOWN_MINUTES", 15)  # Cooldown after limit hit
+# -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
+ENABLE_SESSION_LIMITS = True
+SESSION_MAX_LOSS_USD = 50.0  # Stop if down $50
+SESSION_MAX_LOSS_PERCENT = 0.20  # Or 20% of starting
+SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 losses
+SESSION_COOLDOWN_MINUTES = 15  # Cooldown after limit hit
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
@@ -170,18 +170,18 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (aggressive exits) --------------
-ENABLE_DUMP = env_bool("ENABLE_DUMP", True)
-DUMP_PROB_FLIP = env_float("DUMP_PROB_FLIP", 0.40)  # Exit if prob drops below 40%
-DUMP_PROB_DROP_PERCENT = env_float("DUMP_PROB_DROP_PERCENT", 0.15)  # Exit on 15% drop (faster exit)
-DUMP_MARKET_FLIP_THRESHOLD = env_float("DUMP_MARKET_FLIP_THRESHOLD", 0.35)
-DUMP_MIN_TIME_REMAINING = env_int("DUMP_MIN_TIME_REMAINING", 20)  # Can dump closer to settlement
-DUMP_ON_PRICE_DANGER = env_bool("DUMP_ON_PRICE_DANGER", True)
-DUMP_PRICE_SIGMA_MULTIPLIER = env_float("DUMP_PRICE_SIGMA_MULTIPLIER", 1.2)  # More sensitive
+# -------------- DUMP CONFIGURATION (HARDWIRED - less aggressive) --------------
+ENABLE_DUMP = True
+DUMP_PROB_FLIP = 0.35  # Exit if prob drops below 35% - HARDWIRED
+DUMP_PROB_DROP_PERCENT = 0.30  # Exit on 30% drop (less aggressive) - HARDWIRED
+DUMP_MARKET_FLIP_THRESHOLD = 0.30
+DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
+DUMP_ON_PRICE_DANGER = True
+DUMP_PRICE_SIGMA_MULTIPLIER = 1.5  # Less sensitive to price swings
 
 # -------------- SMART DUMP (cut losses, let winners ride) --------------
-DUMP_IF_LOSING_CENTS = env_int("DUMP_IF_LOSING_CENTS", 15)  # Dump if underwater by 15¢+
-DUMP_PROTECT_PROFIT_CENTS = env_int("DUMP_PROTECT_PROFIT_CENTS", 10)  # Lock in 10¢+ profit
+DUMP_IF_LOSING_CENTS = 25  # Dump if underwater by 25¢+ (more room)
+DUMP_PROTECT_PROFIT_CENTS = 15  # Lock in 15¢+ profit
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
