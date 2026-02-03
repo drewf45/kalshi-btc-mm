@@ -727,13 +727,19 @@ def parse_position_for_market(positions: List[Dict[str, Any]], market_ticker: st
 def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[float]]:
     try:
         resp = client.request("GET", "/portfolio/balance")
-    except Exception:
+    except Exception as e:
+        log.warning(f"[BALANCE] API exception: {e}")
         return None, None
     if not isinstance(resp, dict):
+        log.warning(f"[BALANCE] Response not dict: {type(resp)} = {resp}")
         return None, None
+
+    # Log raw response once to understand structure
+    log.info(f"[BALANCE] Raw API response keys: {list(resp.keys())}")
 
     base = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
 
+    # Kalshi API returns balance in cents, need to convert to dollars
     cand_available = [
         "available_balance",
         "available",
@@ -741,6 +747,7 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
         "available_funds",
         "free_collateral",
         "available_collateral",
+        "payout",  # Kalshi uses this
     ]
     cand_total = [
         "balance",
@@ -756,17 +763,24 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
     for k in cand_available:
         if k in base:
             try:
-                av = float(base[k])
+                raw_val = base[k]
+                # Kalshi returns cents as integer, convert to dollars
+                av = float(raw_val) / 100.0 if isinstance(raw_val, int) and raw_val > 100 else float(raw_val)
+                log.info(f"[BALANCE] Found available: {k}={raw_val} -> ${av:.2f}")
                 break
             except Exception:
                 pass
     for k in cand_total:
         if k in base:
             try:
-                tot = float(base[k])
+                raw_val = base[k]
+                tot = float(raw_val) / 100.0 if isinstance(raw_val, int) and raw_val > 100 else float(raw_val)
                 break
             except Exception:
                 pass
+
+    if av is None:
+        log.warning(f"[BALANCE] Could not find available balance in response: {base}")
 
     return av, tot
 
