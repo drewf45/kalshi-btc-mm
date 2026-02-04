@@ -137,12 +137,12 @@ CANCEL_UNFILLED_AT_CLOSE = True
 
 PROB_MIN = 0.75  # High confidence entries only - HARDWIRED
 EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
-MAX_ENTRY_PRICE_CENTS = 90  # Edge gate caps effective price to prob*100 - HARDWIRED
+MAX_ENTRY_PRICE_CENTS = 50  # Hard cap: win >= loss (50¢ win, 50¢ lose) - HARDWIRED
 FEE_CENTS_PER_CONTRACT = 0
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
-BANKROLL_FRACTION = 0.15  # 15% base per trade - HARDWIRED
+BANKROLL_FRACTION = 0.10  # 10% base per trade - less variance - HARDWIRED
 MIN_CONTRACTS = 1
 MAX_CONTRACTS = 100  # Allow bigger positions
 MIN_FREE_USD_TO_TRADE = 5.0
@@ -152,7 +152,7 @@ ENABLE_BANKROLL_SCALING = True
 SCALING_WIN_MULTIPLIER = 1.25  # +25% after win
 SCALING_LOSS_MULTIPLIER = 0.70  # -30% after loss
 SCALING_MIN_FRACTION = 0.05  # Floor at 5%
-SCALING_MAX_FRACTION = 0.35  # Cap at 35%
+SCALING_MAX_FRACTION = 0.20  # Cap at 20% - prevents oversized positions
 
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
