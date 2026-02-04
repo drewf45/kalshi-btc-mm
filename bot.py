@@ -135,10 +135,17 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.90  # Near certainty - HARDWIRED
+PROB_MIN = 0.60  # Minimum prob to even consider (trend does the real work) - HARDWIRED
 EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
 MAX_ENTRY_PRICE_CENTS = 90  # Allow higher entries with high prob - HARDWIRED
 FEE_CENTS_PER_CONTRACT = 0
+
+# -------------- PROBABILITY TREND DETECTION (watch early, buy on momentum) --------------
+PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
+PROB_TREND_MIN_SAMPLES = 10       # Need at least 10 samples (~90s at 1/sec)
+PROB_TREND_THRESHOLD = 0.12       # 12% swing in one direction = strong trend
+PROB_TREND_MIN_CURRENT = 0.60     # Current prob must be at least 60% for our side
+PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
@@ -1097,6 +1104,94 @@ class SpotTrend:
         return f"trend={direction}(${move:+.0f}/{mins:.0f}min/{n}pts)"
 
 
+class ProbTrend:
+    """
+    Tracks probability trend within a single market to detect momentum.
+    Enables buying when probability is steadily climbing one direction,
+    even if it hasn't hit 90% yet — catch the move early while prices are good.
+    """
+    def __init__(self):
+        self.samples: List[Tuple[float, float]] = []  # (timestamp, p_yes_blend)
+        self.market_ticker: Optional[str] = None
+
+    def reset(self, market_ticker: str) -> None:
+        """Reset for a new market"""
+        self.samples = []
+        self.market_ticker = market_ticker
+
+    def record(self, p_yes_blend: float) -> None:
+        """Record a probability sample (every poll)"""
+        now = time.time()
+        self.samples.append((now, p_yes_blend))
+        # Prune old samples outside the window
+        cutoff = now - PROB_TREND_WINDOW_SECONDS
+        self.samples = [(t, p) for t, p in self.samples if t >= cutoff]
+
+    def get_trend(self) -> Tuple[float, str, int, float]:
+        """
+        Returns: (prob_change, direction, num_samples, seconds_of_data)
+        - prob_change: how much p_yes has moved (positive = trending YES)
+        - direction: "strong_yes", "yes", "strong_no", "no", or "flat"
+        - num_samples: how many data points
+        - seconds_of_data: time span covered
+        """
+        if len(self.samples) < PROB_TREND_MIN_SAMPLES:
+            return 0.0, "flat", len(self.samples), 0.0
+
+        oldest_p = self.samples[0][1]
+        newest_p = self.samples[-1][1]
+        change = newest_p - oldest_p
+        seconds = self.samples[-1][0] - self.samples[0][0]
+
+        if change >= PROB_TREND_THRESHOLD:
+            direction = "strong_yes"
+        elif change >= PROB_TREND_THRESHOLD / 2:
+            direction = "yes"
+        elif change <= -PROB_TREND_THRESHOLD:
+            direction = "strong_no"
+        elif change <= -PROB_TREND_THRESHOLD / 2:
+            direction = "no"
+        else:
+            direction = "flat"
+
+        return change, direction, len(self.samples), seconds
+
+    def should_buy(self, side: str, current_prob: float) -> Tuple[bool, str]:
+        """
+        Check if the probability trend supports buying this side.
+        Returns: (should_buy, reason)
+
+        Logic: if probability has been steadily climbing toward our side
+        for 60+ seconds, that's the signal — don't wait for 90%.
+        """
+        if not PROB_TREND_ENTRY_ENABLED:
+            return False, "trend_entry_disabled"
+
+        change, direction, n_samples, seconds = self.get_trend()
+
+        if seconds < 60:
+            return False, f"need_more_data({seconds:.0f}s)"
+
+        # Must have minimum current probability
+        if current_prob < PROB_TREND_MIN_CURRENT:
+            return False, f"prob_too_low({current_prob:.2f})"
+
+        # Check if trend supports our side
+        if side == "yes" and "yes" in direction:
+            return True, f"trend_yes({change:+.2f}/{seconds:.0f}s)"
+        if side == "no" and "no" in direction:
+            return True, f"trend_no({change:+.2f}/{seconds:.0f}s)"
+
+        return False, f"no_trend({direction})"
+
+    def summary(self) -> str:
+        """Short string for logging"""
+        change, direction, n, seconds = self.get_trend()
+        if n < PROB_TREND_MIN_SAMPLES:
+            return f"prob_trend=warming({n}/{PROB_TREND_MIN_SAMPLES})"
+        return f"prob_trend={direction}({change:+.0%}/{seconds:.0f}s/{n}pts)"
+
+
 @dataclass
 class BotState:
     sm: str = SM.IDLE
@@ -1466,6 +1561,7 @@ def main() -> None:
     st = BotState()
     session = SessionState()
     trend = SpotTrend()
+    prob_trend = ProbTrend()
     active_market_obj: Dict[str, Any] = {}
 
     # Initialize session with starting balance
@@ -1546,10 +1642,9 @@ def main() -> None:
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
             log.warning(
                 f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
-                f"SESSION: daily_pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
-                f"W/L={session.total_wins}/{session.total_losses} "
-                f"frac={session.current_fraction:.1%} paused={session.is_paused} | "
-                f"{trend.summary()}"
+                f"SESSION: pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
+                f"W/L={session.total_wins}/{session.total_losses} frac={session.current_fraction:.1%} | "
+                f"{prob_trend.summary()}"
             )
             last_heartbeat = now
 
@@ -1611,6 +1706,7 @@ def main() -> None:
 
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
+                    prob_trend.reset(mt2)
 
                     st.event = ev2
                     st.market = mt2
@@ -1825,6 +1921,9 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # Record probability for trend detection (every poll while armed)
+        prob_trend.record(p_yes_blend)
+
         if LOG_DECISIONS:
             yes_px_log = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
             no_px_log = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
@@ -1838,10 +1937,9 @@ def main() -> None:
 
             log.info(
                 f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} "
-                f"yes_buffer={yes_buffer_str} no_buffer={no_buffer_str} "
-                f"p_yes_blend={p_yes_blend:.4f} p_no_blend={p_no_blend:.4f} "
+                f"p_yes={p_yes_blend:.2f} p_no={p_no_blend:.2f} "
                 f"YES(edge={edge_yes_str}) NO(edge={edge_no_str}) -> {chosen_side}@{chosen_px} "
-                f"| {trend.summary()}"
+                f"| {prob_trend.summary()}"
             )
 
         if chosen_side is None or chosen_px is None:
@@ -1891,6 +1989,21 @@ def main() -> None:
                 log.info(f"[TREND] Trading {chosen_side.upper()} against {trend_dir} — edge {edge_for_trend:.4f} sufficient")
         elif alignment == "with":
             log.info(f"[TREND] Trading WITH {trend_dir} ({chosen_side.upper()}) — {trend.summary()}")
+
+        # --- PROBABILITY TREND CHECK: the main signal ---
+        # We want to see probability trending strongly in one direction before entering
+        current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
+        prob_trend_ok, prob_trend_reason = prob_trend.should_buy(chosen_side, current_prob_for_side)
+
+        if PROB_TREND_ENTRY_ENABLED and not prob_trend_ok:
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.info(f"[PROB_TREND] Waiting for momentum: {prob_trend_reason} | {prob_trend.summary()}")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if prob_trend_ok:
+            log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
 
         # Check session limits before trading
         can_trade, pause_reason = session.check_can_trade()
