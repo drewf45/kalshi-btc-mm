@@ -135,7 +135,7 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.70  # Higher confidence = better win rate - HARDWIRED
+PROB_MIN = 0.75  # High confidence entries only - HARDWIRED
 EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
 MAX_ENTRY_PRICE_CENTS = 90  # Edge gate caps effective price to prob*100 - HARDWIRED
 FEE_CENTS_PER_CONTRACT = 0
