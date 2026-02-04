@@ -128,7 +128,7 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
 # -------------- SCALPER STRATEGY (HARDWIRED) --------------
-ENTRY_START_SECONDS = 180  # 3 min before close - wait for certainty - HARDWIRED
+ENTRY_START_SECONDS = 360  # Arm at 6min - watch book settle early - HARDWIRED
 ENTRY_DECISION_SECONDS = 60
 ENTRY_LAST_SECONDS = 30  # Trade until 30s before close - HARDWIRED
 FILL_WAIT_SECONDS = 20
