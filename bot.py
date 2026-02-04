@@ -135,7 +135,7 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.85  # Very high confidence only - HARDWIRED
+PROB_MIN = 0.90  # Near certainty - HARDWIRED
 EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
 MAX_ENTRY_PRICE_CENTS = 90  # Allow higher entries with high prob - HARDWIRED
 FEE_CENTS_PER_CONTRACT = 0
@@ -170,25 +170,25 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (HARDWIRED - less aggressive) --------------
+# -------------- DUMP CONFIGURATION (SIMPLE: only dump below 50%) --------------
 ENABLE_DUMP = True
-DUMP_PROB_FLIP = 0.35  # Exit if prob drops below 35% - HARDWIRED
-DUMP_PROB_DROP_PERCENT = 0.30  # Exit on 30% drop (less aggressive) - HARDWIRED
-DUMP_MARKET_FLIP_THRESHOLD = 0.30
+DUMP_PROB_FLIP = 0.50  # Only dump if our prob drops below 50% - HARDWIRED
+DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (would need 100% drop)
+DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Market book flips against us
 DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
-DUMP_ON_PRICE_DANGER = True
-DUMP_PRICE_SIGMA_MULTIPLIER = 1.5  # Less sensitive to price swings
+DUMP_ON_PRICE_DANGER = False  # Disabled - trust probability
+DUMP_PRICE_SIGMA_MULTIPLIER = 1.5
 
-# -------------- DUMP GRACE / SETTLING PERIOD (anti-jostle) --------------
-DUMP_GRACE_PERIOD_SECONDS = 60    # No dumps at all for 60s after entry
-DUMP_SETTLING_PERIOD_SECONDS = 120  # Use relaxed thresholds for 120s after entry
-DUMP_SETTLING_PROB_FLIP = 0.20      # During settling: only dump if prob below 20%
-DUMP_SETTLING_PROB_DROP = 0.50      # During settling: only dump on 50%+ drop
-DUMP_SETTLING_MARKET_FLIP = 0.20    # During settling: only dump if market prob < 20%
-DUMP_NEAR_5050_ENTRY_THRESHOLD = 0.65  # Entry p_gate below this = "near 50/50"
-DUMP_NEAR_5050_PROB_FLIP = 0.25     # Near 50/50 entries: only dump below 25%
-DUMP_NEAR_5050_PROB_DROP = 0.40     # Near 50/50 entries: only dump on 40%+ drop
-DUMP_NEAR_5050_MARKET_FLIP = 0.25   # Near 50/50 entries: market flip threshold
+# -------------- DUMP GRACE PERIOD (short - we enter at high confidence) --------------
+DUMP_GRACE_PERIOD_SECONDS = 15    # Brief grace, we enter at 90%+ so it's settled
+DUMP_SETTLING_PERIOD_SECONDS = 30  # Short settling
+DUMP_SETTLING_PROB_FLIP = 0.50      # Same threshold during settling
+DUMP_SETTLING_PROB_DROP = 1.0       # Disabled
+DUMP_SETTLING_MARKET_FLIP = 0.50
+DUMP_NEAR_5050_ENTRY_THRESHOLD = 0.65  # Won't trigger at 90%+ entries anyway
+DUMP_NEAR_5050_PROB_FLIP = 0.50
+DUMP_NEAR_5050_PROB_DROP = 1.0
+DUMP_NEAR_5050_MARKET_FLIP = 0.50
 
 # -------------- SMART DUMP (cut losses, let winners ride) --------------
 DUMP_IF_LOSING_CENTS = 25  # Dump if underwater by 25¢+ (more room)
