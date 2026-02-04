@@ -135,7 +135,7 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.60  # Minimum prob to even consider (trend does the real work) - HARDWIRED
+PROB_MIN = 0.65  # Minimum prob to even consider (trend does the real work) - HARDWIRED
 EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
 MAX_ENTRY_PRICE_CENTS = 90  # Allow higher entries with high prob - HARDWIRED
 FEE_CENTS_PER_CONTRACT = 0
@@ -143,9 +143,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # -------------- PROBABILITY TREND DETECTION (watch early, buy on momentum) --------------
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
 PROB_TREND_MIN_SAMPLES = 10       # Need at least 10 samples (~90s at 1/sec)
-PROB_TREND_THRESHOLD = 0.12       # 12% swing in one direction = strong trend
-PROB_TREND_MIN_CURRENT = 0.60     # Current prob must be at least 60% for our side
+PROB_TREND_THRESHOLD = 0.10       # 10% swing in one direction = strong trend
+PROB_TREND_MIN_CURRENT = 0.70     # Current prob must be at least 70% for our side
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries
+REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
@@ -2001,6 +2002,32 @@ def main() -> None:
                 last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
+
+        # --- CROSS-VALIDATE: prob trend must match BTC spot trend ---
+        # If probability says YES but BTC is dropping, that's suspicious (whale manipulation?)
+        # If probability says NO but BTC is rising, also suspicious
+        if REQUIRE_TREND_ALIGNMENT and prob_trend_ok:
+            prob_change, prob_dir, _, _ = prob_trend.get_trend()
+            spot_move, spot_dir, _ = trend.get_trend()
+
+            # Determine expected alignment
+            # YES = BTC should be stable or rising (not strong_down)
+            # NO = BTC should be stable or falling (not strong_up)
+            misaligned = False
+            if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 50:
+                misaligned = True
+                mismatch_reason = f"prob_yes but BTC {spot_dir} (${spot_move:+.0f})"
+            elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 50:
+                misaligned = True
+                mismatch_reason = f"prob_no but BTC {spot_dir} (${spot_move:+.0f})"
+
+            if misaligned:
+                log.warning(f"[ALIGNMENT] BLOCKED — {mismatch_reason}. Prob trend may be manipulation, not signal.")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Log alignment confirmation
+            log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC {spot_dir}")
 
         if prob_trend_ok:
             log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
