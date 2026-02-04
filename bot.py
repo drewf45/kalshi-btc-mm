@@ -135,9 +135,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.55  # Lower threshold = more trades - HARDWIRED
+PROB_MIN = 0.70  # Higher confidence = better win rate - HARDWIRED
 EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
-MAX_ENTRY_PRICE_CENTS = 90  # Allow up to 90¢ - HARDWIRED
+MAX_ENTRY_PRICE_CENTS = 55  # Cap entry price so wins > losses - HARDWIRED
 FEE_CENTS_PER_CONTRACT = 0
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
