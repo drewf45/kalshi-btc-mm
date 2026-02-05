@@ -2,17 +2,17 @@
 # Kalshi rolling 15m BTC SCALPER - Trade every market with edge
 #
 # STRATEGY:
-# - Arms at T-360s (6 minutes before close) for early edge capture
-# - Trades aggressively: 55% prob, 1% edge, up to 90¢ entry
+# - Arms at T-720s (12 minutes before close) to catch moves early
+# - Watches probability trend develop, enters when momentum confirms
 # - Scales bankroll UP on wins, pulls back on losses
-# - DUMPS fast if probability flips or drawdown hits limits
+# - PROACTIVE DUMP: exits when probability reverses, not when it's too late
 # - Session-level loss limits to protect capital
 #
 # KEY SETTINGS:
-# - ENTRY_START_SECONDS=360 (6 min window)
+# - ENTRY_START_SECONDS=720 (12 min window - catch moves early)
 # - ENTRY_LAST_SECONDS=30 (trade until 30s before close)
-# - PROB_MIN=0.55 (trade more markets)
-# - EDGE_MIN=0.01 (1% minimum edge)
+# - PROB_MIN=0.65, PROB_TREND_MIN_CURRENT=0.70
+# - DUMP_REVERSAL_THRESHOLD=8% (exit on reversal, not on total loss)
 # - MAX_ENTRY_PRICE=90¢ (allow higher entries)
 # - BANKROLL_FRACTION=0.15 (15% base sizing)
 # - Bankroll scaling: increase on wins, decrease on losses
@@ -128,7 +128,7 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
 # -------------- SCALPER STRATEGY (HARDWIRED) --------------
-ENTRY_START_SECONDS = 360  # Arm at 6min - watch book settle early - HARDWIRED
+ENTRY_START_SECONDS = 720  # Arm at 12min - catch the move early, not after it's priced in
 ENTRY_DECISION_SECONDS = 60
 ENTRY_LAST_SECONDS = 30  # Trade until 30s before close - HARDWIRED
 FILL_WAIT_SECONDS = 20
