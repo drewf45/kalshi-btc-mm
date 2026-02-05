@@ -1,23 +1,22 @@
 # bot.py
-# Kalshi rolling 15m BTC aggressive strategy with DUMP capability
+# Kalshi rolling 15m BTC SCALPER - Trade every market with edge
 #
-# WHAT THIS DOES:
-# - Arms at T-600s (10 minutes before close) 
-# - Trades aggressively (60% prob, 1.5% edge, up to 85¢ entry)
-# - Monitors position continuously
-# - DUMPS position if probability flips or price moves dangerously
-# - Sizes positions at 10% of bankroll with Kelly scaling
+# STRATEGY:
+# - Arms at T-720s (12 minutes before close) to catch moves early
+# - Watches probability trend develop, enters when momentum confirms
+# - Scales bankroll UP on wins, pulls back on losses
+# - PROACTIVE DUMP: exits when probability reverses, not when it's too late
+# - Session-level loss limits to protect capital
 #
-# CHANGES FROM ORIGINAL:
-# - Changed ENTRY_START_SECONDS from 120 -> 600 (10 min early arming)
-# - Changed PROB_MIN from 0.85 -> 0.60 (trade more)
-# - Changed EDGE_MIN from 0.01 -> 0.015 (1.5%)
-# - Changed MAX_ENTRY_PRICE from 99 -> 85¢
-# - Changed BANKROLL_FRACTION from 0.05 -> 0.10 (10%)
-# - Added DUMP logic with multiple exit triggers
-# - Added continuous position monitoring in HOLD state
-# - Removed "one decision" constraint - now checks continuously while armed
-# - ADDED DEBUG LOGGING FOR URL CONSTRUCTION
+# KEY SETTINGS:
+# - ENTRY_START_SECONDS=720 (12 min window - catch moves early)
+# - ENTRY_LAST_SECONDS=30 (trade until 30s before close)
+# - PROB_MIN=0.65, PROB_TREND_MIN_CURRENT=0.70
+# - DUMP_REVERSAL_THRESHOLD=8% (exit on reversal, not on total loss)
+# - MAX_ENTRY_PRICE=90¢ (allow higher entries)
+# - BANKROLL_FRACTION=0.15 (15% base sizing)
+# - Bankroll scaling: increase on wins, decrease on losses
+# - Session loss limit: stop trading if down too much
 
 import os
 import time
@@ -48,6 +47,11 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-bot")
 log.warning("BOOT: logger initialized", extra={})
+
+# Early debug: Check if credentials exist
+print(f"DEBUG: KALSHI_API_KEY_ID exists: {bool(os.getenv('KALSHI_API_KEY_ID'))}", flush=True)
+print(f"DEBUG: KALSHI_PRIVATE_KEY_PEM_BASE64 exists: {bool(os.getenv('KALSHI_PRIVATE_KEY_PEM_BASE64'))}", flush=True)
+print(f"DEBUG: KALSHI_API_BASE = {os.getenv('KALSHI_API_BASE', 'not set')}", flush=True)
 
 
 # -----------------------------
@@ -123,25 +127,47 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# -------------- AGGRESSIVE STRATEGY ENVs --------------
-ENTRY_START_SECONDS = env_int("ENTRY_START_SECONDS", 600)  # CHANGED: 10 min early
-ENTRY_DECISION_SECONDS = env_int("ENTRY_DECISION_SECONDS", 60)
-ENTRY_LAST_SECONDS = env_int("ENTRY_LAST_SECONDS", 45)  # Stop new entries at 45s
-FILL_WAIT_SECONDS = env_int("FILL_WAIT_SECONDS", 30)
-ALLOW_TAKER_AT_LAST = env_bool("ALLOW_TAKER_AT_LAST", True)
-CANCEL_UNFILLED_AT_CLOSE = env_bool("CANCEL_UNFILLED_AT_CLOSE", True)
+# -------------- SCALPER STRATEGY (HARDWIRED) --------------
+ENTRY_START_SECONDS = 720  # Arm at 12min - catch the move early, not after it's priced in
+ENTRY_DECISION_SECONDS = 60
+ENTRY_LAST_SECONDS = 30  # Trade until 30s before close - HARDWIRED
+FILL_WAIT_SECONDS = 20
+ALLOW_TAKER_AT_LAST = True
+CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = env_float("PROB_MIN", 0.60)  # CHANGED: Lower threshold
-EDGE_MIN = env_float("EDGE_MIN", 0.015)  # CHANGED: 1.5% edge
-MAX_ENTRY_PRICE_CENTS = env_int("MAX_ENTRY_PRICE_CENTS", 85)  # CHANGED: Max 85¢
-FEE_CENTS_PER_CONTRACT = env_int("FEE_CENTS_PER_CONTRACT", 0)
+PROB_MIN = 0.65  # Minimum prob to even consider (trend does the real work) - HARDWIRED
+EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
+MAX_ENTRY_PRICE_CENTS = 90  # Allow higher entries with high prob - HARDWIRED
+FEE_CENTS_PER_CONTRACT = 0
 
-SPOT_SIGMA_USD_PER_SQRT_SEC = env_float("SPOT_SIGMA_USD_PER_SQRT_SEC", 12.0)
+# -------------- PROBABILITY TREND DETECTION (watch early, buy on momentum) --------------
+PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
+PROB_TREND_MIN_SAMPLES = 10       # Need at least 10 samples (~90s at 1/sec)
+PROB_TREND_THRESHOLD = 0.10       # 10% swing in one direction = strong trend
+PROB_TREND_MIN_CURRENT = 0.70     # Current prob must be at least 70% for our side
+PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries
+REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend
 
-BANKROLL_FRACTION = env_float("BANKROLL_FRACTION", 0.10)  # CHANGED: 10% per trade
-MIN_CONTRACTS = env_int("MIN_CONTRACTS", 1)
-MAX_CONTRACTS = env_int("MAX_CONTRACTS", 50)
-MIN_FREE_USD_TO_TRADE = env_float("MIN_FREE_USD_TO_TRADE", 5.0)
+SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
+
+BANKROLL_FRACTION = 0.15  # 15% base per trade - HARDWIRED
+MIN_CONTRACTS = 1
+MAX_CONTRACTS = 100  # Allow bigger positions
+MIN_FREE_USD_TO_TRADE = 5.0
+
+# -------------- BANKROLL SCALING (HARDWIRED) --------------
+ENABLE_BANKROLL_SCALING = True
+SCALING_WIN_MULTIPLIER = 1.25  # +25% after win
+SCALING_LOSS_MULTIPLIER = 0.70  # -30% after loss
+SCALING_MIN_FRACTION = 0.05  # Floor at 5%
+SCALING_MAX_FRACTION = 0.35  # Cap at 35%
+
+# -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
+ENABLE_SESSION_LIMITS = True
+DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
+SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one market
+SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
+BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
@@ -152,14 +178,27 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (NEW) --------------
-ENABLE_DUMP = env_bool("ENABLE_DUMP", True)
-DUMP_PROB_FLIP = env_float("DUMP_PROB_FLIP", 0.45)  # Exit if prob drops below 45%
-DUMP_PROB_DROP_PERCENT = env_float("DUMP_PROB_DROP_PERCENT", 0.20)  # Exit if -20% drop
-DUMP_MARKET_FLIP_THRESHOLD = env_float("DUMP_MARKET_FLIP_THRESHOLD", 0.30)
-DUMP_MIN_TIME_REMAINING = env_int("DUMP_MIN_TIME_REMAINING", 30)  # Never dump <30s
-DUMP_ON_PRICE_DANGER = env_bool("DUMP_ON_PRICE_DANGER", True)
-DUMP_PRICE_SIGMA_MULTIPLIER = env_float("DUMP_PRICE_SIGMA_MULTIPLIER", 1.5)
+# -------------- DUMP CONFIGURATION (PROACTIVE: get best exit price) --------------
+ENABLE_DUMP = True
+# OLD: DUMP_PROB_FLIP = 0.50 (waited too long, terrible exit prices)
+# NEW: Dump based on probability TREND, not absolute threshold
+DUMP_PROB_FLIP = 0.45  # Last resort floor - if we somehow got here, definitely dump
+DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (trend detection handles this better)
+DUMP_MARKET_FLIP_THRESHOLD = 0.45  # Last resort floor
+DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
+DUMP_ON_PRICE_DANGER = False  # Disabled - trust probability
+
+# -------------- PROACTIVE DUMP (dump early when trend reverses) --------------
+DUMP_ON_PROB_REVERSAL = True   # Dump when probability is trending against us
+DUMP_REVERSAL_THRESHOLD = 0.12  # If prob drops 12%+ from peak, it's a real reversal
+DUMP_REVERSAL_MIN_SAMPLES = 5   # Need at least 5 samples to confirm reversal
+DUMP_EARLY_EXIT_ENABLED = True  # Allow dumping above 50% if trend is bad
+
+# -------------- DUMP TIMING (balance early arm with patience) --------------
+DUMP_GRACE_PERIOD_SECONDS = 15      # No dumps at all for first 15s (entry settling)
+DUMP_PROACTIVE_AFTER_SECONDS = 90   # Proactive dumps only after 90s in trade
+# First 90s: only dump if floor hit (45%) - let the trade breathe
+# After 90s: dump on 12% reversal from peak - now it's a real signal
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -184,32 +223,41 @@ _last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
 
 # -------------- SIZING + PROB GATE --------------
 PROB_GATE_USE_BLEND = env_bool("PROB_GATE_USE_BLEND", True)
-BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.25)
+BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.40)  # Allow up to 40%
 
-EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.02)
-EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 2.5)
+EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.015)  # Start scaling earlier
+EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 3.0)  # Steeper scaling
 
-A_PLUS_PROB = env_float("A_PLUS_PROB", 0.92)
-A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)
-A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.15)
+A_PLUS_PROB = env_float("A_PLUS_PROB", 0.85)  # Lower bar for A+ trades
+A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.025)
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.25)  # Go bigger on A+ setups
 
-HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.98)
-HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 10)
+HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
-LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 15)
-LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 100.0)
-LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.05)
-LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 20)
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 75.0)  # Tighter buffer
+LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.03)
+LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 30)
+
+# -------------- TREND TRACKING (know what BTC is doing) --------------
+TREND_WINDOW_MINUTES = 60          # Look back 60 min (~4 markets)
+TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
+TREND_STRONG_THRESHOLD = 100.0     # $100+ move in window = strong trend
+TREND_MODERATE_THRESHOLD = 50.0    # $50+ move = moderate trend
+TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against strong trend
+TREND_AGAINST_BLOCK = True         # Block trades against strong trend entirely
+TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading with trend
 
 # Heartbeat
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 
 # -----------------------------
-# Kalshi API client (RSA-PSS signing)  **WITH DEBUG**
+# Kalshi API client (RSA-PSS signing)  **UNCHANGED**
 # -----------------------------
 class KalshiClient:
     def __init__(self, api_base: str, api_prefix: str, key_id: str, private_key_pem_b64: str):
@@ -224,9 +272,6 @@ class KalshiClient:
         self.private_key = serialization.load_pem_private_key(pem_bytes, password=None)
 
         self.session = requests.Session()
-        
-        # DEBUG: Print what we initialized with
-        print(f"DEBUG INIT: api_base={self.api_base} api_prefix={self.api_prefix}", flush=True)
 
     def _sign_headers(self, method: str, full_url: str) -> Dict[str, str]:
         ts = str(now_ms())
@@ -263,9 +308,6 @@ class KalshiClient:
 
         url = f"{self.api_base}{self.api_prefix}{path}"
         url_with_q = url + "?" + urlencode(params) if params else url
-        
-        # DEBUG: Print the constructed URL
-        print(f"DEBUG URL: base={self.api_base} prefix={self.api_prefix} path={path} -> full={url_with_q}", flush=True)
 
         headers = self._sign_headers(method, url)
         headers["Accept"] = "application/json"
@@ -711,48 +753,26 @@ def parse_position_for_market(positions: List[Dict[str, Any]], market_ticker: st
 def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[float]]:
     try:
         resp = client.request("GET", "/portfolio/balance")
-    except Exception:
+    except Exception as e:
+        log.warning(f"[BALANCE] API exception: {e}")
         return None, None
     if not isinstance(resp, dict):
+        log.warning(f"[BALANCE] Response not dict: {type(resp)} = {resp}")
         return None, None
 
-    base = resp.get("balance") if isinstance(resp.get("balance"), dict) else resp
+    # Kalshi API returns: {'balance': 2512, 'portfolio_value': 0, 'updated_ts': ...}
+    # balance is in CENTS, need to convert to dollars
+    balance_cents = resp.get("balance")
+    portfolio_cents = resp.get("portfolio_value", 0)
 
-    cand_available = [
-        "available_balance",
-        "available",
-        "available_cash",
-        "available_funds",
-        "free_collateral",
-        "available_collateral",
-    ]
-    cand_total = [
-        "balance",
-        "total_balance",
-        "total",
-        "equity",
-        "account_value",
-    ]
+    if balance_cents is not None:
+        available_usd = float(balance_cents) / 100.0
+        total_usd = float(balance_cents + portfolio_cents) / 100.0
+        log.info(f"[BALANCE] {balance_cents}¢ available (${available_usd:.2f}), portfolio={portfolio_cents}¢")
+        return available_usd, total_usd
 
-    av = None
-    tot = None
-
-    for k in cand_available:
-        if k in base:
-            try:
-                av = float(base[k])
-                break
-            except Exception:
-                pass
-    for k in cand_total:
-        if k in base:
-            try:
-                tot = float(base[k])
-                break
-            except Exception:
-                pass
-
-    return av, tot
+    log.warning(f"[BALANCE] Could not find 'balance' in response: {resp}")
+    return None, None
 
 
 def build_order_payload(
@@ -812,6 +832,363 @@ class SM:
     HOLD = "HOLD"  # Now actively monitors for dump conditions
     DUMPED = "DUMPED"  # NEW: Position was dumped early
     ROLL = "ROLL"
+    COOLDOWN = "COOLDOWN"  # Paused due to session limits
+
+
+@dataclass
+class SessionState:
+    """Track daily P&L from real balance, reset per-market stats on each roll"""
+    # Daily tracking (persists across markets, only resets on bot restart)
+    starting_balance_usd: float = 0.0  # Balance when bot started
+    current_balance_usd: float = 0.0   # Last known real balance from API
+    daily_pnl_usd: float = 0.0         # True P&L = current_balance - starting_balance
+    total_markets: int = 0
+    total_wins: int = 0
+    total_losses: int = 0
+
+    # Per-market tracking (resets on each market roll)
+    market_wins: int = 0
+    market_losses: int = 0
+    consecutive_losses: int = 0
+    consecutive_wins: int = 0
+    current_fraction: float = BANKROLL_FRACTION
+
+    # Session limits
+    is_paused: bool = False
+    pause_until: float = 0.0
+    pause_reason: Optional[str] = None
+    is_daily_stopped: bool = False  # HARD STOP - never unpauses
+
+    # Balance refresh
+    pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
+
+    # Trade history
+    recent_trades: List[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.recent_trades is None:
+            self.recent_trades = []
+
+    def reset_for_new_market(self):
+        """Reset per-market state on each market roll. Daily state persists."""
+        self.market_wins = 0
+        self.market_losses = 0
+        self.consecutive_losses = 0
+        self.consecutive_wins = 0
+        self.current_fraction = BANKROLL_FRACTION  # Reset to base fraction
+        # Clear per-market pause (but NOT daily hard stop)
+        if not self.is_daily_stopped:
+            self.is_paused = False
+            self.pause_reason = None
+        log.warning(
+            f"[SESSION] Market reset: fraction={self.current_fraction:.2%} "
+            f"daily_pnl=${self.daily_pnl_usd:.2f} W/L={self.total_wins}/{self.total_losses}"
+        )
+
+    def update_balance(self, balance_usd: float):
+        """Update true P&L from actual account balance"""
+        self.current_balance_usd = balance_usd
+        self.daily_pnl_usd = balance_usd - self.starting_balance_usd
+        log.warning(
+            f"[SESSION] Balance update: ${balance_usd:.2f} "
+            f"(started=${self.starting_balance_usd:.2f}, daily_pnl=${self.daily_pnl_usd:.2f})"
+        )
+        # Check daily hard stop
+        self._check_daily_stop()
+
+    def schedule_balance_check(self):
+        """Schedule a balance check after settlement"""
+        self.pending_balance_check_at = time.time() + BALANCE_CHECK_DELAY_SECONDS
+        log.info(f"[SESSION] Balance check scheduled in {BALANCE_CHECK_DELAY_SECONDS}s")
+
+    def needs_balance_check(self) -> bool:
+        """Check if it's time to fetch balance"""
+        return self.pending_balance_check_at > 0 and time.time() >= self.pending_balance_check_at
+
+    def clear_balance_check(self):
+        self.pending_balance_check_at = 0.0
+
+    def record_trade(self, market: str, side: str, entry_price: int, exit_price: Optional[int],
+                     qty: int, pnl_cents: int, was_dump: bool = False):
+        """Record a completed trade"""
+        pnl_usd = pnl_cents / 100.0
+        self.total_markets += 1
+
+        trade = {
+            "market": market, "side": side, "entry": entry_price,
+            "exit": exit_price, "qty": qty, "pnl_cents": pnl_cents,
+            "pnl_usd": pnl_usd, "was_dump": was_dump, "ts": time.time(),
+        }
+        self.recent_trades.append(trade)
+        if len(self.recent_trades) > 50:
+            self.recent_trades = self.recent_trades[-50:]
+
+        if pnl_cents > 0:
+            self.total_wins += 1
+            self.market_wins += 1
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            self._scale_up()
+        else:
+            self.total_losses += 1
+            self.market_losses += 1
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+            self._scale_down()
+
+        # Check consecutive loss limit (per-market)
+        self._check_consecutive_limit()
+
+        # Schedule balance check to get true P&L
+        self.schedule_balance_check()
+
+        log.warning(
+            f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
+            f"W/L={self.total_wins}/{self.total_losses} "
+            f"streak={self.consecutive_wins}W/{self.consecutive_losses}L "
+            f"fraction={self.current_fraction:.2%}"
+        )
+
+    def _scale_up(self):
+        if not ENABLE_BANKROLL_SCALING:
+            return
+        new_frac = self.current_fraction * SCALING_WIN_MULTIPLIER
+        self.current_fraction = min(new_frac, SCALING_MAX_FRACTION)
+
+    def _scale_down(self):
+        if not ENABLE_BANKROLL_SCALING:
+            return
+        new_frac = self.current_fraction * SCALING_LOSS_MULTIPLIER
+        self.current_fraction = max(new_frac, SCALING_MIN_FRACTION)
+
+    def _check_daily_stop(self):
+        """HARD STOP: never lose more than 75% of starting balance"""
+        if not ENABLE_SESSION_LIMITS or self.starting_balance_usd <= 0:
+            return
+        loss_pct = -self.daily_pnl_usd / self.starting_balance_usd
+        if loss_pct >= DAILY_MAX_LOSS_PERCENT:
+            self.is_daily_stopped = True
+            self.is_paused = True
+            self.pause_reason = f"DAILY_HARD_STOP_lost_{loss_pct:.0%}"
+            log.warning(
+                f"[SESSION] DAILY HARD STOP: lost {loss_pct:.0%} of starting balance "
+                f"(${self.starting_balance_usd:.2f} -> ${self.current_balance_usd:.2f}). "
+                f"Bot will NOT trade until restart."
+            )
+
+    def _check_consecutive_limit(self):
+        """Pause on consecutive losses within a market (temporary cooldown)"""
+        if not ENABLE_SESSION_LIMITS:
+            return
+        if self.consecutive_losses >= SESSION_CONSECUTIVE_LOSSES_LIMIT:
+            self.is_paused = True
+            self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
+            self.pause_reason = f"consecutive_losses_{self.consecutive_losses}"
+            self.current_fraction = SCALING_MIN_FRACTION
+            log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
+
+    def check_can_trade(self) -> Tuple[bool, Optional[str]]:
+        """Check if we can trade"""
+        # Daily hard stop is permanent until restart
+        if self.is_daily_stopped:
+            return False, f"DAILY_HARD_STOP (lost 75%+ of starting balance)"
+
+        if not self.is_paused:
+            return True, None
+
+        if self.pause_until > 0 and time.time() >= self.pause_until:
+            self.is_paused = False
+            self.pause_reason = None
+            self.consecutive_losses = 0
+            log.warning("[SESSION] Cooldown ended, resuming trading")
+            return True, None
+
+        remaining = int(self.pause_until - time.time()) if self.pause_until > 0 else 0
+        return False, f"paused:{self.pause_reason} ({remaining}s remaining)"
+
+    def get_current_fraction(self) -> float:
+        """Get the current bankroll fraction to use"""
+        return self.current_fraction
+
+
+class SpotTrend:
+    """
+    Tracks BTC spot price over a rolling window to detect trends.
+    Helps the bot avoid trading against strong momentum.
+    """
+    def __init__(self, window_minutes: int = TREND_WINDOW_MINUTES,
+                 sample_interval: int = TREND_SAMPLE_INTERVAL_SECONDS):
+        self.window_seconds = window_minutes * 60
+        self.sample_interval = sample_interval
+        self.samples: List[Tuple[float, float]] = []  # (timestamp, spot_price)
+        self.last_sample_time: float = 0.0
+
+    def record(self, spot: float) -> None:
+        """Record a spot price sample (rate-limited by sample_interval)"""
+        now = time.time()
+        if (now - self.last_sample_time) < self.sample_interval:
+            return
+        self.samples.append((now, spot))
+        self.last_sample_time = now
+        # Prune old samples outside the window
+        cutoff = now - self.window_seconds
+        self.samples = [(t, p) for t, p in self.samples if t >= cutoff]
+
+    def get_trend(self) -> Tuple[float, str, int]:
+        """
+        Returns: (move_usd, direction, num_samples)
+        - move_usd: price change from oldest to newest sample (positive = up)
+        - direction: "up", "down", or "flat"
+        - num_samples: how many data points we have
+        """
+        if len(self.samples) < 2:
+            return 0.0, "flat", len(self.samples)
+
+        oldest_price = self.samples[0][1]
+        newest_price = self.samples[-1][1]
+        move = newest_price - oldest_price
+
+        if abs(move) >= TREND_STRONG_THRESHOLD:
+            direction = "strong_up" if move > 0 else "strong_down"
+        elif abs(move) >= TREND_MODERATE_THRESHOLD:
+            direction = "up" if move > 0 else "down"
+        else:
+            direction = "flat"
+
+        return move, direction, len(self.samples)
+
+    def get_window_minutes(self) -> float:
+        """How many minutes of data we actually have"""
+        if len(self.samples) < 2:
+            return 0.0
+        return (self.samples[-1][0] - self.samples[0][0]) / 60.0
+
+    def trade_alignment(self, side: str, lo: Optional[float], hi: Optional[float],
+                        spot: float) -> str:
+        """
+        Check if a proposed trade aligns with the trend.
+        Returns: "with", "against", or "neutral"
+
+        Logic:
+        - YES bet = we think BTC will stay ABOVE lo (or in range)
+        - NO bet = we think BTC will stay BELOW hi (or in range)
+        - If BTC is trending UP strongly and we want NO → against trend
+        - If BTC is trending DOWN strongly and we want YES → against trend
+        """
+        move, direction, _ = self.get_trend()
+
+        if direction == "flat":
+            return "neutral"
+
+        trending_up = "up" in direction
+        trending_down = "down" in direction
+
+        if side == "yes" and trending_down:
+            return "against"
+        if side == "no" and trending_up:
+            return "against"
+        if side == "yes" and trending_up:
+            return "with"
+        if side == "no" and trending_down:
+            return "with"
+
+        return "neutral"
+
+    def summary(self) -> str:
+        """Short string for logging"""
+        move, direction, n = self.get_trend()
+        mins = self.get_window_minutes()
+        if n < 2:
+            return "trend=N/A(warming)"
+        return f"trend={direction}(${move:+.0f}/{mins:.0f}min/{n}pts)"
+
+
+class ProbTrend:
+    """
+    Tracks probability trend within a single market to detect momentum.
+    Enables buying when probability is steadily climbing one direction,
+    even if it hasn't hit 90% yet — catch the move early while prices are good.
+    """
+    def __init__(self):
+        self.samples: List[Tuple[float, float]] = []  # (timestamp, p_yes_blend)
+        self.market_ticker: Optional[str] = None
+
+    def reset(self, market_ticker: str) -> None:
+        """Reset for a new market"""
+        self.samples = []
+        self.market_ticker = market_ticker
+
+    def record(self, p_yes_blend: float) -> None:
+        """Record a probability sample (every poll)"""
+        now = time.time()
+        self.samples.append((now, p_yes_blend))
+        # Prune old samples outside the window
+        cutoff = now - PROB_TREND_WINDOW_SECONDS
+        self.samples = [(t, p) for t, p in self.samples if t >= cutoff]
+
+    def get_trend(self) -> Tuple[float, str, int, float]:
+        """
+        Returns: (prob_change, direction, num_samples, seconds_of_data)
+        - prob_change: how much p_yes has moved (positive = trending YES)
+        - direction: "strong_yes", "yes", "strong_no", "no", or "flat"
+        - num_samples: how many data points
+        - seconds_of_data: time span covered
+        """
+        if len(self.samples) < PROB_TREND_MIN_SAMPLES:
+            return 0.0, "flat", len(self.samples), 0.0
+
+        oldest_p = self.samples[0][1]
+        newest_p = self.samples[-1][1]
+        change = newest_p - oldest_p
+        seconds = self.samples[-1][0] - self.samples[0][0]
+
+        if change >= PROB_TREND_THRESHOLD:
+            direction = "strong_yes"
+        elif change >= PROB_TREND_THRESHOLD / 2:
+            direction = "yes"
+        elif change <= -PROB_TREND_THRESHOLD:
+            direction = "strong_no"
+        elif change <= -PROB_TREND_THRESHOLD / 2:
+            direction = "no"
+        else:
+            direction = "flat"
+
+        return change, direction, len(self.samples), seconds
+
+    def should_buy(self, side: str, current_prob: float) -> Tuple[bool, str]:
+        """
+        Check if the probability trend supports buying this side.
+        Returns: (should_buy, reason)
+
+        Logic: if probability has been steadily climbing toward our side
+        for 60+ seconds, that's the signal — don't wait for 90%.
+        """
+        if not PROB_TREND_ENTRY_ENABLED:
+            return False, "trend_entry_disabled"
+
+        change, direction, n_samples, seconds = self.get_trend()
+
+        if seconds < 60:
+            return False, f"need_more_data({seconds:.0f}s)"
+
+        # Must have minimum current probability
+        if current_prob < PROB_TREND_MIN_CURRENT:
+            return False, f"prob_too_low({current_prob:.2f})"
+
+        # Check if trend supports our side
+        if side == "yes" and "yes" in direction:
+            return True, f"trend_yes({change:+.2f}/{seconds:.0f}s)"
+        if side == "no" and "no" in direction:
+            return True, f"trend_no({change:+.2f}/{seconds:.0f}s)"
+
+        return False, f"no_trend({direction})"
+
+    def summary(self) -> str:
+        """Short string for logging"""
+        change, direction, n, seconds = self.get_trend()
+        if n < PROB_TREND_MIN_SAMPLES:
+            return f"prob_trend=warming({n}/{PROB_TREND_MIN_SAMPLES})"
+        return f"prob_trend={direction}({change:+.0%}/{seconds:.0f}s/{n}pts)"
 
 
 @dataclass
@@ -836,7 +1213,11 @@ class BotState:
     entry_model_prob: Optional[float] = None
     entry_market_prob: Optional[float] = None
     entry_spot_price: Optional[float] = None
+    entry_price_cents: Optional[int] = None  # Track entry price for P&L
     entry_time: float = 0.0
+
+    # Peak probability tracking (for proactive dump)
+    peak_prob_for_side: float = 0.0  # Highest prob we've seen for our side since entry
 
     last_p_yes: Optional[float] = None
     last_edge_yes: Optional[float] = None
@@ -848,9 +1229,885 @@ class BotState:
     last_p_yes_blend: Optional[float] = None
 
 
-# [REST OF THE CODE CONTINUES WITH CHOOSE_TRADE, SHOULD_DUMP, COMPUTE FUNCTIONS, AND MAIN - TRUNCATED FOR LENGTH]
-# THE REMAINING CODE IS IDENTICAL TO THE PREVIOUS VERSION
+# -----------------------------
+# Decision logic (MODIFIED FOR CONTINUOUS TRADING + DUMP)
+# -----------------------------
+def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
+    return float(p) - float(price_cents + fee_cents) / 100.0
 
-# Due to character limit, I'll note that the rest of the functions (choose_trade, should_dump_position, 
-# compute_fraction_for_trade, compute_qty_from_bankroll, and main) remain exactly the same as the 
-# previous version I provided. The ONLY changes are the two print() debug statements added to KalshiClient.
+
+def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int]:
+    if bid is None and ask is None:
+        return None
+    if bid is None:
+        px = int(ask) - 1
+        return clamp_int(px, 1, 99) if px >= 1 else None
+    if ask is None:
+        return clamp_int(int(bid), 1, 99)
+    max_rest = int(ask) - 1
+    if max_rest < 1:
+        return None
+    px = int(bid) + int(JOIN_UP_CENTS)
+    px = min(px, max_rest)
+    return clamp_int(px, 1, 99)
+
+
+def choose_trade(
+    http: requests.Session,
+    spot: float,
+    lo: Optional[float],
+    hi: Optional[float],
+    secs_to_close: int,
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+    no_bid: Optional[int],
+    no_ask: Optional[int],
+) -> Tuple[
+    Optional[str], Optional[int],
+    float, float,
+    float, float,
+    Optional[float], Optional[float], float,
+    float, float
+]:
+    t_eff = max(5.0, float(min(secs_to_close, 120)))
+    sigma_used = float(get_sigma_cached(http))
+    sd = sigma_used * math.sqrt(t_eff)
+
+    p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
+    p_no_model = 1.0 - p_yes_model
+
+    p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
+
+    if p_mkt is not None:
+        p_yes_blend = float(MODEL_BLEND_ALPHA) * p_yes_model + (1.0 - float(MODEL_BLEND_ALPHA)) * float(p_mkt)
+    else:
+        p_yes_blend = p_yes_model
+    p_yes_blend = max(0.0, min(1.0, p_yes_blend))
+    p_no_blend = 1.0 - p_yes_blend
+
+    if POST_ONLY:
+        yes_px = postable_entry_price(yes_bid, yes_ask)
+        no_px = postable_entry_price(no_bid, no_ask)
+    else:
+        yes_px = yes_ask
+        no_px = no_ask
+
+    ok_book_yes = spread_ok(yes_bid, yes_ask)
+    ok_book_no = spread_ok(no_bid, no_ask)
+
+    edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
+    edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+
+    div_yes = None
+    if p_mkt is not None:
+        div_yes = p_yes_model - p_mkt
+
+    div_gate_yes = True
+    div_gate_no = True
+    if REQUIRE_DIVERGENCE and (div_yes is not None):
+        div_gate_yes = (div_yes >= MIN_DIVERGENCE)
+        div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
+
+    # MODIFIED: Use blended probability for gating
+    effective_prob_min = PROB_MIN
+    if secs_to_close < LATE_ENTRY_TIME_SEC:
+        effective_prob_min = PROB_MIN + LATE_ENTRY_PROB_BOOST
+        
+    ok_yes = (
+        yes_px is not None
+        and ok_book_yes
+        and (p_yes_blend >= effective_prob_min)  # Use blend for gate
+        and (edge_yes >= EDGE_MIN)
+        and (yes_px <= MAX_ENTRY_PRICE_CENTS)
+        and div_gate_yes
+    )
+    ok_no = (
+        no_px is not None
+        and ok_book_no
+        and (p_no_blend >= effective_prob_min)  # Use blend for gate
+        and (edge_no >= EDGE_MIN)
+        and (no_px <= MAX_ENTRY_PRICE_CENTS)
+        and div_gate_no
+    )
+
+    # Boundary buffer protection
+    if lo is not None and spot < (lo + BOUNDARY_BUFFER_USD):
+        if ok_yes:
+            log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to lower bound ${lo:.2f}, blocking YES")
+        ok_yes = False
+    
+    if hi is not None and spot > (hi - BOUNDARY_BUFFER_USD):
+        if ok_no:
+            log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to upper bound ${hi:.2f}, blocking NO")
+        ok_no = False
+
+    # High-certainty override
+    if secs_to_close < HIGH_CERTAINTY_TIME_SEC:
+        yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
+        no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
+        
+        if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= HIGH_CERTAINTY_MAX_PRICE and yes_boundary_ok:
+            ok_yes = True
+            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_model:.4f}, price={yes_px})")
+        if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= HIGH_CERTAINTY_MAX_PRICE and no_boundary_ok:
+            ok_no = True
+            log.info(f"[OVERRIDE] NO high-certainty (p={p_no_model:.4f}, price={no_px})")
+
+    if ok_yes and ok_no:
+        if edge_yes > edge_no + 1e-9:
+            return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        if edge_no > edge_yes + 1e-9:
+            return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        if p_yes_model >= p_no_model:
+            return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+    if ok_yes:
+        return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+    if ok_no:
+        return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+    return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+
+# PROACTIVE DUMP: Get best exit price, don't wait until it's too late
+def should_dump_position(
+    st: BotState,
+    p_yes_blend: float,
+    p_no_blend: float,
+    p_mkt: Optional[float],
+    spot: float,
+    lo: Optional[float],
+    hi: Optional[float],
+    sigma: float,
+    secs_to_close: int,
+    trend: Optional['SpotTrend'] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    PROACTIVE dump logic: exit early when probability reverses to get best price.
+    The goal is NOT to wait until we've definitely lost - it's to exit while
+    we can still get a decent price.
+
+    Returns: (should_dump, reason)
+    """
+    if not ENABLE_DUMP:
+        return False, None
+
+    if secs_to_close < DUMP_MIN_TIME_REMAINING:
+        return False, "too_close_to_settlement"
+
+    if st.entry_model_prob is None:
+        return False, "no_entry_data"
+
+    # --- GRACE PERIOD: brief pause to let entry volatility settle ---
+    time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 9999
+    if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
+        return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
+
+    # Determine current probability for our side
+    if st.side == "yes":
+        current_prob = p_yes_blend
+        entry_prob = st.entry_model_prob
+    else:
+        current_prob = p_no_blend
+        entry_prob = 1.0 - st.entry_model_prob
+
+    # Update peak probability tracking
+    if current_prob > st.peak_prob_for_side:
+        st.peak_prob_for_side = current_prob
+
+    drop_from_peak = st.peak_prob_for_side - current_prob
+    in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
+
+    # === PROACTIVE DUMP: Exit on probability reversal ===
+    # Only kicks in after settling period - let the trade breathe early on
+    if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED and not in_settling:
+        # If probability has dropped significantly from its peak, dump NOW
+        # Don't wait until it hits 50% - by then exit prices are terrible
+        if drop_from_peak >= DUMP_REVERSAL_THRESHOLD:
+            log.warning(
+                f"[DUMP REVERSAL] prob dropped {drop_from_peak:.1%} from peak "
+                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — exiting for best price"
+            )
+            return True, f"reversal_{current_prob:.0%}_from_peak_{st.peak_prob_for_side:.0%}"
+
+    # === FLOOR: Last resort - always active (even during settling) ===
+    if current_prob < DUMP_PROB_FLIP:
+        return True, f"floor_{current_prob:.0%}<{DUMP_PROB_FLIP:.0%}"
+
+    # Still holding - show status
+    phase = "settling" if in_settling else "active"
+    return False, f"{phase}_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}_drop={drop_from_peak:.0%}"
+
+
+def compute_fraction_for_trade(edge_net: float, p_gate: float, session_fraction: Optional[float] = None) -> float:
+    """Compute position sizing fraction based on edge, probability, and session state"""
+    # Use session-adjusted fraction if provided, otherwise use default
+    base = session_fraction if session_fraction is not None else float(BANKROLL_FRACTION)
+
+    if (p_gate >= float(A_PLUS_PROB)) and (edge_net >= float(A_PLUS_EDGE)):
+        frac = max(base, float(A_PLUS_FRACTION))
+    else:
+        bump = float(EDGE_SIZE_SLOPE) * max(0.0, float(edge_net) - float(EDGE_SIZE_START))
+        frac = base + bump
+
+    frac = min(frac, float(BANKROLL_FRACTION_HARD_CAP))
+    frac = clamp_float(frac, 0.0, 0.99)
+    return float(frac)
+
+
+def compute_qty_from_bankroll(
+    available_usd: Optional[float],
+    entry_cents: int,
+    edge_net: float,
+    p_gate: float,
+    session: Optional[SessionState] = None
+) -> int:
+    """Compute order quantity based on bankroll, edge, and session state"""
+    if entry_cents is None or entry_cents <= 0:
+        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+
+    if available_usd is None or available_usd <= 0:
+        log.warning(f"[SIZE] available_usd is None or <=0, falling back to ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+
+    if available_usd < MIN_FREE_USD_TO_TRADE:
+        log.warning(f"[SIZE] available_usd ${available_usd:.2f} < MIN_FREE_USD_TO_TRADE ${MIN_FREE_USD_TO_TRADE}, returning 0")
+        return 0
+
+    # Get session-adjusted fraction if available
+    session_fraction = session.get_current_fraction() if session else None
+    frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate, session_fraction=session_fraction)
+    stake_usd = max(0.0, float(available_usd) * float(frac))
+
+    cost_per = float(entry_cents) / 100.0
+
+    if cost_per <= 0.0:
+        log.warning(f"[SIZE] cost_per={cost_per} invalid, returning ORDER_QTY={ORDER_QTY}")
+        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+
+    qty = int(stake_usd // cost_per)
+    qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
+
+    session_info = f" (session_frac={session_fraction:.2%})" if session_fraction else ""
+    log.info(f"[SIZE] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} qty={qty}{session_info}")
+
+    return qty
+
+
+# -----------------------------
+# Main (SCALPER with session tracking)
+# -----------------------------
+def main() -> None:
+    log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
+    log.warning(
+        f"[BOOTCFG] SERIES={SERIES_TICKER} ARM_TIME={ENTRY_START_SECONDS}s "
+        f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
+        f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
+        f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
+    )
+    log.warning(
+        f"[BOOTCFG] DUMP: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
+        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} floor={DUMP_PROB_FLIP:.0%}"
+    )
+    log.warning(
+        f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
+        f"loss_mult={SCALING_LOSS_MULTIPLIER} min={SCALING_MIN_FRACTION:.0%} max={SCALING_MAX_FRACTION:.0%}"
+    )
+    log.warning(
+        f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
+        f"consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} cooldown={SESSION_COOLDOWN_MINUTES}min "
+        f"balance_check_delay={BALANCE_CHECK_DELAY_SECONDS}s"
+    )
+    log.warning(
+        f"[BOOTCFG] TREND: window={TREND_WINDOW_MINUTES}min strong=${TREND_STRONG_THRESHOLD} "
+        f"moderate=${TREND_MODERATE_THRESHOLD} block_against={TREND_AGAINST_BLOCK} "
+        f"edge_boost={TREND_AGAINST_EDGE_BOOST} edge_discount={TREND_WITH_EDGE_DISCOUNT}"
+    )
+    log.warning("[HEARTBEAT] main() entered — SCALPER is running")
+
+    if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
+        raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
+
+    client = KalshiClient(API_BASE, API_PREFIX, API_KEY_ID, PRIVATE_KEY_PEM_B64)
+    http = requests.Session()
+
+    st = BotState()
+    session = SessionState()
+    trend = SpotTrend()
+    prob_trend = ProbTrend()
+    active_market_obj: Dict[str, Any] = {}
+
+    # Initialize session with starting balance
+    try:
+        av, tot = get_balance_usd(client)
+        if av is not None:
+            session.starting_balance_usd = av
+            session.current_balance_usd = av
+            session.daily_pnl_usd = 0.0
+            log.warning(f"[SESSION] Starting balance: ${av:.2f} (75% hard stop at ${av * 0.25:.2f})")
+    except Exception as e:
+        log.warning(f"[SESSION] Could not fetch starting balance: {e}")
+
+    last_meta = 0.0
+    last_state_log = 0.0
+    last_ob_warn = 0.0
+    last_heartbeat = 0.0
+
+    def refresh_active_market() -> Tuple[str, str, Dict[str, Any]]:
+        if MARKET_OVERRIDE and MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
+            mt = MARKET_OVERRIDE
+            try:
+                snap = client.request("GET", f"/markets/{mt}")
+                mobj = snap.get("market") if isinstance(snap, dict) and isinstance(snap.get("market"), dict) else (snap if isinstance(snap, dict) else {})
+            except Exception:
+                mobj = {}
+            ev = EVENT_TICKER if EVENT_TICKER != "<auto>" else "<manual>"
+            return ev, mt, mobj
+
+        params = {"series_ticker": SERIES_TICKER, "status": "open", "limit": 200}
+        resp = client.request("GET", "/markets", params=params)
+        markets = resp.get("markets", []) if isinstance(resp, dict) else []
+        if not markets:
+            raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
+        ev, mt, mobj = pick_active_market(markets)
+        return ev, mt, mobj
+
+    def reconcile_on_market_change(new_market: str) -> None:
+        if BOOTSTRAP_CANCEL_OPEN_ORDERS or CANCEL_ALL_STRAYS_ALWAYS:
+            try:
+                cancel_all_strays_for_market(client, new_market)
+            except Exception as e:
+                log.warning(f"[RECON] cancel strays failed: {e}")
+
+        try:
+            pos = parse_position_for_market(get_positions(client), new_market)
+        except Exception:
+            pos = 0
+
+        if pos != 0:
+            st.sm = SM.HOLD
+            st.market = new_market
+            st.traded_this_market = True
+            st.order_id = None
+            # Determine which side we're holding
+            st.side = "yes" if pos > 0 else "no"
+            log.warning(f"[RECON] found existing position in {new_market}: pos={pos} side={st.side}. Enter HOLD.")
+            return
+
+        st.sm = SM.IDLE
+        st.market = new_market
+        st.traded_this_market = False
+        st.order_id = None
+        st.side = None
+        st.target_price = None
+        st.qty = 0
+
+    ev, mt, mobj = refresh_active_market()
+    active_market_obj = mobj or {}
+    st.market = mt
+    st.event = ev
+    reconcile_on_market_change(mt)
+    last_meta = time.time()
+
+    while True:
+        now = time.time()
+
+        if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
+            log.warning(
+                f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
+                f"SESSION: pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
+                f"W/L={session.total_wins}/{session.total_losses} frac={session.current_fraction:.1%} | "
+                f"{prob_trend.summary()}"
+            )
+            last_heartbeat = now
+
+        # Check if we need to fetch balance after settlement
+        if session.needs_balance_check():
+            try:
+                bal, _ = get_balance_usd(client)
+                if bal is not None:
+                    session.update_balance(bal)
+                session.clear_balance_check()
+            except Exception as e:
+                log.warning(f"[SESSION] Balance check failed: {e}")
+
+        if (now - last_meta) >= META_REFRESH_SECONDS:
+            try:
+                ev2, mt2, mobj2 = refresh_active_market()
+                if mt2 != st.market:
+                    old_market = st.market
+                    log.warning(f"[ROLL] {old_market} -> {mt2}")
+
+                    # Record P&L for settled position (if we had one)
+                    if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
+                        # Try to determine settlement result (with retry)
+                        # Settlement takes 45-60 seconds, confirmation within 3 minutes
+                        result = None
+                        log.info(f"[ROLL] Waiting for settlement result for {old_market}...")
+                        for retry in range(6):  # Try up to 6 times over ~90 seconds
+                            try:
+                                old_mkt_data = client.request("GET", f"/markets/{old_market}")
+                                old_mkt_obj = old_mkt_data.get("market", old_mkt_data) if isinstance(old_mkt_data, dict) else {}
+                                result = old_mkt_obj.get("result", "").lower()
+                                if result in ("yes", "no"):
+                                    break
+                                log.info(f"[ROLL] Retry {retry+1}/6: result='{result}' for {old_market}, waiting 15s...")
+                                time.sleep(15.0)  # Wait 15s before retry (90s total max wait)
+                            except Exception as e:
+                                log.warning(f"[ROLL] Retry {retry+1}/6 failed: {e}")
+                                time.sleep(15.0)
+
+                        # Calculate P&L based on settlement
+                        pnl_cents = None
+                        if result == "yes":
+                            # YES paid 100, NO paid 0
+                            if st.side == "yes":
+                                pnl_cents = (100 - st.entry_price_cents) * st.qty
+                            else:
+                                pnl_cents = -st.entry_price_cents * st.qty
+                        elif result == "no":
+                            # YES paid 0, NO paid 100
+                            if st.side == "yes":
+                                pnl_cents = -st.entry_price_cents * st.qty
+                            else:
+                                pnl_cents = (100 - st.entry_price_cents) * st.qty
+                        else:
+                            # Unknown result - try to determine from balance change
+                            log.warning(f"[ROLL] Unknown settlement result '{result}' for {old_market}, checking balance...")
+                            try:
+                                new_bal, _ = get_balance_usd(client)
+                                if new_bal is not None and session.current_balance_usd > 0:
+                                    bal_change_cents = int((new_bal - session.current_balance_usd) * 100)
+                                    # If balance went up, we won. If down, we lost.
+                                    if bal_change_cents > 0:
+                                        pnl_cents = (100 - st.entry_price_cents) * st.qty
+                                        log.warning(f"[ROLL] Balance up ${bal_change_cents/100:.2f} -> assuming WIN")
+                                    else:
+                                        pnl_cents = -st.entry_price_cents * st.qty
+                                        log.warning(f"[ROLL] Balance down ${-bal_change_cents/100:.2f} -> assuming LOSS")
+                                else:
+                                    # Can't determine, skip recording this trade
+                                    log.warning(f"[ROLL] Cannot determine result for {old_market}, skipping trade record")
+                                    pnl_cents = None
+                            except Exception as e:
+                                log.warning(f"[ROLL] Balance check failed: {e}, skipping trade record")
+                                pnl_cents = None
+
+                        if pnl_cents is not None:
+                            session.record_trade(
+                                market=old_market,
+                                side=st.side,
+                                entry_price=st.entry_price_cents,
+                                exit_price=100 if (result == st.side) else 0,
+                                qty=st.qty,
+                                pnl_cents=pnl_cents,
+                                was_dump=False,
+                            )
+                            log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
+
+                    # Reset per-market session state (keeps daily P&L intact)
+                    session.reset_for_new_market()
+                    prob_trend.reset(mt2)
+
+                    st.event = ev2
+                    st.market = mt2
+                    active_market_obj = mobj2 or {}
+                    st.sm = SM.ROLL
+                    st.traded_this_market = False
+                    st.order_id = None
+                    st.side = None
+                    st.target_price = None
+                    st.qty = 0
+                    st.entry_price_cents = None
+                    reconcile_on_market_change(mt2)
+                else:
+                    if isinstance(mobj2, dict) and mobj2:
+                        active_market_obj = mobj2
+                last_meta = now
+            except Exception as e:
+                log.warning(f"[ROLL] refresh failed: {e}")
+                last_meta = now
+
+        if not st.market:
+            time.sleep(POLL_SECONDS)
+            continue
+
+        close_ts = extract_close_ts(active_market_obj, st.market)
+        secs_to_close = None
+        if close_ts is not None:
+            secs_to_close = int(close_ts - int(time.time()))
+
+        pos = 0
+        try:
+            pos = parse_position_for_market(get_positions(client), st.market)
+        except Exception as e:
+            log.warning(f"[INV] positions fetch failed: {e}")
+
+        # MODIFIED: In HOLD state, check for dump conditions
+        if pos != 0:
+            if st.sm != SM.HOLD:
+                st.sm = SM.HOLD
+                st.traded_this_market = True
+                st.side = "yes" if pos > 0 else "no"
+                log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side}")
+            
+            # Check dump conditions continuously
+            if ENABLE_DUMP and secs_to_close is not None:
+                spot = fetch_btc_spot_usd(http)
+                if spot is not None:
+                    trend.record(spot)
+                    try:
+                        ob = client.request("GET", f"/markets/{st.market}/orderbook")
+                        yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
+                        lo, hi = market_bounds_usd(active_market_obj)
+                        
+                        # Recalculate probabilities
+                        sigma_used = get_sigma_cached(http)
+                        t_eff = max(5.0, float(min(secs_to_close, 120)))
+                        sd = sigma_used * math.sqrt(t_eff)
+                        p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
+                        p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask)
+                        
+                        if p_mkt is not None:
+                            p_yes_blend = MODEL_BLEND_ALPHA * p_yes_model + (1.0 - MODEL_BLEND_ALPHA) * p_mkt
+                        else:
+                            p_yes_blend = p_yes_model
+                        p_no_blend = 1.0 - p_yes_blend
+                        
+                        should_dump, dump_reason = should_dump_position(
+                            st, p_yes_blend, p_no_blend, p_mkt,
+                            spot, lo, hi, sigma_used, secs_to_close, trend
+                        )
+
+                        # Log dump check status periodically
+                        if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                            time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
+                            our_prob = p_yes_blend if st.side == "yes" else p_no_blend
+                            phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else "active"
+                            drop_from_peak = st.peak_prob_for_side - our_prob if st.peak_prob_for_side > 0 else 0
+                            log.info(
+                                f"[HOLD] {st.market} {st.side.upper()} pos={pos} "
+                                f"held={time_in_trade:.0f}s phase={phase} "
+                                f"our_p={our_prob:.1%} peak={st.peak_prob_for_side:.1%} drop={drop_from_peak:.1%} "
+                                f"dump={dump_reason or 'none'}"
+                            )
+                            last_state_log = now
+
+                        if should_dump:
+                            log.warning(f"[DUMP] Triggering dump: {dump_reason}")
+
+                            # Estimate exit price (use current bid/ask)
+                            if st.side == "yes":
+                                exit_price_cents = yes_bid if yes_bid else 50
+                            else:
+                                exit_price_cents = no_bid if no_bid else 50
+
+                            # Place opposing market order to exit
+                            try:
+                                exit_side = "no" if st.side == "yes" else "yes"
+                                exit_payload = build_order_payload(
+                                    market_ticker=st.market,
+                                    action="buy",
+                                    side=exit_side,
+                                    price_cents=99,  # Market order
+                                    count=abs(pos),
+                                    post_only=False,
+                                )
+
+                                if not DRY_RUN:
+                                    oid = place_order(client, exit_payload)
+                                    log.warning(f"[DUMP] Placed exit order {oid} BUY {exit_side} qty={abs(pos)}")
+
+                                    # Record P&L for dump (entry cost - exit value)
+                                    if st.entry_price_cents is not None:
+                                        # For YES: paid entry_price, selling at exit_price
+                                        # For NO: paid entry_price, selling at exit_price
+                                        # P&L = (exit_price - entry_price) * qty for winning side
+                                        # But on dump we're usually losing, so:
+                                        pnl_cents = (exit_price_cents - st.entry_price_cents) * abs(pos)
+                                        session.record_trade(
+                                            market=st.market,
+                                            side=st.side,
+                                            entry_price=st.entry_price_cents,
+                                            exit_price=exit_price_cents,
+                                            qty=abs(pos),
+                                            pnl_cents=pnl_cents,
+                                            was_dump=True,
+                                        )
+                                else:
+                                    log.warning(f"[DRY] Would dump: BUY {exit_side} qty={abs(pos)}")
+
+                                st.sm = SM.DUMPED
+                                st.side = None
+                                st.entry_price_cents = None
+
+                            except Exception as e:
+                                log.error(f"[DUMP] Failed to place exit order: {e}")
+                        
+                    except Exception as e:
+                        log.warning(f"[DUMP] Check failed: {e}")
+            
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if ONE_TRADE_PER_MARKET and st.traded_this_market:
+            st.sm = SM.HOLD
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if secs_to_close is None:
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.warning(f"[STATE] market={st.market} missing close_ts")
+                last_state_log = now
+            last_meta = 0.0
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # MODIFIED: Arm early (600s instead of 120s)
+        if secs_to_close > ENTRY_START_SECONDS:
+            st.sm = SM.IDLE
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.info(f"[STATE] {st.market} IDLE t_close={secs_to_close}s (arming at {ENTRY_START_SECONDS}s)")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        st.sm = SM.ARMED
+
+        # MODIFIED: Stop checking continuously once we're <45s to close
+        if secs_to_close < ENTRY_LAST_SECONDS:
+            st.traded_this_market = True
+            log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        spot = fetch_btc_spot_usd(http)
+        if spot is not None:
+            trend.record(spot)
+        if spot is None:
+            log.warning(f"[SPOT] failed; skipping this poll")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        try:
+            ob = client.request("GET", f"/markets/{st.market}/orderbook")
+        except Exception as e:
+            log.warning(f"[OB] fetch failed: {e}")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
+        lo, hi = market_bounds_usd(active_market_obj)
+
+        try:
+            (
+                chosen_side, chosen_px,
+                p_yes_model, p_no_model,
+                p_yes_blend, p_no_blend,
+                p_mkt, div_yes, sigma_used,
+                edge_yes, edge_no
+            ) = choose_trade(
+                http=http,
+                spot=spot,
+                lo=lo,
+                hi=hi,
+                secs_to_close=secs_to_close,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+            )
+        except Exception as e:
+            log.warning(f"[DECIDE] choose_trade failed: {e}")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # Record probability for trend detection (every poll while armed)
+        prob_trend.record(p_yes_blend)
+
+        if LOG_DECISIONS:
+            yes_px_log = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
+            no_px_log = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
+            edge_yes_log = compute_edge(p_yes_blend, yes_px_log, FEE_CENTS_PER_CONTRACT) if yes_px_log is not None else None
+            edge_no_log = compute_edge(p_no_blend, no_px_log, FEE_CENTS_PER_CONTRACT) if no_px_log is not None else None
+
+            yes_buffer_str = f"${spot-lo:.2f}" if lo else "N/A"
+            no_buffer_str = f"${hi-spot:.2f}" if hi else "N/A"
+            edge_yes_str = f"{edge_yes_log:.4f}" if edge_yes_log is not None else "N/A"
+            edge_no_str = f"{edge_no_log:.4f}" if edge_no_log is not None else "N/A"
+
+            log.info(
+                f"[DECIDE] {st.market} t_close={secs_to_close}s spot=${spot:.2f} "
+                f"p_yes={p_yes_blend:.2f} p_no={p_no_blend:.2f} "
+                f"YES(edge={edge_yes_str}) NO(edge={edge_no_str}) -> {chosen_side}@{chosen_px} "
+                f"| {prob_trend.summary()}"
+            )
+
+        if chosen_side is None or chosen_px is None:
+            if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
+                log.warning(f"[OB] no usable entry: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})")
+                last_ob_warn = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # --- TREND CHECK: don't fight strong momentum ---
+        alignment = trend.trade_alignment(chosen_side, lo, hi, spot)
+        trend_move, trend_dir, trend_n = trend.get_trend()
+
+        if chosen_side == "yes":
+            edge_for_trend = float(edge_yes)
+        else:
+            edge_for_trend = float(edge_no)
+
+        if alignment == "against" and "strong" in trend_dir:
+            if TREND_AGAINST_BLOCK:
+                log.warning(
+                    f"[TREND] BLOCKED {chosen_side.upper()} — against {trend_dir} "
+                    f"(${trend_move:+.0f} over {trend.get_window_minutes():.0f}min). "
+                    f"Edge={edge_for_trend:.4f} not enough to fight momentum."
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+            elif edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
+                log.warning(
+                    f"[TREND] SKIPPED {chosen_side.upper()} — against {trend_dir} "
+                    f"(${trend_move:+.0f}), edge={edge_for_trend:.4f} < "
+                    f"{EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+        elif alignment == "against":
+            # Moderate trend — require extra edge but don't block
+            if edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
+                log.warning(
+                    f"[TREND] SKIPPED {chosen_side.upper()} — against moderate {trend_dir} "
+                    f"(${trend_move:+.0f}), edge={edge_for_trend:.4f} < "
+                    f"{EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+            else:
+                log.info(f"[TREND] Trading {chosen_side.upper()} against {trend_dir} — edge {edge_for_trend:.4f} sufficient")
+        elif alignment == "with":
+            log.info(f"[TREND] Trading WITH {trend_dir} ({chosen_side.upper()}) — {trend.summary()}")
+
+        # --- PROBABILITY TREND CHECK: the main signal ---
+        # We want to see probability trending strongly in one direction before entering
+        current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
+        prob_trend_ok, prob_trend_reason = prob_trend.should_buy(chosen_side, current_prob_for_side)
+
+        if PROB_TREND_ENTRY_ENABLED and not prob_trend_ok:
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.info(f"[PROB_TREND] Waiting for momentum: {prob_trend_reason} | {prob_trend.summary()}")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # --- CROSS-VALIDATE: prob trend must match BTC spot trend ---
+        # If probability says YES but BTC is dropping, that's suspicious (whale manipulation?)
+        # If probability says NO but BTC is rising, also suspicious
+        if REQUIRE_TREND_ALIGNMENT and prob_trend_ok:
+            prob_change, prob_dir, _, _ = prob_trend.get_trend()
+            spot_move, spot_dir, _ = trend.get_trend()
+
+            # Determine expected alignment
+            # YES = BTC should be stable or rising (not strong_down)
+            # NO = BTC should be stable or falling (not strong_up)
+            misaligned = False
+            if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 50:
+                misaligned = True
+                mismatch_reason = f"prob_yes but BTC {spot_dir} (${spot_move:+.0f})"
+            elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 50:
+                misaligned = True
+                mismatch_reason = f"prob_no but BTC {spot_dir} (${spot_move:+.0f})"
+
+            if misaligned:
+                log.warning(f"[ALIGNMENT] BLOCKED — {mismatch_reason}. Prob trend may be manipulation, not signal.")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Log alignment confirmation
+            log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC {spot_dir}")
+
+        if prob_trend_ok:
+            log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
+
+        # Check session limits before trading
+        can_trade, pause_reason = session.check_can_trade()
+        if not can_trade:
+            st.sm = SM.COOLDOWN
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.warning(f"[SESSION] Trading paused: {pause_reason}")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        available_usd, total_usd = get_balance_usd(client)
+
+        if chosen_side == "yes":
+            edge_net = float(edge_yes)
+            p_gate = float(p_yes_blend)
+        else:
+            edge_net = float(edge_no)
+            p_gate = float(p_no_blend)
+
+        qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+        if qty <= 0:
+            log.warning(f"[SKIP] {st.market} qty=0")
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
+
+        use_post_only = POST_ONLY
+        if secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
+            use_post_only = False
+            log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+
+        payload = build_order_payload(
+            market_ticker=st.market,
+            action="buy",
+            side=chosen_side,
+            price_cents=int(chosen_px),
+            count=int(qty),
+            post_only=use_post_only,
+        )
+
+        if not ENABLE_TRADING or DRY_RUN:
+            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty} (session_frac={session.current_fraction:.2%})")
+            st.traded_this_market = True
+            st.sm = SM.HOLD
+            time.sleep(POLL_SECONDS)
+            continue
+
+        try:
+            oid = place_order(client, payload)
+            st.traded_this_market = True
+            st.sm = SM.HOLD
+            st.side = chosen_side
+            st.entry_model_prob = p_yes_model
+            st.entry_market_prob = p_mkt
+            st.entry_spot_price = spot
+            st.entry_price_cents = int(chosen_px)  # Track entry price for P&L
+            st.entry_time = now
+            st.qty = qty
+            # Initialize peak tracking for proactive dump
+            st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+
+            log.warning(
+                f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f} session_frac={session.current_fraction:.2%}"
+            )
+        except Exception as e:
+            log.warning(f"[ORDER] place failed: {e}")
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.exception(f"FATAL: bot crashed: {e}")
+        raise
