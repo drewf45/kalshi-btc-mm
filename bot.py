@@ -1722,19 +1722,21 @@ def main() -> None:
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
                         # Try to determine settlement result (with retry)
+                        # Settlement takes 45-60 seconds, confirmation within 3 minutes
                         result = None
-                        for retry in range(3):  # Try up to 3 times
+                        log.info(f"[ROLL] Waiting for settlement result for {old_market}...")
+                        for retry in range(6):  # Try up to 6 times over ~90 seconds
                             try:
                                 old_mkt_data = client.request("GET", f"/markets/{old_market}")
                                 old_mkt_obj = old_mkt_data.get("market", old_mkt_data) if isinstance(old_mkt_data, dict) else {}
                                 result = old_mkt_obj.get("result", "").lower()
                                 if result in ("yes", "no"):
                                     break
-                                log.info(f"[ROLL] Retry {retry+1}: result='{result}' for {old_market}, waiting...")
-                                time.sleep(1.0)  # Wait 1s before retry
+                                log.info(f"[ROLL] Retry {retry+1}/6: result='{result}' for {old_market}, waiting 15s...")
+                                time.sleep(15.0)  # Wait 15s before retry (90s total max wait)
                             except Exception as e:
-                                log.warning(f"[ROLL] Retry {retry+1} failed: {e}")
-                                time.sleep(1.0)
+                                log.warning(f"[ROLL] Retry {retry+1}/6 failed: {e}")
+                                time.sleep(15.0)
 
                         # Calculate P&L based on settlement
                         pnl_cents = None
