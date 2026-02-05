@@ -178,33 +178,24 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (SIMPLE: only dump below 50%) --------------
+# -------------- DUMP CONFIGURATION (PROACTIVE: get best exit price) --------------
 ENABLE_DUMP = True
-DUMP_PROB_FLIP = 0.50  # Only dump if our prob drops below 50% - HARDWIRED
-DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (would need 100% drop)
-DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Market book flips against us
+# OLD: DUMP_PROB_FLIP = 0.50 (waited too long, terrible exit prices)
+# NEW: Dump based on probability TREND, not absolute threshold
+DUMP_PROB_FLIP = 0.45  # Last resort floor - if we somehow got here, definitely dump
+DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (trend detection handles this better)
+DUMP_MARKET_FLIP_THRESHOLD = 0.45  # Last resort floor
 DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
 DUMP_ON_PRICE_DANGER = False  # Disabled - trust probability
-DUMP_PRICE_SIGMA_MULTIPLIER = 1.5
 
-# -------------- DUMP GRACE PERIOD (short - we enter at high confidence) --------------
-DUMP_GRACE_PERIOD_SECONDS = 15    # Brief grace, we enter at 90%+ so it's settled
-DUMP_SETTLING_PERIOD_SECONDS = 30  # Short settling
-DUMP_SETTLING_PROB_FLIP = 0.50      # Same threshold during settling
-DUMP_SETTLING_PROB_DROP = 1.0       # Disabled
-DUMP_SETTLING_MARKET_FLIP = 0.50
-DUMP_NEAR_5050_ENTRY_THRESHOLD = 0.65  # Won't trigger at 90%+ entries anyway
-DUMP_NEAR_5050_PROB_FLIP = 0.50
-DUMP_NEAR_5050_PROB_DROP = 1.0
-DUMP_NEAR_5050_MARKET_FLIP = 0.50
+# -------------- PROACTIVE DUMP (dump early when trend reverses) --------------
+DUMP_ON_PROB_REVERSAL = True   # Dump when probability is trending against us
+DUMP_REVERSAL_THRESHOLD = 0.08  # If prob drops 8%+ from peak, consider dumping
+DUMP_REVERSAL_MIN_SAMPLES = 5   # Need at least 5 samples to confirm reversal
+DUMP_EARLY_EXIT_ENABLED = True  # Allow dumping above 50% if trend is bad
 
-# -------------- DUMP CROSS-VALIDATION (same logic as entry) --------------
-DUMP_REQUIRE_TREND_ALIGNMENT = True  # Only dump if BTC trend confirms reversal
-DUMP_TREND_THRESHOLD = 50  # BTC must move $50+ against us to confirm dump
-
-# -------------- SMART DUMP (cut losses, let winners ride) --------------
-DUMP_IF_LOSING_CENTS = 25  # Dump if underwater by 25¢+ (more room)
-DUMP_PROTECT_PROFIT_CENTS = 15  # Lock in 15¢+ profit
+# -------------- DUMP GRACE PERIOD --------------
+DUMP_GRACE_PERIOD_SECONDS = 15  # Brief pause to let entry volatility settle
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -1222,6 +1213,9 @@ class BotState:
     entry_price_cents: Optional[int] = None  # Track entry price for P&L
     entry_time: float = 0.0
 
+    # Peak probability tracking (for proactive dump)
+    peak_prob_for_side: float = 0.0  # Highest prob we've seen for our side since entry
+
     last_p_yes: Optional[float] = None
     last_edge_yes: Optional[float] = None
     last_edge_no: Optional[float] = None
@@ -1373,7 +1367,7 @@ def choose_trade(
     return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
 
-# NEW: Dump decision logic (with grace period / settling logic + cross-validation)
+# PROACTIVE DUMP: Get best exit price, don't wait until it's too late
 def should_dump_position(
     st: BotState,
     p_yes_blend: float,
@@ -1387,9 +1381,10 @@ def should_dump_position(
     trend: Optional['SpotTrend'] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Check if we should dump our position.
-    Uses grace period + settling period to avoid dumping during early market jostling.
-    Cross-validates with BTC spot trend: only dump if BTC confirms the reversal.
+    PROACTIVE dump logic: exit early when probability reverses to get best price.
+    The goal is NOT to wait until we've definitely lost - it's to exit while
+    we can still get a decent price.
+
     Returns: (should_dump, reason)
     """
     if not ENABLE_DUMP:
@@ -1401,34 +1396,10 @@ def should_dump_position(
     if st.entry_model_prob is None:
         return False, "no_entry_data"
 
-    # --- GRACE PERIOD: no dumps at all for N seconds after entry ---
+    # --- GRACE PERIOD: brief pause to let entry volatility settle ---
     time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 9999
     if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
         return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
-
-    # --- Determine thresholds based on settling period and entry conditions ---
-    in_settling = time_in_trade < DUMP_SETTLING_PERIOD_SECONDS
-
-    # Was this a near-50/50 entry? Check the entry gate probability
-    entry_p_gate = st.entry_model_prob if st.side == "yes" else (1.0 - st.entry_model_prob)
-    near_5050_entry = entry_p_gate < DUMP_NEAR_5050_ENTRY_THRESHOLD
-
-    # Pick thresholds: settling > near_5050 > normal
-    if in_settling:
-        thresh_flip = DUMP_SETTLING_PROB_FLIP
-        thresh_drop = DUMP_SETTLING_PROB_DROP
-        thresh_mkt_flip = DUMP_SETTLING_MARKET_FLIP
-        phase = "settling"
-    elif near_5050_entry:
-        thresh_flip = DUMP_NEAR_5050_PROB_FLIP
-        thresh_drop = DUMP_NEAR_5050_PROB_DROP
-        thresh_mkt_flip = DUMP_NEAR_5050_MARKET_FLIP
-        phase = "near5050"
-    else:
-        thresh_flip = DUMP_PROB_FLIP
-        thresh_drop = DUMP_PROB_DROP_PERCENT
-        thresh_mkt_flip = DUMP_MARKET_FLIP_THRESHOLD
-        phase = "normal"
 
     # Determine current probability for our side
     if st.side == "yes":
@@ -1438,58 +1409,28 @@ def should_dump_position(
         current_prob = p_no_blend
         entry_prob = 1.0 - st.entry_model_prob
 
-    # --- CROSS-VALIDATION: Check if BTC trend confirms reversal ---
-    # Only dump if BTC is actually moving against our position
-    btc_confirms_dump = True  # Default to True if no trend data or disabled
-    trend_reason = ""
+    # Update peak probability tracking
+    if current_prob > st.peak_prob_for_side:
+        st.peak_prob_for_side = current_prob
 
-    if DUMP_REQUIRE_TREND_ALIGNMENT and trend is not None:
-        spot_move, spot_dir, trend_n = trend.get_trend()
+    # === PROACTIVE DUMP: Exit on probability reversal ===
+    if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED:
+        drop_from_peak = st.peak_prob_for_side - current_prob
 
-        if trend_n >= 2:  # Have enough trend data
-            # YES position: dump only if BTC is trending DOWN (price dropping = bad for YES)
-            # NO position: dump only if BTC is trending UP (price rising = bad for NO)
-            if st.side == "yes":
-                # For YES: BTC dropping confirms we should dump
-                if spot_move < -DUMP_TREND_THRESHOLD:
-                    btc_confirms_dump = True
-                    trend_reason = f"btc_down_${spot_move:.0f}"
-                elif spot_move > DUMP_TREND_THRESHOLD:
-                    # BTC is rising but prob dropped? Likely manipulation, HOLD
-                    btc_confirms_dump = False
-                    trend_reason = f"btc_up_${spot_move:.0f}_HOLD"
-                else:
-                    # BTC flat, prob dropped - could be noise, HOLD
-                    btc_confirms_dump = False
-                    trend_reason = f"btc_flat_${spot_move:.0f}_HOLD"
-            else:  # NO position
-                # For NO: BTC rising confirms we should dump
-                if spot_move > DUMP_TREND_THRESHOLD:
-                    btc_confirms_dump = True
-                    trend_reason = f"btc_up_${spot_move:.0f}"
-                elif spot_move < -DUMP_TREND_THRESHOLD:
-                    # BTC is dropping but prob dropped? Likely manipulation, HOLD
-                    btc_confirms_dump = False
-                    trend_reason = f"btc_down_${spot_move:.0f}_HOLD"
-                else:
-                    # BTC flat, prob dropped - could be noise, HOLD
-                    btc_confirms_dump = False
-                    trend_reason = f"btc_flat_${spot_move:.0f}_HOLD"
+        # If probability has dropped significantly from its peak, dump NOW
+        # Don't wait until it hits 50% - by then exit prices are terrible
+        if drop_from_peak >= DUMP_REVERSAL_THRESHOLD:
+            log.warning(
+                f"[DUMP REVERSAL] prob dropped {drop_from_peak:.1%} from peak "
+                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — exiting for best price"
+            )
+            return True, f"reversal_{current_prob:.0%}_from_peak_{st.peak_prob_for_side:.0%}"
 
-    # TRIGGER 1: Probability flipped below threshold
-    if current_prob < thresh_flip:
-        if not btc_confirms_dump:
-            log.info(f"[DUMP BLOCKED] prob_flip but {trend_reason} — holding for now")
-            return False, f"prob_flip_blocked_{trend_reason}"
-        return True, f"prob_flip_{current_prob:.3f}(<{thresh_flip}_{phase})_{trend_reason}"
+    # === FLOOR: Last resort if we somehow got here ===
+    if current_prob < DUMP_PROB_FLIP:
+        return True, f"floor_{current_prob:.0%}<{DUMP_PROB_FLIP:.0%}"
 
-    # TRIGGER 2: Probability dropped significantly
-    prob_drop = entry_prob - current_prob
-    if prob_drop > thresh_drop:
-        if not btc_confirms_dump:
-            log.info(f"[DUMP BLOCKED] prob_drop but {trend_reason} — holding for now")
-            return False, f"prob_drop_blocked_{trend_reason}"
-        return True, f"prob_drop_{prob_drop:.3f}(>{thresh_drop}_{phase})_{trend_reason}"
+    return False, f"holding_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}"
 
     # TRIGGER 3: Market probability flipped
     if USE_MARKET_IMPLIED and p_mkt is not None:
@@ -2171,6 +2112,8 @@ def main() -> None:
             st.entry_price_cents = int(chosen_px)  # Track entry price for P&L
             st.entry_time = now
             st.qty = qty
+            # Initialize peak tracking for proactive dump
+            st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
 
             log.warning(
                 f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
