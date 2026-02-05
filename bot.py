@@ -198,6 +198,10 @@ DUMP_NEAR_5050_PROB_FLIP = 0.50
 DUMP_NEAR_5050_PROB_DROP = 1.0
 DUMP_NEAR_5050_MARKET_FLIP = 0.50
 
+# -------------- DUMP CROSS-VALIDATION (same logic as entry) --------------
+DUMP_REQUIRE_TREND_ALIGNMENT = True  # Only dump if BTC trend confirms reversal
+DUMP_TREND_THRESHOLD = 50  # BTC must move $50+ against us to confirm dump
+
 # -------------- SMART DUMP (cut losses, let winners ride) --------------
 DUMP_IF_LOSING_CENTS = 25  # Dump if underwater by 25¢+ (more room)
 DUMP_PROTECT_PROFIT_CENTS = 15  # Lock in 15¢+ profit
@@ -1369,7 +1373,7 @@ def choose_trade(
     return None, None, p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
 
 
-# NEW: Dump decision logic (with grace period / settling logic)
+# NEW: Dump decision logic (with grace period / settling logic + cross-validation)
 def should_dump_position(
     st: BotState,
     p_yes_blend: float,
@@ -1380,10 +1384,12 @@ def should_dump_position(
     hi: Optional[float],
     sigma: float,
     secs_to_close: int,
+    trend: Optional['SpotTrend'] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Check if we should dump our position.
     Uses grace period + settling period to avoid dumping during early market jostling.
+    Cross-validates with BTC spot trend: only dump if BTC confirms the reversal.
     Returns: (should_dump, reason)
     """
     if not ENABLE_DUMP:
@@ -1432,20 +1438,67 @@ def should_dump_position(
         current_prob = p_no_blend
         entry_prob = 1.0 - st.entry_model_prob
 
+    # --- CROSS-VALIDATION: Check if BTC trend confirms reversal ---
+    # Only dump if BTC is actually moving against our position
+    btc_confirms_dump = True  # Default to True if no trend data or disabled
+    trend_reason = ""
+
+    if DUMP_REQUIRE_TREND_ALIGNMENT and trend is not None:
+        spot_move, spot_dir, trend_n = trend.get_trend()
+
+        if trend_n >= 2:  # Have enough trend data
+            # YES position: dump only if BTC is trending DOWN (price dropping = bad for YES)
+            # NO position: dump only if BTC is trending UP (price rising = bad for NO)
+            if st.side == "yes":
+                # For YES: BTC dropping confirms we should dump
+                if spot_move < -DUMP_TREND_THRESHOLD:
+                    btc_confirms_dump = True
+                    trend_reason = f"btc_down_${spot_move:.0f}"
+                elif spot_move > DUMP_TREND_THRESHOLD:
+                    # BTC is rising but prob dropped? Likely manipulation, HOLD
+                    btc_confirms_dump = False
+                    trend_reason = f"btc_up_${spot_move:.0f}_HOLD"
+                else:
+                    # BTC flat, prob dropped - could be noise, HOLD
+                    btc_confirms_dump = False
+                    trend_reason = f"btc_flat_${spot_move:.0f}_HOLD"
+            else:  # NO position
+                # For NO: BTC rising confirms we should dump
+                if spot_move > DUMP_TREND_THRESHOLD:
+                    btc_confirms_dump = True
+                    trend_reason = f"btc_up_${spot_move:.0f}"
+                elif spot_move < -DUMP_TREND_THRESHOLD:
+                    # BTC is dropping but prob dropped? Likely manipulation, HOLD
+                    btc_confirms_dump = False
+                    trend_reason = f"btc_down_${spot_move:.0f}_HOLD"
+                else:
+                    # BTC flat, prob dropped - could be noise, HOLD
+                    btc_confirms_dump = False
+                    trend_reason = f"btc_flat_${spot_move:.0f}_HOLD"
+
     # TRIGGER 1: Probability flipped below threshold
     if current_prob < thresh_flip:
-        return True, f"prob_flip_{current_prob:.3f}(<{thresh_flip}_{phase})"
+        if not btc_confirms_dump:
+            log.info(f"[DUMP BLOCKED] prob_flip but {trend_reason} — holding for now")
+            return False, f"prob_flip_blocked_{trend_reason}"
+        return True, f"prob_flip_{current_prob:.3f}(<{thresh_flip}_{phase})_{trend_reason}"
 
     # TRIGGER 2: Probability dropped significantly
     prob_drop = entry_prob - current_prob
     if prob_drop > thresh_drop:
-        return True, f"prob_drop_{prob_drop:.3f}(>{thresh_drop}_{phase})"
+        if not btc_confirms_dump:
+            log.info(f"[DUMP BLOCKED] prob_drop but {trend_reason} — holding for now")
+            return False, f"prob_drop_blocked_{trend_reason}"
+        return True, f"prob_drop_{prob_drop:.3f}(>{thresh_drop}_{phase})_{trend_reason}"
 
     # TRIGGER 3: Market probability flipped
     if USE_MARKET_IMPLIED and p_mkt is not None:
         market_prob = p_mkt if st.side == "yes" else (1.0 - p_mkt)
         if market_prob < thresh_mkt_flip:
-            return True, f"market_flip_{market_prob:.3f}(<{thresh_mkt_flip}_{phase})"
+            if not btc_confirms_dump:
+                log.info(f"[DUMP BLOCKED] market_flip but {trend_reason} — holding for now")
+                return False, f"market_flip_blocked_{trend_reason}"
+            return True, f"market_flip_{market_prob:.3f}(<{thresh_mkt_flip}_{phase})_{trend_reason}"
 
     # TRIGGER 4: Bitcoin price danger zone (always active - no grace for this)
     if DUMP_ON_PRICE_DANGER:
@@ -1776,7 +1829,7 @@ def main() -> None:
                         
                         should_dump, dump_reason = should_dump_position(
                             st, p_yes_blend, p_no_blend, p_mkt,
-                            spot, lo, hi, sigma_used, secs_to_close
+                            spot, lo, hi, sigma_used, secs_to_close, trend
                         )
 
                         # Log dump check status periodically
