@@ -1721,30 +1721,58 @@ def main() -> None:
 
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
-                        # Try to determine settlement result
-                        try:
-                            old_mkt_data = client.request("GET", f"/markets/{old_market}")
-                            old_mkt_obj = old_mkt_data.get("market", old_mkt_data) if isinstance(old_mkt_data, dict) else {}
-                            result = old_mkt_obj.get("result", "").lower()
+                        # Try to determine settlement result (with retry)
+                        result = None
+                        for retry in range(3):  # Try up to 3 times
+                            try:
+                                old_mkt_data = client.request("GET", f"/markets/{old_market}")
+                                old_mkt_obj = old_mkt_data.get("market", old_mkt_data) if isinstance(old_mkt_data, dict) else {}
+                                result = old_mkt_obj.get("result", "").lower()
+                                if result in ("yes", "no"):
+                                    break
+                                log.info(f"[ROLL] Retry {retry+1}: result='{result}' for {old_market}, waiting...")
+                                time.sleep(1.0)  # Wait 1s before retry
+                            except Exception as e:
+                                log.warning(f"[ROLL] Retry {retry+1} failed: {e}")
+                                time.sleep(1.0)
 
-                            # Calculate P&L based on settlement
-                            if result == "yes":
-                                # YES paid 100, NO paid 0
-                                if st.side == "yes":
-                                    pnl_cents = (100 - st.entry_price_cents) * st.qty
-                                else:
-                                    pnl_cents = -st.entry_price_cents * st.qty
-                            elif result == "no":
-                                # YES paid 0, NO paid 100
-                                if st.side == "yes":
-                                    pnl_cents = -st.entry_price_cents * st.qty
-                                else:
-                                    pnl_cents = (100 - st.entry_price_cents) * st.qty
+                        # Calculate P&L based on settlement
+                        pnl_cents = None
+                        if result == "yes":
+                            # YES paid 100, NO paid 0
+                            if st.side == "yes":
+                                pnl_cents = (100 - st.entry_price_cents) * st.qty
                             else:
-                                # Unknown result, assume loss equal to entry
                                 pnl_cents = -st.entry_price_cents * st.qty
-                                log.warning(f"[ROLL] Unknown settlement result '{result}' for {old_market}")
+                        elif result == "no":
+                            # YES paid 0, NO paid 100
+                            if st.side == "yes":
+                                pnl_cents = -st.entry_price_cents * st.qty
+                            else:
+                                pnl_cents = (100 - st.entry_price_cents) * st.qty
+                        else:
+                            # Unknown result - try to determine from balance change
+                            log.warning(f"[ROLL] Unknown settlement result '{result}' for {old_market}, checking balance...")
+                            try:
+                                new_bal, _ = get_balance_usd(client)
+                                if new_bal is not None and session.current_balance_usd > 0:
+                                    bal_change_cents = int((new_bal - session.current_balance_usd) * 100)
+                                    # If balance went up, we won. If down, we lost.
+                                    if bal_change_cents > 0:
+                                        pnl_cents = (100 - st.entry_price_cents) * st.qty
+                                        log.warning(f"[ROLL] Balance up ${bal_change_cents/100:.2f} -> assuming WIN")
+                                    else:
+                                        pnl_cents = -st.entry_price_cents * st.qty
+                                        log.warning(f"[ROLL] Balance down ${-bal_change_cents/100:.2f} -> assuming LOSS")
+                                else:
+                                    # Can't determine, skip recording this trade
+                                    log.warning(f"[ROLL] Cannot determine result for {old_market}, skipping trade record")
+                                    pnl_cents = None
+                            except Exception as e:
+                                log.warning(f"[ROLL] Balance check failed: {e}, skipping trade record")
+                                pnl_cents = None
 
+                        if pnl_cents is not None:
                             session.record_trade(
                                 market=old_market,
                                 side=st.side,
@@ -1755,8 +1783,6 @@ def main() -> None:
                                 was_dump=False,
                             )
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
-                        except Exception as e:
-                            log.warning(f"[ROLL] Could not determine settlement for {old_market}: {e}")
 
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
