@@ -1,22 +1,21 @@
 # bot.py
-# Kalshi rolling 15m BTC SCALPER - Trade every market with edge
+# Kalshi rolling 15m BTC — Certain wins, hold to close, scale bankroll
 #
 # STRATEGY:
-# - Arms at T-720s (12 minutes before close) to catch moves early
-# - Watches probability trend develop, enters when momentum confirms
-# - Scales bankroll UP on wins, pulls back on losses
-# - PROACTIVE DUMP: exits when probability reverses, not when it's too late
-# - Session-level loss limits to protect capital
+# - Arms at T-720s (12 min) to OBSERVE market, BTC price, trends, book
+# - Buys only when CERTAIN of the outcome (80%+ prob, trend + BTC aligned)
+# - Even a few cents edge per contract is fine — buy MORE contracts
+# - HOLDS TO SETTLEMENT — collect the full payout for being right
+# - Dump is ABORT ONLY — safety net, not a regular exit
+# - Scales bankroll: wins compound, size grows, 96 markets/day
 #
 # KEY SETTINGS:
-# - ENTRY_START_SECONDS=720 (12 min window - catch moves early)
-# - ENTRY_LAST_SECONDS=30 (trade until 30s before close)
-# - PROB_MIN=0.65, PROB_TREND_MIN_CURRENT=0.70
-# - DUMP_REVERSAL_THRESHOLD=8% (exit on reversal, not on total loss)
-# - MAX_ENTRY_PRICE=90¢ (allow higher entries)
-# - BANKROLL_FRACTION=0.15 (15% base sizing)
-# - Bankroll scaling: increase on wins, decrease on losses
-# - Session loss limit: stop trading if down too much
+# - PROB_MIN=0.80 (only trade near-certain outcomes)
+# - EDGE_MIN=0.02 (small edge OK — volume over 96 markets compounds)
+# - MAX_ENTRY_PRICE=95¢ (allow buying if certainty supports the price)
+# - BANKROLL_FRACTION=0.30 (buy lots of contracts per trade)
+# - DUMP is abort-only: 20% reversal, 120s patience, 12¢ hard stop
+# - Bankroll scaling: grows on wins, 96 markets/day = compounding machine
 
 import os
 import time
@@ -127,40 +126,43 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
-# -------------- SCALPER STRATEGY (HARDWIRED) --------------
-ENTRY_START_SECONDS = 720  # Arm at 12min - catch the move early, not after it's priced in
+# -------------- HOLD-TO-CLOSE STRATEGY (HARDWIRED) --------------
+# Philosophy: arm early to OBSERVE price/trends/book. Buy only when CERTAIN
+# of the outcome. Even a few cents edge is fine — buy MORE contracts.
+# Hold to settlement. Dump is abort-only. Trade every market possible.
+ENTRY_START_SECONDS = 720  # Arm at 12min - observe market, find the price
 ENTRY_DECISION_SECONDS = 60
-ENTRY_LAST_SECONDS = 30  # Trade until 30s before close - HARDWIRED
+ENTRY_LAST_SECONDS = 15  # Can buy late since we're holding to close
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.65  # Minimum prob to even consider (trend does the real work) - HARDWIRED
-EDGE_MIN = 0.01  # 1% minimum edge - HARDWIRED
-MAX_ENTRY_PRICE_CENTS = 90  # Allow higher entries with high prob - HARDWIRED
+PROB_MIN = 0.80  # HIGH bar: only enter when outcome is near-certain
+EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
+MAX_ENTRY_PRICE_CENTS = 95  # Allow expensive contracts if probability supports it
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- PROBABILITY TREND DETECTION (watch early, buy on momentum) --------------
+# -------------- PROBABILITY TREND DETECTION (confirm certainty with momentum) --------------
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
 PROB_TREND_MIN_SAMPLES = 10       # Need at least 10 samples (~90s at 1/sec)
 PROB_TREND_THRESHOLD = 0.10       # 10% swing in one direction = strong trend
-PROB_TREND_MIN_CURRENT = 0.70     # Current prob must be at least 70% for our side
+PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% — we need certainty
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
-BANKROLL_FRACTION = 0.15  # 15% base per trade - HARDWIRED
+BANKROLL_FRACTION = 0.30  # 30% base — buy lots of contracts, each trade settles before next
 MIN_CONTRACTS = 1
 MAX_CONTRACTS = 100  # Allow bigger positions
 MIN_FREE_USD_TO_TRADE = 5.0
 
 # -------------- BANKROLL SCALING (HARDWIRED) --------------
 ENABLE_BANKROLL_SCALING = True
-SCALING_WIN_MULTIPLIER = 1.25  # +25% after win
-SCALING_LOSS_MULTIPLIER = 0.70  # -30% after loss
-SCALING_MIN_FRACTION = 0.05  # Floor at 5%
-SCALING_MAX_FRACTION = 0.35  # Cap at 35%
+SCALING_WIN_MULTIPLIER = 1.20  # +20% after win — steady compounding over 96 markets
+SCALING_LOSS_MULTIPLIER = 0.70  # -30% after loss — pull back but don't crater (losses should be rare)
+SCALING_MIN_FRACTION = 0.15  # Floor at 15% — always size meaningfully
+SCALING_MAX_FRACTION = 0.50  # Cap at 50% — let it scale up aggressively on streaks
 
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
@@ -178,27 +180,32 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (PROACTIVE: get best exit price) --------------
+# -------------- DUMP CONFIGURATION (SAFETY NET: only dump when truly wrong) --------
 ENABLE_DUMP = True
-# OLD: DUMP_PROB_FLIP = 0.50 (waited too long, terrible exit prices)
-# NEW: Dump based on probability TREND, not absolute threshold
-DUMP_PROB_FLIP = 0.45  # Last resort floor - if we somehow got here, definitely dump
-DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (trend detection handles this better)
-DUMP_MARKET_FLIP_THRESHOLD = 0.45  # Last resort floor
+# Philosophy: we entered with high conviction. Dump only if the thesis is BROKEN,
+# not on normal volatility. The goal is hold to close.
+DUMP_PROB_FLIP = 0.50  # Floor: if we've lost the majority, the thesis is broken
+DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (reversal handles this)
+DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor: exit at coin-flip territory
 DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
 DUMP_ON_PRICE_DANGER = False  # Disabled - trust probability
 
-# -------------- PROACTIVE DUMP (dump early when trend reverses) --------------
-DUMP_ON_PROB_REVERSAL = True   # Dump when probability is trending against us
-DUMP_REVERSAL_THRESHOLD = 0.12  # If prob drops 12%+ from peak, it's a real reversal
+# -------------- REVERSAL DUMP (last resort, not regular exit) -----------------
+DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
+DUMP_REVERSAL_THRESHOLD = 0.20  # 20% drop from peak — very patient, thesis must truly break
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.15  # 15% even when profitable — give trades room
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.10  # Only tighten after 10%+ gain above entry
 DUMP_REVERSAL_MIN_SAMPLES = 5   # Need at least 5 samples to confirm reversal
-DUMP_EARLY_EXIT_ENABLED = True  # Allow dumping above 50% if trend is bad
+DUMP_EARLY_EXIT_ENABLED = True  # Allow dumping above 50% if thesis is broken
 
-# -------------- DUMP TIMING (balance early arm with patience) --------------
-DUMP_GRACE_PERIOD_SECONDS = 15      # No dumps at all for first 15s (entry settling)
-DUMP_PROACTIVE_AFTER_SECONDS = 90   # Proactive dumps only after 90s in trade
-# First 90s: only dump if floor hit (45%) - let the trade breathe
-# After 90s: dump on 12% reversal from peak - now it's a real signal
+# -------------- DUMP TIMING (hold to close — be very patient) -----------------
+DUMP_GRACE_PERIOD_SECONDS = 30      # No dumps for first 30s — we entered with conviction
+DUMP_PROACTIVE_AFTER_SECONDS = 120  # Only consider dump after 2 MINUTES — hold to close
+# First 120s: only dump if floor hit (50%) or hard P&L stop — trust the thesis
+# After 120s: dump on 20% reversal — something is truly wrong
+
+# -------------- HARD P&L STOP (prevent catastrophic single-trade losses) ------
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 12  # Hard stop: dump if losing >12¢/contract unrealized
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -223,14 +230,14 @@ _last_sigma_val: float = SPOT_SIGMA_USD_PER_SQRT_SEC
 
 # -------------- SIZING + PROB GATE --------------
 PROB_GATE_USE_BLEND = env_bool("PROB_GATE_USE_BLEND", True)
-BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.40)  # Allow up to 40%
+BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.50)  # Allow up to 50%
 
 EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.015)  # Start scaling earlier
 EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 3.0)  # Steeper scaling
 
-A_PLUS_PROB = env_float("A_PLUS_PROB", 0.85)  # Lower bar for A+ trades
-A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.025)
-A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.25)  # Go bigger on A+ setups
+A_PLUS_PROB = env_float("A_PLUS_PROB", 0.90)  # A+ = extremely certain outcome
+A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = even small edge at 90%+ prob is golden
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Go big — 90%+ prob is as sure as it gets
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
@@ -239,9 +246,9 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 75.0)  # Tighter buffer
-LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.03)
-LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 30)
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 100.0)  # Wider buffer — need BTC well inside range for certainty
+LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — base prob already 80%, that's the bar
+LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
 # -------------- TREND TRACKING (know what BTC is doing) --------------
 TREND_WINDOW_MINUTES = 60          # Look back 60 min (~4 markets)
@@ -1419,15 +1426,35 @@ def should_dump_position(
     drop_from_peak = st.peak_prob_for_side - current_prob
     in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
 
-    # === PROACTIVE DUMP: Exit on probability reversal ===
-    # Only kicks in after settling period - let the trade breathe early on
+    # === HARD P&L STOP: prevent catastrophic single-trade losses ===
+    # Active even during settling — never let a single trade blow up
+    if st.entry_price_cents is not None:
+        # Estimate current exit price for our side
+        exit_price_est = int(current_prob * 100)
+        unrealized_loss_per_contract = st.entry_price_cents - exit_price_est
+        if unrealized_loss_per_contract >= DUMP_MAX_LOSS_CENTS_PER_CONTRACT:
+            log.warning(
+                f"[DUMP HARD STOP] losing ~{unrealized_loss_per_contract}¢/contract "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — hard stop"
+            )
+            return True, f"hard_stop_{unrealized_loss_per_contract}c_per_contract"
+
+    # === REVERSAL DUMP: Exit only if thesis is truly broken ===
+    # Only kicks in after long settling period — we entered to hold to close
     if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED and not in_settling:
-        # If probability has dropped significantly from its peak, dump NOW
-        # Don't wait until it hits 50% - by then exit prices are terrible
-        if drop_from_peak >= DUMP_REVERSAL_THRESHOLD:
+        # Use tighter threshold when we had significant gains (protect profit)
+        gain_above_entry = st.peak_prob_for_side - entry_prob
+        if gain_above_entry >= DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY:
+            effective_threshold = DUMP_REVERSAL_THRESHOLD_PROFIT  # 15%
+        else:
+            effective_threshold = DUMP_REVERSAL_THRESHOLD  # 20%
+
+        if drop_from_peak >= effective_threshold:
             log.warning(
                 f"[DUMP REVERSAL] prob dropped {drop_from_peak:.1%} from peak "
-                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — exiting for best price"
+                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — "
+                f"threshold={effective_threshold:.0%} (profit_tighten={gain_above_entry >= DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY}) "
+                f"— thesis broken, exiting"
             )
             return True, f"reversal_{current_prob:.0%}_from_peak_{st.peak_prob_for_side:.0%}"
 
@@ -1497,7 +1524,7 @@ def compute_qty_from_bankroll(
 
 
 # -----------------------------
-# Main (SCALPER with session tracking)
+# Main (VALUE SNIPER with session tracking)
 # -----------------------------
 def main() -> None:
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
@@ -1509,7 +1536,8 @@ def main() -> None:
     )
     log.warning(
         f"[BOOTCFG] DUMP: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
-        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} floor={DUMP_PROB_FLIP:.0%}"
+        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} profit_tighten={DUMP_REVERSAL_THRESHOLD_PROFIT:.0%} "
+        f"hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract floor={DUMP_PROB_FLIP:.0%}"
     )
     log.warning(
         f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
