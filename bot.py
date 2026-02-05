@@ -190,12 +190,15 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust probability
 
 # -------------- PROACTIVE DUMP (dump early when trend reverses) --------------
 DUMP_ON_PROB_REVERSAL = True   # Dump when probability is trending against us
-DUMP_REVERSAL_THRESHOLD = 0.08  # If prob drops 8%+ from peak, consider dumping
+DUMP_REVERSAL_THRESHOLD = 0.12  # If prob drops 12%+ from peak, it's a real reversal
 DUMP_REVERSAL_MIN_SAMPLES = 5   # Need at least 5 samples to confirm reversal
 DUMP_EARLY_EXIT_ENABLED = True  # Allow dumping above 50% if trend is bad
 
-# -------------- DUMP GRACE PERIOD --------------
-DUMP_GRACE_PERIOD_SECONDS = 15  # Brief pause to let entry volatility settle
+# -------------- DUMP TIMING (balance early arm with patience) --------------
+DUMP_GRACE_PERIOD_SECONDS = 15      # No dumps at all for first 15s (entry settling)
+DUMP_PROACTIVE_AFTER_SECONDS = 90   # Proactive dumps only after 90s in trade
+# First 90s: only dump if floor hit (45%) - let the trade breathe
+# After 90s: dump on 12% reversal from peak - now it's a real signal
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -1413,10 +1416,12 @@ def should_dump_position(
     if current_prob > st.peak_prob_for_side:
         st.peak_prob_for_side = current_prob
 
-    # === PROACTIVE DUMP: Exit on probability reversal ===
-    if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED:
-        drop_from_peak = st.peak_prob_for_side - current_prob
+    drop_from_peak = st.peak_prob_for_side - current_prob
+    in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
 
+    # === PROACTIVE DUMP: Exit on probability reversal ===
+    # Only kicks in after settling period - let the trade breathe early on
+    if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED and not in_settling:
         # If probability has dropped significantly from its peak, dump NOW
         # Don't wait until it hits 50% - by then exit prices are terrible
         if drop_from_peak >= DUMP_REVERSAL_THRESHOLD:
@@ -1426,38 +1431,13 @@ def should_dump_position(
             )
             return True, f"reversal_{current_prob:.0%}_from_peak_{st.peak_prob_for_side:.0%}"
 
-    # === FLOOR: Last resort if we somehow got here ===
+    # === FLOOR: Last resort - always active (even during settling) ===
     if current_prob < DUMP_PROB_FLIP:
         return True, f"floor_{current_prob:.0%}<{DUMP_PROB_FLIP:.0%}"
 
-    return False, f"holding_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}"
-
-    # TRIGGER 3: Market probability flipped
-    if USE_MARKET_IMPLIED and p_mkt is not None:
-        market_prob = p_mkt if st.side == "yes" else (1.0 - p_mkt)
-        if market_prob < thresh_mkt_flip:
-            if not btc_confirms_dump:
-                log.info(f"[DUMP BLOCKED] market_flip but {trend_reason} — holding for now")
-                return False, f"market_flip_blocked_{trend_reason}"
-            return True, f"market_flip_{market_prob:.3f}(<{thresh_mkt_flip}_{phase})_{trend_reason}"
-
-    # TRIGGER 4: Bitcoin price danger zone (always active - no grace for this)
-    if DUMP_ON_PRICE_DANGER:
-        if st.side == "yes":
-            if lo is not None:
-                danger_price = lo - (sigma * DUMP_PRICE_SIGMA_MULTIPLIER)
-                if spot < danger_price:
-                    distance = lo - spot
-                    return True, f"price_danger_YES_${distance:.0f}_below"
-
-        elif st.side == "no":
-            if hi is not None:
-                danger_price = hi + (sigma * DUMP_PRICE_SIGMA_MULTIPLIER)
-                if spot > danger_price:
-                    distance = spot - hi
-                    return True, f"price_danger_NO_${distance:.0f}_above"
-
-    return False, None
+    # Still holding - show status
+    phase = "settling" if in_settling else "active"
+    return False, f"{phase}_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}_drop={drop_from_peak:.0%}"
 
 
 def compute_fraction_for_trade(edge_net: float, p_gate: float, session_fraction: Optional[float] = None) -> float:
@@ -1528,8 +1508,8 @@ def main() -> None:
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
     )
     log.warning(
-        f"[BOOTCFG] DUMP_GRACE={DUMP_GRACE_PERIOD_SECONDS}s "
-        f"REVERSAL_THRESHOLD={DUMP_REVERSAL_THRESHOLD:.0%} PROACTIVE={DUMP_ON_PROB_REVERSAL}"
+        f"[BOOTCFG] DUMP: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
+        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} floor={DUMP_PROB_FLIP:.0%}"
     )
     log.warning(
         f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
