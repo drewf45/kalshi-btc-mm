@@ -1528,8 +1528,8 @@ def main() -> None:
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
     )
     log.warning(
-        f"[BOOTCFG] DUMP_GRACE={DUMP_GRACE_PERIOD_SECONDS}s DUMP_SETTLING={DUMP_SETTLING_PERIOD_SECONDS}s "
-        f"NEAR5050_THRESHOLD={DUMP_NEAR_5050_ENTRY_THRESHOLD}"
+        f"[BOOTCFG] DUMP_GRACE={DUMP_GRACE_PERIOD_SECONDS}s "
+        f"REVERSAL_THRESHOLD={DUMP_REVERSAL_THRESHOLD:.0%} PROACTIVE={DUMP_ON_PROB_REVERSAL}"
     )
     log.warning(
         f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
@@ -1805,13 +1805,13 @@ def main() -> None:
                         if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                             time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
                             our_prob = p_yes_blend if st.side == "yes" else p_no_blend
-                            phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else (
-                                "settling" if time_in_trade < DUMP_SETTLING_PERIOD_SECONDS else "normal"
-                            )
+                            phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else "active"
+                            drop_from_peak = st.peak_prob_for_side - our_prob if st.peak_prob_for_side > 0 else 0
                             log.info(
                                 f"[HOLD] {st.market} {st.side.upper()} pos={pos} "
                                 f"held={time_in_trade:.0f}s phase={phase} "
-                                f"our_p={our_prob:.3f} dump={dump_reason or 'none'}"
+                                f"our_p={our_prob:.1%} peak={st.peak_prob_for_side:.1%} drop={drop_from_peak:.1%} "
+                                f"dump={dump_reason or 'none'}"
                             )
                             last_state_log = now
 
