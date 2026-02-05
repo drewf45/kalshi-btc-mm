@@ -10,7 +10,7 @@
 # - Scales bankroll: wins compound, size grows, 96 markets/day
 #
 # KEY SETTINGS:
-# - PROB_MIN=0.80 (only trade near-certain outcomes)
+# - TIME-DEPENDENT PROB: 92% if >5min, 85% if 3-5min, 80% if <3min
 # - EDGE_MIN=0.02 (small edge OK — volume over 96 markets compounds)
 # - MAX_ENTRY_PRICE=95¢ (allow buying if certainty supports the price)
 # - BANKROLL_FRACTION=0.30 (buy lots of contracts per trade)
@@ -137,10 +137,20 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.80  # HIGH bar: only enter when outcome is near-certain
+PROB_MIN = 0.80  # Base prob bar for late entries (≤3 min to close)
 EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
 MAX_ENTRY_PRICE_CENTS = 95  # Allow expensive contracts if probability supports it
 FEE_CENTS_PER_CONTRACT = 0
+
+# -------------- TIME-DEPENDENT CERTAINTY (early = need more certainty) --------
+# 80% at 10 min is NOT certain — BTC moves hundreds of dollars in 10 min.
+# 80% at 2 min IS certain — BTC can't move far enough to flip.
+# So: require higher prob earlier, relax as we get closer to settlement.
+PROB_EARLY_ENTRY_SECONDS = 300   # >5 min to close = "early"
+PROB_EARLY_MIN = 0.92            # Need 92%+ to enter early (must be very sure)
+PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
+PROB_MID_MIN = 0.85              # Need 85%+ in mid window
+# <3 min = PROB_MIN (0.80) — close enough that 80% is reliable
 
 # -------------- PROBABILITY TREND DETECTION (confirm certainty with momentum) --------------
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
@@ -1315,10 +1325,13 @@ def choose_trade(
         div_gate_yes = (div_yes >= MIN_DIVERGENCE)
         div_gate_no = ((-div_yes) >= MIN_DIVERGENCE)
 
-    # MODIFIED: Use blended probability for gating
-    effective_prob_min = PROB_MIN
-    if secs_to_close < LATE_ENTRY_TIME_SEC:
-        effective_prob_min = PROB_MIN + LATE_ENTRY_PROB_BOOST
+    # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
+    if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
+        effective_prob_min = PROB_EARLY_MIN   # >5min: need 92%+
+    elif secs_to_close > PROB_MID_ENTRY_SECONDS:
+        effective_prob_min = PROB_MID_MIN     # 3-5min: need 85%+
+    else:
+        effective_prob_min = PROB_MIN         # <3min: 80% is reliable
         
     ok_yes = (
         yes_px is not None
