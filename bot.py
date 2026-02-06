@@ -153,13 +153,19 @@ PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
 PROB_MID_MIN = 0.85              # Need 85%+ in mid window
 # <3 min = PROB_MIN (0.80) — close enough that 80% is reliable
 
-# -------------- PROBABILITY TREND DETECTION (confirm certainty with momentum) --------------
+# -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
+# When prob is borderline (80-89%), require momentum confirmation.
+# When prob is high (90%+), the outcome speaks for itself — skip trend checks.
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
-PROB_TREND_MIN_SAMPLES = 10       # Need at least 10 samples (~90s at 1/sec)
-PROB_TREND_THRESHOLD = 0.10       # 10% swing in one direction = strong trend
+PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
+PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% — we need certainty
-PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries
-REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend
+PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
+REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend (borderline only)
+# HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
+# Rationale: 90% prob means BTC is well inside the range. You don't need momentum
+# confirmation when the outcome is already near-certain. Just buy and hold.
+PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
@@ -269,7 +275,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 100.0)  # Wider buffer — need BTC well inside range for certainty
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 50.0)  # $50 buffer — BTC-aware bail is the real safety net during hold
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — base prob already 80%, that's the bar
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
@@ -279,8 +285,8 @@ TREND_SHORT_WINDOW_MINUTES = 30    # Short-term trend: 30 min (~2 markets)
 TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
 TREND_STRONG_THRESHOLD = 100.0     # $100+ move in window = strong trend
 TREND_MODERATE_THRESHOLD = 50.0    # $50+ move = moderate trend
-TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against strong trend
-TREND_AGAINST_BLOCK = True         # Block trades against strong trend entirely
+TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against trend
+TREND_AGAINST_BLOCK = False        # Don't hard-block — require extra edge instead (trade every market)
 TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading with trend
 
 # Heartbeat
@@ -1613,9 +1619,13 @@ def main() -> None:
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
     )
     log.warning(
-        f"[BOOTCFG] DUMP: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
-        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} profit_tighten={DUMP_REVERSAL_THRESHOLD_PROFIT:.0%} "
-        f"hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract floor={DUMP_PROB_FLIP:.0%}"
+        f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
+        f"boundary_buffer=${BOUNDARY_BUFFER_USD:.0f} trend_block={TREND_AGAINST_BLOCK}"
+    )
+    log.warning(
+        f"[BOOTCFG] BAIL: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
+        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract "
+        f"btc_buffer_early=${DUMP_BTC_SAFE_BUFFER_EARLY:.0f} btc_buffer_late=${DUMP_BTC_SAFE_BUFFER_LATE:.0f}"
     )
     log.warning(
         f"[BOOTCFG] SIZING: base_contracts={BASE_CONTRACTS} increment={CONTRACT_INCREMENT}/win "
@@ -2061,108 +2071,114 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # --- MULTI-TIMEFRAME TREND CHECK: don't fight momentum ---
-        # Check both 60-min (macro) and 30-min (recent) trends
-        alignment = trend.trade_alignment(chosen_side, lo, hi, spot)
-        trend_move, trend_dir, trend_n = trend.get_trend()
-        alignment_short = trend_short.trade_alignment(chosen_side, lo, hi, spot)
-        trend_short_move, trend_short_dir, trend_short_n = trend_short.get_trend()
-
-        if chosen_side == "yes":
-            edge_for_trend = float(edge_yes)
-        else:
-            edge_for_trend = float(edge_no)
-
-        # Block if EITHER timeframe shows strong opposing trend
-        either_strong_against = (
-            (alignment == "against" and "strong" in trend_dir) or
-            (alignment_short == "against" and "strong" in trend_short_dir)
-        )
-        either_against = alignment == "against" or alignment_short == "against"
-
-        if either_strong_against:
-            if TREND_AGAINST_BLOCK:
-                log.warning(
-                    f"[TREND] BLOCKED {chosen_side.upper()} — against strong trend "
-                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}). "
-                    f"Edge={edge_for_trend:.4f} not enough to fight momentum."
-                )
-                time.sleep(POLL_SECONDS)
-                continue
-            elif edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
-                log.warning(
-                    f"[TREND] SKIPPED {chosen_side.upper()} — against strong trend "
-                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}), "
-                    f"edge={edge_for_trend:.4f} < {EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
-                )
-                time.sleep(POLL_SECONDS)
-                continue
-        elif either_against:
-            # Moderate opposing trend on either timeframe — require extra edge
-            if edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
-                log.warning(
-                    f"[TREND] SKIPPED {chosen_side.upper()} — against moderate trend "
-                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}), "
-                    f"edge={edge_for_trend:.4f} < {EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
-                )
-                time.sleep(POLL_SECONDS)
-                continue
-            else:
-                log.info(f"[TREND] Trading {chosen_side.upper()} against moderate trend — edge {edge_for_trend:.4f} sufficient")
-        elif alignment == "with" or alignment_short == "with":
-            log.info(
-                f"[TREND] Trading WITH trend ({chosen_side.upper()}) — "
-                f"60m={trend.summary()} 30m={trend_short.summary()}"
-            )
-
-        # --- PROBABILITY TREND CHECK: the main signal ---
-        # We want to see probability trending strongly in one direction before entering
+        # ================================================================
+        # ENTRY FILTER PIPELINE
+        # Two paths:
+        #   FAST LANE (≥90% prob): outcome is near-certain → buy immediately
+        #   STANDARD  (<90% prob): borderline → need trend + momentum confirmation
+        # This lets us trade every market when it's obvious, but stay cautious
+        # when the outcome is unclear.
+        # ================================================================
         current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
-        prob_trend_ok, prob_trend_reason = prob_trend.should_buy(chosen_side, current_prob_for_side)
+        fast_lane = current_prob_for_side >= PROB_FAST_LANE_THRESHOLD
 
-        if PROB_TREND_ENTRY_ENABLED and not prob_trend_ok:
-            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.info(f"[PROB_TREND] Waiting for momentum: {prob_trend_reason} | {prob_trend.summary()}")
-                last_state_log = now
-            time.sleep(POLL_SECONDS)
-            continue
+        if fast_lane:
+            log.warning(
+                f"[FAST LANE] {chosen_side.upper()} prob={current_prob_for_side:.1%} ≥ {PROB_FAST_LANE_THRESHOLD:.0%} "
+                f"— skipping trend/momentum checks, outcome near-certain"
+            )
+        else:
+            # --- MULTI-TIMEFRAME TREND CHECK (borderline trades only) ---
+            alignment = trend.trade_alignment(chosen_side, lo, hi, spot)
+            trend_move, trend_dir, trend_n = trend.get_trend()
+            alignment_short = trend_short.trade_alignment(chosen_side, lo, hi, spot)
+            trend_short_move, trend_short_dir, trend_short_n = trend_short.get_trend()
 
-        # --- CROSS-VALIDATE: prob trend must match BTC spot trend ---
-        # If probability says YES but BTC is dropping, that's suspicious (whale manipulation?)
-        # If probability says NO but BTC is rising, also suspicious
-        # Check BOTH 60-min and 30-min for misalignment signals
-        if REQUIRE_TREND_ALIGNMENT and prob_trend_ok:
-            prob_change, prob_dir, _, _ = prob_trend.get_trend()
-            spot_move, spot_dir, _ = trend.get_trend()
-            spot_short_move, spot_short_dir, _ = trend_short.get_trend()
+            if chosen_side == "yes":
+                edge_for_trend = float(edge_yes)
+            else:
+                edge_for_trend = float(edge_no)
 
-            # Determine expected alignment (check both timeframes)
-            # YES = BTC should be stable or rising (not strong_down)
-            # NO = BTC should be stable or falling (not strong_up)
-            misaligned = False
-            if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 50:
-                misaligned = True
-                mismatch_reason = f"prob_yes but BTC 60m={spot_dir}(${spot_move:+.0f})"
-            elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 50:
-                misaligned = True
-                mismatch_reason = f"prob_no but BTC 60m={spot_dir}(${spot_move:+.0f})"
-            elif chosen_side == "yes" and "down" in spot_short_dir and abs(spot_short_move) > 50:
-                misaligned = True
-                mismatch_reason = f"prob_yes but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
-            elif chosen_side == "no" and "up" in spot_short_dir and abs(spot_short_move) > 50:
-                misaligned = True
-                mismatch_reason = f"prob_no but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
+            # Check if EITHER timeframe shows opposing trend
+            either_strong_against = (
+                (alignment == "against" and "strong" in trend_dir) or
+                (alignment_short == "against" and "strong" in trend_short_dir)
+            )
+            either_against = alignment == "against" or alignment_short == "against"
 
-            if misaligned:
-                log.warning(f"[ALIGNMENT] BLOCKED — {mismatch_reason}. Prob trend may be manipulation, not signal.")
+            if either_strong_against:
+                if TREND_AGAINST_BLOCK:
+                    log.warning(
+                        f"[TREND] BLOCKED {chosen_side.upper()} — against strong trend "
+                        f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}). "
+                        f"Edge={edge_for_trend:.4f} not enough to fight momentum."
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+                elif edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
+                    log.warning(
+                        f"[TREND] SKIPPED {chosen_side.upper()} — against strong trend "
+                        f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}), "
+                        f"edge={edge_for_trend:.4f} < {EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+            elif either_against:
+                if edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
+                    log.warning(
+                        f"[TREND] SKIPPED {chosen_side.upper()} — against moderate trend "
+                        f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}), "
+                        f"edge={edge_for_trend:.4f} < {EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+                else:
+                    log.info(f"[TREND] Trading {chosen_side.upper()} against moderate trend — edge {edge_for_trend:.4f} sufficient")
+            elif alignment == "with" or alignment_short == "with":
+                log.info(
+                    f"[TREND] Trading WITH trend ({chosen_side.upper()}) — "
+                    f"60m={trend.summary()} 30m={trend_short.summary()}"
+                )
+
+            # --- PROBABILITY TREND CHECK (borderline trades need momentum) ---
+            prob_trend_ok, prob_trend_reason = prob_trend.should_buy(chosen_side, current_prob_for_side)
+
+            if PROB_TREND_ENTRY_ENABLED and not prob_trend_ok:
+                if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                    log.info(f"[PROB_TREND] Waiting for momentum: {prob_trend_reason} | {prob_trend.summary()}")
+                    last_state_log = now
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Log alignment confirmation
-            log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC 60m={spot_dir} 30m={spot_short_dir}")
+            # --- CROSS-VALIDATE: prob trend must match BTC spot trend ---
+            if REQUIRE_TREND_ALIGNMENT and prob_trend_ok:
+                prob_change, prob_dir, _, _ = prob_trend.get_trend()
+                spot_move, spot_dir, _ = trend.get_trend()
+                spot_short_move, spot_short_dir, _ = trend_short.get_trend()
 
-        if prob_trend_ok:
-            log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
+                misaligned = False
+                if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 50:
+                    misaligned = True
+                    mismatch_reason = f"prob_yes but BTC 60m={spot_dir}(${spot_move:+.0f})"
+                elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 50:
+                    misaligned = True
+                    mismatch_reason = f"prob_no but BTC 60m={spot_dir}(${spot_move:+.0f})"
+                elif chosen_side == "yes" and "down" in spot_short_dir and abs(spot_short_move) > 50:
+                    misaligned = True
+                    mismatch_reason = f"prob_yes but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
+                elif chosen_side == "no" and "up" in spot_short_dir and abs(spot_short_move) > 50:
+                    misaligned = True
+                    mismatch_reason = f"prob_no but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
+
+                if misaligned:
+                    log.warning(f"[ALIGNMENT] BLOCKED — {mismatch_reason}. Prob trend may be manipulation, not signal.")
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC 60m={spot_dir} 30m={spot_short_dir}")
+
+            if prob_trend_ok:
+                log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
 
         # Check session limits before trading
         can_trade, pause_reason = session.check_can_trade()
