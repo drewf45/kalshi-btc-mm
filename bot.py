@@ -13,9 +13,10 @@
 # - TIME-DEPENDENT PROB: 92% if >5min, 85% if 3-5min, 80% if <3min
 # - EDGE_MIN=0.02 (small edge OK — volume over 96 markets compounds)
 # - MAX_ENTRY_PRICE=95¢ (allow buying if certainty supports the price)
-# - BANKROLL_FRACTION=0.30 (buy lots of contracts per trade)
-# - DUMP is abort-only: 20% reversal, 120s patience, 12¢ hard stop
-# - Bankroll scaling: grows on wins, 96 markets/day = compounding machine
+# - CONTRACT SCALING: start at 3, +1 per win. Losses reset to base.
+# - BTC-AWARE BAIL: only dump if BTC has moved against us, not book noise
+# - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
+# - Dump is abort-only: 20% reversal, 120s patience, 15¢ hard stop
 
 import os
 import time
@@ -162,17 +163,20 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
-BANKROLL_FRACTION = 0.30  # 30% base — buy lots of contracts, each trade settles before next
-MIN_CONTRACTS = 1
-MAX_CONTRACTS = 100  # Allow bigger positions
+# -------------- CONTRACT-COUNT SCALING (HARDWIRED) --------------
+# Philosophy: size by CONTRACT COUNT, not percentage.
+# Start with BASE_CONTRACTS. Each win adds 1 contract. Each loss resets to base.
+# Over 96 markets/day this compounds: win 10 in a row = 10 extra contracts.
+# Simple, predictable, no bankroll-fraction math needed.
+BASE_CONTRACTS = 3          # Start each session buying 3 contracts
+CONTRACT_INCREMENT = 1      # Add 1 contract per consecutive win
+MAX_CONTRACTS = 100         # Hard cap
+MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
-
-# -------------- BANKROLL SCALING (HARDWIRED) --------------
-ENABLE_BANKROLL_SCALING = True
-SCALING_WIN_MULTIPLIER = 1.20  # +20% after win — steady compounding over 96 markets
-SCALING_LOSS_MULTIPLIER = 0.70  # -30% after loss — pull back but don't crater (losses should be rare)
-SCALING_MIN_FRACTION = 0.15  # Floor at 15% — always size meaningfully
-SCALING_MAX_FRACTION = 0.50  # Cap at 50% — let it scale up aggressively on streaks
+# Legacy fraction-based sizing (kept for A+ trade logic and safety checks)
+BANKROLL_FRACTION = 0.30
+SCALING_MIN_FRACTION = 0.15
+SCALING_MAX_FRACTION = 0.50
 
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
@@ -190,32 +194,41 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- DUMP CONFIGURATION (SAFETY NET: only dump when truly wrong) --------
+# -------------- BAIL CONFIGURATION (LAST RESORT — salvage only when truly cooked) ----
 ENABLE_DUMP = True
-# Philosophy: we entered with high conviction. Dump only if the thesis is BROKEN,
-# not on normal volatility. The goal is hold to close.
-DUMP_PROB_FLIP = 0.50  # Floor: if we've lost the majority, the thesis is broken
-DUMP_PROB_DROP_PERCENT = 1.0  # Disabled (reversal handles this)
-DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor: exit at coin-flip territory
-DUMP_MIN_TIME_REMAINING = 15  # Can dump closer to settlement
-DUMP_ON_PRICE_DANGER = False  # Disabled - trust probability
+# Philosophy: we entered with high conviction and hold to close. Bail ONLY if
+# BTC has actually moved against us AND the book confirms it. A book spike
+# while BTC is $150 on our side is NOT a reason to bail.
+DUMP_PROB_FLIP = 0.50  # Floor: if prob hits coin-flip AND BTC confirms, bail
+DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
+DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
+DUMP_MIN_TIME_REMAINING = 15  # Can bail closer to settlement
+DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
 
-# -------------- REVERSAL DUMP (last resort, not regular exit) -----------------
+# -------------- BTC-AWARE BAIL (the key fix: don't dump winners) ---------------
+# Before ANY bail trigger fires, check: is BTC on our side of the boundary?
+# YES side: spot > lo + buffer → BTC is safely above range floor → HOLD
+# NO side:  spot < hi - buffer → BTC is safely below range ceiling → HOLD
+# If BTC is on our side, the book is lying (thin book, spike, manipulation).
+# ONLY bail if BTC has actually crossed or is dangerously close to boundary.
+DUMP_BTC_SAFE_BUFFER_EARLY = 75.0    # >2min to close: need $75 buffer to suppress bail
+DUMP_BTC_SAFE_BUFFER_LATE = 30.0     # <2min to close: $30 is enough (BTC can't move far)
+DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
+
+# -------------- REVERSAL BAIL (only after BTC check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.20  # 20% drop from peak — very patient, thesis must truly break
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.15  # 15% even when profitable — give trades room
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.10  # Only tighten after 10%+ gain above entry
-DUMP_REVERSAL_MIN_SAMPLES = 5   # Need at least 5 samples to confirm reversal
-DUMP_EARLY_EXIT_ENABLED = True  # Allow dumping above 50% if thesis is broken
+DUMP_REVERSAL_THRESHOLD = 0.20  # 20% drop from peak — very patient
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.15  # 15% when profitable
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.10  # Tighten after 10%+ gain
+DUMP_REVERSAL_MIN_SAMPLES = 5
+DUMP_EARLY_EXIT_ENABLED = True
 
-# -------------- DUMP TIMING (hold to close — be very patient) -----------------
-DUMP_GRACE_PERIOD_SECONDS = 30      # No dumps for first 30s — we entered with conviction
-DUMP_PROACTIVE_AFTER_SECONDS = 120  # Only consider dump after 2 MINUTES — hold to close
-# First 120s: only dump if floor hit (50%) or hard P&L stop — trust the thesis
-# After 120s: dump on 20% reversal — something is truly wrong
+# -------------- BAIL TIMING (hold to close — be very patient) -----------------
+DUMP_GRACE_PERIOD_SECONDS = 30      # No bail for first 30s
+DUMP_PROACTIVE_AFTER_SECONDS = 120  # Proactive bail only after 2 min
 
-# -------------- HARD P&L STOP (prevent catastrophic single-trade losses) ------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 12  # Hard stop: dump if losing >12¢/contract unrealized
+# -------------- HARD P&L STOP (last-resort backstop) -------------------------
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 15  # Hard stop (still subject to BTC check)
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -261,7 +274,8 @@ LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — 
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
 # -------------- TREND TRACKING (know what BTC is doing) --------------
-TREND_WINDOW_MINUTES = 60          # Look back 60 min (~4 markets)
+TREND_WINDOW_MINUTES = 60          # Long-term trend: 60 min (~4 markets)
+TREND_SHORT_WINDOW_MINUTES = 30    # Short-term trend: 30 min (~2 markets)
 TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
 TREND_STRONG_THRESHOLD = 100.0     # $100+ move in window = strong trend
 TREND_MODERATE_THRESHOLD = 50.0    # $50+ move = moderate trend
@@ -868,7 +882,9 @@ class SessionState:
     market_losses: int = 0
     consecutive_losses: int = 0
     consecutive_wins: int = 0
-    current_fraction: float = BANKROLL_FRACTION
+    current_fraction: float = BANKROLL_FRACTION  # Legacy, kept for safety checks
+    # Contract-count scaling: the core sizing model
+    current_contracts: int = BASE_CONTRACTS
 
     # Session limits
     is_paused: bool = False
@@ -887,18 +903,19 @@ class SessionState:
             self.recent_trades = []
 
     def reset_for_new_market(self):
-        """Reset per-market state on each market roll. Daily state persists."""
+        """Reset per-market state on each market roll. Daily state persists.
+        NOTE: consecutive_wins and current_contracts PERSIST across markets —
+        that's the whole point of contract-count scaling over 96 markets/day."""
         self.market_wins = 0
         self.market_losses = 0
-        self.consecutive_losses = 0
-        self.consecutive_wins = 0
-        self.current_fraction = BANKROLL_FRACTION  # Reset to base fraction
+        # consecutive_wins/losses intentionally NOT reset — they span markets
+        # current_contracts intentionally NOT reset — grows with streak
         # Clear per-market pause (but NOT daily hard stop)
         if not self.is_daily_stopped:
             self.is_paused = False
             self.pause_reason = None
         log.warning(
-            f"[SESSION] Market reset: fraction={self.current_fraction:.2%} "
+            f"[SESSION] Market reset: contracts={self.current_contracts} streak={self.consecutive_wins}W "
             f"daily_pnl=${self.daily_pnl_usd:.2f} W/L={self.total_wins}/{self.total_losses}"
         )
 
@@ -963,20 +980,16 @@ class SessionState:
             f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
             f"W/L={self.total_wins}/{self.total_losses} "
             f"streak={self.consecutive_wins}W/{self.consecutive_losses}L "
-            f"fraction={self.current_fraction:.2%}"
+            f"next_contracts={self.current_contracts}"
         )
 
     def _scale_up(self):
-        if not ENABLE_BANKROLL_SCALING:
-            return
-        new_frac = self.current_fraction * SCALING_WIN_MULTIPLIER
-        self.current_fraction = min(new_frac, SCALING_MAX_FRACTION)
+        """Win: add 1 contract. Simple compounding over 96 markets/day."""
+        self.current_contracts = min(self.current_contracts + CONTRACT_INCREMENT, MAX_CONTRACTS)
 
     def _scale_down(self):
-        if not ENABLE_BANKROLL_SCALING:
-            return
-        new_frac = self.current_fraction * SCALING_LOSS_MULTIPLIER
-        self.current_fraction = max(new_frac, SCALING_MIN_FRACTION)
+        """Loss: reset to base. Losses should be rare — when they happen, start fresh."""
+        self.current_contracts = BASE_CONTRACTS
 
     def _check_daily_stop(self):
         """HARD STOP: never lose more than 75% of starting balance"""
@@ -1001,7 +1014,7 @@ class SessionState:
             self.is_paused = True
             self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
             self.pause_reason = f"consecutive_losses_{self.consecutive_losses}"
-            self.current_fraction = SCALING_MIN_FRACTION
+            self.current_contracts = BASE_CONTRACTS  # Reset to base on consecutive loss pause
             log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
 
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
@@ -1024,8 +1037,12 @@ class SessionState:
         return False, f"paused:{self.pause_reason} ({remaining}s remaining)"
 
     def get_current_fraction(self) -> float:
-        """Get the current bankroll fraction to use"""
+        """Get the current bankroll fraction to use (legacy, for safety checks)"""
         return self.current_fraction
+
+    def get_current_contracts(self) -> int:
+        """Get how many contracts to buy this market."""
+        return self.current_contracts
 
 
 class SpotTrend:
@@ -1391,6 +1408,29 @@ def choose_trade(
 
 
 # PROACTIVE DUMP: Get best exit price, don't wait until it's too late
+def _btc_is_safe(side: str, spot: float, lo: Optional[float], hi: Optional[float],
+                  secs_to_close: int) -> Tuple[bool, float]:
+    """
+    Check if BTC spot price is safely on our side of the market boundary.
+    Returns (is_safe, buffer_distance_usd).
+
+    This is THE key check: if BTC is on our side, the book is lying.
+    Don't bail on a winner just because the orderbook spiked for 3 seconds.
+    """
+    buffer = DUMP_BTC_SAFE_BUFFER_LATE if secs_to_close < DUMP_BTC_SAFE_CUTOFF_SECONDS else DUMP_BTC_SAFE_BUFFER_EARLY
+
+    if side == "yes" and lo is not None:
+        # YES wins if BTC stays ABOVE lo. Safe if spot > lo + buffer.
+        distance = spot - lo
+        return distance >= buffer, distance
+    elif side == "no" and hi is not None:
+        # NO wins if BTC stays BELOW hi. Safe if spot < hi - buffer.
+        distance = hi - spot
+        return distance >= buffer, distance
+
+    return False, 0.0  # Can't determine — not safe
+
+
 def should_dump_position(
     st: BotState,
     p_yes_blend: float,
@@ -1404,9 +1444,11 @@ def should_dump_position(
     trend: Optional['SpotTrend'] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
-    PROACTIVE dump logic: exit early when probability reverses to get best price.
-    The goal is NOT to wait until we've definitely lost - it's to exit while
-    we can still get a decent price.
+    BAIL logic: last resort only. Hold to close is the goal.
+
+    KEY PRINCIPLE: Before any bail trigger fires, check if BTC is on our side
+    of the boundary. If it is, the book is lying — HOLD. Only bail when
+    BTC has actually moved against us.
 
     Returns: (should_dump, reason)
     """
@@ -1419,7 +1461,7 @@ def should_dump_position(
     if st.entry_model_prob is None:
         return False, "no_entry_data"
 
-    # --- GRACE PERIOD: brief pause to let entry volatility settle ---
+    # --- GRACE PERIOD ---
     time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 9999
     if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
         return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
@@ -1439,45 +1481,65 @@ def should_dump_position(
     drop_from_peak = st.peak_prob_for_side - current_prob
     in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
 
-    # === HARD P&L STOP: prevent catastrophic single-trade losses ===
-    # Active even during settling — never let a single trade blow up
+    # =============================================================
+    # === BTC SAFETY CHECK: THE MASTER OVERRIDE ===
+    # If BTC is on our side of the boundary, DO NOT BAIL.
+    # The book can spike, the probability can drop on a thin book,
+    # but if BTC is $100+ on our side with 1 minute left, we WIN.
+    # =============================================================
+    btc_safe, btc_distance = _btc_is_safe(st.side, spot, lo, hi, secs_to_close)
+    if btc_safe:
+        # BTC is on our side — this is a winner. Hold no matter what the book says.
+        phase = "settling" if in_settling else "active"
+        return False, (
+            f"btc_safe_{phase}_dist=${btc_distance:.0f}_"
+            f"prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}_drop={drop_from_peak:.0%}"
+        )
+
+    # === Below here: BTC is NOT safely on our side — bail checks apply ===
+
+    # --- HARD P&L STOP: BTC is against us AND losing big ---
     if st.entry_price_cents is not None:
-        # Estimate current exit price for our side
         exit_price_est = int(current_prob * 100)
         unrealized_loss_per_contract = st.entry_price_cents - exit_price_est
         if unrealized_loss_per_contract >= DUMP_MAX_LOSS_CENTS_PER_CONTRACT:
             log.warning(
-                f"[DUMP HARD STOP] losing ~{unrealized_loss_per_contract}¢/contract "
-                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — hard stop"
+                f"[BAIL HARD STOP] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+                f"losing ~{unrealized_loss_per_contract}¢/contract "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — salvaging"
             )
             return True, f"hard_stop_{unrealized_loss_per_contract}c_per_contract"
 
-    # === REVERSAL DUMP: Exit only if thesis is truly broken ===
-    # Only kicks in after long settling period — we entered to hold to close
+    # --- REVERSAL BAIL: BTC is against us AND prob has dropped significantly ---
     if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED and not in_settling:
-        # Use tighter threshold when we had significant gains (protect profit)
         gain_above_entry = st.peak_prob_for_side - entry_prob
         if gain_above_entry >= DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY:
-            effective_threshold = DUMP_REVERSAL_THRESHOLD_PROFIT  # 15%
+            effective_threshold = DUMP_REVERSAL_THRESHOLD_PROFIT
         else:
-            effective_threshold = DUMP_REVERSAL_THRESHOLD  # 20%
+            effective_threshold = DUMP_REVERSAL_THRESHOLD
 
         if drop_from_peak >= effective_threshold:
             log.warning(
-                f"[DUMP REVERSAL] prob dropped {drop_from_peak:.1%} from peak "
-                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — "
-                f"threshold={effective_threshold:.0%} (profit_tighten={gain_above_entry >= DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY}) "
-                f"— thesis broken, exiting"
+                f"[BAIL REVERSAL] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+                f"prob dropped {drop_from_peak:.1%} from peak "
+                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — salvaging"
             )
             return True, f"reversal_{current_prob:.0%}_from_peak_{st.peak_prob_for_side:.0%}"
 
-    # === FLOOR: Last resort - always active (even during settling) ===
+    # --- FLOOR: BTC is against us AND prob is at coin-flip ---
     if current_prob < DUMP_PROB_FLIP:
+        log.warning(
+            f"[BAIL FLOOR] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+            f"prob={current_prob:.1%} < {DUMP_PROB_FLIP:.0%} — salvaging"
+        )
         return True, f"floor_{current_prob:.0%}<{DUMP_PROB_FLIP:.0%}"
 
-    # Still holding - show status
+    # Still holding
     phase = "settling" if in_settling else "active"
-    return False, f"{phase}_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}_drop={drop_from_peak:.0%}"
+    return False, (
+        f"{phase}_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}"
+        f"_drop={drop_from_peak:.0%}_btc_dist=${btc_distance:.0f}"
+    )
 
 
 def compute_fraction_for_trade(edge_net: float, p_gate: float, session_fraction: Optional[float] = None) -> float:
@@ -1503,35 +1565,38 @@ def compute_qty_from_bankroll(
     p_gate: float,
     session: Optional[SessionState] = None
 ) -> int:
-    """Compute order quantity based on bankroll, edge, and session state"""
+    """Compute order quantity using contract-count scaling.
+
+    Primary model: session.current_contracts (base + 1 per win streak).
+    Safety cap: never spend more than BANKROLL_FRACTION of available balance.
+    """
     if entry_cents is None or entry_cents <= 0:
-        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to ORDER_QTY={ORDER_QTY}")
-        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to BASE_CONTRACTS={BASE_CONTRACTS}")
+        return clamp_int(BASE_CONTRACTS, MIN_CONTRACTS, MAX_CONTRACTS)
 
     if available_usd is None or available_usd <= 0:
-        log.warning(f"[SIZE] available_usd is None or <=0, falling back to ORDER_QTY={ORDER_QTY}")
-        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+        log.warning(f"[SIZE] available_usd is None or <=0, falling back to BASE_CONTRACTS={BASE_CONTRACTS}")
+        return clamp_int(BASE_CONTRACTS, MIN_CONTRACTS, MAX_CONTRACTS)
 
     if available_usd < MIN_FREE_USD_TO_TRADE:
         log.warning(f"[SIZE] available_usd ${available_usd:.2f} < MIN_FREE_USD_TO_TRADE ${MIN_FREE_USD_TO_TRADE}, returning 0")
         return 0
 
-    # Get session-adjusted fraction if available
-    session_fraction = session.get_current_fraction() if session else None
-    frac = compute_fraction_for_trade(edge_net=edge_net, p_gate=p_gate, session_fraction=session_fraction)
-    stake_usd = max(0.0, float(available_usd) * float(frac))
+    # Primary: contract count from session (base + streak bonus)
+    target_qty = session.get_current_contracts() if session else BASE_CONTRACTS
 
+    # Safety cap: don't spend more than we can afford
     cost_per = float(entry_cents) / 100.0
+    if cost_per > 0:
+        max_affordable = int(available_usd * BANKROLL_FRACTION / cost_per)
+        if target_qty > max_affordable:
+            log.info(f"[SIZE] Capping qty {target_qty} -> {max_affordable} (afford cap at {BANKROLL_FRACTION:.0%} of ${available_usd:.2f})")
+            target_qty = max_affordable
 
-    if cost_per <= 0.0:
-        log.warning(f"[SIZE] cost_per={cost_per} invalid, returning ORDER_QTY={ORDER_QTY}")
-        return clamp_int(ORDER_QTY, MIN_CONTRACTS, MAX_CONTRACTS)
+    qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
-    qty = int(stake_usd // cost_per)
-    qty = clamp_int(qty, MIN_CONTRACTS, MAX_CONTRACTS)
-
-    session_info = f" (session_frac={session_fraction:.2%})" if session_fraction else ""
-    log.info(f"[SIZE] avail=${available_usd:.2f} frac={frac:.4f} stake=${stake_usd:.2f} qty={qty}{session_info}")
+    streak = session.consecutive_wins if session else 0
+    log.info(f"[SIZE] contracts={qty} (base={BASE_CONTRACTS}+{streak}wins) cost={entry_cents}¢ avail=${available_usd:.2f}")
 
     return qty
 
@@ -1553,8 +1618,8 @@ def main() -> None:
         f"hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract floor={DUMP_PROB_FLIP:.0%}"
     )
     log.warning(
-        f"[BOOTCFG] SCALING: enabled={ENABLE_BANKROLL_SCALING} win_mult={SCALING_WIN_MULTIPLIER} "
-        f"loss_mult={SCALING_LOSS_MULTIPLIER} min={SCALING_MIN_FRACTION:.0%} max={SCALING_MAX_FRACTION:.0%}"
+        f"[BOOTCFG] SIZING: base_contracts={BASE_CONTRACTS} increment={CONTRACT_INCREMENT}/win "
+        f"max={MAX_CONTRACTS} (resets to base on loss)"
     )
     log.warning(
         f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
@@ -1562,9 +1627,9 @@ def main() -> None:
         f"balance_check_delay={BALANCE_CHECK_DELAY_SECONDS}s"
     )
     log.warning(
-        f"[BOOTCFG] TREND: window={TREND_WINDOW_MINUTES}min strong=${TREND_STRONG_THRESHOLD} "
-        f"moderate=${TREND_MODERATE_THRESHOLD} block_against={TREND_AGAINST_BLOCK} "
-        f"edge_boost={TREND_AGAINST_EDGE_BOOST} edge_discount={TREND_WITH_EDGE_DISCOUNT}"
+        f"[BOOTCFG] TREND: windows={TREND_WINDOW_MINUTES}min+{TREND_SHORT_WINDOW_MINUTES}min "
+        f"strong=${TREND_STRONG_THRESHOLD} moderate=${TREND_MODERATE_THRESHOLD} "
+        f"block_against={TREND_AGAINST_BLOCK} edge_boost={TREND_AGAINST_EDGE_BOOST}"
     )
     log.warning("[HEARTBEAT] main() entered — SCALPER is running")
 
@@ -1576,7 +1641,8 @@ def main() -> None:
 
     st = BotState()
     session = SessionState()
-    trend = SpotTrend()
+    trend = SpotTrend()  # 60-min long-term trend
+    trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
     active_market_obj: Dict[str, Any] = {}
 
@@ -1659,8 +1725,8 @@ def main() -> None:
             log.warning(
                 f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
                 f"SESSION: pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
-                f"W/L={session.total_wins}/{session.total_losses} frac={session.current_fraction:.1%} | "
-                f"{prob_trend.summary()}"
+                f"W/L={session.total_wins}/{session.total_losses} contracts={session.current_contracts} "
+                f"streak={session.consecutive_wins}W | {prob_trend.summary()}"
             )
             last_heartbeat = now
 
@@ -1799,6 +1865,7 @@ def main() -> None:
                 spot = fetch_btc_spot_usd(http)
                 if spot is not None:
                     trend.record(spot)
+                    trend_short.record(spot)
                     try:
                         ob = client.request("GET", f"/markets/{st.market}/orderbook")
                         yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
@@ -1927,6 +1994,7 @@ def main() -> None:
         spot = fetch_btc_spot_usd(http)
         if spot is not None:
             trend.record(spot)
+            trend_short.record(spot)
         if spot is None:
             log.warning(f"[SPOT] failed; skipping this poll")
             time.sleep(POLL_SECONDS)
@@ -1993,46 +2061,59 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # --- TREND CHECK: don't fight strong momentum ---
+        # --- MULTI-TIMEFRAME TREND CHECK: don't fight momentum ---
+        # Check both 60-min (macro) and 30-min (recent) trends
         alignment = trend.trade_alignment(chosen_side, lo, hi, spot)
         trend_move, trend_dir, trend_n = trend.get_trend()
+        alignment_short = trend_short.trade_alignment(chosen_side, lo, hi, spot)
+        trend_short_move, trend_short_dir, trend_short_n = trend_short.get_trend()
 
         if chosen_side == "yes":
             edge_for_trend = float(edge_yes)
         else:
             edge_for_trend = float(edge_no)
 
-        if alignment == "against" and "strong" in trend_dir:
+        # Block if EITHER timeframe shows strong opposing trend
+        either_strong_against = (
+            (alignment == "against" and "strong" in trend_dir) or
+            (alignment_short == "against" and "strong" in trend_short_dir)
+        )
+        either_against = alignment == "against" or alignment_short == "against"
+
+        if either_strong_against:
             if TREND_AGAINST_BLOCK:
                 log.warning(
-                    f"[TREND] BLOCKED {chosen_side.upper()} — against {trend_dir} "
-                    f"(${trend_move:+.0f} over {trend.get_window_minutes():.0f}min). "
+                    f"[TREND] BLOCKED {chosen_side.upper()} — against strong trend "
+                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}). "
                     f"Edge={edge_for_trend:.4f} not enough to fight momentum."
                 )
                 time.sleep(POLL_SECONDS)
                 continue
             elif edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
                 log.warning(
-                    f"[TREND] SKIPPED {chosen_side.upper()} — against {trend_dir} "
-                    f"(${trend_move:+.0f}), edge={edge_for_trend:.4f} < "
-                    f"{EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                    f"[TREND] SKIPPED {chosen_side.upper()} — against strong trend "
+                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}), "
+                    f"edge={edge_for_trend:.4f} < {EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
                 )
                 time.sleep(POLL_SECONDS)
                 continue
-        elif alignment == "against":
-            # Moderate trend — require extra edge but don't block
+        elif either_against:
+            # Moderate opposing trend on either timeframe — require extra edge
             if edge_for_trend < EDGE_MIN + TREND_AGAINST_EDGE_BOOST:
                 log.warning(
-                    f"[TREND] SKIPPED {chosen_side.upper()} — against moderate {trend_dir} "
-                    f"(${trend_move:+.0f}), edge={edge_for_trend:.4f} < "
-                    f"{EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
+                    f"[TREND] SKIPPED {chosen_side.upper()} — against moderate trend "
+                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}), "
+                    f"edge={edge_for_trend:.4f} < {EDGE_MIN + TREND_AGAINST_EDGE_BOOST:.4f} required"
                 )
                 time.sleep(POLL_SECONDS)
                 continue
             else:
-                log.info(f"[TREND] Trading {chosen_side.upper()} against {trend_dir} — edge {edge_for_trend:.4f} sufficient")
-        elif alignment == "with":
-            log.info(f"[TREND] Trading WITH {trend_dir} ({chosen_side.upper()}) — {trend.summary()}")
+                log.info(f"[TREND] Trading {chosen_side.upper()} against moderate trend — edge {edge_for_trend:.4f} sufficient")
+        elif alignment == "with" or alignment_short == "with":
+            log.info(
+                f"[TREND] Trading WITH trend ({chosen_side.upper()}) — "
+                f"60m={trend.summary()} 30m={trend_short.summary()}"
+            )
 
         # --- PROBABILITY TREND CHECK: the main signal ---
         # We want to see probability trending strongly in one direction before entering
@@ -2049,20 +2130,28 @@ def main() -> None:
         # --- CROSS-VALIDATE: prob trend must match BTC spot trend ---
         # If probability says YES but BTC is dropping, that's suspicious (whale manipulation?)
         # If probability says NO but BTC is rising, also suspicious
+        # Check BOTH 60-min and 30-min for misalignment signals
         if REQUIRE_TREND_ALIGNMENT and prob_trend_ok:
             prob_change, prob_dir, _, _ = prob_trend.get_trend()
             spot_move, spot_dir, _ = trend.get_trend()
+            spot_short_move, spot_short_dir, _ = trend_short.get_trend()
 
-            # Determine expected alignment
+            # Determine expected alignment (check both timeframes)
             # YES = BTC should be stable or rising (not strong_down)
             # NO = BTC should be stable or falling (not strong_up)
             misaligned = False
             if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 50:
                 misaligned = True
-                mismatch_reason = f"prob_yes but BTC {spot_dir} (${spot_move:+.0f})"
+                mismatch_reason = f"prob_yes but BTC 60m={spot_dir}(${spot_move:+.0f})"
             elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 50:
                 misaligned = True
-                mismatch_reason = f"prob_no but BTC {spot_dir} (${spot_move:+.0f})"
+                mismatch_reason = f"prob_no but BTC 60m={spot_dir}(${spot_move:+.0f})"
+            elif chosen_side == "yes" and "down" in spot_short_dir and abs(spot_short_move) > 50:
+                misaligned = True
+                mismatch_reason = f"prob_yes but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
+            elif chosen_side == "no" and "up" in spot_short_dir and abs(spot_short_move) > 50:
+                misaligned = True
+                mismatch_reason = f"prob_no but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
 
             if misaligned:
                 log.warning(f"[ALIGNMENT] BLOCKED — {mismatch_reason}. Prob trend may be manipulation, not signal.")
@@ -2070,7 +2159,7 @@ def main() -> None:
                 continue
 
             # Log alignment confirmation
-            log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC {spot_dir}")
+            log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC 60m={spot_dir} 30m={spot_short_dir}")
 
         if prob_trend_ok:
             log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
@@ -2116,7 +2205,7 @@ def main() -> None:
         )
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty} (session_frac={session.current_fraction:.2%})")
+            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty} (contracts={session.current_contracts} streak={session.consecutive_wins}W)")
             st.traded_this_market = True
             st.sm = SM.HOLD
             time.sleep(POLL_SECONDS)
@@ -2138,7 +2227,7 @@ def main() -> None:
 
             log.warning(
                 f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
-                f"edge={edge_net:.4f} p_gate={p_gate:.4f} session_frac={session.current_fraction:.2%}"
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f} contracts={session.current_contracts} streak={session.consecutive_wins}W"
             )
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
