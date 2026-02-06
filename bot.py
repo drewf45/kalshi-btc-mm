@@ -236,6 +236,18 @@ DUMP_PROACTIVE_AFTER_SECONDS = 120  # Proactive bail only after 2 min
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
 DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 15  # Hard stop (still subject to BTC check)
 
+# -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
+# If we bail because BTC moved against us, the OTHER side is now the high-prob winner.
+# Instead of just eating the loss, flip to the other side and hold THAT to settlement.
+# Example: bought YES at 94¢, BTC tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
+#          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
+# Safety: the flip goes through normal entry criteria (prob gate, edge gate, etc.)
+#         so we only flip if the other side is actually a good trade.
+FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
+FLIP_MIN_TIME_REMAINING = 60        # Need at least 60s to close — enough for one more hold
+FLIP_MIN_PROB = 0.80                # Other side must be ≥80% prob to flip into it
+FLIP_MAX_ENTRY_PRICE = 95           # Don't overpay on the flip
+
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
 MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.75)
@@ -1238,6 +1250,7 @@ class BotState:
     event: Optional[str] = None
 
     traded_this_market: bool = False
+    has_flipped: bool = False  # True after one flip — prevent infinite flip-flop
     side: Optional[str] = None  # "yes" or "no" - which side we're holding
     action: Optional[str] = None
     target_price: Optional[int] = None
@@ -1628,6 +1641,10 @@ def main() -> None:
         f"btc_buffer_early=${DUMP_BTC_SAFE_BUFFER_EARLY:.0f} btc_buffer_late=${DUMP_BTC_SAFE_BUFFER_LATE:.0f}"
     )
     log.warning(
+        f"[BOOTCFG] FLIP: enabled={FLIP_AFTER_DUMP} min_time={FLIP_MIN_TIME_REMAINING}s "
+        f"min_prob={FLIP_MIN_PROB:.0%} max_price={FLIP_MAX_ENTRY_PRICE}¢ (one flip per market)"
+    )
+    log.warning(
         f"[BOOTCFG] SIZING: base_contracts={BASE_CONTRACTS} increment={CONTRACT_INCREMENT}/win "
         f"max={MAX_CONTRACTS} (resets to base on loss)"
     )
@@ -1716,6 +1733,7 @@ def main() -> None:
         st.sm = SM.IDLE
         st.market = new_market
         st.traded_this_market = False
+        st.has_flipped = False
         st.order_id = None
         st.side = None
         st.target_price = None
@@ -1833,6 +1851,7 @@ def main() -> None:
                     active_market_obj = mobj2 or {}
                     st.sm = SM.ROLL
                     st.traded_this_market = False
+                    st.has_flipped = False
                     st.order_id = None
                     st.side = None
                     st.target_price = None
@@ -1914,7 +1933,8 @@ def main() -> None:
                             last_state_log = now
 
                         if should_dump:
-                            log.warning(f"[DUMP] Triggering dump: {dump_reason}")
+                            log.warning(f"[BAIL] Triggering bail: {dump_reason}")
+                            dumped_side = st.side
 
                             # Estimate exit price (use current bid/ask)
                             if st.side == "yes":
@@ -1936,14 +1956,10 @@ def main() -> None:
 
                                 if not DRY_RUN:
                                     oid = place_order(client, exit_payload)
-                                    log.warning(f"[DUMP] Placed exit order {oid} BUY {exit_side} qty={abs(pos)}")
+                                    log.warning(f"[BAIL] Placed exit order {oid} BUY {exit_side} qty={abs(pos)}")
 
-                                    # Record P&L for dump (entry cost - exit value)
+                                    # Record P&L for dump
                                     if st.entry_price_cents is not None:
-                                        # For YES: paid entry_price, selling at exit_price
-                                        # For NO: paid entry_price, selling at exit_price
-                                        # P&L = (exit_price - entry_price) * qty for winning side
-                                        # But on dump we're usually losing, so:
                                         pnl_cents = (exit_price_cents - st.entry_price_cents) * abs(pos)
                                         session.record_trade(
                                             market=st.market,
@@ -1955,14 +1971,107 @@ def main() -> None:
                                             was_dump=True,
                                         )
                                 else:
-                                    log.warning(f"[DRY] Would dump: BUY {exit_side} qty={abs(pos)}")
+                                    log.warning(f"[DRY] Would bail: BUY {exit_side} qty={abs(pos)}")
 
-                                st.sm = SM.DUMPED
-                                st.side = None
-                                st.entry_price_cents = None
+                                # ============================================
+                                # FLIP LOGIC: buy the other side and hold to settlement
+                                # If we bailed because BTC moved against us, the other
+                                # side is now the high-prob winner. Flip into it.
+                                # ============================================
+                                flip_side = "no" if dumped_side == "yes" else "yes"
+                                flip_prob = p_no_blend if dumped_side == "yes" else p_yes_blend
+                                flip_price = no_ask if flip_side == "no" else yes_ask
+
+                                can_flip = (
+                                    FLIP_AFTER_DUMP
+                                    and not st.has_flipped  # Only one flip per market
+                                    and secs_to_close >= FLIP_MIN_TIME_REMAINING
+                                    and flip_prob >= FLIP_MIN_PROB
+                                    and flip_price is not None
+                                    and flip_price <= FLIP_MAX_ENTRY_PRICE
+                                )
+
+                                if can_flip:
+                                    flip_edge = flip_prob - (flip_price / 100.0)
+                                    flip_qty = session.get_current_contracts()
+
+                                    # Safety cap on flip qty
+                                    try:
+                                        avail_usd, _ = get_balance_usd(client)
+                                        if avail_usd and avail_usd > 0:
+                                            cost_per = flip_price / 100.0
+                                            max_afford = int(avail_usd * BANKROLL_FRACTION / cost_per) if cost_per > 0 else 0
+                                            flip_qty = min(flip_qty, max_afford)
+                                        flip_qty = max(MIN_CONTRACTS, min(flip_qty, MAX_CONTRACTS))
+                                    except Exception:
+                                        flip_qty = BASE_CONTRACTS
+
+                                    log.warning(
+                                        f"[FLIP] Flipping to {flip_side.upper()} after bail — "
+                                        f"prob={flip_prob:.1%} price={flip_price}¢ edge={flip_edge:.4f} "
+                                        f"qty={flip_qty} t_close={secs_to_close}s"
+                                    )
+
+                                    if not DRY_RUN:
+                                        try:
+                                            flip_payload = build_order_payload(
+                                                market_ticker=st.market,
+                                                action="buy",
+                                                side=flip_side,
+                                                price_cents=int(flip_price),
+                                                count=int(flip_qty),
+                                                post_only=False,  # Taker — need to get in fast after bail
+                                            )
+                                            flip_oid = place_order(client, flip_payload)
+                                            log.warning(
+                                                f"[FLIP] Placed flip order {flip_oid} BUY {flip_side.upper()} "
+                                                f"@ {flip_price}¢ qty={flip_qty}"
+                                            )
+
+                                            # Update state for the new position
+                                            st.sm = SM.HOLD
+                                            st.side = flip_side
+                                            st.entry_price_cents = int(flip_price)
+                                            st.entry_time = time.time()
+                                            st.entry_model_prob = p_yes_model if flip_side == "yes" else (1.0 - p_yes_model)
+                                            st.entry_market_prob = p_mkt
+                                            st.entry_spot_price = spot
+                                            st.qty = flip_qty
+                                            st.peak_prob_for_side = flip_prob
+                                            st.has_flipped = True
+                                            st.traded_this_market = True
+
+                                        except Exception as e:
+                                            log.error(f"[FLIP] Failed to place flip order: {e}")
+                                            st.sm = SM.DUMPED
+                                            st.side = None
+                                            st.entry_price_cents = None
+                                    else:
+                                        log.warning(f"[DRY] Would flip: BUY {flip_side.upper()} @ {flip_price}¢ qty={flip_qty}")
+                                        st.sm = SM.DUMPED
+                                        st.side = None
+                                        st.entry_price_cents = None
+                                else:
+                                    # No flip — just stay dumped
+                                    reason_parts = []
+                                    if not FLIP_AFTER_DUMP:
+                                        reason_parts.append("disabled")
+                                    if st.has_flipped:
+                                        reason_parts.append("already_flipped")
+                                    if secs_to_close < FLIP_MIN_TIME_REMAINING:
+                                        reason_parts.append(f"time={secs_to_close}s<{FLIP_MIN_TIME_REMAINING}s")
+                                    if flip_prob < FLIP_MIN_PROB:
+                                        reason_parts.append(f"prob={flip_prob:.1%}<{FLIP_MIN_PROB:.0%}")
+                                    if flip_price is not None and flip_price > FLIP_MAX_ENTRY_PRICE:
+                                        reason_parts.append(f"price={flip_price}¢>{FLIP_MAX_ENTRY_PRICE}¢")
+
+                                    log.info(f"[FLIP] Skipped — {', '.join(reason_parts) or 'no_ask'}")
+                                    st.sm = SM.DUMPED
+                                    st.side = None
+                                    st.entry_price_cents = None
 
                             except Exception as e:
-                                log.error(f"[DUMP] Failed to place exit order: {e}")
+                                log.error(f"[BAIL] Failed to place exit order: {e}")
                         
                     except Exception as e:
                         log.warning(f"[DUMP] Check failed: {e}")
