@@ -1226,8 +1226,10 @@ class ProbTrend:
         Check if the probability trend supports buying this side.
         Returns: (should_buy, reason)
 
-        Logic: if probability has been steadily climbing toward our side
-        for 60+ seconds, that's the signal — don't wait for 90%.
+        Three cases:
+          1. Trend matches our side (yes trending → buy yes) → GO
+          2. Trend is FLAT and prob is high → GO (stable certainty is a good sign)
+          3. Trend is AGAINST us (yes trending but we want no) → BLOCK
         """
         if not PROB_TREND_ENTRY_ENABLED:
             return False, "trend_entry_disabled"
@@ -1241,13 +1243,19 @@ class ProbTrend:
         if current_prob < PROB_TREND_MIN_CURRENT:
             return False, f"prob_too_low({current_prob:.2f})"
 
-        # Check if trend supports our side
+        # CASE 1: Trend matches our side → strong GO
         if side == "yes" and "yes" in direction:
             return True, f"trend_yes({change:+.2f}/{seconds:.0f}s)"
         if side == "no" and "no" in direction:
             return True, f"trend_no({change:+.2f}/{seconds:.0f}s)"
 
-        return False, f"no_trend({direction})"
+        # CASE 2: Trend is FLAT → probability is stable and high → GO
+        # "Flat at 87%" means BTC has been safely in range for minutes. That's certainty.
+        if direction == "flat":
+            return True, f"flat_stable({current_prob:.0%}/{seconds:.0f}s)"
+
+        # CASE 3: Trend is AGAINST us → BLOCK
+        return False, f"trend_against({direction}/{change:+.2f})"
 
     def summary(self) -> str:
         """Short string for logging"""
