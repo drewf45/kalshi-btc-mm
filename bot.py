@@ -298,6 +298,13 @@ HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
+# SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
+# conservative BS estimate against market price.  With <2 min left the market
+# price IS the probability.  If blend prob is high, buy even with thin/no edge.
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 97)   # cap risk
+
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
@@ -1427,17 +1434,38 @@ def choose_trade(
             log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to upper bound ${hi:.2f}, blocking NO")
         ok_no = False
 
-    # High-certainty override
+    # High-certainty override (last 15 seconds)
     if secs_to_close < HIGH_CERTAINTY_TIME_SEC:
         yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
         no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
-        
+
         if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= HIGH_CERTAINTY_MAX_PRICE and yes_boundary_ok:
             ok_yes = True
             log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_model:.4f}, price={yes_px})")
         if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= HIGH_CERTAINTY_MAX_PRICE and no_boundary_ok:
             ok_no = True
             log.info(f"[OVERRIDE] NO high-certainty (p={p_no_model:.4f}, price={no_px})")
+
+    # SETTLEMENT LOCK: <2 min to close, model edge is unreliable.
+    # Market has priced in the near-certain outcome, so our conservative blend
+    # shows negative edge even when the trade is good.  Skip edge requirement
+    # if blend prob is high and price isn't insane.  Settlement payout IS the edge.
+    if secs_to_close <= SETTLEMENT_LOCK_SECONDS:
+        yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
+        no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
+
+        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= SETTLEMENT_LOCK_MAX_PRICE and yes_boundary_ok:
+            ok_yes = True
+            log.warning(
+                f"[SETTLE LOCK] YES override: blend={p_yes_blend:.1%} price={yes_px}¢ "
+                f"edge={edge_yes:.4f} t={secs_to_close}s — settlement payout is the edge"
+            )
+        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= SETTLEMENT_LOCK_MAX_PRICE and no_boundary_ok:
+            ok_no = True
+            log.warning(
+                f"[SETTLE LOCK] NO override: blend={p_no_blend:.1%} price={no_px}¢ "
+                f"edge={edge_no:.4f} t={secs_to_close}s — settlement payout is the edge"
+            )
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
