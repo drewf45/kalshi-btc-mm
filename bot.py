@@ -1309,6 +1309,14 @@ class BotState:
     # Peak probability tracking (for proactive dump)
     peak_prob_for_side: float = 0.0  # Highest prob we've seen for our side since entry
 
+    # Deferred settlement: when we can't get result at roll time, check later
+    pending_settlement_market: Optional[str] = None
+    pending_settlement_side: Optional[str] = None
+    pending_settlement_entry_price: Optional[int] = None
+    pending_settlement_qty: int = 0
+    pending_settlement_was_flip: bool = False
+    pending_settlement_ts: float = 0.0  # When we started waiting
+
     last_p_yes: Optional[float] = None
     last_edge_yes: Optional[float] = None
     last_edge_no: Optional[float] = None
@@ -1859,6 +1867,57 @@ def main() -> None:
             )
             last_heartbeat = now
 
+        # ============================================
+        # DEFERRED SETTLEMENT: re-check if we have a pending result
+        # Settlement can take 4-7 minutes.  Instead of guessing wrong at
+        # roll time, we stash the trade info and poll the API here until
+        # the result is known, then record the correct W/L.
+        # ============================================
+        if st.pending_settlement_market is not None:
+            pending_age = now - st.pending_settlement_ts
+            # Check every ~30s, give up after 10 minutes
+            if pending_age > 600:
+                log.warning(
+                    f"[SETTLE] Giving up on {st.pending_settlement_market} after {pending_age:.0f}s — "
+                    f"recording as unknown (no W/L impact)"
+                )
+                st.pending_settlement_market = None
+            elif int(now) % 30 < POLL_SECONDS + 1:  # Roughly every 30s
+                try:
+                    pend_data = client.request("GET", f"/markets/{st.pending_settlement_market}")
+                    pend_obj = pend_data.get("market", pend_data) if isinstance(pend_data, dict) else {}
+                    pend_result = pend_obj.get("result", "").lower()
+
+                    if pend_result in ("yes", "no"):
+                        pend_side = st.pending_settlement_side
+                        pend_entry = st.pending_settlement_entry_price
+                        pend_qty = st.pending_settlement_qty
+
+                        if pend_result == pend_side:
+                            pend_pnl = (100 - pend_entry) * pend_qty
+                        else:
+                            pend_pnl = -pend_entry * pend_qty
+
+                        session.record_trade(
+                            market=st.pending_settlement_market,
+                            side=pend_side,
+                            entry_price=pend_entry,
+                            exit_price=100 if pend_result == pend_side else 0,
+                            qty=pend_qty,
+                            pnl_cents=pend_pnl,
+                            was_dump=False,
+                        )
+                        log.warning(
+                            f"[SETTLE] Deferred result resolved: {st.pending_settlement_market} "
+                            f"{pend_side.upper()} result={pend_result} pnl={pend_pnl}¢ "
+                            f"(took {pending_age:.0f}s)"
+                        )
+                        st.pending_settlement_market = None
+                    else:
+                        log.info(f"[SETTLE] Still waiting for {st.pending_settlement_market} result ({pending_age:.0f}s)...")
+                except Exception as e:
+                    log.info(f"[SETTLE] Check failed for {st.pending_settlement_market}: {e}")
+
         # Check if we need to fetch balance after settlement
         if session.needs_balance_check():
             try:
@@ -1878,58 +1937,46 @@ def main() -> None:
 
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
-                        # Try to determine settlement result (with retry)
-                        # Settlement takes 45-60 seconds, confirmation within 3 minutes
+                        # Try to determine settlement result (quick check, don't block long)
                         result = None
-                        log.info(f"[ROLL] Waiting for settlement result for {old_market}...")
-                        for retry in range(6):  # Try up to 6 times over ~90 seconds
+                        log.info(f"[ROLL] Checking settlement result for {old_market}...")
+                        for retry in range(3):  # Quick check: 3 × 10s = 30s max
                             try:
                                 old_mkt_data = client.request("GET", f"/markets/{old_market}")
                                 old_mkt_obj = old_mkt_data.get("market", old_mkt_data) if isinstance(old_mkt_data, dict) else {}
                                 result = old_mkt_obj.get("result", "").lower()
                                 if result in ("yes", "no"):
                                     break
-                                log.info(f"[ROLL] Retry {retry+1}/6: result='{result}' for {old_market}, waiting 15s...")
-                                time.sleep(15.0)  # Wait 15s before retry (90s total max wait)
+                                log.info(f"[ROLL] Retry {retry+1}/3: result='{result}' for {old_market}, waiting 10s...")
+                                time.sleep(10.0)
                             except Exception as e:
-                                log.warning(f"[ROLL] Retry {retry+1}/6 failed: {e}")
-                                time.sleep(15.0)
+                                log.warning(f"[ROLL] Retry {retry+1}/3 failed: {e}")
+                                time.sleep(10.0)
 
                         # Calculate P&L based on settlement
                         pnl_cents = None
                         if result == "yes":
-                            # YES paid 100, NO paid 0
                             if st.side == "yes":
                                 pnl_cents = (100 - st.entry_price_cents) * st.qty
                             else:
                                 pnl_cents = -st.entry_price_cents * st.qty
                         elif result == "no":
-                            # YES paid 0, NO paid 100
                             if st.side == "yes":
                                 pnl_cents = -st.entry_price_cents * st.qty
                             else:
                                 pnl_cents = (100 - st.entry_price_cents) * st.qty
                         else:
-                            # Unknown result - try to determine from balance change
-                            log.warning(f"[ROLL] Unknown settlement result '{result}' for {old_market}, checking balance...")
-                            try:
-                                new_bal, _ = get_balance_usd(client)
-                                if new_bal is not None and session.current_balance_usd > 0:
-                                    bal_change_cents = int((new_bal - session.current_balance_usd) * 100)
-                                    # If balance went up, we won. If down, we lost.
-                                    if bal_change_cents > 0:
-                                        pnl_cents = (100 - st.entry_price_cents) * st.qty
-                                        log.warning(f"[ROLL] Balance up ${bal_change_cents/100:.2f} -> assuming WIN")
-                                    else:
-                                        pnl_cents = -st.entry_price_cents * st.qty
-                                        log.warning(f"[ROLL] Balance down ${-bal_change_cents/100:.2f} -> assuming LOSS")
-                                else:
-                                    # Can't determine, skip recording this trade
-                                    log.warning(f"[ROLL] Cannot determine result for {old_market}, skipping trade record")
-                                    pnl_cents = None
-                            except Exception as e:
-                                log.warning(f"[ROLL] Balance check failed: {e}, skipping trade record")
-                                pnl_cents = None
+                            # Settlement not available yet — DEFER, don't guess
+                            log.warning(
+                                f"[ROLL] Settlement result not available for {old_market} after 30s. "
+                                f"Deferring — will re-check during next market."
+                            )
+                            st.pending_settlement_market = old_market
+                            st.pending_settlement_side = st.side
+                            st.pending_settlement_entry_price = st.entry_price_cents
+                            st.pending_settlement_qty = st.qty
+                            st.pending_settlement_was_flip = st.has_flipped
+                            st.pending_settlement_ts = time.time()
 
                         if pnl_cents is not None:
                             session.record_trade(
