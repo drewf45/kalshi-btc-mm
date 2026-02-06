@@ -150,7 +150,7 @@ CANCEL_UNFILLED_AT_CLOSE = True
 
 PROB_MIN = 0.80  # Base prob bar for late entries (≤3 min to close)
 EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
-MAX_ENTRY_PRICE_CENTS = 95  # Allow expensive contracts if probability supports it
+MAX_ENTRY_PRICE_CENTS = 99  # Edge comes from settlement — even 1¢/contract is profit at scale
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 5-min buy window) --------
@@ -260,7 +260,7 @@ DUMP_CATASTROPHIC_LOSS_CENTS = 30      # If losing >30¢/contract, bail no matte
 FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
 FLIP_MIN_TIME_REMAINING = 45        # Need at least 45s — tighter, but the hold is short
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 97           # Match settlement lock — 97¢ for near-certain $1 is fine
+FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -303,7 +303,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob
-SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 97)   # cap risk
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
@@ -1685,6 +1685,19 @@ def compute_qty_from_bankroll(
 
     # Primary: contract count from session (base + streak bonus)
     target_qty = session.get_current_contracts() if session else BASE_CONTRACTS
+
+    # HIGH-PRICE SCALING: when price is high, per-contract edge is thin.
+    # Scale up contracts so absolute dollar profit stays meaningful.
+    # At 95¢ (5¢ edge): 1×.  At 97¢ (3¢ edge): ~2×.  At 99¢ (1¢ edge): 5×.
+    settlement_edge = 100 - entry_cents
+    if settlement_edge > 0 and settlement_edge < 5:
+        scale_factor = max(1, round(5.0 / settlement_edge))
+        scaled_qty = target_qty * scale_factor
+        log.info(
+            f"[SIZE] High-price scaling: {entry_cents}¢ → {settlement_edge}¢ edge → "
+            f"{scale_factor}× → {target_qty} → {scaled_qty} contracts"
+        )
+        target_qty = scaled_qty
 
     # Safety cap: don't spend more than we can afford
     cost_per = float(entry_cents) / 100.0
