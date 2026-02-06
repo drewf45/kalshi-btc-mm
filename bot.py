@@ -23,6 +23,8 @@ import time
 import base64
 import logging
 import math
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -1629,9 +1631,36 @@ def compute_qty_from_bankroll(
 
 
 # -----------------------------
+# Health check server for Render deploy
+# Render needs an HTTP endpoint to confirm the service is alive.
+# This runs in a background thread and doesn't affect the bot.
+# -----------------------------
+HEALTH_CHECK_PORT = int(os.environ.get("PORT", "10000"))
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP logs — they clutter the bot output
+
+def _start_health_server():
+    try:
+        server = HTTPServer(("0.0.0.0", HEALTH_CHECK_PORT), _HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        log.warning(f"[HEALTH] Listening on port {HEALTH_CHECK_PORT}")
+    except Exception as e:
+        log.warning(f"[HEALTH] Could not start health server: {e} (non-fatal)")
+
+
+# -----------------------------
 # Main (VALUE SNIPER with session tracking)
 # -----------------------------
 def main() -> None:
+    _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s BUY={BUY_START_SECONDS}s "
