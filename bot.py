@@ -2103,21 +2103,20 @@ def main() -> None:
                             else:
                                 exit_price_cents = no_bid if no_bid else 50
 
-                            # Place opposing market order to exit
+                            # Place SELL order to close our position (not buy opposite side)
                             try:
-                                exit_side = "no" if st.side == "yes" else "yes"
                                 exit_payload = build_order_payload(
                                     market_ticker=st.market,
-                                    action="buy",
-                                    side=exit_side,
-                                    price_cents=99,  # Market order
+                                    action="sell",
+                                    side=st.side,       # Sell what we're holding
+                                    price_cents=1,       # Sell at 1¢ = market sell (accept any price)
                                     count=abs(pos),
                                     post_only=False,
                                 )
 
                                 if not DRY_RUN:
                                     oid = place_order(client, exit_payload)
-                                    log.warning(f"[BAIL] Placed exit order {oid} BUY {exit_side} qty={abs(pos)}")
+                                    log.warning(f"[BAIL] Placed SELL order {oid} SELL {st.side.upper()} qty={abs(pos)}")
 
                                     # Record P&L for dump
                                     if st.entry_price_cents is not None:
@@ -2132,7 +2131,7 @@ def main() -> None:
                                             was_dump=True,
                                         )
                                 else:
-                                    log.warning(f"[DRY] Would bail: BUY {exit_side} qty={abs(pos)}")
+                                    log.warning(f"[DRY] Would bail: SELL {st.side.upper()} qty={abs(pos)}")
 
                                 # ============================================
                                 # FLIP LOGIC: buy the other side and hold to settlement
