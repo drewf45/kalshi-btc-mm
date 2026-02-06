@@ -2134,10 +2134,19 @@ def main() -> None:
                                     FLIP_AFTER_DUMP
                                     and not st.has_flipped  # Only one flip per market
                                     and secs_to_close >= FLIP_MIN_TIME_REMAINING
-                                    and flip_prob >= FLIP_MIN_PROB
                                     and flip_price is not None
                                     and flip_price <= FLIP_MAX_ENTRY_PRICE
                                 )
+
+                                # Two paths for flip approval:
+                                # 1. Model agrees: blend prob >= 60% (standard confirmation)
+                                # 2. Market confident: flip price >= 80¢ (market says 80%+,
+                                #    model may lag after sudden BTC move — trust the market)
+                                if can_flip:
+                                    market_confident = flip_price >= 80
+                                    model_agrees = flip_prob >= FLIP_MIN_PROB
+                                    if not market_confident and not model_agrees:
+                                        can_flip = False
 
                                 if can_flip:
                                     flip_edge = flip_prob - (flip_price / 100.0)
@@ -2154,8 +2163,9 @@ def main() -> None:
                                     except Exception:
                                         flip_qty = BASE_CONTRACTS
 
+                                    flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                     log.warning(
-                                        f"[FLIP] Flipping to {flip_side.upper()} after bail — "
+                                        f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
                                         f"prob={flip_prob:.1%} price={flip_price}¢ edge={flip_edge:.4f} "
                                         f"qty={flip_qty} t_close={secs_to_close}s"
                                     )
@@ -2208,10 +2218,10 @@ def main() -> None:
                                         reason_parts.append("already_flipped")
                                     if secs_to_close < FLIP_MIN_TIME_REMAINING:
                                         reason_parts.append(f"time={secs_to_close}s<{FLIP_MIN_TIME_REMAINING}s")
-                                    if flip_prob < FLIP_MIN_PROB:
-                                        reason_parts.append(f"prob={flip_prob:.1%}<{FLIP_MIN_PROB:.0%}")
                                     if flip_price is not None and flip_price > FLIP_MAX_ENTRY_PRICE:
                                         reason_parts.append(f"price={flip_price}¢>{FLIP_MAX_ENTRY_PRICE}¢")
+                                    if flip_price is not None and flip_price < 80 and flip_prob < FLIP_MIN_PROB:
+                                        reason_parts.append(f"prob={flip_prob:.1%}<{FLIP_MIN_PROB:.0%},mkt={flip_price}¢<80¢")
 
                                     log.info(f"[FLIP] Skipped — {', '.join(reason_parts) or 'no_ask'}")
                                     st.sm = SM.DUMPED
