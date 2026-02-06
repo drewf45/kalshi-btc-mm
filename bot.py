@@ -131,9 +131,17 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # Philosophy: arm early to OBSERVE price/trends/book. Buy only when CERTAIN
 # of the outcome. Even a few cents edge is fine — buy MORE contracts.
 # Hold to settlement. Dump is abort-only. Trade every market possible.
-ENTRY_START_SECONDS = 720  # Arm at 12min - observe market, find the price
-ENTRY_DECISION_SECONDS = 60
-ENTRY_LAST_SECONDS = 15  # Can buy late since we're holding to close
+#
+# TWO PHASES:
+#   OBSERVE (12min → 5min before close): gather trend data, watch book, DON'T buy
+#   BUY     (5min → 15s before close):   make the call, place the order, hold
+#
+# Why: 92% probability at 12 minutes means NOTHING — BTC moves $300 in 12 min.
+#      92% probability at 3 minutes is reliable — BTC can't move far enough.
+#      The observation window builds high-quality trend data so the buy decision is informed.
+OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
+BUY_START_SECONDS = 300      # Only place orders in the last 5 min — this is the real window
+ENTRY_LAST_SECONDS = 15      # Stop buying with <15s left
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
@@ -143,15 +151,15 @@ EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 mar
 MAX_ENTRY_PRICE_CENTS = 95  # Allow expensive contracts if probability supports it
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (early = need more certainty) --------
-# 80% at 10 min is NOT certain — BTC moves hundreds of dollars in 10 min.
-# 80% at 2 min IS certain — BTC can't move far enough to flip.
-# So: require higher prob earlier, relax as we get closer to settlement.
-PROB_EARLY_ENTRY_SECONDS = 300   # >5 min to close = "early"
-PROB_EARLY_MIN = 0.92            # Need 92%+ to enter early (must be very sure)
-PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
+# -------------- TIME-DEPENDENT CERTAINTY (within the 5-min buy window) --------
+# Buy window is 5min → 15s before close. Require more certainty at the start
+# of the buy window (BTC still has time to move), relax near the end.
+# NOTE: observation phase (12min → 5min) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 240   # 4-5 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.90            # Need 90%+ at start of buy window
+PROB_MID_ENTRY_SECONDS = 120     # 2-4 min to close = "mid"
 PROB_MID_MIN = 0.85              # Need 85%+ in mid window
-# <3 min = PROB_MIN (0.80) — close enough that 80% is reliable
+# <2 min = PROB_MIN (0.80) — close enough that 80% is reliable
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -1626,7 +1634,7 @@ def compute_qty_from_bankroll(
 def main() -> None:
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning(
-        f"[BOOTCFG] SERIES={SERIES_TICKER} ARM_TIME={ENTRY_START_SECONDS}s "
+        f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s BUY={BUY_START_SECONDS}s "
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
@@ -2092,24 +2100,21 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # MODIFIED: Arm early (600s instead of 120s)
-        if secs_to_close > ENTRY_START_SECONDS:
+        # ============================================================
+        # PHASE 1: IDLE — too early to even observe
+        # ============================================================
+        if secs_to_close > OBSERVE_START_SECONDS:
             st.sm = SM.IDLE
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.info(f"[STATE] {st.market} IDLE t_close={secs_to_close}s (arming at {ENTRY_START_SECONDS}s)")
+                log.info(f"[STATE] {st.market} IDLE t_close={secs_to_close}s (observe at {OBSERVE_START_SECONDS}s)")
                 last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
 
-        st.sm = SM.ARMED
-
-        # MODIFIED: Stop checking continuously once we're <45s to close
-        if secs_to_close < ENTRY_LAST_SECONDS:
-            st.traded_this_market = True
-            log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
-            time.sleep(POLL_SECONDS)
-            continue
-
+        # ============================================================
+        # PHASE 2: OBSERVE — gather trend data, watch book, DON'T buy
+        # Runs from 12min → 5min before close
+        # ============================================================
         spot = fetch_btc_spot_usd(http)
         if spot is not None:
             trend.record(spot)
@@ -2119,6 +2124,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # Always fetch orderbook + compute probability (for trend tracking)
         try:
             ob = client.request("GET", f"/markets/{st.market}/orderbook")
         except Exception as e:
@@ -2152,8 +2158,36 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Record probability for trend detection (every poll while armed)
+        # Record probability for trend detection (every poll — observe AND buy phases)
         prob_trend.record(p_yes_blend)
+
+        # If still in observe window: log what we see, but DON'T place orders
+        if secs_to_close > BUY_START_SECONDS:
+            st.sm = SM.ARMED
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                trend_move, trend_dir, _ = trend.get_trend()
+                trend_s_move, trend_s_dir, _ = trend_short.get_trend()
+                log.info(
+                    f"[OBSERVE] {st.market} t_close={secs_to_close}s (buy at {BUY_START_SECONDS}s) "
+                    f"spot=${spot:.2f} p_yes={p_yes_blend:.1%} p_no={p_no_blend:.1%} "
+                    f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_s_dir}(${trend_s_move:+.0f}) "
+                    f"| {prob_trend.summary()}"
+                )
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # ============================================================
+        # PHASE 3: BUY WINDOW — last 5 min, make the call
+        # By now we have 7+ minutes of trend data to inform the decision
+        # ============================================================
+        st.sm = SM.ARMED
+
+        if secs_to_close < ENTRY_LAST_SECONDS:
+            st.traded_this_market = True
+            log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
+            time.sleep(POLL_SECONDS)
+            continue
 
         if LOG_DECISIONS:
             yes_px_log = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
