@@ -1221,18 +1221,23 @@ class ProbTrend:
 
         return change, direction, len(self.samples), seconds
 
-    def should_buy(self, side: str, current_prob: float) -> Tuple[bool, str]:
+    def should_buy(self, side: str, current_prob: float, secs_to_close: int = 0) -> Tuple[bool, str]:
         """
         Check if the probability trend supports buying this side.
         Returns: (should_buy, reason)
 
-        Three cases:
-          1. Trend matches our side (yes trending → buy yes) → GO
-          2. Trend is FLAT and prob is high → GO (stable certainty is a good sign)
-          3. Trend is AGAINST us (yes trending but we want no) → BLOCK
+        Time-dependent strictness (more certain early, relax as outcome clarifies):
+          EARLY (4-5 min): Require active trend match — BTC still has time to swing.
+          MID   (2-4 min): Allow flat trend — stable high prob is enough certainty.
+          LATE  (<2 min):  Skip trend entirely — probability IS the outcome now.
+        Always: Trend matching our side = GO. Trend against us = BLOCK (unless late).
         """
         if not PROB_TREND_ENTRY_ENABLED:
             return False, "trend_entry_disabled"
+
+        # LATE window (<2 min): probability speaks for itself, skip trend check
+        if secs_to_close <= PROB_MID_ENTRY_SECONDS:
+            return True, f"late_window({secs_to_close}s, prob={current_prob:.0%})"
 
         change, direction, n_samples, seconds = self.get_trend()
 
@@ -1243,18 +1248,21 @@ class ProbTrend:
         if current_prob < PROB_TREND_MIN_CURRENT:
             return False, f"prob_too_low({current_prob:.2f})"
 
-        # CASE 1: Trend matches our side → strong GO
+        # Trend matches our side → GO at any time
         if side == "yes" and "yes" in direction:
             return True, f"trend_yes({change:+.2f}/{seconds:.0f}s)"
         if side == "no" and "no" in direction:
             return True, f"trend_no({change:+.2f}/{seconds:.0f}s)"
 
-        # CASE 2: Trend is FLAT → probability is stable and high → GO
-        # "Flat at 87%" means BTC has been safely in range for minutes. That's certainty.
-        if direction == "flat":
-            return True, f"flat_stable({current_prob:.0%}/{seconds:.0f}s)"
+        # MID window (2-4 min): flat trend is acceptable — stable certainty
+        if secs_to_close <= PROB_EARLY_ENTRY_SECONDS and direction == "flat":
+            return True, f"mid_flat({current_prob:.0%}/{seconds:.0f}s, {secs_to_close}s left)"
 
-        # CASE 3: Trend is AGAINST us → BLOCK
+        # EARLY window (4-5 min): flat is NOT enough, need active trend match
+        if direction == "flat":
+            return False, f"early_need_trend({current_prob:.0%}, flat/{secs_to_close}s left)"
+
+        # Trend is AGAINST us → BLOCK
         return False, f"trend_against({direction}/{change:+.2f})"
 
     def summary(self) -> str:
@@ -2341,7 +2349,7 @@ def main() -> None:
                 )
 
             # --- PROBABILITY TREND CHECK (borderline trades need momentum) ---
-            prob_trend_ok, prob_trend_reason = prob_trend.should_buy(chosen_side, current_prob_for_side)
+            prob_trend_ok, prob_trend_reason = prob_trend.should_buy(chosen_side, current_prob_for_side, secs_to_close)
 
             if PROB_TREND_ENTRY_ENABLED and not prob_trend_ok:
                 if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
