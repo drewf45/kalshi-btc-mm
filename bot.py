@@ -260,7 +260,7 @@ DUMP_CATASTROPHIC_LOSS_CENTS = 30      # If losing >30¢/contract, bail no matte
 FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
 FLIP_MIN_TIME_REMAINING = 45        # Need at least 45s — tighter, but the hold is short
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 95           # Don't overpay on the flip
+FLIP_MAX_ENTRY_PRICE = 97           # Match settlement lock — 97¢ for near-certain $1 is fine
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
