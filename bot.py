@@ -244,18 +244,22 @@ DUMP_GRACE_PERIOD_SECONDS = 30      # No bail for first 30s
 DUMP_PROACTIVE_AFTER_SECONDS = 120  # Proactive bail only after 2 min
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 15  # Hard stop (still subject to BTC check)
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 15  # Hard stop (fires after BTC check)
+# CATASTROPHIC STOP: fires BEFORE BTC check — absolute max loss regardless of anything
+# Prevents a $2.65 loss when the hard stop is supposed to cap at 15¢/contract
+DUMP_CATASTROPHIC_LOSS_CENTS = 30      # If losing >30¢/contract, bail no matter what
 
 # -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
 # If we bail because BTC moved against us, the OTHER side is now the high-prob winner.
 # Instead of just eating the loss, flip to the other side and hold THAT to settlement.
 # Example: bought YES at 94¢, BTC tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
 #          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
-# Safety: the flip goes through normal entry criteria (prob gate, edge gate, etc.)
-#         so we only flip if the other side is actually a good trade.
+# Safety: the flip still checks probability and price, but with a LOWER bar
+#         than a fresh entry — this is a recovery play, not a new trade.
+#         We already took the loss; the question is "can I claw some back?"
 FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 60        # Need at least 60s to close — enough for one more hold
-FLIP_MIN_PROB = 0.80                # Other side must be ≥80% prob to flip into it
+FLIP_MIN_TIME_REMAINING = 45        # Need at least 45s — tighter, but the hold is short
+FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
 FLIP_MAX_ENTRY_PRICE = 95           # Don't overpay on the flip
 
 # -------------- A-LEVEL ADDITIONS --------------
@@ -1509,6 +1513,22 @@ def should_dump_position(
 
     drop_from_peak = st.peak_prob_for_side - current_prob
     in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
+
+    # =============================================================
+    # === CATASTROPHIC STOP: fires BEFORE BTC check ===
+    # If we're losing >30¢/contract, something went very wrong.
+    # Bail immediately regardless of BTC position — cap the damage.
+    # =============================================================
+    if st.entry_price_cents is not None:
+        exit_price_est = int(current_prob * 100)
+        catastrophic_loss = st.entry_price_cents - exit_price_est
+        if catastrophic_loss >= DUMP_CATASTROPHIC_LOSS_CENTS:
+            log.warning(
+                f"[BAIL CATASTROPHIC] losing ~{catastrophic_loss}¢/contract "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
+                f"overrides BTC safety, capping damage"
+            )
+            return True, f"catastrophic_{catastrophic_loss}c_per_contract"
 
     # =============================================================
     # === BTC SAFETY CHECK: THE MASTER OVERRIDE ===
