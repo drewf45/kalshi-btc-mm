@@ -2510,7 +2510,14 @@ def main() -> None:
                         # extra contracts in the final seconds for near-free profit.
                         if not should_dump and not st.has_scalped and secs_to_close is not None:
                             our_prob = p_yes_blend if st.side == "yes" else p_no_blend
-                            scalp_ask = yes_ask if st.side == "yes" else no_ask
+
+                            # Get ask price for our side. When the outcome is near-certain,
+                            # the ask dries up (nobody sells the winning side). Fall back to
+                            # deriving from the opposite side's bid: yes_price = 100 - no_bid.
+                            if st.side == "yes":
+                                scalp_ask = yes_ask if yes_ask is not None else (100 - no_bid if no_bid is not None else None)
+                            else:
+                                scalp_ask = no_ask if no_ask is not None else (100 - yes_bid if yes_bid is not None else None)
 
                             should_scalp, scalp_qty, scalp_px, scalp_reason = evaluate_scalp(
                                 st=st,
@@ -2574,7 +2581,7 @@ def main() -> None:
                                     log.warning(f"[SCALP] Order failed: {e}")
                                     st.has_scalped = True  # Don't retry on failure
 
-                            elif secs_to_close <= SCALP_MAX_SECONDS:
+                            elif SCALP_MIN_SECONDS <= secs_to_close <= SCALP_MAX_SECONDS:
                                 # Always log scalp evaluation in the window (not rate-limited)
                                 # so we can see why it's not firing
                                 log.info(f"[SCALP] Not yet (t={secs_to_close}s): {scalp_reason}")
