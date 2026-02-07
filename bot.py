@@ -276,6 +276,32 @@ FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and sett
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
 FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
 
+# -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
+# With <60s left and BTC far from the strike, the outcome is locked.
+# Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
+# Key safety: distance from strike.  If BTC is $300 above the floor with 60s left,
+# it CANNOT reverse.  sigma * sqrt(60) ≈ $93 at 12σ — $300 is >3x the max move.
+#
+# Risk/reward at 99¢ × 33 contracts:
+#   Win (99.5%+ of the time): +$0.33
+#   Lose (BTC reverses $300+ in 60s): -$32.67
+# Over 96 markets/day: ~$31/day extra income if hit rate matches.
+SCALP_ENABLED = True
+SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
+SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
+SCALP_MIN_DISTANCE_USD = 200.0     # BTC must be ≥$200 from strike to scalp
+# Distance tiers: farther from strike = more aggressive sizing
+# Each tier: (min_distance_usd, bankroll_fraction)
+# At $200: use 30% of cash.  At $400: use 60%.  At $600+: use 80%.
+SCALP_DISTANCE_TIERS = [
+    (600.0, 0.80),   # $600+ from strike: extremely safe, go big
+    (400.0, 0.60),   # $400-600: very safe
+    (200.0, 0.30),   # $200-400: safe enough for moderate size
+]
+SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ per contract
+SCALP_MIN_PROB = 0.95             # Model must agree it's near-certain
+SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
+
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
 MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.75)
@@ -1311,6 +1337,7 @@ class BotState:
 
     traded_this_market: bool = False
     has_flipped: bool = False  # True after one flip — prevent infinite flip-flop
+    has_scalped: bool = False  # True after last-minute scalp — one scalp per market
     side: Optional[str] = None  # "yes" or "no" - which side we're holding
     action: Optional[str] = None
     target_price: Optional[int] = None
@@ -1800,6 +1827,122 @@ def compute_qty_from_bankroll(
     return qty
 
 
+def compute_scalp_qty(
+    available_usd: float,
+    entry_cents: int,
+    distance_usd: float,
+) -> int:
+    """Compute scalp order quantity based on distance from strike.
+
+    Farther from strike = safer = more contracts.
+    Uses SCALP_DISTANCE_TIERS to determine bankroll fraction.
+    """
+    if available_usd <= 0 or entry_cents <= 0 or entry_cents > 99:
+        return 0
+
+    # Find the highest-qualifying distance tier (sorted descending)
+    scalp_fraction = 0.0
+    for min_dist, frac in SCALP_DISTANCE_TIERS:
+        if distance_usd >= min_dist:
+            scalp_fraction = frac
+            break
+
+    if scalp_fraction <= 0:
+        return 0
+
+    cost_per = float(entry_cents) / 100.0
+    # How many contracts can we buy with this fraction of cash?
+    target_qty = int(available_usd * scalp_fraction / cost_per)
+
+    # Safety cap: worst-case loss (all contracts go to $0) must not exceed SCALP_MAX_LOSS_FRACTION
+    max_loss_usd = available_usd * SCALP_MAX_LOSS_FRACTION
+    max_qty_for_loss = int(max_loss_usd / cost_per)
+    if target_qty > max_qty_for_loss:
+        log.info(
+            f"[SCALP SIZE] Loss cap: {target_qty} -> {max_qty_for_loss} contracts "
+            f"(max loss ${max_loss_usd:.2f} = {SCALP_MAX_LOSS_FRACTION:.0%} of ${available_usd:.2f})"
+        )
+        target_qty = max_qty_for_loss
+
+    target_qty = max(0, min(target_qty, MAX_CONTRACTS))
+
+    if target_qty > 0:
+        expected_profit = target_qty * (100 - entry_cents) / 100.0
+        max_loss = target_qty * cost_per
+        log.info(
+            f"[SCALP SIZE] qty={target_qty} @ {entry_cents}¢ "
+            f"(dist=${distance_usd:.0f}, frac={scalp_fraction:.0%}, "
+            f"profit=${expected_profit:.2f}, risk=${max_loss:.2f})"
+        )
+
+    return target_qty
+
+
+def evaluate_scalp(
+    st: BotState,
+    side: str,
+    spot: float,
+    lo: Optional[float],
+    hi: Optional[float],
+    secs_to_close: int,
+    p_blend: float,
+    ask_price: Optional[int],
+    available_usd: float,
+    sigma: float,
+) -> Tuple[bool, int, Optional[int], str]:
+    """Evaluate whether to place a last-minute scalp order.
+
+    Returns: (should_scalp, qty, price_cents, reason)
+    """
+    if not SCALP_ENABLED:
+        return False, 0, None, "disabled"
+
+    if st.has_scalped:
+        return False, 0, None, "already_scalped"
+
+    if secs_to_close > SCALP_MAX_SECONDS or secs_to_close < SCALP_MIN_SECONDS:
+        return False, 0, None, f"time={secs_to_close}s_outside_{SCALP_MIN_SECONDS}-{SCALP_MAX_SECONDS}s"
+
+    if ask_price is None or ask_price > SCALP_MAX_ENTRY_PRICE:
+        return False, 0, None, f"price={ask_price}¢_too_high"
+
+    if p_blend < SCALP_MIN_PROB:
+        return False, 0, None, f"prob={p_blend:.1%}<{SCALP_MIN_PROB:.0%}"
+
+    # Core safety: how far is BTC from the strike?
+    if side == "yes" and lo is not None:
+        distance = spot - lo
+    elif side == "no" and hi is not None:
+        distance = hi - spot
+    else:
+        return False, 0, None, "no_boundary"
+
+    if distance < SCALP_MIN_DISTANCE_USD:
+        return False, 0, None, f"dist=${distance:.0f}<${SCALP_MIN_DISTANCE_USD:.0f}"
+
+    # Volatility sanity check: can BTC actually move `distance` in `secs_to_close`?
+    # Max expected move ≈ 4σ√t (covers 99.997% of moves).
+    max_expected_move = 4.0 * sigma * math.sqrt(float(secs_to_close))
+    if distance < max_expected_move * 1.5:
+        return False, 0, None, (
+            f"vol_unsafe: dist=${distance:.0f} < 1.5×max_move=${max_expected_move * 1.5:.0f} "
+            f"(σ={sigma:.1f}, t={secs_to_close}s)"
+        )
+
+    if available_usd < MIN_FREE_USD_TO_TRADE:
+        return False, 0, None, f"cash=${available_usd:.2f}<${MIN_FREE_USD_TO_TRADE}"
+
+    qty = compute_scalp_qty(available_usd, ask_price, distance)
+    if qty <= 0:
+        return False, 0, None, "qty=0"
+
+    reason = (
+        f"dist=${distance:.0f} max_move=${max_expected_move:.0f} "
+        f"prob={p_blend:.1%} price={ask_price}¢ qty={qty}"
+    )
+    return True, qty, ask_price, reason
+
+
 # -----------------------------
 # Health check server for Render deploy
 # Render needs an HTTP endpoint to confirm the service is alive.
@@ -1864,6 +2007,11 @@ def main() -> None:
         f"[BOOTCFG] TREND: windows={TREND_WINDOW_MINUTES}min+{TREND_SHORT_WINDOW_MINUTES}min "
         f"strong=${TREND_STRONG_THRESHOLD} moderate=${TREND_MODERATE_THRESHOLD} "
         f"block_against={TREND_AGAINST_BLOCK} edge_boost={TREND_AGAINST_EDGE_BOOST}"
+    )
+    log.warning(
+        f"[BOOTCFG] SCALP: enabled={SCALP_ENABLED} window={SCALP_MIN_SECONDS}-{SCALP_MAX_SECONDS}s "
+        f"min_dist=${SCALP_MIN_DISTANCE_USD:.0f} min_prob={SCALP_MIN_PROB:.0%} "
+        f"max_loss={SCALP_MAX_LOSS_FRACTION:.0%} tiers={len(SCALP_DISTANCE_TIERS)}"
     )
     log.warning("[HEARTBEAT] main() entered — SCALPER is running")
 
@@ -1941,6 +2089,7 @@ def main() -> None:
         st.market = new_market
         st.traded_this_market = False
         st.has_flipped = False
+        st.has_scalped = False
         st.order_id = None
         st.side = None
         st.target_price = None
@@ -2098,6 +2247,7 @@ def main() -> None:
                     st.sm = SM.ROLL
                     st.traded_this_market = False
                     st.has_flipped = False
+                    st.has_scalped = False
                     st.order_id = None
                     st.side = None
                     st.target_price = None
@@ -2353,9 +2503,81 @@ def main() -> None:
                                 st.side = None
                                 st.entry_price_cents = None
 
+                        # ---- LAST-MINUTE SCALP (inside dump check, only if NOT dumping) ----
+                        # When we're holding and NOT bailing, check if we should pile on
+                        # extra contracts in the final seconds for near-free profit.
+                        if not should_dump and not st.has_scalped and secs_to_close is not None:
+                            our_prob = p_yes_blend if st.side == "yes" else p_no_blend
+                            scalp_ask = yes_ask if st.side == "yes" else no_ask
+
+                            should_scalp, scalp_qty, scalp_px, scalp_reason = evaluate_scalp(
+                                st=st,
+                                side=st.side,
+                                spot=spot,
+                                lo=lo,
+                                hi=hi,
+                                secs_to_close=secs_to_close,
+                                p_blend=our_prob,
+                                ask_price=scalp_ask,
+                                available_usd=session.current_balance_usd,
+                                sigma=sigma_used,
+                            )
+
+                            if should_scalp:
+                                log.warning(
+                                    f"[SCALP] GO — {st.side.upper()} @ {scalp_px}¢ × {scalp_qty} "
+                                    f"t_close={secs_to_close}s | {scalp_reason}"
+                                )
+
+                                try:
+                                    # Fetch fresh cash balance for the scalp order
+                                    scalp_avail, _ = get_balance_usd(client)
+                                    if scalp_avail is not None and scalp_avail >= MIN_FREE_USD_TO_TRADE:
+                                        # Re-evaluate qty with fresh balance
+                                        if st.side == "yes" and lo is not None:
+                                            scalp_dist = spot - lo
+                                        elif st.side == "no" and hi is not None:
+                                            scalp_dist = hi - spot
+                                        else:
+                                            scalp_dist = 0.0
+                                        scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
+
+                                        if scalp_qty > 0:
+                                            scalp_payload = build_order_payload(
+                                                market_ticker=st.market,
+                                                action="buy",
+                                                side=st.side,
+                                                price_cents=int(scalp_px),
+                                                count=int(scalp_qty),
+                                                post_only=False,  # Market order — need guaranteed fill
+                                            )
+
+                                            if not DRY_RUN:
+                                                scalp_oid = place_order(client, scalp_payload)
+                                                st.has_scalped = True
+                                                expected_profit = scalp_qty * (100 - scalp_px) / 100.0
+                                                log.warning(
+                                                    f"[SCALP] PLACED order={scalp_oid} BUY {st.side.upper()} "
+                                                    f"@ {scalp_px}¢ × {scalp_qty} "
+                                                    f"(expect +${expected_profit:.2f} at settlement)"
+                                                )
+                                            else:
+                                                st.has_scalped = True
+                                                log.warning(f"[DRY SCALP] Would buy {st.side.upper()} @ {scalp_px}¢ × {scalp_qty}")
+                                        else:
+                                            log.info(f"[SCALP] Skipped — qty=0 after fresh balance (${scalp_avail:.2f})")
+                                    else:
+                                        log.info(f"[SCALP] Skipped — insufficient cash (${scalp_avail:.2f})")
+                                except Exception as e:
+                                    log.warning(f"[SCALP] Order failed: {e}")
+                                    st.has_scalped = True  # Don't retry on failure
+
+                            elif secs_to_close <= SCALP_MAX_SECONDS and (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                                log.info(f"[SCALP] Not yet: {scalp_reason}")
+
                     except Exception as e:
                         log.warning(f"[DUMP] Check failed: {e}")
-            
+
             time.sleep(POLL_SECONDS)
             continue
 
