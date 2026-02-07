@@ -244,9 +244,14 @@ DUMP_EARLY_EXIT_ENABLED = True
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-trade loss
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-trade loss (dump-side)
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
+# ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
+# Looser than dump cap because settlement losses are rare (76%+ win rate).
+# This scales position size so even a total loss doesn't blow up the bankroll.
+# At $33/10%: max 3 contracts at 97c.  At $330/10%: max 34 contracts at 97c.
+MAX_SETTLEMENT_LOSS_FRACTION = 0.10  # Max 10% of balance at risk per trade (worst case)
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 15      # 15s grace period (was 30s — too slow)
@@ -1767,6 +1772,25 @@ def compute_qty_from_bankroll(
         if target_qty > max_affordable:
             log.info(f"[SIZE] Capping qty {target_qty} -> {max_affordable} (afford cap at {BANKROLL_FRACTION:.0%} of ${available_usd:.2f})")
             target_qty = max_affordable
+
+    # SETTLEMENT LOSS CAP: worst case = lose entire entry cost at settlement.
+    # Cap so that worst-case loss never exceeds MAX_SETTLEMENT_LOSS_FRACTION of balance.
+    # This is looser than the dump-side cap (5%) because settlement losses are rare
+    # (76% win rate) — but it prevents a single bad trade from doing $2-5 damage.
+    # At $33 balance with 10%: max worst-case = $3.30. At 97c: 3 contracts max.
+    # As bankroll grows to $330: max worst-case = $33. At 97c: 34 contracts.
+    if cost_per > 0 and available_usd > 0:
+        max_settlement_loss = available_usd * MAX_SETTLEMENT_LOSS_FRACTION
+        max_qty_for_loss_cap = int(max_settlement_loss / cost_per)
+        if max_qty_for_loss_cap < MIN_CONTRACTS:
+            max_qty_for_loss_cap = MIN_CONTRACTS
+        if target_qty > max_qty_for_loss_cap:
+            log.info(
+                f"[SIZE] Settlement loss cap: {target_qty} -> {max_qty_for_loss_cap} contracts "
+                f"(max loss ${max_settlement_loss:.2f} = {MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}, "
+                f"entry={entry_cents}¢)"
+            )
+            target_qty = max_qty_for_loss_cap
 
     qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
