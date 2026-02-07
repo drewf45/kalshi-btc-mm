@@ -13,10 +13,11 @@
 # - TIME-DEPENDENT PROB: 92% if >5min, 85% if 3-5min, 80% if <3min
 # - EDGE_MIN=0.02 (small edge OK — volume over 96 markets compounds)
 # - MAX_ENTRY_PRICE=95¢ (allow buying if certainty supports the price)
-# - CONTRACT SCALING: start at 3, +1 per win. Losses reset to base.
+# - CONTRACT SCALING: start at 3, +1 per win, -1 per loss (floor at base)
 # - BTC-AWARE BAIL: only dump if BTC has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
-# - Dump is abort-only: 20% reversal, 120s patience, 15¢ hard stop
+# - BANKROLL STOPS: max loss = 5% of balance or 50% of position cost
+# - Dump abort: 12% reversal, 60s patience, catastrophic 30¢ backstop
 
 import os
 import time
@@ -233,15 +234,23 @@ DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after BTC check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.20  # 20% drop from peak — very patient
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.15  # 15% when profitable
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.10  # Tighten after 10%+ gain
+DUMP_REVERSAL_THRESHOLD = 0.12  # 12% drop from peak — faster bail (was 20%, too slow)
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.10  # 10% when profitable (was 15%)
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.08  # Tighten after 8%+ gain (was 10%)
 DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
 
-# -------------- BAIL TIMING (hold to close — be very patient) -----------------
-DUMP_GRACE_PERIOD_SECONDS = 30      # No bail for first 30s
-DUMP_PROACTIVE_AFTER_SECONDS = 120  # Proactive bail only after 2 min
+# -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
+# Never lose more than X% of current balance on a single trade.
+# At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
+# This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-trade loss
+# Also cap at 50% of position cost — if you paid $3, max loss is $1.50
+DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
+
+# -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
+DUMP_GRACE_PERIOD_SECONDS = 15      # 15s grace period (was 30s — too slow)
+DUMP_PROACTIVE_AFTER_SECONDS = 60   # Proactive bail after 1 min (was 2 min — let bankroll cap handle early bail)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
 DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 15  # Hard stop (fires after BTC check)
@@ -1027,8 +1036,17 @@ class SessionState:
         self.current_contracts = min(self.current_contracts + CONTRACT_INCREMENT, MAX_CONTRACTS)
 
     def _scale_down(self):
-        """Loss: reset to base. Losses should be rare — when they happen, start fresh."""
-        self.current_contracts = BASE_CONTRACTS
+        """Loss: step down by 1 contract (floor at base).
+
+        Old behavior: full reset to BASE_CONTRACTS on every loss.
+        Problem: going 26-7 overnight kept contracts at 3-4 because
+        scattered losses kept resetting the count.
+
+        New behavior: lose 1 contract per loss. A 26-7 record means
+        26 - 7 = 19 net wins → contracts = BASE + 19 = 22.
+        This lets the compounding engine actually work over 96 markets/day.
+        """
+        self.current_contracts = max(BASE_CONTRACTS, self.current_contracts - CONTRACT_INCREMENT)
 
     def _check_daily_stop(self):
         """HARD STOP: never lose more than 75% of starting balance"""
@@ -1527,6 +1545,7 @@ def should_dump_position(
     sigma: float,
     secs_to_close: int,
     trend: Optional['SpotTrend'] = None,
+    current_balance_usd: float = 0.0,
 ) -> Tuple[bool, Optional[str]]:
     """
     BAIL logic: last resort only. Hold to close is the goal.
@@ -1534,6 +1553,10 @@ def should_dump_position(
     KEY PRINCIPLE: Before any bail trigger fires, check if BTC is on our side
     of the boundary. If it is, the book is lying — HOLD. Only bail when
     BTC has actually moved against us.
+
+    BANKROLL PROTECTION: Never lose more than 5% of balance or 50% of position
+    cost on a single trade. This fires before BTC check — no position justifies
+    blowing up the bankroll.
 
     Returns: (should_dump, reason)
     """
@@ -1567,9 +1590,47 @@ def should_dump_position(
     in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
 
     # =============================================================
-    # === CATASTROPHIC STOP: fires BEFORE BTC check ===
-    # If we're losing >30¢/contract, something went very wrong.
-    # Bail immediately regardless of BTC position — cap the damage.
+    # === BANKROLL-PROPORTIONAL STOP: fires BEFORE BTC check ===
+    # Never lose more than 5% of balance or 50% of position cost.
+    # This is THE primary loss cap. Scales with bankroll naturally:
+    # $35 balance → max $1.75 loss.  $350 → max $17.50.
+    # =============================================================
+    if st.entry_price_cents is not None and st.qty > 0:
+        exit_price_est = int(current_prob * 100)
+        loss_per_contract = st.entry_price_cents - exit_price_est
+        total_loss_cents = loss_per_contract * st.qty
+        total_loss_usd = total_loss_cents / 100.0
+        position_cost_usd = (st.entry_price_cents * st.qty) / 100.0
+
+        # Cap 1: fraction of current balance
+        if current_balance_usd > 0:
+            max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
+            if total_loss_usd > max_loss_balance:
+                log.warning(
+                    f"[BAIL BANKROLL CAP] losing ${total_loss_usd:.2f} > "
+                    f"{DUMP_MAX_LOSS_FRACTION_OF_BALANCE:.0%} of ${current_balance_usd:.2f} "
+                    f"(cap=${max_loss_balance:.2f}) — {loss_per_contract}¢/ct × {st.qty}ct "
+                    f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
+                    f"overrides BTC safety, protecting bankroll"
+                )
+                return True, f"bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
+
+        # Cap 2: fraction of position cost (never lose more than 50% of what you put in)
+        max_loss_position = position_cost_usd * DUMP_MAX_LOSS_FRACTION_OF_POSITION
+        if total_loss_usd > max_loss_position:
+            log.warning(
+                f"[BAIL POSITION CAP] losing ${total_loss_usd:.2f} > "
+                f"{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%} of position cost "
+                f"${position_cost_usd:.2f} (cap=${max_loss_position:.2f}) — "
+                f"{loss_per_contract}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢)"
+            )
+            return True, f"position_cap_${total_loss_usd:.2f}>{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%}"
+
+    # =============================================================
+    # === CATASTROPHIC STOP: absolute backstop, fires BEFORE BTC check ===
+    # Even if bankroll cap didn't fire (e.g., balance unknown), this catches
+    # extreme per-contract losses.
     # =============================================================
     if st.entry_price_cents is not None:
         exit_price_est = int(current_prob * 100)
@@ -2076,7 +2137,8 @@ def main() -> None:
                         
                         should_dump, dump_reason = should_dump_position(
                             st, p_yes_blend, p_no_blend, p_mkt,
-                            spot, lo, hi, sigma_used, secs_to_close, trend
+                            spot, lo, hi, sigma_used, secs_to_close, trend,
+                            current_balance_usd=session.current_balance_usd,
                         )
 
                         # Log dump check status periodically
