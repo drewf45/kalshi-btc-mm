@@ -1551,6 +1551,13 @@ def _btc_is_safe(side: str, spot: float, lo: Optional[float], hi: Optional[float
 
     This is THE key check: if BTC is on our side, the book is lying.
     Don't bail on a winner just because the orderbook spiked for 3 seconds.
+
+    For "Up or Down" markets (lo only, no hi):
+      YES wins if spot > lo  →  distance = spot - lo
+      NO  wins if spot < lo  →  distance = lo - spot
+    For range markets (both lo and hi):
+      YES wins if lo < spot < hi
+      NO  wins if spot outside range
     """
     buffer = DUMP_BTC_SAFE_BUFFER_LATE if secs_to_close < DUMP_BTC_SAFE_CUTOFF_SECONDS else DUMP_BTC_SAFE_BUFFER_EARLY
 
@@ -1559,8 +1566,13 @@ def _btc_is_safe(side: str, spot: float, lo: Optional[float], hi: Optional[float
         distance = spot - lo
         return distance >= buffer, distance
     elif side == "no" and hi is not None:
-        # NO wins if BTC stays BELOW hi. Safe if spot < hi - buffer.
+        # NO wins if BTC stays BELOW hi (range market). Safe if spot < hi - buffer.
         distance = hi - spot
+        return distance >= buffer, distance
+    elif side == "no" and lo is not None:
+        # NO wins if BTC drops BELOW lo (up-or-down market, no hi).
+        # Safe if spot < lo - buffer (BTC is well below the strike).
+        distance = lo - spot
         return distance >= buffer, distance
 
     return False, 0.0  # Can't determine — not safe
@@ -1910,10 +1922,13 @@ def evaluate_scalp(
         return False, 0, None, f"prob={p_blend:.1%}<{SCALP_MIN_PROB:.0%}"
 
     # Core safety: how far is BTC from the strike?
+    # "Up or Down" markets have only lo (no hi). NO wins when spot < lo.
     if side == "yes" and lo is not None:
         distance = spot - lo
     elif side == "no" and hi is not None:
         distance = hi - spot
+    elif side == "no" and lo is not None:
+        distance = lo - spot
     else:
         return False, 0, None, "no_boundary"
 
@@ -2547,6 +2562,8 @@ def main() -> None:
                                             scalp_dist = spot - lo
                                         elif st.side == "no" and hi is not None:
                                             scalp_dist = hi - spot
+                                        elif st.side == "no" and lo is not None:
+                                            scalp_dist = lo - spot
                                         else:
                                             scalp_dist = 0.0
                                         scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
