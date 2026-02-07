@@ -1921,11 +1921,13 @@ def evaluate_scalp(
         return False, 0, None, f"dist=${distance:.0f}<${SCALP_MIN_DISTANCE_USD:.0f}"
 
     # Volatility sanity check: can BTC actually move `distance` in `secs_to_close`?
-    # Max expected move ≈ 4σ√t (covers 99.997% of moves).
-    max_expected_move = 4.0 * sigma * math.sqrt(float(secs_to_close))
-    if distance < max_expected_move * 1.5:
+    # 3σ√t covers 99.7% of all moves (only 0.15% chance of a directional move this large).
+    # The distance tiers already provide graduated conservatism ($200/$400/$600).
+    # At σ=12, t=60: threshold=$279.  At σ=12, t=30: threshold=$197.
+    max_expected_move = 3.0 * sigma * math.sqrt(float(secs_to_close))
+    if distance < max_expected_move:
         return False, 0, None, (
-            f"vol_unsafe: dist=${distance:.0f} < 1.5×max_move=${max_expected_move * 1.5:.0f} "
+            f"vol_unsafe: dist=${distance:.0f} < 3σ√t=${max_expected_move:.0f} "
             f"(σ={sigma:.1f}, t={secs_to_close}s)"
         )
 
@@ -1937,7 +1939,7 @@ def evaluate_scalp(
         return False, 0, None, "qty=0"
 
     reason = (
-        f"dist=${distance:.0f} max_move=${max_expected_move:.0f} "
+        f"dist=${distance:.0f} 3σ√t=${max_expected_move:.0f} "
         f"prob={p_blend:.1%} price={ask_price}¢ qty={qty}"
     )
     return True, qty, ask_price, reason
@@ -2572,8 +2574,10 @@ def main() -> None:
                                     log.warning(f"[SCALP] Order failed: {e}")
                                     st.has_scalped = True  # Don't retry on failure
 
-                            elif secs_to_close <= SCALP_MAX_SECONDS and (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                                log.info(f"[SCALP] Not yet: {scalp_reason}")
+                            elif secs_to_close <= SCALP_MAX_SECONDS:
+                                # Always log scalp evaluation in the window (not rate-limited)
+                                # so we can see why it's not firing
+                                log.info(f"[SCALP] Not yet (t={secs_to_close}s): {scalp_reason}")
 
                     except Exception as e:
                         log.warning(f"[DUMP] Check failed: {e}")
