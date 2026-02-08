@@ -149,7 +149,7 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.90  # Base prob bar for late entries (≤3 min to close) — raised from 80%: asymmetric payoff needs high win rate
+PROB_MIN = 0.85  # Base prob bar — EV price cap (price ≤ prob) ensures positive EV at any threshold
 EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
 MAX_ENTRY_PRICE_CENTS = 99  # Edge comes from settlement — even 1¢/contract is profit at scale
 FEE_CENTS_PER_CONTRACT = 0
@@ -159,10 +159,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (BTC still has time to move), relax near the end.
 # NOTE: observation phase (12min → 5min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 240   # 4-5 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.95            # Need 95%+ at start of buy window (raised from 90%)
+PROB_EARLY_MIN = 0.92            # >4min: need 92%+ (BTC still has time to move)
 PROB_MID_ENTRY_SECONDS = 120     # 2-4 min to close = "mid"
-PROB_MID_MIN = 0.92              # Need 92%+ in mid window (raised from 85%)
-# <2 min = PROB_MIN (0.90) — asymmetric payoff demands high certainty
+PROB_MID_MIN = 0.88              # 2-4min: need 88%+
+# <2 min = PROB_MIN (0.85) — EV cap protects against overpaying
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -342,14 +342,14 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.93)  # blend prob (raised from 85% — no-edge entries need high certainty)
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.88)  # blend prob — EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
-LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 50.0)  # $50 buffer — BTC-aware bail is the real safety net during hold
-LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — base prob already 90%, that's the bar
+LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
 # -------------- TREND TRACKING (know what BTC is doing) --------------
@@ -1458,11 +1458,11 @@ def choose_trade(
 
     # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
     if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-        effective_prob_min = PROB_EARLY_MIN   # >4min: need 95%+
+        effective_prob_min = PROB_EARLY_MIN   # >4min: need 92%+
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-        effective_prob_min = PROB_MID_MIN     # 2-4min: need 92%+
+        effective_prob_min = PROB_MID_MIN     # 2-4min: need 88%+
     else:
-        effective_prob_min = PROB_MIN         # <2min: 90%+ — asymmetric payoff demands certainty
+        effective_prob_min = PROB_MIN         # <2min: 85%+ — EV cap ensures price ≤ prob
         
     ok_yes = (
         yes_px is not None
