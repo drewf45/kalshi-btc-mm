@@ -248,10 +248,10 @@ DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-t
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
-# Looser than dump cap because settlement losses are rare (76%+ win rate).
-# This scales position size so even a total loss doesn't blow up the bankroll.
-# At $33/10%: max 3 contracts at 97c.  At $330/10%: max 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.10  # Max 10% of balance at risk per trade (worst case)
+# With the EV price cap (price ≤ prob), entries are always +EV, so we can
+# afford to size up.  20% of $35 = $7 → 8 contracts at 88c or 7 at 97c.
+# As bankroll grows to $350: $70 → 80+ contracts.
+MAX_SETTLEMENT_LOSS_FRACTION = 0.20  # Max 20% of balance at risk per trade
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 15      # 15s grace period (was 30s — too slow)
@@ -299,7 +299,7 @@ SCALP_DISTANCE_TIERS = [
     (50.0,  0.15),   # $50-100: moderate — compound the edge
 ]
 SCALP_MAX_ENTRY_PRICE = 97        # Max 97¢ — ensures ≥3¢ profit/contract at settlement
-SCALP_MIN_PROB = 0.93             # Prob gate (EV cap at prob enforces real safety)
+SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
 SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
 
 # -------------- A-LEVEL ADDITIONS --------------
