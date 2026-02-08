@@ -289,17 +289,17 @@ FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contrac
 SCALP_ENABLED = True
 SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
 SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 100.0     # BTC must be ≥$100 from strike to scalp (lowered from $200 — volatility gate is the real safety)
+SCALP_MIN_DISTANCE_USD = 50.0      # BTC must be ≥$50 from strike (lowered — vol gate is the real safety)
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
-# At $100: use 20% of cash.  At $200: use 40%.  At $400+: use 70%.
 SCALP_DISTANCE_TIERS = [
     (400.0, 0.70),   # $400+ from strike: extremely safe, go big
-    (200.0, 0.40),   # $200-400: very safe
-    (100.0, 0.20),   # $100-200: safe enough for moderate size
+    (200.0, 0.50),   # $200-400: very safe
+    (100.0, 0.30),   # $100-200: safe
+    (50.0,  0.15),   # $50-100: moderate — compound the edge
 ]
-SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ per contract
-SCALP_MIN_PROB = 0.95             # Model must agree it's near-certain
+SCALP_MAX_ENTRY_PRICE = 97        # Max 97¢ — ensures ≥3¢ profit/contract at settlement
+SCALP_MIN_PROB = 0.93             # Prob gate (EV cap at prob enforces real safety)
 SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
 
 # -------------- A-LEVEL ADDITIONS --------------
@@ -1916,10 +1916,15 @@ def evaluate_scalp(
         return False, 0, None, f"time={secs_to_close}s_outside_{SCALP_MIN_SECONDS}-{SCALP_MAX_SECONDS}s"
 
     if ask_price is None or ask_price > SCALP_MAX_ENTRY_PRICE:
-        return False, 0, None, f"price={ask_price}¢_too_high"
+        return False, 0, None, f"price={ask_price}¢_too_high(max={SCALP_MAX_ENTRY_PRICE})"
 
     if p_blend < SCALP_MIN_PROB:
         return False, 0, None, f"prob={p_blend:.1%}<{SCALP_MIN_PROB:.0%}"
+
+    # EV cap: never pay more than the probability (same rule as main entry)
+    max_ev_price = int(p_blend * 100)
+    if ask_price > max_ev_price:
+        return False, 0, None, f"price={ask_price}¢>prob_cap={max_ev_price}¢(p={p_blend:.1%})"
 
     # Core safety: how far is BTC from the strike?
     # "Up or Down" markets have only lo (no hi). NO wins when spot < lo.
@@ -1936,13 +1941,13 @@ def evaluate_scalp(
         return False, 0, None, f"dist=${distance:.0f}<${SCALP_MIN_DISTANCE_USD:.0f}"
 
     # Volatility sanity check: can BTC actually move `distance` in `secs_to_close`?
-    # 2σ√t covers 97.7% of all moves (only 2.3% chance of a move this large,
-    # and only ~1.15% in the adverse direction).
-    # At σ=12, t=60: threshold=$186.  At σ=12, t=30: threshold=$131.  At σ=12, t=15: threshold=$93.
-    max_expected_move = 2.0 * sigma * math.sqrt(float(secs_to_close))
+    # 1.5σ√t covers ~93% of moves (~3.5% adverse). Combined with distance tiers
+    # and EV price cap, this gives the scalp enough room to actually fire.
+    # At σ=12, t=60: $139.  t=30: $99.  t=15: $70.  t=10: $57.
+    max_expected_move = 1.5 * sigma * math.sqrt(float(secs_to_close))
     if distance < max_expected_move:
         return False, 0, None, (
-            f"vol_unsafe: dist=${distance:.0f} < 2σ√t=${max_expected_move:.0f} "
+            f"vol_unsafe: dist=${distance:.0f} < 1.5σ√t=${max_expected_move:.0f} "
             f"(σ={sigma:.1f}, t={secs_to_close}s)"
         )
 
@@ -2538,6 +2543,8 @@ def main() -> None:
                                 scalp_ask = no_ask if no_ask is not None else (100 - yes_bid if yes_bid is not None else None)
                             if scalp_ask is None:
                                 scalp_ask = SCALP_MAX_ENTRY_PRICE
+                            # EV cap: never bid more than the probability
+                            scalp_ask = min(scalp_ask, int(our_prob * 100))
 
                             should_scalp, scalp_qty, scalp_px, scalp_reason = evaluate_scalp(
                                 st=st,
