@@ -149,7 +149,7 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.80  # Base prob bar for late entries (≤3 min to close)
+PROB_MIN = 0.90  # Base prob bar for late entries (≤3 min to close) — raised from 80%: asymmetric payoff needs high win rate
 EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
 MAX_ENTRY_PRICE_CENTS = 99  # Edge comes from settlement — even 1¢/contract is profit at scale
 FEE_CENTS_PER_CONTRACT = 0
@@ -159,10 +159,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (BTC still has time to move), relax near the end.
 # NOTE: observation phase (12min → 5min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 240   # 4-5 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # Need 90%+ at start of buy window
+PROB_EARLY_MIN = 0.95            # Need 95%+ at start of buy window (raised from 90%)
 PROB_MID_ENTRY_SECONDS = 120     # 2-4 min to close = "mid"
-PROB_MID_MIN = 0.85              # Need 85%+ in mid window
-# <2 min = PROB_MIN (0.80) — close enough that 80% is reliable
+PROB_MID_MIN = 0.92              # Need 92%+ in mid window (raised from 85%)
+# <2 min = PROB_MIN (0.90) — asymmetric payoff demands high certainty
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -170,7 +170,7 @@ PROB_MID_MIN = 0.85              # Need 85%+ in mid window
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
 PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
-PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% — we need certainty
+PROB_TREND_MIN_CURRENT = 0.88     # Current prob must be ≥88% — raised from 80%
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
@@ -219,7 +219,7 @@ ENABLE_DUMP = True
 DUMP_PROB_FLIP = 0.50  # Floor: if prob hits coin-flip AND BTC confirms, bail
 DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
 DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
-DUMP_MIN_TIME_REMAINING = 15  # Can bail closer to settlement
+DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
 DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
 
 # -------------- BTC-AWARE BAIL (the key fix: don't dump winners) ---------------
@@ -228,15 +228,15 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
 # NO side:  spot < hi - buffer → BTC is safely below range ceiling → HOLD
 # If BTC is on our side, the book is lying (thin book, spike, manipulation).
 # ONLY bail if BTC has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 75.0    # >2min to close: need $75 buffer to suppress bail
-DUMP_BTC_SAFE_BUFFER_LATE = 30.0     # <2min to close: $30 is enough (BTC can't move far)
+DUMP_BTC_SAFE_BUFFER_EARLY = 125.0   # >2min to close: need $125 buffer to suppress bail (raised from $75)
+DUMP_BTC_SAFE_BUFFER_LATE = 75.0     # <2min to close: need $75 buffer (raised from $30 — BTC moves $30-50 routinely)
 DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after BTC check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.12  # 12% drop from peak — faster bail (was 20%, too slow)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.10  # 10% when profitable (was 15%)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.08  # Tighten after 8%+ gain (was 10%)
+DUMP_REVERSAL_THRESHOLD = 0.08  # 8% drop from peak — bail fast (was 12%, still too slow)
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.06  # 6% when profitable — protect gains (was 10%)
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.05  # Tighten after 5%+ gain (was 8%)
 DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
 
@@ -289,14 +289,14 @@ FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contrac
 SCALP_ENABLED = True
 SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
 SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 200.0     # BTC must be ≥$200 from strike to scalp
+SCALP_MIN_DISTANCE_USD = 100.0     # BTC must be ≥$100 from strike to scalp (lowered from $200 — volatility gate is the real safety)
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
-# At $200: use 30% of cash.  At $400: use 60%.  At $600+: use 80%.
+# At $100: use 20% of cash.  At $200: use 40%.  At $400+: use 70%.
 SCALP_DISTANCE_TIERS = [
-    (600.0, 0.80),   # $600+ from strike: extremely safe, go big
-    (400.0, 0.60),   # $400-600: very safe
-    (200.0, 0.30),   # $200-400: safe enough for moderate size
+    (400.0, 0.70),   # $400+ from strike: extremely safe, go big
+    (200.0, 0.40),   # $200-400: very safe
+    (100.0, 0.20),   # $100-200: safe enough for moderate size
 ]
 SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ per contract
 SCALP_MIN_PROB = 0.95             # Model must agree it's near-certain
@@ -342,14 +342,14 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.93)  # blend prob (raised from 85% — no-edge entries need high certainty)
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
-LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.90)
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 50.0)  # $50 buffer — BTC-aware bail is the real safety net during hold
-LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — base prob already 80%, that's the bar
+LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — base prob already 90%, that's the bar
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
 # -------------- TREND TRACKING (know what BTC is doing) --------------
@@ -1458,11 +1458,11 @@ def choose_trade(
 
     # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
     if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-        effective_prob_min = PROB_EARLY_MIN   # >5min: need 92%+
+        effective_prob_min = PROB_EARLY_MIN   # >4min: need 95%+
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-        effective_prob_min = PROB_MID_MIN     # 3-5min: need 85%+
+        effective_prob_min = PROB_MID_MIN     # 2-4min: need 92%+
     else:
-        effective_prob_min = PROB_MIN         # <3min: 80% is reliable
+        effective_prob_min = PROB_MIN         # <2min: 90%+ — asymmetric payoff demands certainty
         
     ok_yes = (
         yes_px is not None
@@ -1936,13 +1936,13 @@ def evaluate_scalp(
         return False, 0, None, f"dist=${distance:.0f}<${SCALP_MIN_DISTANCE_USD:.0f}"
 
     # Volatility sanity check: can BTC actually move `distance` in `secs_to_close`?
-    # 3σ√t covers 99.7% of all moves (only 0.15% chance of a directional move this large).
-    # The distance tiers already provide graduated conservatism ($200/$400/$600).
-    # At σ=12, t=60: threshold=$279.  At σ=12, t=30: threshold=$197.
-    max_expected_move = 3.0 * sigma * math.sqrt(float(secs_to_close))
+    # 2σ√t covers 97.7% of all moves (only 2.3% chance of a move this large,
+    # and only ~1.15% in the adverse direction).
+    # At σ=12, t=60: threshold=$186.  At σ=12, t=30: threshold=$131.  At σ=12, t=15: threshold=$93.
+    max_expected_move = 2.0 * sigma * math.sqrt(float(secs_to_close))
     if distance < max_expected_move:
         return False, 0, None, (
-            f"vol_unsafe: dist=${distance:.0f} < 3σ√t=${max_expected_move:.0f} "
+            f"vol_unsafe: dist=${distance:.0f} < 2σ√t=${max_expected_move:.0f} "
             f"(σ={sigma:.1f}, t={secs_to_close}s)"
         )
 
