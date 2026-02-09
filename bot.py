@@ -1960,7 +1960,7 @@ def compute_qty_from_bankroll(
     # At p=0.998, 99¢: Kelly=0.80 → half-Kelly=0.40 → ~11 contracts on $27
     SETTLE_LOCK_MIN_PROB = 0.998  # True confidence when bot calls it a lock
     sizing_p = p_gate
-    if p_gate >= 0.98 and entry_cents >= 97:
+    if p_gate >= PROB_FAST_LANE_THRESHOLD and entry_cents >= 97:
         if sizing_p < SETTLE_LOCK_MIN_PROB:
             log.info(
                 f"[SIZE] Settlement lock boost: p_gate={p_gate:.3f} at {entry_cents}¢ "
@@ -3179,7 +3179,7 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
-            elif use_post_only or (int(chosen_px) >= 97 and p_gate >= 0.98):
+            elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
                 # At 97-99¢ with ≥98% prob, the book is often locked (no asks).
                 # Whether post_only or LAST_CHANCE taker, there's no counterparty
