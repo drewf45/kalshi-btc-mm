@@ -550,11 +550,17 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
 
     active = []
     future = []
+    past = []
     for ot, ct, m in candidates:
+        ticker = m.get("ticker") or m.get("market_ticker") or "?"
         if ot is not None and ct is not None and ot <= now_ts < ct:
             active.append((ct, m))
         elif ct is not None and ct > now_ts:
             future.append((ct, m))
+        else:
+            past.append((ct or 0, m))
+
+    log.info(f"[PICK] candidates={len(candidates)} active={len(active)} future={len(future)} past={len(past)}")
 
     if active:
         active.sort(key=lambda x: x[0])
@@ -562,6 +568,12 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
     elif future:
         future.sort(key=lambda x: x[0])
         chosen = future[0][1]
+    elif past:
+        # All markets are closed — pick the one that closed most recently
+        # (closest to rolling into the next market)
+        past.sort(key=lambda x: x[0], reverse=True)
+        chosen = past[0][1]
+        log.warning(f"[PICK] No active/future markets — using most recently closed")
     else:
         chosen = markets[0] if markets else {}
         if not chosen:
@@ -2746,13 +2758,14 @@ def main() -> None:
 
         if secs_to_close < ENTRY_LAST_SECONDS:
             if pos == 0 and secs_to_close < 0:
-                # Market already closed, no position — force immediate roll
-                log.warning(f"[SKIP] {st.market} already closed (t_close={secs_to_close}s), no position — forcing roll")
+                # Market already closed, no position — force roll and wait
+                log.warning(f"[SKIP] {st.market} already closed (t_close={secs_to_close}s), no position — waiting for next market")
                 last_meta = 0.0  # Trigger meta refresh on next loop
+                time.sleep(10.0)  # Wait 10s between retries, not 1s — the next market may not exist yet
             else:
                 st.traded_this_market = True
                 log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
-            time.sleep(POLL_SECONDS)
+                time.sleep(POLL_SECONDS)
             continue
 
         if LOG_DECISIONS:
