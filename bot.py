@@ -132,38 +132,39 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
 # -------------- HOLD-TO-CLOSE STRATEGY (HARDWIRED) --------------
-# Philosophy: arm early to OBSERVE price/trends/book. Buy only when CERTAIN
-# of the outcome. Even a few cents edge is fine — buy MORE contracts.
+# Philosophy: arm early to OBSERVE price/trends/book. Buy when confident,
+# but EARLY ENOUGH that the book is still liquid (asks exist).
+# Even a few cents edge is fine — buy MORE contracts.
 # Hold to settlement. Dump is abort-only. Trade every market possible.
 #
-# TWO PHASES:
-#   OBSERVE (12min → 5min before close): gather trend data, watch book, DON'T buy
-#   BUY     (5min → 15s before close):   make the call, place the order, hold
+# KEY INSIGHT: Waiting until T-120s to buy means the book is LOCKED (no asks).
+# Placing a 99¢ bid with no sellers = zero fills = zero profit. Enter at
+# T-300s when probability is high AND the book still has liquidity.
 #
-# Why: 92% probability at 12 minutes means NOTHING — BTC moves $300 in 12 min.
-#      92% probability at 3 minutes is reliable — BTC can't move far enough.
-#      The observation window builds high-quality trend data so the buy decision is informed.
+# TWO PHASES:
+#   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
+#   BUY     (7min → 5s before close):   make the call, place the order, hold
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 120      # Can enter from T-120s — settlement lock is primary path, but don't get locked out of thin books
+BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.92  # 92%+ to enter — with market-weighted blend in last 60s, book at 92c = entry
-EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
+PROB_MIN = 0.85  # 85%+ to enter in last 2 min — market has priced in the outcome
+EDGE_MIN = 0.01  # 1% minimum edge — even 1¢/contract × many contracts compounds
 MAX_ENTRY_PRICE_CENTS = 99  # Edge comes from settlement — even 1¢/contract is profit at scale
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 5-min buy window) --------
-# Buy window is 5min → 15s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
+# Buy window is 7min → 5s before close. Require more certainty at the start
 # of the buy window (BTC still has time to move), relax near the end.
-# NOTE: observation phase (12min → 5min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 240   # 4-5 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.92            # >4min: need 92%+ (BTC still has time to move)
-PROB_MID_ENTRY_SECONDS = 120     # 2-4 min to close = "mid"
-PROB_MID_MIN = 0.88              # 2-4min: need 88%+
-# <2 min = PROB_MIN (0.85) — EV cap protects against overpaying
+# NOTE: observation phase (12min → 7min) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.92            # >5min: need 92%+ (BTC still has time to move)
+PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
+PROB_MID_MIN = 0.88              # 3-5min: need 88%+
+# <3 min = PROB_MIN (0.85) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -171,13 +172,13 @@ PROB_MID_MIN = 0.88              # 2-4min: need 88%+
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
 PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
-PROB_TREND_MIN_CURRENT = 0.88     # Current prob must be ≥88% — raised from 80%
+PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
-# Rationale: 90% prob means BTC is well inside the range. You don't need momentum
-# confirmation when the outcome is already near-certain. Just buy and hold.
-PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
+# Rationale: 85% prob means BTC is well inside the range. At 5 min to close,
+# this is decisive enough. Don't wait for trend alignment when the outcome is clear.
+PROB_FAST_LANE_THRESHOLD = 0.85   # ≥85% prob = buy immediately, no trend check needed
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
@@ -306,7 +307,7 @@ SCALP_DISTANCE_TIERS = [
     (100.0, 0.30),   # $100-200: safe
     (50.0,  0.15),   # $50-100: moderate — compound the edge
 ]
-SCALP_MAX_ENTRY_PRICE = 97        # Max 97¢ — ensures ≥3¢ profit/contract at settlement
+SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
 SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
 
@@ -324,7 +325,7 @@ CANDLES_LOOKBACK = env_int("CANDLES_LOOKBACK", 10)
 SIGMA_FLOOR = env_float("SIGMA_FLOOR", 6.0)
 SIGMA_CEIL = env_float("SIGMA_CEIL", 40.0)
 
-MAX_SPREAD_CENTS_TO_TRADE = env_int("MAX_SPREAD_CENTS_TO_TRADE", 8)
+MAX_SPREAD_CENTS_TO_TRADE = env_int("MAX_SPREAD_CENTS_TO_TRADE", 12)  # Wider to allow entry when book is thinner early on
 REQUIRE_BOTH_SIDES_BOOK = env_bool("REQUIRE_BOTH_SIDES_BOOK", False)
 
 SIGMA_REFRESH_SECONDS = env_float("SIGMA_REFRESH_SECONDS", 5.0)
@@ -349,10 +350,10 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — EV cap (price ≤ prob) is the real protection
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 420)    # Covers entire buy window — settlement payout IS the edge
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
-SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 95)      # locked book: if bid ≥ 95¢ but no ask, join bid queue
+SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
@@ -1388,15 +1389,15 @@ class ProbTrend:
         Returns: (should_buy, reason)
 
         Time-dependent strictness (more certain early, relax as outcome clarifies):
-          EARLY (4-5 min): Require active trend match — BTC still has time to swing.
-          MID   (2-4 min): Allow flat trend — stable high prob is enough certainty.
-          LATE  (<2 min):  Skip trend entirely — probability IS the outcome now.
+          EARLY (5-7 min): Require active trend match — BTC still has time to swing.
+          MID   (3-5 min): Allow flat trend — stable high prob is enough certainty.
+          LATE  (<3 min):  Skip trend entirely — probability IS the outcome now.
         Always: Trend matching our side = GO. Trend against us = BLOCK (unless late).
         """
         if not PROB_TREND_ENTRY_ENABLED:
             return False, "trend_entry_disabled"
 
-        # LATE window (<2 min): probability speaks for itself, skip trend check
+        # LATE window (<3 min): probability speaks for itself, skip trend check
         if secs_to_close <= PROB_MID_ENTRY_SECONDS:
             return True, f"late_window({secs_to_close}s, prob={current_prob:.0%})"
 
@@ -1415,11 +1416,11 @@ class ProbTrend:
         if side == "no" and "no" in direction:
             return True, f"trend_no({change:+.2f}/{seconds:.0f}s)"
 
-        # MID window (2-4 min): flat trend is acceptable — stable certainty
+        # MID window (3-5 min): flat trend is acceptable — stable certainty
         if secs_to_close <= PROB_EARLY_ENTRY_SECONDS and direction == "flat":
             return True, f"mid_flat({current_prob:.0%}/{seconds:.0f}s, {secs_to_close}s left)"
 
-        # EARLY window (4-5 min): flat is NOT enough, need active trend match
+        # EARLY window (5-7 min): flat is NOT enough, need active trend match
         if direction == "flat":
             return False, f"early_need_trend({current_prob:.0%}, flat/{secs_to_close}s left)"
 
@@ -1574,11 +1575,11 @@ def choose_trade(
 
     # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
     if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-        effective_prob_min = PROB_EARLY_MIN   # >4min: need 92%+
+        effective_prob_min = PROB_EARLY_MIN   # >5min: need 92%+
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-        effective_prob_min = PROB_MID_MIN     # 2-4min: need 88%+
+        effective_prob_min = PROB_MID_MIN     # 3-5min: need 88%+
     else:
-        effective_prob_min = PROB_MIN         # <2min: 92%+ — market-weighted blend, EV cap ensures price ≤ prob
+        effective_prob_min = PROB_MIN         # <3min: 85%+ — market has priced in the outcome
         
     ok_yes = (
         yes_px is not None
@@ -1748,21 +1749,20 @@ def should_dump_position(
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
 
-    # SETTLEMENT-LOCK ENTRIES: if we entered in the last 120s, the outcome is
-    # already decided.  Just hold to settlement — don't let dump logic sell a
-    # near-certain winner for 99c when settlement pays $1.
-    if st.entry_time > 0:
-        entry_secs_remaining = secs_to_close + (time.time() - st.entry_time)
-        if entry_secs_remaining <= SETTLEMENT_LOCK_SECONDS:
-            # Only bail on catastrophic loss (bankroll protection), not reversals
-            if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
-                exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
-                loss_per_contract = st.entry_price_cents - exit_price_est
-                total_loss_usd = (loss_per_contract * st.qty) / 100.0
-                max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
-                if total_loss_usd > max_loss_balance:
-                    return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
-            return False, f"late_entry_hold_to_settle_t={secs_to_close}s"
+    # LATE-ENTRY HOLD: if <120s to close, outcome is truly decided.
+    # Hold to settlement — don't let dump logic sell a near-certain winner.
+    # For earlier entries (120-300s), normal dump logic applies — BTC can still move.
+    HOLD_TO_SETTLE_SECONDS = 120  # Only suppress dumps in the last 2 min
+    if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
+        # Only bail on catastrophic loss (bankroll protection), not reversals
+        if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
+            exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+            loss_per_contract = st.entry_price_cents - exit_price_est
+            total_loss_usd = (loss_per_contract * st.qty) / 100.0
+            max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
+            if total_loss_usd > max_loss_balance:
+                return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
+        return False, f"late_entry_hold_to_settle_t={secs_to_close}s"
 
     if st.entry_model_prob is None:
         return False, "no_entry_data"
@@ -1960,7 +1960,7 @@ def compute_qty_from_bankroll(
     # At p=0.998, 99¢: Kelly=0.80 → half-Kelly=0.40 → ~11 contracts on $27
     SETTLE_LOCK_MIN_PROB = 0.998  # True confidence when bot calls it a lock
     sizing_p = p_gate
-    if p_gate >= PROB_FAST_LANE_THRESHOLD and entry_cents >= 97:
+    if p_gate >= 0.90 and entry_cents >= 95:
         if sizing_p < SETTLE_LOCK_MIN_PROB:
             log.info(
                 f"[SIZE] Settlement lock boost: p_gate={p_gate:.3f} at {entry_cents}¢ "
@@ -2873,7 +2873,7 @@ def main() -> None:
 
         # ============================================================
         # PHASE 2: OBSERVE — gather trend data, watch book, DON'T buy
-        # Runs from 12min → 5min before close
+        # Runs from 12min → 7min before close
         # ============================================================
         spot = fetch_btc_spot_usd(http)
         if spot is not None:
@@ -2938,8 +2938,8 @@ def main() -> None:
             continue
 
         # ============================================================
-        # PHASE 3: BUY WINDOW — last 5 min, make the call
-        # By now we have 7+ minutes of trend data to inform the decision
+        # PHASE 3: BUY WINDOW — last 7 min, make the call
+        # By now we have 5 minutes of trend data to inform the decision
         # ============================================================
         st.sm = SM.ARMED
 
@@ -2983,10 +2983,10 @@ def main() -> None:
         # ================================================================
         # ENTRY FILTER PIPELINE
         # Two paths:
-        #   FAST LANE (≥90% prob OR settlement lock window): buy immediately
-        #   STANDARD  (<90% prob, >120s): borderline → need trend + momentum
-        # Settlement lock entries bypass trend/momentum — the outcome is
-        # already decided, BTC's 60min direction is irrelevant.
+        #   FAST LANE (≥85% prob OR settlement lock window): buy immediately
+        #   STANDARD  (<85% prob): borderline → need trend + momentum
+        # The entire buy window is in settlement lock territory, so the
+        # main path for most trades is FAST LANE + taker order = instant fill.
         # ================================================================
         current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
         in_settlement_lock = secs_to_close is not None and secs_to_close <= SETTLEMENT_LOCK_SECONDS
@@ -3120,7 +3120,13 @@ def main() -> None:
             continue
 
         use_post_only = POST_ONLY
-        if secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
+        # AGGRESSIVE FILL: use taker orders when probability is high enough.
+        # Getting filled is worth more than saving maker/taker spread.
+        # Not participating costs 100% of the edge; crossing the spread costs 1-2¢.
+        if p_gate >= 0.85:
+            use_post_only = False
+            log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ 85%, fills > maker savings")
+        elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
             use_post_only = False
             log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
 
