@@ -2745,8 +2745,13 @@ def main() -> None:
         st.sm = SM.ARMED
 
         if secs_to_close < ENTRY_LAST_SECONDS:
-            st.traded_this_market = True
-            log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
+            if pos == 0 and secs_to_close < 0:
+                # Market already closed, no position — force immediate roll
+                log.warning(f"[SKIP] {st.market} already closed (t_close={secs_to_close}s), no position — forcing roll")
+                last_meta = 0.0  # Trigger meta refresh on next loop
+            else:
+                st.traded_this_market = True
+                log.warning(f"[SKIP] {st.market} missed last entry window (t_close={secs_to_close}s)")
             time.sleep(POLL_SECONDS)
             continue
 
