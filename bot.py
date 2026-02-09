@@ -1950,9 +1950,26 @@ def compute_qty_from_bankroll(
 
     cost_per = float(entry_cents) / 100.0
 
+    # SETTLEMENT LOCK BOOST: When p_gate is very high and entry price is near
+    # the probability (e.g., p=0.99 at 99¢), Kelly sees zero edge. But the bot
+    # has already decided this is a near-certain win. The blended probability
+    # is capped/rounded — true certainty is higher. Boost p_gate for sizing
+    # so we buy meaningful contract counts instead of the floor (1 contract).
+    #
+    # At p=0.995, 99¢: Kelly=0.50 → half-Kelly=0.25 → ~7 contracts on $27
+    # At p=0.998, 99¢: Kelly=0.80 → half-Kelly=0.40 → ~11 contracts on $27
+    SETTLE_LOCK_MIN_PROB = 0.998  # True confidence when bot calls it a lock
+    sizing_p = p_gate
+    if p_gate >= 0.98 and entry_cents >= 97:
+        if sizing_p < SETTLE_LOCK_MIN_PROB:
+            log.info(
+                f"[SIZE] Settlement lock boost: p_gate={p_gate:.3f} at {entry_cents}¢ "
+                f"→ using {SETTLE_LOCK_MIN_PROB} for Kelly sizing"
+            )
+            sizing_p = SETTLE_LOCK_MIN_PROB
+
     # PRIMARY: Kelly criterion sizing
-    # p_gate is the blended model probability — our best estimate of true win prob
-    kf = kelly_fraction(p_gate, entry_cents)
+    kf = kelly_fraction(sizing_p, entry_cents)
     fraction = kf * KELLY_MULTIPLIER  # Half-Kelly by default
 
     # Floor: if we decided to trade, commit at least KELLY_FLOOR_FRACTION
@@ -3162,11 +3179,12 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
-            elif use_post_only:
-                # Post-only (maker) order resting on the book — this is intentional.
-                # In locked-book scenarios (e.g., 99¢ bid, no ask), we're the highest
-                # bid. Let it rest and fill if a seller comes. Costs nothing if it
-                # expires unfilled at settlement.
+            elif use_post_only or (int(chosen_px) >= 97 and p_gate >= 0.98):
+                # Order resting on the book — intentional in locked-book scenarios.
+                # At 97-99¢ with ≥98% prob, the book is often locked (no asks).
+                # Whether post_only or LAST_CHANCE taker, there's no counterparty
+                # to fill against. Let it rest — we're the highest bid. Any seller
+                # fills against us. Costs nothing if it expires unfilled at settlement.
                 st.traded_this_market = True
                 st.sm = SM.HOLD
                 st.side = chosen_side
@@ -3178,8 +3196,9 @@ def main() -> None:
                 st.qty = qty  # Intended qty — will reconcile from position on settlement
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                resting_reason = "maker" if use_post_only else "locked_book"
                 log.warning(
-                    f"[FILL] Order {oid} resting as maker @ {chosen_px}¢ × {qty} — "
+                    f"[FILL] Order {oid} resting ({resting_reason}) @ {chosen_px}¢ × {qty} — "
                     f"letting it sit (highest bid, zero cost if unfilled)"
                 )
             else:
