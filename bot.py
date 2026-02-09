@@ -3,7 +3,8 @@
 #
 # STRATEGY:
 # - Arms at T-720s (12 min) to OBSERVE market, BTC price, trends, book
-# - Buys only when CERTAIN of the outcome (80%+ prob, trend + BTC aligned)
+# - Buys in the LAST 60 SECONDS — outcome is decided, book shows the winner
+# - Trusts the MARKET (orderbook) over the model near settlement
 # - Even a few cents edge per contract is fine — buy MORE contracts
 # - HOLDS TO SETTLEMENT — collect the full payout for being right
 # - Dump is ABORT ONLY — safety net, not a regular exit
@@ -143,13 +144,13 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 #      92% probability at 3 minutes is reliable — BTC can't move far enough.
 #      The observation window builds high-quality trend data so the buy decision is informed.
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 300      # Only place orders in the last 5 min — this is the real window
-ENTRY_LAST_SECONDS = 15      # Stop buying with <15s left
+BUY_START_SECONDS = 60       # Only enter in the last 60 seconds — outcome is decided by then
+ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.85  # Base prob bar — EV price cap (price ≤ prob) ensures positive EV at any threshold
+PROB_MIN = 0.92  # 92%+ to enter — with market-weighted blend in last 60s, book at 92c = entry
 EDGE_MIN = 0.02  # 2% minimum edge — even small discounts compound over 96 markets/day
 MAX_ENTRY_PRICE_CENTS = 99  # Edge comes from settlement — even 1¢/contract is profit at scale
 FEE_CENTS_PER_CONTRACT = 0
@@ -191,7 +192,7 @@ MAX_CONTRACTS = 25          # Hard cap — absolute max per order, any code path
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy fraction-based sizing (kept for A+ trade logic and safety checks)
-BANKROLL_FRACTION = 0.30
+BANKROLL_FRACTION = 0.40
 SCALING_MIN_FRACTION = 0.15
 SCALING_MAX_FRACTION = 0.50
 
@@ -249,9 +250,9 @@ DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-t
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
-# afford to size up.  20% of $35 = $7 → 8 contracts at 88c or 7 at 97c.
-# As bankroll grows to $350: $70 → 80+ contracts.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.20  # Max 20% of balance at risk per trade
+# afford to size up.  30% of $35 = $10.50 → 10 contracts at 97c.
+# As bankroll grows to $350: $105 → 100+ contracts.
+MAX_SETTLEMENT_LOSS_FRACTION = 0.30  # Max 30% of balance at risk per trade — this IS the compounding engine
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 15      # 15s grace period (was 30s — too slow)
@@ -342,7 +343,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.88)  # blend prob — EV cap (price ≤ prob) is the real protection
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
@@ -1427,7 +1428,17 @@ def choose_trade(
     p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
 
     if p_mkt is not None:
-        p_yes_blend = float(MODEL_BLEND_ALPHA) * p_yes_model + (1.0 - float(MODEL_BLEND_ALPHA)) * float(p_mkt)
+        # Last 60s: trust the MARKET — the book IS the probability near settlement.
+        # The BS model is too conservative with <1 min left; the orderbook has priced
+        # in the actual BTC distance.  Using 100% market means the EV price cap
+        # (price <= int(p_blend*100)) passes whenever the ask matches the midpoint,
+        # which is exactly right — the book IS the truth near settlement.
+        # Earlier: trust the MODEL — BTC still has time to move.
+        if secs_to_close <= 60:
+            alpha = 0.0   # 100% market — book IS the probability in the last minute
+        else:
+            alpha = float(MODEL_BLEND_ALPHA)  # 75% model, 25% market
+        p_yes_blend = alpha * p_yes_model + (1.0 - alpha) * float(p_mkt)
     else:
         p_yes_blend = p_yes_model
     p_yes_blend = max(0.0, min(1.0, p_yes_blend))
@@ -1462,7 +1473,7 @@ def choose_trade(
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
         effective_prob_min = PROB_MID_MIN     # 2-4min: need 88%+
     else:
-        effective_prob_min = PROB_MIN         # <2min: 85%+ — EV cap ensures price ≤ prob
+        effective_prob_min = PROB_MIN         # <2min: 92%+ — market-weighted blend, EV cap ensures price ≤ prob
         
     ok_yes = (
         yes_px is not None
@@ -1497,12 +1508,14 @@ def choose_trade(
         yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
         no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
 
-        if p_yes_model >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= int(p_yes_model * 100) and yes_boundary_ok:
+        max_yes_hc = int(p_yes_blend * 100) + 1  # +1¢ spread slack
+        max_no_hc = int(p_no_blend * 100) + 1
+        if p_yes_blend >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= max_yes_hc and yes_boundary_ok:
             ok_yes = True
-            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_model:.4f}, price={yes_px}, max={int(p_yes_model*100)})")
-        if p_no_model >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= int(p_no_model * 100) and no_boundary_ok:
+            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_blend:.4f}, price={yes_px}, max={max_yes_hc})")
+        if p_no_blend >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= max_no_hc and no_boundary_ok:
             ok_no = True
-            log.info(f"[OVERRIDE] NO high-certainty (p={p_no_model:.4f}, price={no_px}, max={int(p_no_model*100)})")
+            log.info(f"[OVERRIDE] NO high-certainty (p={p_no_blend:.4f}, price={no_px}, max={max_no_hc})")
 
     # SETTLEMENT LOCK: <2 min to close, model edge is unreliable.
     # Market has priced in the near-certain outcome, so our conservative blend
@@ -1512,17 +1525,22 @@ def choose_trade(
         yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
         no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
 
-        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= int(p_yes_blend * 100) and yes_boundary_ok:
+        # EV cap: allow paying up to prob*100 + 1¢ of spread slack.
+        # The midpoint-based p_blend is slightly below the ask by half the spread,
+        # so int(p_blend*100) always blocks the ask.  1¢ slack accounts for this.
+        max_yes_px = int(p_yes_blend * 100) + 1
+        max_no_px = int(p_no_blend * 100) + 1
+        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_yes_px and yes_boundary_ok:
             ok_yes = True
             log.warning(
                 f"[SETTLE LOCK] YES override: blend={p_yes_blend:.1%} price={yes_px}¢ "
-                f"max={int(p_yes_blend*100)}¢ edge={edge_yes:.4f} t={secs_to_close}s"
+                f"max={max_yes_px}¢ edge={edge_yes:.4f} t={secs_to_close}s"
             )
-        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= int(p_no_blend * 100) and no_boundary_ok:
+        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_no_px and no_boundary_ok:
             ok_no = True
             log.warning(
                 f"[SETTLE LOCK] NO override: blend={p_no_blend:.1%} price={no_px}¢ "
-                f"max={int(p_no_blend*100)}¢ edge={edge_no:.4f} t={secs_to_close}s"
+                f"max={max_no_px}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
     if ok_yes and ok_no:
@@ -1922,7 +1940,7 @@ def evaluate_scalp(
         return False, 0, None, f"prob={p_blend:.1%}<{SCALP_MIN_PROB:.0%}"
 
     # EV cap: never pay more than the probability (same rule as main entry)
-    max_ev_price = int(p_blend * 100)
+    max_ev_price = int(p_blend * 100) + 1  # +1¢ spread slack (midpoint is below ask by half-spread)
     if ask_price > max_ev_price:
         return False, 0, None, f"price={ask_price}¢>prob_cap={max_ev_price}¢(p={p_blend:.1%})"
 
@@ -2544,7 +2562,7 @@ def main() -> None:
                             if scalp_ask is None:
                                 scalp_ask = SCALP_MAX_ENTRY_PRICE
                             # EV cap: never bid more than the probability
-                            scalp_ask = min(scalp_ask, int(our_prob * 100))
+                            scalp_ask = min(scalp_ask, int(our_prob * 100) + 1)  # +1¢ spread slack
 
                             should_scalp, scalp_qty, scalp_px, scalp_reason = evaluate_scalp(
                                 st=st,
