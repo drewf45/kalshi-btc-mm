@@ -313,7 +313,7 @@ SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
-MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.75)
+MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.20)  # Was 0.75 — model is ~50/50 at >5min, drowns out 95% market signal
 
 REQUIRE_DIVERGENCE = env_bool("REQUIRE_DIVERGENCE", False)
 MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)
@@ -1533,17 +1533,22 @@ def choose_trade(
     p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
 
     if p_mkt is not None:
-        # Gradual transition from model-weighted to market-weighted as time runs out:
-        #   >120s: 75% model / 25% market (BTC still has time to move)
-        #   60-120s: linear ramp from 75% model down to 0% (outcome becoming clear)
+        # Gradual transition from model-weighted to market-weighted across buy window:
+        #   >420s: MODEL_BLEND_ALPHA (for observation — model still useful for trend)
+        #   60-420s: linear ramp from MODEL_BLEND_ALPHA down to 0% (market taking over)
         #   <60s: 100% market (book IS the probability)
+        #
+        # KEY FIX: The old 75% model weight at >120s was catastrophic. At T-400s with
+        # a 15-min market, the BS model says 50/50 (σ√t > boundary gap), but the market
+        # is 95% on one side. 75% model weight drags blend to 62% — below all thresholds.
+        # Now we ramp from 420s→60s so the market signal dominates in the buy window.
         if secs_to_close <= 60:
             alpha = 0.0   # 100% market — book IS the probability in the last minute
-        elif secs_to_close <= 120:
-            # Linear ramp: at 120s alpha=MODEL_BLEND_ALPHA, at 60s alpha=0
-            alpha = float(MODEL_BLEND_ALPHA) * (secs_to_close - 60) / 60.0
+        elif secs_to_close <= BUY_START_SECONDS:
+            # Linear ramp across buy window: at BUY_START alpha=MODEL_BLEND_ALPHA, at 60s alpha=0
+            alpha = float(MODEL_BLEND_ALPHA) * (secs_to_close - 60) / float(BUY_START_SECONDS - 60)
         else:
-            alpha = float(MODEL_BLEND_ALPHA)  # 75% model, 25% market
+            alpha = float(MODEL_BLEND_ALPHA)  # Outside buy window: model for observation
         p_yes_blend = alpha * p_yes_model + (1.0 - alpha) * float(p_mkt)
     else:
         p_yes_blend = p_yes_model
@@ -1598,12 +1603,62 @@ def choose_trade(
         and div_gate_no
     )
 
+    # MARKET CONVICTION OVERRIDE: When the book shows ≥85% on one side inside the
+    # buy window, override the blend probability to trust the market.  The BS model
+    # is nearly useless at >5 min (σ√t > boundary gap → 50/50), but the market has
+    # already priced the outcome.  This prevents the model from blocking trades the
+    # orderbook clearly supports.
+    MARKET_CONVICTION_THRESHOLD = 0.85
+    if p_mkt is not None and secs_to_close <= BUY_START_SECONDS:
+        p_yes_mkt = float(p_mkt)
+        p_no_mkt = 1.0 - p_yes_mkt
+        if p_yes_mkt >= MARKET_CONVICTION_THRESHOLD and p_yes_blend < p_yes_mkt:
+            log.info(
+                f"[MKT CONVICTION] YES: book={p_yes_mkt:.1%} > blend={p_yes_blend:.1%}, "
+                f"overriding blend to market"
+            )
+            p_yes_blend = p_yes_mkt
+            p_no_blend = 1.0 - p_yes_blend
+            edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
+            edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+            # Re-evaluate ok_yes/ok_no with new blend
+            ok_yes = (
+                yes_px is not None and ok_book_yes
+                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
+                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
+            )
+            ok_no = (
+                no_px is not None and ok_book_no
+                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
+            )
+        elif p_no_mkt >= MARKET_CONVICTION_THRESHOLD and p_no_blend < p_no_mkt:
+            log.info(
+                f"[MKT CONVICTION] NO: book={p_no_mkt:.1%} > blend={p_no_blend:.1%}, "
+                f"overriding blend to market"
+            )
+            p_no_blend = p_no_mkt
+            p_yes_blend = 1.0 - p_no_blend
+            edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
+            edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
+            # Re-evaluate ok_yes/ok_no with new blend
+            ok_yes = (
+                yes_px is not None and ok_book_yes
+                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
+                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
+            )
+            ok_no = (
+                no_px is not None and ok_book_no
+                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
+            )
+
     # Boundary buffer protection
     if lo is not None and spot < (lo + BOUNDARY_BUFFER_USD):
         if ok_yes:
             log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to lower bound ${lo:.2f}, blocking YES")
         ok_yes = False
-    
+
     if hi is not None and spot > (hi - BOUNDARY_BUFFER_USD):
         if ok_no:
             log.warning(f"[BOUNDARY] Spot ${spot:.2f} too close to upper bound ${hi:.2f}, blocking NO")
