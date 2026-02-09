@@ -27,7 +27,7 @@ import logging
 import math
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
@@ -225,7 +225,7 @@ ENABLE_DUMP = True
 # Philosophy: we entered with high conviction and hold to close. Bail ONLY if
 # BTC has actually moved against us AND the book confirms it. A book spike
 # while BTC is $150 on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.50  # Floor: if prob hits coin-flip AND BTC confirms, bail
+DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND BTC confirms, bail (was 50% — too late, already lost 40¢+)
 DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
 DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
 DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
@@ -237,17 +237,19 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
 # NO side:  spot < hi - buffer → BTC is safely below range ceiling → HOLD
 # If BTC is on our side, the book is lying (thin book, spike, manipulation).
 # ONLY bail if BTC has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 125.0   # >2min to close: need $125 buffer to suppress bail (raised from $75)
-DUMP_BTC_SAFE_BUFFER_LATE = 75.0     # <2min to close: need $75 buffer (raised from $30 — BTC moves $30-50 routinely)
+DUMP_BTC_SAFE_BUFFER_EARLY = 100.0   # >2min to close: need $100 buffer to suppress bail (was $125 — too generous, BTC reverses $100+ in 5min)
+DUMP_BTC_SAFE_BUFFER_LATE = 50.0     # <2min to close: need $50 buffer (was $75 — tighter so we don't hold losers)
 DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after BTC check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.08  # 8% drop from peak — bail fast (was 12%, still too slow)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.06  # 6% when profitable — protect gains (was 10%)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.05  # Tighten after 5%+ gain (was 8%)
+DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
 DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
+# Reversal during early settling phase uses a wider threshold (not blocked entirely)
+DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
 
 # -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
 # Never lose more than X% of current balance on a single trade.
@@ -263,14 +265,26 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 MAX_SETTLEMENT_LOSS_FRACTION = 0.30  # Max 30% of balance at risk per trade — this IS the compounding engine
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 15      # 15s grace period (was 30s — too slow)
-DUMP_PROACTIVE_AFTER_SECONDS = 60   # Proactive bail after 1 min (was 2 min — let bankroll cap handle early bail)
+DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
+DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 15  # Hard stop (fires after BTC check)
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after BTC check (was 15¢ — tighter to salvage more)
 # CATASTROPHIC STOP: fires BEFORE BTC check — absolute max loss regardless of anything
-# Prevents a $2.65 loss when the hard stop is supposed to cap at 15¢/contract
-DUMP_CATASTROPHIC_LOSS_CENTS = 30      # If losing >30¢/contract, bail no matter what
+# Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
+DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
+
+# -------------- WINDOWED PEAK TRACKING (avoid false reversals from book spikes) -----
+# All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
+# false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
+# Use a rolling window max instead: peak = max(prob over last N seconds).
+DUMP_PEAK_WINDOW_SECONDS = 30  # Use max prob over last 30s as "peak" (not all-time)
+
+# -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
+# If probability drops very fast (>4% in 10s), something is seriously wrong.
+# Bail even during settling period — fast drops mean BTC is actively moving against us.
+DUMP_RAPID_DROP_THRESHOLD = 0.04   # 4% drop in the rapid window = emergency
+DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 
 # -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
 # If we bail because BTC moved against us, the OTHER side is now the high-prob winner.
@@ -1464,6 +1478,9 @@ class BotState:
 
     # Peak probability tracking (for proactive dump)
     peak_prob_for_side: float = 0.0  # Highest prob we've seen for our side since entry
+    # Windowed peak tracking: list of (timestamp, prob) for rolling max computation
+    # Avoids false reversal signals from thin-book spikes ratcheting up all-time peak
+    prob_history: list = field(default_factory=list)  # List[Tuple[float, float]]
 
     # Deferred settlement: when we can't get result at roll time, check later
     pending_settlement_market: Optional[str] = None
@@ -1804,10 +1821,11 @@ def should_dump_position(
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
 
-    # LATE-ENTRY HOLD: if <120s to close, outcome is truly decided.
+    # LATE-ENTRY HOLD: if <60s to close, outcome is mostly decided.
     # Hold to settlement — don't let dump logic sell a near-certain winner.
-    # For earlier entries (120-300s), normal dump logic applies — BTC can still move.
-    HOLD_TO_SETTLE_SECONDS = 120  # Only suppress dumps in the last 2 min
+    # For earlier entries (60-420s), normal dump logic applies — BTC can still move.
+    # Was 120s — too long, BTC can move $50-100 in 2 minutes. 60s is safer.
+    HOLD_TO_SETTLE_SECONDS = 60  # Only suppress dumps in the last 1 min
     if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
         # Only bail on catastrophic loss (bankroll protection), not reversals
         if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
@@ -1835,12 +1853,29 @@ def should_dump_position(
         current_prob = p_no_blend
         entry_prob = 1.0 - st.entry_model_prob
 
-    # Update peak probability tracking
+    # Update peak probability tracking (all-time, for logging)
     if current_prob > st.peak_prob_for_side:
         st.peak_prob_for_side = current_prob
 
-    drop_from_peak = st.peak_prob_for_side - current_prob
+    # Record prob sample for windowed peak tracking
+    now_ts = time.time()
+    st.prob_history.append((now_ts, current_prob))
+    # Prune old samples outside the peak window
+    cutoff_ts = now_ts - DUMP_PEAK_WINDOW_SECONDS
+    st.prob_history = [(t, p) for t, p in st.prob_history if t >= cutoff_ts]
+
+    # Windowed peak: max prob over last N seconds (avoids thin-book spike ratcheting)
+    windowed_peak = max(p for _, p in st.prob_history) if st.prob_history else current_prob
+    drop_from_peak = windowed_peak - current_prob
     in_settling = time_in_trade < DUMP_PROACTIVE_AFTER_SECONDS
+
+    # Rapid drop detection: check if prob dropped fast in the last 10s
+    rapid_cutoff = now_ts - DUMP_RAPID_DROP_WINDOW_SECONDS
+    rapid_samples = [(t, p) for t, p in st.prob_history if t >= rapid_cutoff]
+    rapid_drop = 0.0
+    if len(rapid_samples) >= 3:  # Need at least 3 samples for meaningful signal
+        rapid_peak = max(p for _, p in rapid_samples)
+        rapid_drop = rapid_peak - current_prob
 
     # =============================================================
     # === BANKROLL-PROPORTIONAL STOP: fires BEFORE BTC check ===
@@ -1913,6 +1948,17 @@ def should_dump_position(
 
     # === Below here: BTC is NOT safely on our side — bail checks apply ===
 
+    # --- RAPID DROP BAIL: BTC is against us AND prob dropped fast ---
+    # Emergency exit: if prob dropped >4% in the last 10s, BTC is actively moving
+    # against us. Fire even during settling period — speed matters here.
+    if rapid_drop >= DUMP_RAPID_DROP_THRESHOLD:
+        log.warning(
+            f"[BAIL RAPID DROP] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+            f"prob dropped {rapid_drop:.1%} in last {DUMP_RAPID_DROP_WINDOW_SECONDS}s "
+            f"(current={current_prob:.1%}) — emergency exit"
+        )
+        return True, f"rapid_drop_{rapid_drop:.1%}_in_{DUMP_RAPID_DROP_WINDOW_SECONDS}s"
+
     # --- HARD P&L STOP: BTC is against us AND losing big ---
     if st.entry_price_cents is not None:
         exit_price_est = int(current_prob * 100)
@@ -1926,20 +1972,28 @@ def should_dump_position(
             return True, f"hard_stop_{unrealized_loss_per_contract}c_per_contract"
 
     # --- REVERSAL BAIL: BTC is against us AND prob has dropped significantly ---
-    if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED and not in_settling:
-        gain_above_entry = st.peak_prob_for_side - entry_prob
+    # Now fires during settling too (with wider threshold) — was completely blocked before.
+    # Windowed peak (last 30s) is used instead of all-time peak to avoid false signals.
+    if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED:
+        gain_above_entry = windowed_peak - entry_prob
         if gain_above_entry >= DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY:
             effective_threshold = DUMP_REVERSAL_THRESHOLD_PROFIT
         else:
             effective_threshold = DUMP_REVERSAL_THRESHOLD
 
+        # During settling (first 30s), use wider threshold — only bail on big reversals
+        if in_settling:
+            effective_threshold = DUMP_REVERSAL_THRESHOLD_SETTLING
+
         if drop_from_peak >= effective_threshold:
+            phase_label = "settling" if in_settling else "active"
             log.warning(
                 f"[BAIL REVERSAL] BTC NOT safe (dist=${btc_distance:.0f}) AND "
-                f"prob dropped {drop_from_peak:.1%} from peak "
-                f"({st.peak_prob_for_side:.1%} -> {current_prob:.1%}) — salvaging"
+                f"prob dropped {drop_from_peak:.1%} from windowed peak "
+                f"({windowed_peak:.1%} -> {current_prob:.1%}) phase={phase_label} "
+                f"threshold={effective_threshold:.1%} — salvaging"
             )
-            return True, f"reversal_{current_prob:.0%}_from_peak_{st.peak_prob_for_side:.0%}"
+            return True, f"reversal_{current_prob:.0%}_from_wpeak_{windowed_peak:.0%}_{phase_label}"
 
     # --- FLOOR: BTC is against us AND prob is at coin-flip ---
     if current_prob < DUMP_PROB_FLIP:
@@ -1952,8 +2006,8 @@ def should_dump_position(
     # Still holding
     phase = "settling" if in_settling else "active"
     return False, (
-        f"{phase}_prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}"
-        f"_drop={drop_from_peak:.0%}_btc_dist=${btc_distance:.0f}"
+        f"{phase}_prob={current_prob:.0%}_wpeak={windowed_peak:.0%}_peak={st.peak_prob_for_side:.0%}"
+        f"_drop={drop_from_peak:.0%}_rdrop={rapid_drop:.0%}_btc_dist=${btc_distance:.0f}"
     )
 
 
@@ -2738,6 +2792,7 @@ def main() -> None:
                                                 st.entry_spot_price = spot
                                                 st.qty = flip_filled  # Actual filled qty
                                                 st.peak_prob_for_side = flip_prob
+                                                st.prob_history = []  # Reset windowed peak tracking for flipped position
                                                 st.has_flipped = True
                                                 st.traded_this_market = True
                                                 if flip_filled < flip_qty:
@@ -3222,6 +3277,7 @@ def main() -> None:
                 st.entry_time = now
                 st.qty = filled_qty  # Use actual filled qty, not intended
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                st.prob_history = []  # Reset windowed peak tracking for new position
                 if filled_qty < qty:
                     log.warning(f"[FILL] Partial fill: got {filled_qty}/{qty} contracts — canceling remainder")
                     cancel_order_status(client, oid)
@@ -3239,6 +3295,7 @@ def main() -> None:
                 st.entry_time = now
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                st.prob_history = []  # Reset windowed peak tracking for new position
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
             elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
@@ -3257,6 +3314,7 @@ def main() -> None:
                 st.qty = qty  # Intended qty — will reconcile from position on settlement
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                st.prob_history = []  # Reset windowed peak tracking for new position
                 resting_reason = "maker" if use_post_only else "locked_book"
                 log.warning(
                     f"[FILL] Order {oid} resting ({resting_reason}) @ {chosen_px}¢ × {qty} — "
