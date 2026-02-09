@@ -879,6 +879,73 @@ def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     raise RuntimeError(f"Unexpected create order response: {resp}")
 
 
+def get_order(client: KalshiClient, order_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single order by ID. Returns the order dict or None on error."""
+    try:
+        resp = client.request("GET", f"/portfolio/orders/{order_id}")
+        if isinstance(resp, dict):
+            return resp.get("order", resp)
+        return None
+    except Exception as e:
+        log.warning(f"[ORDER] get_order({order_id}) failed: {e}")
+        return None
+
+
+# Fill check constants
+FILL_CHECK_DELAY = 2.0       # seconds to wait before checking fill
+FILL_CHECK_RETRIES = 2       # how many times to re-check before giving up
+FILL_CHECK_INTERVAL = 2.0    # seconds between re-checks
+
+
+def wait_for_fill(client: KalshiClient, order_id: str, market: str) -> Tuple[str, int]:
+    """Wait briefly for an order to fill. Returns (status, filled_qty).
+
+    status: 'filled', 'partial', 'resting', 'canceled', 'unknown'
+    filled_qty: number of contracts that actually filled (0 if none).
+    """
+    time.sleep(FILL_CHECK_DELAY)
+
+    for attempt in range(1, FILL_CHECK_RETRIES + 1):
+        order = get_order(client, order_id)
+        if order is None:
+            # API error — check position as fallback
+            try:
+                pos = abs(parse_position_for_market(get_positions(client), market))
+                if pos > 0:
+                    log.info(f"[FILL] Order lookup failed but found position={pos} in {market}")
+                    return "filled", pos
+            except Exception:
+                pass
+            return "unknown", 0
+
+        status = order.get("status", "unknown")
+        remaining = order.get("remaining_count", order.get("count", 0))
+        total = order.get("count", 0)
+
+        # Kalshi statuses: resting, canceled, executed (fully filled), partial
+        if status == "executed":
+            log.info(f"[FILL] Order {order_id} fully filled: {total} contracts")
+            return "filled", total
+        if remaining == 0 and total > 0:
+            # Fully filled even if status label differs
+            log.info(f"[FILL] Order {order_id} filled (remaining=0): {total} contracts")
+            return "filled", total
+        if 0 < remaining < total:
+            filled = total - remaining
+            log.info(f"[FILL] Order {order_id} partial fill: {filled}/{total} contracts")
+            return "partial", filled
+        if status == "canceled":
+            log.info(f"[FILL] Order {order_id} was canceled")
+            return "canceled", 0
+        # Still resting — wait and retry
+        if attempt < FILL_CHECK_RETRIES:
+            time.sleep(FILL_CHECK_INTERVAL)
+
+    # Still resting after all retries
+    log.warning(f"[FILL] Order {order_id} still resting after {FILL_CHECK_DELAY + FILL_CHECK_RETRIES * FILL_CHECK_INTERVAL}s")
+    return "resting", 0
+
+
 def get_positions(client: KalshiClient) -> List[Dict[str, Any]]:
     resp = client.request("GET", "/portfolio/positions", params={"limit": 200})
     if isinstance(resp, dict):
@@ -2563,18 +2630,31 @@ def main() -> None:
                                                 f"@ {flip_price}¢ qty={flip_qty}"
                                             )
 
-                                            # Update state for the new position
-                                            st.sm = SM.HOLD
-                                            st.side = flip_side
-                                            st.entry_price_cents = int(flip_price)
-                                            st.entry_time = time.time()
-                                            st.entry_model_prob = p_yes_model if flip_side == "yes" else (1.0 - p_yes_model)
-                                            st.entry_market_prob = p_mkt
-                                            st.entry_spot_price = spot
-                                            st.qty = flip_qty
-                                            st.peak_prob_for_side = flip_prob
-                                            st.has_flipped = True
-                                            st.traded_this_market = True
+                                            # Verify flip fill
+                                            flip_fill_status, flip_filled = wait_for_fill(client, flip_oid, st.market)
+                                            if flip_fill_status in ("filled", "partial") and flip_filled > 0:
+                                                st.sm = SM.HOLD
+                                                st.side = flip_side
+                                                st.entry_price_cents = int(flip_price)
+                                                st.entry_time = time.time()
+                                                st.entry_model_prob = p_yes_model if flip_side == "yes" else (1.0 - p_yes_model)
+                                                st.entry_market_prob = p_mkt
+                                                st.entry_spot_price = spot
+                                                st.qty = flip_filled  # Actual filled qty
+                                                st.peak_prob_for_side = flip_prob
+                                                st.has_flipped = True
+                                                st.traded_this_market = True
+                                                if flip_filled < flip_qty:
+                                                    log.warning(f"[FLIP] Partial fill: {flip_filled}/{flip_qty} — canceling remainder")
+                                                    cancel_order_status(client, flip_oid)
+                                                else:
+                                                    log.warning(f"[FLIP] Fill confirmed: {flip_filled} contracts")
+                                            else:
+                                                log.warning(f"[FLIP] Order NOT filled (status={flip_fill_status}) — canceling")
+                                                cancel_order_status(client, flip_oid)
+                                                st.sm = SM.DUMPED
+                                                st.side = None
+                                                st.entry_price_cents = None
                                         else:
                                             log.warning(f"[DRY] Would flip: BUY {flip_side.upper()} @ {flip_price}¢ qty={flip_qty}")
                                             st.sm = SM.DUMPED
@@ -2688,13 +2768,22 @@ def main() -> None:
 
                                             if not DRY_RUN:
                                                 scalp_oid = place_order(client, scalp_payload)
-                                                st.has_scalped = True
                                                 expected_profit = scalp_qty * (100 - scalp_px) / 100.0
                                                 log.warning(
                                                     f"[SCALP] PLACED order={scalp_oid} BUY {st.side.upper()} "
                                                     f"@ {scalp_px}¢ × {scalp_qty} "
                                                     f"(expect +${expected_profit:.2f} at settlement)"
                                                 )
+                                                # Quick fill check for scalp (less time since we're near close)
+                                                scalp_fill_status, scalp_filled = wait_for_fill(client, scalp_oid, st.market)
+                                                if scalp_fill_status in ("filled", "partial") and scalp_filled > 0:
+                                                    st.has_scalped = True
+                                                    log.warning(f"[SCALP] Fill confirmed: {scalp_filled}/{scalp_qty} contracts")
+                                                    if scalp_filled < scalp_qty:
+                                                        cancel_order_status(client, scalp_oid)
+                                                else:
+                                                    log.warning(f"[SCALP] NOT filled (status={scalp_fill_status}) — canceling")
+                                                    cancel_order_status(client, scalp_oid)
                                             else:
                                                 st.has_scalped = True
                                                 log.warning(f"[DRY SCALP] Would buy {st.side.upper()} @ {scalp_px}¢ × {scalp_qty}")
@@ -3012,22 +3101,48 @@ def main() -> None:
 
         try:
             oid = place_order(client, payload)
-            st.traded_this_market = True
-            st.sm = SM.HOLD
-            st.side = chosen_side
-            st.entry_model_prob = p_yes_model
-            st.entry_market_prob = p_mkt
-            st.entry_spot_price = spot
-            st.entry_price_cents = int(chosen_px)  # Track entry price for P&L
-            st.entry_time = now
-            st.qty = qty
-            # Initialize peak tracking for proactive dump
-            st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
-
             log.warning(
                 f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
                 f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} streak={session.consecutive_wins}W"
             )
+
+            # Verify fill before committing state
+            fill_status, filled_qty = wait_for_fill(client, oid, st.market)
+
+            if fill_status in ("filled", "partial") and filled_qty > 0:
+                st.traded_this_market = True
+                st.sm = SM.HOLD
+                st.side = chosen_side
+                st.entry_model_prob = p_yes_model
+                st.entry_market_prob = p_mkt
+                st.entry_spot_price = spot
+                st.entry_price_cents = int(chosen_px)
+                st.entry_time = now
+                st.qty = filled_qty  # Use actual filled qty, not intended
+                st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                if filled_qty < qty:
+                    log.warning(f"[FILL] Partial fill: got {filled_qty}/{qty} contracts — canceling remainder")
+                    cancel_order_status(client, oid)
+                else:
+                    log.warning(f"[FILL] Full fill confirmed: {filled_qty} contracts")
+            elif fill_status == "unknown":
+                # API error — assume filled to be safe (position check will reconcile)
+                st.traded_this_market = True
+                st.sm = SM.HOLD
+                st.side = chosen_side
+                st.entry_model_prob = p_yes_model
+                st.entry_market_prob = p_mkt
+                st.entry_spot_price = spot
+                st.entry_price_cents = int(chosen_px)
+                st.entry_time = now
+                st.qty = qty
+                st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
+            else:
+                # Not filled (resting/canceled) — cancel and reset so we can retry
+                log.warning(f"[FILL] Order {oid} NOT filled (status={fill_status}) — canceling and resetting")
+                cancel_order_status(client, oid)
+                # Do NOT set traded_this_market — let the bot retry next loop
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
 
