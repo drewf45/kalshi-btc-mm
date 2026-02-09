@@ -345,6 +345,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 120)    # <2 min
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
+SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 95)      # locked book: if bid ≥ 95¢ but no ask, join bid queue
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
@@ -540,13 +541,38 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
             return None
 
     candidates = []
+    skipped_statuses = {}
     for m in markets:
         status = str(m.get("status", "")).lower()
-        if status and status != "open":
+        if status and status not in ("open", "active"):
+            skipped_statuses[status] = skipped_statuses.get(status, 0) + 1
             continue
         ot = get_ts(m, "open_time") or get_ts(m, "open_ts") or get_ts(m, "open_timestamp")
         ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
+        # If timestamps are ISO strings, parse them
+        if ot is None:
+            for k in ("open_time", "open_ts", "open_timestamp"):
+                v = m.get(k)
+                if isinstance(v, str) and v:
+                    parsed = _parse_iso_to_epoch_s(v)
+                    if parsed is not None:
+                        ot = parsed
+                        break
+        if ct is None:
+            for k in ("close_time", "close_ts", "close_timestamp"):
+                v = m.get(k)
+                if isinstance(v, str) and v:
+                    parsed = _parse_iso_to_epoch_s(v)
+                    if parsed is not None:
+                        ct = parsed
+                        break
+        # Last resort: infer close_ts from ticker
+        ticker = m.get("ticker") or m.get("market_ticker") or ""
+        if ct is None and ticker:
+            ct = infer_close_ts_from_ticker(ticker, interval_minutes=15)
         candidates.append((ot, ct, m))
+    if skipped_statuses:
+        log.info(f"[PICK] skipped statuses: {skipped_statuses}")
 
     active = []
     future = []
@@ -560,7 +586,7 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         else:
             past.append((ct or 0, m))
 
-    log.info(f"[PICK] candidates={len(candidates)} active={len(active)} future={len(future)} past={len(past)}")
+    log.info(f"[PICK] total_markets={len(markets)} candidates={len(candidates)} active={len(active)} future={len(future)} past={len(past)}")
 
     if active:
         active.sort(key=lambda x: x[0])
@@ -1545,6 +1571,21 @@ def choose_trade(
         # Use max entry price, not model-blended cap.  The model is too conservative
         # near settlement and blocks fair-value entries at 97-99c.
         max_settle_px = SETTLEMENT_LOCK_MAX_PRICE
+
+        # LOCKED BOOK HANDLING: When ask is None (nobody selling), but bid is
+        # high (≥95¢), the book is "locked" — outcome is decided, just no sellers.
+        # Place a limit buy at the bid price to join the queue.  If anyone market-
+        # sells, we get filled.  If not, we simply don't fill — zero risk.
+        # This turns "no ask to hit" from "can't trade" into "join the queue."
+        if yes_px is None and yes_bid is not None and yes_bid >= SETTLEMENT_LOCK_MIN_BID:
+            yes_px = clamp_int(yes_bid, 1, 99)
+            edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT)
+            log.info(f"[LOCKED BOOK] YES: no ask, using bid={yes_bid}¢ as limit price")
+        if no_px is None and no_bid is not None and no_bid >= SETTLEMENT_LOCK_MIN_BID:
+            no_px = clamp_int(no_bid, 1, 99)
+            edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT)
+            log.info(f"[LOCKED BOOK] NO: no ask, using bid={no_bid}¢ as limit price")
+
         if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_settle_px and yes_boundary_ok:
             ok_yes = True
             log.warning(
