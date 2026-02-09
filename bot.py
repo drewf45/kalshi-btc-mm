@@ -187,7 +187,7 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 # Simple, predictable, no bankroll-fraction math needed.
 BASE_CONTRACTS = 3          # Start each session buying 3 contracts
 CONTRACT_INCREMENT = 1      # Add 1 contract per consecutive win
-MAX_CONTRACTS = 100         # Hard cap
+MAX_CONTRACTS = 25          # Hard cap — absolute max per order, any code path
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy fraction-based sizing (kept for A+ trade logic and safety checks)
@@ -2569,16 +2569,25 @@ def main() -> None:
                                     # Fetch fresh cash balance for the scalp order
                                     scalp_avail, _ = get_balance_usd(client)
                                     if scalp_avail is not None and scalp_avail >= MIN_FREE_USD_TO_TRADE:
-                                        # Re-evaluate qty with fresh balance
-                                        if st.side == "yes" and lo is not None:
-                                            scalp_dist = spot - lo
-                                        elif st.side == "no" and hi is not None:
-                                            scalp_dist = hi - spot
-                                        elif st.side == "no" and lo is not None:
-                                            scalp_dist = lo - spot
+                                        # Cap scalp so total position (existing + scalp) ≤ MAX_CONTRACTS
+                                        existing_pos = abs(pos)  # pos from the HOLD loop
+                                        scalp_room = max(0, MAX_CONTRACTS - existing_pos)
+                                        if scalp_room <= 0:
+                                            log.info(f"[SCALP] Skipped — position already at {existing_pos} (max={MAX_CONTRACTS})")
+                                            scalp_qty = 0
+                                            st.has_scalped = True
                                         else:
-                                            scalp_dist = 0.0
-                                        scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
+                                            # Re-evaluate qty with fresh balance
+                                            if st.side == "yes" and lo is not None:
+                                                scalp_dist = spot - lo
+                                            elif st.side == "no" and hi is not None:
+                                                scalp_dist = hi - spot
+                                            elif st.side == "no" and lo is not None:
+                                                scalp_dist = lo - spot
+                                            else:
+                                                scalp_dist = 0.0
+                                            scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
+                                            scalp_qty = min(scalp_qty, scalp_room)  # Enforce position cap
 
                                         if scalp_qty > 0:
                                             scalp_payload = build_order_payload(
