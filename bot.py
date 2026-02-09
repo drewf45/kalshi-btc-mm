@@ -2856,17 +2856,21 @@ def main() -> None:
         # ================================================================
         # ENTRY FILTER PIPELINE
         # Two paths:
-        #   FAST LANE (≥90% prob): outcome is near-certain → buy immediately
-        #   STANDARD  (<90% prob): borderline → need trend + momentum confirmation
-        # This lets us trade every market when it's obvious, but stay cautious
-        # when the outcome is unclear.
+        #   FAST LANE (≥90% prob OR settlement lock window): buy immediately
+        #   STANDARD  (<90% prob, >120s): borderline → need trend + momentum
+        # Settlement lock entries bypass trend/momentum — the outcome is
+        # already decided, BTC's 60min direction is irrelevant.
         # ================================================================
         current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
-        fast_lane = current_prob_for_side >= PROB_FAST_LANE_THRESHOLD
+        in_settlement_lock = secs_to_close is not None and secs_to_close <= SETTLEMENT_LOCK_SECONDS
+        fast_lane = current_prob_for_side >= PROB_FAST_LANE_THRESHOLD or in_settlement_lock
 
         if fast_lane:
+            reason = (f"prob={current_prob_for_side:.1%} ≥ {PROB_FAST_LANE_THRESHOLD:.0%}"
+                      if current_prob_for_side >= PROB_FAST_LANE_THRESHOLD
+                      else f"settlement_lock t={secs_to_close}s prob={current_prob_for_side:.1%}")
             log.warning(
-                f"[FAST LANE] {chosen_side.upper()} prob={current_prob_for_side:.1%} ≥ {PROB_FAST_LANE_THRESHOLD:.0%} "
+                f"[FAST LANE] {chosen_side.upper()} {reason} "
                 f"— skipping trend/momentum checks, outcome near-certain"
             )
         else:
