@@ -2364,6 +2364,30 @@ def main() -> None:
 
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
+                        # Reconcile st.qty with actual position before computing P&L.
+                        # Resting orders may not have filled (or only partially filled).
+                        try:
+                            actual_pos = abs(parse_position_for_market(get_positions(client), old_market))
+                            if actual_pos != st.qty:
+                                log.warning(
+                                    f"[RECON] Position mismatch: st.qty={st.qty} actual={actual_pos} "
+                                    f"— using actual for P&L"
+                                )
+                                st.qty = actual_pos
+                            # Cancel any resting orders for this market
+                            if getattr(st, 'order_id', None):
+                                cancel_order_status(client, st.order_id)
+                        except Exception as e:
+                            log.warning(f"[RECON] Position check failed: {e} — using st.qty={st.qty}")
+
+                        if st.qty == 0:
+                            log.warning(f"[ROLL] No position filled in {old_market} — skipping P&L")
+                            session.reset_for_new_market()
+                            ev, market_ticker, market_obj = ev2, mt2, mobj2
+                            st = BotState(market=mt2)
+                            last_meta = now
+                            continue
+
                         # Try to determine settlement result (quick check, don't block long)
                         result = None
                         log.info(f"[ROLL] Checking settlement result for {old_market}...")
@@ -3138,9 +3162,29 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
+            elif use_post_only:
+                # Post-only (maker) order resting on the book — this is intentional.
+                # In locked-book scenarios (e.g., 99¢ bid, no ask), we're the highest
+                # bid. Let it rest and fill if a seller comes. Costs nothing if it
+                # expires unfilled at settlement.
+                st.traded_this_market = True
+                st.sm = SM.HOLD
+                st.side = chosen_side
+                st.entry_model_prob = p_yes_model
+                st.entry_market_prob = p_mkt
+                st.entry_spot_price = spot
+                st.entry_price_cents = int(chosen_px)
+                st.entry_time = now
+                st.qty = qty  # Intended qty — will reconcile from position on settlement
+                st.order_id = oid
+                st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
+                log.warning(
+                    f"[FILL] Order {oid} resting as maker @ {chosen_px}¢ × {qty} — "
+                    f"letting it sit (highest bid, zero cost if unfilled)"
+                )
             else:
-                # Not filled (resting/canceled) — cancel and reset so we can retry
-                log.warning(f"[FILL] Order {oid} NOT filled (status={fill_status}) — canceling and resetting")
+                # Taker order that should have filled but didn't — cancel and retry
+                log.warning(f"[FILL] Taker order {oid} NOT filled (status={fill_status}) — canceling and resetting")
                 cancel_order_status(client, oid)
                 # Do NOT set traded_this_market — let the bot retry next loop
         except Exception as e:
