@@ -1640,6 +1640,22 @@ def should_dump_position(
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
 
+    # SETTLEMENT-LOCK ENTRIES: if we entered in the last 120s, the outcome is
+    # already decided.  Just hold to settlement — don't let dump logic sell a
+    # near-certain winner for 99c when settlement pays $1.
+    if st.entry_time > 0:
+        entry_secs_remaining = secs_to_close + (time.time() - st.entry_time)
+        if entry_secs_remaining <= SETTLEMENT_LOCK_SECONDS:
+            # Only bail on catastrophic loss (bankroll protection), not reversals
+            if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
+                exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+                loss_per_contract = st.entry_price_cents - exit_price_est
+                total_loss_usd = (loss_per_contract * st.qty) / 100.0
+                max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
+                if total_loss_usd > max_loss_balance:
+                    return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
+            return False, f"late_entry_hold_to_settle_t={secs_to_close}s"
+
     if st.entry_model_prob is None:
         return False, "no_entry_data"
 
