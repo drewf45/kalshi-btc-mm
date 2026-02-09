@@ -1038,6 +1038,8 @@ class SessionState:
                      qty: int, pnl_cents: int, was_dump: bool = False):
         """Record a completed trade"""
         pnl_usd = pnl_cents / 100.0
+        self.daily_pnl_usd += pnl_usd  # Immediate P&L update (balance check will correct later)
+        self.current_balance_usd += pnl_usd  # Estimate balance until real check
         self.total_markets += 1
 
         trade = {
