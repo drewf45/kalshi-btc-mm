@@ -181,17 +181,24 @@ PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend chec
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
-# -------------- CONTRACT-COUNT SCALING (HARDWIRED) --------------
-# Philosophy: size by CONTRACT COUNT, not percentage.
-# Start with BASE_CONTRACTS. Each win adds 1 contract. Each loss resets to base.
-# Over 96 markets/day this compounds: win 10 in a row = 10 extra contracts.
-# Simple, predictable, no bankroll-fraction math needed.
-BASE_CONTRACTS = 3          # Start each session buying 3 contracts
-CONTRACT_INCREMENT = 1      # Add 1 contract per consecutive win
-MAX_CONTRACTS = 25          # Hard cap — absolute max per order, any code path
+# -------------- KELLY BANKROLL SIZING (HARDWIRED) --------------
+# Philosophy: size by BANKROLL FRACTION using Kelly criterion.
+# As you win, your bankroll grows → position size grows automatically.
+# As you lose, bankroll shrinks → position size shrinks (self-protecting).
+# No streak counters needed — compounding is baked into the math.
+#
+# Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
+# where p_true = model probability, price = entry cost / 100.
+# Full Kelly is optimal but volatile; half-Kelly cuts variance ~75%.
+KELLY_MULTIPLIER = 0.50     # Half-Kelly — balances growth vs drawdown protection
+KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
+KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
+MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
-# Legacy fraction-based sizing (kept for A+ trade logic and safety checks)
+# Legacy constants (kept for backward compat in safety checks)
+BASE_CONTRACTS = 3
+CONTRACT_INCREMENT = 1
 BANKROLL_FRACTION = 0.40
 SCALING_MIN_FRACTION = 0.15
 SCALING_MAX_FRACTION = 0.50
@@ -1001,7 +1008,7 @@ class SessionState:
     consecutive_losses: int = 0
     consecutive_wins: int = 0
     current_fraction: float = BANKROLL_FRACTION  # Legacy, kept for safety checks
-    # Contract-count scaling: the core sizing model
+    # Legacy contract-count tracking (sizing now uses Kelly bankroll fraction)
     current_contracts: int = BASE_CONTRACTS
 
     # Session limits
@@ -1022,18 +1029,17 @@ class SessionState:
 
     def reset_for_new_market(self):
         """Reset per-market state on each market roll. Daily state persists.
-        NOTE: consecutive_wins and current_contracts PERSIST across markets —
-        that's the whole point of contract-count scaling over 96 markets/day."""
+        NOTE: Sizing now uses Kelly bankroll fraction (auto-compounds via balance).
+        consecutive_wins/losses persist for stats/logging."""
         self.market_wins = 0
         self.market_losses = 0
-        # consecutive_wins/losses intentionally NOT reset — they span markets
-        # current_contracts intentionally NOT reset — grows with streak
+        # consecutive_wins/losses intentionally NOT reset — useful for stats
         # Clear per-market pause (but NOT daily hard stop)
         if not self.is_daily_stopped:
             self.is_paused = False
             self.pause_reason = None
         log.warning(
-            f"[SESSION] Market reset: contracts={self.current_contracts} streak={self.consecutive_wins}W "
+            f"[SESSION] Market reset: bankroll=${self.current_balance_usd:.2f} streak={self.consecutive_wins}W "
             f"daily_pnl=${self.daily_pnl_usd:.2f} W/L={self.total_wins}/{self.total_losses}"
         )
 
@@ -1098,26 +1104,17 @@ class SessionState:
 
         log.warning(
             f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
+            f"bankroll=${self.current_balance_usd:.2f} "
             f"W/L={self.total_wins}/{self.total_losses} "
-            f"streak={self.consecutive_wins}W/{self.consecutive_losses}L "
-            f"next_contracts={self.current_contracts}"
+            f"streak={self.consecutive_wins}W/{self.consecutive_losses}L"
         )
 
     def _scale_up(self):
-        """Win: add 1 contract. Simple compounding over 96 markets/day."""
+        """Win: legacy counter (sizing now uses Kelly bankroll fraction)."""
         self.current_contracts = min(self.current_contracts + CONTRACT_INCREMENT, MAX_CONTRACTS)
 
     def _scale_down(self):
-        """Loss: step down by 1 contract (floor at base).
-
-        Old behavior: full reset to BASE_CONTRACTS on every loss.
-        Problem: going 26-7 overnight kept contracts at 3-4 because
-        scattered losses kept resetting the count.
-
-        New behavior: lose 1 contract per loss. A 26-7 record means
-        26 - 7 = 19 net wins → contracts = BASE + 19 = 22.
-        This lets the compounding engine actually work over 96 markets/day.
-        """
+        """Loss: legacy counter (sizing now uses Kelly bankroll fraction)."""
         self.current_contracts = max(BASE_CONTRACTS, self.current_contracts - CONTRACT_INCREMENT)
 
     def _check_daily_stop(self):
@@ -1838,20 +1835,24 @@ def should_dump_position(
     )
 
 
-def compute_fraction_for_trade(edge_net: float, p_gate: float, session_fraction: Optional[float] = None) -> float:
-    """Compute position sizing fraction based on edge, probability, and session state"""
-    # Use session-adjusted fraction if provided, otherwise use default
-    base = session_fraction if session_fraction is not None else float(BANKROLL_FRACTION)
+def kelly_fraction(p_true: float, entry_cents: int) -> float:
+    """Kelly criterion fraction for binary Kalshi contracts.
 
-    if (p_gate >= float(A_PLUS_PROB)) and (edge_net >= float(A_PLUS_EDGE)):
-        frac = max(base, float(A_PLUS_FRACTION))
-    else:
-        bump = float(EDGE_SIZE_SLOPE) * max(0.0, float(edge_net) - float(EDGE_SIZE_START))
-        frac = base + bump
+    Returns the optimal fraction of bankroll to wager.
+    f* = p_true - (1 - p_true) / b
+    where b = net_payout / wager = (100 - entry_cents) / entry_cents.
 
-    frac = min(frac, float(BANKROLL_FRACTION_HARD_CAP))
-    frac = clamp_float(frac, 0.0, 0.99)
-    return float(frac)
+    At p_true=0.99, entry=97¢: f* = 0.99 - 0.01/0.0309 = 0.666 (66.6%)
+    At p_true=0.99, entry=99¢: f* = 0.99 - 0.01/0.0101 = 0.000 (no edge)
+    At p_true=0.995, entry=97¢: f* = 0.995 - 0.005/0.0309 = 0.833 (83.3%)
+    """
+    if entry_cents <= 0 or entry_cents >= 100 or p_true <= 0 or p_true >= 1:
+        return 0.0
+    price = entry_cents / 100.0
+    b = (1.0 - price) / price  # net odds: win $0.03 on $0.97 bet = 0.0309
+    q = 1.0 - p_true
+    f = p_true - q / b
+    return max(0.0, f)
 
 
 def compute_qty_from_bankroll(
@@ -1861,53 +1862,49 @@ def compute_qty_from_bankroll(
     p_gate: float,
     session: Optional[SessionState] = None
 ) -> int:
-    """Compute order quantity using contract-count scaling.
+    """Compute order quantity using Kelly criterion bankroll sizing.
 
-    Primary model: session.current_contracts (base + 1 per win streak).
-    Safety cap: never spend more than BANKROLL_FRACTION of available balance.
+    Primary model: Kelly fraction of available bankroll.
+    As you win, bankroll grows → buy more contracts automatically.
+    As you lose, bankroll shrinks → buy fewer (self-protecting).
+    No streak counter needed — compounding is in the math.
     """
     if entry_cents is None or entry_cents <= 0:
-        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to BASE_CONTRACTS={BASE_CONTRACTS}")
-        return clamp_int(BASE_CONTRACTS, MIN_CONTRACTS, MAX_CONTRACTS)
+        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to MIN_CONTRACTS={MIN_CONTRACTS}")
+        return MIN_CONTRACTS
 
     if available_usd is None or available_usd <= 0:
-        log.warning(f"[SIZE] available_usd is None or <=0, falling back to BASE_CONTRACTS={BASE_CONTRACTS}")
-        return clamp_int(BASE_CONTRACTS, MIN_CONTRACTS, MAX_CONTRACTS)
+        log.warning(f"[SIZE] available_usd is None or <=0, falling back to MIN_CONTRACTS={MIN_CONTRACTS}")
+        return MIN_CONTRACTS
 
     if available_usd < MIN_FREE_USD_TO_TRADE:
         log.warning(f"[SIZE] available_usd ${available_usd:.2f} < MIN_FREE_USD_TO_TRADE ${MIN_FREE_USD_TO_TRADE}, returning 0")
         return 0
 
-    # Primary: contract count from session (base + streak bonus)
-    target_qty = session.get_current_contracts() if session else BASE_CONTRACTS
-
-    # HIGH-PRICE SCALING: when price is high, per-contract edge is thin.
-    # Scale up contracts so absolute dollar profit stays meaningful.
-    # At 95¢ (5¢ edge): 1×.  At 97¢ (3¢ edge): ~2×.  At 99¢ (1¢ edge): 5×.
-    settlement_edge = 100 - entry_cents
-    if settlement_edge > 0 and settlement_edge < 5:
-        scale_factor = max(1, round(5.0 / settlement_edge))
-        scaled_qty = target_qty * scale_factor
-        log.info(
-            f"[SIZE] High-price scaling: {entry_cents}¢ → {settlement_edge}¢ edge → "
-            f"{scale_factor}× → {target_qty} → {scaled_qty} contracts"
-        )
-        target_qty = scaled_qty
-
-    # Safety cap: don't spend more than we can afford
     cost_per = float(entry_cents) / 100.0
-    if cost_per > 0:
-        max_affordable = int(available_usd * BANKROLL_FRACTION / cost_per)
-        if target_qty > max_affordable:
-            log.info(f"[SIZE] Capping qty {target_qty} -> {max_affordable} (afford cap at {BANKROLL_FRACTION:.0%} of ${available_usd:.2f})")
-            target_qty = max_affordable
+
+    # PRIMARY: Kelly criterion sizing
+    # p_gate is the blended model probability — our best estimate of true win prob
+    kf = kelly_fraction(p_gate, entry_cents)
+    fraction = kf * KELLY_MULTIPLIER  # Half-Kelly by default
+
+    # Floor: if we decided to trade, commit at least KELLY_FLOOR_FRACTION
+    if fraction < KELLY_FLOOR_FRACTION:
+        log.info(
+            f"[SIZE] Kelly fraction {fraction:.3f} (raw={kf:.3f} × {KELLY_MULTIPLIER}) "
+            f"below floor, using {KELLY_FLOOR_FRACTION:.2f}"
+        )
+        fraction = KELLY_FLOOR_FRACTION
+
+    # Cap: never risk more than KELLY_CAP_FRACTION in one trade
+    if fraction > KELLY_CAP_FRACTION:
+        fraction = KELLY_CAP_FRACTION
+
+    # Convert fraction to contract count
+    target_qty = int(available_usd * fraction / cost_per)
 
     # SETTLEMENT LOSS CAP: worst case = lose entire entry cost at settlement.
     # Cap so that worst-case loss never exceeds MAX_SETTLEMENT_LOSS_FRACTION of balance.
-    # This is looser than the dump-side cap (5%) because settlement losses are rare
-    # (76% win rate) — but it prevents a single bad trade from doing $2-5 damage.
-    # At $33 balance with 10%: max worst-case = $3.30. At 97c: 3 contracts max.
-    # As bankroll grows to $330: max worst-case = $33. At 97c: 34 contracts.
     if cost_per > 0 and available_usd > 0:
         max_settlement_loss = available_usd * MAX_SETTLEMENT_LOSS_FRACTION
         max_qty_for_loss_cap = int(max_settlement_loss / cost_per)
@@ -1923,8 +1920,12 @@ def compute_qty_from_bankroll(
 
     qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
-    streak = session.consecutive_wins if session else 0
-    log.info(f"[SIZE] contracts={qty} (base={BASE_CONTRACTS}+{streak}wins) cost={entry_cents}¢ avail=${available_usd:.2f}")
+    log.info(
+        f"[SIZE] Kelly bankroll sizing: contracts={qty} kelly_f={kf:.3f} "
+        f"half_kelly={fraction:.3f} p_gate={p_gate:.3f} entry={entry_cents}¢ "
+        f"bankroll=${available_usd:.2f} risking=${qty * cost_per:.2f} "
+        f"({qty * cost_per / available_usd:.1%} of bankroll)"
+    )
 
     return qty
 
@@ -2220,8 +2221,8 @@ def main() -> None:
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
             log.warning(
                 f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
-                f"SESSION: pnl=${session.daily_pnl_usd:.2f} bal=${session.current_balance_usd:.2f} "
-                f"W/L={session.total_wins}/{session.total_losses} contracts={session.current_contracts} "
+                f"SESSION: pnl=${session.daily_pnl_usd:.2f} bankroll=${session.current_balance_usd:.2f} "
+                f"W/L={session.total_wins}/{session.total_losses} "
                 f"streak={session.consecutive_wins}W | {prob_trend.summary()}"
             )
             last_heartbeat = now
@@ -2525,24 +2526,20 @@ def main() -> None:
 
                                     if can_flip:
                                         flip_edge = flip_prob - (flip_price / 100.0)
-                                        flip_qty = session.get_current_contracts()
 
-                                        # High-price scaling for flip too
-                                        flip_settle_edge = 100 - flip_price
-                                        if flip_settle_edge > 0 and flip_settle_edge < 5:
-                                            flip_scale = max(1, round(5.0 / flip_settle_edge))
-                                            flip_qty = flip_qty * flip_scale
-
-                                        # Safety cap on flip qty
+                                        # Kelly bankroll sizing for flip
                                         try:
                                             avail_usd, _ = get_balance_usd(client)
                                             if avail_usd and avail_usd > 0:
-                                                cost_per = flip_price / 100.0
-                                                max_afford = int(avail_usd * BANKROLL_FRACTION / cost_per) if cost_per > 0 else 0
-                                                flip_qty = min(flip_qty, max_afford)
-                                            flip_qty = max(MIN_CONTRACTS, min(flip_qty, MAX_CONTRACTS))
+                                                flip_qty = compute_qty_from_bankroll(
+                                                    avail_usd, int(flip_price),
+                                                    edge_net=flip_edge, p_gate=flip_prob,
+                                                    session=session,
+                                                )
+                                            else:
+                                                flip_qty = MIN_CONTRACTS
                                         except Exception:
-                                            flip_qty = BASE_CONTRACTS
+                                            flip_qty = MIN_CONTRACTS
 
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
@@ -3007,7 +3004,7 @@ def main() -> None:
         )
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty} (contracts={session.current_contracts} streak={session.consecutive_wins}W)")
+            log.warning(f"[DRY] would place: BUY {chosen_side} @ {chosen_px}¢ qty={qty} (bankroll=${available_usd:.2f} streak={session.consecutive_wins}W)")
             st.traded_this_market = True
             st.sm = SM.HOLD
             time.sleep(POLL_SECONDS)
@@ -3029,7 +3026,7 @@ def main() -> None:
 
             log.warning(
                 f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
-                f"edge={edge_net:.4f} p_gate={p_gate:.4f} contracts={session.current_contracts} streak={session.consecutive_wins}W"
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} streak={session.consecutive_wins}W"
             )
         except Exception as e:
             log.warning(f"[ORDER] place failed: {e}")
