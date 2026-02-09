@@ -144,7 +144,7 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 #      92% probability at 3 minutes is reliable — BTC can't move far enough.
 #      The observation window builds high-quality trend data so the buy decision is informed.
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 60       # Only enter in the last 60 seconds — outcome is decided by then
+BUY_START_SECONDS = 120      # Can enter from T-120s — settlement lock is primary path, but don't get locked out of thin books
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
