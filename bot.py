@@ -124,7 +124,7 @@ META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
-YES_ONLY = env_bool("YES_ONLY", True)     # Only trade YES side — master one direction first
+YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -152,9 +152,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.85  # 85%+ to enter in last 2 min — market has priced in the outcome
+PROB_MIN = 0.83  # 83%+ to enter in last 2 min — slightly lower bar, EV cap is the real protection
 EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 93  # Force real edge — at 93¢ entry, gain 7¢/win, need ~13 wins per loss (not 32)
+MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
@@ -162,10 +162,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (BTC still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.92            # >5min: need 92%+ (BTC still has time to move)
+PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.88              # 3-5min: need 88%+
-# <3 min = PROB_MIN (0.85) — market has priced in the outcome, EV cap protects
+PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
+# <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -247,8 +247,8 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
 # NO side:  spot < hi - buffer → BTC is safely below range ceiling → HOLD
 # If BTC is on our side, the book is lying (thin book, spike, manipulation).
 # ONLY bail if BTC has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 100.0   # >2min to close: need $100 buffer to suppress bail (was $125 — too generous, BTC reverses $100+ in 5min)
-DUMP_BTC_SAFE_BUFFER_LATE = 50.0     # <2min to close: need $50 buffer (was $75 — tighter so we don't hold losers)
+DUMP_BTC_SAFE_BUFFER_EARLY = 75.0    # >2min to close: need $75 buffer (was $100 — hold more winners, σ√120=$131 still provides margin)
+DUMP_BTC_SAFE_BUFFER_LATE = 40.0     # <2min to close: need $40 buffer (was $50 — σ√60=$93, $40 is safe enough)
 DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after BTC check fails) --------------------
@@ -326,10 +326,10 @@ SCALP_MIN_DISTANCE_USD = 50.0      # BTC must be ≥$50 from strike (lowered —
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
 SCALP_DISTANCE_TIERS = [
-    (400.0, 0.70),   # $400+ from strike: extremely safe, go big
-    (200.0, 0.50),   # $200-400: very safe
-    (100.0, 0.30),   # $100-200: safe
-    (50.0,  0.15),   # $50-100: moderate — compound the edge
+    (400.0, 0.85),   # $400+ from strike: extremely safe, size up hard
+    (200.0, 0.65),   # $200-400: very safe, go bigger
+    (100.0, 0.45),   # $100-200: safe, meaningful size
+    (50.0,  0.25),   # $50-100: moderate — compound the edge
 ]
 SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
