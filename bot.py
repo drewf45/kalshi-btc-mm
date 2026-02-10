@@ -17,8 +17,8 @@
 # - CONTRACT SCALING: start at 3, +1 per win, -1 per loss (floor at base)
 # - BTC-AWARE BAIL: only dump if BTC has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
-# - BANKROLL STOPS: max loss = 5% of balance or 50% of position cost
-# - Dump abort: 12% reversal, 60s patience, catastrophic 30¢ backstop
+# - BANKROLL STOPS: max loss = 3% of balance or 50% of position cost
+# - Dump abort: 6% reversal, 30s patience, catastrophic 20¢ backstop
 
 import os
 import time
@@ -264,14 +264,14 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-trade loss (dump-side)
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
-# afford to size up.  30% of $35 = $10.50 → 10 contracts at 97c.
-# As bankroll grows to $350: $105 → 100+ contracts.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.30  # Max 30% of balance at risk per trade — this IS the compounding engine
+# afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
+# As bankroll grows to $220: $33 → 34 contracts at 97c.
+MAX_SETTLEMENT_LOSS_FRACTION = 0.15  # Max 15% of balance at risk per trade (was 30% — too much, -$3.84 loss on $22 bankroll)
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -1847,21 +1847,36 @@ def should_dump_position(
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
 
-    # LATE-ENTRY HOLD: if <60s to close, outcome is mostly decided.
+    # LATE-ENTRY HOLD: if <30s to close, outcome is mostly decided.
     # Hold to settlement — don't let dump logic sell a near-certain winner.
-    # For earlier entries (60-420s), normal dump logic applies — BTC can still move.
-    # Was 120s — too long, BTC can move $50-100 in 2 minutes. 60s is safer.
-    HOLD_TO_SETTLE_SECONDS = 60  # Only suppress dumps in the last 1 min
+    # For earlier entries, normal dump logic applies — BTC can still move.
+    # Was 60s — BTC can move $90 in 60s (σ=12, √60=7.7). 30s is $65, safer.
+    # CRITICAL FIX: Even within hold window, if BTC is near the boundary,
+    # allow dump logic to run. Blindly holding while BTC drifts toward the
+    # strike is how -$3.84 losses happen.
+    HOLD_TO_SETTLE_SECONDS = 30  # Only suppress dumps in the last 30s (was 60s)
+    HOLD_BTC_DANGER_BUFFER = 75.0  # If BTC is within $75 of boundary, DON'T suppress dumps
     if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
-        # Only bail on catastrophic loss (bankroll protection), not reversals
-        if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
-            exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
-            loss_per_contract = st.entry_price_cents - exit_price_est
-            total_loss_usd = (loss_per_contract * st.qty) / 100.0
-            max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
-            if total_loss_usd > max_loss_balance:
-                return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
-        return False, f"late_entry_hold_to_settle_t={secs_to_close}s"
+        # Check if BTC is dangerously close to boundary — if so, let dump logic run
+        btc_safe_for_hold, btc_hold_dist = _btc_is_safe(st.side, spot, lo, hi, secs_to_close)
+        if not btc_safe_for_hold or btc_hold_dist < HOLD_BTC_DANGER_BUFFER:
+            # BTC is near the boundary — DON'T suppress dumps, let normal logic decide
+            log.warning(
+                f"[HOLD OVERRIDE] BTC near boundary (dist=${btc_hold_dist:.0f} < ${HOLD_BTC_DANGER_BUFFER:.0f}) "
+                f"with {secs_to_close}s left — allowing dump checks"
+            )
+            # Fall through to normal dump logic below
+        else:
+            # BTC is safely on our side — hold to settlement
+            # Still bail on catastrophic loss (bankroll protection)
+            if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
+                exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+                loss_per_contract = st.entry_price_cents - exit_price_est
+                total_loss_usd = (loss_per_contract * st.qty) / 100.0
+                max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
+                if total_loss_usd > max_loss_balance:
+                    return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
+            return False, f"late_entry_hold_to_settle_t={secs_to_close}s_dist=${btc_hold_dist:.0f}"
 
     if st.entry_model_prob is None:
         return False, "no_entry_data"
@@ -2091,11 +2106,16 @@ def compute_qty_from_bankroll(
     # is capped/rounded — true certainty is higher. Boost p_gate for sizing
     # so we buy meaningful contract counts instead of the floor (1 contract).
     #
-    # At p=0.995, 99¢: Kelly=0.50 → half-Kelly=0.25 → ~7 contracts on $27
-    # At p=0.998, 99¢: Kelly=0.80 → half-Kelly=0.40 → ~11 contracts on $27
-    SETTLE_LOCK_MIN_PROB = 0.998  # True confidence when bot calls it a lock
+    # TIGHTENED: Was p_gate>=0.90 at entry>=95¢ → boost to 0.998. This caused
+    # massive oversizing on 90-95% outcomes. Now require p_gate>=0.95 at entry>=97¢
+    # and only boost to 0.995 — still meaningful sizing but much less catastrophic
+    # when the 5% adverse outcome happens.
+    #
+    # At p=0.995, 97¢: Kelly=0.83 → half-Kelly=0.42 → ~9 contracts on $22
+    # At p=0.995, 99¢: Kelly=0.50 → half-Kelly=0.25 → ~5 contracts on $22
+    SETTLE_LOCK_MIN_PROB = 0.995  # Was 0.998 — lower boost reduces tail-risk sizing
     sizing_p = p_gate
-    if p_gate >= 0.90 and entry_cents >= 95:
+    if p_gate >= 0.95 and entry_cents >= 97:  # Was p>=0.90, entry>=95 — too loose
         if sizing_p < SETTLE_LOCK_MIN_PROB:
             log.info(
                 f"[SIZE] Settlement lock boost: p_gate={p_gate:.3f} at {entry_cents}¢ "
