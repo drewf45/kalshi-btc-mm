@@ -124,6 +124,7 @@ META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
+YES_ONLY = env_bool("YES_ONLY", True)     # Only trade YES side — master one direction first
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -1762,6 +1763,13 @@ def choose_trade(
                 f"max={max_settle_px}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
+    # YES_ONLY: Master one direction before adding the other.
+    # Block all NO entries — overrides high-certainty and settlement lock too.
+    if YES_ONLY and ok_no and not ok_yes:
+        log.info(f"[YES_ONLY] Blocking NO entry (edge={edge_no:.4f} prob={p_no_blend:.1%}) — YES_ONLY mode")
+    if YES_ONLY:
+        ok_no = False
+
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
@@ -2331,7 +2339,8 @@ def main() -> None:
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s BUY={BUY_START_SECONDS}s "
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
-        f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT}"
+        f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
+        f"YES_ONLY={YES_ONLY}"
     )
     log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
@@ -2778,6 +2787,7 @@ def main() -> None:
                                         and secs_to_close >= FLIP_MIN_TIME_REMAINING
                                         and flip_price is not None
                                         and flip_price <= FLIP_MAX_ENTRY_PRICE
+                                        and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
                                     )
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
@@ -2862,6 +2872,8 @@ def main() -> None:
                                         reason_parts = []
                                         if not FLIP_AFTER_DUMP:
                                             reason_parts.append("disabled")
+                                        if YES_ONLY and flip_side == "no":
+                                            reason_parts.append("yes_only_mode")
                                         if st.has_flipped:
                                             reason_parts.append("already_flipped")
                                         if secs_to_close < FLIP_MIN_TIME_REMAINING:
