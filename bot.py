@@ -1,23 +1,23 @@
 # bot.py
-# Kalshi rolling 15m BTC — Certain wins, hold to close, scale bankroll
+# Kalshi rolling 15m BTC — Find mispriced contracts, hold to close, scale bankroll
 #
 # STRATEGY:
 # - Arms at T-720s (12 min) to OBSERVE market, BTC price, trends, book
-# - Buys in the LAST 60 SECONDS — outcome is decided, book shows the winner
+# - Buys mispriced contracts in 3-7 min window where model has info advantage
 # - Trusts the MARKET (orderbook) over the model near settlement
-# - Even a few cents edge per contract is fine — buy MORE contracts
+# - Requires 3%+ real edge — only enters when model sees genuine mispricing
 # - HOLDS TO SETTLEMENT — collect the full payout for being right
 # - Dump is ABORT ONLY — safety net, not a regular exit
-# - Scales bankroll: wins compound, size grows, 96 markets/day
+# - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
-# - EDGE_MIN=0.02 (small edge OK — volume over 96 markets compounds)
-# - MAX_ENTRY_PRICE=95¢ (allow buying if certainty supports the price)
-# - CONTRACT SCALING: start at 3, +1 per win, -1 per loss (floor at base)
+# - EDGE_MIN=0.03 (3% real edge — no penny-picking)
+# - MAX_ENTRY_PRICE=93¢ (force real edge — 7¢/win, ~13 wins per loss)
+# - KELLY=0.25 (quarter-Kelly — smoother equity curve)
 # - BTC-AWARE BAIL: only dump if BTC has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
-# - BANKROLL STOPS: max loss = 3% of balance or 50% of position cost
+# - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
 # - Dump abort: 6% reversal, 30s patience, catastrophic 20¢ backstop
 
 import os
@@ -153,8 +153,8 @@ ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
 PROB_MIN = 0.85  # 85%+ to enter in last 2 min — market has priced in the outcome
-EDGE_MIN = 0.01  # 1% minimum edge — even 1¢/contract × many contracts compounds
-MAX_ENTRY_PRICE_CENTS = 99  # Edge comes from settlement — even 1¢/contract is profit at scale
+EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
+MAX_ENTRY_PRICE_CENTS = 93  # Force real edge — at 93¢ entry, gain 7¢/win, need ~13 wins per loss (not 32)
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
@@ -200,8 +200,8 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 #
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
-# Full Kelly is optimal but volatile; half-Kelly cuts variance ~75%.
-KELLY_MULTIPLIER = 0.50     # Half-Kelly — balances growth vs drawdown protection
+# Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
+KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — smaller bets, smoother equity curve, survives loss streaks
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
@@ -272,7 +272,7 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.15  # Max 15% of balance at risk per trade (was 30% — too much, -$3.84 loss on $22 bankroll)
+MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -2108,32 +2108,17 @@ def compute_qty_from_bankroll(
 
     cost_per = float(entry_cents) / 100.0
 
-    # SETTLEMENT LOCK BOOST: When p_gate is very high and entry price is near
-    # the probability (e.g., p=0.99 at 99¢), Kelly sees zero edge. But the bot
-    # has already decided this is a near-certain win. The blended probability
-    # is capped/rounded — true certainty is higher. Boost p_gate for sizing
-    # so we buy meaningful contract counts instead of the floor (1 contract).
-    #
-    # TIGHTENED: Was p_gate>=0.90 at entry>=95¢ → boost to 0.998. This caused
-    # massive oversizing on 90-95% outcomes. Now require p_gate>=0.95 at entry>=97¢
-    # and only boost to 0.995 — still meaningful sizing but much less catastrophic
-    # when the 5% adverse outcome happens.
-    #
-    # At p=0.995, 97¢: Kelly=0.83 → half-Kelly=0.42 → ~9 contracts on $22
-    # At p=0.995, 99¢: Kelly=0.50 → half-Kelly=0.25 → ~5 contracts on $22
-    SETTLE_LOCK_MIN_PROB = 0.995  # Was 0.998 — lower boost reduces tail-risk sizing
+    # SETTLEMENT LOCK BOOST: REMOVED.
+    # Previously boosted p_gate to 0.995 for Kelly sizing when p>=0.95 at entry>=97¢.
+    # This caused massive oversizing — Kelly thought we were 99.5% certain when we
+    # were really 95%, leading to 40%+ bankroll bets that wiped out dozens of small wins.
+    # Now Kelly uses the actual probability. If edge is real, Kelly sizes appropriately.
+    # If edge is tiny, Kelly sizes small — which is correct behavior.
     sizing_p = p_gate
-    if p_gate >= 0.95 and entry_cents >= 97:  # Was p>=0.90, entry>=95 — too loose
-        if sizing_p < SETTLE_LOCK_MIN_PROB:
-            log.info(
-                f"[SIZE] Settlement lock boost: p_gate={p_gate:.3f} at {entry_cents}¢ "
-                f"→ using {SETTLE_LOCK_MIN_PROB} for Kelly sizing"
-            )
-            sizing_p = SETTLE_LOCK_MIN_PROB
 
     # PRIMARY: Kelly criterion sizing
     kf = kelly_fraction(sizing_p, entry_cents)
-    fraction = kf * KELLY_MULTIPLIER  # Half-Kelly by default
+    fraction = kf * KELLY_MULTIPLIER  # Quarter-Kelly by default
 
     # Floor: if we decided to trade, commit at least KELLY_FLOOR_FRACTION
     if fraction < KELLY_FLOOR_FRACTION:
@@ -2169,7 +2154,7 @@ def compute_qty_from_bankroll(
 
     log.info(
         f"[SIZE] Kelly bankroll sizing: contracts={qty} kelly_f={kf:.3f} "
-        f"half_kelly={fraction:.3f} p_gate={p_gate:.3f} entry={entry_cents}¢ "
+        f"quarter_kelly={fraction:.3f} p_gate={p_gate:.3f} entry={entry_cents}¢ "
         f"bankroll=${available_usd:.2f} risking=${qty * cost_per:.2f} "
         f"({qty * cost_per / available_usd:.1%} of bankroll)"
     )
