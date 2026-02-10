@@ -11,7 +11,7 @@
 # - Scales bankroll: wins compound, size grows, 96 markets/day
 #
 # KEY SETTINGS:
-# - TIME-DEPENDENT PROB: 92% if >5min, 85% if 3-5min, 80% if <3min
+# - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
 # - EDGE_MIN=0.02 (small edge OK — volume over 96 markets compounds)
 # - MAX_ENTRY_PRICE=95¢ (allow buying if certainty supports the price)
 # - CONTRACT SCALING: start at 3, +1 per win, -1 per loss (floor at base)
@@ -176,9 +176,18 @@ PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based 
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
-# Rationale: 85% prob means BTC is well inside the range. At 5 min to close,
-# this is decisive enough. Don't wait for trend alignment when the outcome is clear.
-PROB_FAST_LANE_THRESHOLD = 0.85   # ≥85% prob = buy immediately, no trend check needed
+# Rationale: 90%+ prob means BTC is well inside the range. The outcome is decisive.
+# Don't wait for trend alignment when the outcome is clear.
+# TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
+# Near close (<3 min), 85% is enough because the market has priced in the outcome.
+PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
+PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
+
+# CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
+# Prevents snap entries on transient orderbook spikes at T-420s.
+# At T-300s to T-180s, prob must have been on the same side for this many seconds.
+CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment
+CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
 
@@ -364,7 +373,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 420)    # Covers entire buy window — settlement payout IS the edge
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
@@ -1440,6 +1449,23 @@ class ProbTrend:
 
         # Trend is AGAINST us → BLOCK
         return False, f"trend_against({direction}/{change:+.2f})"
+
+    def side_confirmed_for(self, side: str, min_prob: float = 0.85) -> float:
+        """
+        How many seconds has the probability been consistently on this side
+        above min_prob? Returns 0 if no confirmation.
+        Used to prevent snap entries on transient orderbook spikes.
+        """
+        if len(self.samples) < 3:
+            return 0.0
+        now = self.samples[-1][0]
+        confirmed_since = now
+        for t, p in reversed(self.samples):
+            p_for_side = p if side == "yes" else (1.0 - p)
+            if p_for_side < min_prob:
+                break
+            confirmed_since = t
+        return now - confirmed_since
 
     def summary(self) -> str:
         """Short string for logging"""
@@ -3092,19 +3118,42 @@ def main() -> None:
 
         # ================================================================
         # ENTRY FILTER PIPELINE
-        # Two paths:
-        #   FAST LANE (≥85% prob OR settlement lock window): buy immediately
+        # Three paths:
+        #   FAST LANE (≥90% prob, or ≥85% in last 3 min): buy immediately
+        #   CONFIRMED (85-90% prob, >3 min left): need stable signal for 15s
         #   STANDARD  (<85% prob): borderline → need trend + momentum
-        # The entire buy window is in settlement lock territory, so the
-        # main path for most trades is FAST LANE + taker order = instant fill.
+        #
+        # KEY FIX: Settlement lock (180s) is now separate from buy window (420s).
+        # Early window entries (420s-180s) must pass trend/confirmation checks.
+        # This prevents snap entries on transient 85% spikes at T-420s that
+        # flip to the wrong side when BTC moves.
         # ================================================================
         current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
         in_settlement_lock = secs_to_close is not None and secs_to_close <= SETTLEMENT_LOCK_SECONDS
-        fast_lane = current_prob_for_side >= PROB_FAST_LANE_THRESHOLD or in_settlement_lock
+
+        # Time-dependent fast lane threshold
+        if secs_to_close <= SETTLEMENT_LOCK_SECONDS:
+            fast_lane_thresh = PROB_FAST_LANE_LATE_THRESHOLD  # 85% in last 3 min
+        else:
+            fast_lane_thresh = PROB_FAST_LANE_THRESHOLD  # 90% earlier
+
+        fast_lane = current_prob_for_side >= fast_lane_thresh
+
+        # CONFIRMATION HOLD: early in buy window, require signal stability
+        # Even if fast lane fires, check that the signal has been consistent
+        if fast_lane and secs_to_close > CONFIRMATION_HOLD_MIN_TIME:
+            confirmed_secs = prob_trend.side_confirmed_for(chosen_side, fast_lane_thresh)
+            if confirmed_secs < CONFIRMATION_HOLD_SECONDS:
+                fast_lane = False
+                log.info(
+                    f"[CONFIRM] {chosen_side.upper()} prob={current_prob_for_side:.1%} "
+                    f"but only confirmed for {confirmed_secs:.0f}s < {CONFIRMATION_HOLD_SECONDS}s "
+                    f"— waiting for stable signal before early entry"
+                )
 
         if fast_lane:
-            reason = (f"prob={current_prob_for_side:.1%} ≥ {PROB_FAST_LANE_THRESHOLD:.0%}"
-                      if current_prob_for_side >= PROB_FAST_LANE_THRESHOLD
+            reason = (f"prob={current_prob_for_side:.1%} ≥ {fast_lane_thresh:.0%}"
+                      if current_prob_for_side >= fast_lane_thresh
                       else f"settlement_lock t={secs_to_close}s prob={current_prob_for_side:.1%}")
             log.warning(
                 f"[FAST LANE] {chosen_side.upper()} {reason} "
@@ -3233,9 +3282,11 @@ def main() -> None:
         # AGGRESSIVE FILL: use taker orders when probability is high enough.
         # Getting filled is worth more than saving maker/taker spread.
         # Not participating costs 100% of the edge; crossing the spread costs 1-2¢.
-        if p_gate >= 0.85:
+        # TIME-DEPENDENT: require higher prob for taker early (avoid crossing spread on uncertain signals)
+        taker_prob_thresh = 0.90 if secs_to_close > SETTLEMENT_LOCK_SECONDS else 0.85
+        if p_gate >= taker_prob_thresh:
             use_post_only = False
-            log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ 85%, fills > maker savings")
+            log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ {taker_prob_thresh:.0%}, fills > maker savings")
         elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
             use_post_only = False
             log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
