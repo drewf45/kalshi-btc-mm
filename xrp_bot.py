@@ -8,7 +8,7 @@
 # - Requires 3%+ real edge — only enters when model sees genuine mispricing
 # - HOLDS TO SETTLEMENT — collect the full payout for being right
 # - Dump is ABORT ONLY — safety net, not a regular exit
-# - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
+# - Scales bankroll: wins compound via quarter-Kelly, 2-3 markets/day
 #
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
@@ -114,12 +114,12 @@ API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2").rstrip("/")
 API_KEY_ID = getenv_first(["KALSHI_API_KEY_ID"], "")
 PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
 
-SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXXRP15M")
+SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXXRPD")
 EVENT_TICKER = getenv_first(["EVENT_TICKER", "KALSHI_EVENT_TICKER"], "<auto>")
 MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<none>")
 
-POLL_SECONDS = env_float("POLL_SECONDS", 1.0)  # Check every second for dumps
-META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
+POLL_SECONDS = env_float("POLL_SECONDS", 5.0)  # Check every 5s (daily contracts don't need 1s polling)
+META_REFRESH_SECONDS = env_float("META_REFRESH", 60.0)  # Refresh market metadata every 60s (fewer markets per day)
 
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
@@ -138,16 +138,16 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # Even a few cents edge is fine — buy MORE contracts.
 # Hold to settlement. Dump is abort-only. Trade every market possible.
 #
-# KEY INSIGHT: Waiting until T-120s to buy means the book is LOCKED (no asks).
-# Placing a 99¢ bid with no sellers = zero fills = zero profit. Enter at
-# T-300s when probability is high AND the book still has liquidity.
+# KXXRPD contracts settle ~2-3x per day (e.g., 11am & 5pm EST).
+# Contracts span several hours, so observation and buy windows are much wider
+# than the 15-minute BTC bot.
 #
 # TWO PHASES:
-#   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
-#   BUY     (7min → 5s before close):   make the call, place the order, hold
-OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
-ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
+#   OBSERVE (2hr → 1hr before close): gather trend data, watch book, DON'T buy
+#   BUY     (1hr → 5s before close):  make the call, place the order, hold
+OBSERVE_START_SECONDS = 7200   # Start watching at 2 hours out — gather trend + prob data
+BUY_START_SECONDS = 3600       # Can enter from T-3600s (1 hour) — book has liquidity
+ENTRY_LAST_SECONDS = 5         # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
@@ -157,21 +157,21 @@ EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penn
 MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
-# Buy window is 7min → 5s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 1-hour buy window) --------
+# Buy window is 1hr → 5s before close. Require more certainty at the start
 # of the buy window (XRP still has time to move), relax near the end.
-# NOTE: observation phase (12min → 7min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
-PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
-# <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+# NOTE: observation phase (2hr → 1hr) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 1800  # 30-60 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.90            # >30min: need 90%+ — XRP can still move significantly
+PROB_MID_ENTRY_SECONDS = 900     # 15-30 min to close = "mid"
+PROB_MID_MIN = 0.86              # 15-30min: need 86%+
+# <15 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
 # When prob is high (90%+), the outcome speaks for itself — skip trend checks.
-PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
-PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
+PROB_TREND_WINDOW_SECONDS = 600   # Look at last 10 minutes of probability (longer contracts = wider window)
+PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~40s at 5s/poll)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
@@ -185,10 +185,10 @@ PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend chec
 PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
-# Prevents snap entries on transient orderbook spikes at T-420s.
-# At T-300s to T-180s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment
-CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
+# Prevents snap entries on transient orderbook spikes at T-3600s.
+# At T-1800s to T-900s, prob must have been on the same side for this many seconds.
+CONFIRMATION_HOLD_SECONDS = 60   # Signal must persist for 60s before early commitment (longer contracts)
+CONFIRMATION_HOLD_MIN_TIME = 900  # Only require confirmation hold above 15 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 0.0005
 
@@ -219,7 +219,7 @@ ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
 SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one market
 SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
-BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
+BALANCE_CHECK_DELAY_SECONDS = 600  # Wait 10 min after settlement to fetch true balance (daily contracts settle slower)
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
@@ -238,7 +238,7 @@ ENABLE_DUMP = True
 DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND XRP confirms, bail (was 50% — too late, already lost 40¢+)
 DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
 DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
-DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
+DUMP_MIN_TIME_REMAINING = 15  # Can bail until 15s before settlement
 DUMP_ON_PRICE_DANGER = False  # Disabled - trust XRP price, not book noise
 
 # -------------- XRP-AWARE BAIL (the key fix: don't dump winners) ---------------
@@ -275,8 +275,8 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
-DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
+DUMP_GRACE_PERIOD_SECONDS = 30      # 30s grace period (longer contracts = more settling time)
+DUMP_PROACTIVE_AFTER_SECONDS = 120  # Proactive bail after 2 min (daily contracts need more settling time)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
 DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after XRP check (was 15¢ — tighter to salvage more)
@@ -288,13 +288,13 @@ DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matte
 # All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
 # false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
 # Use a rolling window max instead: peak = max(prob over last N seconds).
-DUMP_PEAK_WINDOW_SECONDS = 30  # Use max prob over last 30s as "peak" (not all-time)
+DUMP_PEAK_WINDOW_SECONDS = 120  # Use max prob over last 2 min as "peak" (longer contracts = wider window)
 
 # -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
 # If probability drops very fast (>4% in 10s), something is seriously wrong.
 # Bail even during settling period — fast drops mean XRP is actively moving against us.
 DUMP_RAPID_DROP_THRESHOLD = 0.04   # 4% drop in the rapid window = emergency
-DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
+DUMP_RAPID_DROP_WINDOW_SECONDS = 30  # Look at last 30 seconds for rapid drops (daily contracts)
 
 # -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
 # If we bail because XRP moved against us, the OTHER side is now the high-prob winner.
@@ -305,23 +305,22 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 #         than a fresh entry — this is a recovery play, not a new trade.
 #         We already took the loss; the question is "can I claw some back?"
 FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
+FLIP_MIN_TIME_REMAINING = 60        # Need time to place the order and settle (daily contracts)
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
 FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
-# With <60s left and XRP far from the strike, the outcome is locked.
+# With <5 min left and XRP far from the strike, the outcome is locked.
 # Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
-# Key safety: distance from strike.  If XRP is $300 above the floor with 60s left,
-# it CANNOT reverse.  sigma * sqrt(60) ≈ $93 at 12σ — $300 is >3x the max move.
+# Key safety: distance from strike. Daily contracts = more time, wider scalp window.
 #
 # Risk/reward at 99¢ × 33 contracts:
 #   Win (99.5%+ of the time): +$0.33
-#   Lose (XRP reverses $300+ in 60s): -$32.67
-# Over 96 markets/day: ~$31/day extra income if hit rate matches.
+#   Lose (XRP reverses significantly in 5 min): -$32.67
+# Over 2-3 markets/day: compound gains across daily settlements.
 SCALP_ENABLED = True
-SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
-SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
+SCALP_MAX_SECONDS = 300            # Scalp in the last 5 minutes (daily contracts = wider window)
+SCALP_MIN_SECONDS = 10             # Don't scalp in the last 10s (order might not fill)
 SCALP_MIN_DISTANCE_USD = 0.015     # XRP must be ≥$0.015 from strike (scaled for XRP ~$2.50)
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
@@ -368,28 +367,28 @@ A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = even small edge at 90%+ pro
 A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Go big — 90%+ prob is as sure as it gets
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
-HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 120)  # Last 2 min — longer contracts need wider window
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 900)    # Last 15 min — daily contracts need wider settlement lock
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
-LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 120)  # Last 2 min for daily contracts
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.015)  # $0.015 buffer — XRP-aware bail is the real safety net during hold
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
-LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
+LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 120)  # Last 2 min for daily contracts
 
 # -------------- TREND TRACKING (know what XRP is doing) --------------
-TREND_WINDOW_MINUTES = 60          # Long-term trend: 60 min (~4 markets)
-TREND_SHORT_WINDOW_MINUTES = 30    # Short-term trend: 30 min (~2 markets)
-TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
+TREND_WINDOW_MINUTES = 240         # Long-term trend: 4 hours (~1 full contract window)
+TREND_SHORT_WINDOW_MINUTES = 120   # Short-term trend: 2 hours (~half a contract)
+TREND_SAMPLE_INTERVAL_SECONDS = 60  # Record spot every 60s (daily contracts don't need 30s)
 TREND_STRONG_THRESHOLD = 0.03      # $0.03+ move in window = strong trend (scaled for XRP ~$2.50)
 TREND_MODERATE_THRESHOLD = 0.015   # $0.015+ move = moderate trend (scaled for XRP ~$2.50)
 TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against trend
@@ -497,7 +496,7 @@ def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
         return None
 
 
-def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optional[int]:
+def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 0) -> Optional[int]:
     if not ticker or ticker is None:
         log.warning(f"[TICKER] infer_close_ts received None/empty ticker")
         return None
@@ -553,7 +552,7 @@ def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
             if ts is not None:
                 return ts
 
-    return infer_close_ts_from_ticker(ticker, interval_minutes=15)
+    return infer_close_ts_from_ticker(ticker, interval_minutes=0)  # KXXRPD: ticker time IS settlement time
 
 
 # -----------------------------
@@ -601,7 +600,7 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         # Last resort: infer close_ts from ticker
         ticker = m.get("ticker") or m.get("market_ticker") or ""
         if ct is None and ticker:
-            ct = infer_close_ts_from_ticker(ticker, interval_minutes=15)
+            ct = infer_close_ts_from_ticker(ticker, interval_minutes=0)  # KXXRPD: ticker time IS settlement
         candidates.append((ot, ct, m))
     if skipped_statuses:
         log.info(f"[PICK] skipped statuses: {skipped_statuses}")
@@ -1862,7 +1861,7 @@ def should_dump_position(
     # CRITICAL FIX: Even within hold window, if XRP is near the boundary,
     # allow dump logic to run. Blindly holding while XRP drifts toward the
     # strike is how -$3.84 losses happen.
-    HOLD_TO_SETTLE_SECONDS = 30  # Only suppress dumps in the last 30s (was 60s)
+    HOLD_TO_SETTLE_SECONDS = 120  # Suppress dumps in the last 2 min (daily contracts)
     HOLD_XRP_DANGER_BUFFER = 0.02  # If XRP is within $0.02 of boundary, DON'T suppress dumps
     if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
         # Check if XRP is dangerously close to boundary — if so, let dump logic run
