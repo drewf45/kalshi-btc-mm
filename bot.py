@@ -1,17 +1,17 @@
 # bot.py
-# Kalshi rolling 15m DOGE — Find mispriced contracts, hold to close, scale bankroll
+# Kalshi hourly DOGE above/below — Find mispriced contracts, hold to close, scale bankroll
 #
 # STRATEGY:
-# - Arms at T-720s (12 min) to OBSERVE market, DOGE price, trends, book
-# - Buys mispriced contracts in 3-7 min window where model has info advantage
+# - Arms at T-2880s (48 min) to OBSERVE market, DOGE price, trends, book
+# - Buys mispriced contracts in 12-28 min window where model has info advantage
 # - Trusts the MARKET (orderbook) over the model near settlement
 # - Requires 3%+ real edge — only enters when model sees genuine mispricing
 # - HOLDS TO SETTLEMENT — collect the full payout for being right
 # - Dump is ABORT ONLY — safety net, not a regular exit
-# - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
+# - Scales bankroll: wins compound via quarter-Kelly, 24 markets/day
 #
 # KEY SETTINGS:
-# - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
+# - TIME-DEPENDENT PROB: 90% if >20min, 86% if 12-20min, 83% if <12min
 # - EDGE_MIN=0.03 (3% real edge — no penny-picking)
 # - MAX_ENTRY_PRICE=93¢ (force real edge — 7¢/win, ~13 wins per loss)
 # - KELLY=0.25 (quarter-Kelly — smoother equity curve)
@@ -19,6 +19,7 @@
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
 # - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
 # - Dump abort: 6% reversal, 30s patience, catastrophic 20¢ backstop
+# - HOURLY MARKETS: 24 markets/day, above/below single-strike format
 
 import os
 import time
@@ -114,7 +115,7 @@ API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2").rstrip("/")
 API_KEY_ID = getenv_first(["KALSHI_API_KEY_ID"], "")
 PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
 
-SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXDOGE15M")
+SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXDOGED")
 EVENT_TICKER = getenv_first(["EVENT_TICKER", "KALSHI_EVENT_TICKER"], "<auto>")
 MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<none>")
 
@@ -140,13 +141,13 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 #
 # KEY INSIGHT: Waiting until T-120s to buy means the book is LOCKED (no asks).
 # Placing a 99¢ bid with no sellers = zero fills = zero profit. Enter at
-# T-300s when probability is high AND the book still has liquidity.
+# T-1680s when probability is high AND the book still has liquidity.
 #
 # TWO PHASES:
-#   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
-#   BUY     (7min → 5s before close):   make the call, place the order, hold
-OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
+#   OBSERVE (48min → 28min before close): gather trend data, watch book, DON'T buy
+#   BUY     (28min → 5s before close):   make the call, place the order, hold
+OBSERVE_START_SECONDS = 2880  # Start watching at 48min — gather trend + prob data
+BUY_START_SECONDS = 1680      # Can enter from T-1680s (28 min) — book has liquidity, grab it before it locks up
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
@@ -157,15 +158,15 @@ EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penn
 MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
-# Buy window is 7min → 5s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 28-min buy window) --------
+# Buy window is 28min → 5s before close. Require more certainty at the start
 # of the buy window (DOGE still has time to move), relax near the end.
-# NOTE: observation phase (12min → 7min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
-PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
-# <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+# NOTE: observation phase (48min → 28min) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 1200  # 20-28 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.90            # >20min: need 90%+ (lowered from 92% — trade more markets)
+PROB_MID_ENTRY_SECONDS = 720     # 12-20 min to close = "mid"
+PROB_MID_MIN = 0.86              # 12-20min: need 86%+ (lowered from 88%)
+# <12 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -185,10 +186,10 @@ PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend chec
 PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
-# Prevents snap entries on transient orderbook spikes at T-420s.
-# At T-300s to T-180s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment
-CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
+# Prevents snap entries on transient orderbook spikes at T-1680s.
+# At T-1200s to T-720s, prob must have been on the same side for this many seconds.
+CONFIRMATION_HOLD_SECONDS = 30   # Signal must persist for 30s before early commitment
+CONFIRMATION_HOLD_MIN_TIME = 720  # Only require confirmation hold above 12 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 0.0005
 
@@ -310,17 +311,17 @@ FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for
 FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
-# With <60s left and DOGE far from the strike, the outcome is locked.
+# With <3min left and DOGE far from the strike, the outcome is locked.
 # Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
-# Key safety: distance from strike.  If DOGE is $0.01 above the floor with 60s left,
-# it CANNOT reverse.  sigma * sqrt(60) ≈ $0.004 at σ=0.0005 — $0.01 is >2x the max move.
+# Key safety: distance from strike.  If DOGE is $0.01 above the floor with 3min left,
+# it CANNOT reverse.  sigma * sqrt(180) ≈ $0.007 at σ=0.0005 — $0.01 is >1.4x the max move.
 #
 # Risk/reward at 99¢ × 33 contracts:
 #   Win (99.5%+ of the time): +$0.33
-#   Lose (DOGE reverses $0.01+ in 60s): -$32.67
-# Over 96 markets/day: ~$31/day extra income if hit rate matches.
+#   Lose (DOGE reverses $0.01+ in 3min): -$32.67
+# Over 24 markets/day: ~$8/day extra income if hit rate matches.
 SCALP_ENABLED = True
-SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
+SCALP_MAX_SECONDS = 180            # Only scalp in the last 3 minutes
 SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
 SCALP_MIN_DISTANCE_USD = 0.002     # DOGE must be ≥$0.002 from strike (scaled for DOGE price)
 # Distance tiers: farther from strike = more aggressive sizing
@@ -374,7 +375,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 600)    # Last 10 min only — earlier window still needs trend/prob checks
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
@@ -553,7 +554,7 @@ def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
             if ts is not None:
                 return ts
 
-    return infer_close_ts_from_ticker(ticker, interval_minutes=15)
+    return infer_close_ts_from_ticker(ticker, interval_minutes=60)
 
 
 # -----------------------------
@@ -601,7 +602,7 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         # Last resort: infer close_ts from ticker
         ticker = m.get("ticker") or m.get("market_ticker") or ""
         if ct is None and ticker:
-            ct = infer_close_ts_from_ticker(ticker, interval_minutes=15)
+            ct = infer_close_ts_from_ticker(ticker, interval_minutes=60)
         candidates.append((ot, ct, m))
     if skipped_statuses:
         log.info(f"[PICK] skipped statuses: {skipped_statuses}")
@@ -1578,12 +1579,12 @@ def choose_trade(
 
     if p_mkt is not None:
         # Gradual transition from model-weighted to market-weighted across buy window:
-        #   >420s: MODEL_BLEND_ALPHA (for observation — model still useful for trend)
-        #   60-420s: linear ramp from MODEL_BLEND_ALPHA down to 0% (market taking over)
+        #   >1680s: MODEL_BLEND_ALPHA (for observation — model still useful for trend)
+        #   60-1680s: linear ramp from MODEL_BLEND_ALPHA down to 0% (market taking over)
         #   <60s: 100% market (book IS the probability)
         #
-        # KEY FIX: The old 75% model weight at >120s was catastrophic. At T-400s with
-        # a 15-min market, the BS model says 50/50 (σ√t > boundary gap), but the market
+        # KEY FIX: The old 75% model weight at >120s was catastrophic. At T-1600s with
+        # an hourly market, the BS model says 50/50 (σ√t > boundary gap), but the market
         # is 95% on one side. 75% model weight drags blend to 62% — below all thresholds.
         # Now we ramp from 420s→60s so the market signal dominates in the buy window.
         if secs_to_close <= 60:
