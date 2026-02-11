@@ -13,7 +13,7 @@
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
 # - EDGE_MIN=0.03 (3% real edge — no penny-picking)
-# - MAX_ENTRY_PRICE=96¢ (force real edge — 4¢/win)
+# - MAX_ENTRY_PRICE=90¢ (force real edge — 10¢/win, ~9 wins per loss)
 # - KELLY=0.25 (quarter-Kelly — smoother equity curve)
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
@@ -161,7 +161,7 @@ CANCEL_UNFILLED_AT_CLOSE = True
 
 PROB_MIN = 0.83  # 83%+ to enter in last 2 min — slightly lower bar, EV cap is the real protection
 EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
+MAX_ENTRY_PRICE_CENTS = 90  # Lowered from 96¢ — at 90¢ entry, gain 10¢/win, need ~9 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
@@ -189,7 +189,7 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match ETH spot trend (border
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
 PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
-PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.90  # ≥90% prob in last 3 min = fast lane (was 85% — too loose, caused -EV entries)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
@@ -311,7 +311,7 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 # Safety: the flip still checks probability and price, but with a LOWER bar
 #         than a fresh entry — this is a recovery play, not a new trade.
 #         We already took the loss; the question is "can I claw some back?"
-FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
+FLIP_AFTER_DUMP = False             # DISABLED — flip is -EV with low prob thresholds (60% @ 99¢ = -39¢/ct)
 FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
 FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
@@ -333,14 +333,14 @@ SCALP_MIN_DISTANCE_USD = 1.50      # ETH must be ≥$1.50 from strike (ETH: ~35x
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
 SCALP_DISTANCE_TIERS = [
-    (12.0, 0.85),    # $12+ from strike: extremely safe, size up hard (ETH equiv of BTC $400)
-    (6.0,  0.65),    # $6-12: very safe, go bigger (ETH equiv of BTC $200)
-    (3.0,  0.45),    # $3-6: safe, meaningful size (ETH equiv of BTC $100)
-    (1.5,  0.25),    # $1.50-3: moderate — compound the edge (ETH equiv of BTC $50)
+    (12.0, 0.30),    # $12+ from strike: safe but still capped (ETH equiv of BTC $400)
+    (6.0,  0.20),    # $6-12: moderate (ETH equiv of BTC $200)
+    (3.0,  0.10),    # $3-6: small — one bad scalp undoes 30 good ones (ETH equiv of BTC $100)
+    (1.5,  0.05),    # $1.50-3: minimal — not worth the tail risk (ETH equiv of BTC $50)
 ]
-SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
-SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
+SCALP_MAX_ENTRY_PRICE = 97        # Max 97¢ — need at least 3¢/contract profit to justify risk
+SCALP_MIN_PROB = 0.96             # Must be near-certain for 97¢ entries — 80% @ 99¢ = -19¢/ct EV
+SCALP_MAX_LOSS_FRACTION = 0.08    # Never risk more than 8% of cash on a scalp (was 15% — too aggressive)
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -382,8 +382,8 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
-SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.93)  # Must be genuinely certain — 85% @ 99¢ = -12¢/ct EV
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 93)   # Capped — was 99¢ which allowed -EV entries
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
@@ -1739,8 +1739,10 @@ def choose_trade(
         yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
         no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
 
-        # Use max entry price, not model-blended cap.  The model is too conservative
-        # near settlement and blocks fair-value entries at 97-99c.
+        # EV-POSITIVE PRICING: settlement lock relaxes prob gate but NEVER lets
+        # you overpay.  Max price = min(config cap, probability * 100).
+        # At 95% prob: max 95¢.  At 93% prob: max 93¢.  Never pay more than fair value.
+        # The old code used 99¢ with 85% prob = -12¢/contract EV = guaranteed loss.
         max_settle_px = SETTLEMENT_LOCK_MAX_PRICE
 
         # LOCKED BOOK HANDLING: When ask is None (nobody selling), but bid is
@@ -1757,17 +1759,21 @@ def choose_trade(
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT)
             log.info(f"[LOCKED BOOK] NO: no ask, using bid={no_bid}¢ as limit price")
 
-        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_settle_px and yes_boundary_ok:
+        # EV-POSITIVE GATE: never pay more than the probability (ensures +EV at worst)
+        max_yes_settle = min(max_settle_px, int(p_yes_blend * 100))
+        max_no_settle = min(max_settle_px, int(p_no_blend * 100))
+
+        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_yes_settle and yes_boundary_ok:
             ok_yes = True
             log.warning(
                 f"[SETTLE LOCK] YES override: blend={p_yes_blend:.1%} price={yes_px}¢ "
-                f"max={max_settle_px}¢ edge={edge_yes:.4f} t={secs_to_close}s"
+                f"max={max_yes_settle}¢ edge={edge_yes:.4f} t={secs_to_close}s"
             )
-        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_settle_px and no_boundary_ok:
+        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_no_settle and no_boundary_ok:
             ok_no = True
             log.warning(
                 f"[SETTLE LOCK] NO override: blend={p_no_blend:.1%} price={no_px}¢ "
-                f"max={max_settle_px}¢ edge={edge_no:.4f} t={secs_to_close}s"
+                f"max={max_no_settle}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
     # YES_ONLY: Master one direction before adding the other.
