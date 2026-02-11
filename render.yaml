@@ -1,8 +1,8 @@
 services:
   - type: web
-    name: kalshi-btc-mm
+    name: kalshi-xrp-mm
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python bot_xrp.py
     healthCheckPath: /
