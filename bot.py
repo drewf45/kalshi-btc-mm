@@ -2441,7 +2441,20 @@ def main() -> None:
         st.target_price = None
         st.qty = 0
 
-    ev, mt, mobj = refresh_active_market()
+    # Wait for an open market (hourly markets may have gaps between close and open)
+    _mkt_wait_start = time.time()
+    while True:
+        try:
+            ev, mt, mobj = refresh_active_market()
+            break
+        except RuntimeError as e:
+            _mkt_waited = time.time() - _mkt_wait_start
+            if _mkt_waited > 3600:
+                log.error(f"FATAL: No markets found after {_mkt_waited:.0f}s — giving up")
+                raise
+            log.warning(f"[BOOT] {e} — will retry in 30s (waited {_mkt_waited:.0f}s)")
+            time.sleep(30)
+
     active_market_obj = mobj or {}
     st.market = mt
     st.event = ev
