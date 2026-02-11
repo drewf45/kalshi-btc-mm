@@ -6,3 +6,10 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     healthCheckPath: /
+  - type: web
+    name: kalshi-sol-hourly
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_sol_hourly.py
+    healthCheckPath: /
