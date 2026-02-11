@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: kalshi-btc-mm
+    name: kalshi-eth-1h-mm
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
