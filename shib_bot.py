@@ -335,7 +335,16 @@ SCALP_DISTANCE_TIERS = [
 ]
 SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
+SCALP_MAX_LOSS_FRACTION = 0.05    # Never risk more than 5% of cash on a scalp (was 15% — too much when stacked with main entry)
+
+# -------------- COMBINED POSITION RISK CAP (main entry + scalp) --------------
+# The main entry risks up to MAX_SETTLEMENT_LOSS_FRACTION (8%) and the scalp
+# risks up to SCALP_MAX_LOSS_FRACTION (5%) independently.  Without a combined
+# cap, a single market can lose 13% of bankroll when both positions go wrong.
+# This cap ensures the TOTAL risk across all positions in one market never
+# exceeds a single threshold.  The scalp logic checks existing position cost
+# and only uses whatever room remains under this cap.
+COMBINED_POSITION_RISK_CAP = 0.10  # Max 10% of bankroll at risk per market (main + scalp combined)
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -2167,11 +2176,18 @@ def compute_scalp_qty(
     available_usd: float,
     entry_cents: int,
     distance_usd: float,
+    existing_position_cost_usd: float = 0.0,
+    current_balance_usd: float = 0.0,
 ) -> int:
     """Compute scalp order quantity based on distance from strike.
 
     Farther from strike = safer = more contracts.
     Uses SCALP_DISTANCE_TIERS to determine bankroll fraction.
+
+    Combined risk cap: the scalp + existing position cost must not exceed
+    COMBINED_POSITION_RISK_CAP of the current balance.  This prevents
+    stacking a main entry (8% risk) and a scalp (5% risk) into 13%+ total
+    exposure on a single market.
     """
     if available_usd <= 0 or entry_cents <= 0 or entry_cents > 99:
         return 0
@@ -2190,7 +2206,7 @@ def compute_scalp_qty(
     # How many contracts can we buy with this fraction of cash?
     target_qty = int(available_usd * scalp_fraction / cost_per)
 
-    # Safety cap: worst-case loss (all contracts go to $0) must not exceed SCALP_MAX_LOSS_FRACTION
+    # Safety cap 1: worst-case loss (all contracts go to $0) must not exceed SCALP_MAX_LOSS_FRACTION
     max_loss_usd = available_usd * SCALP_MAX_LOSS_FRACTION
     max_qty_for_loss = int(max_loss_usd / cost_per)
     if target_qty > max_qty_for_loss:
@@ -2200,6 +2216,22 @@ def compute_scalp_qty(
         )
         target_qty = max_qty_for_loss
 
+    # Safety cap 2: COMBINED position risk cap (main entry + scalp)
+    # If we already have a position costing $X, the scalp can only use
+    # whatever room remains under the combined cap.
+    if current_balance_usd > 0 and existing_position_cost_usd > 0:
+        combined_cap_usd = current_balance_usd * COMBINED_POSITION_RISK_CAP
+        remaining_risk_budget = max(0.0, combined_cap_usd - existing_position_cost_usd)
+        max_qty_combined = int(remaining_risk_budget / cost_per)
+        if target_qty > max_qty_combined:
+            log.info(
+                f"[SCALP SIZE] Combined cap: {target_qty} -> {max_qty_combined} contracts "
+                f"(existing=${existing_position_cost_usd:.2f} + scalp must stay under "
+                f"{COMBINED_POSITION_RISK_CAP:.0%} of ${current_balance_usd:.2f} = "
+                f"${combined_cap_usd:.2f}, room=${remaining_risk_budget:.2f})"
+            )
+            target_qty = max_qty_combined
+
     target_qty = max(0, min(target_qty, MAX_CONTRACTS))
 
     if target_qty > 0:
@@ -2208,7 +2240,8 @@ def compute_scalp_qty(
         log.info(
             f"[SCALP SIZE] qty={target_qty} @ {entry_cents}¢ "
             f"(dist=${distance_usd:.0f}, frac={scalp_fraction:.0%}, "
-            f"profit=${expected_profit:.2f}, risk=${max_loss:.2f})"
+            f"profit=${expected_profit:.2f}, risk=${max_loss:.2f}"
+            f", existing_pos=${existing_position_cost_usd:.2f})"
         )
 
     return target_qty
@@ -2225,6 +2258,8 @@ def evaluate_scalp(
     ask_price: Optional[int],
     available_usd: float,
     sigma: float,
+    existing_position_cost_usd: float = 0.0,
+    current_balance_usd: float = 0.0,
 ) -> Tuple[bool, int, Optional[int], str]:
     """Evaluate whether to place a last-minute scalp order.
 
@@ -2278,13 +2313,17 @@ def evaluate_scalp(
     if available_usd < MIN_FREE_USD_TO_TRADE:
         return False, 0, None, f"cash=${available_usd:.2f}<${MIN_FREE_USD_TO_TRADE}"
 
-    qty = compute_scalp_qty(available_usd, ask_price, distance)
+    qty = compute_scalp_qty(
+        available_usd, ask_price, distance,
+        existing_position_cost_usd=existing_position_cost_usd,
+        current_balance_usd=current_balance_usd,
+    )
     if qty <= 0:
-        return False, 0, None, "qty=0"
+        return False, 0, None, f"qty=0(existing_pos=${existing_position_cost_usd:.2f})"
 
     reason = (
         f"dist=${distance:.0f} 3σ√t=${max_expected_move:.0f} "
-        f"prob={p_blend:.1%} price={ask_price}¢ qty={qty}"
+        f"prob={p_blend:.1%} price={ask_price}¢ qty={qty} existing_pos=${existing_position_cost_usd:.2f}"
     )
     return True, qty, ask_price, reason
 
@@ -2908,6 +2947,11 @@ def main() -> None:
                             # EV cap: never bid more than the probability
                             scalp_ask = min(scalp_ask, int(our_prob * 100) + 1)  # +1¢ spread slack
 
+                            # Compute existing position cost for combined risk cap
+                            existing_pos_cost = 0.0
+                            if st.entry_price_cents is not None and st.qty > 0:
+                                existing_pos_cost = (st.entry_price_cents * st.qty) / 100.0
+
                             should_scalp, scalp_qty, scalp_px, scalp_reason = evaluate_scalp(
                                 st=st,
                                 side=st.side,
@@ -2919,6 +2963,8 @@ def main() -> None:
                                 ask_price=scalp_ask,
                                 available_usd=session.current_balance_usd,
                                 sigma=sigma_used,
+                                existing_position_cost_usd=existing_pos_cost,
+                                current_balance_usd=session.current_balance_usd,
                             )
 
                             if should_scalp:
@@ -2948,7 +2994,11 @@ def main() -> None:
                                                 scalp_dist = lo - spot
                                             else:
                                                 scalp_dist = 0.0
-                                            scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
+                                            scalp_qty = compute_scalp_qty(
+                                                scalp_avail, scalp_px, scalp_dist,
+                                                existing_position_cost_usd=existing_pos_cost,
+                                                current_balance_usd=session.current_balance_usd,
+                                            )
                                             scalp_qty = min(scalp_qty, scalp_room)  # Enforce position cap
 
                                         if scalp_qty > 0:
