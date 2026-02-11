@@ -1,8 +1,8 @@
 # bot.py
-# Kalshi rolling 15m BTC — Find mispriced contracts, hold to close, scale bankroll
+# Kalshi rolling 15m DOGE — Find mispriced contracts, hold to close, scale bankroll
 #
 # STRATEGY:
-# - Arms at T-720s (12 min) to OBSERVE market, BTC price, trends, book
+# - Arms at T-720s (12 min) to OBSERVE market, DOGE price, trends, book
 # - Buys mispriced contracts in 3-7 min window where model has info advantage
 # - Trusts the MARKET (orderbook) over the model near settlement
 # - Requires 3%+ real edge — only enters when model sees genuine mispricing
@@ -15,7 +15,7 @@
 # - EDGE_MIN=0.03 (3% real edge — no penny-picking)
 # - MAX_ENTRY_PRICE=93¢ (force real edge — 7¢/win, ~13 wins per loss)
 # - KELLY=0.25 (quarter-Kelly — smoother equity curve)
-# - BTC-AWARE BAIL: only dump if BTC has moved against us, not book noise
+# - DOGE-AWARE BAIL: only dump if DOGE has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
 # - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
 # - Dump abort: 6% reversal, 30s patience, catastrophic 20¢ backstop
@@ -49,7 +49,7 @@ print(f"BOOT: bot.py loaded at {datetime.now(timezone.utc).isoformat()}Z", flush
 # -----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("kalshi-bot")
+log = logging.getLogger("kalshi-doge-bot")
 log.warning("BOOT: logger initialized", extra={})
 
 # Early debug: Check if credentials exist
@@ -114,7 +114,7 @@ API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2").rstrip("/")
 API_KEY_ID = getenv_first(["KALSHI_API_KEY_ID"], "")
 PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
 
-SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXBTC15M")
+SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXDOGE15M")
 EVENT_TICKER = getenv_first(["EVENT_TICKER", "KALSHI_EVENT_TICKER"], "<auto>")
 MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<none>")
 
@@ -128,7 +128,7 @@ YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
-COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/DOGE-USD/spot"
 
 BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 
@@ -159,7 +159,7 @@ FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
 # Buy window is 7min → 5s before close. Require more certainty at the start
-# of the buy window (BTC still has time to move), relax near the end.
+# of the buy window (DOGE still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
 PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
@@ -175,9 +175,9 @@ PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
-REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend (borderline only)
+REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match DOGE spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
-# Rationale: 90%+ prob means BTC is well inside the range. The outcome is decisive.
+# Rationale: 90%+ prob means DOGE is well inside the range. The outcome is decisive.
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
@@ -190,7 +190,7 @@ PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (m
 CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment
 CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
 
-SPOT_SIGMA_USD_PER_SQRT_SEC = 12.0
+SPOT_SIGMA_USD_PER_SQRT_SEC = 0.0005
 
 # -------------- KELLY BANKROLL SIZING (HARDWIRED) --------------
 # Philosophy: size by BANKROLL FRACTION using Kelly criterion.
@@ -233,25 +233,25 @@ OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 # -------------- BAIL CONFIGURATION (LAST RESORT — salvage only when truly cooked) ----
 ENABLE_DUMP = True
 # Philosophy: we entered with high conviction and hold to close. Bail ONLY if
-# BTC has actually moved against us AND the book confirms it. A book spike
-# while BTC is $150 on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND BTC confirms, bail (was 50% — too late, already lost 40¢+)
+# DOGE has actually moved against us AND the book confirms it. A book spike
+# while DOGE is $0.005 on our side is NOT a reason to bail.
+DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND DOGE confirms, bail (was 50% — too late, already lost 40¢+)
 DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
 DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
 DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
-DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
+DUMP_ON_PRICE_DANGER = False  # Disabled - trust DOGE price, not book noise
 
-# -------------- BTC-AWARE BAIL (the key fix: don't dump winners) ---------------
-# Before ANY bail trigger fires, check: is BTC on our side of the boundary?
-# YES side: spot > lo + buffer → BTC is safely above range floor → HOLD
-# NO side:  spot < hi - buffer → BTC is safely below range ceiling → HOLD
-# If BTC is on our side, the book is lying (thin book, spike, manipulation).
-# ONLY bail if BTC has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 75.0    # >2min to close: need $75 buffer (was $100 — hold more winners, σ√120=$131 still provides margin)
-DUMP_BTC_SAFE_BUFFER_LATE = 40.0     # <2min to close: need $40 buffer (was $50 — σ√60=$93, $40 is safe enough)
-DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
+# -------------- DOGE-AWARE BAIL (the key fix: don't dump winners) ---------------
+# Before ANY bail trigger fires, check: is DOGE on our side of the boundary?
+# YES side: spot > lo + buffer → DOGE is safely above range floor → HOLD
+# NO side:  spot < hi - buffer → DOGE is safely below range ceiling → HOLD
+# If DOGE is on our side, the book is lying (thin book, spike, manipulation).
+# ONLY bail if DOGE has actually crossed or is dangerously close to boundary.
+DUMP_DOGE_SAFE_BUFFER_EARLY = 0.003    # >2min to close: need $0.003 buffer (scaled for DOGE price)
+DUMP_DOGE_SAFE_BUFFER_LATE = 0.0015   # <2min to close: need $0.0015 buffer (scaled for DOGE price)
+DUMP_DOGE_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
-# -------------- REVERSAL BAIL (only after BTC check fails) --------------------
+# -------------- REVERSAL BAIL (only after DOGE check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
 DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
 DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
@@ -279,8 +279,8 @@ DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monito
 DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after BTC check (was 15¢ — tighter to salvage more)
-# CATASTROPHIC STOP: fires BEFORE BTC check — absolute max loss regardless of anything
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after DOGE check (was 15¢ — tighter to salvage more)
+# CATASTROPHIC STOP: fires BEFORE DOGE check — absolute max loss regardless of anything
 # Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
 DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
 
@@ -292,14 +292,14 @@ DUMP_PEAK_WINDOW_SECONDS = 30  # Use max prob over last 30s as "peak" (not all-t
 
 # -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
 # If probability drops very fast (>4% in 10s), something is seriously wrong.
-# Bail even during settling period — fast drops mean BTC is actively moving against us.
+# Bail even during settling period — fast drops mean DOGE is actively moving against us.
 DUMP_RAPID_DROP_THRESHOLD = 0.04   # 4% drop in the rapid window = emergency
 DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 
 # -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
-# If we bail because BTC moved against us, the OTHER side is now the high-prob winner.
+# If we bail because DOGE moved against us, the OTHER side is now the high-prob winner.
 # Instead of just eating the loss, flip to the other side and hold THAT to settlement.
-# Example: bought YES at 94¢, BTC tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
+# Example: bought YES at 94¢, DOGE tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
 #          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
 # Safety: the flip still checks probability and price, but with a LOWER bar
 #         than a fresh entry — this is a recovery play, not a new trade.
@@ -310,26 +310,26 @@ FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for
 FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
-# With <60s left and BTC far from the strike, the outcome is locked.
+# With <60s left and DOGE far from the strike, the outcome is locked.
 # Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
-# Key safety: distance from strike.  If BTC is $300 above the floor with 60s left,
-# it CANNOT reverse.  sigma * sqrt(60) ≈ $93 at 12σ — $300 is >3x the max move.
+# Key safety: distance from strike.  If DOGE is $0.01 above the floor with 60s left,
+# it CANNOT reverse.  sigma * sqrt(60) ≈ $0.004 at σ=0.0005 — $0.01 is >2x the max move.
 #
 # Risk/reward at 99¢ × 33 contracts:
 #   Win (99.5%+ of the time): +$0.33
-#   Lose (BTC reverses $300+ in 60s): -$32.67
+#   Lose (DOGE reverses $0.01+ in 60s): -$32.67
 # Over 96 markets/day: ~$31/day extra income if hit rate matches.
 SCALP_ENABLED = True
 SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
 SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 50.0      # BTC must be ≥$50 from strike (lowered — vol gate is the real safety)
+SCALP_MIN_DISTANCE_USD = 0.002     # DOGE must be ≥$0.002 from strike (scaled for DOGE price)
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
 SCALP_DISTANCE_TIERS = [
-    (400.0, 0.85),   # $400+ from strike: extremely safe, size up hard
-    (200.0, 0.65),   # $200-400: very safe, go bigger
-    (100.0, 0.45),   # $100-200: safe, meaningful size
-    (50.0,  0.25),   # $50-100: moderate — compound the edge
+    (0.016, 0.85),   # $0.016+ from strike: extremely safe, size up hard
+    (0.008, 0.65),   # $0.008-0.016: very safe, go bigger
+    (0.004, 0.45),   # $0.004-0.008: safe, meaningful size
+    (0.002, 0.25),   # $0.002-0.004: moderate — compound the edge
 ]
 SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
@@ -343,11 +343,11 @@ REQUIRE_DIVERGENCE = env_bool("REQUIRE_DIVERGENCE", False)
 MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)
 
 USE_DYNAMIC_SIGMA = env_bool("USE_DYNAMIC_SIGMA", True)
-COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/DOGE-USD/candles"
 CANDLES_GRANULARITY_SEC = env_int("CANDLES_GRANULARITY_SEC", 60)
 CANDLES_LOOKBACK = env_int("CANDLES_LOOKBACK", 10)
-SIGMA_FLOOR = env_float("SIGMA_FLOOR", 6.0)
-SIGMA_CEIL = env_float("SIGMA_CEIL", 40.0)
+SIGMA_FLOOR = env_float("SIGMA_FLOOR", 0.0002)
+SIGMA_CEIL = env_float("SIGMA_CEIL", 0.002)
 
 MAX_SPREAD_CENTS_TO_TRADE = env_int("MAX_SPREAD_CENTS_TO_TRADE", 12)  # Wider to allow entry when book is thinner early on
 REQUIRE_BOTH_SIDES_BOOK = env_bool("REQUIRE_BOTH_SIDES_BOOK", False)
@@ -382,16 +382,16 @@ SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked b
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 50.0)  # $50 buffer — BTC-aware bail is the real safety net during hold
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.002)  # $0.002 buffer — DOGE-aware bail is the real safety net during hold
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
-# -------------- TREND TRACKING (know what BTC is doing) --------------
+# -------------- TREND TRACKING (know what DOGE is doing) --------------
 TREND_WINDOW_MINUTES = 60          # Long-term trend: 60 min (~4 markets)
 TREND_SHORT_WINDOW_MINUTES = 30    # Short-term trend: 30 min (~2 markets)
 TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
-TREND_STRONG_THRESHOLD = 100.0     # $100+ move in window = strong trend
-TREND_MODERATE_THRESHOLD = 50.0    # $50+ move = moderate trend
+TREND_STRONG_THRESHOLD = 0.004     # $0.004+ move in window = strong trend (scaled for DOGE price)
+TREND_MODERATE_THRESHOLD = 0.002   # $0.002+ move = moderate trend (scaled for DOGE price)
 TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against trend
 TREND_AGAINST_BLOCK = False        # Don't hard-block — require extra edge instead (trade every market)
 TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading with trend
@@ -673,7 +673,7 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
 # -----------------------------
 # Spot + probability model **UNCHANGED**
 # -----------------------------
-def fetch_btc_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optional[float]:
+def fetch_doge_spot_usd(session: requests.Session, timeout: float = 5.0) -> Optional[float]:
     try:
         r = session.get(COINBASE_SPOT_URL, timeout=timeout)
         r.raise_for_status()
@@ -1265,7 +1265,7 @@ class SessionState:
 
 class SpotTrend:
     """
-    Tracks BTC spot price over a rolling window to detect trends.
+    Tracks DOGE spot price over a rolling window to detect trends.
     Helps the bot avoid trading against strong momentum.
     """
     def __init__(self, window_minutes: int = TREND_WINDOW_MINUTES,
@@ -1322,10 +1322,10 @@ class SpotTrend:
         Returns: "with", "against", or "neutral"
 
         Logic:
-        - YES bet = we think BTC will stay ABOVE lo (or in range)
-        - NO bet = we think BTC will stay BELOW hi (or in range)
-        - If BTC is trending UP strongly and we want NO → against trend
-        - If BTC is trending DOWN strongly and we want YES → against trend
+        - YES bet = we think DOGE will stay ABOVE lo (or in range)
+        - NO bet = we think DOGE will stay BELOW hi (or in range)
+        - If DOGE is trending UP strongly and we want NO → against trend
+        - If DOGE is trending DOWN strongly and we want YES → against trend
         """
         move, direction, _ = self.get_trend()
 
@@ -1413,7 +1413,7 @@ class ProbTrend:
         Returns: (should_buy, reason)
 
         Time-dependent strictness (more certain early, relax as outcome clarifies):
-          EARLY (5-7 min): Require active trend match — BTC still has time to swing.
+          EARLY (5-7 min): Require active trend match — DOGE still has time to swing.
           MID   (3-5 min): Allow flat trend — stable high prob is enough certainty.
           LATE  (<3 min):  Skip trend entirely — probability IS the outcome now.
         Always: Trend matching our side = GO. Trend against us = BLOCK (unless late).
@@ -1788,13 +1788,13 @@ def choose_trade(
 
 
 # PROACTIVE DUMP: Get best exit price, don't wait until it's too late
-def _btc_is_safe(side: str, spot: float, lo: Optional[float], hi: Optional[float],
+def _doge_is_safe(side: str, spot: float, lo: Optional[float], hi: Optional[float],
                   secs_to_close: int) -> Tuple[bool, float]:
     """
-    Check if BTC spot price is safely on our side of the market boundary.
+    Check if DOGE spot price is safely on our side of the market boundary.
     Returns (is_safe, buffer_distance_usd).
 
-    This is THE key check: if BTC is on our side, the book is lying.
+    This is THE key check: if DOGE is on our side, the book is lying.
     Don't bail on a winner just because the orderbook spiked for 3 seconds.
 
     For "Up or Down" markets (lo only, no hi):
@@ -1804,19 +1804,19 @@ def _btc_is_safe(side: str, spot: float, lo: Optional[float], hi: Optional[float
       YES wins if lo < spot < hi
       NO  wins if spot outside range
     """
-    buffer = DUMP_BTC_SAFE_BUFFER_LATE if secs_to_close < DUMP_BTC_SAFE_CUTOFF_SECONDS else DUMP_BTC_SAFE_BUFFER_EARLY
+    buffer = DUMP_DOGE_SAFE_BUFFER_LATE if secs_to_close < DUMP_DOGE_SAFE_CUTOFF_SECONDS else DUMP_DOGE_SAFE_BUFFER_EARLY
 
     if side == "yes" and lo is not None:
-        # YES wins if BTC stays ABOVE lo. Safe if spot > lo + buffer.
+        # YES wins if DOGE stays ABOVE lo. Safe if spot > lo + buffer.
         distance = spot - lo
         return distance >= buffer, distance
     elif side == "no" and hi is not None:
-        # NO wins if BTC stays BELOW hi (range market). Safe if spot < hi - buffer.
+        # NO wins if DOGE stays BELOW hi (range market). Safe if spot < hi - buffer.
         distance = hi - spot
         return distance >= buffer, distance
     elif side == "no" and lo is not None:
-        # NO wins if BTC drops BELOW lo (up-or-down market, no hi).
-        # Safe if spot < lo - buffer (BTC is well below the strike).
+        # NO wins if DOGE drops BELOW lo (up-or-down market, no hi).
+        # Safe if spot < lo - buffer (DOGE is well below the strike).
         distance = lo - spot
         return distance >= buffer, distance
 
@@ -1839,12 +1839,12 @@ def should_dump_position(
     """
     BAIL logic: last resort only. Hold to close is the goal.
 
-    KEY PRINCIPLE: Before any bail trigger fires, check if BTC is on our side
+    KEY PRINCIPLE: Before any bail trigger fires, check if DOGE is on our side
     of the boundary. If it is, the book is lying — HOLD. Only bail when
-    BTC has actually moved against us.
+    DOGE has actually moved against us.
 
     BANKROLL PROTECTION: Never lose more than 5% of balance or 50% of position
-    cost on a single trade. This fires before BTC check — no position justifies
+    cost on a single trade. This fires before DOGE check — no position justifies
     blowing up the bankroll.
 
     Returns: (should_dump, reason)
@@ -1857,25 +1857,25 @@ def should_dump_position(
 
     # LATE-ENTRY HOLD: if <30s to close, outcome is mostly decided.
     # Hold to settlement — don't let dump logic sell a near-certain winner.
-    # For earlier entries, normal dump logic applies — BTC can still move.
-    # Was 60s — BTC can move $90 in 60s (σ=12, √60=7.7). 30s is $65, safer.
-    # CRITICAL FIX: Even within hold window, if BTC is near the boundary,
-    # allow dump logic to run. Blindly holding while BTC drifts toward the
-    # strike is how -$3.84 losses happen.
+    # For earlier entries, normal dump logic applies — DOGE can still move.
+    # Was 60s — DOGE can move quickly. 30s is safer.
+    # CRITICAL FIX: Even within hold window, if DOGE is near the boundary,
+    # allow dump logic to run. Blindly holding while DOGE drifts toward the
+    # strike is how losses happen.
     HOLD_TO_SETTLE_SECONDS = 30  # Only suppress dumps in the last 30s (was 60s)
-    HOLD_BTC_DANGER_BUFFER = 75.0  # If BTC is within $75 of boundary, DON'T suppress dumps
+    HOLD_DOGE_DANGER_BUFFER = 0.003  # If DOGE is within $0.003 of boundary, DON'T suppress dumps
     if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
-        # Check if BTC is dangerously close to boundary — if so, let dump logic run
-        btc_safe_for_hold, btc_hold_dist = _btc_is_safe(st.side, spot, lo, hi, secs_to_close)
-        if not btc_safe_for_hold or btc_hold_dist < HOLD_BTC_DANGER_BUFFER:
-            # BTC is near the boundary — DON'T suppress dumps, let normal logic decide
+        # Check if DOGE is dangerously close to boundary — if so, let dump logic run
+        doge_safe_for_hold, doge_hold_dist = _doge_is_safe(st.side, spot, lo, hi, secs_to_close)
+        if not doge_safe_for_hold or doge_hold_dist < HOLD_DOGE_DANGER_BUFFER:
+            # DOGE is near the boundary — DON'T suppress dumps, let normal logic decide
             log.warning(
-                f"[HOLD OVERRIDE] BTC near boundary (dist=${btc_hold_dist:.0f} < ${HOLD_BTC_DANGER_BUFFER:.0f}) "
+                f"[HOLD OVERRIDE] DOGE near boundary (dist=${doge_hold_dist:.4f} < ${HOLD_DOGE_DANGER_BUFFER:.4f}) "
                 f"with {secs_to_close}s left — allowing dump checks"
             )
             # Fall through to normal dump logic below
         else:
-            # BTC is safely on our side — hold to settlement
+            # DOGE is safely on our side — hold to settlement
             # Still bail on catastrophic loss (bankroll protection)
             if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
                 exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
@@ -1884,7 +1884,7 @@ def should_dump_position(
                 max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
                 if total_loss_usd > max_loss_balance:
                     return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
-            return False, f"late_entry_hold_to_settle_t={secs_to_close}s_dist=${btc_hold_dist:.0f}"
+            return False, f"late_entry_hold_to_settle_t={secs_to_close}s_dist=${doge_hold_dist:.4f}"
 
     if st.entry_model_prob is None:
         return False, "no_entry_data"
@@ -1927,7 +1927,7 @@ def should_dump_position(
         rapid_drop = rapid_peak - current_prob
 
     # =============================================================
-    # === BANKROLL-PROPORTIONAL STOP: fires BEFORE BTC check ===
+    # === BANKROLL-PROPORTIONAL STOP: fires BEFORE DOGE check ===
     # Never lose more than 5% of balance or 50% of position cost.
     # This is THE primary loss cap. Scales with bankroll naturally:
     # $35 balance → max $1.75 loss.  $350 → max $17.50.
@@ -1948,7 +1948,7 @@ def should_dump_position(
                     f"{DUMP_MAX_LOSS_FRACTION_OF_BALANCE:.0%} of ${current_balance_usd:.2f} "
                     f"(cap=${max_loss_balance:.2f}) — {loss_per_contract}¢/ct × {st.qty}ct "
                     f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
-                    f"overrides BTC safety, protecting bankroll"
+                    f"overrides DOGE safety, protecting bankroll"
                 )
                 return True, f"bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
 
@@ -1965,7 +1965,7 @@ def should_dump_position(
             return True, f"position_cap_${total_loss_usd:.2f}>{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%}"
 
     # =============================================================
-    # === CATASTROPHIC STOP: absolute backstop, fires BEFORE BTC check ===
+    # === CATASTROPHIC STOP: absolute backstop, fires BEFORE DOGE check ===
     # Even if bankroll cap didn't fire (e.g., balance unknown), this catches
     # extreme per-contract losses.
     # =============================================================
@@ -1976,51 +1976,51 @@ def should_dump_position(
             log.warning(
                 f"[BAIL CATASTROPHIC] losing ~{catastrophic_loss}¢/contract "
                 f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
-                f"overrides BTC safety, capping damage"
+                f"overrides DOGE safety, capping damage"
             )
             return True, f"catastrophic_{catastrophic_loss}c_per_contract"
 
     # =============================================================
-    # === BTC SAFETY CHECK: THE MASTER OVERRIDE ===
-    # If BTC is on our side of the boundary, DO NOT BAIL.
+    # === DOGE SAFETY CHECK: THE MASTER OVERRIDE ===
+    # If DOGE is on our side of the boundary, DO NOT BAIL.
     # The book can spike, the probability can drop on a thin book,
-    # but if BTC is $100+ on our side with 1 minute left, we WIN.
+    # but if DOGE is $0.003+ on our side with 1 minute left, we WIN.
     # =============================================================
-    btc_safe, btc_distance = _btc_is_safe(st.side, spot, lo, hi, secs_to_close)
-    if btc_safe:
-        # BTC is on our side — this is a winner. Hold no matter what the book says.
+    doge_safe, doge_distance = _doge_is_safe(st.side, spot, lo, hi, secs_to_close)
+    if doge_safe:
+        # DOGE is on our side — this is a winner. Hold no matter what the book says.
         phase = "settling" if in_settling else "active"
         return False, (
-            f"btc_safe_{phase}_dist=${btc_distance:.0f}_"
+            f"doge_safe_{phase}_dist=${doge_distance:.4f}_"
             f"prob={current_prob:.0%}_peak={st.peak_prob_for_side:.0%}_drop={drop_from_peak:.0%}"
         )
 
-    # === Below here: BTC is NOT safely on our side — bail checks apply ===
+    # === Below here: DOGE is NOT safely on our side — bail checks apply ===
 
-    # --- RAPID DROP BAIL: BTC is against us AND prob dropped fast ---
-    # Emergency exit: if prob dropped >4% in the last 10s, BTC is actively moving
+    # --- RAPID DROP BAIL: DOGE is against us AND prob dropped fast ---
+    # Emergency exit: if prob dropped >4% in the last 10s, DOGE is actively moving
     # against us. Fire even during settling period — speed matters here.
     if rapid_drop >= DUMP_RAPID_DROP_THRESHOLD:
         log.warning(
-            f"[BAIL RAPID DROP] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+            f"[BAIL RAPID DROP] DOGE NOT safe (dist=${doge_distance:.4f}) AND "
             f"prob dropped {rapid_drop:.1%} in last {DUMP_RAPID_DROP_WINDOW_SECONDS}s "
             f"(current={current_prob:.1%}) — emergency exit"
         )
         return True, f"rapid_drop_{rapid_drop:.1%}_in_{DUMP_RAPID_DROP_WINDOW_SECONDS}s"
 
-    # --- HARD P&L STOP: BTC is against us AND losing big ---
+    # --- HARD P&L STOP: DOGE is against us AND losing big ---
     if st.entry_price_cents is not None:
         exit_price_est = int(current_prob * 100)
         unrealized_loss_per_contract = st.entry_price_cents - exit_price_est
         if unrealized_loss_per_contract >= DUMP_MAX_LOSS_CENTS_PER_CONTRACT:
             log.warning(
-                f"[BAIL HARD STOP] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+                f"[BAIL HARD STOP] DOGE NOT safe (dist=${doge_distance:.4f}) AND "
                 f"losing ~{unrealized_loss_per_contract}¢/contract "
                 f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — salvaging"
             )
             return True, f"hard_stop_{unrealized_loss_per_contract}c_per_contract"
 
-    # --- REVERSAL BAIL: BTC is against us AND prob has dropped significantly ---
+    # --- REVERSAL BAIL: DOGE is against us AND prob has dropped significantly ---
     # Now fires during settling too (with wider threshold) — was completely blocked before.
     # Windowed peak (last 30s) is used instead of all-time peak to avoid false signals.
     if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED:
@@ -2037,17 +2037,17 @@ def should_dump_position(
         if drop_from_peak >= effective_threshold:
             phase_label = "settling" if in_settling else "active"
             log.warning(
-                f"[BAIL REVERSAL] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+                f"[BAIL REVERSAL] DOGE NOT safe (dist=${doge_distance:.4f}) AND "
                 f"prob dropped {drop_from_peak:.1%} from windowed peak "
                 f"({windowed_peak:.1%} -> {current_prob:.1%}) phase={phase_label} "
                 f"threshold={effective_threshold:.1%} — salvaging"
             )
             return True, f"reversal_{current_prob:.0%}_from_wpeak_{windowed_peak:.0%}_{phase_label}"
 
-    # --- FLOOR: BTC is against us AND prob is at coin-flip ---
+    # --- FLOOR: DOGE is against us AND prob is at coin-flip ---
     if current_prob < DUMP_PROB_FLIP:
         log.warning(
-            f"[BAIL FLOOR] BTC NOT safe (dist=${btc_distance:.0f}) AND "
+            f"[BAIL FLOOR] DOGE NOT safe (dist=${doge_distance:.4f}) AND "
             f"prob={current_prob:.1%} < {DUMP_PROB_FLIP:.0%} — salvaging"
         )
         return True, f"floor_{current_prob:.0%}<{DUMP_PROB_FLIP:.0%}"
@@ -2056,7 +2056,7 @@ def should_dump_position(
     phase = "settling" if in_settling else "active"
     return False, (
         f"{phase}_prob={current_prob:.0%}_wpeak={windowed_peak:.0%}_peak={st.peak_prob_for_side:.0%}"
-        f"_drop={drop_from_peak:.0%}_rdrop={rapid_drop:.0%}_btc_dist=${btc_distance:.0f}"
+        f"_drop={drop_from_peak:.0%}_rdrop={rapid_drop:.0%}_doge_dist=${doge_distance:.4f}"
     )
 
 
@@ -2249,7 +2249,7 @@ def evaluate_scalp(
     if ask_price > max_ev_price:
         return False, 0, None, f"price={ask_price}¢>prob_cap={max_ev_price}¢(p={p_blend:.1%})"
 
-    # Core safety: how far is BTC from the strike?
+    # Core safety: how far is DOGE from the strike?
     # "Up or Down" markets have only lo (no hi). NO wins when spot < lo.
     if side == "yes" and lo is not None:
         distance = spot - lo
@@ -2261,17 +2261,17 @@ def evaluate_scalp(
         return False, 0, None, "no_boundary"
 
     if distance < SCALP_MIN_DISTANCE_USD:
-        return False, 0, None, f"dist=${distance:.0f}<${SCALP_MIN_DISTANCE_USD:.0f}"
+        return False, 0, None, f"dist=${distance:.4f}<${SCALP_MIN_DISTANCE_USD:.4f}"
 
-    # Volatility sanity check: can BTC actually move `distance` in `secs_to_close`?
+    # Volatility sanity check: can DOGE actually move `distance` in `secs_to_close`?
     # 1.5σ√t covers ~93% of moves (~3.5% adverse). Combined with distance tiers
     # and EV price cap, this gives the scalp enough room to actually fire.
-    # At σ=12, t=60: $139.  t=30: $99.  t=15: $70.  t=10: $57.
+    # At σ=0.0005, t=60: $0.006.  t=30: $0.004.  t=15: $0.003.  t=10: $0.002.
     max_expected_move = 1.5 * sigma * math.sqrt(float(secs_to_close))
     if distance < max_expected_move:
         return False, 0, None, (
-            f"vol_unsafe: dist=${distance:.0f} < 1.5σ√t=${max_expected_move:.0f} "
-            f"(σ={sigma:.1f}, t={secs_to_close}s)"
+            f"vol_unsafe: dist=${distance:.4f} < 1.5σ√t=${max_expected_move:.4f} "
+            f"(σ={sigma:.6f}, t={secs_to_close}s)"
         )
 
     if available_usd < MIN_FREE_USD_TO_TRADE:
@@ -2282,7 +2282,7 @@ def evaluate_scalp(
         return False, 0, None, "qty=0"
 
     reason = (
-        f"dist=${distance:.0f} 3σ√t=${max_expected_move:.0f} "
+        f"dist=${distance:.4f} 3σ√t=${max_expected_move:.4f} "
         f"prob={p_blend:.1%} price={ask_price}¢ qty={qty}"
     )
     return True, qty, ask_price, reason
@@ -2334,7 +2334,7 @@ def main() -> None:
     log.warning(
         f"[BOOTCFG] BAIL: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
         f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract "
-        f"btc_buffer_early=${DUMP_BTC_SAFE_BUFFER_EARLY:.0f} btc_buffer_late=${DUMP_BTC_SAFE_BUFFER_LATE:.0f}"
+        f"doge_buffer_early=${DUMP_DOGE_SAFE_BUFFER_EARLY:.4f} doge_buffer_late=${DUMP_DOGE_SAFE_BUFFER_LATE:.4f}"
     )
     log.warning(
         f"[BOOTCFG] FLIP: enabled={FLIP_AFTER_DUMP} min_time={FLIP_MIN_TIME_REMAINING}s "
@@ -2351,12 +2351,12 @@ def main() -> None:
     )
     log.warning(
         f"[BOOTCFG] TREND: windows={TREND_WINDOW_MINUTES}min+{TREND_SHORT_WINDOW_MINUTES}min "
-        f"strong=${TREND_STRONG_THRESHOLD} moderate=${TREND_MODERATE_THRESHOLD} "
+        f"strong=${TREND_STRONG_THRESHOLD:.4f} moderate=${TREND_MODERATE_THRESHOLD:.4f} "
         f"block_against={TREND_AGAINST_BLOCK} edge_boost={TREND_AGAINST_EDGE_BOOST}"
     )
     log.warning(
         f"[BOOTCFG] SCALP: enabled={SCALP_ENABLED} window={SCALP_MIN_SECONDS}-{SCALP_MAX_SECONDS}s "
-        f"min_dist=${SCALP_MIN_DISTANCE_USD:.0f} min_prob={SCALP_MIN_PROB:.0%} "
+        f"min_dist=${SCALP_MIN_DISTANCE_USD:.4f} min_prob={SCALP_MIN_PROB:.0%} "
         f"max_loss={SCALP_MAX_LOSS_FRACTION:.0%} tiers={len(SCALP_DISTANCE_TIERS)}"
     )
     log.warning("[HEARTBEAT] main() entered — SCALPER is running")
@@ -2657,7 +2657,7 @@ def main() -> None:
             
             # Check dump conditions continuously
             if ENABLE_DUMP and secs_to_close is not None:
-                spot = fetch_btc_spot_usd(http)
+                spot = fetch_doge_spot_usd(http)
                 if spot is not None:
                     trend.record(spot)
                     trend_short.record(spot)
@@ -3028,7 +3028,7 @@ def main() -> None:
         # PHASE 2: OBSERVE — gather trend data, watch book, DON'T buy
         # Runs from 12min → 7min before close
         # ============================================================
-        spot = fetch_btc_spot_usd(http)
+        spot = fetch_doge_spot_usd(http)
         if spot is not None:
             trend.record(spot)
             trend_short.record(spot)
@@ -3143,7 +3143,7 @@ def main() -> None:
         # KEY FIX: Settlement lock (180s) is now separate from buy window (420s).
         # Early window entries (420s-180s) must pass trend/confirmation checks.
         # This prevents snap entries on transient 85% spikes at T-420s that
-        # flip to the wrong side when BTC moves.
+        # flip to the wrong side when DOGE moves.
         # ================================================================
         current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
         in_settlement_lock = secs_to_close is not None and secs_to_close <= SETTLEMENT_LOCK_SECONDS
@@ -3239,32 +3239,32 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # --- CROSS-VALIDATE: prob trend must match BTC spot trend ---
+            # --- CROSS-VALIDATE: prob trend must match DOGE spot trend ---
             if REQUIRE_TREND_ALIGNMENT and prob_trend_ok:
                 prob_change, prob_dir, _, _ = prob_trend.get_trend()
                 spot_move, spot_dir, _ = trend.get_trend()
                 spot_short_move, spot_short_dir, _ = trend_short.get_trend()
 
                 misaligned = False
-                if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 50:
+                if chosen_side == "yes" and "down" in spot_dir and abs(spot_move) > 0.002:
                     misaligned = True
-                    mismatch_reason = f"prob_yes but BTC 60m={spot_dir}(${spot_move:+.0f})"
-                elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 50:
+                    mismatch_reason = f"prob_yes but DOGE 60m={spot_dir}(${spot_move:+.4f})"
+                elif chosen_side == "no" and "up" in spot_dir and abs(spot_move) > 0.002:
                     misaligned = True
-                    mismatch_reason = f"prob_no but BTC 60m={spot_dir}(${spot_move:+.0f})"
-                elif chosen_side == "yes" and "down" in spot_short_dir and abs(spot_short_move) > 50:
+                    mismatch_reason = f"prob_no but DOGE 60m={spot_dir}(${spot_move:+.4f})"
+                elif chosen_side == "yes" and "down" in spot_short_dir and abs(spot_short_move) > 0.002:
                     misaligned = True
-                    mismatch_reason = f"prob_yes but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
-                elif chosen_side == "no" and "up" in spot_short_dir and abs(spot_short_move) > 50:
+                    mismatch_reason = f"prob_yes but DOGE 30m={spot_short_dir}(${spot_short_move:+.4f})"
+                elif chosen_side == "no" and "up" in spot_short_dir and abs(spot_short_move) > 0.002:
                     misaligned = True
-                    mismatch_reason = f"prob_no but BTC 30m={spot_short_dir}(${spot_short_move:+.0f})"
+                    mismatch_reason = f"prob_no but DOGE 30m={spot_short_dir}(${spot_short_move:+.4f})"
 
                 if misaligned:
                     log.warning(f"[ALIGNMENT] BLOCKED — {mismatch_reason}. Prob trend may be manipulation, not signal.")
                     time.sleep(POLL_SECONDS)
                     continue
 
-                log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with BTC 60m={spot_dir} 30m={spot_short_dir}")
+                log.info(f"[ALIGNMENT] OK — prob {prob_dir} aligns with DOGE 60m={spot_dir} 30m={spot_short_dir}")
 
             if prob_trend_ok:
                 log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
