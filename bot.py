@@ -2441,7 +2441,14 @@ def main() -> None:
         st.target_price = None
         st.qty = 0
 
-    ev, mt, mobj = refresh_active_market()
+    # Retry until an open market is found (markets may be between windows)
+    while True:
+        try:
+            ev, mt, mobj = refresh_active_market()
+            break
+        except RuntimeError as e:
+            log.warning(f"[BOOT] {e} — retrying in 30s")
+            time.sleep(30)
     active_market_obj = mobj or {}
     st.market = mt
     st.event = ev
