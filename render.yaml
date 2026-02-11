@@ -1,8 +1,8 @@
 services:
   - type: web
-    name: kalshi-btc-mm
+    name: kalshi-btc-1h
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python bot_1h.py
     healthCheckPath: /
