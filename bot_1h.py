@@ -143,30 +143,38 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # T-300s when probability is high AND the book still has liquidity.
 #
 # TWO PHASES:
-#   OBSERVE (48min → 28min before close): gather trend data, watch book, DON'T buy
-#   BUY     (28min → 5s before close):   make the call, place the order, hold
-OBSERVE_START_SECONDS = 2880  # Start watching at 48min — gather trend + prob data
-BUY_START_SECONDS = 1680      # Can enter from T-1680s (28 min) — book has liquidity, grab it before it locks up
+#   OBSERVE (55min → 50min before close): gather trend data, watch book, DON'T buy
+#   BUY     (50min → 5s before close):   make the call, place the order, hold
+#
+# KEY INSIGHT FOR 1H MARKETS: Books pin to 99/1 by ~30min left because BTC
+# direction is clear.  We MUST enter while there's still liquidity and edge,
+# which means buying at 40-50 min remaining, not 28 min.
+OBSERVE_START_SECONDS = 3300  # Start watching at 55min — gather trend + prob data
+BUY_START_SECONDS = 3000      # Can enter from T-3000s (50 min) — book still has liquidity this early
 ENTRY_LAST_SECONDS = 5        # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.83  # 83%+ to enter in last 12 min — slightly lower bar, EV cap is the real protection
-EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 96  # At 96¢ entry, gain 4¢/win, need ~24 wins per loss
+PROB_MIN = 0.80  # 80%+ to enter in last 20 min — lower bar for hourly (books pin early, need to enter sooner)
+EDGE_MIN = 0.02  # 2% minimum edge — slightly looser for hourly (edge evaporates faster as books pin)
+MAX_ENTRY_PRICE_CENTS = 97  # At 97¢ entry, gain 3¢/win — allows entry on higher-prob markets before books lock
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 28-min buy window) --------
-# Buy window is 28min → 5s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 50-min buy window) --------
+# Buy window is 50min → 5s before close. Require more certainty at the start
 # of the buy window (BTC still has time to move), relax near the end.
-# NOTE: observation phase (48min → 28min) gathers data but never buys.
-# 1H markets: BTC has 4x more time to move, so we scale the time boundaries.
-PROB_EARLY_ENTRY_SECONDS = 1200  # 20-28 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >20min: need 90%+ (BTC has time to swing)
-PROB_MID_ENTRY_SECONDS = 720     # 12-20 min to close = "mid"
-PROB_MID_MIN = 0.87              # 12-20min: need 87%+
-# <12 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+# NOTE: observation phase (55min → 50min) gathers data but never buys.
+#
+# 1H REALITY: Books pin to 99/1 by ~30min left, so the "early" buy window
+# (50-35min left) is where all the tradeable liquidity exists.  We need to
+# enter here with reasonable confidence, not wait for 90%+ that never comes
+# until the book is already locked.
+PROB_EARLY_ENTRY_SECONDS = 2100  # 35-50 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.88            # >35min: need 88%+ (BTC has time to swing, but market knows direction)
+PROB_MID_ENTRY_SECONDS = 1200    # 20-35 min to close = "mid" — books starting to pin
+PROB_MID_MIN = 0.84              # 20-35min: need 84%+ (outcome becoming clear)
+# <20 min = PROB_MIN (0.80) — market has priced in the outcome, book may be locked
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -178,18 +186,18 @@ PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based 
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match BTC spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
-# Rationale: 90%+ prob means BTC is well inside the range. The outcome is decisive.
+# Rationale: 88%+ prob means BTC is well inside the range. The outcome is decisive.
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob for fast lane.
-# Near close (<12 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
-PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 12 min = fast lane (market is decisive)
+# Near close (<20 min), 83% is enough because the market has priced in the outcome.
+PROB_FAST_LANE_THRESHOLD = 0.88   # ≥88% prob = buy immediately, no trend check needed
+PROB_FAST_LANE_LATE_THRESHOLD = 0.83  # ≥83% prob in last 20 min = fast lane (market is decisive)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
-# Prevents snap entries on transient orderbook spikes at T-1680s.
+# Prevents snap entries on transient orderbook spikes at T-3000s.
 # Early in buy window, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 30   # Signal must persist for 30s before early commitment (2x for hourly)
-CONFIRMATION_HOLD_MIN_TIME = 720  # Only require confirmation hold above 12 min to close
+CONFIRMATION_HOLD_SECONDS = 45   # Signal must persist for 45s before early commitment (entering very early)
+CONFIRMATION_HOLD_MIN_TIME = 1200  # Only require confirmation hold above 20 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 14.0  # Slightly higher base sigma for hourly (more time = more vol regime shifts)
 
@@ -340,7 +348,7 @@ SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
-MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.20)  # Was 0.75 — model is ~50/50 at >5min, drowns out 95% market signal
+MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.10)  # 10% model weight — BS model is nearly useless at hourly horizons (σ√t >> range)
 
 REQUIRE_DIVERGENCE = env_bool("REQUIRE_DIVERGENCE", False)
 MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)
@@ -375,9 +383,9 @@ HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 30)  # Last 30s for
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
-# conservative BS estimate against market price.  With <2 min left the market
-# price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 600)    # Last 10 min for hourly — earlier window still needs trend/prob checks
+# conservative BS estimate against market price.  With hourly markets, the
+# book IS the probability much sooner.  If blend prob is high, buy even with thin/no edge.
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 1200)   # Last 20 min — hourly books pin early, trust market over model
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
@@ -1571,7 +1579,7 @@ def choose_trade(
     Optional[float], Optional[float], float,
     float, float
 ]:
-    t_eff = max(5.0, float(min(secs_to_close, 600)))  # Cap at 600s for hourly (vs 120s for 15m)
+    t_eff = max(5.0, float(min(secs_to_close, 1800)))  # Cap at 1800s (30min) — model needs realistic horizon for early entries
     sigma_used = float(get_sigma_cached(http))
     sd = sigma_used * math.sqrt(t_eff)
 
@@ -1582,19 +1590,20 @@ def choose_trade(
 
     if p_mkt is not None:
         # Gradual transition from model-weighted to market-weighted across buy window:
-        #   >1680s: MODEL_BLEND_ALPHA (for observation — model still useful for trend)
-        #   180-1680s: linear ramp from MODEL_BLEND_ALPHA down to 0% (market taking over)
-        #   <180s: 100% market (book IS the probability)
+        #   >3000s: MODEL_BLEND_ALPHA (for observation — model still useful for trend)
+        #   600-3000s: linear ramp from MODEL_BLEND_ALPHA down to 0% (market taking over)
+        #   <600s: 100% market (book IS the probability)
         #
-        # KEY FIX: The old 75% model weight at >120s was catastrophic. At T-400s with
-        # a 1-hour market, the BS model says 50/50 (σ√t > boundary gap), but the market
-        # is 95% on one side. 75% model weight drags blend to 62% — below all thresholds.
-        # Now we ramp from 420s→60s so the market signal dominates in the buy window.
-        if secs_to_close <= 180:
-            alpha = 0.0   # 100% market — book IS the probability in the last 3 min (hourly)
+        # CRITICAL FOR 1H: The BS model is USELESS at 40+ min out.
+        # σ√(2400s) ≈ $686 at σ=14 — that's wider than any market range.
+        # The model says 50/50 when the market is 95/5. We MUST trust the
+        # market signal almost entirely during the buy window.
+        # Ramp: MODEL_BLEND_ALPHA at T-3000s → 0 at T-600s (last 10 min pure market).
+        if secs_to_close <= 600:
+            alpha = 0.0   # 100% market — book IS the probability in the last 10 min
         elif secs_to_close <= BUY_START_SECONDS:
-            # Linear ramp across buy window: at BUY_START alpha=MODEL_BLEND_ALPHA, at 180s alpha=0
-            alpha = float(MODEL_BLEND_ALPHA) * (secs_to_close - 180) / float(BUY_START_SECONDS - 180)
+            # Linear ramp across buy window: at BUY_START alpha=MODEL_BLEND_ALPHA, at 600s alpha=0
+            alpha = float(MODEL_BLEND_ALPHA) * (secs_to_close - 600) / float(BUY_START_SECONDS - 600)
         else:
             alpha = float(MODEL_BLEND_ALPHA)  # Outside buy window: model for observation
         p_yes_blend = alpha * p_yes_model + (1.0 - alpha) * float(p_mkt)
@@ -1656,7 +1665,7 @@ def choose_trade(
     # is nearly useless at >5 min (σ√t > boundary gap → 50/50), but the market has
     # already priced the outcome.  This prevents the model from blocking trades the
     # orderbook clearly supports.
-    MARKET_CONVICTION_THRESHOLD = 0.85
+    MARKET_CONVICTION_THRESHOLD = 0.80  # Lower for hourly — book knows direction earlier than model
     if p_mkt is not None and secs_to_close <= BUY_START_SECONDS:
         p_yes_mkt = float(p_mkt)
         p_no_mkt = 1.0 - p_yes_mkt
@@ -2672,7 +2681,7 @@ def main() -> None:
                         
                         # Recalculate probabilities
                         sigma_used = get_sigma_cached(http)
-                        t_eff = max(5.0, float(min(secs_to_close, 600)))  # Cap at 600s for hourly
+                        t_eff = max(5.0, float(min(secs_to_close, 1800)))  # Cap at 1800s for hourly
                         sd = sigma_used * math.sqrt(t_eff)
                         p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
                         p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask)
