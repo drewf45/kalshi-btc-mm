@@ -346,6 +346,31 @@ SCALP_MAX_LOSS_FRACTION = 0.05    # Never risk more than 5% of cash on a scalp (
 # and only uses whatever room remains under this cap.
 COMBINED_POSITION_RISK_CAP = 0.10  # Max 10% of bankroll at risk per market (main + scalp combined)
 
+# -------------- BRACKET ARBITRAGE (buy all 3, dump 2, hold 1) ----------------
+# When an event has 3 range brackets (lo-mid, mid-hi, hi-top), exactly ONE must
+# settle YES at $1.00.  If we buy YES on all 3 cheaply enough (total < 100¢),
+# we're guaranteed profit regardless of outcome.
+#
+# Strategy:
+#   1. Near settlement, identify all 3 sibling brackets for the same event
+#   2. Buy YES on all 3 at the ask (or post limit orders)
+#   3. As the winner becomes clear, dump the 2 losers while they still have bids
+#   4. Hold the winner to settlement at $1.00
+#
+# The edge comes from total ask < 100¢ (guaranteed arb) or from being able to
+# identify the winner early enough to dump losers while they still have residual
+# value (reducing net cost below 100¢).
+BRACKET_ARB_ENABLED = env_bool("BRACKET_ARB_ENABLED", True)
+BRACKET_ARB_MAX_TOTAL_CENTS = env_int("BRACKET_ARB_MAX_TOTAL_CENTS", 97)   # Max total to pay for 3 YES (97¢ = 3¢ guaranteed profit)
+BRACKET_ARB_SOFT_TOTAL_CENTS = env_int("BRACKET_ARB_SOFT_TOTAL_CENTS", 103)  # Allow up to 103¢ if we can dump losers to recover
+BRACKET_ARB_MAX_SECONDS = env_int("BRACKET_ARB_MAX_SECONDS", 600)           # Enter within last 10 minutes
+BRACKET_ARB_MIN_SECONDS = env_int("BRACKET_ARB_MIN_SECONDS", 15)            # Need at least 15s to get fills
+BRACKET_ARB_MAX_SINGLE_PRICE = env_int("BRACKET_ARB_MAX_SINGLE_PRICE", 50)  # Don't pay more than 50¢ for any single bracket (low prices only)
+BRACKET_ARB_BANKROLL_FRACTION = env_float("BRACKET_ARB_BANKROLL_FRACTION", 0.08)  # Max 8% of bankroll per bracket set
+BRACKET_ARB_DUMP_PROB_THRESHOLD = env_float("BRACKET_ARB_DUMP_PROB_THRESHOLD", 0.10)  # Dump when a bracket's YES prob < 10%
+BRACKET_ARB_WINNER_PROB_THRESHOLD = env_float("BRACKET_ARB_WINNER_PROB_THRESHOLD", 0.85)  # Bracket is "winner" when prob > 85%
+BRACKET_ARB_MIN_BRACKETS = env_int("BRACKET_ARB_MIN_BRACKETS", 3)  # Need all 3 brackets to arb
+
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
 MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.20)  # Was 0.75 — model is ~50/50 at >5min, drowns out 95% market signal
@@ -2328,6 +2353,387 @@ def evaluate_scalp(
     return True, qty, ask_price, reason
 
 
+# =====================================================================
+# BRACKET ARBITRAGE — buy all 3, dump 2, hold 1
+# =====================================================================
+
+@dataclass
+class BracketPosition:
+    """Tracks a single bracket within a bracket arb set."""
+    market_ticker: str
+    event_ticker: str
+    floor_strike: Optional[float]
+    cap_strike: Optional[float]
+    qty: int = 0
+    entry_price_cents: Optional[int] = None
+    order_id: Optional[str] = None
+    is_dumped: bool = False
+    dump_price_cents: Optional[int] = None
+    market_obj: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BracketArbState:
+    """Tracks a bracket arb across all 3 (or more) sibling brackets."""
+    event_ticker: Optional[str] = None
+    brackets: List[BracketPosition] = field(default_factory=list)
+    is_active: bool = False       # True once we've bought into brackets
+    entry_time: float = 0.0
+    total_entry_cost_cents: int = 0  # Sum of (entry_price * qty) across all brackets
+    total_qty_per_bracket: int = 0   # Contracts per bracket (same for all)
+    winner_ticker: Optional[str] = None  # Market ticker of the identified winner
+    all_settled: bool = False
+
+    def reset(self):
+        self.event_ticker = None
+        self.brackets = []
+        self.is_active = False
+        self.entry_time = 0.0
+        self.total_entry_cost_cents = 0
+        self.total_qty_per_bracket = 0
+        self.winner_ticker = None
+        self.all_settled = False
+
+    def total_cost_cents(self) -> int:
+        """Total cost in cents per contract-set (sum of all entry prices)."""
+        return sum(b.entry_price_cents for b in self.brackets if b.entry_price_cents is not None)
+
+    def total_invested_usd(self) -> float:
+        """Total USD invested across all brackets."""
+        return sum(
+            (b.entry_price_cents or 0) * b.qty / 100.0
+            for b in self.brackets
+        )
+
+    def undumped_brackets(self) -> List[BracketPosition]:
+        return [b for b in self.brackets if not b.is_dumped and b.qty > 0]
+
+    def dumped_recovery_cents(self) -> int:
+        """Total cents recovered from dumping losers."""
+        return sum(
+            (b.dump_price_cents or 0) * b.qty
+            for b in self.brackets if b.is_dumped
+        )
+
+
+def find_event_brackets(
+    markets: List[Dict[str, Any]],
+    event_ticker: str,
+) -> List[Dict[str, Any]]:
+    """Find all sibling bracket markets for the same event, sorted by floor_strike."""
+    siblings = []
+    for m in markets:
+        ev = m.get("event_ticker") or (m.get("event", {}) or {}).get("ticker") or ""
+        status = str(m.get("status", "")).lower()
+        if ev == event_ticker and status in ("open", "active"):
+            siblings.append(m)
+
+    # Sort by floor_strike ascending (lowest bracket first)
+    def sort_key(m):
+        lo, hi = market_bounds_usd(m)
+        return lo if lo is not None else float("inf")
+
+    siblings.sort(key=sort_key)
+    return siblings
+
+
+def evaluate_bracket_arb(
+    brackets: List[Dict[str, Any]],
+    client,
+    available_usd: float,
+    secs_to_close: int,
+) -> Tuple[bool, List[Tuple[str, int, Dict]], str]:
+    """Evaluate whether bracket arbitrage is available.
+
+    Returns: (should_enter, [(market_ticker, ask_cents, market_obj), ...], reason)
+    """
+    if not BRACKET_ARB_ENABLED:
+        return False, [], "disabled"
+
+    n = len(brackets)
+    if n < BRACKET_ARB_MIN_BRACKETS:
+        return False, [], f"only_{n}_brackets(need_{BRACKET_ARB_MIN_BRACKETS})"
+
+    if secs_to_close > BRACKET_ARB_MAX_SECONDS:
+        return False, [], f"too_early({secs_to_close}s>{BRACKET_ARB_MAX_SECONDS}s)"
+
+    if secs_to_close < BRACKET_ARB_MIN_SECONDS:
+        return False, [], f"too_late({secs_to_close}s<{BRACKET_ARB_MIN_SECONDS}s)"
+
+    if available_usd < MIN_FREE_USD_TO_TRADE:
+        return False, [], f"low_cash(${available_usd:.2f})"
+
+    # Fetch orderbooks for all brackets
+    bracket_prices = []  # (market_ticker, yes_ask_cents, market_obj)
+    total_ask_cents = 0
+
+    for m in brackets:
+        ticker = m.get("ticker") or m.get("market_ticker") or ""
+        try:
+            ob = client.request("GET", f"/markets/{ticker}/orderbook")
+            yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
+        except Exception as e:
+            log.info(f"[BRACKET_ARB] Failed to fetch orderbook for {ticker}: {e}")
+            return False, [], f"ob_fetch_failed({ticker})"
+
+        # Use yes_ask if available, otherwise derive from no_bid
+        if yes_ask is not None:
+            ask_cents = int(yes_ask)
+        elif no_bid is not None:
+            ask_cents = 100 - int(no_bid)
+        else:
+            return False, [], f"no_ask({ticker})"
+
+        if ask_cents > BRACKET_ARB_MAX_SINGLE_PRICE:
+            return False, [], f"single_too_high({ticker}={ask_cents}¢>{BRACKET_ARB_MAX_SINGLE_PRICE}¢)"
+
+        if ask_cents < 1:
+            ask_cents = 1
+
+        bracket_prices.append((ticker, ask_cents, m))
+        total_ask_cents += ask_cents
+
+    # Check if total is cheap enough
+    if total_ask_cents > BRACKET_ARB_SOFT_TOTAL_CENTS:
+        return False, [], f"total_too_high({total_ask_cents}¢>{BRACKET_ARB_SOFT_TOTAL_CENTS}¢)"
+
+    guaranteed_arb = total_ask_cents <= 100
+    cheap_enough = total_ask_cents <= BRACKET_ARB_MAX_TOTAL_CENTS
+
+    reason_parts = [f"total={total_ask_cents}¢"]
+    for ticker, ask, _ in bracket_prices:
+        short_ticker = ticker.split("-")[-1] if "-" in ticker else ticker
+        reason_parts.append(f"{short_ticker}={ask}¢")
+
+    if guaranteed_arb:
+        reason_parts.append("GUARANTEED_ARB")
+    elif cheap_enough:
+        reason_parts.append("CHEAP_ARB")
+    else:
+        reason_parts.append("SOFT_ARB(dump_to_recover)")
+
+    reason = " ".join(reason_parts)
+    log.info(f"[BRACKET_ARB] Evaluating: {reason}")
+
+    return True, bracket_prices, reason
+
+
+def compute_bracket_arb_qty(
+    available_usd: float,
+    bracket_prices: List[Tuple[str, int, Dict]],
+) -> int:
+    """Compute how many contract-sets to buy (same qty for each bracket).
+
+    One contract-set = 1 YES on each bracket. Cost = sum of all asks.
+    Payout = $1.00 (exactly one bracket wins).
+    """
+    total_cost_per_set = sum(ask for _, ask, _ in bracket_prices) / 100.0  # USD per set
+    if total_cost_per_set <= 0:
+        return 0
+
+    budget = available_usd * BRACKET_ARB_BANKROLL_FRACTION
+    max_sets = int(budget / total_cost_per_set)
+
+    # Also cap by MAX_CONTRACTS per bracket
+    max_sets = min(max_sets, MAX_CONTRACTS)
+
+    # Ensure at least 1 set if we can afford it
+    if max_sets <= 0 and budget >= total_cost_per_set:
+        max_sets = 1
+
+    if max_sets > 0:
+        profit_per_set = 1.00 - total_cost_per_set
+        log.info(
+            f"[BRACKET_ARB] Sizing: {max_sets} sets @ ${total_cost_per_set:.3f}/set "
+            f"profit/set=${profit_per_set:.3f} total_risk=${max_sets * total_cost_per_set:.2f} "
+            f"({max_sets * total_cost_per_set / available_usd:.1%} of bankroll)"
+        )
+
+    return max_sets
+
+
+def manage_bracket_arb_positions(
+    arb: BracketArbState,
+    client,
+    spot: float,
+    secs_to_close: int,
+    sigma: float,
+) -> None:
+    """Monitor bracket arb positions: identify winner, dump losers, hold winner.
+
+    Called every poll cycle while bracket arb is active.
+    """
+    if not arb.is_active or not arb.brackets:
+        return
+
+    undumped = arb.undumped_brackets()
+    if len(undumped) <= 1:
+        # Already down to the winner (or no positions left)
+        return
+
+    # Evaluate each undumped bracket: is it clearly a loser or winner?
+    bracket_probs = []
+    for bp in undumped:
+        lo = bp.floor_strike
+        hi = bp.cap_strike
+        if lo is not None and hi is not None:
+            # Range bracket: YES wins if lo < spot < hi
+            t_eff = max(5.0, float(min(secs_to_close, 120)))
+            sd = sigma * math.sqrt(t_eff)
+            if sd > 0:
+                p_yes = prob_yes_in_range(spot, lo, hi, sd)
+            else:
+                p_yes = 1.0 if lo < spot < hi else 0.0
+        elif lo is not None:
+            # "Above" bracket: YES wins if spot > lo
+            t_eff = max(5.0, float(min(secs_to_close, 120)))
+            sd = sigma * math.sqrt(t_eff)
+            if sd > 0:
+                z = (spot - lo) / sd
+                p_yes = _norm_cdf(z)
+            else:
+                p_yes = 1.0 if spot > lo else 0.0
+        elif hi is not None:
+            # "Below" bracket: YES wins if spot < hi
+            t_eff = max(5.0, float(min(secs_to_close, 120)))
+            sd = sigma * math.sqrt(t_eff)
+            if sd > 0:
+                z = (hi - spot) / sd
+                p_yes = _norm_cdf(z)
+            else:
+                p_yes = 1.0 if spot < hi else 0.0
+        else:
+            p_yes = 0.33  # Can't determine, assume equal
+
+        bracket_probs.append((bp, p_yes))
+
+    # Sort by probability descending — highest prob is the likely winner
+    bracket_probs.sort(key=lambda x: x[1], reverse=True)
+
+    winner_bp, winner_prob = bracket_probs[0]
+    losers = bracket_probs[1:]
+
+    log.info(
+        f"[BRACKET_ARB] Monitoring: winner={winner_bp.market_ticker.split('-')[-1]} "
+        f"p={winner_prob:.1%} | losers: "
+        + ", ".join(f"{bp.market_ticker.split('-')[-1]}={p:.1%}" for bp, p in losers)
+        + f" | t={secs_to_close}s spot={spot}"
+    )
+
+    # Dump losers when their probability drops below threshold
+    for bp, p_yes in losers:
+        if p_yes < BRACKET_ARB_DUMP_PROB_THRESHOLD and not bp.is_dumped:
+            log.warning(
+                f"[BRACKET_ARB] DUMPING loser {bp.market_ticker} "
+                f"p={p_yes:.1%}<{BRACKET_ARB_DUMP_PROB_THRESHOLD:.0%} "
+                f"entry={bp.entry_price_cents}¢ qty={bp.qty}"
+            )
+            try:
+                # Market sell at 1¢ (accept any bid)
+                payload = build_order_payload(
+                    market_ticker=bp.market_ticker,
+                    action="sell",
+                    side="yes",
+                    price_cents=1,
+                    count=bp.qty,
+                    post_only=False,
+                )
+                if not DRY_RUN:
+                    oid = place_order(client, payload)
+                    log.warning(f"[BRACKET_ARB] Dump order placed: {oid}")
+                    # Check fill
+                    fill_status, filled = wait_for_fill(client, oid, bp.market_ticker)
+                    if fill_status in ("filled", "partial") and filled > 0:
+                        # Try to get actual exit price from order
+                        try:
+                            order_data = get_order(client, oid)
+                            exit_cents = order_data.get("yes_price") or order_data.get("no_price") or 1
+                        except Exception:
+                            exit_cents = 1
+                        bp.dump_price_cents = int(exit_cents)
+                        bp.is_dumped = True
+                        log.warning(
+                            f"[BRACKET_ARB] Dumped {bp.market_ticker}: "
+                            f"exit={bp.dump_price_cents}¢ loss={(bp.entry_price_cents or 0) - bp.dump_price_cents}¢/contract"
+                        )
+                    else:
+                        log.warning(f"[BRACKET_ARB] Dump not filled for {bp.market_ticker} (status={fill_status})")
+                else:
+                    bp.is_dumped = True
+                    bp.dump_price_cents = 0
+                    log.info(f"[BRACKET_ARB] DRY_RUN: would dump {bp.market_ticker}")
+            except Exception as e:
+                log.warning(f"[BRACKET_ARB] Dump failed for {bp.market_ticker}: {e}")
+
+    # Track the winner
+    if winner_prob >= BRACKET_ARB_WINNER_PROB_THRESHOLD:
+        arb.winner_ticker = winner_bp.market_ticker
+        remaining = arb.undumped_brackets()
+        if len(remaining) == 1:
+            log.warning(
+                f"[BRACKET_ARB] Winner identified: {winner_bp.market_ticker} "
+                f"p={winner_prob:.1%} — holding to settlement"
+            )
+
+
+def settle_bracket_arb(
+    arb: BracketArbState,
+    client,
+    session: 'SessionState',
+) -> None:
+    """Settle a bracket arb — check results and record P&L for all brackets."""
+    if not arb.brackets:
+        return
+
+    total_pnl_cents = 0
+    for bp in arb.brackets:
+        if bp.qty == 0 or bp.entry_price_cents is None:
+            continue
+
+        if bp.is_dumped:
+            # Already exited — P&L = dump_price - entry_price per contract
+            pnl = ((bp.dump_price_cents or 0) - bp.entry_price_cents) * bp.qty
+            total_pnl_cents += pnl
+            continue
+
+        # Still held — check settlement result
+        result = None
+        try:
+            mkt_data = client.request("GET", f"/markets/{bp.market_ticker}")
+            mkt_obj = mkt_data.get("market", mkt_data) if isinstance(mkt_data, dict) else {}
+            result = mkt_obj.get("result", "").lower()
+        except Exception as e:
+            log.warning(f"[BRACKET_ARB] Settlement check failed for {bp.market_ticker}: {e}")
+
+        if result == "yes":
+            pnl = (100 - bp.entry_price_cents) * bp.qty  # Winner!
+        elif result == "no":
+            pnl = -bp.entry_price_cents * bp.qty  # Loser (should have been dumped)
+        else:
+            pnl = 0  # Unknown — will be handled by deferred settlement
+            log.warning(f"[BRACKET_ARB] Result not available for {bp.market_ticker}")
+
+        total_pnl_cents += pnl
+
+    pnl_usd = total_pnl_cents / 100.0
+    session.record_trade(
+        market=f"BRACKET_ARB:{arb.event_ticker}",
+        side="yes",
+        entry_price=arb.total_cost_cents() if arb.brackets else 0,
+        exit_price=100,  # One bracket settles at 100
+        qty=arb.total_qty_per_bracket,
+        pnl_cents=total_pnl_cents,
+        was_dump=False,
+    )
+    log.warning(
+        f"[BRACKET_ARB] Settled {arb.event_ticker}: "
+        f"total_pnl={total_pnl_cents}¢ (${pnl_usd:.2f}) "
+        f"winner={arb.winner_ticker}"
+    )
+
+    arb.all_settled = True
+
+
 # -----------------------------
 # Health check server for Render deploy
 # Render needs an HTTP endpoint to confirm the service is alive.
@@ -2414,6 +2820,10 @@ def main() -> None:
     prob_trend = ProbTrend()
     active_market_obj: Dict[str, Any] = {}
 
+    # Bracket arbitrage state
+    bracket_arb = BracketArbState()
+    _all_event_markets: List[Dict[str, Any]] = []  # Cache of all markets for current event
+
     # Initialize session with starting balance
     try:
         av, tot = get_balance_usd(client)
@@ -2430,7 +2840,8 @@ def main() -> None:
     last_ob_warn = 0.0
     last_heartbeat = 0.0
 
-    def refresh_active_market() -> Tuple[str, str, Dict[str, Any]]:
+    def refresh_active_market() -> Tuple[str, str, Dict[str, Any], List[Dict[str, Any]]]:
+        """Returns (event_ticker, market_ticker, market_obj, all_markets)."""
         if MARKET_OVERRIDE and MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
             mt = MARKET_OVERRIDE
             try:
@@ -2439,7 +2850,7 @@ def main() -> None:
             except Exception:
                 mobj = {}
             ev = EVENT_TICKER if EVENT_TICKER != "<auto>" else "<manual>"
-            return ev, mt, mobj
+            return ev, mt, mobj, [mobj] if mobj else []
 
         params = {"series_ticker": SERIES_TICKER, "status": "open", "limit": 200}
         resp = client.request("GET", "/markets", params=params)
@@ -2447,7 +2858,7 @@ def main() -> None:
         if not markets:
             raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
         ev, mt, mobj = pick_active_market(markets)
-        return ev, mt, mobj
+        return ev, mt, mobj, markets
 
     def reconcile_on_market_change(new_market: str) -> None:
         if BOOTSTRAP_CANCEL_OPEN_ORDERS or CANCEL_ALL_STRAYS_ALWAYS:
@@ -2481,7 +2892,7 @@ def main() -> None:
         st.target_price = None
         st.qty = 0
 
-    ev, mt, mobj = refresh_active_market()
+    ev, mt, mobj, _all_event_markets = refresh_active_market()
     active_market_obj = mobj or {}
     st.market = mt
     st.event = ev
@@ -2563,7 +2974,7 @@ def main() -> None:
 
         if (now - last_meta) >= META_REFRESH_SECONDS:
             try:
-                ev2, mt2, mobj2 = refresh_active_market()
+                ev2, mt2, mobj2, _all_event_markets = refresh_active_market()
                 if mt2 != st.market:
                     old_market = st.market
                     log.warning(f"[ROLL] {old_market} -> {mt2}")
@@ -2646,6 +3057,12 @@ def main() -> None:
                                 was_dump=False,
                             )
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
+
+                    # Settle bracket arb if active
+                    if bracket_arb.is_active:
+                        log.warning(f"[BRACKET_ARB] Market rolling — settling bracket arb for {bracket_arb.event_ticker}")
+                        settle_bracket_arb(bracket_arb, client, session)
+                        bracket_arb.reset()
 
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
@@ -3063,6 +3480,119 @@ def main() -> None:
             last_meta = 0.0
             time.sleep(POLL_SECONDS)
             continue
+
+        # ============================================================
+        # BRACKET ARBITRAGE — buy all 3 brackets, dump 2 losers, hold 1 winner
+        # Runs as an alternative strategy when conditions are right.
+        # Does NOT conflict with regular single-market trading (separate state).
+        # ============================================================
+        if BRACKET_ARB_ENABLED and secs_to_close is not None:
+            # --- MANAGE active bracket arb positions ---
+            if bracket_arb.is_active:
+                spot_arb = fetch_shib_spot_usd(http)
+                if spot_arb is not None:
+                    sigma_arb = get_sigma_cached(http)
+                    manage_bracket_arb_positions(
+                        bracket_arb, client, spot_arb, secs_to_close, sigma_arb,
+                    )
+
+                # Check if market is rolling (bracket arb needs settlement)
+                if secs_to_close <= 0:
+                    settle_bracket_arb(bracket_arb, client, session)
+                    bracket_arb.reset()
+
+            # --- EVALUATE new bracket arb opportunity ---
+            elif (
+                not st.traded_this_market
+                and not bracket_arb.is_active
+                and secs_to_close <= BRACKET_ARB_MAX_SECONDS
+                and secs_to_close >= BRACKET_ARB_MIN_SECONDS
+            ):
+                # Find sibling brackets for this event
+                event_tk = st.event
+                if event_tk and _all_event_markets:
+                    siblings = find_event_brackets(_all_event_markets, event_tk)
+                    if len(siblings) >= BRACKET_ARB_MIN_BRACKETS:
+                        should_arb, bracket_prices, arb_reason = evaluate_bracket_arb(
+                            siblings, client, session.current_balance_usd, secs_to_close,
+                        )
+
+                        if should_arb and bracket_prices:
+                            qty_per_bracket = compute_bracket_arb_qty(
+                                session.current_balance_usd, bracket_prices,
+                            )
+
+                            if qty_per_bracket > 0:
+                                log.warning(
+                                    f"[BRACKET_ARB] ENTERING — {len(bracket_prices)} brackets × {qty_per_bracket} contracts | {arb_reason}"
+                                )
+
+                                # Buy YES on all brackets
+                                all_filled = True
+                                bracket_arb.event_ticker = event_tk
+                                bracket_arb.total_qty_per_bracket = qty_per_bracket
+                                bracket_arb.entry_time = time.time()
+
+                                for ticker, ask_cents, mobj_b in bracket_prices:
+                                    lo_b, hi_b = market_bounds_usd(mobj_b)
+                                    bp = BracketPosition(
+                                        market_ticker=ticker,
+                                        event_ticker=event_tk,
+                                        floor_strike=lo_b,
+                                        cap_strike=hi_b,
+                                        market_obj=mobj_b,
+                                    )
+
+                                    try:
+                                        payload = build_order_payload(
+                                            market_ticker=ticker,
+                                            action="buy",
+                                            side="yes",
+                                            price_cents=ask_cents,
+                                            count=qty_per_bracket,
+                                            post_only=False,
+                                        )
+                                        if not DRY_RUN:
+                                            oid = place_order(client, payload)
+                                            fill_status, filled = wait_for_fill(client, oid, ticker)
+                                            if fill_status in ("filled", "partial") and filled > 0:
+                                                bp.qty = filled
+                                                bp.entry_price_cents = ask_cents
+                                                bp.order_id = oid
+                                                log.warning(
+                                                    f"[BRACKET_ARB] Filled {ticker}: {filled} @ {ask_cents}¢"
+                                                )
+                                            else:
+                                                log.warning(
+                                                    f"[BRACKET_ARB] NOT filled {ticker} (status={fill_status}) — canceling"
+                                                )
+                                                cancel_order_status(client, oid)
+                                                all_filled = False
+                                        else:
+                                            bp.qty = qty_per_bracket
+                                            bp.entry_price_cents = ask_cents
+                                            log.info(f"[BRACKET_ARB] DRY_RUN: would buy {ticker} @ {ask_cents}¢ × {qty_per_bracket}")
+                                    except Exception as e:
+                                        log.warning(f"[BRACKET_ARB] Order failed for {ticker}: {e}")
+                                        all_filled = False
+
+                                    bracket_arb.brackets.append(bp)
+
+                                # Check if we got any fills
+                                filled_brackets = [b for b in bracket_arb.brackets if b.qty > 0]
+                                if filled_brackets:
+                                    bracket_arb.is_active = True
+                                    # Mark the primary market as traded so we don't also enter directionally
+                                    st.traded_this_market = True
+                                    total_cost = bracket_arb.total_invested_usd()
+                                    log.warning(
+                                        f"[BRACKET_ARB] Active: {len(filled_brackets)}/{len(bracket_prices)} brackets filled "
+                                        f"total_cost=${total_cost:.2f} "
+                                        f"guaranteed_pnl=${bracket_arb.total_qty_per_bracket * 1.00 - total_cost:.2f}"
+                                    )
+                                else:
+                                    log.warning(f"[BRACKET_ARB] No brackets filled — aborting")
+                                    bracket_arb.reset()
 
         # ============================================================
         # PHASE 1: IDLE — too early to even observe
