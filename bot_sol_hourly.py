@@ -142,11 +142,11 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # Placing a 99¢ bid with no sellers = zero fills = zero profit. Enter at
 # T-1200s when probability is high AND the book still has liquidity.
 #
-# TWO PHASES:
-#   OBSERVE (48min → 28min before close): gather trend data, watch book, DON'T buy
-#   BUY     (28min → 5s before close):    make the call, place the order, hold
-OBSERVE_START_SECONDS = 2880  # Start watching at 48min — gather trend + prob data
-BUY_START_SECONDS = 1680      # Can enter from T-1680s (28 min) — book has liquidity
+# TWO PHASES (3-hour markets, e.g. 2 PM → 5 PM):
+#   OBSERVE (2hr → 90min before close): gather trend data, watch book, DON'T buy
+#   BUY     (90min → 5s before close):   make the call, place the order, hold
+OBSERVE_START_SECONDS = 7200  # Start watching at 2hr — gather trend + prob data
+BUY_START_SECONDS = 5400      # Can enter from T-5400s (90 min) — book has liquidity
 ENTRY_LAST_SECONDS = 5        # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
@@ -157,20 +157,20 @@ EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penn
 MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 28-min buy window) --------
-# Buy window is 28min → 5s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 90-min buy window) --------
+# Buy window is 90min → 5s before close. Require more certainty at the start
 # of the buy window (SOL still has time to move), relax near the end.
-# NOTE: observation phase (48min → 28min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 1200  # 20-28 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >20min: need 90%+
-PROB_MID_ENTRY_SECONDS = 720     # 12-20 min to close = "mid"
-PROB_MID_MIN = 0.86              # 12-20min: need 86%+
-# <12 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+# NOTE: observation phase (2hr → 90min) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 3600  # 60-90 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.90            # >60min: need 90%+
+PROB_MID_ENTRY_SECONDS = 2400    # 40-60 min to close = "mid"
+PROB_MID_MIN = 0.86              # 40-60min: need 86%+
+# <40 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
 # When prob is high (90%+), the outcome speaks for itself — skip trend checks.
-PROB_TREND_WINDOW_SECONDS = 180   # Look at last 3 min of probability (wider for hourly)
+PROB_TREND_WINDOW_SECONDS = 300   # Look at last 5 min of probability (wider for 3-hour markets)
 PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
@@ -185,12 +185,12 @@ PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend chec
 PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
-# Prevents snap entries on transient orderbook spikes at T-1680s.
-# At T-1200s to T-720s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 30   # Signal must persist for 30s before early commitment (wider for hourly)
-CONFIRMATION_HOLD_MIN_TIME = 720  # Only require confirmation hold above 12 min to close
+# Prevents snap entries on transient orderbook spikes at T-5400s.
+# At T-3600s to T-2400s, prob must have been on the same side for this many seconds.
+CONFIRMATION_HOLD_SECONDS = 60   # Signal must persist for 60s before early commitment (3-hour markets)
+CONFIRMATION_HOLD_MIN_TIME = 2400  # Only require confirmation hold above 40 min to close
 
-SPOT_SIGMA_USD_PER_SQRT_SEC = 0.08  # SOL ~$200, ~2x BTC % vol → 0.08 USD/√sec (hourly move ~$4.8 = ~2.4%)
+SPOT_SIGMA_USD_PER_SQRT_SEC = 0.08  # SOL ~$200, ~2x BTC % vol → 0.08 USD/√sec (3hr move ~$8.3 = ~4.2%)
 
 # -------------- KELLY BANKROLL SIZING (HARDWIRED) --------------
 # Philosophy: size by BANKROLL FRACTION using Kelly criterion.
@@ -247,9 +247,9 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
 # NO side:  spot < hi - buffer → SOL is safely below range ceiling → HOLD
 # If SOL is on our side, the book is lying (thin book, spike, manipulation).
 # ONLY bail if SOL has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 1.50   # >8min to close: need $1.50 buffer (SOL-scaled from BTC's $75)
-DUMP_BTC_SAFE_BUFFER_LATE = 0.80    # <8min to close: need $0.80 buffer (SOL-scaled from BTC's $40)
-DUMP_BTC_SAFE_CUTOFF_SECONDS = 480  # Boundary between early/late buffer (scaled 4x for hourly)
+DUMP_BTC_SAFE_BUFFER_EARLY = 3.00   # >30min to close: need $3.00 buffer (SOL can move a lot in 3hr)
+DUMP_BTC_SAFE_BUFFER_LATE = 1.50    # <30min to close: need $1.50 buffer (convergence zone)
+DUMP_BTC_SAFE_CUTOFF_SECONDS = 1800 # Boundary between early/late buffer (30 min for 3-hour markets)
 
 # -------------- REVERSAL BAIL (only after BTC check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
@@ -275,8 +275,8 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 30      # 30s grace period (scaled for hourly — wider swings)
-DUMP_PROACTIVE_AFTER_SECONDS = 90   # Proactive bail after 90s (scaled for hourly markets)
+DUMP_GRACE_PERIOD_SECONDS = 60      # 60s grace period (3-hour markets — wider swings)
+DUMP_PROACTIVE_AFTER_SECONDS = 180  # Proactive bail after 180s (3-hour markets)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
 DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after BTC check (was 15¢ — tighter to salvage more)
@@ -288,7 +288,7 @@ DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matte
 # All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
 # false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
 # Use a rolling window max instead: peak = max(prob over last N seconds).
-DUMP_PEAK_WINDOW_SECONDS = 60  # Use max prob over last 60s as "peak" (wider for hourly)
+DUMP_PEAK_WINDOW_SECONDS = 120  # Use max prob over last 120s as "peak" (wider for 3-hour markets)
 
 # -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
 # If probability drops very fast (>4% in 10s), something is seriously wrong.
@@ -305,7 +305,7 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 #         than a fresh entry — this is a recovery play, not a new trade.
 #         We already took the loss; the question is "can I claw some back?"
 FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 60        # Need time to place the order and settle (scaled for hourly)
+FLIP_MIN_TIME_REMAINING = 180       # Need time to place the order and settle (3-hour markets)
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
 FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
 
@@ -320,7 +320,7 @@ FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contrac
 #   Lose (BTC reverses $300+ in 60s): -$32.67
 # Over 96 markets/day: ~$31/day extra income if hit rate matches.
 SCALP_ENABLED = True
-SCALP_MAX_SECONDS = 180            # Only scalp in the last 3 minutes (scaled for hourly)
+SCALP_MAX_SECONDS = 600            # Only scalp in the last 10 minutes (scaled for 3-hour markets)
 SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
 SCALP_MIN_DISTANCE_USD = 1.00      # SOL must be ≥$1.00 from strike (SOL-scaled from BTC's $50)
 # Distance tiers: farther from strike = more aggressive sizing
@@ -368,23 +368,23 @@ A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = even small edge at 90%+ pro
 A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Go big — 90%+ prob is as sure as it gets
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
-HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 60)  # Last 60s for hourly (scaled from 15s)
+HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 180)  # Last 3 min for 3-hour markets
 HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 720)    # Last 12 min only — scaled 4x for hourly markets
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 1800)   # Last 30 min only — scaled for 3-hour markets
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
-LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 60)  # Last 60s for hourly
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 180)  # Last 3 min for 3-hour markets
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 1.00)  # $1.00 buffer — SOL-aware bail is the real safety net during hold
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
-LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 60)  # Last 60s for hourly
+LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 180)  # Last 3 min for 3-hour markets
 
 # -------------- TREND TRACKING (know what BTC is doing) --------------
 TREND_WINDOW_MINUTES = 60          # Long-term trend: 60 min (~4 markets)
@@ -1862,7 +1862,7 @@ def should_dump_position(
     # CRITICAL FIX: Even within hold window, if BTC is near the boundary,
     # allow dump logic to run. Blindly holding while BTC drifts toward the
     # strike is how -$3.84 losses happen.
-    HOLD_TO_SETTLE_SECONDS = 120  # Only suppress dumps in the last 2 min (scaled for hourly)
+    HOLD_TO_SETTLE_SECONDS = 300  # Only suppress dumps in the last 5 min (scaled for 3-hour markets)
     HOLD_BTC_DANGER_BUFFER = 1.50  # If SOL is within $1.50 of boundary, DON'T suppress dumps
     if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
         # Check if BTC is dangerously close to boundary — if so, let dump logic run
@@ -3098,7 +3098,7 @@ def main() -> None:
             continue
 
         # ============================================================
-        # PHASE 3: BUY WINDOW — last 7 min, make the call
+        # PHASE 3: BUY WINDOW — last 90 min, make the call
         # By now we have 5 minutes of trend data to inform the decision
         # ============================================================
         st.sm = SM.ARMED
