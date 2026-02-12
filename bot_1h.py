@@ -829,10 +829,10 @@ def pick_bracket_strikes(
 
     log.warning(
         f"[BRACKET] spot=${spot:.0f} | "
-        f"LOWER: {lower_mt} strike=${lower_strike:.0f if lower_strike else 0} "
-        f"(buy YES, dist=${spot - lower_strike:.0f if lower_strike else 0}) | "
-        f"UPPER: {upper_mt} strike=${upper_strike:.0f if upper_strike else 0} "
-        f"(buy NO, dist=${upper_strike - spot:.0f if upper_strike else 0}) | "
+        f"LOWER: {lower_mt} strike=${f'{lower_strike:.0f}' if lower_strike else '0'} "
+        f"(buy YES, dist=${f'{spot - lower_strike:.0f}' if lower_strike else '0'}) | "
+        f"UPPER: {upper_mt} strike=${f'{upper_strike:.0f}' if upper_strike else '0'} "
+        f"(buy NO, dist=${f'{upper_strike - spot:.0f}' if upper_strike else '0'}) | "
         f"candidates: {len(below_spot)} below, {len(above_spot)} above"
     )
 
