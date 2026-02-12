@@ -2594,7 +2594,7 @@ def main() -> None:
         _current_event_markets = event_markets
 
         spot = fetch_btc_spot_usd(http)
-        log.info(f"[PICK] Spot=${spot:.2f if spot else 'N/A'}, selecting best strike from {len(event_markets)} markets")
+        log.info(f"[PICK] Spot=${f'{spot:.2f}' if spot else 'N/A'}, selecting best strike from {len(event_markets)} markets")
 
         ev, mt, mobj = pick_best_strike(event_markets, spot)
         return ev, mt, mobj
