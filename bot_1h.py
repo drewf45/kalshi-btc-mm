@@ -569,9 +569,32 @@ def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
 
 
 # -----------------------------
-# Market selection / parsing **UNCHANGED**
+# Market selection / parsing
+# MODIFIED FOR MULTI-STRIKE EVENTS (KXBTCD has many strikes per hourly event)
 # -----------------------------
-def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
+def _get_event_ticker(m: Dict[str, Any]) -> str:
+    """Extract the event ticker from a market object."""
+    return str(m.get("event_ticker") or m.get("event", {}).get("ticker") or "")
+
+
+def _get_strike(m: Dict[str, Any]) -> Optional[float]:
+    """Extract the primary strike price from a market.
+    For KXBTCD 'greater' type: floor_strike is the threshold.
+    For KXBTCD 'less' type: cap_strike is the threshold."""
+    for key in ("floor_strike", "lower_strike", "strike_lower", "floor",
+                "cap_strike", "upper_strike", "strike_upper", "cap"):
+        v = m.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                continue
+    return None
+
+
+def pick_active_event_markets(markets: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    """From all open markets, find the soonest-closing event and return ALL
+    markets belonging to that event. This gives us every strike for one hourly window."""
     now_ts = int(time.time())
 
     def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
@@ -584,78 +607,218 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         except Exception:
             return None
 
-    candidates = []
-    skipped_statuses = {}
+    # Group markets by event ticker
+    by_event: Dict[str, List[Dict[str, Any]]] = {}
+    event_close_ts: Dict[str, int] = {}
+    skipped_statuses: Dict[str, int] = {}
+
     for m in markets:
         status = str(m.get("status", "")).lower()
         if status and status not in ("open", "active"):
             skipped_statuses[status] = skipped_statuses.get(status, 0) + 1
             continue
-        ot = get_ts(m, "open_time") or get_ts(m, "open_ts") or get_ts(m, "open_timestamp")
-        ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
-        # If timestamps are ISO strings, parse them
-        if ot is None:
-            for k in ("open_time", "open_ts", "open_timestamp"):
-                v = m.get(k)
-                if isinstance(v, str) and v:
-                    parsed = _parse_iso_to_epoch_s(v)
-                    if parsed is not None:
-                        ot = parsed
-                        break
-        if ct is None:
-            for k in ("close_time", "close_ts", "close_timestamp"):
-                v = m.get(k)
-                if isinstance(v, str) and v:
-                    parsed = _parse_iso_to_epoch_s(v)
-                    if parsed is not None:
-                        ct = parsed
-                        break
-        # Last resort: infer close_ts from ticker
-        ticker = m.get("ticker") or m.get("market_ticker") or ""
-        if ct is None and ticker:
-            ct = infer_close_ts_from_ticker(ticker, interval_minutes=60)
-        candidates.append((ot, ct, m))
+
+        ev = _get_event_ticker(m)
+        if not ev:
+            continue
+
+        if ev not in by_event:
+            by_event[ev] = []
+        by_event[ev].append(m)
+
+        # Track close time per event
+        if ev not in event_close_ts:
+            ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
+            if ct is None:
+                for k in ("close_time", "close_ts", "close_timestamp"):
+                    v = m.get(k)
+                    if isinstance(v, str) and v:
+                        parsed = _parse_iso_to_epoch_s(v)
+                        if parsed is not None:
+                            ct = parsed
+                            break
+            if ct is None:
+                ticker = m.get("ticker") or m.get("market_ticker") or ""
+                ct = infer_close_ts_from_ticker(ticker, interval_minutes=60)
+            if ct is not None:
+                event_close_ts[ev] = ct
+
     if skipped_statuses:
         log.info(f"[PICK] skipped statuses: {skipped_statuses}")
 
-    active = []
-    future = []
-    past = []
-    for ot, ct, m in candidates:
-        ticker = m.get("ticker") or m.get("market_ticker") or "?"
-        if ot is not None and ct is not None and ot <= now_ts < ct:
-            active.append((ct, m))
-        elif ct is not None and ct > now_ts:
-            future.append((ct, m))
+    if not by_event:
+        raise RuntimeError("No valid events found in markets")
+
+    # Separate events into active vs future vs past
+    active_events = []
+    future_events = []
+    past_events = []
+    for ev, mlist in by_event.items():
+        ct = event_close_ts.get(ev)
+        if ct is None:
+            continue
+        if ct > now_ts:
+            # Check if any market in this event is currently open
+            active_events.append((ct, ev, mlist))
         else:
-            past.append((ct or 0, m))
+            past_events.append((ct, ev, mlist))
 
-    log.info(f"[PICK] total_markets={len(markets)} candidates={len(candidates)} active={len(active)} future={len(future)} past={len(past)}")
+    log.info(
+        f"[PICK] total_markets={len(markets)} events={len(by_event)} "
+        f"active_events={len(active_events)} past_events={len(past_events)}"
+    )
 
-    if active:
-        active.sort(key=lambda x: x[0])
-        chosen = active[0][1]
-    elif future:
-        future.sort(key=lambda x: x[0])
-        chosen = future[0][1]
-    elif past:
-        # All markets are closed — pick the one that closed most recently
-        # (closest to rolling into the next market)
-        past.sort(key=lambda x: x[0], reverse=True)
-        chosen = past[0][1]
-        log.warning(f"[PICK] No active/future markets — using most recently closed")
+    # Pick the soonest-closing active event
+    if active_events:
+        active_events.sort(key=lambda x: x[0])
+        chosen_ct, chosen_ev, chosen_markets = active_events[0]
+    elif past_events:
+        past_events.sort(key=lambda x: x[0], reverse=True)
+        chosen_ct, chosen_ev, chosen_markets = past_events[0]
+        log.warning(f"[PICK] No active events — using most recently closed: {chosen_ev}")
     else:
-        chosen = markets[0] if markets else {}
-        if not chosen:
-            raise RuntimeError("No markets available to pick from.")
+        raise RuntimeError("No events with valid close times")
 
-    market_ticker = chosen.get("ticker") or chosen.get("market_ticker")
-    event_ticker = chosen.get("event_ticker") or chosen.get("event", {}).get("ticker") or chosen.get("event_ticker")
+    log.info(
+        f"[PICK] Chosen event={chosen_ev} close_ts={chosen_ct} "
+        f"({len(chosen_markets)} strikes) secs_to_close={chosen_ct - now_ts}"
+    )
 
-    if not market_ticker or not event_ticker:
-        raise RuntimeError(f"Could not determine event/market ticker from market object: {chosen}")
+    return chosen_ev, chosen_markets
 
-    return str(event_ticker), str(market_ticker), chosen
+
+def pick_best_strike(
+    event_markets: List[Dict[str, Any]],
+    spot: Optional[float],
+) -> Tuple[str, str, Dict[str, Any]]:
+    """From all markets in one event, pick the best strike for trading.
+
+    Strategy: pick the strike where BTC spot is on the winning side with enough
+    buffer to be confident, but close enough that the book hasn't pinned to 99/1.
+
+    Target: strike where our side has 80-95% probability (sweet spot for edge).
+    If spot is unknown, fall back to the first market.
+    """
+    if not event_markets:
+        raise RuntimeError("No markets in event to pick from")
+
+    if spot is None:
+        # No spot price — just pick the first one
+        m = event_markets[0]
+        mt = m.get("ticker") or m.get("market_ticker") or ""
+        ev = _get_event_ticker(m)
+        log.warning(f"[PICK STRIKE] No spot price, using first market: {mt}")
+        return ev, mt, m
+
+    # Score each market by how close the strike is to the "sweet spot"
+    # Sweet spot = strike where our side's probability is ~85-92%
+    # This means: spot is safely on one side of the strike, but not so far
+    # that the book has pinned.
+    #
+    # For "above X" (floor_strike only): YES wins if spot > X
+    #   distance = spot - floor_strike
+    #   positive = spot is above strike (YES side is winning)
+    #   negative = spot is below strike (NO side is winning)
+    #
+    # For "below X" (cap_strike only): YES wins if spot < X
+    #   distance = cap_strike - spot
+    #   positive = spot is below strike (YES side is winning)
+    #
+    # We want |distance| in a range where prob ≈ 80-95%.
+    # Too close (|distance| < $200): prob ≈ 50-70%, too uncertain
+    # Sweet spot (|distance| $200-$800): prob ≈ 80-95%, tradeable
+    # Too far (|distance| > $1500): prob ≈ 99%+, book pinned
+
+    TARGET_DIST_MIN = 200.0   # Minimum distance for confidence
+    TARGET_DIST_IDEAL = 500.0 # Ideal distance — ~90% prob, good edge
+    TARGET_DIST_MAX = 1500.0  # Beyond this, book is likely pinned
+
+    scored = []
+    for m in event_markets:
+        strike = _get_strike(m)
+        if strike is None:
+            continue
+
+        mt = m.get("ticker") or m.get("market_ticker") or ""
+        lo, hi = market_bounds_usd(m)
+
+        # Determine distance and which side we'd trade
+        if lo is not None and hi is None:
+            # "above X" market — YES wins if spot > lo
+            distance = spot - lo
+            side = "yes" if distance > 0 else "no"
+        elif hi is not None and lo is None:
+            # "below X" market — YES wins if spot < hi
+            distance = hi - spot
+            side = "yes" if distance > 0 else "no"
+        elif lo is not None and hi is not None:
+            # Range market — pick closer boundary
+            dist_lo = spot - lo
+            dist_hi = hi - spot
+            distance = min(dist_lo, dist_hi)
+            side = "yes" if distance > 0 else "no"
+        else:
+            continue
+
+        abs_dist = abs(distance)
+
+        # Score: how close to ideal distance? Penalize too close AND too far.
+        if abs_dist < TARGET_DIST_MIN:
+            # Too close to strike — uncertain, skip unless nothing else
+            score = abs_dist / TARGET_DIST_MIN * 0.5  # 0-0.5
+        elif abs_dist <= TARGET_DIST_MAX:
+            # Sweet spot — score by closeness to ideal
+            if abs_dist <= TARGET_DIST_IDEAL:
+                score = 0.5 + 0.5 * (abs_dist - TARGET_DIST_MIN) / (TARGET_DIST_IDEAL - TARGET_DIST_MIN)
+            else:
+                score = 1.0 - 0.3 * (abs_dist - TARGET_DIST_IDEAL) / (TARGET_DIST_MAX - TARGET_DIST_IDEAL)
+        else:
+            # Too far — book is pinned, very low score
+            score = max(0.0, 0.3 - (abs_dist - TARGET_DIST_MAX) / 5000.0)
+
+        scored.append((score, abs_dist, side, mt, m))
+
+    if not scored:
+        m = event_markets[0]
+        mt = m.get("ticker") or m.get("market_ticker") or ""
+        ev = _get_event_ticker(m)
+        log.warning(f"[PICK STRIKE] No scored markets, using first: {mt}")
+        return ev, mt, m
+
+    # Sort by score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_dist, best_side, best_mt, best_m = scored[0]
+    ev = _get_event_ticker(best_m)
+
+    # Log top 3 for debugging
+    for i, (sc, dist, side, mt, _) in enumerate(scored[:5]):
+        strike = _get_strike(scored[i][4])
+        log.info(
+            f"[PICK STRIKE] #{i+1}: {mt} strike=${strike:.0f} "
+            f"dist=${dist:.0f} side={side} score={sc:.3f}"
+        )
+
+    log.warning(
+        f"[PICK STRIKE] Best: {best_mt} dist=${best_dist:.0f} "
+        f"side={best_side} score={best_score:.3f} "
+        f"(from {len(scored)} strikes)"
+    )
+
+    return ev, best_mt, best_m
+
+
+# Legacy wrapper for compatibility
+def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
+    """Legacy single-market picker. For multi-strike series, use
+    pick_active_event_markets + pick_best_strike instead."""
+    ev, event_markets = pick_active_event_markets(markets)
+    # Try to get spot for strike selection
+    try:
+        http_tmp = requests.Session()
+        spot = fetch_btc_spot_usd(http_tmp)
+    except Exception:
+        spot = None
+    return pick_best_strike(event_markets, spot)
 
 
 def extract_close_ts(market_obj: Dict[str, Any], market_ticker: str) -> Optional[int]:
@@ -2403,7 +2566,12 @@ def main() -> None:
     last_ob_warn = 0.0
     last_heartbeat = 0.0
 
+    # Cache of all markets in the current event (for re-picking best strike)
+    _current_event_markets: List[Dict[str, Any]] = []
+
     def refresh_active_market() -> Tuple[str, str, Dict[str, Any]]:
+        nonlocal _current_event_markets
+
         if MARKET_OVERRIDE and MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
             mt = MARKET_OVERRIDE
             try:
@@ -2412,6 +2580,7 @@ def main() -> None:
             except Exception:
                 mobj = {}
             ev = EVENT_TICKER if EVENT_TICKER != "<auto>" else "<manual>"
+            _current_event_markets = [mobj] if mobj else []
             return ev, mt, mobj
 
         params = {"series_ticker": SERIES_TICKER, "status": "open", "limit": 200}
@@ -2419,7 +2588,15 @@ def main() -> None:
         markets = resp.get("markets", []) if isinstance(resp, dict) else []
         if not markets:
             raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
-        ev, mt, mobj = pick_active_market(markets)
+
+        # MULTI-STRIKE: find the active event, then pick the best strike using live spot
+        ev, event_markets = pick_active_event_markets(markets)
+        _current_event_markets = event_markets
+
+        spot = fetch_btc_spot_usd(http)
+        log.info(f"[PICK] Spot=${spot:.2f if spot else 'N/A'}, selecting best strike from {len(event_markets)} markets")
+
+        ev, mt, mobj = pick_best_strike(event_markets, spot)
         return ev, mt, mobj
 
     def reconcile_on_market_change(new_market: str) -> None:
@@ -2454,12 +2631,22 @@ def main() -> None:
         st.target_price = None
         st.qty = 0
 
-    ev, mt, mobj = refresh_active_market()
-    active_market_obj = mobj or {}
-    st.market = mt
-    st.event = ev
-    reconcile_on_market_change(mt)
-    last_meta = time.time()
+    # Initial market discovery — retry if no markets found (KXBTCD may have gaps between events)
+    while True:
+        try:
+            ev, mt, mobj = refresh_active_market()
+            active_market_obj = mobj or {}
+            st.market = mt
+            st.event = ev
+            reconcile_on_market_change(mt)
+            last_meta = time.time()
+            break
+        except RuntimeError as e:
+            if "No open markets" in str(e) or "No valid events" in str(e):
+                log.warning(f"[STARTUP] No markets yet: {e} — retrying in 60s")
+                time.sleep(60.0)
+                continue
+            raise
 
     while True:
         now = time.time()
@@ -2640,6 +2827,24 @@ def main() -> None:
                 else:
                     if isinstance(mobj2, dict) and mobj2:
                         active_market_obj = mobj2
+                    # STRIKE RE-PICK: If we haven't traded yet and BTC has moved,
+                    # re-pick the best strike within the same event.
+                    # This ensures we're always targeting the optimal strike as BTC drifts.
+                    if not st.traded_this_market and _current_event_markets and len(_current_event_markets) > 1:
+                        try:
+                            repick_spot = fetch_btc_spot_usd(http)
+                            if repick_spot is not None:
+                                _, new_mt, new_mobj = pick_best_strike(_current_event_markets, repick_spot)
+                                if new_mt != st.market:
+                                    log.warning(
+                                        f"[REPICK] BTC moved, switching strike: {st.market} -> {new_mt} "
+                                        f"(spot=${repick_spot:.2f})"
+                                    )
+                                    st.market = new_mt
+                                    active_market_obj = new_mobj
+                                    reconcile_on_market_change(new_mt)
+                        except Exception as e:
+                            log.info(f"[REPICK] Strike re-pick failed (non-fatal): {e}")
                 last_meta = now
             except Exception as e:
                 log.warning(f"[ROLL] refresh failed: {e}")
