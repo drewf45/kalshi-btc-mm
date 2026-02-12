@@ -692,119 +692,151 @@ def pick_best_strike(
     spot: Optional[float],
 ) -> Tuple[str, str, Dict[str, Any]]:
     """From all markets in one event, pick the best strike for trading.
-
-    Strategy: pick the strike where BTC spot is on the winning side with enough
-    buffer to be confident, but close enough that the book hasn't pinned to 99/1.
-
-    Target: strike where our side has 80-95% probability (sweet spot for edge).
-    If spot is unknown, fall back to the first market.
+    For bracket strategy, use pick_bracket_strikes instead.
     """
     if not event_markets:
         raise RuntimeError("No markets in event to pick from")
 
     if spot is None:
-        # No spot price — just pick the first one
         m = event_markets[0]
         mt = m.get("ticker") or m.get("market_ticker") or ""
         ev = _get_event_ticker(m)
         log.warning(f"[PICK STRIKE] No spot price, using first market: {mt}")
         return ev, mt, m
 
-    # Score each market by how close the strike is to the "sweet spot"
-    # Sweet spot = strike where our side's probability is ~85-92%
-    # This means: spot is safely on one side of the strike, but not so far
-    # that the book has pinned.
-    #
-    # For "above X" (floor_strike only): YES wins if spot > X
-    #   distance = spot - floor_strike
-    #   positive = spot is above strike (YES side is winning)
-    #   negative = spot is below strike (NO side is winning)
-    #
-    # For "below X" (cap_strike only): YES wins if spot < X
-    #   distance = cap_strike - spot
-    #   positive = spot is below strike (YES side is winning)
-    #
-    # We want |distance| in a range where prob ≈ 80-95%.
-    # Too close (|distance| < $200): prob ≈ 50-70%, too uncertain
-    # Sweet spot (|distance| $200-$800): prob ≈ 80-95%, tradeable
-    # Too far (|distance| > $1500): prob ≈ 99%+, book pinned
-
-    TARGET_DIST_MIN = 200.0   # Minimum distance for confidence
-    TARGET_DIST_IDEAL = 500.0 # Ideal distance — ~90% prob, good edge
-    TARGET_DIST_MAX = 1500.0  # Beyond this, book is likely pinned
+    # Score each market by distance from spot (sweet spot $200-$800)
+    TARGET_DIST_MIN = 200.0
+    TARGET_DIST_IDEAL = 500.0
+    TARGET_DIST_MAX = 1500.0
 
     scored = []
     for m in event_markets:
         strike = _get_strike(m)
         if strike is None:
             continue
-
         mt = m.get("ticker") or m.get("market_ticker") or ""
         lo, hi = market_bounds_usd(m)
-
-        # Determine distance and which side we'd trade
         if lo is not None and hi is None:
-            # "above X" market — YES wins if spot > lo
             distance = spot - lo
-            side = "yes" if distance > 0 else "no"
         elif hi is not None and lo is None:
-            # "below X" market — YES wins if spot < hi
             distance = hi - spot
-            side = "yes" if distance > 0 else "no"
-        elif lo is not None and hi is not None:
-            # Range market — pick closer boundary
-            dist_lo = spot - lo
-            dist_hi = hi - spot
-            distance = min(dist_lo, dist_hi)
-            side = "yes" if distance > 0 else "no"
         else:
             continue
-
         abs_dist = abs(distance)
-
-        # Score: how close to ideal distance? Penalize too close AND too far.
         if abs_dist < TARGET_DIST_MIN:
-            # Too close to strike — uncertain, skip unless nothing else
-            score = abs_dist / TARGET_DIST_MIN * 0.5  # 0-0.5
+            score = abs_dist / TARGET_DIST_MIN * 0.5
         elif abs_dist <= TARGET_DIST_MAX:
-            # Sweet spot — score by closeness to ideal
             if abs_dist <= TARGET_DIST_IDEAL:
                 score = 0.5 + 0.5 * (abs_dist - TARGET_DIST_MIN) / (TARGET_DIST_IDEAL - TARGET_DIST_MIN)
             else:
                 score = 1.0 - 0.3 * (abs_dist - TARGET_DIST_IDEAL) / (TARGET_DIST_MAX - TARGET_DIST_IDEAL)
         else:
-            # Too far — book is pinned, very low score
             score = max(0.0, 0.3 - (abs_dist - TARGET_DIST_MAX) / 5000.0)
-
+        side = "yes" if distance > 0 else "no"
         scored.append((score, abs_dist, side, mt, m))
 
     if not scored:
         m = event_markets[0]
         mt = m.get("ticker") or m.get("market_ticker") or ""
         ev = _get_event_ticker(m)
-        log.warning(f"[PICK STRIKE] No scored markets, using first: {mt}")
         return ev, mt, m
 
-    # Sort by score descending
     scored.sort(key=lambda x: x[0], reverse=True)
     best_score, best_dist, best_side, best_mt, best_m = scored[0]
     ev = _get_event_ticker(best_m)
-
-    # Log top 3 for debugging
     for i, (sc, dist, side, mt, _) in enumerate(scored[:5]):
         strike = _get_strike(scored[i][4])
-        log.info(
-            f"[PICK STRIKE] #{i+1}: {mt} strike=${strike:.0f} "
-            f"dist=${dist:.0f} side={side} score={sc:.3f}"
-        )
+        log.info(f"[PICK STRIKE] #{i+1}: {mt} strike=${strike:.0f} dist=${dist:.0f} side={side} score={sc:.3f}")
+    log.warning(f"[PICK STRIKE] Best: {best_mt} dist=${best_dist:.0f} side={best_side} score={best_score:.3f} (from {len(scored)} strikes)")
+    return ev, best_mt, best_m
+
+
+def pick_bracket_strikes(
+    event_markets: List[Dict[str, Any]],
+    spot: float,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Pick the two OUTER bracket strikes for a dual-sided trade.
+
+    From all strikes in the event, find:
+    - LOWER outer: strike well BELOW spot → buy YES (BTC is above it)
+    - UPPER outer: strike well ABOVE spot → buy NO (BTC is below it)
+
+    We want the outermost tradeable strikes that still have edge (not pinned 99/1).
+    Target: strikes where our side has 80-95% confidence ($300-$1200 from spot).
+
+    Returns: (lower_market_obj, upper_market_obj) — either may be None.
+    """
+    # For KXBTCD "above $X" markets:
+    #   floor_strike = X (the threshold)
+    #   YES wins if BTC > X at settlement
+    #   NO wins if BTC < X at settlement
+    #
+    # Lower bracket: strike < spot → YES side is winning (spot > strike)
+    #   We want the LOWEST strike that is still "tradeable" (not pinned 99/1)
+    #   i.e., strike is $300-$1200 below spot
+    #
+    # Upper bracket: strike > spot → NO side is winning (spot < strike)
+    #   We want the HIGHEST strike that is still "tradeable" (not pinned 99/1)
+    #   i.e., strike is $300-$1200 above spot
+
+    # Tighter sweet spot for bracket: we want the OUTER trades, not deep ITM
+    BRACKET_MIN_DIST = 300.0    # Too close = uncertain, gray area
+    BRACKET_IDEAL_DIST = 700.0  # Ideal = ~85-92% prob, good edge, still has book
+    BRACKET_MAX_DIST = 1500.0   # Beyond this = pinned, no liquidity
+
+    below_spot = []  # (distance, market) — strikes below spot (for YES trades)
+    above_spot = []  # (distance, market) — strikes above spot (for NO trades)
+
+    for m in event_markets:
+        strike = _get_strike(m)
+        if strike is None:
+            continue
+
+        lo, hi = market_bounds_usd(m)
+
+        # KXBTCD "above X": lo = floor_strike, hi = None
+        if lo is not None and hi is None:
+            dist = spot - lo   # positive = spot is above strike
+            if dist >= BRACKET_MIN_DIST and dist <= BRACKET_MAX_DIST:
+                below_spot.append((dist, m))
+            elif -dist >= BRACKET_MIN_DIST and -dist <= BRACKET_MAX_DIST:
+                # strike is above spot: NO side is winning
+                above_spot.append((-dist, m))  # store as positive distance
+        elif hi is not None and lo is None:
+            # "below X": cap_strike — YES wins if spot < hi
+            dist = hi - spot  # positive = spot is below strike
+            if dist >= BRACKET_MIN_DIST and dist <= BRACKET_MAX_DIST:
+                above_spot.append((dist, m))
+            elif -dist >= BRACKET_MIN_DIST and -dist <= BRACKET_MAX_DIST:
+                below_spot.append((-dist, m))
+
+    # Pick the best from each side — closest to ideal distance
+    def pick_best(candidates: List[Tuple[float, Dict]], ideal: float) -> Optional[Dict[str, Any]]:
+        if not candidates:
+            return None
+        # Sort by closeness to ideal distance
+        candidates.sort(key=lambda x: abs(x[0] - ideal))
+        return candidates[0][1]
+
+    lower_market = pick_best(below_spot, BRACKET_IDEAL_DIST)
+    upper_market = pick_best(above_spot, BRACKET_IDEAL_DIST)
+
+    # Log what we found
+    lower_strike = _get_strike(lower_market) if lower_market else None
+    upper_strike = _get_strike(upper_market) if upper_market else None
+    lower_mt = (lower_market.get("ticker") or "") if lower_market else "None"
+    upper_mt = (upper_market.get("ticker") or "") if upper_market else "None"
 
     log.warning(
-        f"[PICK STRIKE] Best: {best_mt} dist=${best_dist:.0f} "
-        f"side={best_side} score={best_score:.3f} "
-        f"(from {len(scored)} strikes)"
+        f"[BRACKET] spot=${spot:.0f} | "
+        f"LOWER: {lower_mt} strike=${lower_strike:.0f if lower_strike else 0} "
+        f"(buy YES, dist=${spot - lower_strike:.0f if lower_strike else 0}) | "
+        f"UPPER: {upper_mt} strike=${upper_strike:.0f if upper_strike else 0} "
+        f"(buy NO, dist=${upper_strike - spot:.0f if upper_strike else 0}) | "
+        f"candidates: {len(below_spot)} below, {len(above_spot)} above"
     )
 
-    return ev, best_mt, best_m
+    return lower_market, upper_market
 
 
 # Legacy wrapper for compatibility
@@ -1691,6 +1723,16 @@ class BotState:
     pending_settlement_qty: int = 0
     pending_settlement_was_flip: bool = False
     pending_settlement_ts: float = 0.0  # When we started waiting
+
+    # BRACKET STRATEGY: second position on the other outer strike
+    # When we trade the lower outer (YES), we also trade the upper outer (NO).
+    market2: Optional[str] = None          # Second market ticker (the other outer strike)
+    market2_obj: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    side2: Optional[str] = None            # Side for second position ("yes" or "no")
+    entry_price_cents2: Optional[int] = None
+    qty2: int = 0
+    entry_time2: float = 0.0
+    traded_bracket: bool = False           # True once second leg is placed
 
     last_p_yes: Optional[float] = None
     last_edge_yes: Optional[float] = None
@@ -2589,14 +2631,41 @@ def main() -> None:
         if not markets:
             raise RuntimeError(f"No open markets returned for series_ticker={SERIES_TICKER}")
 
-        # MULTI-STRIKE: find the active event, then pick the best strike using live spot
+        # MULTI-STRIKE: find the active event, then pick BRACKET strikes
         ev, event_markets = pick_active_event_markets(markets)
         _current_event_markets = event_markets
 
         spot = fetch_btc_spot_usd(http)
-        log.info(f"[PICK] Spot=${f'{spot:.2f}' if spot else 'N/A'}, selecting best strike from {len(event_markets)} markets")
+        log.info(f"[PICK] Spot=${f'{spot:.2f}' if spot else 'N/A'}, selecting bracket strikes from {len(event_markets)} markets")
 
+        if spot is not None:
+            lower_m, upper_m = pick_bracket_strikes(event_markets, spot)
+
+            # Primary market = lower outer (buy YES — BTC is above the strike)
+            # Secondary market = upper outer (buy NO — BTC is below the strike)
+            if lower_m is not None:
+                mt = lower_m.get("ticker") or lower_m.get("market_ticker") or ""
+                st.market2_obj = upper_m  # Store upper for second leg
+                if upper_m:
+                    st.market2 = upper_m.get("ticker") or upper_m.get("market_ticker") or ""
+                    log.warning(f"[BRACKET] Primary={mt} (YES) Secondary={st.market2} (NO)")
+                else:
+                    st.market2 = None
+                    log.warning(f"[BRACKET] Primary={mt} (YES) — no upper strike found")
+                return ev, mt, lower_m
+            elif upper_m is not None:
+                # Only upper strike found — trade it as primary
+                mt = upper_m.get("ticker") or upper_m.get("market_ticker") or ""
+                st.market2 = None
+                st.market2_obj = None
+                log.warning(f"[BRACKET] Only upper strike: {mt} (NO) — no lower strike found")
+                return ev, mt, upper_m
+
+        # Fallback: use single-strike picker if bracket fails
+        log.warning(f"[BRACKET] Bracket pick failed, falling back to single-strike")
         ev, mt, mobj = pick_best_strike(event_markets, spot)
+        st.market2 = None
+        st.market2_obj = None
         return ev, mt, mobj
 
     def reconcile_on_market_change(new_market: str) -> None:
@@ -2630,6 +2699,13 @@ def main() -> None:
         st.side = None
         st.target_price = None
         st.qty = 0
+        # Reset bracket state
+        st.market2 = None
+        st.market2_obj = None
+        st.side2 = None
+        st.entry_price_cents2 = None
+        st.qty2 = 0
+        st.traded_bracket = False
 
     # Initial market discovery — retry if no markets found (KXBTCD may have gaps between events)
     while True:
@@ -2652,8 +2728,11 @@ def main() -> None:
         now = time.time()
 
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
+            bracket_info = ""
+            if st.market2 and st.traded_bracket:
+                bracket_info = f" BRACKET: leg2={st.market2} {st.side2 or '?'} qty={st.qty2}"
             log.warning(
-                f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market} | "
+                f"[HEARTBEAT] market={st.market} sm={st.sm} traded={st.traded_this_market}{bracket_info} | "
                 f"SESSION: pnl=${session.daily_pnl_usd:.2f} bankroll=${session.current_balance_usd:.2f} "
                 f"W/L={session.total_wins}/{session.total_losses} "
                 f"streak={session.consecutive_wins}W | {prob_trend.summary()}"
@@ -2807,6 +2886,37 @@ def main() -> None:
                             )
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
 
+                        # BRACKET LEG 2 P&L: if we had a second position, compute its result too
+                        if st.market2 and st.side2 and st.qty2 > 0 and st.entry_price_cents2 is not None:
+                            # The second leg is on a DIFFERENT market (different strike, same event)
+                            # Check its result separately
+                            try:
+                                leg2_data = client.request("GET", f"/markets/{st.market2}")
+                                leg2_obj = leg2_data.get("market", leg2_data) if isinstance(leg2_data, dict) else {}
+                                leg2_result = leg2_obj.get("result", "").lower()
+                                if leg2_result in ("yes", "no"):
+                                    if leg2_result == st.side2:
+                                        leg2_pnl = (100 - st.entry_price_cents2) * st.qty2
+                                    else:
+                                        leg2_pnl = -st.entry_price_cents2 * st.qty2
+                                    session.record_trade(
+                                        market=st.market2,
+                                        side=st.side2,
+                                        entry_price=st.entry_price_cents2,
+                                        exit_price=100 if leg2_result == st.side2 else 0,
+                                        qty=st.qty2,
+                                        pnl_cents=leg2_pnl,
+                                        was_dump=False,
+                                    )
+                                    log.warning(
+                                        f"[ROLL BRACKET] Settled {st.market2}: {st.side2.upper()} "
+                                        f"result={leg2_result} pnl={leg2_pnl}¢"
+                                    )
+                                else:
+                                    log.warning(f"[ROLL BRACKET] {st.market2} result not available yet: '{leg2_result}'")
+                            except Exception as e:
+                                log.warning(f"[ROLL BRACKET] Failed to check second leg result: {e}")
+
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
                     prob_trend.reset(mt2)
@@ -2823,6 +2933,13 @@ def main() -> None:
                     st.target_price = None
                     st.qty = 0
                     st.entry_price_cents = None
+                    # Reset bracket state
+                    st.market2 = None
+                    st.market2_obj = None
+                    st.side2 = None
+                    st.entry_price_cents2 = None
+                    st.qty2 = 0
+                    st.traded_bracket = False
                     reconcile_on_market_change(mt2)
                 else:
                     if isinstance(mobj2, dict) and mobj2:
@@ -3569,6 +3686,95 @@ def main() -> None:
                     cancel_order_status(client, oid)
                 else:
                     log.warning(f"[FILL] Full fill confirmed: {filled_qty} contracts")
+
+                # === BRACKET LEG 2: Trade the other outer strike ===
+                if st.market2 and st.market2_obj and not st.traded_bracket:
+                    try:
+                        log.warning(f"[BRACKET LEG2] First leg filled. Placing second leg on {st.market2}...")
+                        # Fetch orderbook for the second strike
+                        ob2 = client.request("GET", f"/markets/{st.market2}/orderbook")
+                        y2_bid, y2_ask, n2_bid, n2_ask = parse_best_yes_no(ob2)
+                        lo2, hi2 = market_bounds_usd(st.market2_obj)
+
+                        # Determine side: if first leg was YES (lower strike), second is NO (upper strike)
+                        # If first leg was NO, second is YES
+                        leg2_side = "no" if chosen_side == "yes" else "yes"
+                        leg2_ask = n2_ask if leg2_side == "no" else y2_ask
+
+                        # Also compute prob for the second strike
+                        t_eff2 = max(5.0, float(min(secs_to_close, 1800)))
+                        sd2 = sigma_used * math.sqrt(t_eff2)
+                        p_yes2 = prob_yes_in_range(spot, lo2, hi2, sd2)
+                        p2_mkt = implied_prob_from_book(y2_bid, y2_ask, n2_bid, n2_ask)
+
+                        if p2_mkt is not None:
+                            # For second leg, trust market heavily
+                            leg2_p_yes = 0.1 * p_yes2 + 0.9 * p2_mkt
+                        else:
+                            leg2_p_yes = p_yes2
+                        leg2_prob = (1.0 - leg2_p_yes) if leg2_side == "no" else leg2_p_yes
+
+                        # Check if second leg is tradeable
+                        if leg2_ask is not None and leg2_prob >= 0.75 and leg2_ask <= MAX_ENTRY_PRICE_CENTS:
+                            # Size the second leg: use half remaining bankroll (split between both legs)
+                            avail2, _ = get_balance_usd(client)
+                            if avail2 and avail2 >= MIN_FREE_USD_TO_TRADE:
+                                leg2_edge = leg2_prob - (leg2_ask / 100.0)
+                                leg2_qty = compute_qty_from_bankroll(
+                                    avail2, int(leg2_ask),
+                                    edge_net=leg2_edge, p_gate=leg2_prob,
+                                    session=session,
+                                )
+                                if leg2_qty > 0:
+                                    leg2_payload = build_order_payload(
+                                        market_ticker=st.market2,
+                                        action="buy",
+                                        side=leg2_side,
+                                        price_cents=int(leg2_ask),
+                                        count=int(leg2_qty),
+                                        post_only=False,  # Taker — need guaranteed fill
+                                    )
+                                    if not DRY_RUN:
+                                        leg2_oid = place_order(client, leg2_payload)
+                                        log.warning(
+                                            f"[BRACKET LEG2] PLACED {st.market2} BUY {leg2_side.upper()} "
+                                            f"@ {leg2_ask}¢ qty={leg2_qty} prob={leg2_prob:.1%} edge={leg2_edge:.4f}"
+                                        )
+                                        leg2_fill, leg2_filled = wait_for_fill(client, leg2_oid, st.market2)
+                                        if leg2_fill in ("filled", "partial") and leg2_filled > 0:
+                                            st.side2 = leg2_side
+                                            st.entry_price_cents2 = int(leg2_ask)
+                                            st.qty2 = leg2_filled
+                                            st.entry_time2 = time.time()
+                                            st.traded_bracket = True
+                                            log.warning(
+                                                f"[BRACKET LEG2] FILLED {leg2_filled}/{leg2_qty} on {st.market2} "
+                                                f"{leg2_side.upper()} @ {leg2_ask}¢ — bracket complete!"
+                                            )
+                                            if leg2_filled < leg2_qty:
+                                                cancel_order_status(client, leg2_oid)
+                                        else:
+                                            log.warning(f"[BRACKET LEG2] NOT filled — canceling")
+                                            cancel_order_status(client, leg2_oid)
+                                            st.traded_bracket = True  # Don't retry
+                                    else:
+                                        log.warning(f"[DRY BRACKET] Would place LEG2: {st.market2} {leg2_side.upper()} @ {leg2_ask}¢ qty={leg2_qty}")
+                                        st.traded_bracket = True
+                                else:
+                                    log.info(f"[BRACKET LEG2] qty=0 — skipping")
+                                    st.traded_bracket = True
+                            else:
+                                log.info(f"[BRACKET LEG2] Insufficient cash (${avail2:.2f}) — skipping")
+                                st.traded_bracket = True
+                        else:
+                            log.info(
+                                f"[BRACKET LEG2] Not tradeable: ask={leg2_ask}¢ prob={leg2_prob:.1%} "
+                                f"max_price={MAX_ENTRY_PRICE_CENTS}¢ — skipping second leg"
+                            )
+                            st.traded_bracket = True
+                    except Exception as e:
+                        log.warning(f"[BRACKET LEG2] Failed: {e}")
+                        st.traded_bracket = True  # Don't retry on error
             elif fill_status == "unknown":
                 # API error — assume filled to be safe (position check will reconcile)
                 st.traded_this_market = True
