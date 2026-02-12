@@ -374,13 +374,13 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
-SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 90)     # Last 90s — at 3min XRP can still swing $0.005+ (was 180s)
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.92)  # Need 92%+ — was 85% which allowed too many marginal entries
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 97)   # Max 97¢ — never enter at 98-99¢ where one loss wipes 50+ wins
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
-LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.92)  # Match settlement lock — was 85%, too loose
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.003)  # $0.003 buffer — wider for XRP volatility, bail is the real safety net
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
@@ -1709,12 +1709,15 @@ def choose_trade(
         ok_no = False
 
     # High-certainty override (last 15 seconds)
+    # FIX: Never allow negative edge. Old +1¢ slack let price exceed probability.
+    # At 95% prob + 96¢ entry: EV = 0.95×4 - 0.05×96 = -1.0¢/contract (NEGATIVE).
+    # Now require price < probability (edge > 0) to enter.
     if secs_to_close < HIGH_CERTAINTY_TIME_SEC:
         yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
         no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
 
-        max_yes_hc = int(p_yes_blend * 100) + 1  # +1¢ spread slack
-        max_no_hc = int(p_no_blend * 100) + 1
+        max_yes_hc = int(p_yes_blend * 100) - 1  # -1¢ ensures positive edge (was +1, allowing negative EV)
+        max_no_hc = int(p_no_blend * 100) - 1
         if p_yes_blend >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= max_yes_hc and yes_boundary_ok:
             ok_yes = True
             log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_blend:.4f}, price={yes_px}, max={max_yes_hc})")
@@ -1722,19 +1725,21 @@ def choose_trade(
             ok_no = True
             log.info(f"[OVERRIDE] NO high-certainty (p={p_no_blend:.4f}, price={no_px}, max={max_no_hc})")
 
-    # SETTLEMENT LOCK: <2 min to close, model edge is unreliable.
-    # Market has priced in the near-certain outcome, so our conservative blend
-    # shows negative edge even when the trade is good.  Skip edge requirement
-    # AND the tight model-based price cap.  The price cap should just be the
-    # max entry price — the prob gate (85%) and boundary check are the real safety.
-    # Settlement payout IS the edge.
+    # SETTLEMENT LOCK: <90s to close, relax probability gate but STILL require edge.
+    # Near settlement the model blend is mostly market-implied, and we pay the ask.
+    # If prob comes from market midpoint and we pay ask, edge = -spread/2.
+    # Entering with negative edge is guaranteed to lose over time.
+    # FIX: Require at least 1% edge (reduced from normal 3% since variance is lower
+    # near settlement, but NEVER zero or negative).
+    SETTLEMENT_LOCK_EDGE_MIN = 0.01  # 1% min edge — thin but positive
     if secs_to_close <= SETTLEMENT_LOCK_SECONDS:
         yes_boundary_ok = (lo is None) or (spot >= lo + BOUNDARY_BUFFER_USD)
         no_boundary_ok = (hi is None) or (spot <= hi - BOUNDARY_BUFFER_USD)
 
-        # Use max entry price, not model-blended cap.  The model is too conservative
-        # near settlement and blocks fair-value entries at 97-99c.
-        max_settle_px = SETTLEMENT_LOCK_MAX_PRICE
+        # Cap price at (probability - 1¢) to guarantee positive edge.
+        # Never pay more than what probability says it's worth.
+        max_settle_yes = min(SETTLEMENT_LOCK_MAX_PRICE, int(p_yes_blend * 100) - 1) if p_yes_blend > 0 else 1
+        max_settle_no = min(SETTLEMENT_LOCK_MAX_PRICE, int(p_no_blend * 100) - 1) if p_no_blend > 0 else 1
 
         # LOCKED BOOK HANDLING: When ask is None (nobody selling), but bid is
         # high (≥95¢), the book is "locked" — outcome is decided, just no sellers.
@@ -1750,17 +1755,17 @@ def choose_trade(
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT)
             log.info(f"[LOCKED BOOK] NO: no ask, using bid={no_bid}¢ as limit price")
 
-        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_settle_px and yes_boundary_ok:
+        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_settle_yes and yes_boundary_ok and edge_yes >= SETTLEMENT_LOCK_EDGE_MIN:
             ok_yes = True
             log.warning(
                 f"[SETTLE LOCK] YES override: blend={p_yes_blend:.1%} price={yes_px}¢ "
-                f"max={max_settle_px}¢ edge={edge_yes:.4f} t={secs_to_close}s"
+                f"max={max_settle_yes}¢ edge={edge_yes:.4f} t={secs_to_close}s"
             )
-        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_settle_px and no_boundary_ok:
+        if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_settle_no and no_boundary_ok and edge_no >= SETTLEMENT_LOCK_EDGE_MIN:
             ok_no = True
             log.warning(
                 f"[SETTLE LOCK] NO override: blend={p_no_blend:.1%} price={no_px}¢ "
-                f"max={max_settle_px}¢ edge={edge_no:.4f} t={secs_to_close}s"
+                f"max={max_settle_no}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
     # YES_ONLY: Master one direction before adding the other.
