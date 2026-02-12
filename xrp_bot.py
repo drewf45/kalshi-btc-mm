@@ -8,7 +8,7 @@
 # - Requires 3%+ real edge — only enters when model sees genuine mispricing
 # - HOLDS TO SETTLEMENT — collect the full payout for being right
 # - Dump is ABORT ONLY — safety net, not a regular exit
-# - Scales bankroll: wins compound via quarter-Kelly, 2-3 markets/day
+# - Scales bankroll: wins compound via quarter-Kelly, 3 markets/day (2am/2pm/5pm)
 #
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
@@ -138,9 +138,9 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # Even a few cents edge is fine — buy MORE contracts.
 # Hold to settlement. Dump is abort-only. Trade every market possible.
 #
-# KXXRPD contracts settle ~2-3x per day (e.g., 11am & 5pm EST).
-# Contracts span several hours, so observation and buy windows are much wider
-# than the 15-minute BTC bot.
+# KXXRPD contracts settle 3x per day at 2am, 2pm, 5pm EST.
+# Contract windows: 5pm→2am (9hr), 2am→2pm (12hr), 2pm→5pm (3hr).
+# Observation and buy windows are much wider than the 15-minute BTC bot.
 #
 # TWO PHASES:
 #   OBSERVE (2hr → 1hr before close): gather trend data, watch book, DON'T buy
@@ -317,7 +317,7 @@ FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contrac
 # Risk/reward at 99¢ × 33 contracts:
 #   Win (99.5%+ of the time): +$0.33
 #   Lose (XRP reverses significantly in 5 min): -$32.67
-# Over 2-3 markets/day: compound gains across daily settlements.
+# Over 3 markets/day (2am, 2pm, 5pm): compound gains across daily settlements.
 SCALP_ENABLED = True
 SCALP_MAX_SECONDS = 300            # Scalp in the last 5 minutes (daily contracts = wider window)
 SCALP_MIN_SECONDS = 10             # Don't scalp in the last 10s (order might not fill)
@@ -497,22 +497,39 @@ def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
 
 
 def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 0) -> Optional[int]:
+    """Parse ticker to get close timestamp.
+
+    KXXRPD tickers use YYmmmDDHH format (9 chars, no minutes):
+        KXXRPD-26FEB1217 -> Feb 12, 2026, 17:00 (5pm EST)
+    KXBTC15M tickers use DDmmmYYHHMM format (11 chars, with minutes):
+        KXBTC15M-12FEB261400 -> Feb 12, 2026, 14:00
+    """
     if not ticker or ticker is None:
         log.warning(f"[TICKER] infer_close_ts received None/empty ticker")
         return None
-        
+
     try:
         parts = str(ticker).split("-")
         if len(parts) < 2:
             return None
         dt_chunk = parts[1]
 
-        day = int(dt_chunk[0:2])
-        mon = MONTHS[dt_chunk[2:5].upper()]
-        yy = int(dt_chunk[5:7])
-        year = 2000 + yy
-        hh = int(dt_chunk[7:9])
-        mm = int(dt_chunk[9:11])
+        if len(dt_chunk) == 9:
+            # YYmmmDDHH format (KXXRPD daily contracts — no minutes)
+            yy = int(dt_chunk[0:2])
+            year = 2000 + yy
+            mon = MONTHS[dt_chunk[2:5].upper()]
+            day = int(dt_chunk[5:7])
+            hh = int(dt_chunk[7:9])
+            mm = 0
+        else:
+            # DDmmmYYHHMM format (KXBTC15M 15-min contracts)
+            day = int(dt_chunk[0:2])
+            mon = MONTHS[dt_chunk[2:5].upper()]
+            yy = int(dt_chunk[5:7])
+            year = 2000 + yy
+            hh = int(dt_chunk[7:9])
+            mm = int(dt_chunk[9:11]) if len(dt_chunk) >= 11 else 0
 
         start_local = datetime(year, mon, day, hh, mm, tzinfo=NY)
         close_local = start_local + timedelta(minutes=int(interval_minutes))
