@@ -204,7 +204,7 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.0006  # XRP ~$2.50, ~2x more volatile in % terms
 KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — smaller bets, smoother equity curve, survives loss streaks
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
-MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
+MAX_CONTRACTS = 25           # Hard cap — XRP contracts are cheap, limit exposure per market
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy constants (kept for backward compat in safety checks)
@@ -247,8 +247,8 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust XRP price, not book noise
 # NO side:  spot < hi - buffer → XRP is safely below range ceiling → HOLD
 # If XRP is on our side, the book is lying (thin book, spike, manipulation).
 # ONLY bail if XRP has actually crossed or is dangerously close to boundary.
-DUMP_XRP_SAFE_BUFFER_EARLY = 0.002   # >2min to close: need $0.002 buffer (scaled for XRP price range)
-DUMP_XRP_SAFE_BUFFER_LATE = 0.001    # <2min to close: need $0.001 buffer (scaled for XRP price range)
+DUMP_XRP_SAFE_BUFFER_EARLY = 0.004   # >2min to close: need $0.004 buffer — XRP is volatile, wider margin
+DUMP_XRP_SAFE_BUFFER_LATE = 0.002    # <2min to close: need $0.002 buffer — still need room for XRP swings
 DUMP_XRP_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after XRP check fails) --------------------
@@ -326,14 +326,14 @@ SCALP_MIN_DISTANCE_USD = 0.0015    # XRP must be ≥$0.0015 from strike (vol gat
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
 SCALP_DISTANCE_TIERS = [
-    (0.010, 0.85),   # $0.01+ from strike: extremely safe, size up hard
-    (0.005, 0.65),   # $0.005-0.01: very safe, go bigger
-    (0.003, 0.45),   # $0.003-0.005: safe, meaningful size
-    (0.0015, 0.25),  # $0.0015-0.003: moderate — compound the edge
+    (0.010, 0.50),   # $0.01+ from strike: very safe, but cap sizing
+    (0.005, 0.35),   # $0.005-0.01: safe, moderate size
+    (0.003, 0.20),   # $0.003-0.005: cautious size
+    (0.0015, 0.10),  # $0.0015-0.003: minimum — XRP moves fast
 ]
 SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
-SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
+SCALP_MIN_PROB = 0.90             # Higher bar for XRP — price swings harder, need more certainty
+SCALP_MAX_LOSS_FRACTION = 0.08    # Never risk more than 8% of cash on a scalp — XRP scalps are riskier
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -382,7 +382,7 @@ SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked b
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.0015)  # $0.0015 buffer — XRP-aware bail is the real safety net during hold
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.003)  # $0.003 buffer — wider for XRP volatility, bail is the real safety net
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
@@ -1863,8 +1863,11 @@ def should_dump_position(
     # allow dump logic to run. Blindly holding while XRP drifts toward the
     # strike is how -$3.84 losses happen.
     HOLD_TO_SETTLE_SECONDS = 30  # Only suppress dumps in the last 30s (was 60s)
-    HOLD_XRP_DANGER_BUFFER = 0.002  # If XRP is within $0.002 of boundary, DON'T suppress dumps
-    if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
+    HOLD_XRP_DANGER_BUFFER = 0.005  # If XRP is within $0.005 of boundary, DON'T suppress dumps — XRP swings fast
+    # NEVER suppress dumps for scalp entries (≥95¢) — a 99¢ scalp that goes wrong
+    # loses nearly everything. Always let dump logic run for these.
+    is_scalp_entry = st.entry_price_cents is not None and st.entry_price_cents >= 95
+    if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS and not is_scalp_entry:
         # Check if XRP is dangerously close to boundary — if so, let dump logic run
         xrp_safe_for_hold, xrp_hold_dist = _xrp_is_safe(st.side, spot, lo, hi, secs_to_close)
         if not xrp_safe_for_hold or xrp_hold_dist < HOLD_XRP_DANGER_BUFFER:
