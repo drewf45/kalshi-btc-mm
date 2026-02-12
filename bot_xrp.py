@@ -123,7 +123,7 @@ META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
 
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
-POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
+POST_ONLY = env_bool("POST_ONLY", True)  # POST_ONLY: post at bid, capture spread as edge — XRP needs maker fills to be profitable
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
@@ -152,8 +152,8 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.83  # 83%+ to enter in last 2 min — slightly lower bar, EV cap is the real protection
-EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
+PROB_MIN = 0.88  # 88%+ to enter in last 2 min — XRP needs higher certainty than BTC (tighter boundaries)
+EDGE_MIN = 0.02  # 2% minimum edge — POST_ONLY gives 1-3¢ better fills, so 2% is achievable and profitable
 MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
@@ -162,9 +162,9 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (XRP still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
+PROB_EARLY_MIN = 0.93            # >5min: need 93%+ — XRP boundaries are tight, need strong model signal
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
+PROB_MID_MIN = 0.90              # 3-5min: need 90%+ — only enter when model is confident
 # <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
@@ -337,7 +337,7 @@ SCALP_MAX_LOSS_FRACTION = 0.08    # Never risk more than 8% of cash on a scalp �
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
-MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.20)  # Was 0.75 — model is ~50/50 at >5min, drowns out 95% market signal
+MODEL_BLEND_ALPHA = env_float("MODEL_BLEND_ALPHA", 0.35)  # 35% model weight — XRP model provides real edge when it diverges from market. BTC uses 20% because market is more efficient; XRP market is thinner, model adds genuine alpha.
 
 REQUIRE_DIVERGENCE = env_bool("REQUIRE_DIVERGENCE", False)
 MIN_DIVERGENCE = env_float("MIN_DIVERGENCE", 0.015)
@@ -1647,55 +1647,13 @@ def choose_trade(
         and div_gate_no
     )
 
-    # MARKET CONVICTION OVERRIDE: When the book shows ≥85% on one side inside the
-    # buy window, override the blend probability to trust the market.  The BS model
-    # is nearly useless at >5 min (σ√t > boundary gap → 50/50), but the market has
-    # already priced the outcome.  This prevents the model from blocking trades the
-    # orderbook clearly supports.
-    MARKET_CONVICTION_THRESHOLD = 0.85
-    if p_mkt is not None and secs_to_close <= BUY_START_SECONDS:
-        p_yes_mkt = float(p_mkt)
-        p_no_mkt = 1.0 - p_yes_mkt
-        if p_yes_mkt >= MARKET_CONVICTION_THRESHOLD and p_yes_blend < p_yes_mkt:
-            log.info(
-                f"[MKT CONVICTION] YES: book={p_yes_mkt:.1%} > blend={p_yes_blend:.1%}, "
-                f"overriding blend to market"
-            )
-            p_yes_blend = p_yes_mkt
-            p_no_blend = 1.0 - p_yes_blend
-            edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
-            edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
-            ok_yes = (
-                yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
-                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
-            )
-            ok_no = (
-                no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
-                and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
-            )
-        elif p_no_mkt >= MARKET_CONVICTION_THRESHOLD and p_no_blend < p_no_mkt:
-            log.info(
-                f"[MKT CONVICTION] NO: book={p_no_mkt:.1%} > blend={p_no_blend:.1%}, "
-                f"overriding blend to market"
-            )
-            p_no_blend = p_no_mkt
-            p_yes_blend = 1.0 - p_no_blend
-            edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
-            edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
-            ok_yes = (
-                yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
-                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
-            )
-            ok_no = (
-                no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
-                and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
-            )
+    # MARKET CONVICTION OVERRIDE: DISABLED for XRP.
+    # For BTC, the market is efficient and overriding blend to market works.
+    # For XRP, overriding blend to market KILLS the model signal — which is
+    # the ONLY source of edge. Without model divergence, edge = p_mkt - ask/100
+    # = midpoint - ask = -spread/2 (always negative). The model must have its
+    # say to create any positive edge on XRP entries.
+    # The blend already weights market at 65% (1 - 0.35 alpha), which is plenty.
 
     # Boundary buffer protection
     if lo is not None and spot < (lo + BOUNDARY_BUFFER_USD):
@@ -3304,17 +3262,15 @@ def main() -> None:
             continue
 
         use_post_only = POST_ONLY
-        # AGGRESSIVE FILL: use taker orders when probability is high enough.
-        # Getting filled is worth more than saving maker/taker spread.
-        # Not participating costs 100% of the edge; crossing the spread costs 1-2¢.
-        # TIME-DEPENDENT: require higher prob for taker early (avoid crossing spread on uncertain signals)
-        taker_prob_thresh = 0.90 if secs_to_close > SETTLEMENT_LOCK_SECONDS else 0.85
-        if p_gate >= taker_prob_thresh:
+        # XRP STRATEGY: Always use POST_ONLY. For XRP, the spread IS the edge.
+        # Hitting the ask with market-derived probability = guaranteed negative edge.
+        # Posting at bid gives 1-3¢ better fills, flipping edge from -1% to +1%.
+        # The tradeoff (lower fill rate) is acceptable — skipping a market is free,
+        # entering at a loss is not. Only switch to taker in the last 10s if we
+        # still haven't filled and probability is extremely high.
+        if secs_to_close <= 10 and p_gate >= 0.96:
             use_post_only = False
-            log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ {taker_prob_thresh:.0%}, fills > maker savings")
-        elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
-            use_post_only = False
-            log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+            log.info(f"[LAST RESORT TAKER] T-{secs_to_close}s p={p_gate:.4f} ≥ 96% — switching to taker for fill")
 
         payload = build_order_payload(
             market_ticker=st.market,
