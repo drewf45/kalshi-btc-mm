@@ -23,7 +23,7 @@
 # ADAPTED FROM bot.py (BTC) — key differences:
 # - Series ticker: KXSOL15M (Solana 15-minute markets)
 # - Spot feed: Coinbase SOL-USD (not BTC-USD)
-# - Sigma: ~0.05 USD/√sec (SOL ~$200, ~1.5x higher % vol than BTC/ETH)
+# - Sigma: ~0.07 USD/√sec (SOL ~$200, ~2x higher % vol than BTC/ETH)
 # - All USD-denominated thresholds scaled ~500x down from BTC for SOL's price regime
 # - Boundary buffers, trend thresholds, scalp distances all adjusted for SOL
 
@@ -159,9 +159,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.83  # 83%+ to enter in last 2 min — slightly lower bar, EV cap is the real protection
-EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
+PROB_MIN = 0.86  # 86%+ to enter in last 2 min — raised from 83%, SOL noise needs higher bar
+EDGE_MIN = 0.04  # 4% minimum edge — SOL noise needs bigger edge to overcome variance (was 3%)
+MAX_ENTRY_PRICE_CENTS = 94  # At 94¢ entry, gain 6¢/win, need ~16 wins per loss (was 96¢ — too thin for SOL)
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
@@ -169,9 +169,9 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (SOL still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
+PROB_EARLY_MIN = 0.93            # >5min: need 93%+ — SOL can swing hard in 5 min, be very selective
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
+PROB_MID_MIN = 0.90              # 3-5min: need 90%+ — raised from 86%, SOL whipsaws more than ETH
 # <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
@@ -188,16 +188,16 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match SOL spot trend (border
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
-PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
+PROB_FAST_LANE_THRESHOLD = 0.93   # ≥93% prob = buy immediately, no trend check needed (raised for SOL noise)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.88  # ≥88% prob in last 3 min = fast lane (raised from 85%)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
 # At T-300s to T-180s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment
+CONFIRMATION_HOLD_SECONDS = 25   # Signal must persist for 25s before early commitment (was 15s — SOL flips fast, need more patience)
 CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
 
-SPOT_SIGMA_USD_PER_SQRT_SEC = 0.05  # SOL: ~0.05 USD/√sec (SOL ~$200, ~1.5x higher % vol than BTC/ETH)
+SPOT_SIGMA_USD_PER_SQRT_SEC = 0.07  # SOL: ~0.07 USD/√sec (SOL ~$200, ~2x higher % vol than BTC/ETH — was 0.05, underestimated)
 
 # -------------- KELLY BANKROLL SIZING (HARDWIRED) --------------
 # Philosophy: size by BANKROLL FRACTION using Kelly criterion.
@@ -208,7 +208,7 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.05  # SOL: ~0.05 USD/√sec (SOL ~$200, ~1.5x hi
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
 # Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
-KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — smaller bets, smoother equity curve, survives loss streaks
+KELLY_MULTIPLIER = 0.20     # Fifth-Kelly — reduced from 0.25 for SOL, smoother equity curve given higher variance
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
@@ -254,14 +254,14 @@ DUMP_ON_PRICE_DANGER = False  # Disabled - trust SOL price, not book noise
 # NO side:  spot < hi - buffer → SOL is safely below range ceiling → HOLD
 # If SOL is on our side, the book is lying (thin book, spike, manipulation).
 # ONLY bail if SOL has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 0.35    # >2min to close: need $0.35 buffer (SOL σ√120=$0.55, $0.35 provides margin)
-DUMP_BTC_SAFE_BUFFER_LATE = 0.18     # <2min to close: need $0.18 buffer (SOL σ√60=$0.39, $0.18 is safe enough)
+DUMP_BTC_SAFE_BUFFER_EARLY = 0.50    # >2min to close: need $0.50 buffer (SOL σ√120=$0.77, $0.50 provides margin — wider to avoid noise bails)
+DUMP_BTC_SAFE_BUFFER_LATE = 0.30     # <2min to close: need $0.30 buffer (SOL σ√60=$0.54, $0.30 is safe — was $0.18, too tight)
 DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after SOL check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
+DUMP_REVERSAL_THRESHOLD = 0.08  # 8% drop from peak — wider for SOL noise (was 6% — too hair-trigger, bailed on normal SOL swings)
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.06  # 6% when profitable — wider to let winners run (was 4% — too tight for SOL)
 DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
 DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
@@ -295,12 +295,12 @@ DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matte
 # All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
 # false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
 # Use a rolling window max instead: peak = max(prob over last N seconds).
-DUMP_PEAK_WINDOW_SECONDS = 30  # Use max prob over last 30s as "peak" (not all-time)
+DUMP_PEAK_WINDOW_SECONDS = 45  # Use max prob over last 45s as "peak" (was 30s — SOL books spike more, wider window avoids false reversals)
 
 # -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
 # If probability drops very fast (>4% in 10s), something is seriously wrong.
 # Bail even during settling period — fast drops mean SOL is actively moving against us.
-DUMP_RAPID_DROP_THRESHOLD = 0.04   # 4% drop in the rapid window = emergency
+DUMP_RAPID_DROP_THRESHOLD = 0.06   # 6% drop in the rapid window = emergency (was 4% — SOL books are noisy, 4% is normal)
 DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 
 # -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
@@ -329,14 +329,15 @@ FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contrac
 SCALP_ENABLED = True
 SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
 SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 0.10      # SOL must be ≥$0.10 from strike (SOL: ~500x lower than BTC's $50)
+SCALP_MIN_DISTANCE_USD = 0.20      # SOL must be ≥$0.20 from strike (was $0.10 — too thin, SOL can gap $0.10 easily)
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
+# Raised all tiers — SOL's higher vol means "safe distance" is larger in % terms
 SCALP_DISTANCE_TIERS = [
-    (0.85, 0.85),    # $0.85+ from strike: extremely safe, size up hard (SOL equiv of BTC $400)
-    (0.43, 0.65),    # $0.43-0.85: very safe, go bigger (SOL equiv of BTC $200)
-    (0.21, 0.45),    # $0.21-0.43: safe, meaningful size (SOL equiv of BTC $100)
-    (0.10, 0.25),    # $0.10-0.21: moderate — compound the edge (SOL equiv of BTC $50)
+    (1.20, 0.85),    # $1.20+ from strike: extremely safe, size up hard
+    (0.60, 0.65),    # $0.60-1.20: very safe, go bigger
+    (0.35, 0.45),    # $0.35-0.60: safe, meaningful size
+    (0.20, 0.25),    # $0.20-0.35: moderate — compound the edge
 ]
 SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
@@ -353,8 +354,8 @@ USE_DYNAMIC_SIGMA = env_bool("USE_DYNAMIC_SIGMA", True)
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/SOL-USD/candles"
 CANDLES_GRANULARITY_SEC = env_int("CANDLES_GRANULARITY_SEC", 60)
 CANDLES_LOOKBACK = env_int("CANDLES_LOOKBACK", 10)
-SIGMA_FLOOR = env_float("SIGMA_FLOOR", 0.02)   # SOL: ~500x lower than BTC floor of 6.0
-SIGMA_CEIL = env_float("SIGMA_CEIL", 0.15)      # SOL: ~500x lower than BTC ceil of 40.0
+SIGMA_FLOOR = env_float("SIGMA_FLOOR", 0.03)   # SOL: floor ~43% of base sigma 0.07 (matches BTC/ETH ratio)
+SIGMA_CEIL = env_float("SIGMA_CEIL", 0.20)      # SOL: ceil ~2.9x of base sigma 0.07 (raised to handle SOL vol spikes)
 
 MAX_SPREAD_CENTS_TO_TRADE = env_int("MAX_SPREAD_CENTS_TO_TRADE", 12)  # Wider to allow entry when book is thinner early on
 REQUIRE_BOTH_SIDES_BOOK = env_bool("REQUIRE_BOTH_SIDES_BOOK", False)
@@ -389,7 +390,7 @@ SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked b
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
-BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.10)  # $0.10 buffer — SOL-aware bail is the real safety net during hold
+BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.15)  # $0.15 buffer — wider for SOL's noisier books (was $0.10)
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
 LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 
@@ -397,8 +398,8 @@ LATE_ENTRY_TIME_SEC = env_int("LATE_ENTRY_TIME_SEC", 15)
 TREND_WINDOW_MINUTES = 60          # Long-term trend: 60 min (~4 markets)
 TREND_SHORT_WINDOW_MINUTES = 30    # Short-term trend: 30 min (~2 markets)
 TREND_SAMPLE_INTERVAL_SECONDS = 30  # Record spot every 30s
-TREND_STRONG_THRESHOLD = 0.22      # $0.22+ move in window = strong trend (SOL: ~500x lower than BTC's $100)
-TREND_MODERATE_THRESHOLD = 0.11    # $0.11+ move = moderate trend (SOL: ~500x lower than BTC's $50)
+TREND_STRONG_THRESHOLD = 0.35      # $0.35+ move in window = strong trend (was $0.22 — too sensitive, SOL noise looked like trends)
+TREND_MODERATE_THRESHOLD = 0.18    # $0.18+ move = moderate trend (was $0.11 — too tight for SOL's normal chop)
 TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against trend
 TREND_AGAINST_BLOCK = False        # Don't hard-block — require extra edge instead (trade every market)
 TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading with trend
@@ -1870,7 +1871,7 @@ def should_dump_position(
     # allow dump logic to run. Blindly holding while SOL drifts toward the
     # strike is how big losses happen.
     HOLD_TO_SETTLE_SECONDS = 30  # Only suppress dumps in the last 30s (was 60s)
-    HOLD_BTC_DANGER_BUFFER = 0.18  # If SOL is within $0.18 of boundary, DON'T suppress dumps
+    HOLD_BTC_DANGER_BUFFER = 0.30  # If SOL is within $0.30 of boundary, DON'T suppress dumps (was $0.18)
     if st.entry_time > 0 and secs_to_close <= HOLD_TO_SETTLE_SECONDS:
         # Check if SOL is dangerously close to boundary — if so, let dump logic run
         btc_safe_for_hold, btc_hold_dist = _btc_is_safe(st.side, spot, lo, hi, secs_to_close)
