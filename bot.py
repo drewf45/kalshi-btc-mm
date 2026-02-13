@@ -217,7 +217,7 @@ SCALING_MAX_FRACTION = 0.50
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
-SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one market
+SESSION_CONSECUTIVE_LOSSES_LIMIT = 4  # Pause after 4 consecutive losses — sit one out, re-evaluate
 SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
 BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
@@ -1108,6 +1108,7 @@ class SessionState:
     pause_until: float = 0.0
     pause_reason: Optional[str] = None
     is_daily_stopped: bool = False  # HARD STOP - never unpauses
+    _needs_trend_reset: bool = False  # Reset trend data after cooldown
 
     # Balance refresh
     pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
@@ -1248,7 +1249,8 @@ class SessionState:
             self.is_paused = False
             self.pause_reason = None
             self.consecutive_losses = 0
-            log.warning("[SESSION] Cooldown ended, resuming trading")
+            self._needs_trend_reset = True  # Signal to reset trend data on resume
+            log.warning("[SESSION] Cooldown ended, resuming — trend data will be reset to re-evaluate")
             return True, None
 
         remaining = int(self.pause_until - time.time()) if self.pause_until > 0 else 0
@@ -1345,6 +1347,12 @@ class SpotTrend:
             return "with"
 
         return "neutral"
+
+    def reset(self) -> None:
+        """Clear all trend data — forces re-observation from scratch."""
+        self.samples.clear()
+        self.last_sample_time = 0.0
+        log.info("[SPOT_TREND] Reset — re-gathering BTC trend data")
 
     def summary(self) -> str:
         """Short string for logging"""
@@ -3278,6 +3286,13 @@ def main() -> None:
                 last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
+
+        # After cooldown: wipe stale trend data so the bot re-observes fresh
+        if session._needs_trend_reset:
+            trend.reset()
+            prob_trend.reset(st.market)
+            session._needs_trend_reset = False
+            log.warning("[SESSION] Post-cooldown: trend data reset — re-evaluating from scratch")
 
         available_usd, total_usd = get_balance_usd(client)
 
