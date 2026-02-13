@@ -274,6 +274,15 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
 
+# -------------- NUKE PREVENTION (cap how many wins one loss can erase) ----------
+# At 96¢ entry: win=$0.04, loss=$0.96 → nuke ratio = 24:1.
+# Without a cap, one bad trade erases 24 good ones.
+# This limits position size so worst-case settlement loss ≤ N × expected win.
+# Example at entry=96¢, NUKE_MAX_WINS_ERASED=5:
+#   max_loss_allowed = 5 × (100-96)/100 × qty → qty ≤ 5 × win_per / cost_per
+#   Effectively: qty ≤ 5 × ($0.04/$0.96) × bankroll_fraction → much smaller at high prices
+NUKE_MAX_WINS_ERASED = 5  # One loss should never wipe more than 5 winning trades
+
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
 DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
@@ -2157,6 +2166,35 @@ def compute_qty_from_bankroll(
                 f"entry={entry_cents}¢)"
             )
             target_qty = max_qty_for_loss_cap
+
+    # NUKE PREVENTION: cap so one loss never erases more than N wins.
+    # At high entry prices the win/loss asymmetry is brutal (96¢: 24:1 nuke ratio).
+    # This sizes the position so that: total_loss ≤ NUKE_MAX_WINS_ERASED × total_win.
+    #   total_loss = qty × entry_cents (worst case: settles at $0)
+    #   total_win  = qty × (100 - entry_cents) (best case: settles at $1)
+    # So: qty × entry ≤ N × qty × (100 - entry) → simplifies to entry ≤ N × (100 - entry)
+    # But that's per-contract (fixed ratio). The real cap is on DOLLAR loss:
+    #   max_dollar_loss = NUKE_MAX_WINS_ERASED × expected_dollar_win_per_trade
+    #   expected_dollar_win = target_qty × (100 - entry_cents) / 100
+    #   max_qty_nuke = NUKE_MAX_WINS_ERASED × (100 - entry_cents) / entry_cents × target_qty ... circular
+    # Non-circular: cap total risk so it equals N average wins at THIS entry price:
+    #   qty_nuke × cost_per ≤ NUKE_MAX_WINS_ERASED × qty_nuke × win_per → always true (it's a ratio)
+    # Real fix: use the ORIGINAL target_qty as the "expected trade size" and cap actual qty:
+    win_per = (100.0 - entry_cents) / 100.0
+    if win_per > 0 and cost_per > 0:
+        # nuke_ratio = how many wins one full loss erases at this entry price
+        nuke_ratio = cost_per / win_per
+        if nuke_ratio > NUKE_MAX_WINS_ERASED:
+            # Scale down: if nuke_ratio is 24 and max is 5, multiply qty by 5/24
+            nuke_scale = NUKE_MAX_WINS_ERASED / nuke_ratio
+            nuke_qty = max(MIN_CONTRACTS, int(target_qty * nuke_scale))
+            if nuke_qty < target_qty:
+                log.warning(
+                    f"[NUKE CAP] entry={entry_cents}¢ nuke_ratio={nuke_ratio:.1f}:1 "
+                    f"(1 loss = {nuke_ratio:.0f} wins) — scaling {target_qty} -> {nuke_qty} contracts "
+                    f"(×{nuke_scale:.2f}) to cap at {NUKE_MAX_WINS_ERASED} wins erased"
+                )
+                target_qty = nuke_qty
 
     qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
