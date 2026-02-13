@@ -160,7 +160,7 @@ ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
 PROB_MIN = 0.86  # 86%+ to enter in last 2 min — raised from 83%, SOL noise needs higher bar
-EDGE_MIN = 0.04  # 4% minimum edge — SOL noise needs bigger edge to overcome variance (was 3%)
+EDGE_MIN = 0.05  # 5% minimum edge — SOL needs stricter edge than BTC/ETH (3%) due to thinner books and higher noise
 MAX_ENTRY_PRICE_CENTS = 94  # At 94¢ entry, gain 6¢/win, need ~16 wins per loss (was 96¢ — too thin for SOL)
 FEE_CENTS_PER_CONTRACT = 0
 
@@ -224,8 +224,10 @@ SCALING_MAX_FRACTION = 0.50
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
-SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one market
-SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
+SESSION_CONSECUTIVE_LOSSES_LIMIT = 4  # Pause after 4 consecutive losses (1 hour of 15-min markets)
+SESSION_COOLDOWN_MINUTES = 15  # Sit out ONE market — keep all trend data, reevaluate
+# After cooldown: require extra edge for first market back (reevaluate)
+POST_COOLDOWN_EDGE_BOOST = 0.02  # Require 2% extra edge after loss streak — force higher-quality entries
 BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
@@ -1123,9 +1125,25 @@ class SessionState:
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
 
+    # Post-cooldown reevaluation: require extra edge after loss streak
+    _post_cooldown_boost: bool = False
+
     def __post_init__(self):
         if self.recent_trades is None:
             self.recent_trades = []
+
+    def get_edge_boost(self) -> float:
+        """Return extra edge required after a loss streak cooldown.
+        Resets after ONE successful market (win clears the boost)."""
+        if self._post_cooldown_boost:
+            return POST_COOLDOWN_EDGE_BOOST
+        return 0.0
+
+    def clear_post_cooldown_boost(self):
+        """Clear edge boost after a winning trade proves strategy is working again."""
+        if self._post_cooldown_boost:
+            self._post_cooldown_boost = False
+            log.warning("[SESSION] Post-cooldown edge boost cleared after win — back to normal edge requirements")
 
     def reset_for_new_market(self):
         """Reset per-market state on each market roll. Daily state persists.
@@ -1189,6 +1207,7 @@ class SessionState:
             self.consecutive_wins += 1
             self.consecutive_losses = 0
             self._scale_up()
+            self.clear_post_cooldown_boost()  # Win after cooldown = strategy working again
         else:
             self.total_losses += 1
             self.market_losses += 1
@@ -1233,15 +1252,48 @@ class SessionState:
             )
 
     def _check_consecutive_limit(self):
-        """Pause on consecutive losses within a market (temporary cooldown)"""
+        """Pause after consecutive losses — sit out ONE market, keep all data, reevaluate.
+
+        OLD behavior: dump data, reset contracts, zero out loss counter → bot forgets everything.
+        NEW behavior: keep trend data flowing, preserve loss context, require extra edge on return.
+        """
         if not ENABLE_SESSION_LIMITS:
             return
         if self.consecutive_losses >= SESSION_CONSECUTIVE_LOSSES_LIMIT:
             self.is_paused = True
             self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
             self.pause_reason = f"consecutive_losses_{self.consecutive_losses}"
-            self.current_contracts = BASE_CONTRACTS  # Reset to base on consecutive loss pause
-            log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
+            self._post_cooldown_boost = True  # Flag: require extra edge on first market back
+            # DON'T reset current_contracts — let Kelly sizing adapt naturally via lower bankroll
+            # DON'T dump any trend data — keep SpotTrend rolling for reevaluation
+            self._analyze_recent_losses()
+            log.warning(
+                f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses — "
+                f"sitting out 1 market ({SESSION_COOLDOWN_MINUTES}min). "
+                f"Keeping all trend data. Will require +{POST_COOLDOWN_EDGE_BOOST:.0%} extra edge on return."
+            )
+
+    def _analyze_recent_losses(self):
+        """Analyze recent losing trades to log what went wrong — reevaluation context."""
+        if not self.recent_trades:
+            return
+        recent_losses = [t for t in self.recent_trades[-8:] if t.get("pnl_cents", 0) < 0]
+        if not recent_losses:
+            return
+
+        sides = [t.get("side", "?") for t in recent_losses]
+        yes_count = sides.count("yes")
+        no_count = sides.count("no")
+        avg_loss = sum(t.get("pnl_cents", 0) for t in recent_losses) / len(recent_losses)
+        dump_count = sum(1 for t in recent_losses if t.get("was_dump", False))
+
+        log.warning(
+            f"[REEVALUATE] Last {len(recent_losses)} losses: "
+            f"YES={yes_count} NO={no_count} avg_loss={avg_loss:.0f}¢ dumps={dump_count} | "
+            f"{'Bias toward YES losses — consider tighter YES entry' if yes_count > no_count * 2 else ''}"
+            f"{'Bias toward NO losses — consider tighter NO entry' if no_count > yes_count * 2 else ''}"
+            f"{'Many dumps — entries may be too early/borderline' if dump_count > len(recent_losses) // 2 else ''}"
+        )
 
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
         """Check if we can trade"""
@@ -1255,8 +1307,17 @@ class SessionState:
         if self.pause_until > 0 and time.time() >= self.pause_until:
             self.is_paused = False
             self.pause_reason = None
-            self.consecutive_losses = 0
-            log.warning("[SESSION] Cooldown ended, resuming trading")
+            # "Take a mark off" — decrement by 1 instead of zeroing.
+            # Keeps loss context so the bot remembers it's been losing.
+            # If it wins next market, consecutive_losses zeros naturally.
+            # If it loses again, it'll hit the limit sooner (at 4 again).
+            self.consecutive_losses = max(0, self.consecutive_losses - 1)
+            log.warning(
+                f"[SESSION] Cooldown ended — resuming with loss context "
+                f"(consecutive_losses={self.consecutive_losses}, "
+                f"post_cooldown_boost={'ON' if getattr(self, '_post_cooldown_boost', False) else 'OFF'}). "
+                f"All trend data preserved for reevaluation."
+            )
             return True, None
 
         remaining = int(self.pause_until - time.time()) if self.pause_until > 0 else 0
@@ -3295,6 +3356,18 @@ def main() -> None:
         else:
             edge_net = float(edge_no)
             p_gate = float(p_no_blend)
+
+        # POST-COOLDOWN REEVALUATION: require extra edge after loss streak
+        # This forces the bot to only take high-quality trades after losing 4 in a row
+        edge_boost = session.get_edge_boost()
+        if edge_boost > 0 and edge_net < EDGE_MIN + edge_boost:
+            log.warning(
+                f"[REEVALUATE] Post-cooldown: edge {edge_net:.4f} < "
+                f"{EDGE_MIN + edge_boost:.4f} (EDGE_MIN + {edge_boost:.2f} boost) — "
+                f"skipping until edge is clearly higher"
+            )
+            time.sleep(POLL_SECONDS)
+            continue
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
         if qty <= 0:
