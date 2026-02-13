@@ -224,8 +224,7 @@ SCALING_MAX_FRACTION = 0.50
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
-SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one market
-SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
+# SESSION_CONSECUTIVE_LOSSES_LIMIT and SESSION_COOLDOWN_MARKETS now defined in MOMENTUM section above
 BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
@@ -402,6 +401,24 @@ TREND_MODERATE_THRESHOLD = 1.50    # $1.50+ move = moderate trend (ETH: ~35x low
 TREND_AGAINST_EDGE_BOOST = 0.02    # Require 2% extra edge to trade against trend
 TREND_AGAINST_BLOCK = False        # Don't hard-block — require extra edge instead (trade every market)
 TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading with trend
+
+# -------------- MOMENTUM / WHIPSAW FILTER (skip fast-moving markets) -----------
+# When ETH moves more than $X in the last N seconds, the probability estimate
+# is stale — the orderbook hasn't caught up yet. Entering on stale probability
+# is how you get the worst losses: you think 93% but it's really 60%.
+# Skip the entry entirely and wait for the market to settle.
+WHIPSAW_ENABLED = True
+WHIPSAW_WINDOW_SECONDS = 45        # Look at last 45 seconds of spot prices
+WHIPSAW_THRESHOLD_USD = 5.0        # Skip if ETH moved > $5 in the window (BTC $150 ÷ ~30 ≈ $5 ETH)
+WHIPSAW_MIN_SAMPLES = 3            # Need at least 3 spot samples in the window
+
+# -------------- CONSECUTIVE LOSS COOLDOWN (smarter than blind 15-min pause) ----
+# Old behavior: 5 losses → hard 15-minute pause → wipes trend data → blind re-entry.
+# New behavior: 4 losses → skip exactly 1 market → use accumulated trend data to
+# evaluate whether conditions have changed → re-enter with full context.
+# Trend data (SpotTrend 60min/30min) is PRESERVED across the cooldown.
+SESSION_CONSECUTIVE_LOSSES_LIMIT = 4  # Trigger after 4 consecutive losses (was 5)
+SESSION_COOLDOWN_MARKETS = 1          # Skip exactly 1 market (not a time-based pause)
 
 # Heartbeat
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
@@ -1114,6 +1131,7 @@ class SessionState:
     is_paused: bool = False
     pause_until: float = 0.0
     pause_reason: Optional[str] = None
+    markets_to_skip: int = 0          # Skip N markets (market-based cooldown, NOT time-based)
     is_daily_stopped: bool = False  # HARD STOP - never unpauses
 
     # Balance refresh
@@ -1232,25 +1250,33 @@ class SessionState:
             )
 
     def _check_consecutive_limit(self):
-        """Pause on consecutive losses within a market (temporary cooldown)"""
+        """After N consecutive losses, skip 1 market instead of blind time-based pause.
+        Trend data is PRESERVED — the bot uses it to evaluate whether conditions changed."""
         if not ENABLE_SESSION_LIMITS:
             return
         if self.consecutive_losses >= SESSION_CONSECUTIVE_LOSSES_LIMIT:
-            self.is_paused = True
-            self.pause_until = time.time() + (SESSION_COOLDOWN_MINUTES * 60)
-            self.pause_reason = f"consecutive_losses_{self.consecutive_losses}"
-            self.current_contracts = BASE_CONTRACTS  # Reset to base on consecutive loss pause
-            log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
+            self.markets_to_skip = SESSION_COOLDOWN_MARKETS
+            self.pause_reason = f"consecutive_losses_{self.consecutive_losses}_skip_{SESSION_COOLDOWN_MARKETS}_markets"
+            self.current_contracts = BASE_CONTRACTS
+            log.warning(
+                f"[SESSION] LOSS STREAK: {self.consecutive_losses} consecutive losses — "
+                f"skipping {SESSION_COOLDOWN_MARKETS} market(s), preserving trend data for re-evaluation"
+            )
 
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
-        """Check if we can trade"""
+        """Check if we can trade. Market-skip cooldown is decremented on each market roll."""
         # Daily hard stop is permanent until restart
         if self.is_daily_stopped:
             return False, f"DAILY_HARD_STOP (lost 75%+ of starting balance)"
 
+        # Market-based cooldown: skip N markets after consecutive losses
+        if self.markets_to_skip > 0:
+            return False, f"skip_market:{self.pause_reason} ({self.markets_to_skip} market(s) left)"
+
         if not self.is_paused:
             return True, None
 
+        # Legacy time-based pause (kept for daily hard stop)
         if self.pause_until > 0 and time.time() >= self.pause_until:
             self.is_paused = False
             self.pause_reason = None
@@ -1260,6 +1286,21 @@ class SessionState:
 
         remaining = int(self.pause_until - time.time()) if self.pause_until > 0 else 0
         return False, f"paused:{self.pause_reason} ({remaining}s remaining)"
+
+    def decrement_market_skip(self, trend_summary: str = "", trend_short_summary: str = "") -> None:
+        """Called on market roll. Decrements the market-skip counter and logs trend context."""
+        if self.markets_to_skip > 0:
+            self.markets_to_skip -= 1
+            log.warning(
+                f"[SESSION] Cooldown: skipped 1 market ({self.markets_to_skip} remaining). "
+                f"Trend context preserved: {trend_summary} {trend_short_summary}"
+            )
+            if self.markets_to_skip <= 0:
+                log.warning(
+                    f"[SESSION] Cooldown complete — re-entering with accumulated trend data. "
+                    f"60m={trend_summary} 30m={trend_short_summary} "
+                    f"(streak was {self.consecutive_losses}L, NOT resetting — trend informs next entry)"
+                )
 
     def get_current_fraction(self) -> float:
         """Get the current bankroll fraction to use (legacy, for safety checks)"""
@@ -1360,6 +1401,45 @@ class SpotTrend:
         if n < 2:
             return "trend=N/A(warming)"
         return f"trend={direction}(${move:+.0f}/{mins:.0f}min/{n}pts)"
+
+
+class SpotMomentum:
+    """
+    Tracks spot price at full resolution (every poll) over a short window
+    to detect whipsaw / fast-moving markets. Unlike SpotTrend which samples
+    every 30s for long-term trend, this captures every price tick.
+    """
+    def __init__(self, window_seconds: int = WHIPSAW_WINDOW_SECONDS):
+        self.window_seconds = window_seconds
+        self.samples: List[Tuple[float, float]] = []  # (timestamp, spot_price)
+
+    def record(self, spot: float) -> None:
+        """Record a spot price (every poll — no rate limiting)."""
+        now = time.time()
+        self.samples.append((now, spot))
+        cutoff = now - self.window_seconds
+        self.samples = [(t, p) for t, p in self.samples if t >= cutoff]
+
+    def max_move(self) -> Tuple[float, int]:
+        """Returns (max_abs_move_usd, num_samples) over the window."""
+        if len(self.samples) < 2:
+            return 0.0, len(self.samples)
+        prices = [p for _, p in self.samples]
+        hi = max(prices)
+        lo = min(prices)
+        return hi - lo, len(self.samples)
+
+    def is_whipsaw(self) -> Tuple[bool, float, str]:
+        """Check if market is in whipsaw / fast-move territory.
+        Returns (is_whipsaw, move_usd, reason)."""
+        if not WHIPSAW_ENABLED:
+            return False, 0.0, "disabled"
+        move, n = self.max_move()
+        if n < WHIPSAW_MIN_SAMPLES:
+            return False, 0.0, f"warming({n}/{WHIPSAW_MIN_SAMPLES})"
+        if move >= WHIPSAW_THRESHOLD_USD:
+            return True, move, f"${move:.0f}>{WHIPSAW_THRESHOLD_USD:.0f}_in_{self.window_seconds}s"
+        return False, move, f"ok(${move:.0f}<${WHIPSAW_THRESHOLD_USD:.0f})"
 
 
 class ProbTrend:
@@ -2359,7 +2439,8 @@ def main() -> None:
     )
     log.warning(
         f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
-        f"consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} cooldown={SESSION_COOLDOWN_MINUTES}min "
+        f"consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} cooldown={SESSION_COOLDOWN_MARKETS}_markets "
+        f"whipsaw=${WHIPSAW_THRESHOLD_USD:.0f}/{WHIPSAW_WINDOW_SECONDS}s "
         f"balance_check_delay={BALANCE_CHECK_DELAY_SECONDS}s"
     )
     log.warning(
@@ -2385,6 +2466,7 @@ def main() -> None:
     trend = SpotTrend()  # 60-min long-term trend
     trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
+    spot_momentum = SpotMomentum()  # Fast spot tracker for whipsaw detection
     active_market_obj: Dict[str, Any] = {}
 
     # Initialize session with starting balance
@@ -2621,8 +2703,15 @@ def main() -> None:
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
 
                     # Reset per-market session state (keeps daily P&L intact)
+                    # Decrement market-skip cooldown BEFORE reset (uses trend data)
+                    session.decrement_market_skip(
+                        trend_summary=trend.summary(),
+                        trend_short_summary=trend_short.summary(),
+                    )
                     session.reset_for_new_market()
                     prob_trend.reset(mt2)
+                    # NOTE: trend and trend_short are NOT reset — they persist across markets
+                    # so that post-cooldown entries have full 60min/30min context
 
                     st.event = ev2
                     st.market = mt2
@@ -3045,6 +3134,7 @@ def main() -> None:
         if spot is not None:
             trend.record(spot)
             trend_short.record(spot)
+            spot_momentum.record(spot)
         if spot is None:
             log.warning(f"[SPOT] failed; skipping this poll")
             time.sleep(POLL_SECONDS)
@@ -3108,6 +3198,22 @@ def main() -> None:
         # By now we have 5 minutes of trend data to inform the decision
         # ============================================================
         st.sm = SM.ARMED
+
+        # WHIPSAW FILTER: if ETH moved > $5 in the last 45s, the probability
+        # estimate is stale. The orderbook hasn't caught up. Skip this entry
+        # cycle and let the market settle. This is where the worst losses happen:
+        # entering on stale 93% probability that's actually 60%.
+        is_whipsaw, whipsaw_move, whipsaw_reason = spot_momentum.is_whipsaw()
+        if is_whipsaw:
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.warning(
+                    f"[WHIPSAW] SKIPPING entry — ETH moved ${whipsaw_move:.2f} in "
+                    f"{WHIPSAW_WINDOW_SECONDS}s (>${WHIPSAW_THRESHOLD_USD:.0f}) — "
+                    f"probability stale, waiting for market to settle"
+                )
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
 
         if secs_to_close < ENTRY_LAST_SECONDS:
             if pos == 0 and secs_to_close < 0:
