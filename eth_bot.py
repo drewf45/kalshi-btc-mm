@@ -131,8 +131,14 @@ META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
-YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only (disabled — NO side has the edge)
-NO_ONLY = env_bool("NO_ONLY", True)      # Trade NO only — YES side is -$2.62, NO side is +$0.30 at 67% win rate
+YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
+NO_ONLY = env_bool("NO_ONLY", False)     # Trade NO only
+# ASYMMETRIC ENTRY: YES side bleeds, NO side wins. Trade both but require
+# YES to clear a higher bar. NO uses the standard settings above.
+YES_EDGE_MIN = 0.05                       # YES needs 5% edge (vs 3% for NO) — only enter on real mispricing
+YES_PROB_MIN = 0.90                       # YES needs 90%+ prob at all times (vs 83% for NO late)
+YES_MAX_ENTRY_PRICE_CENTS = 85            # YES max 85¢ (vs 90¢ for NO) — force bigger upside per win
+YES_KELLY_MULTIPLIER = 0.15              # YES gets 15% Kelly (vs 25% for NO) — smaller bets on the weaker side
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -1719,21 +1725,23 @@ def choose_trade(
     else:
         effective_prob_min = PROB_MIN         # <3min: 85%+ — market has priced in the outcome
         
-    ok_yes = (
-        yes_px is not None
-        and ok_book_yes
-        and (p_yes_blend >= effective_prob_min)  # Use blend for gate
-        and (edge_yes >= EDGE_MIN)
-        and (yes_px <= MAX_ENTRY_PRICE_CENTS)
-        and div_gate_yes
-    )
+    # NO side: standard thresholds (this side is profitable)
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_blend >= effective_prob_min)  # Use blend for gate
+        and (p_no_blend >= effective_prob_min)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
+    )
+    # YES side: TIGHTER thresholds (this side bleeds — need higher bar)
+    ok_yes = (
+        yes_px is not None
+        and ok_book_yes
+        and (p_yes_blend >= max(effective_prob_min, YES_PROB_MIN))  # Always need ≥90%
+        and (edge_yes >= YES_EDGE_MIN)      # Need 5% edge (vs 3% for NO)
+        and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS)  # Max 85¢ (vs 90¢ for NO)
+        and div_gate_yes
     )
 
     # MARKET CONVICTION OVERRIDE: When the book shows ≥85% on one side inside the
@@ -3431,6 +3439,15 @@ def main() -> None:
             p_gate = float(p_no_blend)
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+
+        # ASYMMETRIC SIZING: YES side gets smaller bets (it bleeds)
+        if chosen_side == "yes" and qty > 0:
+            yes_scale = YES_KELLY_MULTIPLIER / KELLY_MULTIPLIER  # 0.15 / 0.25 = 0.60
+            scaled_qty = max(MIN_CONTRACTS, int(qty * yes_scale))
+            if scaled_qty < qty:
+                log.info(f"[SIZE] YES side downscaled: {qty} -> {scaled_qty} contracts (YES_KELLY={YES_KELLY_MULTIPLIER})")
+                qty = scaled_qty
+
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
