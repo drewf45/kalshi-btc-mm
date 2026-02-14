@@ -13,7 +13,7 @@
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
 # - EDGE_MIN=0.03 (3% real edge — no penny-picking)
-# - MAX_ENTRY_PRICE=96¢ (force real edge — 4¢/win)
+# - MIN_PAYOFF=8¢/contract (hard floor — no penny wins, max entry=92¢)
 # - KELLY=0.25 (quarter-Kelly — smoother equity curve)
 # - SOL-AWARE BAIL: only dump if SOL has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
@@ -161,8 +161,17 @@ CANCEL_UNFILLED_AT_CLOSE = True
 
 PROB_MIN = 0.86  # 86%+ to enter in last 2 min — raised from 83%, SOL noise needs higher bar
 EDGE_MIN = 0.05  # 5% minimum edge — SOL needs stricter edge than BTC/ETH (3%) due to thinner books and higher noise
-MAX_ENTRY_PRICE_CENTS = 94  # At 94¢ entry, gain 6¢/win, need ~16 wins per loss (was 96¢ — too thin for SOL)
+MAX_ENTRY_PRICE_CENTS = 92  # At 92¢ entry, gain 8¢/win, need ~12 wins per loss — matches MIN_PAYOFF_CENTS
 FEE_CENTS_PER_CONTRACT = 0
+
+# -------------- MINIMUM PAYOFF THRESHOLD (the key fix for SOL) ----------
+# SOL was winning $0.01–$0.02 and losing $0.25–$0.53.  At those ratios you
+# need 25–50 wins per loss — impossible.  This hard gate blocks ANY trade
+# (including scalps, flips, settlement locks, high-certainty overrides)
+# where the payoff per contract is below this floor.
+# At 8¢: entry ≤92¢.  Win=8¢, worst loss=92¢ → need ~12 wins/loss.
+# This single gate closes every backdoor path to penny-payoff trades.
+MIN_PAYOFF_CENTS = 8  # HARD FLOOR: no trade where win < 8¢/contract (max entry = 92¢)
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
 # Buy window is 7min → 5s before close. Require more certainty at the start
@@ -316,7 +325,7 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
 FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
+FLIP_MAX_ENTRY_PRICE = 92           # Capped by MIN_PAYOFF_CENTS=8 — no more 99¢ recovery flips that win 1¢
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
 # With <60s left and SOL far from the strike, the outcome is locked.
@@ -341,7 +350,7 @@ SCALP_DISTANCE_TIERS = [
     (0.35, 0.45),    # $0.35-0.60: safe, meaningful size
     (0.20, 0.25),    # $0.20-0.35: moderate — compound the edge
 ]
-SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
+SCALP_MAX_ENTRY_PRICE = 92        # Capped by MIN_PAYOFF_CENTS=8 — no more 1¢ scalps (was 99¢, the #1 source of penny wins)
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
 SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
 
@@ -379,14 +388,14 @@ A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Go big — 90%+ prob is 
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
-HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
+HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 92)  # Capped by MIN_PAYOFF_CENTS=8
 
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
 SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
-SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 92)   # Capped by MIN_PAYOFF_CENTS=8 (was 99 — settlement lock was the worst offender)
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
@@ -1839,6 +1848,18 @@ def choose_trade(
     if YES_ONLY:
         ok_no = False
 
+    # === MINIMUM PAYOFF GATE (hard floor — closes ALL backdoor paths) ===
+    # Block any trade where the payoff per contract is below MIN_PAYOFF_CENTS.
+    # This single check catches normal entries, settlement locks, high-certainty
+    # overrides, and any other path that might allow thin-payoff trades.
+    # Payoff = 100 - entry_price (winner gets $1, paid entry_price cents).
+    if ok_yes and yes_px is not None and (100 - int(yes_px)) < MIN_PAYOFF_CENTS:
+        log.warning(f"[PAYOFF GATE] YES blocked: payoff={100 - int(yes_px)}¢ < {MIN_PAYOFF_CENTS}¢ floor (price={yes_px}¢)")
+        ok_yes = False
+    if ok_no and no_px is not None and (100 - int(no_px)) < MIN_PAYOFF_CENTS:
+        log.warning(f"[PAYOFF GATE] NO blocked: payoff={100 - int(no_px)}¢ < {MIN_PAYOFF_CENTS}¢ floor (price={no_px}¢)")
+        ok_no = False
+
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
@@ -2309,6 +2330,10 @@ def evaluate_scalp(
 
     if ask_price is None or ask_price > SCALP_MAX_ENTRY_PRICE:
         return False, 0, None, f"price={ask_price}¢_too_high(max={SCALP_MAX_ENTRY_PRICE})"
+
+    # PAYOFF GATE: block scalps below minimum payoff (closes the penny-scalp backdoor)
+    if ask_price is not None and (100 - ask_price) < MIN_PAYOFF_CENTS:
+        return False, 0, None, f"payoff={100 - ask_price}¢_below_floor({MIN_PAYOFF_CENTS}¢)"
 
     if p_blend < SCALP_MIN_PROB:
         return False, 0, None, f"prob={p_blend:.1%}<{SCALP_MIN_PROB:.0%}"
@@ -2841,6 +2866,7 @@ def main() -> None:
                                         and secs_to_close >= FLIP_MIN_TIME_REMAINING
                                         and flip_price is not None
                                         and flip_price <= FLIP_MAX_ENTRY_PRICE
+                                        and (100 - flip_price) >= MIN_PAYOFF_CENTS  # Payoff gate
                                         and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
                                     )
 
@@ -2934,6 +2960,8 @@ def main() -> None:
                                             reason_parts.append(f"time={secs_to_close}s<{FLIP_MIN_TIME_REMAINING}s")
                                         if flip_price is not None and flip_price > FLIP_MAX_ENTRY_PRICE:
                                             reason_parts.append(f"price={flip_price}¢>{FLIP_MAX_ENTRY_PRICE}¢")
+                                        if flip_price is not None and (100 - flip_price) < MIN_PAYOFF_CENTS:
+                                            reason_parts.append(f"payoff={100 - flip_price}¢<{MIN_PAYOFF_CENTS}¢_floor")
                                         if flip_price is not None and flip_price < 80 and flip_prob < FLIP_MIN_PROB:
                                             reason_parts.append(f"prob={flip_prob:.1%}<{FLIP_MIN_PROB:.0%},mkt={flip_price}¢<80¢")
                                         if flip_price is None:
@@ -3356,6 +3384,13 @@ def main() -> None:
         else:
             edge_net = float(edge_no)
             p_gate = float(p_no_blend)
+
+        # MINIMUM PAYOFF GATE (final safety net — catches anything that slipped through)
+        payoff_cents = 100 - int(chosen_px)
+        if payoff_cents < MIN_PAYOFF_CENTS:
+            log.warning(f"[PAYOFF GATE] BLOCKED: {chosen_side} @ {chosen_px}¢ payoff={payoff_cents}¢ < {MIN_PAYOFF_CENTS}¢ floor")
+            time.sleep(POLL_SECONDS)
+            continue
 
         # POST-COOLDOWN REEVALUATION: require extra edge after loss streak
         # This forces the bot to only take high-quality trades after losing 4 in a row
