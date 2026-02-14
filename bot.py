@@ -261,9 +261,16 @@ DUMP_EARLY_EXIT_ENABLED = True
 # Reversal during early settling phase uses a wider threshold (not blocked entirely)
 DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
 
+# -------------- HARD DOLLAR STOP-LOSS (absolute max loss per trade, no exceptions) -----
+# This fires FIRST, before grace period, before BTC check, before everything.
+# If a trade is losing more than this dollar amount, GET OUT. Period.
+# At 72.5% win rate with ~$0.05 avg win, $0.75 loss = 15 wins erased.
+# Cutting to $0.50 means one loss erases ~10 wins. Still not great but survivable.
+HARD_STOP_LOSS_USD = 0.75  # Absolute max dollar loss per trade — no BTC check, no grace period
+
 # -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
 # Never lose more than X% of current balance on a single trade.
-# At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
+# At $35: max loss = $1.05.  At $350: max loss = $10.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
 DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
@@ -1868,6 +1875,28 @@ def should_dump_position(
     """
     if not ENABLE_DUMP:
         return False, None
+
+    # =============================================================
+    # === HARD DOLLAR STOP-LOSS: FIRES FIRST, NO EXCEPTIONS ===
+    # Before grace period, before BTC check, before late-entry hold.
+    # If the trade is losing more than HARD_STOP_LOSS_USD, get out NOW.
+    # This is what prevents one bad trade from erasing 15 wins.
+    # =============================================================
+    if st.entry_price_cents is not None and st.qty > 0:
+        if st.side == "yes":
+            _hs_prob = p_yes_blend
+        else:
+            _hs_prob = p_no_blend
+        _hs_exit_est = int(_hs_prob * 100)
+        _hs_loss_per_ct = st.entry_price_cents - _hs_exit_est
+        _hs_total_loss = (_hs_loss_per_ct * st.qty) / 100.0
+        if _hs_total_loss >= HARD_STOP_LOSS_USD:
+            log.warning(
+                f"[HARD STOP] losing ${_hs_total_loss:.2f} >= ${HARD_STOP_LOSS_USD:.2f} cap — "
+                f"BAIL (entry={st.entry_price_cents}¢ est_exit={_hs_exit_est}¢ "
+                f"loss={_hs_loss_per_ct}¢/ct × {st.qty}ct) — no exceptions"
+            )
+            return True, f"hard_stop_${_hs_total_loss:.2f}>=${HARD_STOP_LOSS_USD:.2f}"
 
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
