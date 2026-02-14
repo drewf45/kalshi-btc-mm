@@ -131,7 +131,8 @@ META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
-YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
+YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only (disabled — NO side has the edge)
+NO_ONLY = env_bool("NO_ONLY", True)      # Trade NO only — YES side is -$2.62, NO side is +$0.30 at 67% win rate
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -271,14 +272,15 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss
+DUMP_MAX_LOSS_USD = 1.00                  # HARD $1.00 CAP — absolute max loss per trade regardless of balance
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
+MAX_SETTLEMENT_LOSS_FRACTION = 0.04  # Max 4% of balance at risk per trade (was 8% — $4.30 blowup)
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -1856,12 +1858,16 @@ def choose_trade(
                 f"max={max_no_settle}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
-    # YES_ONLY: Master one direction before adding the other.
-    # Block all NO entries — overrides high-certainty and settlement lock too.
+    # YES_ONLY / NO_ONLY: Focus on one direction at a time.
+    # Block entries on the excluded side — overrides high-certainty and settlement lock too.
     if YES_ONLY and ok_no and not ok_yes:
         log.info(f"[YES_ONLY] Blocking NO entry (edge={edge_no:.4f} prob={p_no_blend:.1%}) — YES_ONLY mode")
     if YES_ONLY:
         ok_no = False
+    if NO_ONLY and ok_yes and not ok_no:
+        log.info(f"[NO_ONLY] Blocking YES entry (edge={edge_yes:.4f} prob={p_yes_blend:.1%}) — NO_ONLY mode")
+    if NO_ONLY:
+        ok_yes = False
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -1974,6 +1980,9 @@ def should_dump_position(
                 exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
                 loss_per_contract = st.entry_price_cents - exit_price_est
                 total_loss_usd = (loss_per_contract * st.qty) / 100.0
+                # Absolute $1 hard cap
+                if total_loss_usd > DUMP_MAX_LOSS_USD:
+                    return True, f"late_entry_hard_cap_${total_loss_usd:.2f}>${DUMP_MAX_LOSS_USD:.2f}"
                 max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
                 if total_loss_usd > max_loss_balance:
                     return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
@@ -2032,7 +2041,16 @@ def should_dump_position(
         total_loss_usd = total_loss_cents / 100.0
         position_cost_usd = (st.entry_price_cents * st.qty) / 100.0
 
-        # Cap 1: fraction of current balance
+        # Cap 1a: ABSOLUTE HARD CAP — never lose more than $1.00 per trade
+        if total_loss_usd > DUMP_MAX_LOSS_USD:
+            log.warning(
+                f"[BAIL $1 HARD CAP] losing ${total_loss_usd:.2f} > ${DUMP_MAX_LOSS_USD:.2f} hard cap — "
+                f"{loss_per_contract}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — IMMEDIATE BAIL"
+            )
+            return True, f"hard_cap_${total_loss_usd:.2f}>${DUMP_MAX_LOSS_USD:.2f}"
+
+        # Cap 1b: fraction of current balance
         if current_balance_usd > 0:
             max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
             if total_loss_usd > max_loss_balance:
@@ -2229,17 +2247,19 @@ def compute_qty_from_bankroll(
     target_qty = int(available_usd * fraction / cost_per)
 
     # SETTLEMENT LOSS CAP: worst case = lose entire entry cost at settlement.
-    # Cap so that worst-case loss never exceeds MAX_SETTLEMENT_LOSS_FRACTION of balance.
+    # Cap so that worst-case loss never exceeds MAX_SETTLEMENT_LOSS_FRACTION of balance
+    # AND never exceeds the absolute $1.00 hard cap.
     if cost_per > 0 and available_usd > 0:
-        max_settlement_loss = available_usd * MAX_SETTLEMENT_LOSS_FRACTION
+        max_settlement_loss_pct = available_usd * MAX_SETTLEMENT_LOSS_FRACTION
+        max_settlement_loss = min(max_settlement_loss_pct, DUMP_MAX_LOSS_USD)
         max_qty_for_loss_cap = int(max_settlement_loss / cost_per)
         if max_qty_for_loss_cap < MIN_CONTRACTS:
             max_qty_for_loss_cap = MIN_CONTRACTS
         if target_qty > max_qty_for_loss_cap:
             log.info(
                 f"[SIZE] Settlement loss cap: {target_qty} -> {max_qty_for_loss_cap} contracts "
-                f"(max loss ${max_settlement_loss:.2f} = {MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}, "
-                f"entry={entry_cents}¢)"
+                f"(max loss ${max_settlement_loss:.2f} = min({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}, "
+                f"${DUMP_MAX_LOSS_USD:.2f} hard cap), entry={entry_cents}¢)"
             )
             target_qty = max_qty_for_loss_cap
 
@@ -2418,7 +2438,7 @@ def main() -> None:
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
-        f"YES_ONLY={YES_ONLY}"
+        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY} HARD_STOP=${DUMP_MAX_LOSS_USD:.2f}"
     )
     log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
@@ -2875,6 +2895,7 @@ def main() -> None:
                                         and flip_price is not None
                                         and flip_price <= FLIP_MAX_ENTRY_PRICE
                                         and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
+                                        and not (NO_ONLY and flip_side == "yes")  # Don't flip to YES in NO_ONLY mode
                                     )
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
@@ -2961,6 +2982,8 @@ def main() -> None:
                                             reason_parts.append("disabled")
                                         if YES_ONLY and flip_side == "no":
                                             reason_parts.append("yes_only_mode")
+                                        if NO_ONLY and flip_side == "yes":
+                                            reason_parts.append("no_only_mode")
                                         if st.has_flipped:
                                             reason_parts.append("already_flipped")
                                         if secs_to_close < FLIP_MIN_TIME_REMAINING:
