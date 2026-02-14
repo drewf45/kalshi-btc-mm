@@ -128,13 +128,16 @@ YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the
 NO_ONLY = env_bool("NO_ONLY", False)      # Trade only NO side (overrides YES_ONLY if both set)
 
 # -------------- ASYMMETRIC SIDE REQUIREMENTS --------------------------------
-# YES has been a consistent loser (bleeds). NO wins at 79%.
-# Instead of killing YES entirely, make it prove itself with a higher bar.
-# YES must clear tighter thresholds; NO uses the standard (looser) thresholds.
-YES_PROB_BONUS = 0.05       # YES needs 5% higher probability than NO to enter
-YES_EDGE_BONUS = 0.02       # YES needs 2% more edge than NO (5% total vs 3%)
-YES_MAX_ENTRY_PRICE = 91    # YES capped at 91¢ (9¢ profit/win, nuke ratio 10:1)
-YES_REQUIRE_TREND = True    # YES always requires trend alignment, no fast lane
+# YES has been a consistent loser across all sessions. NO wins at 79%.
+# YES is NOT disabled — but it should only fire when the stars align:
+# every trend, every signal, highest probability, lowest price.
+# Think of YES as a rare bonus trade, not a regular entry.
+YES_PROB_BONUS = 0.12       # YES needs 12% higher probability (95% when NO needs 83%, 102%/impossible early)
+YES_EDGE_BONUS = 0.04       # YES needs 7% total edge (vs NO's 3%) — must be clearly mispriced
+YES_MAX_ENTRY_PRICE = 88    # YES capped at 88¢ (12¢ profit/win, nuke ratio ~7:1, real edge only)
+YES_REQUIRE_TREND = True    # YES always requires trend alignment — no fast lane, no exceptions
+YES_REQUIRE_BOTH_TRENDS = True  # YES must have BOTH 60-min AND 30-min BTC trend aligned
+YES_MIN_BTC_DISTANCE = 150.0    # YES only if BTC is $150+ above floor (safe cushion)
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -3392,6 +3395,41 @@ def main() -> None:
 
             if prob_trend_ok:
                 log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
+
+        # =============================================================
+        # === YES "STARS ALIGN" GATE: extra checks YES must pass ===
+        # YES only fires if EVERY signal confirms. This is the final filter
+        # that makes YES a rare, high-conviction trade instead of a bleeder.
+        # =============================================================
+        if chosen_side == "yes" and not YES_ONLY:
+            # Gate 1: Both BTC trends must align (60-min AND 30-min)
+            if YES_REQUIRE_BOTH_TRENDS:
+                alignment_60 = trend.trade_alignment("yes", lo, hi, spot)
+                alignment_30 = trend_short.trade_alignment("yes", lo, hi, spot)
+                if alignment_60 != "with" or alignment_30 != "with":
+                    log.warning(
+                        f"[YES STARS] BLOCKED — need BOTH trends 'with', got "
+                        f"60m={alignment_60} 30m={alignment_30}"
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+            # Gate 2: BTC must be well above the floor (safe cushion)
+            if lo is not None:
+                btc_above_floor = spot - lo
+                if btc_above_floor < YES_MIN_BTC_DISTANCE:
+                    log.warning(
+                        f"[YES STARS] BLOCKED — BTC ${spot:.0f} only ${btc_above_floor:.0f} above "
+                        f"floor ${lo:.0f} (need ${YES_MIN_BTC_DISTANCE:.0f}+)"
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+            log.warning(
+                f"[YES STARS] ALL GATES PASSED — YES entry approved "
+                f"(prob={current_prob_for_side:.1%} edge={edge_yes:.4f} "
+                f"price={chosen_px}¢ btc_dist=${spot - (lo or 0):.0f})"
+            )
 
         # Check session limits before trading
         can_trade, pause_reason = session.check_can_trade()
