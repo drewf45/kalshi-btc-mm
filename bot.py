@@ -125,6 +125,16 @@ DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
+NO_ONLY = env_bool("NO_ONLY", False)      # Trade only NO side (overrides YES_ONLY if both set)
+
+# -------------- ASYMMETRIC SIDE REQUIREMENTS --------------------------------
+# YES has been a consistent loser (bleeds). NO wins at 79%.
+# Instead of killing YES entirely, make it prove itself with a higher bar.
+# YES must clear tighter thresholds; NO uses the standard (looser) thresholds.
+YES_PROB_BONUS = 0.05       # YES needs 5% higher probability than NO to enter
+YES_EDGE_BONUS = 0.02       # YES needs 2% more edge than NO (5% total vs 3%)
+YES_MAX_ENTRY_PRICE = 91    # YES capped at 91¢ (9¢ profit/win, nuke ratio 10:1)
+YES_REQUIRE_TREND = True    # YES always requires trend alignment, no fast lane
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -266,7 +276,13 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # If a trade is losing more than this dollar amount, GET OUT. Period.
 # At 72.5% win rate with ~$0.05 avg win, $0.75 loss = 15 wins erased.
 # Cutting to $0.50 means one loss erases ~10 wins. Still not great but survivable.
-HARD_STOP_LOSS_USD = 0.75  # Absolute max dollar loss per trade — no BTC check, no grace period
+HARD_STOP_LOSS_USD = 1.00  # Absolute max dollar loss per trade — no BTC check, no grace period
+
+# -------------- MINIMUM EXPECTED PAYOUT (stop making penny trades) ----------
+# If projected win is $0.02-$0.03, the risk/reward is terrible.
+# Require minimum expected profit before entering any trade.
+# expected_payout = qty × (100 - entry_cents) / 100
+MIN_EXPECTED_PAYOUT_USD = 0.10  # Don't enter trades with < $0.10 projected win
 
 # -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
 # Never lose more than X% of current balance on a single trade.
@@ -1648,26 +1664,33 @@ def choose_trade(
 
     # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
     if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-        effective_prob_min = PROB_EARLY_MIN   # >5min: need 92%+
+        effective_prob_min = PROB_EARLY_MIN   # >5min: need 90%+
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-        effective_prob_min = PROB_MID_MIN     # 3-5min: need 88%+
+        effective_prob_min = PROB_MID_MIN     # 3-5min: need 86%+
     else:
-        effective_prob_min = PROB_MIN         # <3min: 85%+ — market has priced in the outcome
-        
+        effective_prob_min = PROB_MIN         # <3min: 83%+ — market has priced in the outcome
+
+    # ASYMMETRIC GATES: YES must clear a higher bar than NO
+    yes_prob_min = effective_prob_min + YES_PROB_BONUS  # YES: +5% prob required
+    yes_edge_min = EDGE_MIN + YES_EDGE_BONUS            # YES: +2% edge required (5% total)
+    yes_max_price = YES_MAX_ENTRY_PRICE                  # YES: capped at 91¢
+    no_prob_min = effective_prob_min                      # NO: standard thresholds
+    no_edge_min = EDGE_MIN                               # NO: standard 3% edge
+
     ok_yes = (
         yes_px is not None
         and ok_book_yes
-        and (p_yes_blend >= effective_prob_min)  # Use blend for gate
-        and (edge_yes >= EDGE_MIN)
-        and (yes_px <= MAX_ENTRY_PRICE_CENTS)
+        and (p_yes_blend >= yes_prob_min)     # YES: tighter prob gate
+        and (edge_yes >= yes_edge_min)        # YES: tighter edge gate
+        and (yes_px <= yes_max_price)         # YES: lower price cap (91¢)
         and div_gate_yes
     )
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_blend >= effective_prob_min)  # Use blend for gate
-        and (edge_no >= EDGE_MIN)
-        and (no_px <= MAX_ENTRY_PRICE_CENTS)
+        and (p_no_blend >= no_prob_min)       # NO: standard prob gate
+        and (edge_no >= no_edge_min)          # NO: standard edge gate
+        and (no_px <= MAX_ENTRY_PRICE_CENTS)  # NO: normal price cap (96¢)
         and div_gate_no
     )
 
@@ -1689,15 +1712,15 @@ def choose_trade(
             p_no_blend = 1.0 - p_yes_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
+            # Re-evaluate ok_yes/ok_no with new blend (asymmetric gates)
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
-                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
+                and (p_yes_blend >= yes_prob_min) and (edge_yes >= yes_edge_min)
+                and (yes_px <= yes_max_price) and div_gate_yes
             )
             ok_no = (
                 no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (p_no_blend >= no_prob_min) and (edge_no >= no_edge_min)
                 and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
             )
         elif p_no_mkt >= MARKET_CONVICTION_THRESHOLD and p_no_blend < p_no_mkt:
@@ -1709,11 +1732,11 @@ def choose_trade(
             p_yes_blend = 1.0 - p_no_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
+            # Re-evaluate ok_yes/ok_no with new blend (asymmetric gates)
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
-                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
+                and (p_yes_blend >= yes_prob_min) and (edge_yes >= yes_edge_min)
+                and (yes_px <= yes_max_price) and div_gate_yes
             )
             ok_no = (
                 no_px is not None and ok_book_no
@@ -1787,12 +1810,22 @@ def choose_trade(
                 f"max={max_settle_px}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
-    # YES_ONLY: Master one direction before adding the other.
-    # Block all NO entries — overrides high-certainty and settlement lock too.
+    # SIDE RESTRICTION: YES_ONLY or NO_ONLY modes
     if YES_ONLY and ok_no and not ok_yes:
         log.info(f"[YES_ONLY] Blocking NO entry (edge={edge_no:.4f} prob={p_no_blend:.1%}) — YES_ONLY mode")
     if YES_ONLY:
         ok_no = False
+    if NO_ONLY and ok_yes and not ok_no:
+        log.info(f"[NO_ONLY] Blocking YES entry (edge={edge_yes:.4f} prob={p_yes_blend:.1%}) — NO_ONLY mode")
+    if NO_ONLY:
+        ok_yes = False
+
+    # Log asymmetric gate info when YES is blocked by tighter requirements
+    if not ok_yes and yes_px is not None and p_yes_blend >= effective_prob_min and not YES_ONLY and not NO_ONLY:
+        log.info(
+            f"[YES TIGHTENED] Blocked: prob={p_yes_blend:.1%} (need {yes_prob_min:.1%}) "
+            f"edge={edge_yes:.4f} (need {yes_edge_min:.2f}) price={yes_px}¢ (max {yes_max_price}¢)"
+        )
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -2400,7 +2433,12 @@ def main() -> None:
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
-        f"YES_ONLY={YES_ONLY}"
+        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY}"
+    )
+    log.warning(
+        f"[BOOTCFG] ASYMMETRIC: YES_PROB_BONUS={YES_PROB_BONUS:.0%} YES_EDGE_BONUS={YES_EDGE_BONUS:.0%} "
+        f"YES_MAX_ENTRY={YES_MAX_ENTRY_PRICE}¢ YES_REQUIRE_TREND={YES_REQUIRE_TREND} "
+        f"HARD_STOP=${HARD_STOP_LOSS_USD:.2f} MIN_PAYOUT=${MIN_EXPECTED_PAYOUT_USD:.2f}"
     )
     log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
@@ -2848,6 +2886,7 @@ def main() -> None:
                                         and flip_price is not None
                                         and flip_price <= FLIP_MAX_ENTRY_PRICE
                                         and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
+                                        and not (NO_ONLY and flip_side == "yes")  # Don't flip to YES in NO_ONLY mode
                                     )
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
@@ -2934,6 +2973,8 @@ def main() -> None:
                                             reason_parts.append("disabled")
                                         if YES_ONLY and flip_side == "no":
                                             reason_parts.append("yes_only_mode")
+                                        if NO_ONLY and flip_side == "yes":
+                                            reason_parts.append("no_only_mode")
                                         if st.has_flipped:
                                             reason_parts.append("already_flipped")
                                         if secs_to_close < FLIP_MIN_TIME_REMAINING:
@@ -3231,6 +3272,14 @@ def main() -> None:
 
         fast_lane = current_prob_for_side >= fast_lane_thresh
 
+        # YES TIGHTENING: YES side never gets fast lane — must always prove trend alignment
+        if fast_lane and chosen_side == "yes" and YES_REQUIRE_TREND:
+            fast_lane = False
+            log.info(
+                f"[YES TIGHTENED] Blocking fast lane for YES (prob={current_prob_for_side:.1%}) "
+                f"— YES must pass trend checks"
+            )
+
         # CONFIRMATION HOLD: early in buy window, require signal stability
         # Even if fast lane fires, check that the signal has been consistent
         if fast_lane and secs_to_close > CONFIRMATION_HOLD_MIN_TIME:
@@ -3373,6 +3422,17 @@ def main() -> None:
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # MIN EXPECTED PAYOUT: don't enter trades where projected win is pennies
+        expected_payout = qty * (100 - int(chosen_px)) / 100.0
+        if expected_payout < MIN_EXPECTED_PAYOUT_USD:
+            log.warning(
+                f"[SKIP PAYOUT] {st.market} {chosen_side.upper()} @ {chosen_px}¢ × {qty} "
+                f"→ expected win ${expected_payout:.2f} < ${MIN_EXPECTED_PAYOUT_USD:.2f} min — not worth the risk"
+            )
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
