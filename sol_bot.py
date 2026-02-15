@@ -12,9 +12,11 @@
 #
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
-# - EDGE_MIN=0.03 (3% real edge — no penny-picking)
+# - EDGE_MIN=0.05 (5% real edge — stricter than BTC/ETH)
 # - MIN_PAYOFF=8¢/contract (hard floor — no penny wins, max entry=92¢)
-# - KELLY=0.25 (quarter-Kelly — smoother equity curve)
+# - HARD_MAX_LOSS=$1.00 (absolute ceiling — no single trade loses >$1)
+# - COLD_START: first 2 trades after restart at half size
+# - KELLY=0.20 (fifth-Kelly — proven sizing from +$0.84 session)
 # - SOL-AWARE BAIL: only dump if SOL has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
 # - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
@@ -133,13 +135,11 @@ ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 
-# -------------- NO-SIDE BIAS (data-driven: NO has 80% WR vs YES 30%) --------
-# The NO side is structurally stronger for SOL — SOL tends to breach the
-# upper boundary more often than it holds above it.  Give NO an advantage:
-# - Lower probability threshold for NO entries (accept slightly less certainty)
-# - Edge discount: treat NO edges as slightly better than they are
-# - When both sides qualify, prefer NO
-NO_BIAS_ENABLED = True
+# -------------- NO-SIDE BIAS (DISABLED — not present during proven session) --------
+# Was added with the 75% sizing increase that caused -$2.61/-$2.70 losses.
+# Rolling back to proven afternoon session state where max loss was -$0.43.
+# Can re-enable after the bot stabilizes at proven sizing.
+NO_BIAS_ENABLED = False
 NO_PROB_DISCOUNT = 0.03        # NO needs 3% less probability to enter (e.g., 90% becomes 87%)
 NO_EDGE_BONUS = 0.01           # Add 1% virtual edge to NO when comparing sides
 NO_SIZING_MULTIPLIER = 1.25    # Size NO positions 25% larger than YES
@@ -228,15 +228,15 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.07  # SOL: ~0.07 USD/√sec (SOL ~$200, ~2x high
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
 # Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
-KELLY_MULTIPLIER = 0.35     # Raised from 0.20 → 0.35 (~75% increase) — bot has proven edge across 3 sessions, time to capitalize
-KELLY_FLOOR_FRACTION = 0.08 # Minimum 8% of bankroll (was 5%) — trade meaningfully when we decide to trade
-KELLY_CAP_FRACTION = 0.65   # Up to 65% of bankroll in one trade (was 50%) — earned via consistent R/R of 1.71
+KELLY_MULTIPLIER = 0.20     # ROLLED BACK — 0.35 caused -$2.61/-$2.70 losses. This was the proven value during +$0.84 session.
+KELLY_FLOOR_FRACTION = 0.05 # ROLLED BACK from 0.08 — minimum 5% of bankroll
+KELLY_CAP_FRACTION = 0.50   # ROLLED BACK from 0.65 — never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy constants (kept for backward compat in safety checks)
-BASE_CONTRACTS = 5          # Raised from 3 — base position reflects proven edge
-CONTRACT_INCREMENT = 2      # Raised from 1 — scale up faster after wins
+BASE_CONTRACTS = 3          # ROLLED BACK from 5
+CONTRACT_INCREMENT = 1      # ROLLED BACK from 2
 BANKROLL_FRACTION = 0.40
 SCALING_MIN_FRACTION = 0.15
 SCALING_MAX_FRACTION = 0.50
@@ -294,14 +294,30 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-trade loss (raised from 3% — worst loss was only $0.21, room to size up)
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # ROLLED BACK from 0.05 — 3% of current balance = max single-trade loss
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.14  # Max 14% of balance at risk per trade (was 8%) — scaled up with proven edge
+MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # ROLLED BACK from 0.14 — max 8% of balance at risk per trade
+
+# -------------- ABSOLUTE DOLLAR LOSS CAP (the -$2.61 lesson) ------------------
+# No single trade can lose more than this, period. This overrides everything:
+# Kelly sizing, bankroll fraction, settlement loss, catastrophic stop — all of it.
+# During the proven +$0.84 afternoon session, max loss was -$0.43.
+# $1.00 gives 2.3x headroom above that while preventing the -$2.61 blowups.
+# Enforced both PRE-TRADE (caps position size) and IN-TRADE (forces bail).
+HARD_MAX_LOSS_USD = 1.00  # ABSOLUTE CEILING: no single trade can lose more than $1.00
+
+# -------------- COLD-START PROTECTION (first trades after restart at half size) --------
+# After a restart the bot has NO trend data, NO prob history, NO market context.
+# The -$2.61 loss was likely a memory-loss blowup — entering blind at full size.
+# First N trades after boot use half the normal position size until the bot has
+# re-established its read on the market.
+COLD_START_TRADES = 2       # First 2 trades after any restart = half size
+COLD_START_SIZE_MULT = 0.50 # 50% of normal position size during cold-start
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -354,17 +370,16 @@ SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not
 SCALP_MIN_DISTANCE_USD = 0.20      # SOL must be ≥$0.20 from strike (was $0.10 — too thin, SOL can gap $0.10 easily)
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
-# Raised all tiers — SOL's higher vol means "safe distance" is larger in % terms
-# Bankroll fractions scaled up ~75% to match new sizing (proven edge)
+# ROLLED BACK scalp tiers to proven values (0.90/0.75/0.55/0.35 caused oversized losses)
 SCALP_DISTANCE_TIERS = [
-    (1.20, 0.90),    # $1.20+ from strike: extremely safe, nearly all-in
-    (0.60, 0.75),    # $0.60-1.20: very safe, go big
-    (0.35, 0.55),    # $0.35-0.60: safe, meaningful size
-    (0.20, 0.35),    # $0.20-0.35: moderate — compound the edge
+    (1.20, 0.85),    # $1.20+ from strike: extremely safe, size up hard
+    (0.60, 0.65),    # $0.60-1.20: very safe, go bigger
+    (0.35, 0.45),    # $0.35-0.60: safe, meaningful size
+    (0.20, 0.25),    # $0.20-0.35: moderate — compound the edge
 ]
 SCALP_MAX_ENTRY_PRICE = 92        # Capped by MIN_PAYOFF_CENTS=8 — no more 1¢ scalps (was 99¢, the #1 source of penny wins)
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.25    # Up to 25% of cash on a scalp (was 15% — scalps at 92¢ with 8¢ payoff are safer than old 99¢ scalps)
+SCALP_MAX_LOSS_FRACTION = 0.15    # ROLLED BACK from 0.25 — never risk more than 15% of cash on a scalp
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -396,7 +411,7 @@ EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 3.0)  # Steeper scaling
 
 A_PLUS_PROB = env_float("A_PLUS_PROB", 0.90)  # A+ = extremely certain outcome
 A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = even small edge at 90%+ prob is golden
-A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.60)  # Go big — 90%+ prob is as sure as it gets (raised from 0.40, bot has earned it)
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # ROLLED BACK from 0.60 — proven value
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
@@ -1145,6 +1160,9 @@ class SessionState:
 
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
+
+    # Cold-start protection: first N trades after boot use half size
+    trades_since_boot: int = 0  # Incremented on each trade entry, never resets
 
     # Post-cooldown reevaluation: require extra edge after loss streak
     _post_cooldown_boost: bool = False
@@ -2084,6 +2102,25 @@ def should_dump_position(
             return True, f"position_cap_${total_loss_usd:.2f}>{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%}"
 
     # =============================================================
+    # === HARD DOLLAR CAP: no single trade can lose more than $1.00 ===
+    # This fires even if the bankroll % caps didn't trigger (e.g., large balance).
+    # Uses the same HARD_MAX_LOSS_USD as the entry sizing cap.
+    # =============================================================
+    if st.entry_price_cents is not None and st.qty > 0:
+        exit_price_est_hc = int(current_prob * 100)
+        loss_per_ct_hc = st.entry_price_cents - exit_price_est_hc
+        total_loss_usd_hc = (loss_per_ct_hc * st.qty) / 100.0
+        if total_loss_usd_hc > HARD_MAX_LOSS_USD:
+            log.warning(
+                f"[BAIL HARD DOLLAR CAP] losing ${total_loss_usd_hc:.2f} > "
+                f"${HARD_MAX_LOSS_USD:.2f} hard cap — "
+                f"{loss_per_ct_hc}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est_hc}¢) — "
+                f"force exit to cap damage at ${HARD_MAX_LOSS_USD:.2f}"
+            )
+            return True, f"hard_dollar_cap_${total_loss_usd_hc:.2f}>${HARD_MAX_LOSS_USD:.2f}"
+
+    # =============================================================
     # === CATASTROPHIC STOP: absolute backstop, fires BEFORE SOL check ===
     # Even if bankroll cap didn't fire (e.g., balance unknown), this catches
     # extreme per-contract losses.
@@ -2269,6 +2306,21 @@ def compute_qty_from_bankroll(
             )
             target_qty = max_qty_for_loss_cap
 
+    # ABSOLUTE DOLLAR LOSS CAP: worst case = lose entire entry at settlement.
+    # Cap qty so worst-case loss never exceeds HARD_MAX_LOSS_USD.
+    # This is the lesson from the -$2.61 and -$2.70 blowups.
+    if cost_per > 0:
+        max_qty_for_hard_cap = int(HARD_MAX_LOSS_USD / cost_per)
+        if max_qty_for_hard_cap < MIN_CONTRACTS:
+            max_qty_for_hard_cap = MIN_CONTRACTS
+        if target_qty > max_qty_for_hard_cap:
+            log.warning(
+                f"[SIZE] HARD DOLLAR CAP: {target_qty} -> {max_qty_for_hard_cap} contracts "
+                f"(max loss ${HARD_MAX_LOSS_USD:.2f}, entry={entry_cents}¢, "
+                f"worst_case=${target_qty * cost_per:.2f} -> ${max_qty_for_hard_cap * cost_per:.2f})"
+            )
+            target_qty = max_qty_for_hard_cap
+
     qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
     log.info(
@@ -2317,6 +2369,18 @@ def compute_scalp_qty(
             f"(max loss ${max_loss_usd:.2f} = {SCALP_MAX_LOSS_FRACTION:.0%} of ${available_usd:.2f})"
         )
         target_qty = max_qty_for_loss
+
+    # ABSOLUTE DOLLAR LOSS CAP (same as normal sizing — no trade can lose > $1.00)
+    max_qty_for_hard_cap = int(HARD_MAX_LOSS_USD / cost_per)
+    if max_qty_for_hard_cap < 1:
+        max_qty_for_hard_cap = 1
+    if target_qty > max_qty_for_hard_cap:
+        log.warning(
+            f"[SCALP SIZE] HARD DOLLAR CAP: {target_qty} -> {max_qty_for_hard_cap} contracts "
+            f"(max loss ${HARD_MAX_LOSS_USD:.2f}, entry={entry_cents}¢, "
+            f"worst_case=${target_qty * cost_per:.2f} -> ${max_qty_for_hard_cap * cost_per:.2f})"
+        )
+        target_qty = max_qty_for_hard_cap
 
     target_qty = max(0, min(target_qty, MAX_CONTRACTS))
 
@@ -2923,6 +2987,15 @@ def main() -> None:
                                         except Exception:
                                             flip_qty = MIN_CONTRACTS
 
+                                        # Cold-start protection applies to flips too
+                                        if session.trades_since_boot < COLD_START_TRADES:
+                                            old_fq = flip_qty
+                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * COLD_START_SIZE_MULT))
+                                            log.warning(
+                                                f"[COLD START] Flip trade #{session.trades_since_boot + 1}/{COLD_START_TRADES}: "
+                                                f"half-sizing {old_fq} -> {flip_qty} contracts"
+                                            )
+
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
@@ -3442,6 +3515,18 @@ def main() -> None:
             if qty > old_qty:
                 log.info(f"[NO BIAS] Sizing up NO: {old_qty} → {qty} contracts (×{NO_SIZING_MULTIPLIER})")
 
+        # COLD-START PROTECTION: first N trades after restart at half size.
+        # Bot has no trend data, no prob history, no market context on boot.
+        # Half-size until it has re-established its read on the market.
+        if session.trades_since_boot < COLD_START_TRADES:
+            old_qty = qty
+            qty = max(MIN_CONTRACTS, int(qty * COLD_START_SIZE_MULT))
+            log.warning(
+                f"[COLD START] Trade #{session.trades_since_boot + 1}/{COLD_START_TRADES}: "
+                f"half-sizing {old_qty} -> {qty} contracts "
+                f"(×{COLD_START_SIZE_MULT} until bot re-establishes market read)"
+            )
+
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
@@ -3499,6 +3584,7 @@ def main() -> None:
                 st.qty = filled_qty  # Use actual filled qty, not intended
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                session.trades_since_boot += 1  # Cold-start counter
                 if filled_qty < qty:
                     log.warning(f"[FILL] Partial fill: got {filled_qty}/{qty} contracts — canceling remainder")
                     cancel_order_status(client, oid)
@@ -3517,6 +3603,7 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                session.trades_since_boot += 1  # Cold-start counter
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
             elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
