@@ -11,10 +11,13 @@
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
 # KEY SETTINGS:
+# - PHILOSOPHY: many small trades, no single loss > $1.00
 # - ASYMMETRIC: NO side is the moneymaker (90% WR, +$2.13/session × 3 sessions)
 #   YES only fires on "stars aligned" — 97% prob, 8% edge, 75¢ max, trend WITH
-# - NO SIDE: prob 83-90% (time-dependent), 3% edge, 90¢ max, Kelly=0.35
+# - NO SIDE: prob 80-87% (time-dependent), 2% edge, 93¢ max, Kelly=0.25
 # - YES SIDE: prob 97%+, 8% edge, 75¢ max, Kelly=0.10, trend must be WITH
+# - HARD $1.00 MAX LOSS PER TRADE — enforced at entry sizing AND dump trigger
+# - Loss calc uses worst-of(model, market bid) — no more blind spots
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
 # - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
@@ -168,9 +171,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.83  # 83%+ to enter in last 2 min — slightly lower bar, EV cap is the real protection
-EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 90  # Lowered from 96¢ — at 90¢ entry, gain 10¢/win, need ~9 wins per loss
+PROB_MIN = 0.80  # 80%+ to enter in last 3 min — $1 hard cap is the real protection now
+EDGE_MIN = 0.02  # 2% minimum edge — lower bar to increase volume, small sizes limit damage
+MAX_ENTRY_PRICE_CENTS = 93  # 93¢ max — win pays 7¢/ct, need ~13 wins per loss (90% WR supports this)
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
@@ -178,10 +181,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (ETH still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
+PROB_EARLY_MIN = 0.87            # >5min: need 87%+ (was 90% — too tight, killed overnight volume)
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
-# <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+PROB_MID_MIN = 0.83              # 3-5min: need 83%+ (was 86% — $1 cap protects, take more trades)
+# <3 min = PROB_MIN (0.80) — market has priced in the outcome, $1 hard cap is the real protection
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -217,7 +220,7 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.35  # ETH: ~0.35 USD/√sec (BTC is ~12, ETH pri
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
 # Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
-KELLY_MULTIPLIER = 0.35     # 35%-Kelly — NO side at 90% win rate over 3 sessions supports larger sizing
+KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — $1.00 hard cap is the real size limiter now
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
@@ -1957,6 +1960,8 @@ def should_dump_position(
     secs_to_close: int,
     trend: Optional['SpotTrend'] = None,
     current_balance_usd: float = 0.0,
+    yes_bid: Optional[int] = None,
+    no_bid: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     BAIL logic: last resort only. Hold to close is the goal.
@@ -1999,8 +2004,11 @@ def should_dump_position(
         else:
             # ETH is safely on our side — hold to settlement
             # Still bail on catastrophic loss (bankroll protection)
+            # FIX: use worst-of(model, market bid) for realistic exit price
             if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
-                exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+                model_exit = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+                our_bid = (yes_bid if st.side == "yes" else no_bid)
+                exit_price_est = min(model_exit, our_bid) if our_bid is not None else model_exit
                 loss_per_contract = st.entry_price_cents - exit_price_est
                 total_loss_usd = (loss_per_contract * st.qty) / 100.0
                 # Absolute $1 hard cap
@@ -2052,13 +2060,30 @@ def should_dump_position(
         rapid_drop = rapid_peak - current_prob
 
     # =============================================================
+    # === REALISTIC EXIT PRICE: worst-of(model, market bid) ===
+    # BUG FIX: Old code used int(current_prob * 100) which is the MODEL's
+    # estimate.  If model says 85% but book bid is 50¢, loss calc thought
+    # loss = 5¢/ct when actual = 40¢/ct → $1 cap never fires → -$2.73.
+    # Now uses MIN(model estimate, market bid) so loss cap sees real losses.
+    # =============================================================
+    def _realistic_exit_cents() -> int:
+        model_est = int(current_prob * 100)
+        our_bid = None
+        if st.side == "yes" and yes_bid is not None:
+            our_bid = yes_bid
+        elif st.side == "no" and no_bid is not None:
+            our_bid = no_bid
+        if our_bid is not None:
+            return min(model_est, our_bid)  # Worst case: whichever is lower
+        return model_est
+
+    # =============================================================
     # === BANKROLL-PROPORTIONAL STOP: fires BEFORE ETH check ===
-    # Never lose more than 5% of balance or 50% of position cost.
-    # This is THE primary loss cap. Scales with bankroll naturally:
-    # $35 balance → max $1.75 loss.  $350 → max $17.50.
+    # Never lose more than $1.00 per trade (HARD). Scales with bankroll.
+    # Uses worst-of(model, market bid) for exit price — no more blind spots.
     # =============================================================
     if st.entry_price_cents is not None and st.qty > 0:
-        exit_price_est = int(current_prob * 100)
+        exit_price_est = _realistic_exit_cents()
         loss_per_contract = st.entry_price_cents - exit_price_est
         total_loss_cents = loss_per_contract * st.qty
         total_loss_usd = total_loss_cents / 100.0
@@ -2069,7 +2094,8 @@ def should_dump_position(
             log.warning(
                 f"[BAIL $1 HARD CAP] losing ${total_loss_usd:.2f} > ${DUMP_MAX_LOSS_USD:.2f} hard cap — "
                 f"{loss_per_contract}¢/ct × {st.qty}ct "
-                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — IMMEDIATE BAIL"
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢ "
+                f"model={int(current_prob*100)}¢ bid={yes_bid if st.side=='yes' else no_bid}¢) — IMMEDIATE BAIL"
             )
             return True, f"hard_cap_${total_loss_usd:.2f}>${DUMP_MAX_LOSS_USD:.2f}"
 
@@ -2104,7 +2130,7 @@ def should_dump_position(
     # extreme per-contract losses.
     # =============================================================
     if st.entry_price_cents is not None:
-        exit_price_est = int(current_prob * 100)
+        exit_price_est = _realistic_exit_cents()
         catastrophic_loss = st.entry_price_cents - exit_price_est
         if catastrophic_loss >= DUMP_CATASTROPHIC_LOSS_CENTS:
             log.warning(
@@ -2326,7 +2352,8 @@ def compute_scalp_qty(
     target_qty = int(available_usd * scalp_fraction / cost_per)
 
     # Safety cap: worst-case loss (all contracts go to $0) must not exceed SCALP_MAX_LOSS_FRACTION
-    max_loss_usd = available_usd * SCALP_MAX_LOSS_FRACTION
+    # AND never exceed the absolute $1.00 hard cap per trade
+    max_loss_usd = min(available_usd * SCALP_MAX_LOSS_FRACTION, DUMP_MAX_LOSS_USD)
     max_qty_for_loss = int(max_loss_usd / cost_per)
     if target_qty > max_qty_for_loss:
         log.info(
@@ -2828,6 +2855,7 @@ def main() -> None:
                             st, p_yes_blend, p_no_blend, p_mkt,
                             spot, lo, hi, sigma_used, secs_to_close, trend,
                             current_balance_usd=session.current_balance_usd,
+                            yes_bid=yes_bid, no_bid=no_bid,
                         )
 
                         # Log dump check status periodically
@@ -3483,7 +3511,7 @@ def main() -> None:
 
         # ASYMMETRIC SIZING: YES side gets smaller bets (it bleeds)
         if chosen_side == "yes" and qty > 0:
-            yes_scale = YES_KELLY_MULTIPLIER / KELLY_MULTIPLIER  # 0.10 / 0.35 = 0.29
+            yes_scale = YES_KELLY_MULTIPLIER / KELLY_MULTIPLIER  # 0.10 / 0.25 = 0.40
             scaled_qty = max(MIN_CONTRACTS, int(qty * yes_scale))
             if scaled_qty < qty:
                 log.info(f"[SIZE] YES side downscaled: {qty} -> {scaled_qty} contracts (YES_KELLY={YES_KELLY_MULTIPLIER})")
