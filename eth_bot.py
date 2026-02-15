@@ -10,18 +10,19 @@
 # - Dump is ABORT ONLY — safety net, not a regular exit
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
-# KEY SETTINGS:
-# - PHILOSOPHY: many small trades, no single loss > $1.00
-# - ASYMMETRIC: NO side is the moneymaker (90% WR, +$2.13/session × 3 sessions)
-#   YES only fires on "stars aligned" — 97% prob, 8% edge, 75¢ max, trend WITH
-# - NO SIDE: prob 80-87% (time-dependent), 2% edge, 93¢ max, Kelly=0.25
-# - YES SIDE: prob 97%+, 8% edge, 75¢ max, Kelly=0.10, trend must be WITH
-# - HARD $1.00 MAX LOSS PER TRADE — enforced at entry sizing AND dump trigger
-# - Loss calc uses worst-of(model, market bid) — no more blind spots
+# KEY SETTINGS (v7 — 6-session analysis rewrite):
+# - YES DISABLED: -$3.44 lifetime, 0-for-5 most recently. NO_ONLY=True.
+#   Phantom logging tracks what YES would have done for future re-evaluation.
+# - HARD $1.00 MAX LOSS PER TRADE — 3 layers of enforcement:
+#   1) Entry sizing: max_possible_loss capped at $1.00 before order placed
+#   2) Dump trigger: loss calc uses worst-of(model, market bid) — no blind spots
+#   3) Independent pre-order gate: rejects oversized positions as last defense
+# - HOLD WINNERS: reversal bail only fires on LOSING positions (not profitable ones)
+#   Avg win was $0.06 because 4% reversal threshold killed every winner.
+#   Now 10-12% threshold, and profitable positions hold to settlement.
+# - NO SIDE: prob 80-87%, 2% edge, 93¢ max, Kelly=0.25
+# - ROLLING DRAWDOWN: -$3 in 2hr → pause 30min, resume at 50% for 3 trades
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
-# - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
-# - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
-# - Dump abort: 6% reversal, 30s patience, catastrophic 20¢ backstop
 #
 # ADAPTED FROM bot.py (BTC) — key differences:
 # - Series ticker: KXETH15M (Ethereum 15-minute markets)
@@ -135,15 +136,17 @@ DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
-NO_ONLY = env_bool("NO_ONLY", False)     # Trade NO only
-# ASYMMETRIC ENTRY: YES side is 40% win rate / -$0.74 over 3 sessions.
-# NO side is 90% win rate / +$2.13.  YES only fires on "stars aligned" —
-# 100% conviction across ALL data, no mathematical chance of reversal.
-YES_EDGE_MIN = 0.08                       # YES needs 8% edge — double NO's bar, only genuine mispricing
-YES_PROB_MIN = 0.97                       # YES needs 97%+ prob — must be near-certain across model+market+book
-YES_MAX_ENTRY_PRICE_CENTS = 75            # YES max 75¢ — win pays 25¢/ct, need only 3 wins per loss
-YES_KELLY_MULTIPLIER = 0.10              # YES gets 10% Kelly — tiny bets even when stars align
-YES_REQUIRE_TREND_ALIGNED = True          # YES requires trend moving WITH the trade (no counter-trend)
+NO_ONLY = env_bool("NO_ONLY", True)      # NO ONLY — YES is -$3.44 lifetime, 0-for-5 most recently
+# YES DISABLED: negative in 4/6 sessions, 40% WR, -$3.44 lifetime.
+# Phantom logging tracks what YES WOULD have done for future re-evaluation.
+# Re-evaluate after 100 NO-only trades to see if YES ever develops an edge.
+YES_PHANTOM_LOG = True                    # Log phantom YES entries (what model would have done)
+# YES gates (kept for code safety — YES is blocked by NO_ONLY above)
+YES_EDGE_MIN = 0.08
+YES_PROB_MIN = 0.97
+YES_MAX_ENTRY_PRICE_CENTS = 75
+YES_KELLY_MULTIPLIER = 0.10
+YES_REQUIRE_TREND_ALIGNED = True
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -236,6 +239,12 @@ SCALING_MAX_FRACTION = 0.50
 # -------------- SESSION LOSS LIMITS (HARDWIRED) --------------
 ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75  # HARD STOP: never lose more than 75% of starting balance
+# ROLLING DRAWDOWN BREAKER: if down $X in rolling Y hours, pause for Z minutes
+ROLLING_DRAWDOWN_WINDOW_SECONDS = 7200  # 2-hour rolling window
+ROLLING_DRAWDOWN_MAX_LOSS_USD = 3.00    # Pause if down $3.00 in 2 hours
+ROLLING_DRAWDOWN_PAUSE_SECONDS = 1800   # Pause 30 minutes
+ROLLING_DRAWDOWN_RESUME_SIZE_FRACTION = 0.50  # Resume at 50% size for first 3 trades
+ROLLING_DRAWDOWN_RESUME_TRADES = 3      # Number of trades at reduced size after resume
 # SESSION_CONSECUTIVE_LOSSES_LIMIT and SESSION_COOLDOWN_MARKETS now defined in MOMENTUM section above
 BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
@@ -271,13 +280,13 @@ DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
 
 # -------------- REVERSAL BAIL (only after ETH check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
+DUMP_REVERSAL_THRESHOLD = 0.10  # 10% drop from peak — only bail on genuine reversals (was 6% — killed winners)
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.12  # 12% when profitable — HOLD WINNERS, only bail on catastrophic reversal
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.08  # Only tighten after 8%+ gain (was 3% — way too aggressive)
 DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
 # Reversal during early settling phase uses a wider threshold (not blocked entirely)
-DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
+DUMP_REVERSAL_THRESHOLD_SETTLING = 0.15  # 15% drop in first 30s — near-impossible, basically hold to settle
 
 # -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
 # Never lose more than X% of current balance on a single trade.
@@ -1229,6 +1238,12 @@ class SessionState:
         # Check consecutive loss limit (per-market)
         self._check_consecutive_limit()
 
+        # Check rolling drawdown (2hr window)
+        self._check_rolling_drawdown()
+
+        # Decrement drawdown resume counter
+        self._decrement_resume_trades()
+
         # Schedule balance check to get true P&L
         self.schedule_balance_check()
 
@@ -1322,6 +1337,49 @@ class SessionState:
     def get_current_contracts(self) -> int:
         """Get how many contracts to buy this market."""
         return self.current_contracts
+
+    def _rolling_pnl(self, window_seconds: float) -> float:
+        """Sum P&L of trades within the rolling window."""
+        cutoff = time.time() - window_seconds
+        return sum(t["pnl_usd"] for t in self.recent_trades if t["ts"] >= cutoff)
+
+    def _check_rolling_drawdown(self):
+        """ROLLING DRAWDOWN BREAKER: if down $3 in 2 hours, pause 30 min."""
+        if not ENABLE_SESSION_LIMITS or self.is_daily_stopped:
+            return
+        rolling_pnl = self._rolling_pnl(ROLLING_DRAWDOWN_WINDOW_SECONDS)
+        if rolling_pnl <= -ROLLING_DRAWDOWN_MAX_LOSS_USD:
+            self.is_paused = True
+            self.pause_until = time.time() + ROLLING_DRAWDOWN_PAUSE_SECONDS
+            self.pause_reason = f"rolling_drawdown_${rolling_pnl:.2f}_in_2hr"
+            self._drawdown_resume_trades = ROLLING_DRAWDOWN_RESUME_TRADES
+            log.warning(
+                f"[SESSION] ROLLING DRAWDOWN: lost ${-rolling_pnl:.2f} in last "
+                f"{ROLLING_DRAWDOWN_WINDOW_SECONDS // 3600}hr — "
+                f"pausing {ROLLING_DRAWDOWN_PAUSE_SECONDS // 60} min, "
+                f"then {ROLLING_DRAWDOWN_RESUME_TRADES} trades at "
+                f"{ROLLING_DRAWDOWN_RESUME_SIZE_FRACTION:.0%} size"
+            )
+
+    def get_size_multiplier(self) -> float:
+        """Returns sizing multiplier (1.0 normal, 0.5 after drawdown resume)."""
+        resume_trades = getattr(self, '_drawdown_resume_trades', 0)
+        if resume_trades > 0:
+            return ROLLING_DRAWDOWN_RESUME_SIZE_FRACTION
+        return 1.0
+
+    def _decrement_resume_trades(self):
+        """Called after each trade when resuming from drawdown pause."""
+        resume_trades = getattr(self, '_drawdown_resume_trades', 0)
+        if resume_trades > 0:
+            self._drawdown_resume_trades = resume_trades - 1
+            if self._drawdown_resume_trades <= 0:
+                log.warning("[SESSION] Drawdown resume period complete — back to full size")
+            else:
+                log.info(
+                    f"[SESSION] Drawdown resume: {self._drawdown_resume_trades} trades left at "
+                    f"{ROLLING_DRAWDOWN_RESUME_SIZE_FRACTION:.0%} size"
+                )
 
 
 class SpotTrend:
@@ -1890,9 +1948,14 @@ def choose_trade(
         log.info(f"[YES_ONLY] Blocking NO entry (edge={edge_no:.4f} prob={p_no_blend:.1%}) — YES_ONLY mode")
     if YES_ONLY:
         ok_no = False
-    if NO_ONLY and ok_yes and not ok_no:
-        log.info(f"[NO_ONLY] Blocking YES entry (edge={edge_yes:.4f} prob={p_yes_blend:.1%}) — NO_ONLY mode")
-    if NO_ONLY:
+    if NO_ONLY and ok_yes:
+        if YES_PHANTOM_LOG:
+            log.warning(
+                f"[PHANTOM YES] Would enter YES @ {yes_px}¢ | "
+                f"prob={p_yes_blend:.1%} edge={edge_yes:.4f} | "
+                f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} | "
+                f"Track to evaluate if YES develops edge"
+            )
         ok_yes = False
 
     if ok_yes and ok_no:
@@ -2170,20 +2233,24 @@ def should_dump_position(
 
     # --- HARD P&L STOP: ETH is against us AND losing big ---
     if st.entry_price_cents is not None:
-        exit_price_est = int(current_prob * 100)
+        exit_price_est = _realistic_exit_cents()
         unrealized_loss_per_contract = st.entry_price_cents - exit_price_est
         if unrealized_loss_per_contract >= DUMP_MAX_LOSS_CENTS_PER_CONTRACT:
             log.warning(
                 f"[BAIL HARD STOP] ETH NOT safe (dist=${btc_distance:.0f}) AND "
                 f"losing ~{unrealized_loss_per_contract}¢/contract "
-                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — salvaging"
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢ "
+                f"model={int(current_prob*100)}¢ bid={yes_bid if st.side=='yes' else no_bid}¢) — salvaging"
             )
             return True, f"hard_stop_{unrealized_loss_per_contract}c_per_contract"
 
     # --- REVERSAL BAIL: ETH is against us AND prob has dropped significantly ---
-    # Now fires during settling too (with wider threshold) — was completely blocked before.
-    # Windowed peak (last 30s) is used instead of all-time peak to avoid false signals.
+    # CRITICAL FIX: Never bail on positions that are currently profitable.
+    # The old thresholds (4-6% drop) were killing winners — avg win dropped to $0.06.
+    # Now: 10-12% drop required, and ONLY when position is underwater.
+    # The $1.00 hard cap handles catastrophic losses. Let winners run to settlement.
     if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED:
+        currently_profitable = current_prob > entry_prob
         gain_above_entry = windowed_peak - entry_prob
         if gain_above_entry >= DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY:
             effective_threshold = DUMP_REVERSAL_THRESHOLD_PROFIT
@@ -2194,15 +2261,20 @@ def should_dump_position(
         if in_settling:
             effective_threshold = DUMP_REVERSAL_THRESHOLD_SETTLING
 
-        if drop_from_peak >= effective_threshold:
+        if drop_from_peak >= effective_threshold and not currently_profitable:
             phase_label = "settling" if in_settling else "active"
             log.warning(
                 f"[BAIL REVERSAL] ETH NOT safe (dist=${btc_distance:.0f}) AND "
                 f"prob dropped {drop_from_peak:.1%} from windowed peak "
                 f"({windowed_peak:.1%} -> {current_prob:.1%}) phase={phase_label} "
-                f"threshold={effective_threshold:.1%} — salvaging"
+                f"threshold={effective_threshold:.1%} entry_prob={entry_prob:.1%} — salvaging"
             )
             return True, f"reversal_{current_prob:.0%}_from_wpeak_{windowed_peak:.0%}_{phase_label}"
+        elif drop_from_peak >= effective_threshold and currently_profitable:
+            log.info(
+                f"[HOLD WINNER] Reversal detected but position profitable "
+                f"(current={current_prob:.1%} > entry={entry_prob:.1%}) — holding to settlement"
+            )
 
     # --- FLOOR: ETH is against us AND prob is at coin-flip ---
     if current_prob < DUMP_PROB_FLIP:
@@ -3509,19 +3581,40 @@ def main() -> None:
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
 
-        # ASYMMETRIC SIZING: YES side gets smaller bets (it bleeds)
-        if chosen_side == "yes" and qty > 0:
-            yes_scale = YES_KELLY_MULTIPLIER / KELLY_MULTIPLIER  # 0.10 / 0.25 = 0.40
-            scaled_qty = max(MIN_CONTRACTS, int(qty * yes_scale))
-            if scaled_qty < qty:
-                log.info(f"[SIZE] YES side downscaled: {qty} -> {scaled_qty} contracts (YES_KELLY={YES_KELLY_MULTIPLIER})")
-                qty = scaled_qty
+        # DRAWDOWN RESUME: reduce size after drawdown pause
+        size_mult = session.get_size_multiplier()
+        if size_mult < 1.0 and qty > 0:
+            old_qty = qty
+            qty = max(MIN_CONTRACTS, int(qty * size_mult))
+            if qty < old_qty:
+                log.info(f"[SIZE] Drawdown resume: {old_qty} -> {qty} contracts ({size_mult:.0%} size)")
 
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
+
+        # INDEPENDENT MAX LOSS GATE — last line of defense before order
+        # This runs AFTER all sizing logic and cannot be bypassed.
+        # YES: max loss = entry_price * contracts (can settle to $0)
+        # NO:  max loss = (100 - entry_price) * contracts (can settle to $1)
+        if chosen_side == "yes":
+            max_possible_loss_usd = (chosen_px * qty) / 100.0
+        else:
+            max_possible_loss_usd = ((100 - chosen_px) * qty) / 100.0
+        if max_possible_loss_usd > DUMP_MAX_LOSS_USD:
+            old_qty = qty
+            if chosen_side == "yes":
+                qty = int(DUMP_MAX_LOSS_USD * 100 / chosen_px)
+            else:
+                qty = int(DUMP_MAX_LOSS_USD * 100 / (100 - chosen_px))
+            qty = max(MIN_CONTRACTS, qty)
+            log.warning(
+                f"[MAX LOSS GATE] {chosen_side.upper()} @ {chosen_px}¢ × {old_qty} "
+                f"= ${max_possible_loss_usd:.2f} max loss > ${DUMP_MAX_LOSS_USD:.2f} cap — "
+                f"reduced to {qty} contracts"
+            )
 
         use_post_only = POST_ONLY
         # AGGRESSIVE FILL: use taker orders when probability is high enough.
