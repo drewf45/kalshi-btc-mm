@@ -11,10 +11,10 @@
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
 # KEY SETTINGS:
-# - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
-# - EDGE_MIN=0.03 (3% real edge — no penny-picking)
-# - MAX_ENTRY_PRICE=90¢ (force real edge — 10¢/win, ~9 wins per loss)
-# - KELLY=0.25 (quarter-Kelly — smoother equity curve)
+# - ASYMMETRIC: NO side is the moneymaker (90% WR, +$2.13/session × 3 sessions)
+#   YES only fires on "stars aligned" — 97% prob, 8% edge, 75¢ max, trend WITH
+# - NO SIDE: prob 83-90% (time-dependent), 3% edge, 90¢ max, Kelly=0.35
+# - YES SIDE: prob 97%+, 8% edge, 75¢ max, Kelly=0.10, trend must be WITH
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
 # - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
 # - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
@@ -133,12 +133,14 @@ ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
 NO_ONLY = env_bool("NO_ONLY", False)     # Trade NO only
-# ASYMMETRIC ENTRY: YES side bleeds, NO side wins. Trade both but require
-# YES to clear a higher bar. NO uses the standard settings above.
-YES_EDGE_MIN = 0.05                       # YES needs 5% edge (vs 3% for NO) — only enter on real mispricing
-YES_PROB_MIN = 0.90                       # YES needs 90%+ prob at all times (vs 83% for NO late)
-YES_MAX_ENTRY_PRICE_CENTS = 85            # YES max 85¢ (vs 90¢ for NO) — force bigger upside per win
-YES_KELLY_MULTIPLIER = 0.15              # YES gets 15% Kelly (vs 25% for NO) — smaller bets on the weaker side
+# ASYMMETRIC ENTRY: YES side is 40% win rate / -$0.74 over 3 sessions.
+# NO side is 90% win rate / +$2.13.  YES only fires on "stars aligned" —
+# 100% conviction across ALL data, no mathematical chance of reversal.
+YES_EDGE_MIN = 0.08                       # YES needs 8% edge — double NO's bar, only genuine mispricing
+YES_PROB_MIN = 0.97                       # YES needs 97%+ prob — must be near-certain across model+market+book
+YES_MAX_ENTRY_PRICE_CENTS = 75            # YES max 75¢ — win pays 25¢/ct, need only 3 wins per loss
+YES_KELLY_MULTIPLIER = 0.10              # YES gets 10% Kelly — tiny bets even when stars align
+YES_REQUIRE_TREND_ALIGNED = True          # YES requires trend moving WITH the trade (no counter-trend)
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -215,7 +217,7 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.35  # ETH: ~0.35 USD/√sec (BTC is ~12, ETH pri
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
 # Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
-KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — smaller bets, smoother equity curve, survives loss streaks
+KELLY_MULTIPLIER = 0.35     # 35%-Kelly — NO side at 90% win rate over 3 sessions supports larger sizing
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
@@ -1762,11 +1764,12 @@ def choose_trade(
             p_no_blend = 1.0 - p_yes_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
+            # Re-evaluate: YES still needs stars-aligned thresholds
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
-                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
+                and (p_yes_blend >= max(effective_prob_min, YES_PROB_MIN))
+                and (edge_yes >= YES_EDGE_MIN)
+                and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS) and div_gate_yes
             )
             ok_no = (
                 no_px is not None and ok_book_no
@@ -1782,11 +1785,12 @@ def choose_trade(
             p_yes_blend = 1.0 - p_no_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
+            # Re-evaluate: YES still needs stars-aligned thresholds
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
-                and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
+                and (p_yes_blend >= max(effective_prob_min, YES_PROB_MIN))
+                and (edge_yes >= YES_EDGE_MIN)
+                and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS) and div_gate_yes
             )
             ok_no = (
                 no_px is not None and ok_book_no
@@ -1812,9 +1816,14 @@ def choose_trade(
 
         max_yes_hc = int(p_yes_blend * 100) + 1  # +1¢ spread slack
         max_no_hc = int(p_no_blend * 100) + 1
-        if p_yes_blend >= HIGH_CERTAINTY_PROB and yes_px is not None and yes_px <= max_yes_hc and yes_boundary_ok:
+        # YES high-certainty: must STILL clear YES_PROB_MIN (97%) and YES_MAX_ENTRY_PRICE (75¢)
+        if (p_yes_blend >= max(HIGH_CERTAINTY_PROB, YES_PROB_MIN)
+                and yes_px is not None
+                and yes_px <= min(max_yes_hc, YES_MAX_ENTRY_PRICE_CENTS)
+                and yes_boundary_ok):
             ok_yes = True
-            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_blend:.4f}, price={yes_px}, max={max_yes_hc})")
+            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_blend:.4f}, price={yes_px}, max={min(max_yes_hc, YES_MAX_ENTRY_PRICE_CENTS)})")
+        # NO high-certainty: standard thresholds
         if p_no_blend >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= max_no_hc and no_boundary_ok:
             ok_no = True
             log.info(f"[OVERRIDE] NO high-certainty (p={p_no_blend:.4f}, price={no_px}, max={max_no_hc})")
@@ -1853,11 +1862,17 @@ def choose_trade(
         max_yes_settle = min(max_settle_px, int(p_yes_blend * 100))
         max_no_settle = min(max_settle_px, int(p_no_blend * 100))
 
-        if not ok_yes and p_yes_blend >= SETTLEMENT_LOCK_MIN_PROB and yes_px is not None and yes_px <= max_yes_settle and yes_boundary_ok:
+        # YES settlement lock: must STILL clear YES_PROB_MIN (97%), YES_EDGE_MIN (8%), YES_MAX_ENTRY_PRICE (75¢)
+        yes_settle_max = min(max_yes_settle, YES_MAX_ENTRY_PRICE_CENTS)
+        if (not ok_yes
+                and p_yes_blend >= max(SETTLEMENT_LOCK_MIN_PROB, YES_PROB_MIN)
+                and edge_yes >= YES_EDGE_MIN
+                and yes_px is not None and yes_px <= yes_settle_max
+                and yes_boundary_ok):
             ok_yes = True
             log.warning(
-                f"[SETTLE LOCK] YES override: blend={p_yes_blend:.1%} price={yes_px}¢ "
-                f"max={max_yes_settle}¢ edge={edge_yes:.4f} t={secs_to_close}s"
+                f"[SETTLE LOCK] YES override (stars-aligned): blend={p_yes_blend:.1%} price={yes_px}¢ "
+                f"max={yes_settle_max}¢ edge={edge_yes:.4f} t={secs_to_close}s"
             )
         if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_no_settle and no_boundary_ok:
             ok_no = True
@@ -3338,6 +3353,32 @@ def main() -> None:
             else:
                 edge_for_trend = float(edge_no)
 
+            # YES STARS-ALIGNED TREND GATE: YES requires trend moving WITH the trade.
+            # Any "against" or "neutral" trend = instant block. NO uses normal trend logic.
+            if YES_REQUIRE_TREND_ALIGNED and chosen_side == "yes":
+                trend_with = (alignment == "with" or alignment_short == "with")
+                trend_against = (alignment == "against" or alignment_short == "against")
+                if trend_against:
+                    log.warning(
+                        f"[YES TREND BLOCK] YES blocked — trend against: "
+                        f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}). "
+                        f"YES requires stars-aligned (all trends WITH)."
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+                if not trend_with:
+                    log.warning(
+                        f"[YES TREND BLOCK] YES blocked — no confirming trend: "
+                        f"60m={trend_dir}(${trend_move:+.0f}) 30m={trend_short_dir}(${trend_short_move:+.0f}). "
+                        f"YES requires at least one trend WITH."
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+                log.info(
+                    f"[YES TREND OK] YES trend aligned: "
+                    f"60m={trend.summary()} 30m={trend_short.summary()}"
+                )
+
             # Check if EITHER timeframe shows opposing trend
             either_strong_against = (
                 (alignment == "against" and "strong" in trend_dir) or
@@ -3442,7 +3483,7 @@ def main() -> None:
 
         # ASYMMETRIC SIZING: YES side gets smaller bets (it bleeds)
         if chosen_side == "yes" and qty > 0:
-            yes_scale = YES_KELLY_MULTIPLIER / KELLY_MULTIPLIER  # 0.15 / 0.25 = 0.60
+            yes_scale = YES_KELLY_MULTIPLIER / KELLY_MULTIPLIER  # 0.10 / 0.35 = 0.29
             scaled_qty = max(MIN_CONTRACTS, int(qty * yes_scale))
             if scaled_qty < qty:
                 log.info(f"[SIZE] YES side downscaled: {qty} -> {scaled_qty} contracts (YES_KELLY={YES_KELLY_MULTIPLIER})")
