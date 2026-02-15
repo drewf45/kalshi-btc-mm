@@ -128,16 +128,19 @@ YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the
 NO_ONLY = env_bool("NO_ONLY", False)      # Trade only NO side (overrides YES_ONLY if both set)
 
 # -------------- ASYMMETRIC SIDE REQUIREMENTS --------------------------------
-# YES has been a consistent loser across all sessions. NO wins at 79%.
-# YES is NOT disabled — but it should only fire when the stars align:
-# every trend, every signal, highest probability, lowest price.
-# Think of YES as a rare bonus trade, not a regular entry.
-YES_PROB_BONUS = 0.12       # YES needs 12% higher probability (95% when NO needs 83%, 102%/impossible early)
-YES_EDGE_BONUS = 0.04       # YES needs 7% total edge (vs NO's 3%) — must be clearly mispriced
-YES_MAX_ENTRY_PRICE = 88    # YES capped at 88¢ (12¢ profit/win, nuke ratio ~7:1, real edge only)
-YES_REQUIRE_TREND = True    # YES always requires trend alignment — no fast lane, no exceptions
+# YES has been net negative across ALL sessions (4/4). NO wins at 87%.
+# The probability model is miscalibrated for YES — says 95% but true rate is <88%.
+# Don't trust the model for YES. Instead, only allow YES when the outcome
+# is PHYSICALLY LOCKED: BTC so far from the strike with so little time left
+# that a reversal is mathematically impossible (distance > 3σ√t).
+# Treat YES like a scalp — last 60 seconds, locked outcome, bonus money.
+YES_PROB_BONUS = 0.14       # YES needs 97% prob in last 3 min (impossible earlier)
+YES_EDGE_BONUS = 0.04       # YES needs 7% total edge
+YES_MAX_ENTRY_PRICE = 85    # YES capped at 85¢ (15¢ profit/win, nuke ratio 5.7:1)
+YES_REQUIRE_TREND = True    # YES always requires trend alignment — no fast lane
 YES_REQUIRE_BOTH_TRENDS = True  # YES must have BOTH 60-min AND 30-min BTC trend aligned
-YES_MIN_BTC_DISTANCE = 150.0    # YES only if BTC is $150+ above floor (safe cushion)
+YES_MIN_BTC_DISTANCE = 200.0    # YES only if BTC is $200+ above floor (physically locked)
+YES_MAX_SECONDS = 60            # YES only in last 60 seconds (scalp timing — outcome decided)
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -3397,38 +3400,64 @@ def main() -> None:
                 log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
 
         # =============================================================
-        # === YES "STARS ALIGN" GATE: extra checks YES must pass ===
-        # YES only fires if EVERY signal confirms. This is the final filter
-        # that makes YES a rare, high-conviction trade instead of a bleeder.
+        # === YES "PHYSICALLY LOCKED" GATE ===
+        # YES is net negative in ALL 4 sessions. The prob model is miscalibrated
+        # for YES — says 95% but true win rate is <88%.
+        # Don't trust the model. Only allow YES when the outcome is physically
+        # impossible to reverse: BTC $200+ from strike, <60s left, both trends up.
+        # This turns YES into a rare scalp-like bonus, not a regular entry.
         # =============================================================
         if chosen_side == "yes" and not YES_ONLY:
-            # Gate 1: Both BTC trends must align (60-min AND 30-min)
+            # Gate 0: Time — YES only in the last 60 seconds (outcome must be decided)
+            if secs_to_close is not None and secs_to_close > YES_MAX_SECONDS:
+                if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                    log.info(
+                        f"[YES LOCKED] BLOCKED — {secs_to_close}s left > {YES_MAX_SECONDS}s max "
+                        f"(YES only fires in last {YES_MAX_SECONDS}s)"
+                    )
+                    last_state_log = now
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Gate 1: Both BTC trends must align (60-min AND 30-min pointing up)
             if YES_REQUIRE_BOTH_TRENDS:
                 alignment_60 = trend.trade_alignment("yes", lo, hi, spot)
                 alignment_30 = trend_short.trade_alignment("yes", lo, hi, spot)
                 if alignment_60 != "with" or alignment_30 != "with":
                     log.warning(
-                        f"[YES STARS] BLOCKED — need BOTH trends 'with', got "
+                        f"[YES LOCKED] BLOCKED — need BOTH trends 'with', got "
                         f"60m={alignment_60} 30m={alignment_30}"
                     )
                     time.sleep(POLL_SECONDS)
                     continue
 
-            # Gate 2: BTC must be well above the floor (safe cushion)
+            # Gate 2: BTC must be $200+ above the floor (physically impossible to reverse)
+            btc_above_floor = 0.0
             if lo is not None:
                 btc_above_floor = spot - lo
                 if btc_above_floor < YES_MIN_BTC_DISTANCE:
                     log.warning(
-                        f"[YES STARS] BLOCKED — BTC ${spot:.0f} only ${btc_above_floor:.0f} above "
+                        f"[YES LOCKED] BLOCKED — BTC ${spot:.0f} only ${btc_above_floor:.0f} above "
                         f"floor ${lo:.0f} (need ${YES_MIN_BTC_DISTANCE:.0f}+)"
                     )
                     time.sleep(POLL_SECONDS)
                     continue
 
+            # Gate 3: Volatility sanity — can BTC actually move that far in remaining time?
+            sigma_now = float(get_sigma_cached(client))
+            max_move = 3.0 * sigma_now * math.sqrt(float(secs_to_close))  # 3σ = 99.7% of moves
+            if lo is not None and btc_above_floor < max_move:
+                log.warning(
+                    f"[YES LOCKED] BLOCKED — BTC dist ${btc_above_floor:.0f} < 3σ√t=${max_move:.0f} "
+                    f"(σ={sigma_now:.1f}, t={secs_to_close}s) — reversal still possible"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+
             log.warning(
-                f"[YES STARS] ALL GATES PASSED — YES entry approved "
-                f"(prob={current_prob_for_side:.1%} edge={edge_yes:.4f} "
-                f"price={chosen_px}¢ btc_dist=${spot - (lo or 0):.0f})"
+                f"[YES LOCKED] ALL GATES PASSED — YES entry approved "
+                f"(t={secs_to_close}s prob={current_prob_for_side:.1%} edge={edge_yes:.4f} "
+                f"price={chosen_px}¢ btc_dist=${btc_above_floor:.0f} 3σ√t=${max_move:.0f})"
             )
 
         # Check session limits before trading
