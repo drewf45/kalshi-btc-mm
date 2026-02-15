@@ -266,7 +266,9 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
 DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
-DUMP_HARD_MAX_LOSS_USD = 0.50             # ABSOLUTE hard cap: never lose more than $0.50 on any single trade, period
+DUMP_SOFT_MAX_LOSS_USD = 0.50             # SOFT cap: at -$0.50 unrealized, try limit sell to exit gracefully
+DUMP_HARD_MAX_LOSS_USD = 0.75             # HARD cap: at -$0.75 unrealized, market sell immediately — no exceptions
+# XRP natural losses when working: -$0.04 to -$0.21. $0.75 worst case = ~3 wins to recover at 85%+ WR.
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
@@ -274,6 +276,21 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
+MAX_LOSS_AT_EXPIRY_USD = 1.00         # Pre-trade gate: reject any trade where max possible loss > $1.00
+
+# -------------- PROFIT LOCK (protect winning sessions) -------------------------
+PNL_LOCK_TIER1_USD = 2.00            # At +$2.00 session P/L: reduce to 50% size
+PNL_LOCK_TIER1_MULT = 0.50
+PNL_LOCK_TIER2_USD = 3.00            # At +$3.00 session P/L: reduce to 25% size
+PNL_LOCK_TIER2_MULT = 0.25
+
+# -------------- STREAK CIRCUIT BREAKER (pause after losses) --------------------
+LOSS_PAUSE_THRESHOLD_USD = 0.50       # Single loss > $0.50 → pause 30 min
+LOSS_PAUSE_SINGLE_MINUTES = 30
+LOSS_PAUSE_DOUBLE_WINDOW_SEC = 3600   # 2 losses within 60 min → pause 60 min
+LOSS_PAUSE_DOUBLE_MINUTES = 60
+LOSS_RESUME_SIZE_MULT = 0.50          # Resume at 50% size
+LOSS_RESUME_TRADES = 3                # Full size after 3 trades at reduced size
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -1110,6 +1127,10 @@ class SessionState:
     pause_reason: Optional[str] = None
     is_daily_stopped: bool = False  # HARD STOP - never unpauses
 
+    # Streak circuit breaker
+    loss_timestamps: List[float] = None   # Timestamps of recent losses (for 2-in-60min detection)
+    trades_since_resume: int = 999        # Trades since resuming from loss pause (999 = normal mode)
+
     # Balance refresh
     pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
 
@@ -1119,6 +1140,8 @@ class SessionState:
     def __post_init__(self):
         if self.recent_trades is None:
             self.recent_trades = []
+        if self.loss_timestamps is None:
+            self.loss_timestamps = []
 
     def reset_for_new_market(self):
         """Reset per-market state on each market roll. Daily state persists.
@@ -1181,13 +1204,17 @@ class SessionState:
             self.market_wins += 1
             self.consecutive_wins += 1
             self.consecutive_losses = 0
+            self.trades_since_resume += 1
             self._scale_up()
         else:
             self.total_losses += 1
             self.market_losses += 1
             self.consecutive_losses += 1
             self.consecutive_wins = 0
+            self.trades_since_resume += 1
             self._scale_down()
+            # Streak circuit breaker
+            self._check_loss_circuit_breaker(pnl_usd)
 
         # Check consecutive loss limit (per-market)
         self._check_consecutive_limit()
@@ -1235,6 +1262,44 @@ class SessionState:
             self.pause_reason = f"consecutive_losses_{self.consecutive_losses}"
             self.current_contracts = BASE_CONTRACTS  # Reset to base on consecutive loss pause
             log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
+
+    def _check_loss_circuit_breaker(self, loss_usd: float):
+        """Streak circuit breaker: pause after significant losses to protect gains."""
+        now = time.time()
+        self.loss_timestamps.append(now)
+        # Prune old timestamps (keep last 2 hours)
+        self.loss_timestamps = [t for t in self.loss_timestamps if now - t < 7200]
+
+        # Rule 1: Single loss > $0.50 → pause 30 min
+        if abs(loss_usd) >= LOSS_PAUSE_THRESHOLD_USD:
+            self.is_paused = True
+            self.pause_until = now + (LOSS_PAUSE_SINGLE_MINUTES * 60)
+            self.pause_reason = f"big_loss_${loss_usd:.2f}"
+            self.trades_since_resume = 0
+            log.warning(
+                f"[CIRCUIT BREAKER] Single loss ${loss_usd:.2f} ≥ ${LOSS_PAUSE_THRESHOLD_USD:.2f} — "
+                f"pausing {LOSS_PAUSE_SINGLE_MINUTES}min, resume at {LOSS_RESUME_SIZE_MULT:.0%} size"
+            )
+            return
+
+        # Rule 2: 2 losses within 60 min → pause 60 min
+        recent_losses = [t for t in self.loss_timestamps if now - t <= LOSS_PAUSE_DOUBLE_WINDOW_SEC]
+        if len(recent_losses) >= 2:
+            self.is_paused = True
+            self.pause_until = now + (LOSS_PAUSE_DOUBLE_MINUTES * 60)
+            self.pause_reason = f"2_losses_in_60min"
+            self.trades_since_resume = 0
+            log.warning(
+                f"[CIRCUIT BREAKER] {len(recent_losses)} losses in last 60min — "
+                f"pausing {LOSS_PAUSE_DOUBLE_MINUTES}min, resume at {LOSS_RESUME_SIZE_MULT:.0%} size"
+            )
+
+    def get_size_multiplier(self) -> float:
+        """Get position size multiplier based on circuit breaker state.
+        After resuming from loss pause, trade at reduced size for N trades."""
+        if self.trades_since_resume < LOSS_RESUME_TRADES:
+            return LOSS_RESUME_SIZE_MULT
+        return 1.0
 
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
         """Check if we can trade"""
@@ -1843,15 +1908,15 @@ def should_dump_position(
             # Fall through to normal dump logic below
         else:
             # XRP is safely on our side — hold to settlement
-            # Still bail on hard dollar cap or bankroll cap (protect gains)
+            # Still bail on dollar caps or bankroll cap (protect gains)
             if st.entry_price_cents is not None and st.qty > 0:
                 exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
                 loss_per_contract = st.entry_price_cents - exit_price_est
                 total_loss_usd = (loss_per_contract * st.qty) / 100.0
-                # Hard dollar cap — absolute ceiling
                 if total_loss_usd > DUMP_HARD_MAX_LOSS_USD:
-                    return True, f"late_entry_hard_cap_${total_loss_usd:.2f}>${DUMP_HARD_MAX_LOSS_USD:.2f}"
-                # Bankroll-proportional cap
+                    return True, f"late_entry_HARD_cap_${total_loss_usd:.2f}>${DUMP_HARD_MAX_LOSS_USD:.2f}"
+                if total_loss_usd > DUMP_SOFT_MAX_LOSS_USD:
+                    return True, f"late_entry_soft_cap_${total_loss_usd:.2f}>${DUMP_SOFT_MAX_LOSS_USD:.2f}"
                 if current_balance_usd > 0:
                     max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
                     if total_loss_usd > max_loss_balance:
@@ -1899,10 +1964,10 @@ def should_dump_position(
         rapid_drop = rapid_peak - current_prob
 
     # =============================================================
-    # === HARD DOLLAR CAP: absolute ceiling, fires FIRST ===
-    # Never lose more than $0.50 on any single trade regardless of
-    # bankroll size, position size, or anything else.
-    # Protects the gains — the original -$3.72 blowup can't recur.
+    # === TWO-TIER DOLLAR CAP: fires FIRST, before everything ===
+    # Soft ($0.50): signal to exit — dump reason returned.
+    # Hard ($0.75): absolute ceiling — no trade can ever lose more.
+    # Natural XRP losses are -$0.04 to -$0.21. $0.75 is ~3 wins to recover.
     # =============================================================
     if st.entry_price_cents is not None and st.qty > 0:
         exit_price_est = int(current_prob * 100)
@@ -1912,12 +1977,21 @@ def should_dump_position(
         if total_loss_usd > DUMP_HARD_MAX_LOSS_USD:
             log.warning(
                 f"[BAIL HARD CAP] losing ${total_loss_usd:.2f} > "
-                f"${DUMP_HARD_MAX_LOSS_USD:.2f} hard cap — "
+                f"${DUMP_HARD_MAX_LOSS_USD:.2f} HARD cap — "
                 f"{loss_per_contract}¢/ct × {st.qty}ct "
                 f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
-                f"absolute safety net, bail immediately"
+                f"market sell immediately, no exceptions"
             )
-            return True, f"hard_cap_${total_loss_usd:.2f}>${DUMP_HARD_MAX_LOSS_USD:.2f}"
+            return True, f"HARD_cap_${total_loss_usd:.2f}>${DUMP_HARD_MAX_LOSS_USD:.2f}"
+        if total_loss_usd > DUMP_SOFT_MAX_LOSS_USD:
+            log.warning(
+                f"[BAIL SOFT CAP] losing ${total_loss_usd:.2f} > "
+                f"${DUMP_SOFT_MAX_LOSS_USD:.2f} soft cap — "
+                f"{loss_per_contract}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
+                f"exit now before it hits hard cap"
+            )
+            return True, f"soft_cap_${total_loss_usd:.2f}>${DUMP_SOFT_MAX_LOSS_USD:.2f}"
 
     # =============================================================
     # === BANKROLL-PROPORTIONAL STOP: fires BEFORE XRP check ===
@@ -3287,6 +3361,52 @@ def main() -> None:
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
+
+        # === PRE-TRADE MAX LOSS CHECK ===
+        # Before entering, verify max possible loss at expiry <= $1.00.
+        # YES trade: lose entire entry cost if settles NO. NO trade: lose (100-price)*qty if settles YES.
+        if chosen_side == "yes":
+            max_loss_at_expiry = (int(chosen_px) * qty) / 100.0
+        else:
+            max_loss_at_expiry = ((100 - int(chosen_px)) * qty) / 100.0
+        if max_loss_at_expiry > MAX_LOSS_AT_EXPIRY_USD:
+            # Reduce qty to fit within the cap
+            if chosen_side == "yes":
+                max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(int(chosen_px), 1))
+            else:
+                max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(100 - int(chosen_px), 1))
+            old_qty = qty
+            qty = max(1, min(qty, max_qty))
+            log.warning(
+                f"[MAX LOSS GATE] Reduced qty {old_qty} → {qty} — "
+                f"max_loss_at_expiry was ${max_loss_at_expiry:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f} cap"
+            )
+            if qty <= 0:
+                log.warning(f"[SKIP] {st.market} — can't size within $1.00 max loss")
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
+
+        # === P/L LOCK: reduce size when session is profitable ===
+        if session.daily_pnl_usd >= PNL_LOCK_TIER2_USD:
+            old_qty = qty
+            qty = max(1, int(qty * PNL_LOCK_TIER2_MULT))
+            if qty != old_qty:
+                log.info(f"[PNL LOCK T2] Session +${session.daily_pnl_usd:.2f} ≥ ${PNL_LOCK_TIER2_USD:.2f} — qty {old_qty} → {qty} (25%)")
+        elif session.daily_pnl_usd >= PNL_LOCK_TIER1_USD:
+            old_qty = qty
+            qty = max(1, int(qty * PNL_LOCK_TIER1_MULT))
+            if qty != old_qty:
+                log.info(f"[PNL LOCK T1] Session +${session.daily_pnl_usd:.2f} ≥ ${PNL_LOCK_TIER1_USD:.2f} — qty {old_qty} → {qty} (50%)")
+
+        # === CIRCUIT BREAKER RESUME SIZE ===
+        # After resuming from loss pause, trade at reduced size for LOSS_RESUME_TRADES trades
+        resume_mult = session.get_size_multiplier()
+        if resume_mult < 1.0:
+            old_qty = qty
+            qty = max(1, int(qty * resume_mult))
+            if qty != old_qty:
+                log.info(f"[RESUME SIZE] Post-pause trade {session.trades_since_resume+1}/{LOSS_RESUME_TRADES} — qty {old_qty} → {qty} ({resume_mult:.0%})")
 
         use_post_only = POST_ONLY
         # XRP STRATEGY: Always use POST_ONLY. For XRP, the spread IS the edge.
