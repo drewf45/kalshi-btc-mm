@@ -310,14 +310,46 @@ MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # ROLLED BACK from 0.14 — max 8% of balan
 # $1.00 gives 2.3x headroom above that while preventing the -$2.61 blowups.
 # Enforced both PRE-TRADE (caps position size) and IN-TRADE (forces bail).
 HARD_MAX_LOSS_USD = 1.00  # ABSOLUTE CEILING: no single trade can lose more than $1.00
+SOFT_STOP_LOSS_USD = 0.50 # SOFT CAP: at -$0.50 unrealized, submit limit sell to exit gracefully
+# Overnight uses tighter soft stop (SOL overnight sessions showed -$2.61/-$2.70 blowups)
+OVERNIGHT_SOFT_STOP_USD = 0.35
 
-# -------------- COLD-START PROTECTION (first trades after restart at half size) --------
+# -------------- INDEPENDENT STOP-LOSS (runs BEFORE strategy, CANNOT be overridden) --------
+# This is the #1 risk fix. Previous stop-loss was embedded in should_dump_position()
+# which uses probability-based exit estimates and can be overridden by SOL safety check.
+# This monitor uses ACTUAL BID PRICES and fires unconditionally.
+# It calculates: unrealized_loss = (entry_price - best_bid) * qty / 100
+# If unrealized_loss >= HARD_MAX_LOSS_USD → immediate market sell, no exceptions.
+# If unrealized_loss >= soft_stop → limit sell at best_bid to exit gracefully.
+INDEPENDENT_STOP_LOSS_ENABLED = True
+
+# -------------- DAYTIME vs OVERNIGHT SIZING --------
+# SOL daytime (8am-8pm EST): +$3.61 combined across 4 profitable sessions, R:R 1.41-2.90
+# SOL overnight: -$2.61/-$2.70 blowups, unreliable.  Size accordingly.
+DAYTIME_SIZE_MULTIPLIER = 1.50   # 50% larger during proven daytime hours
+OVERNIGHT_SIZE_MULTIPLIER = 0.50 # 50% smaller overnight when risk is higher
+DAYTIME_START_HOUR_EST = 8       # 8:00 AM EST
+DAYTIME_END_HOUR_EST = 20        # 8:00 PM EST
+MAX_TRADES_PER_HOUR_OVERNIGHT = 3  # Cap overnight volume — less data = less edge
+
+# -------------- COLD-START PROTECTION (first trades after restart at graduated size) --------
 # After a restart the bot has NO trend data, NO prob history, NO market context.
 # The -$2.61 loss was likely a memory-loss blowup — entering blind at full size.
-# First N trades after boot use half the normal position size until the bot has
-# re-established its read on the market.
-COLD_START_TRADES = 2       # First 2 trades after any restart = half size
-COLD_START_SIZE_MULT = 0.50 # 50% of normal position size during cold-start
+# Graduated ramp-up: 25% → 50% → 100% over first 6 trades.
+COLD_START_TIER_1_TRADES = 2     # Trades 1-2: 25% size
+COLD_START_TIER_1_MULT = 0.25
+COLD_START_TIER_2_TRADES = 5     # Trades 3-5: 50% size
+COLD_START_TIER_2_MULT = 0.50
+# Trades 6+: full size (1.0)
+
+# -------------- SESSION DRAWDOWN BREAKER --------
+# If bot is down $3.00 in a rolling 2-hour window, pause for 60 min.
+# Prevents cascade sessions like the -$7.93 BTC morning.
+SESSION_DRAWDOWN_LIMIT_USD = 3.00
+SESSION_DRAWDOWN_WINDOW_SECONDS = 7200   # 2 hours
+SESSION_DRAWDOWN_PAUSE_SECONDS = 3600    # Pause 60 min
+SESSION_DRAWDOWN_RESUME_SIZE_MULT = 0.50 # Resume at 50% size for first 3 trades
+SESSION_DRAWDOWN_RESUME_TRADES = 3
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -526,6 +558,61 @@ class KalshiClient:
 # -----------------------------
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
+
+
+def is_daytime_est() -> bool:
+    """Return True if current time is within daytime trading hours (8am-8pm EST)."""
+    now_est = datetime.now(NY)
+    return DAYTIME_START_HOUR_EST <= now_est.hour < DAYTIME_END_HOUR_EST
+
+
+def get_time_of_day_size_multiplier() -> float:
+    """Return position size multiplier based on time of day."""
+    if is_daytime_est():
+        return DAYTIME_SIZE_MULTIPLIER
+    return OVERNIGHT_SIZE_MULTIPLIER
+
+
+def get_current_soft_stop() -> float:
+    """Return the soft stop-loss threshold based on time of day."""
+    if is_daytime_est():
+        return SOFT_STOP_LOSS_USD
+    return OVERNIGHT_SOFT_STOP_USD
+
+
+def get_cold_start_multiplier(trades_since_boot: int) -> float:
+    """Return position size multiplier based on trades since restart.
+
+    Graduated ramp-up: 25% for first 2, 50% for 3-5, 100% for 6+.
+    """
+    if trades_since_boot < COLD_START_TIER_1_TRADES:
+        return COLD_START_TIER_1_MULT
+    elif trades_since_boot < COLD_START_TIER_2_TRADES:
+        return COLD_START_TIER_2_MULT
+    return 1.0
+
+
+def calc_unrealized_loss_usd(
+    entry_price_cents: int,
+    best_bid_cents: Optional[int],
+    qty: int,
+    side: str,
+) -> float:
+    """Calculate unrealized loss in USD using actual bid prices, not probability estimates.
+
+    Returns positive number = loss amount. Zero or negative = no loss.
+    For YES: we paid entry_price, can sell at best_bid → loss = (entry - bid) * qty / 100
+    For NO: we paid entry_price for NO, can sell at no_bid → loss = (entry - bid) * qty / 100
+    If no bid available, assume worst case (bid = 1¢).
+    """
+    if entry_price_cents is None or qty <= 0:
+        return 0.0
+    bid = best_bid_cents if best_bid_cents is not None and best_bid_cents > 0 else 1
+    loss_per_contract_cents = entry_price_cents - bid
+    if loss_per_contract_cents <= 0:
+        return 0.0
+    return (loss_per_contract_cents * qty) / 100.0
+
 
 MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -1161,8 +1248,19 @@ class SessionState:
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
 
-    # Cold-start protection: first N trades after boot use half size
+    # Cold-start protection: first N trades after boot use graduated size
     trades_since_boot: int = 0  # Incremented on each trade entry, never resets
+
+    # Drawdown breaker: track rolling P&L for 2-hour window pause
+    drawdown_paused_until: float = 0.0
+    drawdown_resume_trades_remaining: int = 0  # Trades at reduced size after drawdown pause
+
+    # Overnight trade rate limiting
+    overnight_trades_this_hour: int = 0
+    overnight_hour_start: float = 0.0
+
+    # Soft stop tracking: avoid re-sending soft stop orders
+    soft_stop_sent_for_market: Optional[str] = None
 
     # Post-cooldown reevaluation: require extra edge after loss streak
     _post_cooldown_boost: bool = False
@@ -1224,21 +1322,46 @@ class SessionState:
         self.pending_balance_check_at = 0.0
 
     def record_trade(self, market: str, side: str, entry_price: int, exit_price: Optional[int],
-                     qty: int, pnl_cents: int, was_dump: bool = False):
-        """Record a completed trade"""
+                     qty: int, pnl_cents: int, was_dump: bool = False,
+                     hold_time_seconds: float = 0.0, model_confidence: float = 0.0,
+                     exit_reason: str = "settlement"):
+        """Record a completed trade with comprehensive logging."""
         pnl_usd = pnl_cents / 100.0
         self.daily_pnl_usd += pnl_usd  # Immediate P&L update (balance check will correct later)
         self.current_balance_usd += pnl_usd  # Estimate balance until real check
         self.total_markets += 1
 
+        now_ts = time.time()
+        now_est = datetime.now(NY)
         trade = {
             "market": market, "side": side, "entry": entry_price,
             "exit": exit_price, "qty": qty, "pnl_cents": pnl_cents,
-            "pnl_usd": pnl_usd, "was_dump": was_dump, "ts": time.time(),
+            "pnl_usd": pnl_usd, "was_dump": was_dump, "ts": now_ts,
+            "timestamp_exit": now_est.strftime("%Y-%m-%d %H:%M:%S EST"),
+            "hold_time_seconds": hold_time_seconds,
+            "model_confidence": model_confidence,
+            "exit_reason": exit_reason,
+            "session_pnl_at_exit": self.daily_pnl_usd,
+            "trades_since_restart": self.trades_since_boot,
+            "is_daytime": is_daytime_est(),
         }
         self.recent_trades.append(trade)
         if len(self.recent_trades) > 50:
             self.recent_trades = self.recent_trades[-50:]
+
+        # COMPREHENSIVE TRADE LOG — one line per trade for easy grep/analysis
+        log.warning(
+            f"[TRADE LOG] {market} | {side.upper()} | "
+            f"entry={entry_price}¢ exit={exit_price}¢ | "
+            f"qty={qty} | pnl=${pnl_usd:+.2f} | "
+            f"hold={hold_time_seconds:.0f}s | "
+            f"exit_reason={exit_reason} | "
+            f"conf={model_confidence:.1%} | "
+            f"session_pnl=${self.daily_pnl_usd:.2f} | "
+            f"trade#{self.trades_since_boot} | "
+            f"{'DAY' if is_daytime_est() else 'NIGHT'} | "
+            f"{now_est.strftime('%H:%M EST')}"
+        )
 
         if pnl_cents > 0:
             self.total_wins += 1
@@ -1259,6 +1382,19 @@ class SessionState:
 
         # Schedule balance check to get true P&L
         self.schedule_balance_check()
+
+        # Check drawdown breaker after every loss
+        if pnl_cents < 0:
+            should_pause_dd, dd_reason = self.check_drawdown()
+            if should_pause_dd:
+                self.drawdown_paused_until = time.time() + SESSION_DRAWDOWN_PAUSE_SECONDS
+                self.is_paused = True
+                self.pause_reason = dd_reason
+                log.warning(
+                    f"[SESSION] DRAWDOWN BREAKER: {dd_reason} — "
+                    f"pausing {SESSION_DRAWDOWN_PAUSE_SECONDS // 60} min, "
+                    f"will resume at {SESSION_DRAWDOWN_RESUME_SIZE_MULT:.0%} size"
+                )
 
         log.warning(
             f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
@@ -1334,11 +1470,62 @@ class SessionState:
             f"{'Many dumps — entries may be too early/borderline' if dump_count > len(recent_losses) // 2 else ''}"
         )
 
+    def check_drawdown(self) -> Tuple[bool, Optional[str]]:
+        """Check rolling 2-hour P&L for drawdown breaker.
+
+        If total losses in the last 2 hours exceed SESSION_DRAWDOWN_LIMIT_USD,
+        pause trading for 60 min.  Returns (should_pause, reason).
+        """
+        if not self.recent_trades:
+            return False, None
+        cutoff = time.time() - SESSION_DRAWDOWN_WINDOW_SECONDS
+        recent_pnl = sum(
+            t.get("pnl_usd", 0.0)
+            for t in self.recent_trades
+            if t.get("ts", 0) >= cutoff
+        )
+        if recent_pnl <= -SESSION_DRAWDOWN_LIMIT_USD:
+            return True, f"drawdown_${abs(recent_pnl):.2f}_in_2h"
+        return False, None
+
+    def check_overnight_rate_limit(self) -> bool:
+        """Return True if overnight trade rate limit is hit (max 3/hour).
+
+        Only applies during overnight hours.  Returns False (no limit) during daytime.
+        """
+        if is_daytime_est():
+            return False
+        now_ts = time.time()
+        # Reset counter every hour
+        if now_ts - self.overnight_hour_start >= 3600:
+            self.overnight_trades_this_hour = 0
+            self.overnight_hour_start = now_ts
+        return self.overnight_trades_this_hour >= MAX_TRADES_PER_HOUR_OVERNIGHT
+
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
         """Check if we can trade"""
         # Daily hard stop is permanent until restart
         if self.is_daily_stopped:
             return False, f"DAILY_HARD_STOP (lost 75%+ of starting balance)"
+
+        # Drawdown breaker: check if still paused from drawdown
+        if self.drawdown_paused_until > 0 and time.time() < self.drawdown_paused_until:
+            remaining = int(self.drawdown_paused_until - time.time())
+            return False, f"DRAWDOWN_PAUSE ({remaining}s remaining)"
+        elif self.drawdown_paused_until > 0 and time.time() >= self.drawdown_paused_until:
+            # Drawdown pause expired — resume at reduced size
+            if self.drawdown_resume_trades_remaining <= 0:
+                self.drawdown_resume_trades_remaining = SESSION_DRAWDOWN_RESUME_TRADES
+            self.drawdown_paused_until = 0.0
+            log.warning(
+                f"[SESSION] Drawdown pause ended — resuming at "
+                f"{SESSION_DRAWDOWN_RESUME_SIZE_MULT:.0%} size for "
+                f"{self.drawdown_resume_trades_remaining} trades"
+            )
+
+        # Overnight rate limit
+        if self.check_overnight_rate_limit():
+            return False, f"OVERNIGHT_RATE_LIMIT ({MAX_TRADES_PER_HOUR_OVERNIGHT}/hr)"
 
         if not self.is_paused:
             return True, None
@@ -2686,6 +2873,7 @@ def main() -> None:
                             qty=pend_qty,
                             pnl_cents=pend_pnl,
                             was_dump=False,
+                            exit_reason=f"settlement_deferred_{pend_result}",
                         )
                         log.warning(
                             f"[SETTLE] Deferred result resolved: {st.pending_settlement_market} "
@@ -2783,6 +2971,7 @@ def main() -> None:
                             st.pending_settlement_ts = time.time()
 
                         if pnl_cents is not None:
+                            settle_hold = time.time() - st.entry_time if st.entry_time > 0 else 0
                             session.record_trade(
                                 market=old_market,
                                 side=st.side,
@@ -2791,6 +2980,8 @@ def main() -> None:
                                 qty=st.qty,
                                 pnl_cents=pnl_cents,
                                 was_dump=False,
+                                hold_time_seconds=settle_hold,
+                                exit_reason=f"settlement_{result}",
                             )
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
 
@@ -2842,7 +3033,94 @@ def main() -> None:
                 st.side = "yes" if pos > 0 else "no"
                 log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side}")
             
-            # Check dump conditions continuously
+            # =============================================================
+            # INDEPENDENT STOP-LOSS MONITOR — runs FIRST, CANNOT be overridden
+            # Uses actual bid prices, not probability estimates.
+            # This is the #1 risk fix — prevents -$2.61/-$2.70/-$3.63 blowups.
+            # =============================================================
+            if INDEPENDENT_STOP_LOSS_ENABLED and st.entry_price_cents is not None and st.qty > 0:
+                try:
+                    sl_ob = client.request("GET", f"/markets/{st.market}/orderbook")
+                    sl_yes_bid, sl_yes_ask, sl_no_bid, sl_no_ask = parse_best_yes_no(sl_ob)
+                    sl_our_bid = sl_yes_bid if st.side == "yes" else sl_no_bid
+                    sl_unrealized = calc_unrealized_loss_usd(
+                        st.entry_price_cents, sl_our_bid, st.qty, st.side
+                    )
+
+                    current_soft = get_current_soft_stop()
+
+                    # HARD STOP: $1.00 — immediate market sell, NO EXCEPTIONS
+                    if sl_unrealized >= HARD_MAX_LOSS_USD:
+                        log.warning(
+                            f"[STOP_LOSS TRIGGERED] HARD STOP | {st.market} | {st.side.upper()} | "
+                            f"entry={st.entry_price_cents}¢ | bid={sl_our_bid}¢ | "
+                            f"qty={st.qty} | loss=${sl_unrealized:.2f} >= ${HARD_MAX_LOSS_USD:.2f} | "
+                            f"IMMEDIATE MARKET SELL — no override"
+                        )
+                        try:
+                            sl_payload = build_order_payload(
+                                market_ticker=st.market,
+                                action="sell",
+                                side=st.side,
+                                price_cents=1,  # Market sell (accept any price)
+                                count=abs(pos),
+                                post_only=False,
+                            )
+                            if not DRY_RUN:
+                                sl_oid = place_order(client, sl_payload)
+                                log.warning(f"[STOP_LOSS] SELL order placed {sl_oid}")
+                            # Record P&L
+                            exit_px = sl_our_bid if sl_our_bid and sl_our_bid > 0 else 1
+                            pnl_c = (exit_px - st.entry_price_cents) * st.qty
+                            sl_hold_time = time.time() - st.entry_time if st.entry_time > 0 else 0
+                            session.record_trade(
+                                market=st.market, side=st.side,
+                                entry_price=st.entry_price_cents,
+                                exit_price=exit_px, qty=st.qty,
+                                pnl_cents=pnl_c, was_dump=True,
+                                hold_time_seconds=sl_hold_time,
+                                exit_reason=f"STOP_LOSS_HARD_{sl_unrealized:.2f}",
+                            )
+                            # Reset state
+                            st.sm = SM.DUMPED
+                            st.side = None
+                            st.entry_price_cents = None
+                            st.qty = 0
+                            st.traded_this_market = True
+                        except Exception as e:
+                            log.error(f"[STOP_LOSS] Failed to place sell: {e}")
+                        time.sleep(POLL_SECONDS)
+                        continue
+
+                    # SOFT STOP: $0.50 (or $0.35 overnight) — limit sell at best bid
+                    elif sl_unrealized >= current_soft and session.soft_stop_sent_for_market != st.market:
+                        log.warning(
+                            f"[STOP_LOSS SOFT] | {st.market} | {st.side.upper()} | "
+                            f"entry={st.entry_price_cents}¢ | bid={sl_our_bid}¢ | "
+                            f"qty={st.qty} | loss=${sl_unrealized:.2f} >= ${current_soft:.2f} | "
+                            f"limit sell at {sl_our_bid}¢"
+                        )
+                        try:
+                            soft_px = sl_our_bid if sl_our_bid and sl_our_bid > 0 else 1
+                            soft_payload = build_order_payload(
+                                market_ticker=st.market,
+                                action="sell",
+                                side=st.side,
+                                price_cents=soft_px,
+                                count=abs(pos),
+                                post_only=False,
+                            )
+                            if not DRY_RUN:
+                                soft_oid = place_order(client, soft_payload)
+                                log.warning(f"[STOP_LOSS SOFT] Limit sell placed {soft_oid} @ {soft_px}¢")
+                            session.soft_stop_sent_for_market = st.market
+                        except Exception as e:
+                            log.warning(f"[STOP_LOSS SOFT] Failed: {e}")
+
+                except Exception as e:
+                    log.warning(f"[STOP_LOSS] Monitor error (non-fatal): {e}")
+
+            # Check dump conditions continuously (strategy-level — secondary to stop-loss above)
             if ENABLE_DUMP and secs_to_close is not None:
                 spot = fetch_sol_spot_usd(http)
                 if spot is not None:
@@ -2923,6 +3201,7 @@ def main() -> None:
                             if sell_ok and st.entry_price_cents is not None:
                                 try:
                                     pnl_cents = (exit_price_cents - st.entry_price_cents) * dump_qty
+                                    dump_hold_time = time.time() - st.entry_time if st.entry_time > 0 else 0
                                     session.record_trade(
                                         market=st.market,
                                         side=st.side,
@@ -2931,6 +3210,8 @@ def main() -> None:
                                         qty=dump_qty,
                                         pnl_cents=pnl_cents,
                                         was_dump=True,
+                                        hold_time_seconds=dump_hold_time,
+                                        exit_reason=f"BAIL_{dump_reason}",
                                     )
                                 except Exception as e:
                                     log.warning(f"[BAIL] P&L recording failed (non-fatal): {e}")
@@ -2987,13 +3268,17 @@ def main() -> None:
                                         except Exception:
                                             flip_qty = MIN_CONTRACTS
 
-                                        # Cold-start protection applies to flips too
-                                        if session.trades_since_boot < COLD_START_TRADES:
+                                        # Cold-start + time-of-day + drawdown sizing for flips
+                                        flip_cs = get_cold_start_multiplier(session.trades_since_boot)
+                                        flip_tod = get_time_of_day_size_multiplier()
+                                        flip_size_mult = min(flip_cs, flip_tod)
+                                        if session.drawdown_resume_trades_remaining > 0:
+                                            flip_size_mult = min(flip_size_mult, SESSION_DRAWDOWN_RESUME_SIZE_MULT)
+                                        if flip_size_mult < 1.0:
                                             old_fq = flip_qty
-                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * COLD_START_SIZE_MULT))
+                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * flip_size_mult))
                                             log.warning(
-                                                f"[COLD START] Flip trade #{session.trades_since_boot + 1}/{COLD_START_TRADES}: "
-                                                f"half-sizing {old_fq} -> {flip_qty} contracts"
+                                                f"[FLIP SIZE] {old_fq} -> {flip_qty} contracts (×{flip_size_mult:.0%})"
                                             )
 
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
@@ -3508,23 +3793,42 @@ def main() -> None:
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
 
-        # NO-SIDE SIZING BOOST: size NO positions larger (80% WR vs 30% YES)
+        # NO-SIDE SIZING BOOST (currently disabled — not in proven session)
         if NO_BIAS_ENABLED and chosen_side == "no" and NO_SIZING_MULTIPLIER > 1.0:
             old_qty = qty
             qty = min(MAX_CONTRACTS, int(qty * NO_SIZING_MULTIPLIER))
             if qty > old_qty:
                 log.info(f"[NO BIAS] Sizing up NO: {old_qty} → {qty} contracts (×{NO_SIZING_MULTIPLIER})")
 
-        # COLD-START PROTECTION: first N trades after restart at half size.
-        # Bot has no trend data, no prob history, no market context on boot.
-        # Half-size until it has re-established its read on the market.
-        if session.trades_since_boot < COLD_START_TRADES:
-            old_qty = qty
-            qty = max(MIN_CONTRACTS, int(qty * COLD_START_SIZE_MULT))
+        # === POSITION SIZE ADJUSTMENTS (applied in order) ===
+        base_qty = qty
+
+        # 1. COLD-START: graduated ramp-up (25% → 50% → 100%)
+        cs_mult = get_cold_start_multiplier(session.trades_since_boot)
+        if cs_mult < 1.0:
+            qty = max(MIN_CONTRACTS, int(qty * cs_mult))
             log.warning(
-                f"[COLD START] Trade #{session.trades_since_boot + 1}/{COLD_START_TRADES}: "
-                f"half-sizing {old_qty} -> {qty} contracts "
-                f"(×{COLD_START_SIZE_MULT} until bot re-establishes market read)"
+                f"[COLD START] Trade #{session.trades_since_boot + 1}: "
+                f"{base_qty} -> {qty} contracts (×{cs_mult:.0%})"
+            )
+
+        # 2. DAYTIME/OVERNIGHT sizing: 1.5x day, 0.5x night
+        tod_mult = get_time_of_day_size_multiplier()
+        if abs(tod_mult - 1.0) > 0.01:
+            old_qty = qty
+            qty = max(MIN_CONTRACTS, int(qty * tod_mult))
+            if qty != old_qty:
+                period = "DAYTIME" if is_daytime_est() else "OVERNIGHT"
+                log.info(f"[{period} SIZE] {old_qty} -> {qty} contracts (×{tod_mult})")
+
+        # 3. DRAWDOWN RESUME: 50% size for first 3 trades after drawdown pause
+        if session.drawdown_resume_trades_remaining > 0:
+            old_qty = qty
+            qty = max(MIN_CONTRACTS, int(qty * SESSION_DRAWDOWN_RESUME_SIZE_MULT))
+            log.warning(
+                f"[DRAWDOWN RESUME] {old_qty} -> {qty} contracts "
+                f"(×{SESSION_DRAWDOWN_RESUME_SIZE_MULT}, "
+                f"{session.drawdown_resume_trades_remaining} trades left at reduced size)"
             )
 
         if qty <= 0:
@@ -3532,6 +3836,19 @@ def main() -> None:
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
+
+        # PRE-TRADE MAX LOSS CHECK: reject if max possible loss > $1.00
+        # YES: max_loss = entry_price * qty (price can go to $0)
+        # NO: max_loss = (100 - entry_price) * qty (price can go to $1)
+        cost_per_contract = int(chosen_px) / 100.0
+        max_possible_loss = cost_per_contract * qty
+        if max_possible_loss > HARD_MAX_LOSS_USD:
+            old_qty = qty
+            qty = max(MIN_CONTRACTS, int(HARD_MAX_LOSS_USD / cost_per_contract))
+            log.warning(
+                f"[PRE-TRADE CAP] max_loss=${max_possible_loss:.2f} > ${HARD_MAX_LOSS_USD:.2f}: "
+                f"reducing {old_qty} -> {qty} contracts"
+            )
 
         use_post_only = POST_ONLY
         # AGGRESSIVE FILL: use taker orders when probability is high enough.
@@ -3585,6 +3902,11 @@ def main() -> None:
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
                 session.trades_since_boot += 1  # Cold-start counter
+                session.soft_stop_sent_for_market = None  # Reset soft stop for new position
+                if session.drawdown_resume_trades_remaining > 0:
+                    session.drawdown_resume_trades_remaining -= 1
+                if not is_daytime_est():
+                    session.overnight_trades_this_hour += 1
                 if filled_qty < qty:
                     log.warning(f"[FILL] Partial fill: got {filled_qty}/{qty} contracts — canceling remainder")
                     cancel_order_status(client, oid)
@@ -3604,6 +3926,11 @@ def main() -> None:
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
                 session.trades_since_boot += 1  # Cold-start counter
+                session.soft_stop_sent_for_market = None
+                if session.drawdown_resume_trades_remaining > 0:
+                    session.drawdown_resume_trades_remaining -= 1
+                if not is_daytime_est():
+                    session.overnight_trades_this_hour += 1
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
             elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
