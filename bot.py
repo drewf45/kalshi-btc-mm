@@ -1898,6 +1898,8 @@ def should_dump_position(
     secs_to_close: int,
     trend: Optional['SpotTrend'] = None,
     current_balance_usd: float = 0.0,
+    yes_bid: Optional[int] = None,
+    no_bid: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     BAIL logic: last resort only. Hold to close is the goal.
@@ -1919,21 +1921,42 @@ def should_dump_position(
     # === HARD DOLLAR STOP-LOSS: FIRES FIRST, NO EXCEPTIONS ===
     # Before grace period, before BTC check, before late-entry hold.
     # If the trade is losing more than HARD_STOP_LOSS_USD, get out NOW.
-    # This is what prevents one bad trade from erasing 15 wins.
+    #
+    # CRITICAL: Use the ACTUAL BID PRICE (what we'd get if we sold now),
+    # NOT the probability estimate. The prob can lag behind reality —
+    # blend shows 70% when the real bid is 10¢. That's how a $2.87 loss
+    # slips through a $1.00 hard stop.
+    # Check BOTH prob-based AND bid-based estimates, fire on whichever is worse.
     # =============================================================
     if st.entry_price_cents is not None and st.qty > 0:
+        # Method 1: probability-based estimate
         if st.side == "yes":
             _hs_prob = p_yes_blend
         else:
             _hs_prob = p_no_blend
-        _hs_exit_est = int(_hs_prob * 100)
-        _hs_loss_per_ct = st.entry_price_cents - _hs_exit_est
-        _hs_total_loss = (_hs_loss_per_ct * st.qty) / 100.0
+        _hs_exit_prob = int(_hs_prob * 100)
+        _hs_loss_prob = (st.entry_price_cents - _hs_exit_prob) * st.qty / 100.0
+
+        # Method 2: actual bid price (what the market will actually pay us)
+        if st.side == "yes" and yes_bid is not None:
+            _hs_exit_bid = yes_bid
+        elif st.side == "no" and no_bid is not None:
+            _hs_exit_bid = no_bid
+        else:
+            _hs_exit_bid = _hs_exit_prob  # fallback to prob if no bid available
+        _hs_loss_bid = (st.entry_price_cents - _hs_exit_bid) * st.qty / 100.0
+
+        # Use the WORST case (highest loss) of both methods
+        _hs_total_loss = max(_hs_loss_prob, _hs_loss_bid)
+        _hs_method = "bid" if _hs_loss_bid >= _hs_loss_prob else "prob"
+        _hs_exit_used = _hs_exit_bid if _hs_method == "bid" else _hs_exit_prob
+
         if _hs_total_loss >= HARD_STOP_LOSS_USD:
             log.warning(
                 f"[HARD STOP] losing ${_hs_total_loss:.2f} >= ${HARD_STOP_LOSS_USD:.2f} cap — "
-                f"BAIL (entry={st.entry_price_cents}¢ est_exit={_hs_exit_est}¢ "
-                f"loss={_hs_loss_per_ct}¢/ct × {st.qty}ct) — no exceptions"
+                f"BAIL (entry={st.entry_price_cents}¢ exit_{_hs_method}={_hs_exit_used}¢ "
+                f"loss_bid=${_hs_loss_bid:.2f} loss_prob=${_hs_loss_prob:.2f} "
+                f"× {st.qty}ct) — no exceptions"
             )
             return True, f"hard_stop_${_hs_total_loss:.2f}>=${HARD_STOP_LOSS_USD:.2f}"
 
@@ -2263,6 +2286,22 @@ def compute_qty_from_bankroll(
                     f"(×{nuke_scale:.2f}) to cap at {NUKE_MAX_WINS_ERASED} wins erased"
                 )
                 target_qty = nuke_qty
+
+    # HARD STOP BACKSTOP: Even if the hard stop fails to fire (no bids, locked book,
+    # API error), the position must be small enough that a FULL settlement loss
+    # stays under the hard stop cap. This is the last line of defense.
+    # max_qty × cost_per ≤ HARD_STOP_LOSS_USD → max_qty = HARD_STOP_LOSS_USD / cost_per
+    if cost_per > 0:
+        max_qty_hard_stop = int(HARD_STOP_LOSS_USD / cost_per)
+        if max_qty_hard_stop < MIN_CONTRACTS:
+            max_qty_hard_stop = MIN_CONTRACTS
+        if target_qty > max_qty_hard_stop:
+            log.warning(
+                f"[HARD STOP SIZE] Capping qty {target_qty} -> {max_qty_hard_stop} so full "
+                f"settlement loss (${target_qty * cost_per:.2f}) stays under "
+                f"${HARD_STOP_LOSS_USD:.2f} hard stop"
+            )
+            target_qty = max_qty_hard_stop
 
     qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
@@ -2793,15 +2832,26 @@ def main() -> None:
                         p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask)
                         
                         if p_mkt is not None:
-                            p_yes_blend = MODEL_BLEND_ALPHA * p_yes_model + (1.0 - MODEL_BLEND_ALPHA) * p_mkt
+                            # TIME-RAMPED blend (same as entry logic):
+                            # Near close, trust the MARKET, not the model.
+                            # The model lags and masks losses from the hard stop.
+                            if secs_to_close <= 60:
+                                _hold_alpha = 0.0  # 100% market in last minute
+                            elif secs_to_close <= BUY_START_SECONDS:
+                                _hold_alpha = float(MODEL_BLEND_ALPHA) * (secs_to_close - 60) / float(BUY_START_SECONDS - 60)
+                            else:
+                                _hold_alpha = float(MODEL_BLEND_ALPHA)
+                            p_yes_blend = _hold_alpha * p_yes_model + (1.0 - _hold_alpha) * float(p_mkt)
                         else:
                             p_yes_blend = p_yes_model
+                        p_yes_blend = max(0.0, min(1.0, p_yes_blend))
                         p_no_blend = 1.0 - p_yes_blend
                         
                         should_dump, dump_reason = should_dump_position(
                             st, p_yes_blend, p_no_blend, p_mkt,
                             spot, lo, hi, sigma_used, secs_to_close, trend,
                             current_balance_usd=session.current_balance_usd,
+                            yes_bid=yes_bid, no_bid=no_bid,
                         )
 
                         # Log dump check status periodically
