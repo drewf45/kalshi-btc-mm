@@ -152,9 +152,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.83  # 83%+ to enter in last 8 min — slightly lower bar, EV cap is the real protection
+PROB_MIN = 0.90  # 90%+ to enter — must have real conviction, not marginal
 EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 96  # At 96¢ entry, gain 4¢/win, need ~24 wins per loss
+MAX_ENTRY_PRICE_CENTS = 85  # At 85¢ entry, gain 15¢/win — need ~6 wins per loss (was 96¢ = needed 24:1)
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 25-min buy window) --------
@@ -162,10 +162,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (SHIB still has time to move), relax near the end.
 # NOTE: observation phase (40min → 25min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 900   # 15-25 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.90            # >15min: need 90%+ — SHIB has time to move
+PROB_EARLY_MIN = 0.93            # >15min: need 93%+ — SHIB has time to move (was 90%)
 PROB_MID_ENTRY_SECONDS = 480     # 8-15 min to close = "mid"
-PROB_MID_MIN = 0.86              # 8-15min: need 86%+
-# <8 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+PROB_MID_MIN = 0.91              # 8-15min: need 91%+ (was 86% — let too many losers through)
+# <8 min = PROB_MIN (0.90) — market has priced in the outcome, still need conviction
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -181,8 +181,8 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match SHIB spot trend (borde
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<8 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
-PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 8 min = fast lane (market is decisive)
+PROB_FAST_LANE_THRESHOLD = 0.93   # ≥93% prob = buy immediately, no trend check needed (was 90%)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.90  # ≥90% prob in last 8 min = fast lane (was 85% — too loose)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-1500s.
@@ -223,6 +223,15 @@ SESSION_CONSECUTIVE_LOSSES_LIMIT = 5  # Pause after 5 consecutive losses in one 
 SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
 BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
+# -------------- HARD PER-MARKET LOSS CAP (absolute ceiling, no exceptions) -----
+# This is the #1 safety net.  No matter what the dump logic, flip logic, or scalp
+# does, the TOTAL realized + unrealized loss on a single market can never exceed
+# this fraction of bankroll.  If the cap is hit, ALL positions are liquidated and
+# no new entries (including flips/scalps) are allowed for the rest of that market.
+# This prevents the cascading blowup: entry loses 8%, flip loses 8%, scalp loses 5% = 21%.
+HARD_LOSS_CAP_FRACTION = 0.04   # 4% of bankroll = absolute max loss per market
+HARD_LOSS_CAP_ENABLED = True
+
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
 
@@ -237,7 +246,7 @@ ENABLE_DUMP = True
 # Philosophy: we entered with high conviction and hold to close. Bail ONLY if
 # SHIB has actually moved against us AND the book confirms it. A book spike
 # while SHIB is on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND SHIB confirms, bail (was 50% — too late, already lost 40¢+)
+DUMP_PROB_FLIP = 0.70  # Floor: if prob drops to 70% AND SHIB confirms, bail (was 60% — too late, losses compound fast)
 DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
 DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
 DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
@@ -255,36 +264,36 @@ DUMP_BTC_SAFE_CUTOFF_SECONDS = 300   # Boundary between early/late buffer (5 min
 
 # -------------- REVERSAL BAIL (only after SHIB check fails) --------------------
 DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
+DUMP_REVERSAL_THRESHOLD = 0.04  # 4% drop from peak — bail fast (was 6% — 4% catches reversals before damage)
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.03  # 3% when profitable — protect gains aggressively (was 4%)
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.02  # Tighten after 2%+ gain (was 3% — start protecting immediately)
 DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
 # Reversal during early settling phase uses a wider threshold (not blocked entirely)
-DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
+DUMP_REVERSAL_THRESHOLD_SETTLING = 0.06  # 6% drop in first 30s = something is very wrong, bail even early (was 10%)
 
 # -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.02  # 2% of current balance = max single-trade loss (was 3% — still blew up)
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
+MAX_SETTLEMENT_LOSS_FRACTION = 0.04  # Max 4% of balance at risk per trade (was 8% — matched to HARD_LOSS_CAP_FRACTION)
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
-DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
+DUMP_GRACE_PERIOD_SECONDS = 5       # 5s grace period — start monitoring ASAP (was 10s)
+DUMP_PROACTIVE_AFTER_SECONDS = 15   # Proactive bail after 15s — detect reversals fast (was 30s)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after SHIB check (was 15¢ — tighter to salvage more)
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 7   # Hard stop after SHIB check — bail at 7¢ loss/contract (was 10¢)
 # CATASTROPHIC STOP: fires BEFORE SHIB check — absolute max loss regardless of anything
-# Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
-DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
+# At 85¢ max entry, 12¢ loss = market dropped to 73¢ = something is very wrong.
+DUMP_CATASTROPHIC_LOSS_CENTS = 12      # If losing >12¢/contract, bail no matter what (was 20¢ — way too much rope)
 
 # -------------- WINDOWED PEAK TRACKING (avoid false reversals from book spikes) -----
 # All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
@@ -306,10 +315,14 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 # Safety: the flip still checks probability and price, but with a LOWER bar
 #         than a fresh entry — this is a recovery play, not a new trade.
 #         We already took the loss; the question is "can I claw some back?"
-FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
-FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
+# FLIP DISABLED — was the #1 cause of compounding losses.
+# At 60% prob and 99¢ entry, EV = -39¢/contract.  The flip was a coin-flip
+# recovery play that doubled losses instead of recovering them.
+# Accept the loss, move on to the next market with full bankroll.
+FLIP_AFTER_DUMP = False             # DISABLED — stop compounding losses after bail
+FLIP_MIN_TIME_REMAINING = 15        # (irrelevant when disabled)
+FLIP_MIN_PROB = 0.85                # Would need 85%+ to even consider (was 60% — pure gamble)
+FLIP_MAX_ENTRY_PRICE = 85           # Match main entry cap (was 99¢ — absurd)
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
 # With <120s left and SHIB far from the strike, the outcome is locked.
@@ -333,8 +346,8 @@ SCALP_DISTANCE_TIERS = [
     (0.0000003, 0.45),   # ~1.5% from strike: safe, meaningful size
     (0.0000002, 0.25),   # ~1% from strike: moderate — compound the edge
 ]
-SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
-SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
+SCALP_MAX_ENTRY_PRICE = 95        # Max 95¢ — need 5¢+ payoff to justify the risk (was 99¢ = 1¢ payoff = absurd)
+SCALP_MIN_PROB = 0.95             # Require 95%+ — scalp is only for LOCKED outcomes (was 80%)
 SCALP_MAX_LOSS_FRACTION = 0.05    # Never risk more than 5% of cash on a scalp (was 15% — too much when stacked with main entry)
 
 # -------------- COMBINED POSITION RISK CAP (main entry + scalp) --------------
@@ -344,7 +357,7 @@ SCALP_MAX_LOSS_FRACTION = 0.05    # Never risk more than 5% of cash on a scalp (
 # This cap ensures the TOTAL risk across all positions in one market never
 # exceeds a single threshold.  The scalp logic checks existing position cost
 # and only uses whatever room remains under this cap.
-COMBINED_POSITION_RISK_CAP = 0.10  # Max 10% of bankroll at risk per market (main + scalp combined)
+COMBINED_POSITION_RISK_CAP = 0.05  # Max 5% of bankroll at risk per market (main + scalp combined, was 10%)
 
 # -------------- BRACKET ARBITRAGE (buy all 3, dump 2, hold 1) ----------------
 # When an event has 3 range brackets (lo-mid, mid-hi, hi-top), exactly ONE must
@@ -1552,6 +1565,11 @@ class BotState:
     pending_settlement_qty: int = 0
     pending_settlement_was_flip: bool = False
     pending_settlement_ts: float = 0.0  # When we started waiting
+
+    # Hard loss cap tracking: total realized loss in this market (dumps + flips)
+    # Once this exceeds HARD_LOSS_CAP_FRACTION * balance, NO more entries allowed.
+    market_realized_loss_usd: float = 0.0
+    hard_cap_hit: bool = False  # Latched — once True, no more activity on this market
 
     last_p_yes: Optional[float] = None
     last_edge_yes: Optional[float] = None
@@ -3202,6 +3220,19 @@ def main() -> None:
                                         pnl_cents=pnl_cents,
                                         was_dump=True,
                                     )
+                                    # Track cumulative loss for hard cap
+                                    if pnl_cents < 0:
+                                        st.market_realized_loss_usd += abs(pnl_cents) / 100.0
+                                        if HARD_LOSS_CAP_ENABLED:
+                                            cap_usd = session.current_balance_usd * HARD_LOSS_CAP_FRACTION
+                                            if st.market_realized_loss_usd >= cap_usd:
+                                                st.hard_cap_hit = True
+                                                log.warning(
+                                                    f"[HARD_CAP] Market loss ${st.market_realized_loss_usd:.2f} "
+                                                    f">= cap ${cap_usd:.2f} ({HARD_LOSS_CAP_FRACTION:.0%} of "
+                                                    f"${session.current_balance_usd:.2f}). "
+                                                    f"NO MORE ENTRIES on {st.market}."
+                                                )
                                 except Exception as e:
                                     log.warning(f"[BAIL] P&L recording failed (non-fatal): {e}")
 
@@ -3226,6 +3257,7 @@ def main() -> None:
                                     can_flip = (
                                         FLIP_AFTER_DUMP
                                         and not st.has_flipped
+                                        and not st.hard_cap_hit  # HARD CAP: no flips after cap hit
                                         and secs_to_close >= FLIP_MIN_TIME_REMAINING
                                         and flip_price is not None
                                         and flip_price <= FLIP_MAX_ENTRY_PRICE
@@ -3346,7 +3378,7 @@ def main() -> None:
                         # ---- LAST-MINUTE SCALP (inside dump check, only if NOT dumping) ----
                         # When we're holding and NOT bailing, check if we should pile on
                         # extra contracts in the final seconds for near-free profit.
-                        if not should_dump and not st.has_scalped and secs_to_close is not None:
+                        if not should_dump and not st.has_scalped and not st.hard_cap_hit and secs_to_close is not None:
                             our_prob = p_yes_blend if st.side == "yes" else p_no_blend
 
                             # Get ask price for our side. When the outcome is near-certain,
@@ -3465,6 +3497,17 @@ def main() -> None:
                     except Exception as e:
                         log.warning(f"[DUMP] Check failed: {e}")
 
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # HARD LOSS CAP: if we've already lost too much on this market, stop everything
+        if st.hard_cap_hit:
+            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.warning(
+                    f"[HARD_CAP] {st.market} — capped at ${st.market_realized_loss_usd:.2f} loss. "
+                    f"Waiting for market roll."
+                )
+                last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
 
