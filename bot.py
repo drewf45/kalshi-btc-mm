@@ -283,6 +283,35 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # At 72.5% win rate with ~$0.05 avg win, $0.75 loss = 15 wins erased.
 # Cutting to $0.50 means one loss erases ~10 wins. Still not great but survivable.
 HARD_STOP_LOSS_USD = 1.00  # Absolute max dollar loss per trade — no BTC check, no grace period
+SOFT_STOP_LOSS_USD = 0.75  # Soft stop: at -$0.75 unrealized, start trying to exit with limit sell
+
+# -------------- YES TIME-OF-DAY RESTRICTION ---------------------------------
+# YES is net negative in 5/6 sessions. Only profitable session was overnight.
+# Disable YES during daytime (8am-8pm EST) where it consistently bleeds.
+# Allow YES overnight (8pm-8am EST) where it showed +$1.00 at 75% WR.
+# Combined with the "physically locked" gate, YES can only fire overnight
+# in the last 60s when BTC is $200+ above floor. Extremely selective.
+YES_DAYTIME_DISABLED = True           # Kill YES trades during 8am-8pm EST
+YES_DAYTIME_START_HOUR = 8            # 8am EST
+YES_DAYTIME_END_HOUR = 20             # 8pm EST
+YES_DAYTIME_TIMEZONE = "America/New_York"
+
+# -------------- SESSION DRAWDOWN BREAKER ------------------------------------
+# If down $2.00+ in a rolling 2-hour window, pause 30 min, resume at 50% size.
+# Prevents cascade sessions like the -$7.93 morning.
+DRAWDOWN_ENABLED = True
+DRAWDOWN_MAX_LOSS_USD = 2.00          # Max loss in rolling window before pause
+DRAWDOWN_WINDOW_SECONDS = 7200        # 2-hour rolling window
+DRAWDOWN_PAUSE_SECONDS = 1800         # Pause for 30 minutes
+DRAWDOWN_RESUME_SIZE_MULT = 0.50      # Resume at 50% position size
+DRAWDOWN_RESUME_TRADES = 3            # Run 3 trades at reduced size before full size
+
+# -------------- EARLY EXIT ON UNDERWATER POSITIONS --------------------------
+# If position is down >30% of max possible loss within first 5 minutes,
+# exit early — don't let underwater positions ride to expiry.
+EARLY_EXIT_ENABLED = True
+EARLY_EXIT_LOSS_FRACTION = 0.30       # 30% of max possible loss
+EARLY_EXIT_WINDOW_SECONDS = 300       # First 5 minutes of holding
 
 # -------------- MINIMUM EXPECTED PAYOUT (stop making penny trades) ----------
 # If projected win is $0.02-$0.03, the risk/reward is terrible.
@@ -1148,6 +1177,11 @@ class SessionState:
     is_daily_stopped: bool = False  # HARD STOP - never unpauses
     _needs_trend_reset: bool = False  # Reset trend data after cooldown
 
+    # Drawdown breaker
+    drawdown_paused: bool = False
+    drawdown_resume_at: float = 0.0
+    drawdown_reduced_trades: int = 0  # Count of trades at reduced size after drawdown
+
     # Balance refresh
     pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
 
@@ -1208,11 +1242,15 @@ class SessionState:
         trade = {
             "market": market, "side": side, "entry": entry_price,
             "exit": exit_price, "qty": qty, "pnl_cents": pnl_cents,
-            "pnl_usd": pnl_usd, "was_dump": was_dump, "ts": time.time(),
+            "pnl_usd": pnl_usd, "was_dump": was_dump,
+            "ts": time.time(), "timestamp": time.time(),
         }
         self.recent_trades.append(trade)
         if len(self.recent_trades) > 50:
             self.recent_trades = self.recent_trades[-50:]
+
+        # Check rolling drawdown after every trade
+        self.check_rolling_drawdown()
 
         if pnl_cents > 0:
             self.total_wins += 1
@@ -1274,11 +1312,51 @@ class SessionState:
             self.current_contracts = BASE_CONTRACTS  # Reset to base on consecutive loss pause
             log.warning(f"[SESSION] PAUSED: {self.consecutive_losses} consecutive losses - cooldown {SESSION_COOLDOWN_MINUTES}min")
 
+    def check_rolling_drawdown(self) -> None:
+        """Check if rolling P&L in window exceeds drawdown limit. Triggers pause if so."""
+        if not DRAWDOWN_ENABLED or not self.recent_trades:
+            return
+        # Already in drawdown pause
+        if self.drawdown_paused:
+            return
+        cutoff = time.time() - DRAWDOWN_WINDOW_SECONDS
+        rolling_pnl = sum(
+            t.get("pnl_usd", t.get("pnl_cents", 0) / 100.0)
+            for t in self.recent_trades
+            if t.get("timestamp", 0) >= cutoff
+        )
+        if rolling_pnl <= -DRAWDOWN_MAX_LOSS_USD:
+            self.drawdown_paused = True
+            self.drawdown_resume_at = time.time() + DRAWDOWN_PAUSE_SECONDS
+            self.drawdown_reduced_trades = 0
+            log.warning(
+                f"[DRAWDOWN] Rolling {DRAWDOWN_WINDOW_SECONDS//60}min P&L = ${rolling_pnl:.2f} "
+                f"<= -${DRAWDOWN_MAX_LOSS_USD:.2f} — PAUSING {DRAWDOWN_PAUSE_SECONDS//60}min, "
+                f"then resume at {DRAWDOWN_RESUME_SIZE_MULT:.0%} size for {DRAWDOWN_RESUME_TRADES} trades"
+            )
+
+    def get_drawdown_size_multiplier(self) -> float:
+        """Returns position size multiplier based on drawdown state."""
+        if not self.drawdown_paused:
+            return 1.0
+        if self.drawdown_reduced_trades < DRAWDOWN_RESUME_TRADES:
+            return DRAWDOWN_RESUME_SIZE_MULT
+        return 1.0
+
     def check_can_trade(self) -> Tuple[bool, Optional[str]]:
         """Check if we can trade"""
         # Daily hard stop is permanent until restart
         if self.is_daily_stopped:
             return False, f"DAILY_HARD_STOP (lost 75%+ of starting balance)"
+
+        # Drawdown breaker pause
+        if self.drawdown_paused:
+            if time.time() >= self.drawdown_resume_at:
+                self.drawdown_paused = False
+                log.warning(f"[DRAWDOWN] Pause ended — resuming at {DRAWDOWN_RESUME_SIZE_MULT:.0%} size for {DRAWDOWN_RESUME_TRADES} trades")
+            else:
+                remaining = int(self.drawdown_resume_at - time.time())
+                return False, f"drawdown_pause ({remaining}s remaining)"
 
         if not self.is_paused:
             return True, None
@@ -1951,14 +2029,15 @@ def should_dump_position(
         _hs_method = "bid" if _hs_loss_bid >= _hs_loss_prob else "prob"
         _hs_exit_used = _hs_exit_bid if _hs_method == "bid" else _hs_exit_prob
 
-        if _hs_total_loss >= HARD_STOP_LOSS_USD:
+        # SOFT STOP: at -$0.75, start exiting (logged as soft_stop for tracking)
+        if _hs_total_loss >= SOFT_STOP_LOSS_USD:
             log.warning(
-                f"[HARD STOP] losing ${_hs_total_loss:.2f} >= ${HARD_STOP_LOSS_USD:.2f} cap — "
-                f"BAIL (entry={st.entry_price_cents}¢ exit_{_hs_method}={_hs_exit_used}¢ "
+                f"[SOFT STOP] losing ${_hs_total_loss:.2f} >= ${SOFT_STOP_LOSS_USD:.2f} soft cap — "
+                f"EXIT (entry={st.entry_price_cents}¢ exit_{_hs_method}={_hs_exit_used}¢ "
                 f"loss_bid=${_hs_loss_bid:.2f} loss_prob=${_hs_loss_prob:.2f} "
-                f"× {st.qty}ct) — no exceptions"
+                f"× {st.qty}ct) — exiting before hard stop"
             )
-            return True, f"hard_stop_${_hs_total_loss:.2f}>=${HARD_STOP_LOSS_USD:.2f}"
+            return True, f"soft_stop_${_hs_total_loss:.2f}>=${SOFT_STOP_LOSS_USD:.2f}"
 
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
@@ -1997,8 +2076,33 @@ def should_dump_position(
     if st.entry_model_prob is None:
         return False, "no_entry_data"
 
-    # --- GRACE PERIOD ---
     time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 9999
+
+    # --- EARLY EXIT ON UNDERWATER POSITIONS ---
+    # If down >30% of max possible loss within first 5 minutes, exit early.
+    # Don't let underwater positions ride to expiry.
+    if EARLY_EXIT_ENABLED and st.entry_price_cents is not None and st.qty > 0:
+        if time_in_trade <= EARLY_EXIT_WINDOW_SECONDS:
+            # Max possible loss = entry_price × qty (contract goes to $0)
+            max_possible_loss = (st.entry_price_cents * st.qty) / 100.0
+            threshold_loss = max_possible_loss * EARLY_EXIT_LOSS_FRACTION
+
+            # Use bid price if available for accurate loss estimate
+            if st.side == "yes":
+                _ee_exit = yes_bid if yes_bid is not None else int(p_yes_blend * 100)
+            else:
+                _ee_exit = no_bid if no_bid is not None else int(p_no_blend * 100)
+            _ee_loss = (st.entry_price_cents - _ee_exit) * st.qty / 100.0
+
+            if _ee_loss >= threshold_loss:
+                log.warning(
+                    f"[EARLY EXIT] Down ${_ee_loss:.2f} >= {EARLY_EXIT_LOSS_FRACTION:.0%} of "
+                    f"max loss ${max_possible_loss:.2f} (threshold ${threshold_loss:.2f}) "
+                    f"in first {time_in_trade:.0f}s — exiting before it gets worse"
+                )
+                return True, f"early_exit_${_ee_loss:.2f}>={EARLY_EXIT_LOSS_FRACTION:.0%}_of_max"
+
+    # --- GRACE PERIOD ---
     if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
         return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
 
@@ -3458,6 +3562,24 @@ def main() -> None:
         # This turns YES into a rare scalp-like bonus, not a regular entry.
         # =============================================================
         if chosen_side == "yes" and not YES_ONLY:
+            # Gate -1: Daytime block — YES disabled 8am-8pm EST (bleeds during daytime)
+            if YES_DAYTIME_DISABLED:
+                try:
+                    est_now = datetime.now(ZoneInfo(YES_DAYTIME_TIMEZONE))
+                    est_hour = est_now.hour
+                    if YES_DAYTIME_START_HOUR <= est_hour < YES_DAYTIME_END_HOUR:
+                        if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                            log.info(
+                                f"[YES DAYTIME] BLOCKED — {est_hour}:00 EST is daytime "
+                                f"({YES_DAYTIME_START_HOUR}:00-{YES_DAYTIME_END_HOUR}:00). "
+                                f"YES only allowed overnight."
+                            )
+                            last_state_log = now
+                        time.sleep(POLL_SECONDS)
+                        continue
+                except Exception as e:
+                    log.warning(f"[YES DAYTIME] Timezone check failed: {e} — allowing trade")
+
             # Gate 0: Time — YES only in the last 60 seconds (outcome must be decided)
             if secs_to_close is not None and secs_to_close > YES_MAX_SECONDS:
                 if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
@@ -3537,6 +3659,18 @@ def main() -> None:
             p_gate = float(p_no_blend)
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+
+        # Apply drawdown size multiplier if recovering from drawdown pause
+        dd_mult = session.get_drawdown_size_multiplier()
+        if dd_mult < 1.0 and qty > 0:
+            old_qty = qty
+            qty = max(MIN_CONTRACTS, int(qty * dd_mult))
+            session.drawdown_reduced_trades += 1
+            log.warning(
+                f"[DRAWDOWN SIZE] Reduced {old_qty} -> {qty} contracts "
+                f"(×{dd_mult:.0%}, trade {session.drawdown_reduced_trades}/{DRAWDOWN_RESUME_TRADES})"
+            )
+
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
