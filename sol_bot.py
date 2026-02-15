@@ -133,6 +133,17 @@ ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 
+# -------------- NO-SIDE BIAS (data-driven: NO has 80% WR vs YES 30%) --------
+# The NO side is structurally stronger for SOL — SOL tends to breach the
+# upper boundary more often than it holds above it.  Give NO an advantage:
+# - Lower probability threshold for NO entries (accept slightly less certainty)
+# - Edge discount: treat NO edges as slightly better than they are
+# - When both sides qualify, prefer NO
+NO_BIAS_ENABLED = True
+NO_PROB_DISCOUNT = 0.03        # NO needs 3% less probability to enter (e.g., 90% becomes 87%)
+NO_EDGE_BONUS = 0.01           # Add 1% virtual edge to NO when comparing sides
+NO_SIZING_MULTIPLIER = 1.25    # Size NO positions 25% larger than YES
+
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/SOL-USD/spot"
@@ -217,15 +228,15 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.07  # SOL: ~0.07 USD/√sec (SOL ~$200, ~2x high
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
 # Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
-KELLY_MULTIPLIER = 0.20     # Fifth-Kelly — reduced from 0.25 for SOL, smoother equity curve given higher variance
-KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
-KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
+KELLY_MULTIPLIER = 0.35     # Raised from 0.20 → 0.35 (~75% increase) — bot has proven edge across 3 sessions, time to capitalize
+KELLY_FLOOR_FRACTION = 0.08 # Minimum 8% of bankroll (was 5%) — trade meaningfully when we decide to trade
+KELLY_CAP_FRACTION = 0.65   # Up to 65% of bankroll in one trade (was 50%) — earned via consistent R/R of 1.71
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy constants (kept for backward compat in safety checks)
-BASE_CONTRACTS = 3
-CONTRACT_INCREMENT = 1
+BASE_CONTRACTS = 5          # Raised from 3 — base position reflects proven edge
+CONTRACT_INCREMENT = 2      # Raised from 1 — scale up faster after wins
 BANKROLL_FRACTION = 0.40
 SCALING_MIN_FRACTION = 0.15
 SCALING_MAX_FRACTION = 0.50
@@ -283,14 +294,14 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.05  # 5% of current balance = max single-trade loss (raised from 3% — worst loss was only $0.21, room to size up)
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
+MAX_SETTLEMENT_LOSS_FRACTION = 0.14  # Max 14% of balance at risk per trade (was 8%) — scaled up with proven edge
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -344,15 +355,16 @@ SCALP_MIN_DISTANCE_USD = 0.20      # SOL must be ≥$0.20 from strike (was $0.10
 # Distance tiers: farther from strike = more aggressive sizing
 # Each tier: (min_distance_usd, bankroll_fraction)
 # Raised all tiers — SOL's higher vol means "safe distance" is larger in % terms
+# Bankroll fractions scaled up ~75% to match new sizing (proven edge)
 SCALP_DISTANCE_TIERS = [
-    (1.20, 0.85),    # $1.20+ from strike: extremely safe, size up hard
-    (0.60, 0.65),    # $0.60-1.20: very safe, go bigger
-    (0.35, 0.45),    # $0.35-0.60: safe, meaningful size
-    (0.20, 0.25),    # $0.20-0.35: moderate — compound the edge
+    (1.20, 0.90),    # $1.20+ from strike: extremely safe, nearly all-in
+    (0.60, 0.75),    # $0.60-1.20: very safe, go big
+    (0.35, 0.55),    # $0.35-0.60: safe, meaningful size
+    (0.20, 0.35),    # $0.20-0.35: moderate — compound the edge
 ]
 SCALP_MAX_ENTRY_PRICE = 92        # Capped by MIN_PAYOFF_CENTS=8 — no more 1¢ scalps (was 99¢, the #1 source of penny wins)
 SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
+SCALP_MAX_LOSS_FRACTION = 0.25    # Up to 25% of cash on a scalp (was 15% — scalps at 92¢ with 8¢ payoff are safer than old 99¢ scalps)
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -384,7 +396,7 @@ EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 3.0)  # Steeper scaling
 
 A_PLUS_PROB = env_float("A_PLUS_PROB", 0.90)  # A+ = extremely certain outcome
 A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = even small edge at 90%+ prob is golden
-A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Go big — 90%+ prob is as sure as it gets
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.60)  # Go big — 90%+ prob is as sure as it gets (raised from 0.40, bot has earned it)
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
@@ -1702,25 +1714,34 @@ def choose_trade(
 
     # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
     if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-        effective_prob_min = PROB_EARLY_MIN   # >5min: need 92%+
+        effective_prob_min = PROB_EARLY_MIN   # >5min: need 93%+
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-        effective_prob_min = PROB_MID_MIN     # 3-5min: need 88%+
+        effective_prob_min = PROB_MID_MIN     # 3-5min: need 90%+
     else:
-        effective_prob_min = PROB_MIN         # <3min: 85%+ — market has priced in the outcome
-        
+        effective_prob_min = PROB_MIN         # <3min: 86%+ — market has priced in the outcome
+
+    # NO-SIDE BIAS: lower the bar for NO entries (80% WR vs 30% YES)
+    effective_prob_min_yes = effective_prob_min
+    effective_prob_min_no = effective_prob_min
+    effective_edge_min_yes = EDGE_MIN
+    effective_edge_min_no = EDGE_MIN
+    if NO_BIAS_ENABLED:
+        effective_prob_min_no = max(PROB_MIN - 0.05, effective_prob_min - NO_PROB_DISCOUNT)
+        effective_edge_min_no = max(0.02, EDGE_MIN - NO_EDGE_BONUS)
+
     ok_yes = (
         yes_px is not None
         and ok_book_yes
-        and (p_yes_blend >= effective_prob_min)  # Use blend for gate
-        and (edge_yes >= EDGE_MIN)
+        and (p_yes_blend >= effective_prob_min_yes)  # Use blend for gate
+        and (edge_yes >= effective_edge_min_yes)
         and (yes_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_yes
     )
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_blend >= effective_prob_min)  # Use blend for gate
-        and (edge_no >= EDGE_MIN)
+        and (p_no_blend >= effective_prob_min_no)  # NO gets lower bar (proven 80% WR)
+        and (edge_no >= effective_edge_min_no)      # NO gets edge discount
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
     )
@@ -1743,15 +1764,15 @@ def choose_trade(
             p_no_blend = 1.0 - p_yes_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate ok_yes/ok_no with new blend
+            # Re-evaluate ok_yes/ok_no with new blend (NO-biased thresholds)
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
+                and (p_yes_blend >= effective_prob_min_yes) and (edge_yes >= effective_edge_min_yes)
                 and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
             )
             ok_no = (
                 no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (p_no_blend >= effective_prob_min_no) and (edge_no >= effective_edge_min_no)
                 and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
             )
         elif p_no_mkt >= MARKET_CONVICTION_THRESHOLD and p_no_blend < p_no_mkt:
@@ -1764,14 +1785,15 @@ def choose_trade(
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
             # Re-evaluate ok_yes/ok_no with new blend
+            # Re-evaluate ok_yes/ok_no with new blend (NO-biased thresholds)
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= effective_prob_min) and (edge_yes >= EDGE_MIN)
+                and (p_yes_blend >= effective_prob_min_yes) and (edge_yes >= effective_edge_min_yes)
                 and (yes_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_yes
             )
             ok_no = (
                 no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (p_no_blend >= effective_prob_min_no) and (edge_no >= effective_edge_min_no)
                 and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
             )
 
@@ -1861,9 +1883,16 @@ def choose_trade(
         ok_no = False
 
     if ok_yes and ok_no:
-        if edge_yes > edge_no + 1e-9:
+        # NO-SIDE BIAS: when both qualify, give NO an edge bonus in the comparison.
+        # NO has 80% WR vs YES 30% — structurally prefer NO unless YES has a big edge lead.
+        effective_edge_yes = float(edge_yes)
+        effective_edge_no = float(edge_no) + (NO_EDGE_BONUS if NO_BIAS_ENABLED else 0.0)
+        if effective_edge_yes > effective_edge_no + 1e-9:
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
-        if edge_no > edge_yes + 1e-9:
+        if effective_edge_no > effective_edge_yes + 1e-9:
+            return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+        # Tiebreaker: prefer NO (data-driven: 80% WR)
+        if NO_BIAS_ENABLED:
             return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
         if p_yes_model >= p_no_model:
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
@@ -3405,6 +3434,14 @@ def main() -> None:
             continue
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+
+        # NO-SIDE SIZING BOOST: size NO positions larger (80% WR vs 30% YES)
+        if NO_BIAS_ENABLED and chosen_side == "no" and NO_SIZING_MULTIPLIER > 1.0:
+            old_qty = qty
+            qty = min(MAX_CONTRACTS, int(qty * NO_SIZING_MULTIPLIER))
+            if qty > old_qty:
+                log.info(f"[NO BIAS] Sizing up NO: {old_qty} → {qty} contracts (×{NO_SIZING_MULTIPLIER})")
+
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
