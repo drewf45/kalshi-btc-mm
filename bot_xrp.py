@@ -266,6 +266,7 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
 DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
+DUMP_HARD_MAX_LOSS_USD = 0.50             # ABSOLUTE hard cap: never lose more than $0.50 on any single trade, period
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
@@ -1842,14 +1843,19 @@ def should_dump_position(
             # Fall through to normal dump logic below
         else:
             # XRP is safely on our side — hold to settlement
-            # Still bail on catastrophic loss (bankroll protection)
-            if st.entry_price_cents is not None and st.qty > 0 and current_balance_usd > 0:
+            # Still bail on hard dollar cap or bankroll cap (protect gains)
+            if st.entry_price_cents is not None and st.qty > 0:
                 exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
                 loss_per_contract = st.entry_price_cents - exit_price_est
                 total_loss_usd = (loss_per_contract * st.qty) / 100.0
-                max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
-                if total_loss_usd > max_loss_balance:
-                    return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
+                # Hard dollar cap — absolute ceiling
+                if total_loss_usd > DUMP_HARD_MAX_LOSS_USD:
+                    return True, f"late_entry_hard_cap_${total_loss_usd:.2f}>${DUMP_HARD_MAX_LOSS_USD:.2f}"
+                # Bankroll-proportional cap
+                if current_balance_usd > 0:
+                    max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
+                    if total_loss_usd > max_loss_balance:
+                        return True, f"late_entry_bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
             return False, f"late_entry_hold_to_settle_t={secs_to_close}s_dist=${xrp_hold_dist:.4f}"
 
     if st.entry_model_prob is None:
@@ -1893,10 +1899,31 @@ def should_dump_position(
         rapid_drop = rapid_peak - current_prob
 
     # =============================================================
+    # === HARD DOLLAR CAP: absolute ceiling, fires FIRST ===
+    # Never lose more than $0.50 on any single trade regardless of
+    # bankroll size, position size, or anything else.
+    # Protects the gains — the original -$3.72 blowup can't recur.
+    # =============================================================
+    if st.entry_price_cents is not None and st.qty > 0:
+        exit_price_est = int(current_prob * 100)
+        loss_per_contract = st.entry_price_cents - exit_price_est
+        total_loss_cents = loss_per_contract * st.qty
+        total_loss_usd = total_loss_cents / 100.0
+        if total_loss_usd > DUMP_HARD_MAX_LOSS_USD:
+            log.warning(
+                f"[BAIL HARD CAP] losing ${total_loss_usd:.2f} > "
+                f"${DUMP_HARD_MAX_LOSS_USD:.2f} hard cap — "
+                f"{loss_per_contract}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
+                f"absolute safety net, bail immediately"
+            )
+            return True, f"hard_cap_${total_loss_usd:.2f}>${DUMP_HARD_MAX_LOSS_USD:.2f}"
+
+    # =============================================================
     # === BANKROLL-PROPORTIONAL STOP: fires BEFORE XRP check ===
-    # Never lose more than 5% of balance or 50% of position cost.
+    # Never lose more than 3% of balance or 50% of position cost.
     # This is THE primary loss cap. Scales with bankroll naturally:
-    # $35 balance → max $1.75 loss.  $350 → max $17.50.
+    # $35 balance → max $1.05 loss.  $350 → max $10.50.
     # =============================================================
     if st.entry_price_cents is not None and st.qty > 0:
         exit_price_est = int(current_prob * 100)
