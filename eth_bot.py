@@ -194,7 +194,7 @@ PROB_MID_MIN = 0.83              # 3-5min: need 83%+ (was 86% — $1 cap protect
 # When prob is high (90%+), the outcome speaks for itself — skip trend checks.
 PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
 PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
-PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
+PROB_TREND_THRESHOLD = 0.05       # 5% swing in one direction = trend signal (was 8% — ETH moves less than BTC)
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match ETH spot trend (borderline only)
@@ -203,13 +203,13 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match ETH spot trend (border
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
-PROB_FAST_LANE_LATE_THRESHOLD = 0.90  # ≥90% prob in last 3 min = fast lane (was 85% — too loose, caused -EV entries)
+PROB_FAST_LANE_THRESHOLD = 0.85   # ≥85% prob = buy immediately, no trend check needed (was 90% — too tight)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.83  # ≥83% prob in last 3 min = fast lane (market has priced in outcome)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
 # At T-300s to T-180s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment
+CONFIRMATION_HOLD_SECONDS = 8    # Signal must persist for 8s before early commitment (was 15 — too slow for ETH)
 CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 0.35  # ETH: ~0.35 USD/√sec (BTC is ~12, ETH price ~35x lower with similar % vol)
@@ -1956,6 +1956,11 @@ def choose_trade(
                 f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} | "
                 f"Track to evaluate if YES develops edge"
             )
+        ok_yes = False
+
+    # FAILSAFE: NO_ONLY physically prevents YES return regardless of any override above.
+    # YES is -$4.43 lifetime, 0-for-5 last session, -$0.99 this session.
+    if NO_ONLY:
         ok_yes = False
 
     if ok_yes and ok_no:
