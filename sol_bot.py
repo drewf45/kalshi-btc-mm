@@ -14,7 +14,7 @@
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
 # - EDGE_MIN=0.04 (4% real edge — loosened from 5% to increase volume)
 # - MIN_PAYOFF=8¢/contract (hard floor — no penny wins, max entry=92¢)
-# - HARD_MAX_LOSS=$1.00 (absolute ceiling — no single trade loses >$1)
+# - HARD_MAX_LOSS=$0.75 (absolute ceiling — tighter than other bots, protects SOL's edge)
 # - COLD_START: first 2 trades after restart at half size
 # - KELLY=0.20 (fifth-Kelly — proven sizing from +$0.84 session)
 # - SOL-AWARE BAIL: only dump if SOL has moved against us, not book noise
@@ -303,16 +303,16 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # ROLLED BACK from 0.14 — max 8% of balance at risk per trade
 
-# -------------- ABSOLUTE DOLLAR LOSS CAP (the -$2.61 lesson) ------------------
-# No single trade can lose more than this, period. This overrides everything:
-# Kelly sizing, bankroll fraction, settlement loss, catastrophic stop — all of it.
-# During the proven +$0.84 afternoon session, max loss was -$0.43.
-# $1.00 gives 2.3x headroom above that while preventing the -$2.61 blowups.
-# Enforced both PRE-TRADE (caps position size) and IN-TRADE (forces bail).
-HARD_MAX_LOSS_USD = 1.00  # ABSOLUTE CEILING: no single trade can lose more than $1.00
-SOFT_STOP_LOSS_USD = 0.50 # SOFT CAP: at -$0.50 unrealized, submit limit sell to exit gracefully
+# -------------- ABSOLUTE DOLLAR LOSS CAP ------------------
+# SOL is close to consistently profitable — tighter cap protects the edge.
+# 2 blowups at -$2.61/-$2.70 would be -$1.50 total with this cap.
+# Normal SOL losses are -$0.07 to -$0.21 so $0.75 gives 3.5x headroom.
+# Enforced PRE-TRADE (caps position size), IN-TRADE (forces bail),
+# and by the independent stop-loss monitor (uses actual bid prices).
+HARD_MAX_LOSS_USD = 0.75  # ABSOLUTE CEILING: no single trade can lose more than $0.75
+SOFT_STOP_LOSS_USD = 0.40 # SOFT CAP: at -$0.40 unrealized, submit limit sell to exit gracefully
 # Overnight uses tighter soft stop (SOL overnight sessions showed -$2.61/-$2.70 blowups)
-OVERNIGHT_SOFT_STOP_USD = 0.35
+OVERNIGHT_SOFT_STOP_USD = 0.30
 
 # -------------- INDEPENDENT STOP-LOSS (runs BEFORE strategy, CANNOT be overridden) --------
 # This is the #1 risk fix. Previous stop-loss was embedded in should_dump_position()
@@ -323,11 +323,21 @@ OVERNIGHT_SOFT_STOP_USD = 0.35
 # If unrealized_loss >= soft_stop → limit sell at best_bid to exit gracefully.
 INDEPENDENT_STOP_LOSS_ENABLED = True
 
+# -------------- TRAILING STOP (lock in profits on winners) --------
+# SOL YES wins are often small ($0.07-$0.10) that could be bigger.
+# Once a position is up $0.10, set a trailing stop $0.06 below the peak.
+# If the trade runs to +$0.30 the stop trails to +$0.24.
+# Lets occasional big wins through while protecting realized gains.
+# Only applies to YES during daytime (YES is disabled overnight anyway).
+TRAILING_STOP_ENABLED = True
+TRAILING_STOP_ACTIVATION_USD = 0.10  # Start trailing once profit >= $0.10
+TRAILING_STOP_TRAIL_USD = 0.06       # Trail $0.06 below peak unrealized P&L
+
 # -------------- DAYTIME vs OVERNIGHT SIZING --------
 # SOL daytime (8am-8pm EST): +$3.61 combined across 4 profitable sessions, R:R 1.41-2.90
 # SOL overnight: -$2.61/-$2.70 blowups, unreliable.  Size accordingly.
-DAYTIME_SIZE_MULTIPLIER = 1.50   # 50% larger during proven daytime hours
-OVERNIGHT_SIZE_MULTIPLIER = 0.50 # 50% smaller overnight when risk is higher
+DAYTIME_SIZE_MULTIPLIER = 1.25   # 25% larger during proven daytime hours (was 1.50, trimmed — Kelly went haywire at aggressive sizing)
+OVERNIGHT_SIZE_MULTIPLIER = 0.75 # 25% smaller overnight (was 0.50, relaxed slightly — overnight NO is 80%+ WR)
 DAYTIME_START_HOUR_EST = 8       # 8:00 AM EST
 DAYTIME_END_HOUR_EST = 20        # 8:00 PM EST
 MAX_TRADES_PER_HOUR_OVERNIGHT = 3  # Cap overnight volume — less data = less edge
@@ -1800,6 +1810,8 @@ class BotState:
 
     # Peak probability tracking (for proactive dump)
     peak_prob_for_side: float = 0.0  # Highest prob we've seen for our side since entry
+    # Peak unrealized P&L tracking (for trailing stop)
+    peak_unrealized_pnl: float = 0.0  # Highest unrealized profit seen since entry
     # Windowed peak tracking: list of (timestamp, prob) for rolling max computation
     # Avoids false reversal signals from thin-book spikes ratcheting up all-time peak
     prob_history: list = field(default_factory=list)  # List[Tuple[float, float]]
@@ -3127,6 +3139,55 @@ def main() -> None:
                         except Exception as e:
                             log.warning(f"[STOP_LOSS SOFT] Failed: {e}")
 
+                    # TRAILING STOP: lock in profits on winners
+                    # Calculates unrealized profit from actual bid, tracks peak,
+                    # and sells if profit drops $0.06 below peak after reaching $0.10.
+                    if TRAILING_STOP_ENABLED and sl_unrealized == 0 and sl_our_bid is not None:
+                        bid_cents = sl_our_bid if sl_our_bid > 0 else 0
+                        unrealized_profit_usd = (bid_cents - st.entry_price_cents) * st.qty / 100.0
+                        if unrealized_profit_usd > st.peak_unrealized_pnl:
+                            st.peak_unrealized_pnl = unrealized_profit_usd
+                        # Only trail if we've hit the activation threshold
+                        if st.peak_unrealized_pnl >= TRAILING_STOP_ACTIVATION_USD:
+                            trail_floor = st.peak_unrealized_pnl - TRAILING_STOP_TRAIL_USD
+                            if unrealized_profit_usd <= trail_floor:
+                                log.warning(
+                                    f"[TRAILING STOP] {st.market} | {st.side.upper()} | "
+                                    f"peak=${st.peak_unrealized_pnl:.2f} current=${unrealized_profit_usd:.2f} "
+                                    f"floor=${trail_floor:.2f} | locking in profit"
+                                )
+                                try:
+                                    trail_payload = build_order_payload(
+                                        market_ticker=st.market,
+                                        action="sell",
+                                        side=st.side,
+                                        price_cents=1,  # Market sell
+                                        count=abs(pos),
+                                        post_only=False,
+                                    )
+                                    if not DRY_RUN:
+                                        trail_oid = place_order(client, trail_payload)
+                                        log.warning(f"[TRAILING STOP] SELL placed {trail_oid}")
+                                    trail_hold = time.time() - st.entry_time if st.entry_time > 0 else 0
+                                    trail_pnl_c = (bid_cents - st.entry_price_cents) * st.qty
+                                    session.record_trade(
+                                        market=st.market, side=st.side,
+                                        entry_price=st.entry_price_cents,
+                                        exit_price=bid_cents, qty=st.qty,
+                                        pnl_cents=trail_pnl_c, was_dump=True,
+                                        hold_time_seconds=trail_hold,
+                                        exit_reason=f"TRAILING_STOP_peak_{st.peak_unrealized_pnl:.2f}",
+                                    )
+                                    st.sm = SM.DUMPED
+                                    st.side = None
+                                    st.entry_price_cents = None
+                                    st.qty = 0
+                                    st.traded_this_market = True
+                                except Exception as e:
+                                    log.warning(f"[TRAILING STOP] Failed: {e}")
+                                time.sleep(POLL_SECONDS)
+                                continue
+
                 except Exception as e:
                     log.warning(f"[STOP_LOSS] Monitor error (non-fatal): {e}")
 
@@ -3327,6 +3388,7 @@ def main() -> None:
                                                 st.qty = flip_filled  # Actual filled qty
                                                 st.peak_prob_for_side = flip_prob
                                                 st.prob_history = []  # Reset windowed peak tracking for flipped position
+                                                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracking
                                                 st.has_flipped = True
                                                 st.traded_this_market = True
                                                 if flip_filled < flip_qty:
@@ -3912,6 +3974,7 @@ def main() -> None:
                 st.qty = filled_qty  # Use actual filled qty, not intended
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracking
                 session.trades_since_boot += 1  # Cold-start counter
                 session.soft_stop_sent_for_market = None  # Reset soft stop for new position
                 if session.drawdown_resume_trades_remaining > 0:
@@ -3936,6 +3999,7 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracking
                 session.trades_since_boot += 1  # Cold-start counter
                 session.soft_stop_sent_for_market = None
                 if session.drawdown_resume_trades_remaining > 0:
@@ -3961,6 +4025,7 @@ def main() -> None:
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracking
                 resting_reason = "maker" if use_post_only else "locked_book"
                 log.warning(
                     f"[FILL] Order {oid} resting ({resting_reason}) @ {chosen_px}¢ × {qty} — "
