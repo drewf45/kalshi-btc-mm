@@ -142,6 +142,14 @@ YES_REQUIRE_BOTH_TRENDS = True  # YES must have BOTH 60-min AND 30-min BTC trend
 YES_MIN_BTC_DISTANCE = 200.0    # YES only if BTC is $200+ above floor (physically locked)
 YES_MAX_SECONDS = 60            # YES only in last 60 seconds (scalp timing — outcome decided)
 
+# -------------- ULTRA-STRICT YES GATE (4-condition simultaneous check) --------
+# YES trades should be rare but nearly guaranteed wins.
+# ALL 4 conditions must be true simultaneously or the trade is skipped.
+YES_ULTRA_MIN_PROB = 0.92       # (1) Model probability must exceed 92%
+YES_ULTRA_MIN_MOVE_PCT = 0.60   # (2) BTC must have completed 60%+ of the expected range move
+YES_ULTRA_MAX_SECONDS = 420     # (3) Fewer than 7 minutes remaining (420s)
+YES_ULTRA_MAX_SPREAD = 8        # (4) Spread to $1.00 must be ≤ 8 cents (market agrees near-certain)
+
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
@@ -1180,6 +1188,80 @@ class SM:
     DUMPED = "DUMPED"  # NEW: Position was dumped early
     ROLL = "ROLL"
     COOLDOWN = "COOLDOWN"  # Paused due to session limits
+
+
+class YesHourlyTracker:
+    """Track YES trade opportunities, skips, and outcomes per hour.
+    Prints a summary log every hour."""
+
+    def __init__(self):
+        self.current_hour: int = -1  # Will be set on first call
+        self.opportunities: int = 0
+        self.skipped: int = 0
+        self.skip_reasons: Dict[str, int] = {}  # condition_name -> count
+        self.executed: int = 0
+        self.wins: int = 0
+        self.losses: int = 0
+        self.net_pnl_usd: float = 0.0
+
+    def _maybe_rotate(self):
+        """Check if we've crossed into a new hour. If so, print summary and reset."""
+        now_hour = datetime.now(timezone.utc).hour
+        if self.current_hour == -1:
+            self.current_hour = now_hour
+            return
+        if now_hour != self.current_hour:
+            self._print_summary()
+            self._reset()
+            self.current_hour = now_hour
+
+    def record_opportunity_skipped(self, failed_conditions: List[str]):
+        """Record a YES opportunity that was skipped."""
+        self._maybe_rotate()
+        self.opportunities += 1
+        self.skipped += 1
+        for cond in failed_conditions:
+            self.skip_reasons[cond] = self.skip_reasons.get(cond, 0) + 1
+
+    def record_opportunity_executed(self):
+        """Record a YES trade that passed all gates and was placed."""
+        self._maybe_rotate()
+        self.opportunities += 1
+        self.executed += 1
+
+    def record_result(self, pnl_usd: float):
+        """Record a YES trade result (win or loss)."""
+        self._maybe_rotate()
+        if pnl_usd > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+        self.net_pnl_usd += pnl_usd
+
+    def _print_summary(self):
+        """Print hourly YES summary."""
+        if self.opportunities == 0 and self.executed == 0:
+            return
+        # Find most common skip reason
+        top_skip = "none"
+        if self.skip_reasons:
+            top_skip = max(self.skip_reasons, key=self.skip_reasons.get)
+        skip_breakdown = ", ".join(f"{k}={v}" for k, v in sorted(self.skip_reasons.items(), key=lambda x: -x[1]))
+        log.warning(
+            f"[YES HOURLY] hour={self.current_hour:02d}:00 UTC | "
+            f"opportunities={self.opportunities} skipped={self.skipped} executed={self.executed} | "
+            f"wins={self.wins} losses={self.losses} net_pnl=${self.net_pnl_usd:.2f} | "
+            f"top_skip_reason={top_skip} | breakdown: {skip_breakdown or 'none'}"
+        )
+
+    def _reset(self):
+        self.opportunities = 0
+        self.skipped = 0
+        self.skip_reasons = {}
+        self.executed = 0
+        self.wins = 0
+        self.losses = 0
+        self.net_pnl_usd = 0.0
 
 
 @dataclass
@@ -2802,6 +2884,7 @@ def main() -> None:
 
     st = BotState()
     session = SessionState()
+    yes_tracker = YesHourlyTracker()
     trend = SpotTrend()  # 60-min long-term trend
     trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
@@ -2934,6 +3017,8 @@ def main() -> None:
                             pnl_cents=pend_pnl,
                             was_dump=False,
                         )
+                        if pend_side == "yes":
+                            yes_tracker.record_result(pend_pnl / 100.0)
                         log.warning(
                             f"[SETTLE] Deferred result resolved: {st.pending_settlement_market} "
                             f"{pend_side.upper()} result={pend_result} pnl={pend_pnl}¢ "
@@ -3039,6 +3124,8 @@ def main() -> None:
                                 pnl_cents=pnl_cents,
                                 was_dump=False,
                             )
+                            if st.side == "yes":
+                                yes_tracker.record_result(pnl_cents / 100.0)
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
 
                     # Reset per-market session state (keeps daily P&L intact)
@@ -3219,6 +3306,8 @@ def main() -> None:
                                         pnl_cents=pnl_cents,
                                         was_dump=True,
                                     )
+                                    if st.side == "yes":
+                                        yes_tracker.record_result(pnl_cents / 100.0)
                                 except Exception as e:
                                     log.warning(f"[BAIL] P&L recording failed (non-fatal): {e}")
 
@@ -3781,27 +3870,68 @@ def main() -> None:
                 log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
 
         # =============================================================
-        # === YES "PHYSICALLY LOCKED" GATE ===
-        # YES is net negative in ALL 4 sessions. The prob model is miscalibrated
-        # for YES — says 95% but true win rate is <88%.
-        # Don't trust the model. Only allow YES when the outcome is physically
-        # impossible to reverse: BTC $200+ from strike, <60s left, both trends up.
-        # This turns YES into a rare scalp-like bonus, not a regular entry.
+        # === YES ULTRA-STRICT GATE (4-condition simultaneous check) ===
+        # YES trades should be rare but nearly guaranteed wins.
+        # ALL 4 conditions must be true simultaneously:
+        #   1. Probability > 92%
+        #   2. Price move completed >= 60% of range
+        #   3. Less than 7 minutes remaining
+        #   4. Spread to $1.00 <= 8 cents
+        # Plus all existing physical-lock gates (daytime, trends, distance, vol).
         # =============================================================
         if chosen_side == "yes" and not YES_ONLY:
+            # Compute the 4 ultra-strict conditions
+            _yes_prob = current_prob_for_side
+            _yes_spread = 100 - int(chosen_px)  # cents between YES price and $1.00
+            _yes_mins_remaining = secs_to_close / 60.0 if secs_to_close else 99.0
+
+            # Price move % completed: how far BTC is through the range toward YES
+            # YES wins when spot > lo. Range = hi - lo. Move = spot - lo.
+            _yes_range = (hi - lo) if (lo is not None and hi is not None and hi > lo) else 1.0
+            _yes_move = (spot - lo) if lo is not None else 0.0
+            _yes_move_pct = _yes_move / _yes_range if _yes_range > 0 else 0.0
+            _yes_move_pct = max(0.0, min(1.0, _yes_move_pct))
+
+            # Evaluate all 4 conditions
+            _yes_failed = []
+            if _yes_prob < YES_ULTRA_MIN_PROB:
+                _yes_failed.append("prob")
+            if _yes_move_pct < YES_ULTRA_MIN_MOVE_PCT:
+                _yes_failed.append("move_pct")
+            if secs_to_close > YES_ULTRA_MAX_SECONDS:
+                _yes_failed.append("time")
+            if _yes_spread > YES_ULTRA_MAX_SPREAD:
+                _yes_failed.append("spread")
+
+            # If ANY condition fails, skip and log
+            if _yes_failed:
+                log.warning(
+                    f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                    f"market_id={st.market} confidence={_yes_prob:.1%} "
+                    f"price_move_pct={_yes_move_pct:.1%} "
+                    f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                    f"which_condition_failed={','.join(_yes_failed)}"
+                )
+                yes_tracker.record_opportunity_skipped(_yes_failed)
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # --- All 4 ultra-strict conditions passed. Now run physical-lock gates. ---
+
             # Gate -1: Daytime block — YES disabled 8am-8pm EST (bleeds during daytime)
             if YES_DAYTIME_DISABLED:
                 try:
                     est_now = datetime.now(ZoneInfo(YES_DAYTIME_TIMEZONE))
                     est_hour = est_now.hour
                     if YES_DAYTIME_START_HOUR <= est_hour < YES_DAYTIME_END_HOUR:
-                        if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                            log.info(
-                                f"[YES DAYTIME] BLOCKED — {est_hour}:00 EST is daytime "
-                                f"({YES_DAYTIME_START_HOUR}:00-{YES_DAYTIME_END_HOUR}:00). "
-                                f"YES only allowed overnight."
-                            )
-                            last_state_log = now
+                        log.warning(
+                            f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                            f"market_id={st.market} confidence={_yes_prob:.1%} "
+                            f"price_move_pct={_yes_move_pct:.1%} "
+                            f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                            f"which_condition_failed=daytime_block"
+                        )
+                        yes_tracker.record_opportunity_skipped(["daytime_block"])
                         time.sleep(POLL_SECONDS)
                         continue
                 except Exception as e:
@@ -3809,12 +3939,14 @@ def main() -> None:
 
             # Gate 0: Time — YES only in the last 60 seconds (outcome must be decided)
             if secs_to_close is not None and secs_to_close > YES_MAX_SECONDS:
-                if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                    log.info(
-                        f"[YES LOCKED] BLOCKED — {secs_to_close}s left > {YES_MAX_SECONDS}s max "
-                        f"(YES only fires in last {YES_MAX_SECONDS}s)"
-                    )
-                    last_state_log = now
+                log.warning(
+                    f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                    f"market_id={st.market} confidence={_yes_prob:.1%} "
+                    f"price_move_pct={_yes_move_pct:.1%} "
+                    f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                    f"which_condition_failed=time_lock_60s"
+                )
+                yes_tracker.record_opportunity_skipped(["time_lock_60s"])
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -3824,9 +3956,14 @@ def main() -> None:
                 alignment_30 = trend_short.trade_alignment("yes", lo, hi, spot)
                 if alignment_60 != "with" or alignment_30 != "with":
                     log.warning(
-                        f"[YES LOCKED] BLOCKED — need BOTH trends 'with', got "
+                        f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                        f"market_id={st.market} confidence={_yes_prob:.1%} "
+                        f"price_move_pct={_yes_move_pct:.1%} "
+                        f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                        f"which_condition_failed=trend_alignment "
                         f"60m={alignment_60} 30m={alignment_30}"
                     )
+                    yes_tracker.record_opportunity_skipped(["trend_alignment"])
                     time.sleep(POLL_SECONDS)
                     continue
 
@@ -3836,9 +3973,14 @@ def main() -> None:
                 btc_above_floor = spot - lo
                 if btc_above_floor < YES_MIN_BTC_DISTANCE:
                     log.warning(
-                        f"[YES LOCKED] BLOCKED — BTC ${spot:.0f} only ${btc_above_floor:.0f} above "
-                        f"floor ${lo:.0f} (need ${YES_MIN_BTC_DISTANCE:.0f}+)"
+                        f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                        f"market_id={st.market} confidence={_yes_prob:.1%} "
+                        f"price_move_pct={_yes_move_pct:.1%} "
+                        f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                        f"which_condition_failed=btc_distance "
+                        f"dist=${btc_above_floor:.0f} need=${YES_MIN_BTC_DISTANCE:.0f}"
                     )
+                    yes_tracker.record_opportunity_skipped(["btc_distance"])
                     time.sleep(POLL_SECONDS)
                     continue
 
@@ -3847,16 +3989,26 @@ def main() -> None:
             max_move = 3.0 * sigma_now * math.sqrt(float(secs_to_close))  # 3σ = 99.7% of moves
             if lo is not None and btc_above_floor < max_move:
                 log.warning(
-                    f"[YES LOCKED] BLOCKED — BTC dist ${btc_above_floor:.0f} < 3σ√t=${max_move:.0f} "
-                    f"(σ={sigma_now:.1f}, t={secs_to_close}s) — reversal still possible"
+                    f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                    f"market_id={st.market} confidence={_yes_prob:.1%} "
+                    f"price_move_pct={_yes_move_pct:.1%} "
+                    f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                    f"which_condition_failed=volatility "
+                    f"dist=${btc_above_floor:.0f} 3σ√t=${max_move:.0f}"
                 )
+                yes_tracker.record_opportunity_skipped(["volatility"])
                 time.sleep(POLL_SECONDS)
                 continue
 
+            # ALL GATES PASSED — record and log
+            yes_tracker.record_opportunity_executed()
             log.warning(
-                f"[YES LOCKED] ALL GATES PASSED — YES entry approved "
-                f"(t={secs_to_close}s prob={current_prob_for_side:.1%} edge={edge_yes:.4f} "
-                f"price={chosen_px}¢ btc_dist=${btc_above_floor:.0f} 3σ√t=${max_move:.0f})"
+                f"[YES ULTRA PASS] ALL GATES PASSED — YES entry approved | "
+                f"timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                f"market_id={st.market} confidence={_yes_prob:.1%} "
+                f"price_move_pct={_yes_move_pct:.1%} "
+                f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                f"btc_dist=${btc_above_floor:.0f} 3σ√t=${max_move:.0f}"
             )
 
         # Check session limits before trading
