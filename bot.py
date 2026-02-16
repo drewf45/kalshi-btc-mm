@@ -223,6 +223,12 @@ KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
+
+# -------------- PORTFOLIO RISK CAP (2% per trade) --------------------------------
+# Before placing any trade, max_risk = portfolio_balance × 0.02.
+# Number of contracts must not result in potential loss exceeding max_risk.
+# If Kelly suggests larger, cap at max_risk. Overrides Kelly when needed.
+PORTFOLIO_MAX_RISK_FRACTION = 0.02  # 2% of portfolio balance = max risk per trade
 # Legacy constants (kept for backward compat in safety checks)
 BASE_CONTRACTS = 3
 CONTRACT_INCREMENT = 1
@@ -280,10 +286,10 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 # -------------- HARD DOLLAR STOP-LOSS (absolute max loss per trade, no exceptions) -----
 # This fires FIRST, before grace period, before BTC check, before everything.
 # If a trade is losing more than this dollar amount, GET OUT. Period.
-# At 72.5% win rate with ~$0.05 avg win, $0.75 loss = 15 wins erased.
-# Cutting to $0.50 means one loss erases ~10 wins. Still not great but survivable.
-HARD_STOP_LOSS_USD = 1.00  # Absolute max dollar loss per trade — no BTC check, no grace period
-SOFT_STOP_LOSS_USD = 0.75  # Soft stop: at -$0.75 unrealized, start trying to exit with limit sell
+# $0.40 hard cap: at 70%+ WR with $0.10-0.15 avg win, one $0.40 loss = ~3 wins erased.
+# Never allow a single trade to lose more than $0.40 under any circumstances.
+HARD_STOP_LOSS_USD = 0.40  # Absolute max dollar loss per trade — overrides all other exit logic
+SOFT_STOP_LOSS_USD = 0.30  # Soft stop: at -$0.30 unrealized, immediately market-sell to exit
 
 # -------------- YES TIME-OF-DAY RESTRICTION ---------------------------------
 # YES is net negative in 5/6 sessions. Only profitable session was overnight.
@@ -346,12 +352,26 @@ NUKE_MAX_WINS_ERASED = 5  # One loss should never wipe more than 5 winning trade
 # NO signal can result in too many contracts. Hard ceiling prevents that.
 MAX_NO_CONTRACTS = 5  # Hard cap on NO contracts regardless of Kelly output
 
+# -------------- BTC-SPECIFIC SIDE ADJUSTMENTS --------------------------------
+# YES has excessive losses — reduce YES position size by 50%.
+# NO is entering at insufficient confidence — raise minimum to 85%.
+YES_POSITION_SIZE_MULT = 0.50    # Multiply all YES position sizes by 0.5
+NO_MIN_CONFIDENCE = 0.85         # NO side requires 85% minimum confidence
+
 # -------------- TRAILING STOP ON WINNERS --------------------------------------
 # Too many BTC trades go to +$0.30-$0.50 then give it all back at settlement.
 # Once up $0.15, trail $0.10 below peak unrealized P&L. Lock in gains.
 TRAILING_STOP_ENABLED = True
 TRAILING_STOP_ACTIVATE_USD = 0.15  # Activate once unrealized P&L hits +$0.15
 TRAILING_STOP_TRAIL_USD = 0.10     # Exit if P&L drops $0.10 below peak
+
+# -------------- PORTFOLIO MILESTONE TRACKING ----------------------------------
+# Track portfolio balance after every trade. Log milestones at every $5 increment.
+# After $100, log profit cap hit and suggest withdrawing above $100.
+MILESTONE_ENABLED = True
+MILESTONE_INCREMENT = 5.0          # Log milestone every $5
+MILESTONE_START = 30.0             # First milestone at $30
+MILESTONE_PROFIT_CAP = 100.0      # Above $100, withdraw all excess
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -1194,6 +1214,9 @@ class SessionState:
     drawdown_resume_at: float = 0.0
     drawdown_reduced_trades: int = 0  # Count of trades at reduced size after drawdown
 
+    # Milestone tracking
+    next_milestone: float = MILESTONE_START  # Next milestone to log
+
     # Balance refresh
     pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
 
@@ -1203,6 +1226,16 @@ class SessionState:
     def __post_init__(self):
         if self.recent_trades is None:
             self.recent_trades = []
+
+    def init_milestones(self, balance: float):
+        """Set next_milestone to the first $5 increment above current balance."""
+        if MILESTONE_ENABLED and balance > 0:
+            # Find the next $5 milestone above current balance
+            self.next_milestone = (int(balance / MILESTONE_INCREMENT) + 1) * MILESTONE_INCREMENT
+            log.info(
+                f"[MILESTONE] Initialized: balance=${balance:.2f} "
+                f"next_milestone=${self.next_milestone:.0f}"
+            )
 
     def reset_for_new_market(self):
         """Reset per-market state on each market roll. Daily state persists.
@@ -1288,6 +1321,39 @@ class SessionState:
             f"bankroll=${self.current_balance_usd:.2f} "
             f"W/L={self.total_wins}/{self.total_losses} "
             f"streak={self.consecutive_wins}W/{self.consecutive_losses}L"
+        )
+
+        # Portfolio milestone tracking
+        self._check_milestones()
+
+    def _check_milestones(self):
+        """Track portfolio milestones at every $5 increment. Log withdrawal suggestions."""
+        if not MILESTONE_ENABLED:
+            return
+        bal = self.current_balance_usd
+
+        # Check if we crossed a milestone
+        while bal >= self.next_milestone:
+            log.warning(
+                f"[MILESTONE_HIT] ${self.next_milestone:.0f} — withdraw $1 | "
+                f"balance=${bal:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
+                f"W/L={self.total_wins}/{self.total_losses}"
+            )
+            self.next_milestone += MILESTONE_INCREMENT
+
+        # Profit cap: above $100, withdraw all excess
+        if bal >= MILESTONE_PROFIT_CAP:
+            excess = bal - MILESTONE_PROFIT_CAP
+            log.warning(
+                f"[PROFIT_CAP_HIT] withdraw all above ${MILESTONE_PROFIT_CAP:.0f} "
+                f"(excess=${excess:.2f}) | balance=${bal:.2f}"
+            )
+
+        # Log distance to next milestone after every trade
+        distance = self.next_milestone - bal
+        log.info(
+            f"[MILESTONE] balance=${bal:.2f} next_milestone=${self.next_milestone:.0f} "
+            f"distance_to_milestone=${distance:.2f}"
         )
 
     def _scale_up(self):
@@ -2044,15 +2110,28 @@ def should_dump_position(
         _hs_method = "bid" if _hs_loss_bid >= _hs_loss_prob else "prob"
         _hs_exit_used = _hs_exit_bid if _hs_method == "bid" else _hs_exit_prob
 
-        # SOFT STOP: at -$0.75, start exiting (logged as soft_stop for tracking)
+        # HARD STOP: at $0.40 unrealized loss, immediately market-sell.
+        # This overrides ALL other sizing and exit logic. No exceptions.
+        if _hs_total_loss >= HARD_STOP_LOSS_USD:
+            log.warning(
+                f"[STOP_LOSS_HIT] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                f"market_id={st.market} entry_price={st.entry_price_cents}¢ "
+                f"exit_price={_hs_exit_used}¢ loss_amount=${_hs_total_loss:.2f} "
+                f"reason=STOP_LOSS_HIT | method={_hs_method} qty={st.qty} "
+                f"loss_bid=${_hs_loss_bid:.2f} loss_prob=${_hs_loss_prob:.2f}"
+            )
+            return True, f"STOP_LOSS_HIT_${_hs_total_loss:.2f}>=${HARD_STOP_LOSS_USD:.2f}"
+
+        # SOFT STOP: at $0.30 unrealized loss, start exiting.
         if _hs_total_loss >= SOFT_STOP_LOSS_USD:
             log.warning(
-                f"[SOFT STOP] losing ${_hs_total_loss:.2f} >= ${SOFT_STOP_LOSS_USD:.2f} soft cap — "
-                f"EXIT (entry={st.entry_price_cents}¢ exit_{_hs_method}={_hs_exit_used}¢ "
-                f"loss_bid=${_hs_loss_bid:.2f} loss_prob=${_hs_loss_prob:.2f} "
-                f"× {st.qty}ct) — exiting before hard stop"
+                f"[STOP_LOSS_HIT] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+                f"market_id={st.market} entry_price={st.entry_price_cents}¢ "
+                f"exit_price={_hs_exit_used}¢ loss_amount=${_hs_total_loss:.2f} "
+                f"reason=SOFT_STOP | method={_hs_method} qty={st.qty} "
+                f"loss_bid=${_hs_loss_bid:.2f} loss_prob=${_hs_loss_prob:.2f}"
             )
-            return True, f"soft_stop_${_hs_total_loss:.2f}>=${SOFT_STOP_LOSS_USD:.2f}"
+            return True, f"SOFT_STOP_${_hs_total_loss:.2f}>=${SOFT_STOP_LOSS_USD:.2f}"
 
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
@@ -2361,6 +2440,21 @@ def compute_qty_from_bankroll(
 
     # Convert fraction to contract count
     target_qty = int(available_usd * fraction / cost_per)
+
+    # PORTFOLIO RISK CAP: max_risk = portfolio_balance × 2%. Cap contracts so
+    # potential loss (entry_cost × qty) never exceeds max_risk.
+    if cost_per > 0 and available_usd > 0:
+        max_risk_usd = available_usd * PORTFOLIO_MAX_RISK_FRACTION
+        max_qty_risk = int(max_risk_usd / cost_per)
+        if max_qty_risk < MIN_CONTRACTS:
+            max_qty_risk = MIN_CONTRACTS
+        if target_qty > max_qty_risk:
+            log.warning(
+                f"[SIZE] PORTFOLIO_RISK_CAP: suggested={target_qty} capped={max_qty_risk} "
+                f"portfolio_balance=${available_usd:.2f} max_risk=${max_risk_usd:.2f} "
+                f"({PORTFOLIO_MAX_RISK_FRACTION:.0%} of balance) entry={entry_cents}¢"
+            )
+            target_qty = max_qty_risk
 
     # SETTLEMENT LOSS CAP: worst case = lose entire entry cost at settlement.
     # Cap so that worst-case loss never exceeds MAX_SETTLEMENT_LOSS_FRACTION of balance.
@@ -2720,6 +2814,7 @@ def main() -> None:
             session.starting_balance_usd = av
             session.current_balance_usd = av
             session.daily_pnl_usd = 0.0
+            session.init_milestones(av)
             log.warning(f"[SESSION] Starting balance: ${av:.2f} (75% hard stop at ${av * 0.25:.2f})")
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
@@ -3179,11 +3274,23 @@ def main() -> None:
                                         except Exception:
                                             flip_qty = MIN_CONTRACTS
 
+                                        # BTC adjustments on flip: YES ×0.5, NO confidence check
+                                        if flip_side == "yes" and YES_POSITION_SIZE_MULT < 1.0:
+                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * YES_POSITION_SIZE_MULT))
+                                        if flip_side == "no" and flip_prob < NO_MIN_CONFIDENCE:
+                                            log.warning(f"[FLIP] SKIP NO flip — confidence {flip_prob:.1%} < {NO_MIN_CONFIDENCE:.0%}")
+                                            flip_qty = 0  # Block the flip
                                         # NO cap + universal validation on flip
                                         if flip_side == "no" and flip_qty > MAX_NO_CONTRACTS:
                                             flip_qty = MAX_NO_CONTRACTS
-                                        flip_qty = validate_position_size(flip_side, int(flip_price), flip_qty)
+                                        if flip_qty > 0:
+                                            flip_qty = validate_position_size(flip_side, int(flip_price), flip_qty)
 
+                                        if flip_qty <= 0:
+                                            log.warning(f"[FLIP] Skipped — qty=0 after adjustments")
+                                            can_flip = False
+
+                                    if can_flip:
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
@@ -3778,20 +3885,45 @@ def main() -> None:
             edge_net = float(edge_no)
             p_gate = float(p_no_blend)
 
-        qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+        raw_qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+        qty = raw_qty
+        adjustment_reason = "none"
+
+        # BTC-SPECIFIC: NO side requires 85% minimum confidence.
+        if chosen_side == "no" and p_gate < NO_MIN_CONFIDENCE:
+            log.warning(
+                f"[BTC ADJ] SKIP NO — confidence {p_gate:.1%} < {NO_MIN_CONFIDENCE:.0%} min | "
+                f"side={chosen_side} price={chosen_px}¢ raw_size={raw_qty}"
+            )
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # BTC-SPECIFIC: YES position sizing reduced by 50%.
+        if chosen_side == "yes" and YES_POSITION_SIZE_MULT < 1.0:
+            qty = max(MIN_CONTRACTS, int(qty * YES_POSITION_SIZE_MULT))
+            adjustment_reason = f"YES_SIZE_MULT={YES_POSITION_SIZE_MULT}"
 
         # NO-SIDE CONTRACT CEILING: 5 of 6 BTC blowups were NO side.
         # Hard cap regardless of Kelly output.
         if chosen_side == "no" and qty > MAX_NO_CONTRACTS:
-            log.warning(
-                f"[NO CAP] Capping NO qty {qty} -> {MAX_NO_CONTRACTS} "
-                f"(hard ceiling for BTC NO side)"
-            )
             qty = MAX_NO_CONTRACTS
+            adjustment_reason = f"NO_CAP={MAX_NO_CONTRACTS}"
 
         # UNIVERSAL VALIDATION: absolute last gate before order.
         # Makes blowups physically impossible even if all upstream sizing has bugs.
+        pre_validate_qty = qty
         qty = validate_position_size(chosen_side, int(chosen_px), qty)
+        if qty < pre_validate_qty:
+            adjustment_reason = f"VALIDATE_CAP={qty}"
+
+        # BTC-SPECIFIC LOGGING: show side, confidence, raw and adjusted sizes.
+        log.warning(
+            f"[BTC ADJ] side={chosen_side.upper()} confidence={p_gate:.1%} "
+            f"raw_position_size={raw_qty} adjusted_position_size={qty} "
+            f"reason={adjustment_reason} edge={edge_net:.4f} "
+            f"price={chosen_px}¢ bankroll=${available_usd:.2f}"
+        )
 
         # Apply drawdown size multiplier if recovering from drawdown pause
         dd_mult = session.get_drawdown_size_multiplier()
