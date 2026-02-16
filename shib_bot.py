@@ -152,9 +152,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.90  # 90%+ to enter — must have real conviction, not marginal
-EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penny edges
-MAX_ENTRY_PRICE_CENTS = 85  # At 85¢ entry, gain 15¢/win — need ~6 wins per loss (was 96¢ = needed 24:1)
+PROB_MIN = 0.95  # 95%+ to enter — maximum conviction only, no marginal trades
+EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing
+MAX_ENTRY_PRICE_CENTS = 85  # At 85¢ entry, gain 15¢/win — need ~6 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 25-min buy window) --------
@@ -162,10 +162,10 @@ FEE_CENTS_PER_CONTRACT = 0
 # of the buy window (SHIB still has time to move), relax near the end.
 # NOTE: observation phase (40min → 25min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 900   # 15-25 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.93            # >15min: need 93%+ — SHIB has time to move (was 90%)
+PROB_EARLY_MIN = 0.97            # >15min: need 97%+ — SHIB has time to move, near-certain only
 PROB_MID_ENTRY_SECONDS = 480     # 8-15 min to close = "mid"
-PROB_MID_MIN = 0.91              # 8-15min: need 91%+ (was 86% — let too many losers through)
-# <8 min = PROB_MIN (0.90) — market has priced in the outcome, still need conviction
+PROB_MID_MIN = 0.96              # 8-15min: need 96%+ — still need very high conviction
+# <8 min = PROB_MIN (0.95) — maximum conviction required at all times
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -173,16 +173,16 @@ PROB_MID_MIN = 0.91              # 8-15min: need 91%+ (was 86% — let too many 
 PROB_TREND_WINDOW_SECONDS = 180   # Look at last 180 seconds of probability (wider for hourly)
 PROB_TREND_MIN_SAMPLES = 10       # Need at least 10 samples (~100s at 1/sec)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
-PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
-PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
+PROB_TREND_MIN_CURRENT = 0.95     # Current prob must be ≥95% for trend-based entries (was 80%)
+PROB_TREND_ENTRY_ENABLED = False  # DISABLED — no borderline trend-based entries, max conviction only
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match SHIB spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
 # Rationale: 90%+ prob means SHIB is well inside the range. The outcome is decisive.
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<8 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.93   # ≥93% prob = buy immediately, no trend check needed (was 90%)
-PROB_FAST_LANE_LATE_THRESHOLD = 0.90  # ≥90% prob in last 8 min = fast lane (was 85% — too loose)
+PROB_FAST_LANE_THRESHOLD = 0.97   # ≥97% prob = buy immediately, no trend check needed
+PROB_FAST_LANE_LATE_THRESHOLD = 0.95  # ≥95% prob in last 8 min = fast lane
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-1500s.
@@ -246,7 +246,7 @@ ENABLE_DUMP = True
 # Philosophy: we entered with high conviction and hold to close. Bail ONLY if
 # SHIB has actually moved against us AND the book confirms it. A book spike
 # while SHIB is on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.70  # Floor: if prob drops to 70% AND SHIB confirms, bail (was 60% — too late, losses compound fast)
+DUMP_PROB_FLIP = 0.80  # Floor: if prob drops to 80% AND SHIB confirms, bail (entered at 95%+, 80% means something is very wrong)
 DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
 DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
 DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
@@ -412,24 +412,25 @@ BANKROLL_FRACTION_HARD_CAP = env_float("BANKROLL_FRACTION_HARD_CAP", 0.50)  # Al
 EDGE_SIZE_START = env_float("EDGE_SIZE_START", 0.015)  # Start scaling earlier
 EDGE_SIZE_SLOPE = env_float("EDGE_SIZE_SLOPE", 3.0)  # Steeper scaling
 
-A_PLUS_PROB = env_float("A_PLUS_PROB", 0.90)  # A+ = extremely certain outcome
-A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = even small edge at 90%+ prob is golden
-A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Go big — 90%+ prob is as sure as it gets
+A_PLUS_PROB = env_float("A_PLUS_PROB", 0.97)  # A+ = near-certain outcome only (was 90%)
+A_PLUS_EDGE = env_float("A_PLUS_EDGE", 0.03)  # A+ = still need 3% edge
+A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # Size up when truly certain
 
-HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
+HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.97)  # Must match top threshold (was 95% — too low)
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
-HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
+HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 85)  # Match main cap (was 99¢)
 
-# SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
-# conservative BS estimate against market price.  With <2 min left the market
-# price IS the probability.  If blend prob is high, buy even with thin/no edge.
-SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 480)    # Last 8 min only — earlier window still needs trend/prob checks (scaled for hourly)
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # blend prob — lower bar, EV cap (price ≤ prob) is the real protection
-SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 99)   # edge = settlement
-SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
+# SETTLEMENT LOCK: near expiry override.
+# NEUTERED — was the #1 blowup path: 85% prob at 99¢ = -14¢/contract EV.
+# Now requires SAME conviction as normal entry (95%+) and same price cap (85¢).
+# This effectively makes it a no-op — which is the point.  No backdoors.
+SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 480)
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.95)  # Match PROB_MIN — no free passes (was 85%)
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 85)    # Match MAX_ENTRY_PRICE_CENTS — no 99¢ entries (was 99)
+SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 95)       # Locked book: only join at 95¢+ bid (was 90¢)
 
-LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 60)  # Last chance window wider for hourly
-LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 60)
+LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.95)  # Match PROB_MIN (was 85%)
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 0.0000002)  # ~1% of SHIB price — SHIB-aware bail is the real safety net during hold
 LATE_ENTRY_PROB_BOOST = env_float("LATE_ENTRY_PROB_BOOST", 0.0)  # No boost — EV price cap is the real protection
@@ -1706,7 +1707,7 @@ def choose_trade(
     # is nearly useless at >5 min (σ√t > boundary gap → 50/50), but the market has
     # already priced the outcome.  This prevents the model from blocking trades the
     # orderbook clearly supports.
-    MARKET_CONVICTION_THRESHOLD = 0.85
+    MARKET_CONVICTION_THRESHOLD = 0.95  # Only trust market when it agrees with max conviction (was 85%)
     if p_mkt is not None and secs_to_close <= BUY_START_SECONDS:
         p_yes_mkt = float(p_mkt)
         p_no_mkt = 1.0 - p_yes_mkt
@@ -3924,7 +3925,7 @@ def main() -> None:
         # Getting filled is worth more than saving maker/taker spread.
         # Not participating costs 100% of the edge; crossing the spread costs 1-2¢.
         # TIME-DEPENDENT: require higher prob for taker early (avoid crossing spread on uncertain signals)
-        taker_prob_thresh = 0.90 if secs_to_close > SETTLEMENT_LOCK_SECONDS else 0.85
+        taker_prob_thresh = 0.95  # Same as entry — no takers at lower conviction
         if p_gate >= taker_prob_thresh:
             use_post_only = False
             log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ {taker_prob_thresh:.0%}, fills > maker savings")
