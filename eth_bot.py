@@ -10,23 +10,18 @@
 # - Dump is ABORT ONLY — safety net, not a regular exit
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
-# KEY SETTINGS (v8 — 10-session optimization):
-# - YES RE-ENABLED with 150% CONVICTION MULTIPLIER: 0-for-9 lifetime, -$3.44.
-#   Not disabled — but must clear 150% of normal conviction to enter.
-#   Prob floors: 95% late, 99% mid/early + 8% edge + 75¢ max + trend aligned.
-#   Only fires on absolute slam dunks in the last ~3 minutes.
-# - HARD $1.00 MAX LOSS PER TRADE — 3 layers of enforcement:
-#   1) Entry sizing: max_possible_loss capped at $1.00 before order placed
-#   2) Dump trigger: loss calc uses worst-of(model, market bid) — no blind spots
-#   3) Independent pre-order gate: both sides use entry_price × qty (NO bug fixed)
+# KEY SETTINGS (v9 — universal stop-loss + YES disabled + milestones):
+# - YES DISABLED: -$5.46 lifetime, 0-for-13. NO_ONLY=True. Phantom logging active.
+# - HARD $0.40 MAX LOSS PER TRADE — 3 layers of enforcement:
+#   1) Entry sizing: max_risk = min(2% of portfolio, $0.40) before order placed
+#   2) Dump trigger: $0.40 hard cap, 15¢/contract catastrophic, 8¢/contract hard stop
+#   3) Independent pre-order gate: entry_price × qty ≤ $0.40 (both sides)
+# - 2% PORTFOLIO POSITION SIZE CAP: max_risk = balance × 0.02, never exceeds $0.40
+# - PORTFOLIO MILESTONES: track $5 increments from $30, log withdraw advice
 # - NO VOLUME BOOST: prob thresholds lowered 5 points (75% late, 78% mid, 82% early)
-#   ETH NO is 73% WR at 2-4 trades/session — more trades at this WR = more profit.
 # - MIN TAKE-PROFIT HOLD: don't dump profitable positions below $0.08 with >2min left
 # - HOLD WINNERS: reversal bail only fires on LOSING positions (not profitable ones)
-#   Avg win was $0.06 because 4% reversal threshold killed every winner.
-#   Now 10-12% threshold, and profitable positions hold to settlement.
 # - NO SIDE: prob 75-82% (loosened), 2% edge, 93¢ max, Kelly=0.25
-# - YES SIDE: 150% conviction (95% late / 99% mid+early), 8% edge, 75¢ max, Kelly=0.10, trend-aligned
 # - ROLLING DRAWDOWN: -$3 in 2hr → pause 30min, resume at 50% for 3 trades
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
 #
@@ -142,22 +137,17 @@ DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
-NO_ONLY = env_bool("NO_ONLY", False)     # Both sides enabled — YES gated by 150% conviction multiplier
-# YES RE-ENABLED with 150% CONVICTION MULTIPLIER (v8):
-# YES was 0-for-9, -$3.44 lifetime, -$2.02 in last 4 trades. Not disabled — but
-# must clear 150% of normal conviction to enter. The multiplier scales the
-# "distance from coin-flip" so YES probability floors are:
-#   Late  (<3 min): 80% normal → 95% for YES
-#   Mid  (3-5 min): 83% normal → 99% for YES (practically impossible)
-#   Early (5-7 min): 87% normal → 99% for YES (practically impossible)
-# Net effect: YES can only fire in the last ~3 min on absolute slam dunks.
-# Combined with 8% edge, 75¢ max price, trend alignment, and 10% Kelly,
-# this means YES only enters when the model is screaming certainty.
-YES_CONVICTION_MULTIPLIER = 1.50         # YES needs 150% of normal conviction (distance from 50%)
-YES_EDGE_MIN = 0.08                      # 8% edge minimum (vs 2% for NO) — 4x normal
-YES_MAX_ENTRY_PRICE_CENTS = 75           # 75¢ max (vs 93¢ for NO) — cheap entries only
-YES_KELLY_MULTIPLIER = 0.10              # 10% of Kelly sizing (vs 25% for NO) — tiny positions
-YES_REQUIRE_TREND_ALIGNED = True         # All trends must be WITH the trade — no exceptions
+NO_ONLY = env_bool("NO_ONLY", True)      # YES DISABLED — net negative across all sessions, 0-for-13
+# YES DISABLED (v9): -$5.46 lifetime on YES, 0 wins in last 13 YES trades.
+# The YES side has been net negative in EVERY analysis window. Burning money.
+# NO_ONLY=True hard-blocks all YES entries. Phantom logging tracks what YES
+# WOULD have done so we can evaluate whether to re-enable after backtesting.
+# The 150% conviction gates are kept in code for when/if YES is re-enabled.
+YES_CONVICTION_MULTIPLIER = 1.50         # YES needs 150% of normal conviction (kept for future re-enable)
+YES_EDGE_MIN = 0.08                      # 8% edge minimum (vs 2% for NO) — kept for future re-enable
+YES_MAX_ENTRY_PRICE_CENTS = 75           # 75¢ max (vs 93¢ for NO) — kept for future re-enable
+YES_KELLY_MULTIPLIER = 0.10              # 10% of Kelly sizing (vs 25% for NO) — kept for future re-enable
+YES_REQUIRE_TREND_ALIGNED = True         # All trends must be WITH the trade — kept for future re-enable
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -314,25 +304,26 @@ MIN_TAKE_PROFIT_TIME_REMAINING = 120      # Only apply the hold if >2 min remain
 # Never lose more than X% of current balance on a single trade.
 # At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss
-DUMP_MAX_LOSS_USD = 1.00                  # HARD $1.00 CAP — absolute max loss per trade regardless of balance
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.02  # 2% of current balance = max single-trade loss (was 3% — tighter cap)
+DUMP_MAX_LOSS_USD = 0.40                  # HARD $0.40 CAP — absolute max loss per trade regardless of balance
+# 10-session analysis: 13 blowups totaling -$39.37. $1.00 cap wasn't tight enough.
+# $0.40 makes blowups physically survivable — need <3 wins to recover each loss.
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.04  # Max 4% of balance at risk per trade (was 8% — $4.30 blowup)
+MAX_SETTLEMENT_LOSS_FRACTION = 0.02  # Max 2% of balance at risk per trade (was 4% — tighter for $0.40 cap)
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
 DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
 
 # -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after ETH check (was 15¢ — tighter to salvage more)
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 8   # Hard stop after ETH check (was 10¢ — tighter for $0.40 cap)
 # CATASTROPHIC STOP: fires BEFORE ETH check — absolute max loss regardless of anything
-# Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
-DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
+DUMP_CATASTROPHIC_LOSS_CENTS = 15      # If losing >15¢/contract, bail no matter what (was 20¢ — tighter for $0.40 cap)
 
 # -------------- WINDOWED PEAK TRACKING (avoid false reversals from book spikes) -----
 # All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
@@ -1184,6 +1175,10 @@ class SessionState:
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
 
+    # Portfolio milestone tracking ($5 increments from $30)
+    next_milestone_usd: float = 30.0       # Next milestone to hit
+    last_milestone_hit_usd: float = 0.0    # Last milestone crossed
+
     def __post_init__(self):
         if self.recent_trades is None:
             self.recent_trades = []
@@ -1269,11 +1264,15 @@ class SessionState:
         # Schedule balance check to get true P&L
         self.schedule_balance_check()
 
+        # Check portfolio milestones
+        self._check_milestones()
+
         log.warning(
             f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
             f"bankroll=${self.current_balance_usd:.2f} "
             f"W/L={self.total_wins}/{self.total_losses} "
-            f"streak={self.consecutive_wins}W/{self.consecutive_losses}L"
+            f"streak={self.consecutive_wins}W/{self.consecutive_losses}L "
+            f"distance_to_milestone=${self.next_milestone_usd - self.current_balance_usd:.2f}"
         )
 
     def _scale_up(self):
@@ -1298,6 +1297,35 @@ class SessionState:
                 f"(${self.starting_balance_usd:.2f} -> ${self.current_balance_usd:.2f}). "
                 f"Bot will NOT trade until restart."
             )
+
+    def _check_milestones(self):
+        """Portfolio milestone tracking: $5 increments from $30.
+        When balance crosses a milestone, log it and advance to the next one.
+        After $100, log profit cap hit."""
+        bal = self.current_balance_usd
+        if bal <= 0:
+            return
+        # Check if we crossed the next milestone
+        while bal >= self.next_milestone_usd:
+            self.last_milestone_hit_usd = self.next_milestone_usd
+            if self.next_milestone_usd >= 100.0:
+                log.warning(
+                    f"[PROFIT_CAP_HIT] Portfolio ${bal:.2f} >= $100 — "
+                    f"withdraw all above $100 (excess=${bal - 100:.2f})"
+                )
+            else:
+                log.warning(
+                    f"[MILESTONE_HIT] ${self.next_milestone_usd:.0f} — "
+                    f"withdraw $1 (balance=${bal:.2f} "
+                    f"daily_pnl=${self.daily_pnl_usd:.2f})"
+                )
+            self.next_milestone_usd += 5.0
+        # Log distance to next milestone
+        distance = self.next_milestone_usd - bal
+        log.info(
+            f"[MILESTONE] balance=${bal:.2f} next=${self.next_milestone_usd:.0f} "
+            f"distance_to_milestone=${distance:.2f}"
+        )
 
     def _check_consecutive_limit(self):
         """After N consecutive losses, skip 1 market instead of blind time-based pause.
@@ -1983,22 +2011,14 @@ def choose_trade(
         ok_no = False
     if NO_ONLY and ok_yes:
         log.warning(
-            f"[NO_ONLY] Blocking YES entry @ {yes_px}¢ | "
-            f"prob={p_yes_blend:.1%} edge={edge_yes:.4f} | "
-            f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'}"
+            f"[ETH_YES_DISABLED] timestamp={datetime.now(timezone.utc).isoformat()}Z "
+            f"confidence={p_yes_blend:.4f} edge={edge_yes:.4f} price={yes_px}¢ "
+            f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} "
+            f"reason=ETH_YES_DISABLED"
         )
         ok_yes = False
     if NO_ONLY:
-        ok_yes = False
-
-    # Log YES entries that pass 150% conviction (for tracking)
-    if ok_yes:
-        log.warning(
-            f"[YES 150% PASS] YES entry approved @ {yes_px}¢ | "
-            f"prob={p_yes_blend:.1%} floor={yes_prob_floor:.1%} edge={edge_yes:.4f} | "
-            f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} | "
-            f"150% conviction gate cleared — slam dunk entry"
-        )
+        ok_yes = False  # FAILSAFE: hard-block YES regardless of any override above
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -2197,7 +2217,7 @@ def should_dump_position(
         # Cap 1a: ABSOLUTE HARD CAP — never lose more than $1.00 per trade
         if total_loss_usd > DUMP_MAX_LOSS_USD:
             log.warning(
-                f"[BAIL $1 HARD CAP] losing ${total_loss_usd:.2f} > ${DUMP_MAX_LOSS_USD:.2f} hard cap — "
+                f"[BAIL HARD CAP] losing ${total_loss_usd:.2f} > ${DUMP_MAX_LOSS_USD:.2f} hard cap — "
                 f"{loss_per_contract}¢/ct × {st.qty}ct "
                 f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢ "
                 f"model={int(current_prob*100)}¢ bid={yes_bid if st.side=='yes' else no_bid}¢) — IMMEDIATE BAIL"
@@ -2428,20 +2448,21 @@ def compute_qty_from_bankroll(
     # Convert fraction to contract count
     target_qty = int(available_usd * fraction / cost_per)
 
-    # SETTLEMENT LOSS CAP: worst case = lose entire entry cost at settlement.
-    # Cap so that worst-case loss never exceeds MAX_SETTLEMENT_LOSS_FRACTION of balance
-    # AND never exceeds the absolute $1.00 hard cap.
+    # POSITION SIZE CAP: max_risk = min(2% of portfolio, $0.40 hard cap).
+    # Worst case = lose entire entry cost at settlement. Cap contracts so
+    # max possible loss never exceeds max_risk. This makes blowups physically impossible.
     if cost_per > 0 and available_usd > 0:
-        max_settlement_loss_pct = available_usd * MAX_SETTLEMENT_LOSS_FRACTION
-        max_settlement_loss = min(max_settlement_loss_pct, DUMP_MAX_LOSS_USD)
-        max_qty_for_loss_cap = int(max_settlement_loss / cost_per)
+        max_risk_pct = available_usd * MAX_SETTLEMENT_LOSS_FRACTION  # 2% of portfolio
+        max_risk = min(max_risk_pct, DUMP_MAX_LOSS_USD)              # min(2% portfolio, $0.40)
+        max_qty_for_loss_cap = int(max_risk / cost_per)
         if max_qty_for_loss_cap < MIN_CONTRACTS:
             max_qty_for_loss_cap = MIN_CONTRACTS
         if target_qty > max_qty_for_loss_cap:
-            log.info(
-                f"[SIZE] Settlement loss cap: {target_qty} -> {max_qty_for_loss_cap} contracts "
-                f"(max loss ${max_settlement_loss:.2f} = min({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}, "
-                f"${DUMP_MAX_LOSS_USD:.2f} hard cap), entry={entry_cents}¢)"
+            log.warning(
+                f"[SIZE_CAPPED] suggested={target_qty} capped={max_qty_for_loss_cap} "
+                f"portfolio=${available_usd:.2f} max_risk=${max_risk:.2f} "
+                f"(min({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}=${max_risk_pct:.2f}, "
+                f"${DUMP_MAX_LOSS_USD:.2f} hard cap)) entry={entry_cents}¢"
             )
             target_qty = max_qty_for_loss_cap
 
@@ -2679,7 +2700,12 @@ def main() -> None:
             session.starting_balance_usd = av
             session.current_balance_usd = av
             session.daily_pnl_usd = 0.0
-            log.warning(f"[SESSION] Starting balance: ${av:.2f} (75% hard stop at ${av * 0.25:.2f})")
+            # Initialize milestone tracking: next $5 increment above current balance
+            session.next_milestone_usd = (int(av / 5) + 1) * 5.0
+            log.warning(
+                f"[SESSION] Starting balance: ${av:.2f} (75% hard stop at ${av * 0.25:.2f}) "
+                f"next_milestone=${session.next_milestone_usd:.0f}"
+            )
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
 
