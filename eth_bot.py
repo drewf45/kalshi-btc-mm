@@ -179,7 +179,7 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.80  # 80%+ to enter in last 3 min — $1 hard cap is the real protection now
+PROB_MIN = 0.80  # 80%+ to enter in last 3 min — $0.40 hard cap is the real protection now
 EDGE_MIN = 0.02  # 2% minimum edge — lower bar to increase volume, small sizes limit damage
 MAX_ENTRY_PRICE_CENTS = 93  # 93¢ max — win pays 7¢/ct, need ~13 wins per loss (90% WR supports this)
 
@@ -196,8 +196,8 @@ FEE_CENTS_PER_CONTRACT = 0
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
 PROB_EARLY_MIN = 0.87            # >5min: need 87%+ (was 90% — too tight, killed overnight volume)
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.83              # 3-5min: need 83%+ (was 86% — $1 cap protects, take more trades)
-# <3 min = PROB_MIN (0.80) — market has priced in the outcome, $1 hard cap is the real protection
+PROB_MID_MIN = 0.83              # 3-5min: need 83%+ (was 86% — $0.40 cap protects, take more trades)
+# <3 min = PROB_MIN (0.80) — market has priced in the outcome, $0.40 hard cap is the real protection
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -233,7 +233,7 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.35  # ETH: ~0.35 USD/√sec (BTC is ~12, ETH pri
 # Kelly fraction = p_true - (1 - p_true) / ((1 - price) / price)
 # where p_true = model probability, price = entry cost / 100.
 # Full Kelly is optimal but volatile; quarter-Kelly gives smoother equity curve.
-KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — $1.00 hard cap is the real size limiter now
+KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — $0.40 hard cap is the real size limiter now
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
@@ -2260,9 +2260,9 @@ def should_dump_position(
     of the boundary. If it is, the book is lying — HOLD. Only bail when
     ETH has actually moved against us.
 
-    BANKROLL PROTECTION: Never lose more than 5% of balance or 50% of position
-    cost on a single trade. This fires before ETH check — no position justifies
-    blowing up the bankroll.
+    BANKROLL PROTECTION: $0.40 hard cap, 2% of balance, 50% of position cost,
+    and 15¢/ct catastrophic stop all fire BEFORE grace period AND before ETH
+    check — no position justifies blowing up the bankroll.
 
     Returns: (should_dump, reason)
     """
@@ -2301,7 +2301,7 @@ def should_dump_position(
                 exit_price_est = min(model_exit, our_bid) if our_bid is not None else model_exit
                 loss_per_contract = st.entry_price_cents - exit_price_est
                 total_loss_usd = (loss_per_contract * st.qty) / 100.0
-                # Absolute $1 hard cap
+                # Absolute $0.40 hard cap
                 if total_loss_usd > DUMP_MAX_LOSS_USD:
                     return True, f"late_entry_hard_cap_${total_loss_usd:.2f}>${DUMP_MAX_LOSS_USD:.2f}"
                 max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
@@ -2312,18 +2312,95 @@ def should_dump_position(
     if st.entry_model_prob is None:
         return False, "no_entry_data"
 
-    # --- GRACE PERIOD ---
+    # =============================================================
+    # === $0.40 HARD CAP: fires ALWAYS, even during grace period ===
+    # The hard dollar cap must NEVER be delayed. Grace period only
+    # protects against noise-triggered reversals, not real losses.
+    # Moved here from below grace period so it fires on EVERY check.
+    # =============================================================
     time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 9999
-    if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
-        return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
 
-    # Determine current probability for our side
+    # Determine current probability for our side (needed for exit price est)
     if st.side == "yes":
         current_prob = p_yes_blend
         entry_prob = st.entry_model_prob
     else:
         current_prob = p_no_blend
         entry_prob = 1.0 - st.entry_model_prob
+
+    # Realistic exit price: worst-of(model, market bid)
+    def _realistic_exit_cents() -> int:
+        model_est = int(current_prob * 100)
+        our_bid = None
+        if st.side == "yes" and yes_bid is not None:
+            our_bid = yes_bid
+        elif st.side == "no" and no_bid is not None:
+            our_bid = no_bid
+        if our_bid is not None:
+            return min(model_est, our_bid)  # Worst case: whichever is lower
+        return model_est
+
+    # --- ABSOLUTE $0.40 HARD CAP: fires BEFORE grace period, BEFORE everything ---
+    if st.entry_price_cents is not None and st.qty > 0:
+        exit_price_est = _realistic_exit_cents()
+        loss_per_contract = st.entry_price_cents - exit_price_est
+        total_loss_cents = loss_per_contract * st.qty
+        total_loss_usd = total_loss_cents / 100.0
+        position_cost_usd = (st.entry_price_cents * st.qty) / 100.0
+
+        # Cap 1a: ABSOLUTE HARD CAP — $0.40
+        if total_loss_usd > DUMP_MAX_LOSS_USD:
+            log.warning(
+                f"[BAIL HARD CAP] losing ${total_loss_usd:.2f} > ${DUMP_MAX_LOSS_USD:.2f} hard cap — "
+                f"{loss_per_contract}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢ "
+                f"model={int(current_prob*100)}¢ bid={yes_bid if st.side=='yes' else no_bid}¢) "
+                f"t_in_trade={time_in_trade:.0f}s — IMMEDIATE BAIL"
+            )
+            return True, f"hard_cap_${total_loss_usd:.2f}>${DUMP_MAX_LOSS_USD:.2f}"
+
+        # Cap 1b: fraction of current balance (2%)
+        if current_balance_usd > 0:
+            max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
+            if total_loss_usd > max_loss_balance:
+                log.warning(
+                    f"[BAIL BANKROLL CAP] losing ${total_loss_usd:.2f} > "
+                    f"{DUMP_MAX_LOSS_FRACTION_OF_BALANCE:.0%} of ${current_balance_usd:.2f} "
+                    f"(cap=${max_loss_balance:.2f}) — {loss_per_contract}¢/ct × {st.qty}ct "
+                    f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) "
+                    f"t_in_trade={time_in_trade:.0f}s — IMMEDIATE BAIL"
+                )
+                return True, f"bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
+
+        # Cap 2: fraction of position cost (50%)
+        max_loss_position = position_cost_usd * DUMP_MAX_LOSS_FRACTION_OF_POSITION
+        if total_loss_usd > max_loss_position:
+            log.warning(
+                f"[BAIL POSITION CAP] losing ${total_loss_usd:.2f} > "
+                f"{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%} of position cost "
+                f"${position_cost_usd:.2f} (cap=${max_loss_position:.2f}) — "
+                f"{loss_per_contract}¢/ct × {st.qty}ct "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) "
+                f"t_in_trade={time_in_trade:.0f}s"
+            )
+            return True, f"position_cap_${total_loss_usd:.2f}>{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%}"
+
+    # --- CATASTROPHIC PER-CONTRACT STOP: also fires BEFORE grace period ---
+    if st.entry_price_cents is not None:
+        exit_price_est = _realistic_exit_cents()
+        catastrophic_loss = st.entry_price_cents - exit_price_est
+        if catastrophic_loss >= DUMP_CATASTROPHIC_LOSS_CENTS:
+            log.warning(
+                f"[BAIL CATASTROPHIC] losing ~{catastrophic_loss}¢/contract "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) "
+                f"t_in_trade={time_in_trade:.0f}s — IMMEDIATE BAIL"
+            )
+            return True, f"catastrophic_{catastrophic_loss}c_per_contract"
+
+    # --- GRACE PERIOD: only blocks soft dump signals (reversal, drop, etc.) ---
+    # Hard caps above already fired if loss is dangerous.
+    if time_in_trade < DUMP_GRACE_PERIOD_SECONDS:
+        return False, f"grace_period_{time_in_trade:.0f}s/{DUMP_GRACE_PERIOD_SECONDS}s"
 
     # Update peak probability tracking (all-time, for logging)
     if current_prob > st.peak_prob_for_side:
@@ -2348,87 +2425,6 @@ def should_dump_position(
     if len(rapid_samples) >= 3:  # Need at least 3 samples for meaningful signal
         rapid_peak = max(p for _, p in rapid_samples)
         rapid_drop = rapid_peak - current_prob
-
-    # =============================================================
-    # === REALISTIC EXIT PRICE: worst-of(model, market bid) ===
-    # BUG FIX: Old code used int(current_prob * 100) which is the MODEL's
-    # estimate.  If model says 85% but book bid is 50¢, loss calc thought
-    # loss = 5¢/ct when actual = 40¢/ct → $1 cap never fires → -$2.73.
-    # Now uses MIN(model estimate, market bid) so loss cap sees real losses.
-    # =============================================================
-    def _realistic_exit_cents() -> int:
-        model_est = int(current_prob * 100)
-        our_bid = None
-        if st.side == "yes" and yes_bid is not None:
-            our_bid = yes_bid
-        elif st.side == "no" and no_bid is not None:
-            our_bid = no_bid
-        if our_bid is not None:
-            return min(model_est, our_bid)  # Worst case: whichever is lower
-        return model_est
-
-    # =============================================================
-    # === BANKROLL-PROPORTIONAL STOP: fires BEFORE ETH check ===
-    # Never lose more than $1.00 per trade (HARD). Scales with bankroll.
-    # Uses worst-of(model, market bid) for exit price — no more blind spots.
-    # =============================================================
-    if st.entry_price_cents is not None and st.qty > 0:
-        exit_price_est = _realistic_exit_cents()
-        loss_per_contract = st.entry_price_cents - exit_price_est
-        total_loss_cents = loss_per_contract * st.qty
-        total_loss_usd = total_loss_cents / 100.0
-        position_cost_usd = (st.entry_price_cents * st.qty) / 100.0
-
-        # Cap 1a: ABSOLUTE HARD CAP — never lose more than $1.00 per trade
-        if total_loss_usd > DUMP_MAX_LOSS_USD:
-            log.warning(
-                f"[BAIL HARD CAP] losing ${total_loss_usd:.2f} > ${DUMP_MAX_LOSS_USD:.2f} hard cap — "
-                f"{loss_per_contract}¢/ct × {st.qty}ct "
-                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢ "
-                f"model={int(current_prob*100)}¢ bid={yes_bid if st.side=='yes' else no_bid}¢) — IMMEDIATE BAIL"
-            )
-            return True, f"hard_cap_${total_loss_usd:.2f}>${DUMP_MAX_LOSS_USD:.2f}"
-
-        # Cap 1b: fraction of current balance
-        if current_balance_usd > 0:
-            max_loss_balance = current_balance_usd * DUMP_MAX_LOSS_FRACTION_OF_BALANCE
-            if total_loss_usd > max_loss_balance:
-                log.warning(
-                    f"[BAIL BANKROLL CAP] losing ${total_loss_usd:.2f} > "
-                    f"{DUMP_MAX_LOSS_FRACTION_OF_BALANCE:.0%} of ${current_balance_usd:.2f} "
-                    f"(cap=${max_loss_balance:.2f}) — {loss_per_contract}¢/ct × {st.qty}ct "
-                    f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
-                    f"overrides ETH safety, protecting bankroll"
-                )
-                return True, f"bankroll_cap_${total_loss_usd:.2f}>${max_loss_balance:.2f}"
-
-        # Cap 2: fraction of position cost (never lose more than 50% of what you put in)
-        max_loss_position = position_cost_usd * DUMP_MAX_LOSS_FRACTION_OF_POSITION
-        if total_loss_usd > max_loss_position:
-            log.warning(
-                f"[BAIL POSITION CAP] losing ${total_loss_usd:.2f} > "
-                f"{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%} of position cost "
-                f"${position_cost_usd:.2f} (cap=${max_loss_position:.2f}) — "
-                f"{loss_per_contract}¢/ct × {st.qty}ct "
-                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢)"
-            )
-            return True, f"position_cap_${total_loss_usd:.2f}>{DUMP_MAX_LOSS_FRACTION_OF_POSITION:.0%}"
-
-    # =============================================================
-    # === CATASTROPHIC STOP: absolute backstop, fires BEFORE ETH check ===
-    # Even if bankroll cap didn't fire (e.g., balance unknown), this catches
-    # extreme per-contract losses.
-    # =============================================================
-    if st.entry_price_cents is not None:
-        exit_price_est = _realistic_exit_cents()
-        catastrophic_loss = st.entry_price_cents - exit_price_est
-        if catastrophic_loss >= DUMP_CATASTROPHIC_LOSS_CENTS:
-            log.warning(
-                f"[BAIL CATASTROPHIC] losing ~{catastrophic_loss}¢/contract "
-                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢) — "
-                f"overrides ETH safety, capping damage"
-            )
-            return True, f"catastrophic_{catastrophic_loss}c_per_contract"
 
     # =============================================================
     # === MINIMUM TAKE-PROFIT HOLD: don't dump small winners ===
@@ -2494,7 +2490,7 @@ def should_dump_position(
     # CRITICAL FIX: Never bail on positions that are currently profitable.
     # The old thresholds (4-6% drop) were killing winners — avg win dropped to $0.06.
     # Now: 10-12% drop required, and ONLY when position is underwater.
-    # The $1.00 hard cap handles catastrophic losses. Let winners run to settlement.
+    # The $0.40 hard cap handles catastrophic losses. Let winners run to settlement.
     if DUMP_ON_PROB_REVERSAL and DUMP_EARLY_EXIT_ENABLED:
         currently_profitable = current_prob > entry_prob
         gain_above_entry = windowed_peak - entry_prob
@@ -2671,7 +2667,7 @@ def compute_scalp_qty(
     target_qty = int(available_usd * scalp_fraction / cost_per)
 
     # Safety cap: worst-case loss (all contracts go to $0) must not exceed SCALP_MAX_LOSS_FRACTION
-    # AND never exceed the absolute $1.00 hard cap per trade
+    # AND never exceed the absolute $0.40 hard cap per trade
     max_loss_usd = min(available_usd * SCALP_MAX_LOSS_FRACTION, DUMP_MAX_LOSS_USD)
     max_qty_for_loss = int(max_loss_usd / cost_per)
     if target_qty > max_qty_for_loss:
@@ -3927,6 +3923,33 @@ def main() -> None:
         elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
             use_post_only = False
             log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+
+        # COMPREHENSIVE PRE-TRADE LOG: every trade is logged with full context.
+        cost_per_contract = int(chosen_px) / 100.0
+        worst_case_loss = qty * cost_per_contract
+        if chosen_side == "yes":
+            # Compute ultra gate values for the log
+            _log_gate_passed, _log_gate_failed, _log_gate_details = yes_ultra_gate(
+                p_yes_blend, spot, lo, hi, secs_to_close, int(chosen_px),
+            )
+            log.warning(
+                f"[PRE-TRADE] side=YES contracts={qty} cost_per={cost_per_contract:.2f} "
+                f"worst_case_loss=${worst_case_loss:.2f} (cap=${DUMP_MAX_LOSS_USD:.2f}) "
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} "
+                f"| ULTRA_GATE: prob={_log_gate_details['prob']:.4f}({'PASS' if _log_gate_details['prob'] >= YES_ULTRA_GATE_PROB else 'FAIL'}) "
+                f"move={_log_gate_details['move_pct']:.1%}({'PASS' if _log_gate_details['move_pct'] >= YES_ULTRA_GATE_MOVE_PCT else 'FAIL'}) "
+                f"time={_log_gate_details['secs']}s({'PASS' if _log_gate_details['secs'] <= YES_ULTRA_GATE_TIME_SEC else 'FAIL'}) "
+                f"price={_log_gate_details['price']}¢({'PASS' if _log_gate_details['price'] is not None and _log_gate_details['price'] >= YES_ULTRA_GATE_PRICE_CENTS else 'FAIL'}) "
+                f"gate={'ALL_PASS' if _log_gate_passed else 'BLOCKED:' + ','.join(_log_gate_failed)} "
+                f"kelly_reduction={YES_KELLY_REDUCTION:.0%}"
+            )
+        else:
+            log.warning(
+                f"[PRE-TRADE] side=NO contracts={qty} cost_per={cost_per_contract:.2f} "
+                f"worst_case_loss=${worst_case_loss:.2f} (cap=${DUMP_MAX_LOSS_USD:.2f}) "
+                f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} "
+                f"spot=${spot:.2f} lo={lo} hi={hi} t={secs_to_close}s"
+            )
 
         payload = build_order_payload(
             market_ticker=st.market,
