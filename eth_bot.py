@@ -10,9 +10,11 @@
 # - Dump is ABORT ONLY — safety net, not a regular exit
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
-# KEY SETTINGS (v7 — 6-session analysis rewrite):
-# - YES DISABLED: -$3.44 lifetime, 0-for-5 most recently. NO_ONLY=True.
-#   Phantom logging tracks what YES would have done for future re-evaluation.
+# KEY SETTINGS (v8 — YES 150% conviction gate):
+# - YES RE-ENABLED with 150% CONVICTION MULTIPLIER: 0-for-9 lifetime, -$3.44.
+#   Not disabled — but must clear 150% of normal conviction to enter.
+#   Prob floors: 95% late, 99% mid/early + 8% edge + 75¢ max + trend aligned.
+#   Only fires on absolute slam dunks in the last ~3 minutes.
 # - HARD $1.00 MAX LOSS PER TRADE — 3 layers of enforcement:
 #   1) Entry sizing: max_possible_loss capped at $1.00 before order placed
 #   2) Dump trigger: loss calc uses worst-of(model, market bid) — no blind spots
@@ -21,6 +23,7 @@
 #   Avg win was $0.06 because 4% reversal threshold killed every winner.
 #   Now 10-12% threshold, and profitable positions hold to settlement.
 # - NO SIDE: prob 80-87%, 2% edge, 93¢ max, Kelly=0.25
+# - YES SIDE: 150% conviction (95% late / 99% mid+early), 8% edge, 75¢ max, Kelly=0.10, trend-aligned
 # - ROLLING DRAWDOWN: -$3 in 2hr → pause 30min, resume at 50% for 3 trades
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
 #
@@ -136,17 +139,22 @@ DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
-NO_ONLY = env_bool("NO_ONLY", True)      # NO ONLY — YES is -$3.44 lifetime, 0-for-5 most recently
-# YES DISABLED: negative in 4/6 sessions, 40% WR, -$3.44 lifetime.
-# Phantom logging tracks what YES WOULD have done for future re-evaluation.
-# Re-evaluate after 100 NO-only trades to see if YES ever develops an edge.
-YES_PHANTOM_LOG = True                    # Log phantom YES entries (what model would have done)
-# YES gates (kept for code safety — YES is blocked by NO_ONLY above)
-YES_EDGE_MIN = 0.08
-YES_PROB_MIN = 0.97
-YES_MAX_ENTRY_PRICE_CENTS = 75
-YES_KELLY_MULTIPLIER = 0.10
-YES_REQUIRE_TREND_ALIGNED = True
+NO_ONLY = env_bool("NO_ONLY", False)     # Both sides enabled — YES gated by 150% conviction multiplier
+# YES RE-ENABLED with 150% CONVICTION MULTIPLIER (v8):
+# YES was 0-for-9, -$3.44 lifetime, -$2.02 in last 4 trades. Not disabled — but
+# must clear 150% of normal conviction to enter. The multiplier scales the
+# "distance from coin-flip" so YES probability floors are:
+#   Late  (<3 min): 80% normal → 95% for YES
+#   Mid  (3-5 min): 83% normal → 99% for YES (practically impossible)
+#   Early (5-7 min): 87% normal → 99% for YES (practically impossible)
+# Net effect: YES can only fire in the last ~3 min on absolute slam dunks.
+# Combined with 8% edge, 75¢ max price, trend alignment, and 10% Kelly,
+# this means YES only enters when the model is screaming certainty.
+YES_CONVICTION_MULTIPLIER = 1.50         # YES needs 150% of normal conviction (distance from 50%)
+YES_EDGE_MIN = 0.08                      # 8% edge minimum (vs 2% for NO) — 4x normal
+YES_MAX_ENTRY_PRICE_CENTS = 75           # 75¢ max (vs 93¢ for NO) — cheap entries only
+YES_KELLY_MULTIPLIER = 0.10              # 10% of Kelly sizing (vs 25% for NO) — tiny positions
+YES_REQUIRE_TREND_ALIGNED = True         # All trends must be WITH the trade — no exceptions
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -1788,6 +1796,11 @@ def choose_trade(
     else:
         effective_prob_min = PROB_MIN         # <3min: 85%+ — market has priced in the outcome
         
+    # YES 150% CONVICTION: dynamic probability floor
+    # Scale "distance from coin-flip" by 1.5x: YES needs 150% of normal conviction.
+    # Late: 80% → 95%, Mid: 83% → 99%, Early: 87% → 99% (capped)
+    yes_prob_floor = min(0.99, 0.50 + (effective_prob_min - 0.50) * YES_CONVICTION_MULTIPLIER)
+
     # NO side: standard thresholds (this side is profitable)
     ok_no = (
         no_px is not None
@@ -1797,13 +1810,13 @@ def choose_trade(
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
     )
-    # YES side: TIGHTER thresholds (this side bleeds — need higher bar)
+    # YES side: 150% CONVICTION thresholds (0-for-9 history — slam dunks only)
     ok_yes = (
         yes_px is not None
         and ok_book_yes
-        and (p_yes_blend >= max(effective_prob_min, YES_PROB_MIN))  # Always need ≥90%
-        and (edge_yes >= YES_EDGE_MIN)      # Need 5% edge (vs 3% for NO)
-        and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS)  # Max 85¢ (vs 90¢ for NO)
+        and (p_yes_blend >= yes_prob_floor)   # 150% conviction: 95% late, 99% mid/early
+        and (edge_yes >= YES_EDGE_MIN)        # 8% edge (vs 2% for NO)
+        and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS)  # 75¢ max (vs 93¢ for NO)
         and div_gate_yes
     )
 
@@ -1825,10 +1838,10 @@ def choose_trade(
             p_no_blend = 1.0 - p_yes_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate: YES still needs stars-aligned thresholds
+            # Re-evaluate: YES still needs 150% conviction thresholds
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= max(effective_prob_min, YES_PROB_MIN))
+                and (p_yes_blend >= yes_prob_floor)
                 and (edge_yes >= YES_EDGE_MIN)
                 and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS) and div_gate_yes
             )
@@ -1846,10 +1859,10 @@ def choose_trade(
             p_yes_blend = 1.0 - p_no_blend
             edge_yes = compute_edge(p_yes_blend, yes_px, FEE_CENTS_PER_CONTRACT) if yes_px is not None else -1e9
             edge_no = compute_edge(p_no_blend, no_px, FEE_CENTS_PER_CONTRACT) if no_px is not None else -1e9
-            # Re-evaluate: YES still needs stars-aligned thresholds
+            # Re-evaluate: YES still needs 150% conviction thresholds
             ok_yes = (
                 yes_px is not None and ok_book_yes
-                and (p_yes_blend >= max(effective_prob_min, YES_PROB_MIN))
+                and (p_yes_blend >= yes_prob_floor)
                 and (edge_yes >= YES_EDGE_MIN)
                 and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS) and div_gate_yes
             )
@@ -1877,13 +1890,14 @@ def choose_trade(
 
         max_yes_hc = int(p_yes_blend * 100) + 1  # +1¢ spread slack
         max_no_hc = int(p_no_blend * 100) + 1
-        # YES high-certainty: must STILL clear YES_PROB_MIN (97%) and YES_MAX_ENTRY_PRICE (75¢)
-        if (p_yes_blend >= max(HIGH_CERTAINTY_PROB, YES_PROB_MIN)
+        # YES high-certainty: must STILL clear 150% conviction floor and YES_MAX_ENTRY_PRICE (75¢)
+        if (p_yes_blend >= max(HIGH_CERTAINTY_PROB, yes_prob_floor)
                 and yes_px is not None
                 and yes_px <= min(max_yes_hc, YES_MAX_ENTRY_PRICE_CENTS)
+                and edge_yes >= YES_EDGE_MIN
                 and yes_boundary_ok):
             ok_yes = True
-            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_blend:.4f}, price={yes_px}, max={min(max_yes_hc, YES_MAX_ENTRY_PRICE_CENTS)})")
+            log.info(f"[OVERRIDE] YES high-certainty (p={p_yes_blend:.4f}, floor={yes_prob_floor:.1%}, price={yes_px}, max={min(max_yes_hc, YES_MAX_ENTRY_PRICE_CENTS)})")
         # NO high-certainty: standard thresholds
         if p_no_blend >= HIGH_CERTAINTY_PROB and no_px is not None and no_px <= max_no_hc and no_boundary_ok:
             ok_no = True
@@ -1923,17 +1937,17 @@ def choose_trade(
         max_yes_settle = min(max_settle_px, int(p_yes_blend * 100))
         max_no_settle = min(max_settle_px, int(p_no_blend * 100))
 
-        # YES settlement lock: must STILL clear YES_PROB_MIN (97%), YES_EDGE_MIN (8%), YES_MAX_ENTRY_PRICE (75¢)
+        # YES settlement lock: must STILL clear 150% conviction floor, YES_EDGE_MIN (8%), YES_MAX_ENTRY_PRICE (75¢)
         yes_settle_max = min(max_yes_settle, YES_MAX_ENTRY_PRICE_CENTS)
         if (not ok_yes
-                and p_yes_blend >= max(SETTLEMENT_LOCK_MIN_PROB, YES_PROB_MIN)
+                and p_yes_blend >= max(SETTLEMENT_LOCK_MIN_PROB, yes_prob_floor)
                 and edge_yes >= YES_EDGE_MIN
                 and yes_px is not None and yes_px <= yes_settle_max
                 and yes_boundary_ok):
             ok_yes = True
             log.warning(
-                f"[SETTLE LOCK] YES override (stars-aligned): blend={p_yes_blend:.1%} price={yes_px}¢ "
-                f"max={yes_settle_max}¢ edge={edge_yes:.4f} t={secs_to_close}s"
+                f"[SETTLE LOCK] YES override (150% conviction): blend={p_yes_blend:.1%} floor={yes_prob_floor:.1%} "
+                f"price={yes_px}¢ max={yes_settle_max}¢ edge={edge_yes:.4f} t={secs_to_close}s"
             )
         if not ok_no and p_no_blend >= SETTLEMENT_LOCK_MIN_PROB and no_px is not None and no_px <= max_no_settle and no_boundary_ok:
             ok_no = True
@@ -1949,19 +1963,23 @@ def choose_trade(
     if YES_ONLY:
         ok_no = False
     if NO_ONLY and ok_yes:
-        if YES_PHANTOM_LOG:
-            log.warning(
-                f"[PHANTOM YES] Would enter YES @ {yes_px}¢ | "
-                f"prob={p_yes_blend:.1%} edge={edge_yes:.4f} | "
-                f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} | "
-                f"Track to evaluate if YES develops edge"
-            )
+        log.warning(
+            f"[NO_ONLY] Blocking YES entry @ {yes_px}¢ | "
+            f"prob={p_yes_blend:.1%} edge={edge_yes:.4f} | "
+            f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'}"
+        )
         ok_yes = False
-
-    # FAILSAFE: NO_ONLY physically prevents YES return regardless of any override above.
-    # YES is -$4.43 lifetime, 0-for-5 last session, -$0.99 this session.
     if NO_ONLY:
         ok_yes = False
+
+    # Log YES entries that pass 150% conviction (for tracking)
+    if ok_yes:
+        log.warning(
+            f"[YES 150% PASS] YES entry approved @ {yes_px}¢ | "
+            f"prob={p_yes_blend:.1%} floor={yes_prob_floor:.1%} edge={edge_yes:.4f} | "
+            f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} | "
+            f"150% conviction gate cleared — slam dunk entry"
+        )
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -2565,7 +2583,7 @@ def main() -> None:
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
-        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY} HARD_STOP=${DUMP_MAX_LOSS_USD:.2f}"
+        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY} YES_CONVICTION={YES_CONVICTION_MULTIPLIER:.0%} HARD_STOP=${DUMP_MAX_LOSS_USD:.2f}"
     )
     log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
@@ -3025,6 +3043,27 @@ def main() -> None:
                                         and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
                                         and not (NO_ONLY and flip_side == "yes")  # Don't flip to YES in NO_ONLY mode
                                     )
+
+                                    # YES flip: apply 150% conviction gate (same as choose_trade)
+                                    if can_flip and flip_side == "yes":
+                                        if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
+                                            _flip_prob_min = PROB_EARLY_MIN
+                                        elif secs_to_close > PROB_MID_ENTRY_SECONDS:
+                                            _flip_prob_min = PROB_MID_MIN
+                                        else:
+                                            _flip_prob_min = PROB_MIN
+                                        _flip_yes_floor = min(0.99, 0.50 + (_flip_prob_min - 0.50) * YES_CONVICTION_MULTIPLIER)
+                                        if flip_prob < _flip_yes_floor:
+                                            log.warning(
+                                                f"[FLIP] YES flip blocked — 150% conviction: "
+                                                f"prob={flip_prob:.1%} < floor={_flip_yes_floor:.1%}"
+                                            )
+                                            can_flip = False
+                                        if flip_price > YES_MAX_ENTRY_PRICE_CENTS:
+                                            log.warning(
+                                                f"[FLIP] YES flip blocked — price {flip_price}¢ > YES max {YES_MAX_ENTRY_PRICE_CENTS}¢"
+                                            )
+                                            can_flip = False
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
                                     if can_flip:
