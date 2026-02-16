@@ -204,7 +204,9 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.0006  # XRP ~$2.50, ~2x more volatile in % terms
 KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — smaller bets, smoother equity curve, survives loss streaks
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
-MAX_CONTRACTS = 25           # Hard cap — XRP contracts are cheap, limit exposure per market
+MAX_CONTRACTS = 3            # Hard cap — XRP should never hold more than 3 contracts.
+                             # At 90¢ × 3 = $2.70 max loss WITHOUT gate. With $0.75 gate, effectively 1 contract at high prices.
+                             # Belt-and-suspenders: gate caps dollar risk, this caps contract count.
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy constants (kept for backward compat in safety checks)
@@ -2963,10 +2965,65 @@ def main() -> None:
                                 st.side = None
                                 st.entry_price_cents = None
 
+                        # ---- EXPIRY EXIT — close positions 2 min before settlement ----
+                        # Prevents all-or-nothing settlement risk by closing early.
+                        # Close losing positions (unrealized < -$0.10) or take profit (> +$0.05).
+                        expiry_exited = False
+                        if not should_dump and secs_to_close is not None and secs_to_close <= 120 and st.entry_price_cents is not None:
+                            if st.side == "yes":
+                                current_bid = yes_bid if yes_bid is not None else 50
+                            else:
+                                current_bid = no_bid if no_bid is not None else 50
+
+                            unrealized_pnl_usd = ((current_bid - st.entry_price_cents) * abs(pos)) / 100.0
+
+                            expiry_reason = ""
+                            if unrealized_pnl_usd < -0.10:
+                                expiry_exited = True
+                                expiry_reason = f"EXPIRY_EXIT: unrealized=${unrealized_pnl_usd:.2f} < -$0.10, t={secs_to_close}s"
+                            elif unrealized_pnl_usd > 0.05:
+                                expiry_exited = True
+                                expiry_reason = f"EXPIRY_TAKE_PROFIT: unrealized=${unrealized_pnl_usd:.2f} > +$0.05, t={secs_to_close}s"
+
+                            if expiry_exited:
+                                log.warning(f"[EXPIRY] {expiry_reason}")
+                                try:
+                                    exit_payload = build_order_payload(
+                                        market_ticker=st.market,
+                                        action="sell",
+                                        side=st.side,
+                                        price_cents=1,       # Market sell
+                                        count=abs(pos),
+                                        post_only=False,
+                                    )
+                                    if not DRY_RUN:
+                                        oid = place_order(client, exit_payload)
+                                        log.warning(f"[EXPIRY] SELL order placed {oid} — {st.side.upper()} qty={abs(pos)}")
+
+                                        # Record P&L
+                                        pnl_cents = (current_bid - st.entry_price_cents) * abs(pos)
+                                        session.record_trade(
+                                            market=st.market,
+                                            side=st.side,
+                                            entry_price=st.entry_price_cents,
+                                            exit_price=current_bid,
+                                            qty=abs(pos),
+                                            pnl_cents=pnl_cents,
+                                            was_dump=True,
+                                        )
+                                    else:
+                                        log.warning(f"[DRY] Would expiry exit: SELL {st.side.upper()} qty={abs(pos)}")
+
+                                    st.sm = SM.DUMPED
+                                    st.side = None
+                                    st.entry_price_cents = None
+                                except Exception as e:
+                                    log.error(f"[EXPIRY] Failed to exit: {e}")
+
                         # ---- LAST-MINUTE SCALP (inside dump check, only if NOT dumping) ----
                         # When we're holding and NOT bailing, check if we should pile on
                         # extra contracts in the final seconds for near-free profit.
-                        if not should_dump and not st.has_scalped and secs_to_close is not None:
+                        if not should_dump and not expiry_exited and not st.has_scalped and secs_to_close is not None:
                             our_prob = p_yes_blend if st.side == "yes" else p_no_blend
 
                             # Get ask price for our side. When the outcome is near-certain,
