@@ -301,6 +301,14 @@ PNL_LOCK_TIER1_MULT = 0.50
 PNL_LOCK_TIER2_USD = 3.00            # At +$3.00 session P/L: reduce to 25% size
 PNL_LOCK_TIER2_MULT = 0.25
 
+# -------------- YES ENTRY GATE (tighter YES filter — XRP YES earned more freedom) --
+# All 4 conditions must be true to place a YES trade:
+YES_GATE_MIN_PROB = 0.88             # (1) Blend probability for YES must exceed 88%
+YES_GATE_MIN_MOVE_PCT = 0.50         # (2) XRP moved ≥50% of expected move in YES direction
+YES_GATE_MAX_SECS = 480              # (3) Fewer than 8 minutes remaining (480s)
+YES_GATE_MIN_CONTRACT_PRICE = 88     # (4) YES contract price on Kalshi ≥ 88¢
+YES_GATE_WINDOW_SECONDS = 900.0      # Full 15-minute window for expected move calculation
+
 # -------------- STREAK CIRCUIT BREAKER (pause after losses) --------------------
 LOSS_PAUSE_THRESHOLD_USD = 0.50       # Single loss > $0.50 → pause 30 min
 LOSS_PAUSE_SINGLE_MINUTES = 30
@@ -1160,6 +1168,19 @@ class SessionState:
     xrp_wins: int = 0
     xrp_losses: int = 0
 
+    # Hourly YES summary tracking
+    yes_hour_start: float = 0.0          # Start of current tracking hour
+    yes_opportunities: int = 0           # Total YES opportunities seen this hour
+    yes_skipped_total: int = 0           # Total skipped this hour
+    yes_skipped_prob: int = 0            # Skipped: prob < 88%
+    yes_skipped_move: int = 0            # Skipped: price move < 50%
+    yes_skipped_time: int = 0            # Skipped: time > 8 min remaining
+    yes_skipped_price: int = 0           # Skipped: contract price < 88¢
+    yes_executed: int = 0                # Total YES trades executed this hour
+    yes_hour_wins: int = 0               # YES wins this hour
+    yes_hour_losses: int = 0             # YES losses this hour
+    yes_hour_pnl_cents: int = 0          # YES net P&L this hour (cents)
+
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
 
@@ -1168,6 +1189,7 @@ class SessionState:
             self.recent_trades = []
         if self.loss_timestamps is None:
             self.loss_timestamps = []
+        self.yes_hour_start = time.time()
 
     def reset_for_new_market(self):
         """Reset per-market state on each market roll. Daily state persists.
@@ -1256,6 +1278,10 @@ class SessionState:
         # Milestone tracking
         self._check_milestones()
 
+        # YES hourly outcome tracking
+        if side == "yes":
+            self.record_yes_outcome(pnl_cents)
+
         # XRP running P&L tracking
         self.xrp_running_pnl_usd += pnl_usd
         self.xrp_trade_count += 1
@@ -1288,6 +1314,67 @@ class SessionState:
         while balance >= self.next_milestone:
             log.warning(f"[MILESTONE] MILESTONE_HIT: ${self.next_milestone:.0f} - withdraw $1")
             self.next_milestone += 5.0
+
+    def check_yes_hourly_summary(self):
+        """Print hourly YES summary and reset counters if an hour has passed."""
+        now = time.time()
+        if now - self.yes_hour_start >= 3600:
+            # Determine which condition failed most
+            skip_counts = {
+                "prob<88%": self.yes_skipped_prob,
+                "move<50%": self.yes_skipped_move,
+                "time>8min": self.yes_skipped_time,
+                "price<88¢": self.yes_skipped_price,
+            }
+            most_common = max(skip_counts, key=skip_counts.get) if self.yes_skipped_total > 0 else "none"
+            log.warning(
+                f"[YES HOURLY] opportunities_seen={self.yes_opportunities} "
+                f"skipped={self.yes_skipped_total} "
+                f"(prob={self.yes_skipped_prob} move={self.yes_skipped_move} "
+                f"time={self.yes_skipped_time} price={self.yes_skipped_price} "
+                f"most_common={most_common}) "
+                f"executed={self.yes_executed} "
+                f"wins={self.yes_hour_wins} losses={self.yes_hour_losses} "
+                f"net_pnl=${self.yes_hour_pnl_cents / 100.0:.2f}"
+            )
+            # Reset for next hour
+            self.yes_hour_start = now
+            self.yes_opportunities = 0
+            self.yes_skipped_total = 0
+            self.yes_skipped_prob = 0
+            self.yes_skipped_move = 0
+            self.yes_skipped_time = 0
+            self.yes_skipped_price = 0
+            self.yes_executed = 0
+            self.yes_hour_wins = 0
+            self.yes_hour_losses = 0
+            self.yes_hour_pnl_cents = 0
+
+    def record_yes_skip(self, failed_condition: str):
+        """Record a skipped YES opportunity."""
+        self.yes_opportunities += 1
+        self.yes_skipped_total += 1
+        if "prob" in failed_condition:
+            self.yes_skipped_prob += 1
+        elif "move" in failed_condition:
+            self.yes_skipped_move += 1
+        elif "time" in failed_condition:
+            self.yes_skipped_time += 1
+        elif "price" in failed_condition:
+            self.yes_skipped_price += 1
+
+    def record_yes_executed(self):
+        """Record a YES trade that passed all gates and was executed."""
+        self.yes_opportunities += 1
+        self.yes_executed += 1
+
+    def record_yes_outcome(self, pnl_cents: int):
+        """Record the outcome of a YES trade for hourly summary."""
+        self.yes_hour_pnl_cents += pnl_cents
+        if pnl_cents > 0:
+            self.yes_hour_wins += 1
+        else:
+            self.yes_hour_losses += 1
 
     def _scale_up(self):
         """Win: legacy counter (sizing now uses Kelly bankroll fraction)."""
@@ -3510,6 +3597,59 @@ def main() -> None:
 
             if prob_trend_ok:
                 log.warning(f"[PROB_TREND] GO signal: {prob_trend_reason} | {prob_trend.summary()}")
+
+        # Check YES hourly summary (prints if an hour has passed)
+        session.check_yes_hourly_summary()
+
+        # === YES ENTRY GATE: all 4 conditions must be true ===
+        # XRP YES has earned trust but still needs a safety filter.
+        # NO entries are not gated — this only applies to YES.
+        if chosen_side == "yes":
+            # Calculate price move percentage in YES direction
+            if lo is not None and sigma_used > 0:
+                expected_move = sigma_used * math.sqrt(YES_GATE_WINDOW_SECONDS)
+                actual_move = spot - lo
+                price_move_pct = actual_move / expected_move if expected_move > 0 else 0.0
+            else:
+                price_move_pct = 1.0  # Can't compute — pass this check
+
+            minutes_remaining = secs_to_close / 60.0 if secs_to_close is not None else 99.0
+
+            # Check all 4 conditions
+            cond_prob = p_yes_blend >= YES_GATE_MIN_PROB
+            cond_move = price_move_pct >= YES_GATE_MIN_MOVE_PCT
+            cond_time = secs_to_close is not None and secs_to_close <= YES_GATE_MAX_SECS
+            cond_price = chosen_px is not None and int(chosen_px) >= YES_GATE_MIN_CONTRACT_PRICE
+
+            if not (cond_prob and cond_move and cond_time and cond_price):
+                # Determine which condition(s) failed
+                failed = []
+                if not cond_prob:
+                    failed.append(f"prob={p_yes_blend:.1%}<{YES_GATE_MIN_PROB:.0%}")
+                if not cond_move:
+                    failed.append(f"move={price_move_pct:.0%}<{YES_GATE_MIN_MOVE_PCT:.0%}")
+                if not cond_time:
+                    failed.append(f"time={minutes_remaining:.1f}min>8min")
+                if not cond_price:
+                    failed.append(f"price={chosen_px}¢<{YES_GATE_MIN_CONTRACT_PRICE}¢")
+
+                # Log the skip with all requested fields
+                first_fail = failed[0].split("=")[0] if failed else "unknown"
+                log.warning(
+                    f"[YES GATE SKIP] ts={int(time.time())} market_id={st.market} "
+                    f"confidence={p_yes_blend:.4f} price_move_pct={price_move_pct:.2f} "
+                    f"minutes_remaining={minutes_remaining:.1f} contract_price={chosen_px}¢ "
+                    f"which_condition_failed={','.join(failed)}"
+                )
+
+                # Track skip for hourly summary
+                session.record_yes_skip(first_fail)
+
+                time.sleep(POLL_SECONDS)
+                continue
+            else:
+                # All conditions passed — track as executed
+                session.record_yes_executed()
 
         # Check session limits before trading
         can_trade, pause_reason = session.check_can_trade()
