@@ -12,7 +12,7 @@
 #
 # KEY SETTINGS:
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
-# - EDGE_MIN=0.05 (5% real edge — stricter than BTC/ETH)
+# - EDGE_MIN=0.04 (4% real edge — loosened from 5% to increase volume)
 # - MIN_PAYOFF=8¢/contract (hard floor — no penny wins, max entry=92¢)
 # - HARD_MAX_LOSS=$1.00 (absolute ceiling — no single trade loses >$1)
 # - COLD_START: first 2 trades after restart at half size
@@ -170,8 +170,8 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.86  # 86%+ to enter in last 2 min — raised from 83%, SOL noise needs higher bar
-EDGE_MIN = 0.05  # 5% minimum edge — SOL needs stricter edge than BTC/ETH (3%) due to thinner books and higher noise
+PROB_MIN = 0.80  # 80%+ to enter in last 2 min — was 86%, way too conservative for 100% WR bot
+EDGE_MIN = 0.04  # 4% minimum edge — was 5%, lowered to increase volume while keeping quality
 MAX_ENTRY_PRICE_CENTS = 92  # At 92¢ entry, gain 8¢/win, need ~12 wins per loss — matches MIN_PAYOFF_CENTS
 FEE_CENTS_PER_CONTRACT = 0
 
@@ -189,10 +189,10 @@ MIN_PAYOFF_CENTS = 8  # HARD FLOOR: no trade where win < 8¢/contract (max entry
 # of the buy window (SOL still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
 PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.93            # >5min: need 93%+ — SOL can swing hard in 5 min, be very selective
+PROB_EARLY_MIN = 0.88            # >5min: need 88%+ — was 93%, lowered 5pts to increase volume (BTC uses 90%)
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.90              # 3-5min: need 90%+ — raised from 86%, SOL whipsaws more than ETH
-# <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+PROB_MID_MIN = 0.84              # 3-5min: need 84%+ — was 90%, lowered 6pts (BTC uses 86%)
+# <3 min = PROB_MIN (0.80) — market has priced in the outcome, stop-loss protects
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -208,13 +208,13 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match SOL spot trend (border
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.93   # ≥93% prob = buy immediately, no trend check needed (raised for SOL noise)
-PROB_FAST_LANE_LATE_THRESHOLD = 0.88  # ≥88% prob in last 3 min = fast lane (raised from 85%)
+PROB_FAST_LANE_THRESHOLD = 0.88   # ≥88% prob = buy immediately, no trend check needed (was 93%, loosened to match BTC-like volume)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.83  # ≥83% prob in last 3 min = fast lane (was 88%, BTC uses 85%)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
 # At T-300s to T-180s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 25   # Signal must persist for 25s before early commitment (was 15s — SOL flips fast, need more patience)
+CONFIRMATION_HOLD_SECONDS = 15   # Signal must persist for 15s before early commitment (was 25s — too conservative, matched BTC now)
 CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 0.07  # SOL: ~0.07 USD/√sec (SOL ~$200, ~2x higher % vol than BTC/ETH — was 0.05, underestimated)
