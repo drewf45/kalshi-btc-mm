@@ -268,6 +268,16 @@ DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is 
 DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
 DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
+
+# -------------- UNIVERSAL $0.40 HARD STOP-LOSS --------------------------------
+# If unrealized loss on any single position reaches $0.40, market sell immediately.
+# Overrides ALL other sizing and exit logic. No single trade can ever lose more.
+STOP_LOSS_USD = 0.40
+
+# -------------- POSITION SIZE CAP (2% of portfolio) ---------------------------
+# Before placing any trade, max_risk = portfolio_balance * 0.02.
+# If Kelly suggests larger, cap it. Limits max downside per trade to 2% of portfolio.
+POSITION_SIZE_CAP_FRACTION = 0.02
 # ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
 # With the EV price cap (price ≤ prob), entries are always +EV, so we can
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
@@ -1112,6 +1122,9 @@ class SessionState:
     # Balance refresh
     pending_balance_check_at: float = 0.0  # When to fetch balance after settlement
 
+    # Milestone tracking: every $5 from $30. After $100, withdraw above $100.
+    next_milestone: float = 30.0  # Next milestone to hit (starts at $30)
+
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
 
@@ -1139,6 +1152,11 @@ class SessionState:
         """Update true P&L from actual account balance"""
         self.current_balance_usd = balance_usd
         self.daily_pnl_usd = balance_usd - self.starting_balance_usd
+        # Initialize milestone to the next $5 increment >= $30 above current balance
+        if self.next_milestone == 30.0 and balance_usd >= 30.0:
+            self.next_milestone = 30.0 + (5.0 * math.ceil((balance_usd - 30.0) / 5.0))
+            if self.next_milestone <= balance_usd:
+                self.next_milestone += 5.0
         log.warning(
             f"[SESSION] Balance update: ${balance_usd:.2f} "
             f"(started=${self.starting_balance_usd:.2f}, daily_pnl=${self.daily_pnl_usd:.2f})"
@@ -1194,12 +1212,28 @@ class SessionState:
         # Schedule balance check to get true P&L
         self.schedule_balance_check()
 
+        # Milestone tracking
+        self._check_milestones()
+
         log.warning(
             f"[SESSION] Trade recorded: pnl=${pnl_usd:.2f} daily_pnl=${self.daily_pnl_usd:.2f} "
             f"bankroll=${self.current_balance_usd:.2f} "
             f"W/L={self.total_wins}/{self.total_losses} "
             f"streak={self.consecutive_wins}W/{self.consecutive_losses}L"
         )
+
+    def _check_milestones(self):
+        """Check portfolio milestones at every $5 increment from $30. Withdraw $1 at each."""
+        balance = self.current_balance_usd
+        distance = self.next_milestone - balance
+        log.info(f"[MILESTONE] balance=${balance:.2f} next_milestone=${self.next_milestone:.2f} distance_to_milestone=${distance:.2f}")
+
+        if balance >= 100.0:
+            log.warning(f"[MILESTONE] PROFIT_CAP_HIT: withdraw all above $100 (balance=${balance:.2f})")
+
+        while balance >= self.next_milestone:
+            log.warning(f"[MILESTONE] MILESTONE_HIT: ${self.next_milestone:.0f} - withdraw $1")
+            self.next_milestone += 5.0
 
     def _scale_up(self):
         """Win: legacy counter (sizing now uses Kelly bankroll fraction)."""
@@ -1855,6 +1889,24 @@ def should_dump_position(
     if secs_to_close < DUMP_MIN_TIME_REMAINING:
         return False, "too_close_to_settlement"
 
+    # =============================================================
+    # === UNIVERSAL $0.40 HARD STOP-LOSS: fires FIRST, overrides ALL ===
+    # If unrealized loss >= $0.40, market sell immediately.
+    # No single trade can ever lose more than this amount.
+    # =============================================================
+    if st.entry_price_cents is not None and st.qty > 0:
+        exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+        loss_per_contract = st.entry_price_cents - exit_price_est
+        total_loss_usd = (loss_per_contract * st.qty) / 100.0
+        if total_loss_usd >= STOP_LOSS_USD:
+            log.warning(
+                f"[STOP_LOSS_HIT] ts={int(time.time())} market_id={st.market} "
+                f"entry_price={st.entry_price_cents}¢ exit_price={exit_price_est}¢ "
+                f"loss_amount=${total_loss_usd:.2f} reason=STOP_LOSS_HIT — "
+                f"unrealized loss ≥ ${STOP_LOSS_USD:.2f}, market sell immediately"
+            )
+            return True, f"STOP_LOSS_HIT_${total_loss_usd:.2f}>=${STOP_LOSS_USD:.2f}"
+
     # LATE-ENTRY HOLD: if <30s to close, outcome is mostly decided.
     # Hold to settlement — don't let dump logic sell a near-certain winner.
     # For earlier entries, normal dump logic applies — BTC can still move.
@@ -2149,6 +2201,21 @@ def compute_qty_from_bankroll(
                 f"entry={entry_cents}¢)"
             )
             target_qty = max_qty_for_loss_cap
+
+    # POSITION SIZE CAP: max potential loss per trade <= 2% of portfolio balance.
+    # max_risk = portfolio_balance * 0.02. Cap qty so entry_cost * qty <= max_risk.
+    if cost_per > 0 and available_usd > 0:
+        max_risk = available_usd * POSITION_SIZE_CAP_FRACTION
+        max_qty_for_risk = int(max_risk / cost_per)
+        if max_qty_for_risk < MIN_CONTRACTS:
+            max_qty_for_risk = MIN_CONTRACTS
+        if target_qty > max_qty_for_risk:
+            log.warning(
+                f"[SIZE CAP] Position size capped: suggested_size={target_qty} capped_size={max_qty_for_risk} "
+                f"portfolio_balance=${available_usd:.2f} max_risk_amount=${max_risk:.2f} "
+                f"(entry={entry_cents}¢, {POSITION_SIZE_CAP_FRACTION:.0%} cap)"
+            )
+            target_qty = max_qty_for_risk
 
     qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
