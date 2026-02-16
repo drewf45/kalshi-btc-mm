@@ -274,6 +274,7 @@ DUMP_HARD_MAX_LOSS_USD = 0.75             # HARD cap: at -$0.75 unrealized, mark
 # -------------- UNIVERSAL $0.40 HARD STOP-LOSS --------------------------------
 # If unrealized loss on any single position reaches $0.40, market sell immediately.
 # Overrides ALL other sizing and exit logic. No single trade can ever lose more.
+# Active monitoring runs every POLL_SECONDS (1.0s) — well under the 5s minimum.
 STOP_LOSS_USD = 0.40
 
 # -------------- POSITION SIZE CAP (2% of portfolio) ---------------------------
@@ -292,8 +293,10 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
-MAX_LOSS_AT_EXPIRY_USD = 0.75         # Pre-trade gate: max possible loss if contract settles at $0.
-                                      # Matches hard stop. Makes blowups physically impossible at expiry.
+MAX_LOSS_AT_EXPIRY_USD = 0.40         # Pre-trade gate: max possible loss if contract settles at $0.
+                                      # Matches STOP_LOSS_USD. If market closes before stop-loss fires,
+                                      # position size ensures total loss <= $0.40.
+                                      # max_contracts = floor($0.40 / cost_per_contract).
 
 # -------------- PROFIT LOCK (protect winning sessions) -------------------------
 PNL_LOCK_TIER1_USD = 2.00            # At +$2.00 session P/L: reduce to 50% size
@@ -2905,7 +2908,9 @@ def main() -> None:
                 st.side = "yes" if pos > 0 else "no"
                 log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side}")
             
-            # Check dump conditions continuously
+            # Check dump conditions continuously (every POLL_SECONDS = 1.0s).
+            # The $0.40 stop-loss fires FIRST in should_dump_position(),
+            # monitoring unrealized P&L every poll cycle (well under 5s minimum).
             if ENABLE_DUMP and secs_to_close is not None:
                 spot = fetch_xrp_spot_usd(http)
                 if spot is not None:
@@ -3727,6 +3732,32 @@ def main() -> None:
         if secs_to_close <= 10 and p_gate >= 0.96:
             use_post_only = False
             log.info(f"[LAST RESORT TAKER] T-{secs_to_close}s p={p_gate:.4f} ≥ 96% — switching to taker for fill")
+
+        # === COMPREHENSIVE PRE-TRADE LOG ===
+        cost_per_contract = int(chosen_px) / 100.0
+        worst_case_loss = cost_per_contract * qty
+        if chosen_side == "yes":
+            # Recompute YES gate values for logging
+            if lo is not None and sigma_used > 0:
+                log_expected_move = sigma_used * math.sqrt(YES_GATE_WINDOW_SECONDS)
+                log_price_move_pct = (spot - lo) / log_expected_move if log_expected_move > 0 else 0.0
+            else:
+                log_price_move_pct = 1.0
+            log_minutes_remaining = secs_to_close / 60.0 if secs_to_close is not None else 99.0
+            log_g_prob = f"PASS({p_yes_blend:.1%}≥{YES_GATE_MIN_PROB:.0%})" if p_yes_blend >= YES_GATE_MIN_PROB else f"FAIL({p_yes_blend:.1%}<{YES_GATE_MIN_PROB:.0%})"
+            log_g_move = f"PASS({log_price_move_pct:.0%}≥{YES_GATE_MIN_MOVE_PCT:.0%})" if log_price_move_pct >= YES_GATE_MIN_MOVE_PCT else f"FAIL({log_price_move_pct:.0%}<{YES_GATE_MIN_MOVE_PCT:.0%})"
+            log_g_time = f"PASS({log_minutes_remaining:.1f}min<8min)" if (secs_to_close is not None and secs_to_close <= YES_GATE_MAX_SECS) else f"FAIL({log_minutes_remaining:.1f}min≥8min)"
+            log_g_price = f"PASS({chosen_px}¢≥{YES_GATE_MIN_CONTRACT_PRICE}¢)" if int(chosen_px) >= YES_GATE_MIN_CONTRACT_PRICE else f"FAIL({chosen_px}¢<{YES_GATE_MIN_CONTRACT_PRICE}¢)"
+        else:
+            log_g_prob = "N/A(NO)"
+            log_g_move = "N/A(NO)"
+            log_g_time = "N/A(NO)"
+            log_g_price = "N/A(NO)"
+        log.warning(
+            f"[TRADE LOG] side={chosen_side.upper()} contracts={qty} "
+            f"cost_per_contract=${cost_per_contract:.2f} worst_case_loss=${worst_case_loss:.2f} "
+            f"gates: prob={log_g_prob} move={log_g_move} time={log_g_time} price={log_g_price}"
+        )
 
         payload = build_order_payload(
             market_ticker=st.market,
