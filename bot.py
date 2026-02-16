@@ -341,6 +341,18 @@ MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — o
 #   Effectively: qty ≤ 5 × ($0.04/$0.96) × bankroll_fraction → much smaller at high prices
 NUKE_MAX_WINS_ERASED = 5  # One loss should never wipe more than 5 winning trades
 
+# -------------- NO-SIDE CONTRACT CEILING (BTC-specific) -----------------------
+# 5 of 6 BTC blowups were NO side. Even with Kelly + nuke cap, a high-confidence
+# NO signal can result in too many contracts. Hard ceiling prevents that.
+MAX_NO_CONTRACTS = 5  # Hard cap on NO contracts regardless of Kelly output
+
+# -------------- TRAILING STOP ON WINNERS --------------------------------------
+# Too many BTC trades go to +$0.30-$0.50 then give it all back at settlement.
+# Once up $0.15, trail $0.10 below peak unrealized P&L. Lock in gains.
+TRAILING_STOP_ENABLED = True
+TRAILING_STOP_ACTIVATE_USD = 0.15  # Activate once unrealized P&L hits +$0.15
+TRAILING_STOP_TRAIL_USD = 0.10     # Exit if P&L drops $0.10 below peak
+
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
 DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
@@ -1633,6 +1645,9 @@ class BotState:
     # Avoids false reversal signals from thin-book spikes ratcheting up all-time peak
     prob_history: list = field(default_factory=list)  # List[Tuple[float, float]]
 
+    # Trailing stop: track peak unrealized P&L for locking in gains
+    peak_unrealized_pnl: float = 0.0
+
     # Deferred settlement: when we can't get result at roll time, check later
     pending_settlement_market: Optional[str] = None
     pending_settlement_side: Optional[str] = None
@@ -2456,6 +2471,19 @@ def compute_scalp_qty(
         )
         target_qty = max_qty_for_loss
 
+    # HARD STOP BACKSTOP: scalp settlement loss must also stay under HARD_STOP_LOSS_USD.
+    # This was missing — scalps at 15% of balance could risk $5+ on a $36 bankroll.
+    if cost_per > 0:
+        max_qty_hard = int(HARD_STOP_LOSS_USD / cost_per)
+        if max_qty_hard < 1:
+            max_qty_hard = 1
+        if target_qty > max_qty_hard:
+            log.warning(
+                f"[SCALP HARD CAP] Capping scalp {target_qty} -> {max_qty_hard} "
+                f"(settlement loss ${target_qty * cost_per:.2f} > ${HARD_STOP_LOSS_USD:.2f})"
+            )
+            target_qty = max_qty_hard
+
     target_qty = max(0, min(target_qty, MAX_CONTRACTS))
 
     if target_qty > 0:
@@ -2468,6 +2496,55 @@ def compute_scalp_qty(
         )
 
     return target_qty
+
+
+def validate_position_size(
+    side: str,
+    entry_cents: int,
+    num_contracts: int,
+    existing_qty: int = 0,
+    existing_entry_cents: int = 0,
+    max_loss: float = HARD_STOP_LOSS_USD,
+) -> int:
+    """Universal last-gate validation: cap contracts so max possible loss <= max_loss.
+
+    This runs RIGHT BEFORE every place_order BUY call. Even if every upstream
+    sizing function has bugs, this makes blowups physically impossible.
+
+    For add-on orders (scalps on existing positions), pass existing_qty and
+    existing_entry_cents so the COMBINED position is capped.
+    """
+    if num_contracts <= 0 or entry_cents <= 0:
+        return num_contracts
+
+    cost_new = float(entry_cents) / 100.0
+    # Existing position risk
+    cost_existing = (float(existing_entry_cents) / 100.0) * existing_qty if existing_qty > 0 else 0.0
+    # Budget remaining for new contracts
+    budget = max_loss - cost_existing
+    if budget <= 0:
+        log.warning(
+            f"[VALIDATE] BLOCKED — existing position already risks "
+            f"${cost_existing:.2f} >= ${max_loss:.2f} cap"
+        )
+        return 0
+
+    max_new = int(budget / cost_new) if cost_new > 0 else num_contracts
+    if max_new < 1:
+        max_new = 1  # Allow at least 1 if there's any budget
+
+    if num_contracts > max_new:
+        log.warning(
+            f"[VALIDATE] SIZE_CAPPED | side={side} | entry={entry_cents}¢ | "
+            f"original={num_contracts} | capped={max_new} | "
+            f"existing_risk=${cost_existing:.2f} | "
+            f"max_loss_before=${cost_existing + cost_new * num_contracts:.2f} | "
+            f"max_loss_after=${cost_existing + cost_new * max_new:.2f} | "
+            f"cap=${max_loss:.2f}"
+        )
+        return max_new
+
+    return num_contracts
 
 
 def evaluate_scalp(
@@ -2958,6 +3035,35 @@ def main() -> None:
                             yes_bid=yes_bid, no_bid=no_bid,
                         )
 
+                        # --- TRAILING STOP ON WINNERS ---
+                        # Once position is up $0.15, trail $0.10 below peak.
+                        # Uses bid price for accurate P&L (not model estimate).
+                        if TRAILING_STOP_ENABLED and not should_dump and st.entry_price_cents is not None and st.qty > 0:
+                            if st.side == "yes":
+                                _ts_bid = yes_bid if yes_bid is not None else int(p_yes_blend * 100)
+                            else:
+                                _ts_bid = no_bid if no_bid is not None else int(p_no_blend * 100)
+                            _ts_pnl = (_ts_bid - st.entry_price_cents) * st.qty / 100.0
+
+                            # Update peak unrealized P&L
+                            if _ts_pnl > st.peak_unrealized_pnl:
+                                st.peak_unrealized_pnl = _ts_pnl
+
+                            # If we've reached the activation threshold, check trail
+                            if st.peak_unrealized_pnl >= TRAILING_STOP_ACTIVATE_USD:
+                                _ts_floor = st.peak_unrealized_pnl - TRAILING_STOP_TRAIL_USD
+                                if _ts_pnl <= _ts_floor:
+                                    should_dump = True
+                                    dump_reason = (
+                                        f"trailing_stop_pnl=${_ts_pnl:.2f}_peak=${st.peak_unrealized_pnl:.2f}"
+                                        f"_floor=${_ts_floor:.2f}"
+                                    )
+                                    log.warning(
+                                        f"[TRAILING STOP] P&L ${_ts_pnl:.2f} dropped below "
+                                        f"${_ts_floor:.2f} (peak ${st.peak_unrealized_pnl:.2f} - "
+                                        f"${TRAILING_STOP_TRAIL_USD:.2f} trail) — locking in gains"
+                                    )
+
                         # Log dump check status periodically
                         if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                             time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
@@ -3073,6 +3179,11 @@ def main() -> None:
                                         except Exception:
                                             flip_qty = MIN_CONTRACTS
 
+                                        # NO cap + universal validation on flip
+                                        if flip_side == "no" and flip_qty > MAX_NO_CONTRACTS:
+                                            flip_qty = MAX_NO_CONTRACTS
+                                        flip_qty = validate_position_size(flip_side, int(flip_price), flip_qty)
+
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
@@ -3108,6 +3219,7 @@ def main() -> None:
                                                 st.qty = flip_filled  # Actual filled qty
                                                 st.peak_prob_for_side = flip_prob
                                                 st.prob_history = []  # Reset windowed peak tracking for flipped position
+                                                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
                                                 st.has_flipped = True
                                                 st.traded_this_market = True
                                                 if flip_filled < flip_qty:
@@ -3225,6 +3337,14 @@ def main() -> None:
                                                 scalp_dist = 0.0
                                             scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
                                             scalp_qty = min(scalp_qty, scalp_room)  # Enforce position cap
+
+                                            # UNIVERSAL VALIDATION: cap scalp so COMBINED position
+                                            # (existing + scalp) can't lose more than $1.00 at settlement.
+                                            scalp_qty = validate_position_size(
+                                                st.side, scalp_px, scalp_qty,
+                                                existing_qty=abs(pos),
+                                                existing_entry_cents=st.entry_price_cents or 0,
+                                            )
 
                                         if scalp_qty > 0:
                                             scalp_payload = build_order_payload(
@@ -3660,6 +3780,19 @@ def main() -> None:
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
 
+        # NO-SIDE CONTRACT CEILING: 5 of 6 BTC blowups were NO side.
+        # Hard cap regardless of Kelly output.
+        if chosen_side == "no" and qty > MAX_NO_CONTRACTS:
+            log.warning(
+                f"[NO CAP] Capping NO qty {qty} -> {MAX_NO_CONTRACTS} "
+                f"(hard ceiling for BTC NO side)"
+            )
+            qty = MAX_NO_CONTRACTS
+
+        # UNIVERSAL VALIDATION: absolute last gate before order.
+        # Makes blowups physically impossible even if all upstream sizing has bugs.
+        qty = validate_position_size(chosen_side, int(chosen_px), qty)
+
         # Apply drawdown size multiplier if recovering from drawdown pause
         dd_mult = session.get_drawdown_size_multiplier()
         if dd_mult < 1.0 and qty > 0:
@@ -3739,6 +3872,7 @@ def main() -> None:
                 st.qty = filled_qty  # Use actual filled qty, not intended
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
                 if filled_qty < qty:
                     log.warning(f"[FILL] Partial fill: got {filled_qty}/{qty} contracts — canceling remainder")
                     cancel_order_status(client, oid)
@@ -3757,6 +3891,7 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
             elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
@@ -3776,6 +3911,7 @@ def main() -> None:
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
+                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
                 resting_reason = "maker" if use_post_only else "locked_book"
                 log.warning(
                     f"[FILL] Order {oid} resting ({resting_reason}) @ {chosen_px}¢ × {qty} — "
