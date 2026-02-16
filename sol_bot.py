@@ -14,7 +14,7 @@
 # - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
 # - EDGE_MIN=0.04 (4% real edge — loosened from 5% to increase volume)
 # - MIN_PAYOFF=8¢/contract (hard floor — no penny wins, max entry=92¢)
-# - HARD_MAX_LOSS=$0.75 (absolute ceiling — tighter than other bots, protects SOL's edge)
+# - HARD_MAX_LOSS=$0.40 (absolute ceiling — never lose more than $0.40 on any trade)
 # - COLD_START: first 2 trades after restart at half size
 # - KELLY=0.20 (fifth-Kelly — proven sizing from +$0.84 session)
 # - SOL-AWARE BAIL: only dump if SOL has moved against us, not book noise
@@ -135,14 +135,17 @@ ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 
-# -------------- NO-SIDE BIAS (DISABLED — not present during proven session) --------
-# Was added with the 75% sizing increase that caused -$2.61/-$2.70 losses.
-# Rolling back to proven afternoon session state where max loss was -$0.43.
-# Can re-enable after the bot stabilizes at proven sizing.
-NO_BIAS_ENABLED = False
-NO_PROB_DISCOUNT = 0.03        # NO needs 3% less probability to enter (e.g., 90% becomes 87%)
-NO_EDGE_BONUS = 0.01           # Add 1% virtual edge to NO when comparing sides
-NO_SIZING_MULTIPLIER = 1.25    # Size NO positions 25% larger than YES
+# -------------- SIDE BIAS (data-driven: NO produces consistent small wins, YES had blowup) --------
+# SOL NO: +$1.80 lifetime, consistent small wins, ideal R:R
+# SOL YES: -$1.65 lifetime, -$1.81 blowup — needs smaller sizing
+# Size NO up 20%, YES down 40%.  Entry logic unchanged — only sizing affected.
+SIDE_BIAS_ENABLED = True
+NO_SIZING_MULTIPLIER = 1.20    # NO positions sized 20% larger (proven edge)
+YES_SIZING_MULTIPLIER = 0.60   # YES positions sized 40% smaller (blowup protection)
+NO_PROB_DISCOUNT = 0.0         # No entry threshold changes — keep the proven model
+NO_EDGE_BONUS = 0.0            # No edge threshold changes
+# Legacy alias (referenced in choose_trade tiebreaker)
+NO_BIAS_ENABLED = SIDE_BIAS_ENABLED
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -304,15 +307,15 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # ROLLED BACK from 0.14 — max 8% of balance at risk per trade
 
 # -------------- ABSOLUTE DOLLAR LOSS CAP ------------------
-# SOL is close to consistently profitable — tighter cap protects the edge.
-# 2 blowups at -$2.61/-$2.70 would be -$1.50 total with this cap.
-# Normal SOL losses are -$0.07 to -$0.21 so $0.75 gives 3.5x headroom.
+# $0.40 hard stop. Never allow a single trade to lose more than $0.40
+# under any circumstances. This overrides all other sizing and exit logic.
 # Enforced PRE-TRADE (caps position size), IN-TRADE (forces bail),
 # and by the independent stop-loss monitor (uses actual bid prices).
-HARD_MAX_LOSS_USD = 0.75  # ABSOLUTE CEILING: no single trade can lose more than $0.75
-SOFT_STOP_LOSS_USD = 0.40 # SOFT CAP: at -$0.40 unrealized, submit limit sell to exit gracefully
-# Overnight uses tighter soft stop (SOL overnight sessions showed -$2.61/-$2.70 blowups)
-OVERNIGHT_SOFT_STOP_USD = 0.30
+HARD_MAX_LOSS_USD = 0.40  # ABSOLUTE CEILING: no single trade can lose more than $0.40
+PORTFOLIO_RISK_FRACTION = 0.02  # Max risk per trade = 2% of portfolio balance
+SOFT_STOP_LOSS_USD = 0.30 # SOFT CAP: at -$0.30 unrealized, submit limit sell to exit gracefully
+# Overnight uses tighter soft stop
+OVERNIGHT_SOFT_STOP_USD = 0.25
 
 # -------------- INDEPENDENT STOP-LOSS (runs BEFORE strategy, CANNOT be overridden) --------
 # This is the #1 risk fix. Previous stop-loss was embedded in should_dump_position()
@@ -1272,6 +1275,9 @@ class SessionState:
     # Soft stop tracking: avoid re-sending soft stop orders
     soft_stop_sent_for_market: Optional[str] = None
 
+    # Milestone tracking: log withdrawal prompts at $5 increments
+    next_milestone: float = 30.0  # Start tracking from $30
+
     # Post-cooldown reevaluation: require extra edge after loss streak
     _post_cooldown_boost: bool = False
 
@@ -1316,6 +1322,11 @@ class SessionState:
             f"[SESSION] Balance update: ${balance_usd:.2f} "
             f"(started=${self.starting_balance_usd:.2f}, daily_pnl=${self.daily_pnl_usd:.2f})"
         )
+        # Initialize next_milestone based on current balance (snap to next $5 above)
+        if self.next_milestone < 30.0 or balance_usd >= self.next_milestone:
+            self.next_milestone = math.ceil(balance_usd / 5.0) * 5.0
+            if self.next_milestone <= balance_usd:
+                self.next_milestone += 5.0
         # Check daily hard stop
         self._check_daily_stop()
 
@@ -1412,6 +1423,30 @@ class SessionState:
             f"W/L={self.total_wins}/{self.total_losses} "
             f"streak={self.consecutive_wins}W/{self.consecutive_losses}L"
         )
+
+        # Milestone tracking
+        self._check_milestones()
+
+    def _check_milestones(self):
+        """Track portfolio milestones at $5 increments. Log withdrawal prompts."""
+        bal = self.current_balance_usd
+        distance = self.next_milestone - bal
+        log.info(
+            f"[MILESTONE] balance=${bal:.2f} next_milestone=${self.next_milestone:.2f} "
+            f"distance_to_milestone=${distance:.2f}"
+        )
+        # Check if we crossed the next milestone
+        while bal >= self.next_milestone:
+            if self.next_milestone >= 100.0:
+                log.warning(
+                    f"[MILESTONE] PROFIT_CAP_HIT: balance=${bal:.2f} >= $100 — withdraw all above $100"
+                )
+                self.next_milestone += 5.0
+            else:
+                log.warning(
+                    f"[MILESTONE] MILESTONE_HIT: ${self.next_milestone:.0f} — withdraw $1"
+                )
+                self.next_milestone += 5.0
 
     def _scale_up(self):
         """Win: legacy counter (sizing now uses Kelly bankroll fraction)."""
@@ -3866,12 +3901,18 @@ def main() -> None:
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
 
-        # NO-SIDE SIZING BOOST (currently disabled — not in proven session)
-        if NO_BIAS_ENABLED and chosen_side == "no" and NO_SIZING_MULTIPLIER > 1.0:
-            old_qty = qty
-            qty = min(MAX_CONTRACTS, int(qty * NO_SIZING_MULTIPLIER))
-            if qty > old_qty:
-                log.info(f"[NO BIAS] Sizing up NO: {old_qty} → {qty} contracts (×{NO_SIZING_MULTIPLIER})")
+        # SIDE BIAS: NO ×1.2, YES ×0.6 (data-driven)
+        if SIDE_BIAS_ENABLED:
+            if chosen_side == "no":
+                old_qty = qty
+                qty = min(MAX_CONTRACTS, max(MIN_CONTRACTS, int(qty * NO_SIZING_MULTIPLIER)))
+                if qty != old_qty:
+                    log.info(f"[SIDE BIAS] NO: {old_qty} → {qty} contracts (×{NO_SIZING_MULTIPLIER})")
+            elif chosen_side == "yes":
+                old_qty = qty
+                qty = max(MIN_CONTRACTS, int(qty * YES_SIZING_MULTIPLIER))
+                if qty != old_qty:
+                    log.info(f"[SIDE BIAS] YES: {old_qty} → {qty} contracts (×{YES_SIZING_MULTIPLIER})")
 
         # === POSITION SIZE ADJUSTMENTS (applied in order) ===
         base_qty = qty
@@ -3910,17 +3951,32 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # PRE-TRADE MAX LOSS CHECK: reject if max possible loss > $1.00
-        # YES: max_loss = entry_price * qty (price can go to $0)
-        # NO: max_loss = (100 - entry_price) * qty (price can go to $1)
+        # PRE-TRADE POSITION SIZE VALIDATION
+        # Two independent caps — the tighter one wins:
+        #   1. HARD DOLLAR CAP: max loss never > $0.40
+        #   2. PORTFOLIO % CAP: max loss never > 2% of current balance
         cost_per_contract = int(chosen_px) / 100.0
         max_possible_loss = cost_per_contract * qty
+
+        # Cap 1: absolute dollar cap
         if max_possible_loss > HARD_MAX_LOSS_USD:
             old_qty = qty
             qty = max(MIN_CONTRACTS, int(HARD_MAX_LOSS_USD / cost_per_contract))
             log.warning(
                 f"[PRE-TRADE CAP] max_loss=${max_possible_loss:.2f} > ${HARD_MAX_LOSS_USD:.2f}: "
                 f"reducing {old_qty} -> {qty} contracts"
+            )
+            max_possible_loss = cost_per_contract * qty
+
+        # Cap 2: 2% of portfolio balance
+        max_risk_usd = session.current_balance_usd * PORTFOLIO_RISK_FRACTION
+        if max_risk_usd > 0 and max_possible_loss > max_risk_usd:
+            suggested = qty
+            qty = max(MIN_CONTRACTS, int(max_risk_usd / cost_per_contract))
+            log.warning(
+                f"[PORTFOLIO CAP] suggested_size={suggested} capped_size={qty} "
+                f"portfolio_balance=${session.current_balance_usd:.2f} "
+                f"max_risk_amount=${max_risk_usd:.2f}"
             )
 
         use_post_only = POST_ONLY
