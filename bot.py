@@ -136,7 +136,7 @@ NO_ONLY = env_bool("NO_ONLY", False)      # Trade only NO side (overrides YES_ON
 # Treat YES like a scalp — last 60 seconds, locked outcome, bonus money.
 YES_PROB_BONUS = 0.14       # YES needs 97% prob in last 3 min (impossible earlier)
 YES_EDGE_BONUS = 0.04       # YES needs 7% total edge
-YES_MAX_ENTRY_PRICE = 85    # YES capped at 85¢ (15¢ profit/win, nuke ratio 5.7:1)
+YES_MAX_ENTRY_PRICE = 96    # YES price cap in choose_trade (ultra-strict gate enforces >=92¢ minimum)
 YES_REQUIRE_TREND = True    # YES always requires trend alignment — no fast lane
 YES_REQUIRE_BOTH_TRENDS = True  # YES must have BOTH 60-min AND 30-min BTC trend aligned
 YES_MIN_BTC_DISTANCE = 200.0    # YES only if BTC is $200+ above floor (physically locked)
@@ -148,7 +148,7 @@ YES_MAX_SECONDS = 60            # YES only in last 60 seconds (scalp timing — 
 YES_ULTRA_MIN_PROB = 0.92       # (1) Model probability must exceed 92%
 YES_ULTRA_MIN_MOVE_PCT = 0.60   # (2) BTC must have completed 60%+ of the expected range move
 YES_ULTRA_MAX_SECONDS = 420     # (3) Fewer than 7 minutes remaining (420s)
-YES_ULTRA_MAX_SPREAD = 8        # (4) Spread to $1.00 must be ≤ 8 cents (market agrees near-certain)
+YES_ULTRA_MIN_PRICE = 92        # (4) YES contract price must be >= 92 cents (market agrees near-certain)
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -2588,8 +2588,14 @@ def compute_qty_from_bankroll(
     # max_qty × cost_per ≤ HARD_STOP_LOSS_USD → max_qty = HARD_STOP_LOSS_USD / cost_per
     if cost_per > 0:
         max_qty_hard_stop = int(HARD_STOP_LOSS_USD / cost_per)
-        if max_qty_hard_stop < MIN_CONTRACTS:
-            max_qty_hard_stop = MIN_CONTRACTS
+        # CRITICAL: If one contract costs more than the hard stop cap, DO NOT TRADE.
+        # Previously floored to MIN_CONTRACTS=1 which allowed $0.89 loss through $0.40 cap.
+        if max_qty_hard_stop <= 0:
+            log.warning(
+                f"[HARD STOP BLOCK] cost_per=${cost_per:.2f} > HARD_STOP=${HARD_STOP_LOSS_USD:.2f} — "
+                f"single contract exceeds max loss cap, CANNOT TRADE at {entry_cents}¢"
+            )
+            return 0
         if target_qty > max_qty_hard_stop:
             log.warning(
                 f"[HARD STOP SIZE] Capping qty {target_qty} -> {max_qty_hard_stop} so full "
@@ -2651,8 +2657,12 @@ def compute_scalp_qty(
     # This was missing — scalps at 15% of balance could risk $5+ on a $36 bankroll.
     if cost_per > 0:
         max_qty_hard = int(HARD_STOP_LOSS_USD / cost_per)
-        if max_qty_hard < 1:
-            max_qty_hard = 1
+        if max_qty_hard <= 0:
+            log.warning(
+                f"[SCALP HARD BLOCK] cost_per=${cost_per:.2f} > ${HARD_STOP_LOSS_USD:.2f} — "
+                f"single scalp contract exceeds max loss, blocking"
+            )
+            return 0
         if target_qty > max_qty_hard:
             log.warning(
                 f"[SCALP HARD CAP] Capping scalp {target_qty} -> {max_qty_hard} "
@@ -2706,8 +2716,17 @@ def validate_position_size(
         return 0
 
     max_new = int(budget / cost_new) if cost_new > 0 else num_contracts
-    if max_new < 1:
-        max_new = 1  # Allow at least 1 if there's any budget
+
+    # CRITICAL: If one contract costs more than remaining budget, DO NOT TRADE.
+    # This was the root cause of -$0.89 loss through $0.40 cap.
+    # Previously: "if max_new < 1: max_new = 1" which allowed trades over the cap.
+    if max_new <= 0:
+        log.warning(
+            f"[VALIDATE] BLOCKED — cost_per=${cost_new:.2f} > budget=${budget:.2f} "
+            f"(cap=${max_loss:.2f} - existing=${cost_existing:.2f}) | "
+            f"side={side} entry={entry_cents}¢ — single contract exceeds max loss"
+        )
+        return 0
 
     if num_contracts > max_new:
         log.warning(
@@ -3876,13 +3895,13 @@ def main() -> None:
         #   1. Probability > 92%
         #   2. Price move completed >= 60% of range
         #   3. Less than 7 minutes remaining
-        #   4. Spread to $1.00 <= 8 cents
+        #   4. YES contract price >= 92 cents (market agrees near-certain)
         # Plus all existing physical-lock gates (daytime, trends, distance, vol).
         # =============================================================
         if chosen_side == "yes" and not YES_ONLY:
             # Compute the 4 ultra-strict conditions
             _yes_prob = current_prob_for_side
-            _yes_spread = 100 - int(chosen_px)  # cents between YES price and $1.00
+            _yes_price = int(chosen_px)  # YES contract price in cents
             _yes_mins_remaining = secs_to_close / 60.0 if secs_to_close else 99.0
 
             # Price move % completed: how far BTC is through the range toward YES
@@ -3900,8 +3919,8 @@ def main() -> None:
                 _yes_failed.append("move_pct")
             if secs_to_close > YES_ULTRA_MAX_SECONDS:
                 _yes_failed.append("time")
-            if _yes_spread > YES_ULTRA_MAX_SPREAD:
-                _yes_failed.append("spread")
+            if _yes_price < YES_ULTRA_MIN_PRICE:
+                _yes_failed.append("price")
 
             # If ANY condition fails, skip and log
             if _yes_failed:
@@ -3909,7 +3928,7 @@ def main() -> None:
                     f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
                     f"market_id={st.market} confidence={_yes_prob:.1%} "
                     f"price_move_pct={_yes_move_pct:.1%} "
-                    f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                    f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                     f"which_condition_failed={','.join(_yes_failed)}"
                 )
                 yes_tracker.record_opportunity_skipped(_yes_failed)
@@ -3928,7 +3947,7 @@ def main() -> None:
                             f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
                             f"market_id={st.market} confidence={_yes_prob:.1%} "
                             f"price_move_pct={_yes_move_pct:.1%} "
-                            f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                            f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                             f"which_condition_failed=daytime_block"
                         )
                         yes_tracker.record_opportunity_skipped(["daytime_block"])
@@ -3943,7 +3962,7 @@ def main() -> None:
                     f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
                     f"market_id={st.market} confidence={_yes_prob:.1%} "
                     f"price_move_pct={_yes_move_pct:.1%} "
-                    f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                    f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                     f"which_condition_failed=time_lock_60s"
                 )
                 yes_tracker.record_opportunity_skipped(["time_lock_60s"])
@@ -3959,7 +3978,7 @@ def main() -> None:
                         f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
                         f"market_id={st.market} confidence={_yes_prob:.1%} "
                         f"price_move_pct={_yes_move_pct:.1%} "
-                        f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                        f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                         f"which_condition_failed=trend_alignment "
                         f"60m={alignment_60} 30m={alignment_30}"
                     )
@@ -3976,7 +3995,7 @@ def main() -> None:
                         f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
                         f"market_id={st.market} confidence={_yes_prob:.1%} "
                         f"price_move_pct={_yes_move_pct:.1%} "
-                        f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                        f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                         f"which_condition_failed=btc_distance "
                         f"dist=${btc_above_floor:.0f} need=${YES_MIN_BTC_DISTANCE:.0f}"
                     )
@@ -3992,7 +4011,7 @@ def main() -> None:
                     f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
                     f"market_id={st.market} confidence={_yes_prob:.1%} "
                     f"price_move_pct={_yes_move_pct:.1%} "
-                    f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                    f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                     f"which_condition_failed=volatility "
                     f"dist=${btc_above_floor:.0f} 3σ√t=${max_move:.0f}"
                 )
@@ -4007,7 +4026,7 @@ def main() -> None:
                 f"timestamp={datetime.now(timezone.utc).isoformat()}Z "
                 f"market_id={st.market} confidence={_yes_prob:.1%} "
                 f"price_move_pct={_yes_move_pct:.1%} "
-                f"minutes_remaining={_yes_mins_remaining:.1f} spread={_yes_spread}¢ "
+                f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
                 f"btc_dist=${btc_above_floor:.0f} 3σ√t=${max_move:.0f}"
             )
 
@@ -4052,7 +4071,8 @@ def main() -> None:
             continue
 
         # BTC-SPECIFIC: YES position sizing reduced by 50%.
-        if chosen_side == "yes" and YES_POSITION_SIZE_MULT < 1.0:
+        # Guard: if qty==0 (hard stop blocked), don't override with MIN_CONTRACTS.
+        if chosen_side == "yes" and YES_POSITION_SIZE_MULT < 1.0 and qty > 0:
             qty = max(MIN_CONTRACTS, int(qty * YES_POSITION_SIZE_MULT))
             adjustment_reason = f"YES_SIZE_MULT={YES_POSITION_SIZE_MULT}"
 
@@ -4069,13 +4089,30 @@ def main() -> None:
         if qty < pre_validate_qty:
             adjustment_reason = f"VALIDATE_CAP={qty}"
 
-        # BTC-SPECIFIC LOGGING: show side, confidence, raw and adjusted sizes.
+        # PRE-TRADE COMPREHENSIVE LOG: every trade must show worst-case analysis.
+        # This is the canonical audit trail for verifying the $0.40 hard stop works.
+        cost_per_contract = int(chosen_px) / 100.0 if chosen_side == "yes" else (100 - int(chosen_px)) / 100.0
+        worst_case_loss = qty * cost_per_contract
+        hard_stop_pass = worst_case_loss <= HARD_STOP_LOSS_USD or qty == 0
         log.warning(
-            f"[BTC ADJ] side={chosen_side.upper()} confidence={p_gate:.1%} "
-            f"raw_position_size={raw_qty} adjusted_position_size={qty} "
-            f"reason={adjustment_reason} edge={edge_net:.4f} "
-            f"price={chosen_px}¢ bankroll=${available_usd:.2f}"
+            f"[PRE-TRADE] side={chosen_side.upper()} contracts={qty} "
+            f"cost_per=${cost_per_contract:.2f} worst_case_loss=${worst_case_loss:.2f} "
+            f"hard_stop_cap=${HARD_STOP_LOSS_USD:.2f} "
+            f"PASS={'YES' if hard_stop_pass else '*** BLOCKED ***'} | "
+            f"confidence={p_gate:.1%} edge={edge_net:.4f} "
+            f"price={chosen_px}¢ raw_qty={raw_qty} adj_qty={qty} "
+            f"reason={adjustment_reason} bankroll=${available_usd:.2f} "
+            f"market={st.market}"
         )
+        # SAFETY: If worst-case exceeds hard stop, block the trade.
+        # This should never happen if upstream sizing is correct, but defense-in-depth.
+        if not hard_stop_pass and qty > 0:
+            log.error(
+                f"[PRE-TRADE BLOCKED] worst_case=${worst_case_loss:.2f} > "
+                f"hard_stop=${HARD_STOP_LOSS_USD:.2f} — REFUSING TRADE | "
+                f"side={chosen_side} price={chosen_px}¢ qty={qty}"
+            )
+            qty = 0
 
         # Apply drawdown size multiplier if recovering from drawdown pause
         dd_mult = session.get_drawdown_size_multiplier()
