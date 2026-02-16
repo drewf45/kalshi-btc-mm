@@ -10,7 +10,7 @@
 # - Dump is ABORT ONLY — safety net, not a regular exit
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
 #
-# KEY SETTINGS (v8 — YES 150% conviction gate):
+# KEY SETTINGS (v8 — 10-session optimization):
 # - YES RE-ENABLED with 150% CONVICTION MULTIPLIER: 0-for-9 lifetime, -$3.44.
 #   Not disabled — but must clear 150% of normal conviction to enter.
 #   Prob floors: 95% late, 99% mid/early + 8% edge + 75¢ max + trend aligned.
@@ -18,11 +18,14 @@
 # - HARD $1.00 MAX LOSS PER TRADE — 3 layers of enforcement:
 #   1) Entry sizing: max_possible_loss capped at $1.00 before order placed
 #   2) Dump trigger: loss calc uses worst-of(model, market bid) — no blind spots
-#   3) Independent pre-order gate: rejects oversized positions as last defense
+#   3) Independent pre-order gate: both sides use entry_price × qty (NO bug fixed)
+# - NO VOLUME BOOST: prob thresholds lowered 5 points (75% late, 78% mid, 82% early)
+#   ETH NO is 73% WR at 2-4 trades/session — more trades at this WR = more profit.
+# - MIN TAKE-PROFIT HOLD: don't dump profitable positions below $0.08 with >2min left
 # - HOLD WINNERS: reversal bail only fires on LOSING positions (not profitable ones)
 #   Avg win was $0.06 because 4% reversal threshold killed every winner.
 #   Now 10-12% threshold, and profitable positions hold to settlement.
-# - NO SIDE: prob 80-87%, 2% edge, 93¢ max, Kelly=0.25
+# - NO SIDE: prob 75-82% (loosened), 2% edge, 93¢ max, Kelly=0.25
 # - YES SIDE: 150% conviction (95% late / 99% mid+early), 8% edge, 75¢ max, Kelly=0.10, trend-aligned
 # - ROLLING DRAWDOWN: -$3 in 2hr → pause 30min, resume at 50% for 3 trades
 # - ETH-AWARE BAIL: only dump if ETH has moved against us, not book noise
@@ -185,6 +188,11 @@ CANCEL_UNFILLED_AT_CLOSE = True
 PROB_MIN = 0.80  # 80%+ to enter in last 3 min — $1 hard cap is the real protection now
 EDGE_MIN = 0.02  # 2% minimum edge — lower bar to increase volume, small sizes limit damage
 MAX_ENTRY_PRICE_CENTS = 93  # 93¢ max — win pays 7¢/ct, need ~13 wins per loss (90% WR supports this)
+
+# NO VOLUME BOOST: ETH NO is 73% WR but only 2-4 trades/session. More trades = more profit.
+# Lower NO probability threshold by 5 points to increase volume.
+# YES conviction multiplier is computed from the BASE thresholds (above), not the adjusted ones.
+NO_PROB_ADJUSTMENT = -0.05  # NO enters 5 points easier (75% late, 78% mid, 82% early)
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
@@ -295,6 +303,12 @@ DUMP_REVERSAL_MIN_SAMPLES = 5
 DUMP_EARLY_EXIT_ENABLED = True
 # Reversal during early settling phase uses a wider threshold (not blocked entirely)
 DUMP_REVERSAL_THRESHOLD_SETTLING = 0.15  # 15% drop in first 30s — near-impossible, basically hold to settle
+
+# MINIMUM TAKE-PROFIT HOLD: don't dump profitable positions with small gains.
+# Several NO wins are tiny ($0.06, $0.09). Hold for better exit if >2 min remain.
+# Only applies to non-catastrophic dump paths (bankroll stops always fire).
+MIN_TAKE_PROFIT_USD = 0.08                # Hold profitable positions until $0.08+ gain
+MIN_TAKE_PROFIT_TIME_REMAINING = 120      # Only apply the hold if >2 min remaining
 
 # -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
 # Never lose more than X% of current balance on a single trade.
@@ -1790,22 +1804,27 @@ def choose_trade(
 
     # TIME-DEPENDENT PROBABILITY GATE: earlier = need more certainty
     if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-        effective_prob_min = PROB_EARLY_MIN   # >5min: need 92%+
+        effective_prob_min = PROB_EARLY_MIN   # >5min: need 87%+
     elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-        effective_prob_min = PROB_MID_MIN     # 3-5min: need 88%+
+        effective_prob_min = PROB_MID_MIN     # 3-5min: need 83%+
     else:
-        effective_prob_min = PROB_MIN         # <3min: 85%+ — market has priced in the outcome
-        
-    # YES 150% CONVICTION: dynamic probability floor
+        effective_prob_min = PROB_MIN         # <3min: 80%+ — market has priced in the outcome
+
+    # YES 150% CONVICTION: computed from BASE thresholds (not NO-adjusted)
     # Scale "distance from coin-flip" by 1.5x: YES needs 150% of normal conviction.
     # Late: 80% → 95%, Mid: 83% → 99%, Early: 87% → 99% (capped)
     yes_prob_floor = min(0.99, 0.50 + (effective_prob_min - 0.50) * YES_CONVICTION_MULTIPLIER)
 
-    # NO side: standard thresholds (this side is profitable)
+    # NO VOLUME BOOST: lower NO probability threshold to increase trade count.
+    # ETH NO is 73% WR at 2-4 trades/session — more trades at this WR = more profit.
+    # Late: 80% → 75%, Mid: 83% → 78%, Early: 87% → 82%
+    no_prob_min = max(0.50, effective_prob_min + NO_PROB_ADJUSTMENT)
+
+    # NO side: loosened thresholds (73% WR, need more volume)
     ok_no = (
         no_px is not None
         and ok_book_no
-        and (p_no_blend >= effective_prob_min)
+        and (p_no_blend >= no_prob_min)
         and (edge_no >= EDGE_MIN)
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
@@ -1847,7 +1866,7 @@ def choose_trade(
             )
             ok_no = (
                 no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (p_no_blend >= no_prob_min) and (edge_no >= EDGE_MIN)
                 and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
             )
         elif p_no_mkt >= MARKET_CONVICTION_THRESHOLD and p_no_blend < p_no_mkt:
@@ -1868,7 +1887,7 @@ def choose_trade(
             )
             ok_no = (
                 no_px is not None and ok_book_no
-                and (p_no_blend >= effective_prob_min) and (edge_no >= EDGE_MIN)
+                and (p_no_blend >= no_prob_min) and (edge_no >= EDGE_MIN)
                 and (no_px <= MAX_ENTRY_PRICE_CENTS) and div_gate_no
             )
 
@@ -2225,6 +2244,25 @@ def should_dump_position(
                 f"overrides ETH safety, capping damage"
             )
             return True, f"catastrophic_{catastrophic_loss}c_per_contract"
+
+    # =============================================================
+    # === MINIMUM TAKE-PROFIT HOLD: don't dump small winners ===
+    # If position is profitable (est_exit > entry) and profit < $0.08,
+    # hold for a better exit if >2 min remain. The bankroll/catastrophic
+    # stops above already fired if the loss is dangerous — this just
+    # prevents dumping tiny winners prematurely.
+    # =============================================================
+    if st.entry_price_cents is not None and st.qty > 0 and secs_to_close > MIN_TAKE_PROFIT_TIME_REMAINING:
+        exit_price_est = _realistic_exit_cents()
+        gain_per_contract_cents = exit_price_est - st.entry_price_cents
+        total_gain_usd = (gain_per_contract_cents * st.qty) / 100.0
+        if total_gain_usd > 0 and total_gain_usd < MIN_TAKE_PROFIT_USD:
+            log.info(
+                f"[TAKE-PROFIT HOLD] Position profitable (+${total_gain_usd:.2f}) but below "
+                f"${MIN_TAKE_PROFIT_USD:.2f} min — holding for better exit "
+                f"(entry={st.entry_price_cents}¢ est_exit={exit_price_est}¢ t={secs_to_close}s)"
+            )
+            return False, f"take_profit_hold_${total_gain_usd:.2f}<${MIN_TAKE_PROFIT_USD:.2f}"
 
     # =============================================================
     # === ETH SAFETY CHECK: THE MASTER OVERRIDE ===
@@ -3641,18 +3679,13 @@ def main() -> None:
 
         # INDEPENDENT MAX LOSS GATE — last line of defense before order
         # This runs AFTER all sizing logic and cannot be bypassed.
-        # YES: max loss = entry_price * contracts (can settle to $0)
-        # NO:  max loss = (100 - entry_price) * contracts (can settle to $1)
-        if chosen_side == "yes":
-            max_possible_loss_usd = (chosen_px * qty) / 100.0
-        else:
-            max_possible_loss_usd = ((100 - chosen_px) * qty) / 100.0
+        # BOTH SIDES: max loss = entry_price × contracts (you pay entry_price, get $0 if wrong)
+        # On Kalshi: YES + NO = 100¢. Buying NO at 92¢ means you pay 92¢, lose 92¢ if wrong.
+        # The old formula used (100 - entry_price) for NO which calculated profit, not loss.
+        max_possible_loss_usd = (chosen_px * qty) / 100.0
         if max_possible_loss_usd > DUMP_MAX_LOSS_USD:
             old_qty = qty
-            if chosen_side == "yes":
-                qty = int(DUMP_MAX_LOSS_USD * 100 / chosen_px)
-            else:
-                qty = int(DUMP_MAX_LOSS_USD * 100 / (100 - chosen_px))
+            qty = int(DUMP_MAX_LOSS_USD * 100 / chosen_px)
             qty = max(MIN_CONTRACTS, qty)
             log.warning(
                 f"[MAX LOSS GATE] {chosen_side.upper()} @ {chosen_px}¢ × {old_qty} "
