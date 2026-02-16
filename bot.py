@@ -140,15 +140,16 @@ YES_MAX_ENTRY_PRICE = 96    # YES price cap in choose_trade (ultra-strict gate e
 YES_REQUIRE_TREND = True    # YES always requires trend alignment — no fast lane
 YES_REQUIRE_BOTH_TRENDS = True  # YES must have BOTH 60-min AND 30-min BTC trend aligned
 YES_MIN_BTC_DISTANCE = 200.0    # YES only if BTC is $200+ above floor (physically locked)
-YES_MAX_SECONDS = 60            # YES only in last 60 seconds (scalp timing — outcome decided)
+YES_MAX_SECONDS = 600           # YES within last 10 min (was 60s — too restrictive, zero fills)
 
 # -------------- ULTRA-STRICT YES GATE (4-condition simultaneous check) --------
 # YES trades should be rare but nearly guaranteed wins.
 # ALL 4 conditions must be true simultaneously or the trade is skipped.
+# RELAXED: enter earlier for better fill rates — $0.40 hard stop is the real protection.
 YES_ULTRA_MIN_PROB = 0.92       # (1) Model probability must exceed 92%
 YES_ULTRA_MIN_MOVE_PCT = 0.60   # (2) BTC must have completed 60%+ of the expected range move
-YES_ULTRA_MAX_SECONDS = 420     # (3) Fewer than 7 minutes remaining (420s)
-YES_ULTRA_MIN_PRICE = 92        # (4) YES contract price must be >= 92 cents (market agrees near-certain)
+YES_ULTRA_MAX_SECONDS = 600     # (3) Up to 10 minutes remaining (was 420s/7min — too late, no fills)
+YES_ULTRA_MIN_PRICE = 85        # (4) YES contract price must be >= 85 cents (was 92 — too close to $1, no fills)
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -167,10 +168,10 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # T-300s when probability is high AND the book still has liquidity.
 #
 # TWO PHASES:
-#   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
-#   BUY     (7min → 5s before close):   make the call, place the order, hold
+#   OBSERVE (12min → 10min before close): gather trend data, watch book, DON'T buy
+#   BUY     (10min → 5s before close):   make the call, place the order, hold
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
+BUY_START_SECONDS = 600      # Can enter from T-600s (10 min) — earlier entry = more liquidity = better fills
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
@@ -181,11 +182,11 @@ EDGE_MIN = 0.03  # 3% minimum edge — only enter with real mispricing, not penn
 MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
-# Buy window is 7min → 5s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 10-min buy window) -------
+# Buy window is 10min → 5s before close. Require more certainty at the start
 # of the buy window (BTC still has time to move), relax near the end.
-# NOTE: observation phase (12min → 7min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
+# NOTE: observation phase (12min → 10min) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 300   # 5-10 min to close = "early" part of buy window
 PROB_EARLY_MIN = 0.90            # >5min: need 90%+ (lowered from 92% — trade more markets)
 PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
 PROB_MID_MIN = 0.86              # 3-5min: need 86%+ (lowered from 88%)
@@ -364,7 +365,7 @@ MAX_NO_CONTRACTS = 5  # Hard cap on NO contracts regardless of Kelly output
 # YES has excessive losses — reduce YES position size by 50%.
 # NO is entering at insufficient confidence — raise minimum to 85%.
 YES_POSITION_SIZE_MULT = 0.50    # Multiply all YES position sizes by 0.5
-NO_MIN_CONFIDENCE = 0.85         # NO side requires 85% minimum confidence
+NO_MIN_CONFIDENCE = 0.80         # NO side requires 80% confidence (was 85% — NO is 100% profitable, let it breathe)
 
 # -------------- TRAILING STOP ON WINNERS --------------------------------------
 # Too many BTC trades go to +$0.30-$0.50 then give it all back at settlement.
@@ -1262,6 +1263,101 @@ class YesHourlyTracker:
         self.wins = 0
         self.losses = 0
         self.net_pnl_usd = 0.0
+
+
+class FillRateTracker:
+    """Track order fill rates across all order paths (main, flip, scalp).
+    Prints a summary log every hour to help tune entry timing and pricing."""
+
+    def __init__(self):
+        self.current_hour: int = -1
+        self.orders_posted: int = 0
+        self.orders_filled: int = 0
+        self.orders_partial: int = 0
+        self.orders_unfilled: int = 0
+        # Per-side tracking
+        self.yes_posted: int = 0
+        self.yes_filled: int = 0
+        self.no_posted: int = 0
+        self.no_filled: int = 0
+        # Per-path tracking
+        self.path_stats: Dict[str, Dict[str, int]] = {}  # path -> {posted, filled, unfilled}
+
+    def _maybe_rotate(self):
+        now_hour = datetime.now(timezone.utc).hour
+        if self.current_hour == -1:
+            self.current_hour = now_hour
+            return
+        if now_hour != self.current_hour:
+            self._print_summary()
+            self._reset()
+            self.current_hour = now_hour
+
+    def record_posted(self, side: str, path: str = "main"):
+        """Record an order that was posted to the exchange."""
+        self._maybe_rotate()
+        self.orders_posted += 1
+        if side == "yes":
+            self.yes_posted += 1
+        else:
+            self.no_posted += 1
+        if path not in self.path_stats:
+            self.path_stats[path] = {"posted": 0, "filled": 0, "unfilled": 0}
+        self.path_stats[path]["posted"] += 1
+
+    def record_fill(self, side: str, path: str = "main", partial: bool = False):
+        """Record an order that was filled (fully or partially)."""
+        self._maybe_rotate()
+        if partial:
+            self.orders_partial += 1
+        else:
+            self.orders_filled += 1
+        if side == "yes":
+            self.yes_filled += 1
+        else:
+            self.no_filled += 1
+        if path not in self.path_stats:
+            self.path_stats[path] = {"posted": 0, "filled": 0, "unfilled": 0}
+        self.path_stats[path]["filled"] += 1
+
+    def record_unfilled(self, side: str, path: str = "main"):
+        """Record an order that was NOT filled."""
+        self._maybe_rotate()
+        self.orders_unfilled += 1
+        if path not in self.path_stats:
+            self.path_stats[path] = {"posted": 0, "filled": 0, "unfilled": 0}
+        self.path_stats[path]["unfilled"] += 1
+
+    def _print_summary(self):
+        if self.orders_posted == 0:
+            return
+        fill_rate = (self.orders_filled + self.orders_partial) / self.orders_posted * 100
+        yes_rate = (self.yes_filled / self.yes_posted * 100) if self.yes_posted > 0 else 0
+        no_rate = (self.no_filled / self.no_posted * 100) if self.no_posted > 0 else 0
+        path_str = " | ".join(
+            f"{p}: {s['filled']}/{s['posted']}"
+            for p, s in sorted(self.path_stats.items())
+        )
+        log.warning(
+            f"[FILL RATE] hour={self.current_hour:02d}:00 UTC | "
+            f"posted={self.orders_posted} filled={self.orders_filled} "
+            f"partial={self.orders_partial} unfilled={self.orders_unfilled} "
+            f"rate={fill_rate:.0f}% | "
+            f"YES={self.yes_filled}/{self.yes_posted}({yes_rate:.0f}%) "
+            f"NO={self.no_filled}/{self.no_posted}({no_rate:.0f}%) | "
+            f"paths: {path_str or 'none'}"
+        )
+
+    def _reset(self):
+        self.orders_posted = 0
+        self.orders_filled = 0
+        self.orders_partial = 0
+        self.orders_unfilled = 0
+        self.yes_posted = 0
+        self.yes_filled = 0
+        self.no_posted = 0
+        self.no_filled = 0
+        self.path_stats = {}
 
 
 @dataclass
@@ -2862,6 +2958,20 @@ def main() -> None:
         f"HARD_STOP=${HARD_STOP_LOSS_USD:.2f} MIN_PAYOUT=${MIN_EXPECTED_PAYOUT_USD:.2f}"
     )
     log.warning(
+        f"[BOOTCFG] YES GATE: ultra_min_price={YES_ULTRA_MIN_PRICE}¢ ultra_min_prob={YES_ULTRA_MIN_PROB:.0%} "
+        f"ultra_max_secs={YES_ULTRA_MAX_SECONDS}s ultra_min_move={YES_ULTRA_MIN_MOVE_PCT:.0%} "
+        f"time_lock={YES_MAX_SECONDS}s | NO_MIN_CONF={NO_MIN_CONFIDENCE:.0%} "
+        f"BUY_WINDOW={BUY_START_SECONDS}s"
+    )
+    # IMPORTANT: Flag hard stop vs YES price interaction
+    _max_yes_for_hard_stop = int(HARD_STOP_LOSS_USD * 100)  # Max YES price allowing ≥1 contract
+    if YES_ULTRA_MIN_PRICE > _max_yes_for_hard_stop:
+        log.warning(
+            f"[BOOTCFG] *** NOTE: YES min price ({YES_ULTRA_MIN_PRICE}¢) > hard stop allows "
+            f"({_max_yes_for_hard_stop}¢ max for 1 contract). YES trades effectively BLOCKED "
+            f"by $0.40 hard stop. This is SAFE — raise hard stop to enable YES. ***"
+        )
+    log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
         f"boundary_buffer=${BOUNDARY_BUFFER_USD:.0f} trend_block={TREND_AGAINST_BLOCK}"
     )
@@ -2904,6 +3014,7 @@ def main() -> None:
     st = BotState()
     session = SessionState()
     yes_tracker = YesHourlyTracker()
+    fill_tracker = FillRateTracker()
     trend = SpotTrend()  # 60-min long-term trend
     trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
@@ -3416,6 +3527,7 @@ def main() -> None:
                                                 post_only=False,
                                             )
                                             flip_oid = place_order(client, flip_payload)
+                                            fill_tracker.record_posted(flip_side, "flip")
                                             log.warning(
                                                 f"[FLIP] Placed flip order {flip_oid} BUY {flip_side.upper()} "
                                                 f"@ {flip_price}¢ qty={flip_qty}"
@@ -3424,6 +3536,7 @@ def main() -> None:
                                             # Verify flip fill
                                             flip_fill_status, flip_filled = wait_for_fill(client, flip_oid, st.market)
                                             if flip_fill_status in ("filled", "partial") and flip_filled > 0:
+                                                fill_tracker.record_fill(flip_side, "flip", partial=(flip_fill_status == "partial"))
                                                 st.sm = SM.HOLD
                                                 st.side = flip_side
                                                 st.entry_price_cents = int(flip_price)
@@ -3443,6 +3556,7 @@ def main() -> None:
                                                 else:
                                                     log.warning(f"[FLIP] Fill confirmed: {flip_filled} contracts")
                                             else:
+                                                fill_tracker.record_unfilled(flip_side, "flip")
                                                 log.warning(f"[FLIP] Order NOT filled (status={flip_fill_status}) — canceling")
                                                 cancel_order_status(client, flip_oid)
                                                 st.sm = SM.DUMPED
@@ -3573,6 +3687,7 @@ def main() -> None:
 
                                             if not DRY_RUN:
                                                 scalp_oid = place_order(client, scalp_payload)
+                                                fill_tracker.record_posted(st.side, "scalp")
                                                 expected_profit = scalp_qty * (100 - scalp_px) / 100.0
                                                 log.warning(
                                                     f"[SCALP] PLACED order={scalp_oid} BUY {st.side.upper()} "
@@ -3582,11 +3697,13 @@ def main() -> None:
                                                 # Quick fill check for scalp (less time since we're near close)
                                                 scalp_fill_status, scalp_filled = wait_for_fill(client, scalp_oid, st.market)
                                                 if scalp_fill_status in ("filled", "partial") and scalp_filled > 0:
+                                                    fill_tracker.record_fill(st.side, "scalp", partial=(scalp_fill_status == "partial"))
                                                     st.has_scalped = True
                                                     log.warning(f"[SCALP] Fill confirmed: {scalp_filled}/{scalp_qty} contracts")
                                                     if scalp_filled < scalp_qty:
                                                         cancel_order_status(client, scalp_oid)
                                                 else:
+                                                    fill_tracker.record_unfilled(st.side, "scalp")
                                                     log.warning(f"[SCALP] NOT filled (status={scalp_fill_status}) — canceling")
                                                     cancel_order_status(client, scalp_oid)
                                             else:
@@ -4091,7 +4208,7 @@ def main() -> None:
 
         # PRE-TRADE COMPREHENSIVE LOG: every trade must show worst-case analysis.
         # This is the canonical audit trail for verifying the $0.40 hard stop works.
-        cost_per_contract = int(chosen_px) / 100.0 if chosen_side == "yes" else (100 - int(chosen_px)) / 100.0
+        cost_per_contract = int(chosen_px) / 100.0  # Both YES and NO: you pay chosen_px cents per contract
         worst_case_loss = qty * cost_per_contract
         hard_stop_pass = worst_case_loss <= HARD_STOP_LOSS_USD or qty == 0
         log.warning(
@@ -4173,6 +4290,7 @@ def main() -> None:
 
         try:
             oid = place_order(client, payload)
+            fill_tracker.record_posted(chosen_side, "main")
             log.warning(
                 f"[ORDER] PLACED {st.market} order_id={oid} BUY {chosen_side.upper()} @ {chosen_px}¢ qty={qty} "
                 f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} streak={session.consecutive_wins}W"
@@ -4182,6 +4300,7 @@ def main() -> None:
             fill_status, filled_qty = wait_for_fill(client, oid, st.market)
 
             if fill_status in ("filled", "partial") and filled_qty > 0:
+                fill_tracker.record_fill(chosen_side, "main", partial=(fill_status == "partial"))
                 st.traded_this_market = True
                 st.sm = SM.HOLD
                 st.side = chosen_side
@@ -4240,6 +4359,7 @@ def main() -> None:
                 )
             else:
                 # Taker order that should have filled but didn't — cancel and retry
+                fill_tracker.record_unfilled(chosen_side, "main")
                 log.warning(f"[FILL] Taker order {oid} NOT filled (status={fill_status}) — canceling and resetting")
                 cancel_order_status(client, oid)
                 # Do NOT set traded_this_market — let the bot retry next loop
