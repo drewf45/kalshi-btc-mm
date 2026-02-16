@@ -143,29 +143,34 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # T-300s when probability is high AND the book still has liquidity.
 #
 # TWO PHASES:
-#   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
-#   BUY     (7min → 5s before close):   make the call, place the order, hold
+#   OBSERVE (12min → 10min before close): gather trend data, watch book, DON'T buy
+#   BUY     (10min → 5s before close):   make the call, place the order, hold
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
+BUY_START_SECONDS = 600      # Can enter from T-600s (10 min) — enter earlier for better fills at 85¢+
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.88  # 88%+ to enter in last 2 min — XRP needs higher certainty than BTC (tighter boundaries)
+PROB_MIN = 0.85  # 85%+ to enter in last 5 min — lower bar for better fills, $0.40 cap protects
 EDGE_MIN = 0.02  # 2% minimum edge — POST_ONLY gives 1-3¢ better fills, so 2% is achievable and profitable
 MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
-# Buy window is 7min → 5s before close. Require more certainty at the start
+# -------------- TIME-DEPENDENT CERTAINTY (within the 10-min buy window) --------
+# Buy window is 10min → 5s before close. Require more certainty at the start
 # of the buy window (XRP still has time to move), relax near the end.
-# NOTE: observation phase (12min → 7min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.93            # >5min: need 93%+ — XRP boundaries are tight, need strong model signal
-PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.90              # 3-5min: need 90%+ — only enter when model is confident
-# <3 min = PROB_MIN (0.83) — market has priced in the outcome, EV cap protects
+# NOTE: observation phase (12min → 10min) gathers data but never buys.
+PROB_EARLY_ENTRY_SECONDS = 480   # 8-10 min to close = "early" part of buy window
+PROB_EARLY_MIN = 0.85            # >8min: need 85%+ — enter earlier for better fills
+PROB_MID_ENTRY_SECONDS = 300     # 5-8 min to close = "mid"
+PROB_MID_MIN = 0.85              # 5-8min: need 85%+ — enough certainty for fills
+# <5 min = PROB_MIN (0.85) — market has priced in the outcome, $0.40 cap protects
+
+# -------------- NO SIDE OVERRIDE (NO has been 100% profitable) -----------------
+# NO side can be more aggressive — allow entries at lower probability.
+NO_SIDE_MIN_PROB = 0.80           # NO entries allowed at 80%+ prob (vs 85%+ general)
+NO_SIDE_MIN_PRICE = 85            # NO contract price must be ≥85¢
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -181,8 +186,8 @@ REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match XRP spot trend (border
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.90   # ≥90% prob = buy immediately, no trend check needed
-PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # ≥85% prob in last 3 min = fast lane (market is decisive)
+PROB_FAST_LANE_THRESHOLD = 0.85   # ≥85% prob = buy immediately, no trend check needed (was 90% — enter earlier)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.80  # ≥80% prob in last 5 min = fast lane (market is decisive)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
@@ -306,10 +311,10 @@ PNL_LOCK_TIER2_MULT = 0.25
 
 # -------------- YES ENTRY GATE (tighter YES filter — XRP YES earned more freedom) --
 # All 4 conditions must be true to place a YES trade:
-YES_GATE_MIN_PROB = 0.88             # (1) Blend probability for YES must exceed 88%
+YES_GATE_MIN_PROB = 0.85             # (1) Blend probability for YES must exceed 85% (was 88% — let gates breathe)
 YES_GATE_MIN_MOVE_PCT = 0.50         # (2) XRP moved ≥50% of expected move in YES direction
-YES_GATE_MAX_SECS = 480              # (3) Fewer than 8 minutes remaining (480s)
-YES_GATE_MIN_CONTRACT_PRICE = 88     # (4) YES contract price on Kalshi ≥ 88¢
+YES_GATE_MAX_SECS = 600              # (3) Fewer than 10 minutes remaining (was 480 — match new buy window)
+YES_GATE_MIN_CONTRACT_PRICE = 85     # (4) YES contract price on Kalshi ≥ 85¢ (was 88¢ — earlier fills)
 YES_GATE_WINDOW_SECONDS = 900.0      # Full 15-minute window for expected move calculation
 
 # -------------- STREAK CIRCUIT BREAKER (pause after losses) --------------------
@@ -1184,6 +1189,13 @@ class SessionState:
     yes_hour_losses: int = 0             # YES losses this hour
     yes_hour_pnl_cents: int = 0          # YES net P&L this hour (cents)
 
+    # Fill rate tracking
+    orders_posted: int = 0       # Total orders placed
+    orders_filled: int = 0       # Fully filled
+    orders_partial: int = 0      # Partially filled
+    orders_unfilled: int = 0     # Resting/canceled/unknown (no fill)
+    last_fill_rate_log: float = 0.0  # Timestamp of last fill rate log
+
     # Trade history
     recent_trades: List[Dict[str, Any]] = None
 
@@ -1378,6 +1390,32 @@ class SessionState:
             self.yes_hour_wins += 1
         else:
             self.yes_hour_losses += 1
+
+    def record_fill(self, fill_status: str):
+        """Track fill outcome for fill rate monitoring."""
+        self.orders_posted += 1
+        if fill_status == "filled":
+            self.orders_filled += 1
+        elif fill_status == "partial":
+            self.orders_partial += 1
+        else:
+            self.orders_unfilled += 1
+        # Log fill rate every 10 orders
+        if self.orders_posted > 0 and self.orders_posted % 10 == 0:
+            self._log_fill_rate()
+
+    def _log_fill_rate(self):
+        """Log current fill rate statistics."""
+        total = self.orders_posted
+        if total == 0:
+            return
+        fill_rate = (self.orders_filled + self.orders_partial) / total * 100
+        log.warning(
+            f"[FILL RATE] posted={total} filled={self.orders_filled} partial={self.orders_partial} "
+            f"unfilled={self.orders_unfilled} fill_rate={fill_rate:.1f}% "
+            f"(target: 70%+)"
+        )
+        self.last_fill_rate_log = time.time()
 
     def _scale_up(self):
         """Win: legacy counter (sizing now uses Kelly bankroll fraction)."""
@@ -1862,6 +1900,16 @@ def choose_trade(
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
     )
+
+    # NO SIDE OVERRIDE: NO trades have been 100% profitable — use more aggressive
+    # probability threshold (80% vs general 85%) when other conditions are met.
+    if not ok_no and no_px is not None and ok_book_no and (edge_no >= EDGE_MIN) and (no_px <= MAX_ENTRY_PRICE_CENTS):
+        if p_no_blend >= NO_SIDE_MIN_PROB and no_px >= NO_SIDE_MIN_PRICE:
+            ok_no = True
+            log.info(
+                f"[NO OVERRIDE] NO entry allowed via relaxed gate: prob={p_no_blend:.1%}>={NO_SIDE_MIN_PROB:.0%} "
+                f"price={no_px}¢>={NO_SIDE_MIN_PRICE}¢ (effective_min was {effective_prob_min:.1%})"
+            )
 
     # MARKET CONVICTION OVERRIDE: DISABLED for XRP.
     # For BTC, the market is efficient and overriding blend to market works.
@@ -3087,6 +3135,7 @@ def main() -> None:
 
                                             # Verify flip fill
                                             flip_fill_status, flip_filled = wait_for_fill(client, flip_oid, st.market)
+                                            session.record_fill(flip_fill_status)
                                             if flip_fill_status in ("filled", "partial") and flip_filled > 0:
                                                 st.sm = SM.HOLD
                                                 st.side = flip_side
@@ -3304,6 +3353,7 @@ def main() -> None:
                                                 )
                                                 # Quick fill check for scalp (less time since we're near close)
                                                 scalp_fill_status, scalp_filled = wait_for_fill(client, scalp_oid, st.market)
+                                                session.record_fill(scalp_fill_status)
                                                 if scalp_fill_status in ("filled", "partial") and scalp_filled > 0:
                                                     st.has_scalped = True
                                                     log.warning(f"[SCALP] Fill confirmed: {scalp_filled}/{scalp_qty} contracts")
@@ -3784,6 +3834,7 @@ def main() -> None:
 
             # Verify fill before committing state
             fill_status, filled_qty = wait_for_fill(client, oid, st.market)
+            session.record_fill(fill_status)
 
             if fill_status in ("filled", "partial") and filled_qty > 0:
                 st.traded_this_market = True
