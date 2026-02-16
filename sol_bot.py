@@ -147,6 +147,16 @@ NO_EDGE_BONUS = 0.0            # No edge threshold changes
 # Legacy alias (referenced in choose_trade tiebreaker)
 NO_BIAS_ENABLED = SIDE_BIAS_ENABLED
 
+# -------------- ULTRA-STRICT YES CONFIDENCE GATE --------
+# SOL YES has had a -$1.81 blowup and other losses.
+# Only enter YES when ALL 4 conditions are simultaneously true.
+# YES trades should be rare but high conviction.
+YES_GATE_ENABLED = True
+YES_GATE_PROB_MIN = 0.93           # (1) Calculated probability > 93%
+YES_GATE_PRICE_MOVE_PCT = 0.65     # (2) SOL moved 65%+ of expected move in YES direction
+YES_GATE_MAX_SECONDS = 360         # (3) < 6 minutes remaining
+YES_GATE_MIN_CONTRACT_CENTS = 91   # (4) YES contract price >= 91¢
+
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/SOL-USD/spot"
@@ -1384,6 +1394,10 @@ class SessionState:
             f"{now_est.strftime('%H:%M EST')}"
         )
 
+        # Track YES results for hourly summary
+        if side == "yes":
+            yes_tracker.record_yes_result(pnl_cents, is_win=(pnl_cents > 0))
+
         if pnl_cents > 0:
             self.total_wins += 1
             self.market_wins += 1
@@ -1870,6 +1884,73 @@ class BotState:
 
 
 # -----------------------------
+# YES Opportunity Tracker (module-level for hourly summary)
+# Tracks all YES opportunities seen by choose_trade(), whether gated or executed.
+# Reset hourly when the summary is printed.
+# -----------------------------
+class YesTracker:
+    """Track YES trade opportunities for hourly summary reporting."""
+    def __init__(self):
+        self.reset()
+        self.hour_start = time.time()
+
+    def reset(self):
+        self.opportunities = 0      # Total YES opportunities seen (ok_yes was True pre-gate)
+        self.skipped = 0            # Blocked by ultra-strict gate
+        self.skip_prob = 0          # Failed: prob < 93%
+        self.skip_move = 0          # Failed: price move < 65%
+        self.skip_time = 0          # Failed: > 6 min remaining
+        self.skip_price = 0         # Failed: contract < 91¢
+        self.executed = 0           # Passed gate and entered
+        self.wins = 0
+        self.losses = 0
+        self.net_pnl_cents = 0
+        self.hour_start = time.time()
+
+    def record_opportunity_skipped(self, failed_prob: bool, failed_move: bool,
+                                    failed_time: bool, failed_price: bool):
+        self.opportunities += 1
+        self.skipped += 1
+        if failed_prob:
+            self.skip_prob += 1
+        if failed_move:
+            self.skip_move += 1
+        if failed_time:
+            self.skip_time += 1
+        if failed_price:
+            self.skip_price += 1
+
+    def record_opportunity_passed(self):
+        self.opportunities += 1
+        self.executed += 1
+
+    def record_yes_result(self, pnl_cents: int, is_win: bool):
+        if is_win:
+            self.wins += 1
+        else:
+            self.losses += 1
+        self.net_pnl_cents += pnl_cents
+
+    def should_log_hourly(self) -> bool:
+        return (time.time() - self.hour_start) >= 3600.0
+
+    def log_hourly_summary(self):
+        elapsed_min = (time.time() - self.hour_start) / 60.0
+        log.warning(
+            f"[YES HOURLY SUMMARY] period={elapsed_min:.0f}min | "
+            f"opportunities={self.opportunities} | "
+            f"skipped={self.skipped} (prob={self.skip_prob} move={self.skip_move} "
+            f"time={self.skip_time} price={self.skip_price}) | "
+            f"executed={self.executed} | "
+            f"wins={self.wins} losses={self.losses} | "
+            f"net_pnl=${self.net_pnl_cents / 100.0:+.2f}"
+        )
+        self.reset()
+
+yes_tracker = YesTracker()
+
+
+# -----------------------------
 # Decision logic (MODIFIED FOR CONTINUOUS TRADING + DUMP)
 # -----------------------------
 def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
@@ -2143,6 +2224,64 @@ def choose_trade(
     if ok_no and no_px is not None and (100 - int(no_px)) < MIN_PAYOFF_CENTS:
         log.warning(f"[PAYOFF GATE] NO blocked: payoff={100 - int(no_px)}¢ < {MIN_PAYOFF_CENTS}¢ floor (price={no_px}¢)")
         ok_no = False
+
+    # === ULTRA-STRICT YES CONFIDENCE GATE ===
+    # SOL YES has had a -$1.81 blowup and other losses. Only enter YES when
+    # ALL 4 conditions are true simultaneously. YES trades should be rare but high conviction.
+    #   (1) Probability > 93%
+    #   (2) SOL price moved 65%+ of expected move in YES direction
+    #   (3) < 6 minutes remaining
+    #   (4) YES contract price >= 91¢
+    if YES_GATE_ENABLED and ok_yes:
+        # Calculate price move percentage in YES direction
+        # For range markets (lo and hi): fraction of range above lo
+        # For up-or-down (lo only): fraction of 1-sigma expected move above lo
+        if lo is not None and hi is not None and hi > lo:
+            price_move_pct = (spot - lo) / (hi - lo)
+        elif lo is not None:
+            expected_move = sigma_used * math.sqrt(max(5.0, float(secs_to_close)))
+            price_move_pct = (spot - lo) / expected_move if expected_move > 0 else 0.0
+        else:
+            price_move_pct = 0.0
+
+        contract_price_cents = int(yes_px) if yes_px is not None else 0
+
+        gate_prob = p_yes_blend >= YES_GATE_PROB_MIN
+        gate_move = price_move_pct >= YES_GATE_PRICE_MOVE_PCT
+        gate_time = secs_to_close <= YES_GATE_MAX_SECONDS
+        gate_price = contract_price_cents >= YES_GATE_MIN_CONTRACT_CENTS
+
+        if not (gate_prob and gate_move and gate_time and gate_price):
+            # Log which conditions failed
+            failed = []
+            if not gate_prob:
+                failed.append(f"prob={p_yes_blend:.1%}<{YES_GATE_PROB_MIN:.0%}")
+            if not gate_move:
+                failed.append(f"move={price_move_pct:.1%}<{YES_GATE_PRICE_MOVE_PCT:.0%}")
+            if not gate_time:
+                failed.append(f"time={secs_to_close}s>{YES_GATE_MAX_SECONDS}s")
+            if not gate_price:
+                failed.append(f"price={contract_price_cents}¢<{YES_GATE_MIN_CONTRACT_CENTS}¢")
+
+            log.info(
+                f"[YES GATE SKIP] conf={p_yes_blend:.1%} "
+                f"move={price_move_pct:.1%} time={secs_to_close}s "
+                f"contract={contract_price_cents}¢ failed=[{', '.join(failed)}]"
+            )
+            yes_tracker.record_opportunity_skipped(
+                failed_prob=not gate_prob,
+                failed_move=not gate_move,
+                failed_time=not gate_time,
+                failed_price=not gate_price,
+            )
+            ok_yes = False
+        else:
+            log.warning(
+                f"[YES GATE PASS] ALL conditions met: prob={p_yes_blend:.1%} "
+                f"move={price_move_pct:.1%} time={secs_to_close}s "
+                f"contract={contract_price_cents}¢ — YES entry allowed"
+            )
+            yes_tracker.record_opportunity_passed()
 
     if ok_yes and ok_no:
         # NO-SIDE BIAS: when both qualify, give NO an edge bonus in the comparison.
@@ -2890,6 +3029,10 @@ def main() -> None:
                 f"streak={session.consecutive_wins}W | {prob_trend.summary()}"
             )
             last_heartbeat = now
+
+        # Hourly YES summary log
+        if yes_tracker.should_log_hourly():
+            yes_tracker.log_hourly_summary()
 
         # ============================================
         # DEFERRED SETTLEMENT: re-check if we have a pending result
