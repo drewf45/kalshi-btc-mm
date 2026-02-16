@@ -2868,15 +2868,10 @@ def main() -> None:
                                             flip_qty = MIN_CONTRACTS
 
                                         # PRE-TRADE MAX LOSS GATE (flips too)
-                                        if flip_side == "yes":
-                                            flip_max_loss = (int(flip_price) * flip_qty) / 100.0
-                                        else:
-                                            flip_max_loss = ((100 - int(flip_price)) * flip_qty) / 100.0
+                                        # Max loss = price × qty (lose what you paid).
+                                        flip_max_loss = (int(flip_price) * flip_qty) / 100.0
                                         if flip_max_loss > MAX_LOSS_AT_EXPIRY_USD:
-                                            if flip_side == "yes":
-                                                per_ct = int(flip_price) / 100.0
-                                            else:
-                                                per_ct = (100 - int(flip_price)) / 100.0
+                                            per_ct = int(flip_price) / 100.0
                                             old_fq = flip_qty
                                             flip_qty = max(1, int(MAX_LOSS_AT_EXPIRY_USD / per_ct)) if per_ct > 0 else 1
                                             log.warning(f"[FLIP MAX LOSS] Reduced flip qty {old_fq} → {flip_qty} — max_loss ${flip_max_loss:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f}")
@@ -3033,18 +3028,12 @@ def main() -> None:
                                             scalp_qty = min(scalp_qty, scalp_room)  # Enforce position cap
 
                                             # PRE-TRADE MAX LOSS GATE (scalps too)
-                                            # Scalp at 98¢ × 3 = $2.94 max loss — must cap.
-                                            if st.side == "yes":
-                                                scalp_max_loss = (int(scalp_px) * scalp_qty) / 100.0
-                                            else:
-                                                scalp_max_loss = ((100 - int(scalp_px)) * scalp_qty) / 100.0
+                                            # Max loss = price × qty (lose what you paid if contract settles $0).
+                                            scalp_max_loss = (int(scalp_px) * scalp_qty) / 100.0
                                             existing_max_loss = (st.entry_price_cents * st.qty) / 100.0 if st.entry_price_cents and st.qty else 0.0
                                             combined_max_loss = existing_max_loss + scalp_max_loss
                                             if combined_max_loss > MAX_LOSS_AT_EXPIRY_USD:
-                                                if st.side == "yes":
-                                                    per_ct = int(scalp_px) / 100.0
-                                                else:
-                                                    per_ct = (100 - int(scalp_px)) / 100.0
+                                                per_ct = int(scalp_px) / 100.0
                                                 allowed = max(0, int((MAX_LOSS_AT_EXPIRY_USD - existing_max_loss) / per_ct)) if per_ct > 0 else 0
                                                 old_sq = scalp_qty
                                                 scalp_qty = max(0, min(scalp_qty, allowed))
@@ -3399,18 +3388,12 @@ def main() -> None:
             continue
 
         # === PRE-TRADE MAX LOSS CHECK ===
-        # Before entering, verify max possible loss at expiry <= $1.00.
-        # YES trade: lose entire entry cost if settles NO. NO trade: lose (100-price)*qty if settles YES.
-        if chosen_side == "yes":
-            max_loss_at_expiry = (int(chosen_px) * qty) / 100.0
-        else:
-            max_loss_at_expiry = ((100 - int(chosen_px)) * qty) / 100.0
+        # Before entering, verify max possible loss at expiry <= $0.75.
+        # BUY any side: max loss = entry_price * contracts (contract settles at $0, you lose what you paid).
+        # This is the same for YES and NO — you always lose your cost basis.
+        max_loss_at_expiry = (int(chosen_px) * qty) / 100.0
         if max_loss_at_expiry > MAX_LOSS_AT_EXPIRY_USD:
-            # Reduce qty to fit within the cap
-            if chosen_side == "yes":
-                max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(int(chosen_px), 1))
-            else:
-                max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(100 - int(chosen_px), 1))
+            max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(int(chosen_px), 1))
             old_qty = qty
             qty = max(1, min(qty, max_qty))
             log.warning(
