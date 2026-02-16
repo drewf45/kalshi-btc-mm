@@ -154,8 +154,8 @@ NO_BIAS_ENABLED = SIDE_BIAS_ENABLED
 YES_GATE_ENABLED = True
 YES_GATE_PROB_MIN = 0.93           # (1) Calculated probability > 93%
 YES_GATE_PRICE_MOVE_PCT = 0.65     # (2) SOL moved 65%+ of expected move in YES direction
-YES_GATE_MAX_SECONDS = 360         # (3) < 6 minutes remaining
-YES_GATE_MIN_CONTRACT_CENTS = 91   # (4) YES contract price >= 91¢
+YES_GATE_MAX_SECONDS = 600         # (3) < 10 minutes remaining (widened from 6min for fill rate)
+YES_GATE_MIN_CONTRACT_CENTS = 85   # (4) YES contract price >= 85¢ (was 91¢ — too restrictive for fills)
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -174,17 +174,17 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 # T-300s when probability is high AND the book still has liquidity.
 #
 # TWO PHASES:
-#   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
-#   BUY     (7min → 5s before close):   make the call, place the order, hold
+#   OBSERVE (12min → 10min before close): gather trend data, watch book, DON'T buy
+#   BUY     (10min → 5s before close):   make the call, place the order, hold
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
+BUY_START_SECONDS = 600      # Can enter from T-600s (10 min) — enter earlier for fills, $0.40 cap is the real safety
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.80  # 80%+ to enter in last 2 min — was 86%, way too conservative for 100% WR bot
-EDGE_MIN = 0.04  # 4% minimum edge — was 5%, lowered to increase volume while keeping quality
+PROB_MIN = 0.78  # 78%+ to enter in last 3 min — $0.40 cap is the real protection, let gates breathe
+EDGE_MIN = 0.03  # 3% minimum edge — lowered to improve fill rates, hard cap protects downside
 MAX_ENTRY_PRICE_CENTS = 92  # At 92¢ entry, gain 8¢/win, need ~12 wins per loss — matches MIN_PAYOFF_CENTS
 FEE_CENTS_PER_CONTRACT = 0
 
@@ -201,11 +201,14 @@ MIN_PAYOFF_CENTS = 8  # HARD FLOOR: no trade where win < 8¢/contract (max entry
 # Buy window is 7min → 5s before close. Require more certainty at the start
 # of the buy window (SOL still has time to move), relax near the end.
 # NOTE: observation phase (12min → 7min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.88            # >5min: need 88%+ — was 93%, lowered 5pts to increase volume (BTC uses 90%)
-PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.84              # 3-5min: need 84%+ — was 90%, lowered 6pts (BTC uses 86%)
-# <3 min = PROB_MIN (0.80) — market has priced in the outcome, stop-loss protects
+PROB_EARLY_ENTRY_SECONDS = 480   # 8-10 min to close = "early" part of widened buy window
+PROB_EARLY_MIN = 0.85            # >8min: need 85%+ — enter earlier for fills, cap protects
+PROB_MID_ENTRY_SECONDS = 300     # 5-8 min to close = "mid"
+PROB_MID_MIN = 0.80              # 5-8min: need 80%+ — loosen to improve fill rate
+# <5 min = PROB_MIN (0.78) — market has priced in the outcome, $0.40 cap protects
+
+# NO-side can be more aggressive — NO has been consistently profitable
+NO_PROB_FLOOR = 0.80  # NO never requires more than 80% probability regardless of time tier
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -1951,6 +1954,50 @@ yes_tracker = YesTracker()
 
 
 # -----------------------------
+# Fill Rate Tracker — track orders posted vs filled for tuning
+# -----------------------------
+class FillTracker:
+    """Track order fill rates for hourly summary reporting."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.posted = 0
+        self.filled = 0
+        self.partial = 0
+        self.unfilled = 0   # resting, canceled, unknown
+        self.hour_start = time.time()
+
+    def record(self, status: str):
+        self.posted += 1
+        if status == "filled":
+            self.filled += 1
+        elif status == "partial":
+            self.partial += 1
+        else:
+            self.unfilled += 1
+
+    def fill_rate(self) -> float:
+        if self.posted == 0:
+            return 0.0
+        return (self.filled + self.partial) / self.posted
+
+    def should_log(self) -> bool:
+        return (time.time() - self.hour_start) >= 3600.0
+
+    def log_summary(self):
+        rate = self.fill_rate()
+        log.warning(
+            f"[FILL RATE] posted={self.posted} filled={self.filled} "
+            f"partial={self.partial} unfilled={self.unfilled} "
+            f"rate={rate:.0%} (target: 70%+)"
+        )
+        self.reset()
+
+fill_tracker = FillTracker()
+
+
+# -----------------------------
 # Decision logic (MODIFIED FOR CONTINUOUS TRADING + DUMP)
 # -----------------------------
 def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
@@ -2053,13 +2100,14 @@ def choose_trade(
     else:
         effective_prob_min = PROB_MIN         # <3min: 86%+ — market has priced in the outcome
 
-    # NO-SIDE BIAS: lower the bar for NO entries (80% WR vs 30% YES)
+    # NO-SIDE BIAS: lower the bar for NO entries (NO has been consistently profitable)
     effective_prob_min_yes = effective_prob_min
-    effective_prob_min_no = effective_prob_min
+    # NO floor: never require more than 80% for NO, regardless of time tier
+    effective_prob_min_no = min(effective_prob_min, NO_PROB_FLOOR)
     effective_edge_min_yes = EDGE_MIN
     effective_edge_min_no = EDGE_MIN
     if NO_BIAS_ENABLED:
-        effective_prob_min_no = max(PROB_MIN - 0.05, effective_prob_min - NO_PROB_DISCOUNT)
+        effective_prob_min_no = min(effective_prob_min_no, max(PROB_MIN - 0.05, effective_prob_min - NO_PROB_DISCOUNT))
         effective_edge_min_no = max(0.02, EDGE_MIN - NO_EDGE_BONUS)
 
     ok_yes = (
@@ -3044,6 +3092,8 @@ def main() -> None:
         # Hourly YES summary log
         if yes_tracker.should_log_hourly():
             yes_tracker.log_hourly_summary()
+        if fill_tracker.should_log():
+            fill_tracker.log_summary()
 
         # ============================================
         # DEFERRED SETTLEMENT: re-check if we have a pending result
@@ -3588,6 +3638,7 @@ def main() -> None:
 
                                             # Verify flip fill
                                             flip_fill_status, flip_filled = wait_for_fill(client, flip_oid, st.market)
+                                            fill_tracker.record(flip_fill_status)
                                             if flip_fill_status in ("filled", "partial") and flip_filled > 0:
                                                 st.sm = SM.HOLD
                                                 st.side = flip_side
@@ -3759,6 +3810,7 @@ def main() -> None:
                                                 )
                                                 # Quick fill check for scalp (less time since we're near close)
                                                 scalp_fill_status, scalp_filled = wait_for_fill(client, scalp_oid, st.market)
+                                                fill_tracker.record(scalp_fill_status)
                                                 if scalp_fill_status in ("filled", "partial") and scalp_filled > 0:
                                                     st.has_scalped = True
                                                     log.warning(f"[SCALP] Fill confirmed: {scalp_filled}/{scalp_qty} contracts")
@@ -4261,6 +4313,7 @@ def main() -> None:
 
             # Verify fill before committing state
             fill_status, filled_qty = wait_for_fill(client, oid, st.market)
+            fill_tracker.record(fill_status)
 
             if fill_status in ("filled", "partial") and filled_qty > 0:
                 st.traded_this_market = True
