@@ -2691,11 +2691,17 @@ def compute_qty_from_bankroll(
 
     # ABSOLUTE DOLLAR LOSS CAP: worst case = lose entire entry at settlement.
     # Cap qty so worst-case loss never exceeds HARD_MAX_LOSS_USD.
-    # This is the lesson from the -$2.61 and -$2.70 blowups.
+    # If even 1 contract exceeds the cap, return 0 — DO NOT TRADE.
+    # This is the lesson from the -$2.61, -$2.70, and -$0.89 blowups.
     if cost_per > 0:
         max_qty_for_hard_cap = int(HARD_MAX_LOSS_USD / cost_per)
-        if max_qty_for_hard_cap < MIN_CONTRACTS:
-            max_qty_for_hard_cap = MIN_CONTRACTS
+        if max_qty_for_hard_cap < 1:
+            # One contract alone costs more than $0.40 — CANNOT trade safely
+            log.warning(
+                f"[SIZE] HARD CAP BLOCK: entry={entry_cents}¢ costs ${cost_per:.2f}/contract "
+                f"> ${HARD_MAX_LOSS_USD:.2f} cap — refusing to size (returning 0)"
+            )
+            return 0
         if target_qty > max_qty_for_hard_cap:
             log.warning(
                 f"[SIZE] HARD DOLLAR CAP: {target_qty} -> {max_qty_for_hard_cap} contracts "
@@ -2704,7 +2710,7 @@ def compute_qty_from_bankroll(
             )
             target_qty = max_qty_for_hard_cap
 
-    qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
+    qty = clamp_int(target_qty, 1, MAX_CONTRACTS)
 
     log.info(
         f"[SIZE] Kelly bankroll sizing: contracts={qty} kelly_f={kf:.3f} "
@@ -2753,10 +2759,15 @@ def compute_scalp_qty(
         )
         target_qty = max_qty_for_loss
 
-    # ABSOLUTE DOLLAR LOSS CAP (same as normal sizing — no trade can lose > $1.00)
+    # ABSOLUTE DOLLAR LOSS CAP — no trade can lose > HARD_MAX_LOSS_USD
+    # If even 1 contract exceeds the cap, return 0 — DO NOT SCALP.
     max_qty_for_hard_cap = int(HARD_MAX_LOSS_USD / cost_per)
     if max_qty_for_hard_cap < 1:
-        max_qty_for_hard_cap = 1
+        log.warning(
+            f"[SCALP SIZE] HARD CAP BLOCK: entry={entry_cents}¢ costs ${cost_per:.2f}/contract "
+            f"> ${HARD_MAX_LOSS_USD:.2f} cap — refusing to scalp"
+        )
+        return 0
     if target_qty > max_qty_for_hard_cap:
         log.warning(
             f"[SCALP SIZE] HARD DOLLAR CAP: {target_qty} -> {max_qty_for_hard_cap} contracts "
@@ -3514,9 +3525,9 @@ def main() -> None:
                                                     session=session,
                                                 )
                                             else:
-                                                flip_qty = MIN_CONTRACTS
+                                                flip_qty = 1
                                         except Exception:
-                                            flip_qty = MIN_CONTRACTS
+                                            flip_qty = 1
 
                                         # Cold-start + time-of-day + drawdown sizing for flips
                                         flip_cs = get_cold_start_multiplier(session.trades_since_boot)
@@ -3526,11 +3537,33 @@ def main() -> None:
                                             flip_size_mult = min(flip_size_mult, SESSION_DRAWDOWN_RESUME_SIZE_MULT)
                                         if flip_size_mult < 1.0:
                                             old_fq = flip_qty
-                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * flip_size_mult))
+                                            flip_qty = max(1, int(flip_qty * flip_size_mult))
                                             log.warning(
                                                 f"[FLIP SIZE] {old_fq} -> {flip_qty} contracts (×{flip_size_mult:.0%})"
                                             )
 
+                                        # HARD CAP for flips: worst-case = flip_qty * flip_price/100
+                                        flip_cost_per = float(flip_price) / 100.0
+                                        flip_worst = flip_cost_per * flip_qty
+                                        if flip_cost_per > HARD_MAX_LOSS_USD:
+                                            log.warning(
+                                                f"[FLIP BLOCK] entry={flip_price}¢ costs ${flip_cost_per:.2f}/contract "
+                                                f"> ${HARD_MAX_LOSS_USD:.2f} — SKIPPING FLIP"
+                                            )
+                                            can_flip = False
+                                        elif flip_worst > HARD_MAX_LOSS_USD:
+                                            old_fq2 = flip_qty
+                                            flip_qty = int(HARD_MAX_LOSS_USD / flip_cost_per)
+                                            if flip_qty < 1:
+                                                log.warning(f"[FLIP BLOCK] Cannot size flip within cap — SKIPPING")
+                                                can_flip = False
+                                            else:
+                                                log.warning(
+                                                    f"[FLIP CAP] {old_fq2} -> {flip_qty} contracts "
+                                                    f"(worst ${flip_worst:.2f} > ${HARD_MAX_LOSS_USD:.2f} cap)"
+                                                )
+
+                                    if can_flip:
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
@@ -3684,6 +3717,27 @@ def main() -> None:
                                                 scalp_dist = 0.0
                                             scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
                                             scalp_qty = min(scalp_qty, scalp_room)  # Enforce position cap
+
+                                            # HARD CAP for scalps: worst-case = scalp_qty * scalp_px/100
+                                            scalp_cost_per = float(scalp_px) / 100.0
+                                            scalp_worst = scalp_cost_per * scalp_qty
+                                            if scalp_cost_per > HARD_MAX_LOSS_USD:
+                                                log.warning(
+                                                    f"[SCALP BLOCK] entry={scalp_px}¢ costs ${scalp_cost_per:.2f}/contract "
+                                                    f"> ${HARD_MAX_LOSS_USD:.2f} — SKIPPING SCALP"
+                                                )
+                                                scalp_qty = 0
+                                            elif scalp_worst > HARD_MAX_LOSS_USD:
+                                                old_sq = scalp_qty
+                                                scalp_qty = int(HARD_MAX_LOSS_USD / scalp_cost_per)
+                                                if scalp_qty < 1:
+                                                    scalp_qty = 0
+                                                    log.warning(f"[SCALP BLOCK] Cannot size within cap — SKIPPING")
+                                                else:
+                                                    log.warning(
+                                                        f"[SCALP CAP] {old_sq} -> {scalp_qty} contracts "
+                                                        f"(worst ${scalp_worst:.2f} > ${HARD_MAX_LOSS_USD:.2f} cap)"
+                                                    )
 
                                         if scalp_qty > 0:
                                             scalp_payload = build_order_payload(
@@ -4094,17 +4148,34 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # PRE-TRADE POSITION SIZE VALIDATION
+        # PRE-TRADE POSITION SIZE VALIDATION (FINAL GATE — nothing bypasses this)
         # Two independent caps — the tighter one wins:
-        #   1. HARD DOLLAR CAP: max loss never > $0.40
+        #   1. HARD DOLLAR CAP: worst-case loss never > $0.40 (contracts * cost_per_contract)
         #   2. PORTFOLIO % CAP: max loss never > 2% of current balance
+        # If even 1 contract exceeds the cap, SKIP the trade entirely.
         cost_per_contract = int(chosen_px) / 100.0
         max_possible_loss = cost_per_contract * qty
 
         # Cap 1: absolute dollar cap
+        if cost_per_contract > HARD_MAX_LOSS_USD:
+            log.warning(
+                f"[PRE-TRADE BLOCK] entry={chosen_px}¢ costs ${cost_per_contract:.2f}/contract "
+                f"> ${HARD_MAX_LOSS_USD:.2f} hard cap — SKIPPING TRADE ENTIRELY"
+            )
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
         if max_possible_loss > HARD_MAX_LOSS_USD:
             old_qty = qty
-            qty = max(MIN_CONTRACTS, int(HARD_MAX_LOSS_USD / cost_per_contract))
+            qty = int(HARD_MAX_LOSS_USD / cost_per_contract)
+            if qty < 1:
+                log.warning(
+                    f"[PRE-TRADE BLOCK] Cannot size within ${HARD_MAX_LOSS_USD:.2f} cap "
+                    f"at {chosen_px}¢ — SKIPPING"
+                )
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
             log.warning(
                 f"[PRE-TRADE CAP] max_loss=${max_possible_loss:.2f} > ${HARD_MAX_LOSS_USD:.2f}: "
                 f"reducing {old_qty} -> {qty} contracts"
@@ -4115,7 +4186,9 @@ def main() -> None:
         max_risk_usd = session.current_balance_usd * PORTFOLIO_RISK_FRACTION
         if max_risk_usd > 0 and max_possible_loss > max_risk_usd:
             suggested = qty
-            qty = max(MIN_CONTRACTS, int(max_risk_usd / cost_per_contract))
+            qty = max(1, int(max_risk_usd / cost_per_contract))
+            if cost_per_contract * qty > max_risk_usd and qty > 1:
+                qty -= 1
             log.warning(
                 f"[PORTFOLIO CAP] suggested_size={suggested} capped_size={qty} "
                 f"portfolio_balance=${session.current_balance_usd:.2f} "
@@ -4134,6 +4207,34 @@ def main() -> None:
         elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
             use_post_only = False
             log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+
+        # COMPREHENSIVE PRE-TRADE LOG — every trade gets a full audit trail
+        final_worst_case = cost_per_contract * qty
+        # YES gate values (only meaningful for YES trades)
+        if chosen_side == "yes" and lo is not None:
+            if hi is not None and hi > lo:
+                _gate_move_pct = (spot - lo) / (hi - lo)
+            else:
+                _gate_sigma = get_sigma_cached(http)
+                _gate_expected = _gate_sigma * math.sqrt(max(5.0, float(secs_to_close)))
+                _gate_move_pct = (spot - lo) / _gate_expected if _gate_expected > 0 else 0.0
+            _gate_contract = int(chosen_px)
+            log.warning(
+                f"[PRE-TRADE AUDIT] {st.market} | {chosen_side.upper()} | "
+                f"qty={qty} | entry={chosen_px}¢ | cost_per=${cost_per_contract:.2f} | "
+                f"worst_case_loss=${final_worst_case:.2f} | hard_cap=${HARD_MAX_LOSS_USD:.2f} | "
+                f"YES_GATE: prob={p_gate:.1%}{'>='+str(int(YES_GATE_PROB_MIN*100))+'% PASS' if p_gate >= YES_GATE_PROB_MIN else '<'+str(int(YES_GATE_PROB_MIN*100))+'% FAIL'} | "
+                f"move={_gate_move_pct:.1%}{'>=65% PASS' if _gate_move_pct >= YES_GATE_PRICE_MOVE_PCT else '<65% FAIL'} | "
+                f"time={secs_to_close}s{'<=360s PASS' if secs_to_close <= YES_GATE_MAX_SECONDS else '>360s FAIL'} | "
+                f"contract={_gate_contract}¢{'>=' + str(YES_GATE_MIN_CONTRACT_CENTS) + '¢ PASS' if _gate_contract >= YES_GATE_MIN_CONTRACT_CENTS else '<' + str(YES_GATE_MIN_CONTRACT_CENTS) + '¢ FAIL'}"
+            )
+        else:
+            log.warning(
+                f"[PRE-TRADE AUDIT] {st.market} | {chosen_side.upper()} | "
+                f"qty={qty} | entry={chosen_px}¢ | cost_per=${cost_per_contract:.2f} | "
+                f"worst_case_loss=${final_worst_case:.2f} | hard_cap=${HARD_MAX_LOSS_USD:.2f} | "
+                f"p_gate={p_gate:.1%} | edge={edge_net:.4f} | t={secs_to_close}s"
+            )
 
         payload = build_order_payload(
             market_ticker=st.market,
