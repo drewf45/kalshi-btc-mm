@@ -276,7 +276,8 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
-MAX_LOSS_AT_EXPIRY_USD = 1.00         # Pre-trade gate: reject any trade where max possible loss > $1.00
+MAX_LOSS_AT_EXPIRY_USD = 0.75         # Pre-trade gate: max possible loss if contract settles at $0.
+                                      # Matches hard stop. Makes blowups physically impossible at expiry.
 
 # -------------- PROFIT LOCK (protect winning sessions) -------------------------
 PNL_LOCK_TIER1_USD = 2.00            # At +$2.00 session P/L: reduce to 50% size
@@ -2866,6 +2867,20 @@ def main() -> None:
                                         except Exception:
                                             flip_qty = MIN_CONTRACTS
 
+                                        # PRE-TRADE MAX LOSS GATE (flips too)
+                                        if flip_side == "yes":
+                                            flip_max_loss = (int(flip_price) * flip_qty) / 100.0
+                                        else:
+                                            flip_max_loss = ((100 - int(flip_price)) * flip_qty) / 100.0
+                                        if flip_max_loss > MAX_LOSS_AT_EXPIRY_USD:
+                                            if flip_side == "yes":
+                                                per_ct = int(flip_price) / 100.0
+                                            else:
+                                                per_ct = (100 - int(flip_price)) / 100.0
+                                            old_fq = flip_qty
+                                            flip_qty = max(1, int(MAX_LOSS_AT_EXPIRY_USD / per_ct)) if per_ct > 0 else 1
+                                            log.warning(f"[FLIP MAX LOSS] Reduced flip qty {old_fq} → {flip_qty} — max_loss ${flip_max_loss:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f}")
+
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
@@ -3016,6 +3031,27 @@ def main() -> None:
                                                 scalp_dist = 0.0
                                             scalp_qty = compute_scalp_qty(scalp_avail, scalp_px, scalp_dist)
                                             scalp_qty = min(scalp_qty, scalp_room)  # Enforce position cap
+
+                                            # PRE-TRADE MAX LOSS GATE (scalps too)
+                                            # Scalp at 98¢ × 3 = $2.94 max loss — must cap.
+                                            if st.side == "yes":
+                                                scalp_max_loss = (int(scalp_px) * scalp_qty) / 100.0
+                                            else:
+                                                scalp_max_loss = ((100 - int(scalp_px)) * scalp_qty) / 100.0
+                                            existing_max_loss = (st.entry_price_cents * st.qty) / 100.0 if st.entry_price_cents and st.qty else 0.0
+                                            combined_max_loss = existing_max_loss + scalp_max_loss
+                                            if combined_max_loss > MAX_LOSS_AT_EXPIRY_USD:
+                                                if st.side == "yes":
+                                                    per_ct = int(scalp_px) / 100.0
+                                                else:
+                                                    per_ct = (100 - int(scalp_px)) / 100.0
+                                                allowed = max(0, int((MAX_LOSS_AT_EXPIRY_USD - existing_max_loss) / per_ct)) if per_ct > 0 else 0
+                                                old_sq = scalp_qty
+                                                scalp_qty = max(0, min(scalp_qty, allowed))
+                                                log.warning(
+                                                    f"[SCALP MAX LOSS] Reduced scalp qty {old_sq} → {scalp_qty} — "
+                                                    f"combined max_loss ${combined_max_loss:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f}"
+                                                )
 
                                         if scalp_qty > 0:
                                             scalp_payload = build_order_payload(
