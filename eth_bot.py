@@ -137,17 +137,21 @@ DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
-NO_ONLY = env_bool("NO_ONLY", True)      # YES DISABLED — net negative across all sessions, 0-for-13
-# YES DISABLED (v9): -$5.46 lifetime on YES, 0 wins in last 13 YES trades.
-# The YES side has been net negative in EVERY analysis window. Burning money.
-# NO_ONLY=True hard-blocks all YES entries. Phantom logging tracks what YES
-# WOULD have done so we can evaluate whether to re-enable after backtesting.
-# The 150% conviction gates are kept in code for when/if YES is re-enabled.
-YES_CONVICTION_MULTIPLIER = 1.50         # YES needs 150% of normal conviction (kept for future re-enable)
-YES_EDGE_MIN = 0.08                      # 8% edge minimum (vs 2% for NO) — kept for future re-enable
-YES_MAX_ENTRY_PRICE_CENTS = 75           # 75¢ max (vs 93¢ for NO) — kept for future re-enable
-YES_KELLY_MULTIPLIER = 0.10              # 10% of Kelly sizing (vs 25% for NO) — kept for future re-enable
-YES_REQUIRE_TREND_ALIGNED = True         # All trends must be WITH the trade — kept for future re-enable
+NO_ONLY = env_bool("NO_ONLY", False)     # Ultra gate replaces hard block — see YES_ULTRA_GATE_*
+# YES ULTRA GATE (v10): replaces NO_ONLY=True hard block.
+# YES has been net negative (-$5.46 lifetime, 0-for-13), but rather than disable entirely,
+# we gate YES behind 4 simultaneous conditions so it ONLY fires on near-certain outcomes.
+# Expected: maybe 1-2 YES trades per day at most. All skips are logged with condition breakdown.
+YES_ULTRA_GATE_PROB = 0.95               # Condition 1: blended probability must exceed 95%
+YES_ULTRA_GATE_MOVE_PCT = 0.70           # Condition 2: ETH must have moved 70%+ of range toward center
+YES_ULTRA_GATE_TIME_SEC = 300            # Condition 3: must be < 5 minutes remaining
+YES_ULTRA_GATE_PRICE_CENTS = 93          # Condition 4: YES contract price must be >= 93¢ (market consensus)
+YES_KELLY_REDUCTION = 0.50               # YES gets 50% of normal Kelly sizing (half position)
+YES_CONVICTION_MULTIPLIER = 1.50         # Legacy 150% conviction (still applied in ok_yes threshold)
+YES_EDGE_MIN = 0.02                      # Same as NO — ultra gate is the real protection now
+YES_MAX_ENTRY_PRICE_CENTS = 99           # Effectively uncapped — ultra gate requires >= 93¢
+YES_KELLY_MULTIPLIER = 0.10              # 10% of Kelly sizing (legacy, ultra gate + YES_KELLY_REDUCTION is primary)
+YES_REQUIRE_TREND_ALIGNED = True         # All trends must be WITH the trade
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -458,6 +462,9 @@ SESSION_COOLDOWN_MARKETS = 1          # Skip exactly 1 market (not a time-based 
 # Heartbeat
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
+
+# Module-level YES summary tracker (initialized in main())
+_yes_summary: Optional["YesSummary"] = None
 
 # -----------------------------
 # Kalshi API client (RSA-PSS signing)  **UNCHANGED**
@@ -1230,6 +1237,10 @@ class SessionState:
         self.current_balance_usd += pnl_usd  # Estimate balance until real check
         self.total_markets += 1
 
+        # Track YES trade results in the hourly summary
+        if side == "yes" and _yes_summary is not None:
+            _yes_summary.record_yes_result(pnl_cents)
+
         trade = {
             "market": market, "side": side, "entry": entry_price,
             "exit": exit_price, "qty": qty, "pnl_cents": pnl_cents,
@@ -1430,6 +1441,75 @@ class SessionState:
                     f"[SESSION] Drawdown resume: {self._drawdown_resume_trades} trades left at "
                     f"{ROLLING_DRAWDOWN_RESUME_SIZE_FRACTION:.0%} size"
                 )
+
+
+class YesSummary:
+    """Hourly YES trade summary tracker.
+
+    Tracks every YES opportunity the ultra gate evaluates: how many were seen,
+    skipped (with per-condition breakdown), executed, and the P&L outcome.
+    Dumps a summary log every hour and resets.
+    """
+    def __init__(self):
+        self.reset()
+        self.last_dump_ts: float = time.time()
+
+    def reset(self):
+        self.opportunities: int = 0
+        self.skipped_total: int = 0
+        self.skipped_prob: int = 0       # Condition 1 failed: prob < 95%
+        self.skipped_move: int = 0       # Condition 2 failed: move < 70%
+        self.skipped_time: int = 0       # Condition 3 failed: time >= 5 min
+        self.skipped_price: int = 0      # Condition 4 failed: price < 93¢
+        self.executed: int = 0
+        self.wins: int = 0
+        self.losses: int = 0
+        self.net_pnl_cents: int = 0
+
+    def record_opportunity(self, passed: bool, failed_conditions: List[str]):
+        """Record a YES opportunity evaluated by the ultra gate."""
+        self.opportunities += 1
+        if not passed:
+            self.skipped_total += 1
+            for cond in failed_conditions:
+                if cond == "prob":
+                    self.skipped_prob += 1
+                elif cond == "move":
+                    self.skipped_move += 1
+                elif cond == "time":
+                    self.skipped_time += 1
+                elif cond == "price":
+                    self.skipped_price += 1
+        else:
+            self.executed += 1
+
+    def record_yes_result(self, pnl_cents: int):
+        """Record the P&L result of a YES trade."""
+        self.net_pnl_cents += pnl_cents
+        if pnl_cents > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+
+    def maybe_dump(self) -> bool:
+        """Dump hourly summary if >= 1 hour since last dump. Returns True if dumped."""
+        now = time.time()
+        if now - self.last_dump_ts < 3600:
+            return False
+        self._dump()
+        self.reset()
+        self.last_dump_ts = now
+        return True
+
+    def _dump(self):
+        log.warning(
+            f"[YES_HOURLY] opportunities={self.opportunities} "
+            f"skipped={self.skipped_total} "
+            f"(prob={self.skipped_prob} move={self.skipped_move} "
+            f"time={self.skipped_time} price={self.skipped_price}) "
+            f"executed={self.executed} wins={self.wins} losses={self.losses} "
+            f"net_pnl=${self.net_pnl_cents / 100:.2f}"
+        )
 
 
 class SpotTrend:
@@ -1742,6 +1822,67 @@ def compute_edge(p: float, price_cents: int, fee_cents: int) -> float:
     return float(p) - float(price_cents + fee_cents) / 100.0
 
 
+def yes_ultra_gate(
+    p_yes_blend: float,
+    spot: float,
+    lo: Optional[float],
+    hi: Optional[float],
+    secs_to_close: int,
+    yes_px: Optional[int],
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    """4-condition ultra gate for YES trades.
+
+    ALL conditions must pass simultaneously:
+      1. Probability > 95%
+      2. ETH has moved 70%+ toward range center (YES direction)
+      3. < 5 minutes remaining
+      4. YES contract price >= 93¢ (overwhelming market consensus)
+
+    Returns (passed, failed_conditions, details_dict).
+    failed_conditions is a list of condition names that failed (empty if passed).
+    details_dict has the raw values for logging.
+    """
+    failed = []
+
+    # Compute move fraction: how far into [lo, hi] range is spot?
+    # 0% = at boundary, 100% = at midpoint
+    if lo is not None and hi is not None and hi > lo:
+        range_width = hi - lo
+        if spot < lo or spot > hi:
+            move_pct = 0.0  # Outside range — no YES move at all
+        else:
+            dist_from_boundary = min(spot - lo, hi - spot)
+            move_pct = dist_from_boundary / (range_width / 2.0)
+    else:
+        move_pct = 0.0  # Can't compute — fail safe
+
+    details = {
+        "prob": p_yes_blend,
+        "move_pct": move_pct,
+        "secs": secs_to_close,
+        "price": yes_px,
+    }
+
+    # Condition 1: probability > 95%
+    if p_yes_blend < YES_ULTRA_GATE_PROB:
+        failed.append("prob")
+
+    # Condition 2: 70%+ of expected move completed
+    if move_pct < YES_ULTRA_GATE_MOVE_PCT:
+        failed.append("move")
+
+    # Condition 3: < 5 minutes remaining
+    if secs_to_close > YES_ULTRA_GATE_TIME_SEC:
+        failed.append("time")
+
+    # Condition 4: YES price >= 93¢
+    if yes_px is None or yes_px < YES_ULTRA_GATE_PRICE_CENTS:
+        failed.append("price")
+
+    passed = len(failed) == 0
+    return passed, failed, details
+
+
 def postable_entry_price(bid: Optional[int], ask: Optional[int]) -> Optional[int]:
     if bid is None and ask is None:
         return None
@@ -2004,21 +2145,45 @@ def choose_trade(
             )
 
     # YES_ONLY / NO_ONLY: Focus on one direction at a time.
-    # Block entries on the excluded side — overrides high-certainty and settlement lock too.
     if YES_ONLY and ok_no and not ok_yes:
         log.info(f"[YES_ONLY] Blocking NO entry (edge={edge_no:.4f} prob={p_no_blend:.1%}) — YES_ONLY mode")
     if YES_ONLY:
         ok_no = False
-    if NO_ONLY and ok_yes:
-        log.warning(
-            f"[ETH_YES_DISABLED] timestamp={datetime.now(timezone.utc).isoformat()}Z "
-            f"confidence={p_yes_blend:.4f} edge={edge_yes:.4f} price={yes_px}¢ "
-            f"model={p_yes_model:.1%} mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'} "
-            f"reason=ETH_YES_DISABLED"
-        )
-        ok_yes = False
     if NO_ONLY:
-        ok_yes = False  # FAILSAFE: hard-block YES regardless of any override above
+        ok_yes = False
+
+    # YES ULTRA GATE: 4-condition simultaneous check.
+    # Replaces the old NO_ONLY hard block. YES only fires when ALL conditions pass:
+    #   1. prob > 95%  2. ETH moved 70%+ of range  3. < 5 min left  4. price >= 93¢
+    # Every YES opportunity is logged with condition breakdown for the hourly summary.
+    if ok_yes:
+        gate_passed, gate_failed, gate_details = yes_ultra_gate(
+            p_yes_blend, spot, lo, hi, secs_to_close, yes_px,
+        )
+        if not gate_passed:
+            failed_str = ",".join(gate_failed)
+            log.warning(
+                f"[YES_ULTRA_GATE] BLOCKED: failed={failed_str} "
+                f"prob={gate_details['prob']:.4f} (need≥{YES_ULTRA_GATE_PROB}) "
+                f"move={gate_details['move_pct']:.1%} (need≥{YES_ULTRA_GATE_MOVE_PCT:.0%}) "
+                f"time={gate_details['secs']}s (need≤{YES_ULTRA_GATE_TIME_SEC}s) "
+                f"price={gate_details['price']}¢ (need≥{YES_ULTRA_GATE_PRICE_CENTS}¢) "
+                f"edge={edge_yes:.4f} model={p_yes_model:.1%} "
+                f"mkt={p_mkt if p_mkt is None else f'{p_mkt:.1%}'}"
+            )
+            ok_yes = False
+            # Record in global yes_summary tracker (if initialized)
+            if _yes_summary is not None:
+                _yes_summary.record_opportunity(False, gate_failed)
+        else:
+            log.warning(
+                f"[YES_ULTRA_GATE] PASSED: ALL 4 conditions met — "
+                f"prob={gate_details['prob']:.4f} move={gate_details['move_pct']:.1%} "
+                f"time={gate_details['secs']}s price={gate_details['price']}¢ "
+                f"edge={edge_yes:.4f}"
+            )
+            if _yes_summary is not None:
+                _yes_summary.record_opportunity(True, [])
 
     if ok_yes and ok_no:
         if edge_yes > edge_no + 1e-9:
@@ -2642,7 +2807,9 @@ def main() -> None:
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
         f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
         f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
-        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY} YES_CONVICTION={YES_CONVICTION_MULTIPLIER:.0%} HARD_STOP=${DUMP_MAX_LOSS_USD:.2f}"
+        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY} HARD_STOP=${DUMP_MAX_LOSS_USD:.2f} "
+        f"YES_ULTRA_GATE: prob≥{YES_ULTRA_GATE_PROB:.0%} move≥{YES_ULTRA_GATE_MOVE_PCT:.0%} "
+        f"time≤{YES_ULTRA_GATE_TIME_SEC}s price≥{YES_ULTRA_GATE_PRICE_CENTS}¢ kelly_reduction={YES_KELLY_REDUCTION:.0%}"
     )
     log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
@@ -2685,12 +2852,15 @@ def main() -> None:
     client = KalshiClient(API_BASE, API_PREFIX, API_KEY_ID, PRIVATE_KEY_PEM_B64)
     http = requests.Session()
 
+    global _yes_summary
+
     st = BotState()
     session = SessionState()
     trend = SpotTrend()  # 60-min long-term trend
     trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
     spot_momentum = SpotMomentum()  # Fast spot tracker for whipsaw detection
+    _yes_summary = YesSummary()  # Hourly YES trade summary tracker
     active_market_obj: Dict[str, Any] = {}
 
     # Initialize session with starting balance
@@ -2783,6 +2953,9 @@ def main() -> None:
                 f"streak={session.consecutive_wins}W | {prob_trend.summary()}"
             )
             last_heartbeat = now
+
+        # Hourly YES summary dump
+        _yes_summary.maybe_dump()
 
         # ============================================
         # DEFERRED SETTLEMENT: re-check if we have a pending result
@@ -3108,26 +3281,30 @@ def main() -> None:
                                         and not (NO_ONLY and flip_side == "yes")  # Don't flip to YES in NO_ONLY mode
                                     )
 
-                                    # YES flip: apply 150% conviction gate (same as choose_trade)
+                                    # YES flip: apply ultra gate (same 4-condition check as choose_trade)
                                     if can_flip and flip_side == "yes":
-                                        if secs_to_close > PROB_EARLY_ENTRY_SECONDS:
-                                            _flip_prob_min = PROB_EARLY_MIN
-                                        elif secs_to_close > PROB_MID_ENTRY_SECONDS:
-                                            _flip_prob_min = PROB_MID_MIN
+                                        _fg_passed, _fg_failed, _fg_details = yes_ultra_gate(
+                                            flip_prob, spot, lo, hi, secs_to_close,
+                                            int(flip_price) if flip_price is not None else None,
+                                        )
+                                        if not _fg_passed:
+                                            _fg_str = ",".join(_fg_failed)
+                                            log.warning(
+                                                f"[FLIP] YES flip blocked — ultra gate: failed={_fg_str} "
+                                                f"prob={_fg_details['prob']:.4f} move={_fg_details['move_pct']:.1%} "
+                                                f"time={_fg_details['secs']}s price={_fg_details['price']}¢"
+                                            )
+                                            can_flip = False
+                                            if _yes_summary is not None:
+                                                _yes_summary.record_opportunity(False, _fg_failed)
                                         else:
-                                            _flip_prob_min = PROB_MIN
-                                        _flip_yes_floor = min(0.99, 0.50 + (_flip_prob_min - 0.50) * YES_CONVICTION_MULTIPLIER)
-                                        if flip_prob < _flip_yes_floor:
                                             log.warning(
-                                                f"[FLIP] YES flip blocked — 150% conviction: "
-                                                f"prob={flip_prob:.1%} < floor={_flip_yes_floor:.1%}"
+                                                f"[FLIP] YES flip passed ultra gate — "
+                                                f"prob={_fg_details['prob']:.4f} move={_fg_details['move_pct']:.1%} "
+                                                f"time={_fg_details['secs']}s price={_fg_details['price']}¢"
                                             )
-                                            can_flip = False
-                                        if flip_price > YES_MAX_ENTRY_PRICE_CENTS:
-                                            log.warning(
-                                                f"[FLIP] YES flip blocked — price {flip_price}¢ > YES max {YES_MAX_ENTRY_PRICE_CENTS}¢"
-                                            )
-                                            can_flip = False
+                                            if _yes_summary is not None:
+                                                _yes_summary.record_opportunity(True, [])
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
                                     if can_flip:
@@ -3152,6 +3329,15 @@ def main() -> None:
                                                 flip_qty = MIN_CONTRACTS
                                         except Exception:
                                             flip_qty = MIN_CONTRACTS
+
+                                        # YES Kelly reduction for flips too
+                                        if flip_side == "yes" and flip_qty > 0:
+                                            _old_fq = flip_qty
+                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * YES_KELLY_REDUCTION))
+                                            log.warning(
+                                                f"[FLIP SIZE] YES Kelly reduction: {_old_fq} -> {flip_qty} "
+                                                f"({YES_KELLY_REDUCTION:.0%} of normal)"
+                                            )
 
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
@@ -3688,6 +3874,16 @@ def main() -> None:
             p_gate = float(p_no_blend)
 
         qty = compute_qty_from_bankroll(available_usd, int(chosen_px), edge_net=edge_net, p_gate=p_gate, session=session)
+
+        # YES KELLY REDUCTION: YES trades get 50% of normal Kelly sizing.
+        # Even when the ultra gate passes, YES positions are half-sized for protection.
+        if chosen_side == "yes" and qty > 0:
+            old_qty_yes = qty
+            qty = max(MIN_CONTRACTS, int(qty * YES_KELLY_REDUCTION))
+            log.warning(
+                f"[SIZE] YES Kelly reduction: {old_qty_yes} -> {qty} contracts "
+                f"({YES_KELLY_REDUCTION:.0%} of normal)"
+            )
 
         # DRAWDOWN RESUME: reduce size after drawdown pause
         size_mult = session.get_size_multiplier()
