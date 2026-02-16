@@ -2075,6 +2075,16 @@ def choose_trade(
     if YES_ONLY:
         ok_no = False
 
+    # OVERNIGHT YES BLOCK: disable YES entries 8pm-8am EST.
+    # Both overnight sessions had SOL YES losses (-$2.61, -$0.88).
+    # SOL NO overnight was 3W/0L, +$0.64. YES is fine during daytime.
+    if ok_yes and not is_daytime_est():
+        log.info(
+            f"[OVERNIGHT YES BLOCK] Blocking YES entry overnight "
+            f"(edge={edge_yes:.4f} prob={p_yes_blend:.1%}) — YES disabled 8pm-8am EST"
+        )
+        ok_yes = False
+
     # === MINIMUM PAYOFF GATE (hard floor — closes ALL backdoor paths) ===
     # Block any trade where the payoff per contract is below MIN_PAYOFF_CENTS.
     # This single check catches normal entries, settlement locks, high-certainty
@@ -3242,6 +3252,7 @@ def main() -> None:
                                         and flip_price <= FLIP_MAX_ENTRY_PRICE
                                         and (100 - flip_price) >= MIN_PAYOFF_CENTS  # Payoff gate
                                         and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
+                                        and not (flip_side == "yes" and not is_daytime_est())  # No YES flips overnight
                                     )
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
