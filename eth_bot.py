@@ -38,6 +38,7 @@ import base64
 import logging
 import math
 import threading
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -129,6 +130,11 @@ PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
 SERIES_TICKER = getenv_first(["SERIES", "KALSHI_SERIES", "KALSHI_SERIES_TICKER"], "KXETH15M")
 EVENT_TICKER = getenv_first(["EVENT_TICKER", "KALSHI_EVENT_TICKER"], "<auto>")
 MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<none>")
+
+# BOT_TAG: identifies this bot's orders in a shared Kalshi account.
+# All 4 bots (BTC, ETH, SOL, XRP) share one account. Each bot tags its orders
+# with this prefix so it can distinguish its own trades from other bots'.
+BOT_TAG = "ETH"
 
 POLL_SECONDS = env_float("POLL_SECONDS", 1.0)  # Check every second for dumps
 META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
@@ -999,14 +1005,10 @@ def wait_for_fill(client: KalshiClient, order_id: str, market: str) -> Tuple[str
     for attempt in range(1, FILL_CHECK_RETRIES + 1):
         order = get_order(client, order_id)
         if order is None:
-            # API error — check position as fallback
-            try:
-                pos = abs(parse_position_for_market(get_positions(client), market))
-                if pos > 0:
-                    log.info(f"[FILL] Order lookup failed but found position={pos} in {market}")
-                    return "filled", pos
-            except Exception:
-                pass
+            # API error — return unknown. DO NOT fall back to get_positions() because
+            # all 4 bots share one Kalshi account and API positions include other bots' trades.
+            # The caller handles "unknown" by assuming filled with intended qty.
+            log.warning(f"[FILL] Order lookup failed for {order_id} — returning unknown (shared account)")
             return "unknown", 0
 
         status = order.get("status", "unknown")
@@ -1082,7 +1084,13 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
     if balance_cents is not None:
         available_usd = float(balance_cents) / 100.0
         total_usd = float(balance_cents + portfolio_cents) / 100.0
-        log.info(f"[BALANCE] {balance_cents}¢ available (${available_usd:.2f}), portfolio={portfolio_cents}¢")
+        # SHARED ACCOUNT NOTE: available_usd is FREE cash (already excludes all bots' positions).
+        # portfolio_cents includes ALL bots' unrealized positions. This bot uses only available_usd
+        # for sizing, so other bots' positions are automatically accounted for.
+        log.info(
+            f"[BALANCE] {balance_cents}¢ available (${available_usd:.2f}), "
+            f"portfolio={portfolio_cents}¢ (all bots combined), BOT_TAG={BOT_TAG}"
+        )
         return available_usd, total_usd
 
     log.warning(f"[BALANCE] Could not find 'balance' in response: {resp}")
@@ -1097,12 +1105,16 @@ def build_order_payload(
     count: int,
     post_only: bool,
 ) -> Dict[str, Any]:
+    # Tag every order with BOT_TAG so we can identify this bot's trades
+    # in a shared Kalshi account (multiple bots, one account).
+    client_oid = f"{BOT_TAG}-{uuid.uuid4().hex[:12]}"
     body: Dict[str, Any] = {
         "ticker": market_ticker,
         "action": action,
         "side": side,
         "type": "limit",
         "count": int(count),
+        "client_order_id": client_oid,
     }
     if side == "yes":
         body["yes_price"] = int(price_cents)
@@ -2927,20 +2939,18 @@ def main() -> None:
             except Exception as e:
                 log.warning(f"[RECON] cancel strays failed: {e}")
 
+        # SHARED ACCOUNT: API positions include OTHER bots' trades.
+        # Log API position for diagnostic but do NOT enter HOLD from it.
+        # Only this bot's internal state (set on fill confirmation) is authoritative.
         try:
-            pos = parse_position_for_market(get_positions(client), new_market)
+            api_pos = parse_position_for_market(get_positions(client), new_market)
+            if api_pos != 0:
+                log.info(
+                    f"[RECON] API shows position={api_pos} in {new_market} "
+                    f"(may be another bot — BOT_TAG={BOT_TAG}, ignoring for HOLD)"
+                )
         except Exception:
-            pos = 0
-
-        if pos != 0:
-            st.sm = SM.HOLD
-            st.market = new_market
-            st.traded_this_market = True
-            st.order_id = None
-            # Determine which side we're holding
-            st.side = "yes" if pos > 0 else "no"
-            log.warning(f"[RECON] found existing position in {new_market}: pos={pos} side={st.side}. Enter HOLD.")
-            return
+            api_pos = 0
 
         st.sm = SM.IDLE
         st.market = new_market
@@ -3044,21 +3054,35 @@ def main() -> None:
 
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
-                        # Reconcile st.qty with actual position before computing P&L.
-                        # Resting orders may not have filled (or only partially filled).
-                        try:
-                            actual_pos = abs(parse_position_for_market(get_positions(client), old_market))
-                            if actual_pos != st.qty:
-                                log.warning(
-                                    f"[RECON] Position mismatch: st.qty={st.qty} actual={actual_pos} "
-                                    f"— using actual for P&L"
-                                )
-                                st.qty = actual_pos
-                            # Cancel any resting orders for this market
-                            if getattr(st, 'order_id', None):
+                        # Reconcile st.qty for resting orders that may have partially filled.
+                        # Use ORDER API (not position API) — shared account means positions
+                        # include other bots' trades.
+                        if getattr(st, 'order_id', None):
+                            try:
+                                recon_order = get_order(client, st.order_id)
+                                if recon_order is not None:
+                                    recon_total = recon_order.get("count", 0)
+                                    recon_remaining = recon_order.get("remaining_count", 0)
+                                    recon_filled = recon_total - recon_remaining
+                                    if recon_filled != st.qty:
+                                        log.warning(
+                                            f"[RECON] Order {st.order_id}: filled={recon_filled} vs st.qty={st.qty} "
+                                            f"— using order fill count for P&L"
+                                        )
+                                        st.qty = recon_filled
                                 cancel_order_status(client, st.order_id)
-                        except Exception as e:
-                            log.warning(f"[RECON] Position check failed: {e} — using st.qty={st.qty}")
+                            except Exception as e:
+                                log.warning(f"[RECON] Order check failed: {e} — using st.qty={st.qty}")
+                        # Diagnostic: log API position vs internal (never override)
+                        try:
+                            api_recon_pos = abs(parse_position_for_market(get_positions(client), old_market))
+                            if api_recon_pos != st.qty:
+                                log.info(
+                                    f"[RECON] API pos={api_recon_pos} vs internal qty={st.qty} for {old_market} "
+                                    f"(shared account — using internal, BOT_TAG={BOT_TAG})"
+                                )
+                        except Exception:
+                            pass
 
                         if st.qty == 0:
                             log.warning(f"[ROLL] No position filled in {old_market} — skipping P&L")
@@ -3162,19 +3186,28 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = int(close_ts - int(time.time()))
 
-        pos = 0
+        # INTERNAL POSITION TRACKING: use bot's own state, not Kalshi API positions.
+        # All 4 bots share one Kalshi account — API positions include OTHER bots' trades.
+        # Using API positions caused false HOLD entries with no entry data → dump disabled.
+        own_position = st.qty > 0 and st.side is not None
+
+        # Diagnostic: compare internal vs API (log-only, NEVER override internal state)
         try:
-            pos = parse_position_for_market(get_positions(client), st.market)
+            api_pos = parse_position_for_market(get_positions(client), st.market)
+            if bool(api_pos) != own_position:
+                log.warning(
+                    f"[POS_MISMATCH] Internal: side={st.side} qty={st.qty} sm={st.sm} | "
+                    f"API: pos={api_pos} — using internal (shared account, BOT_TAG={BOT_TAG})"
+                )
         except Exception as e:
+            api_pos = 0
             log.warning(f"[INV] positions fetch failed: {e}")
 
-        # MODIFIED: In HOLD state, check for dump conditions
-        if pos != 0:
+        if own_position:
             if st.sm != SM.HOLD:
                 st.sm = SM.HOLD
                 st.traded_this_market = True
-                st.side = "yes" if pos > 0 else "no"
-                log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side}")
+                log.warning(f"[HOLD] market={st.market} side={st.side} qty={st.qty} (internal tracking)")
             
             # Check dump conditions continuously
             if ENABLE_DUMP and secs_to_close is not None:
@@ -3234,7 +3267,7 @@ def main() -> None:
                             phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else "active"
                             drop_from_peak = st.peak_prob_for_side - our_prob if st.peak_prob_for_side > 0 else 0
                             log.info(
-                                f"[HOLD] {st.market} {st.side.upper()} pos={pos} "
+                                f"[HOLD] {st.market} {st.side.upper()} qty={st.qty} "
                                 f"held={time_in_trade:.0f}s phase={phase} "
                                 f"our_p={our_prob:.1%} peak={st.peak_prob_for_side:.1%} drop={drop_from_peak:.1%} "
                                 f"dump={dump_reason or 'none'}"
@@ -3244,7 +3277,7 @@ def main() -> None:
                         if should_dump:
                             log.warning(f"[BAIL] Triggering bail: {dump_reason}")
                             dumped_side = st.side
-                            dump_qty = abs(pos)
+                            dump_qty = st.qty  # Internal tracking (not API — shared account)
 
                             # Estimate exit price (use current bid/ask)
                             if st.side == "yes":
@@ -3432,11 +3465,13 @@ def main() -> None:
                                                 cancel_order_status(client, flip_oid)
                                                 st.sm = SM.DUMPED
                                                 st.side = None
+                                                st.qty = 0
                                                 st.entry_price_cents = None
                                         else:
                                             log.warning(f"[DRY] Would flip: BUY {flip_side.upper()} @ {flip_price}¢ qty={flip_qty}")
                                             st.sm = SM.DUMPED
                                             st.side = None
+                                            st.qty = 0
                                             st.entry_price_cents = None
                                     else:
                                         # No flip — log why
@@ -3461,17 +3496,20 @@ def main() -> None:
                                         log.warning(f"[FLIP] Skipped — {', '.join(reason_parts) or 'unknown'}")
                                         st.sm = SM.DUMPED
                                         st.side = None
+                                        st.qty = 0
                                         st.entry_price_cents = None
 
                                 except Exception as e:
                                     log.error(f"[FLIP] Failed: {e}")
                                     st.sm = SM.DUMPED
                                     st.side = None
+                                    st.qty = 0
                                     st.entry_price_cents = None
                             else:
                                 # Sell failed — can't flip
                                 st.sm = SM.DUMPED
                                 st.side = None
+                                st.qty = 0
                                 st.entry_price_cents = None
 
                         # ---- LAST-MINUTE SCALP (inside dump check, only if NOT dumping) ----
@@ -3519,7 +3557,7 @@ def main() -> None:
                                     scalp_avail, _ = get_balance_usd(client)
                                     if scalp_avail is not None and scalp_avail >= MIN_FREE_USD_TO_TRADE:
                                         # Cap scalp so total position (existing + scalp) ≤ MAX_CONTRACTS
-                                        existing_pos = abs(pos)  # pos from the HOLD loop
+                                        existing_pos = st.qty  # Internal tracking (not API — shared account)
                                         scalp_room = max(0, MAX_CONTRACTS - existing_pos)
                                         if scalp_room <= 0:
                                             log.info(f"[SCALP] Skipped — position already at {existing_pos} (max={MAX_CONTRACTS})")
