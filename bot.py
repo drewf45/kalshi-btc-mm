@@ -127,6 +127,14 @@ POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 NO_ONLY = env_bool("NO_ONLY", False)      # Trade only NO side (overrides YES_ONLY if both set)
 
+# -------------- MULTI-BOT ACCOUNT SHARING ------------------------------------
+# All 4 bots (BTC, ETH, SOL, XRP) share one Kalshi account. Each bot must:
+#   1. Track its OWN positions internally (not rely on account-wide API feed)
+#   2. Tag its orders with BOT_ID so it can identify its own trades
+#   3. Only use its fair share of available cash (balance / NUM_CONCURRENT_BOTS)
+BOT_ID = os.getenv("BOT_ID", "BTC")           # Unique identifier for this bot instance
+NUM_CONCURRENT_BOTS = env_int("NUM_CONCURRENT_BOTS", 4)  # Number of bots sharing the account
+
 # -------------- ASYMMETRIC SIDE REQUIREMENTS --------------------------------
 # YES is filtered by the ultra-strict gate (92% prob, 60% move, 10min, 85¢+, etc).
 # NO extra bonus on prob/edge in choose_trade — the ultra-strict gate is the
@@ -1130,6 +1138,40 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
     return None, None
 
 
+def get_bot_available_usd(
+    client: KalshiClient,
+    position_tracker: 'BotPositionTracker',
+) -> Tuple[Optional[float], Optional[float]]:
+    """Get this bot's fair share of available cash.
+
+    Multiple bots share one Kalshi account. The raw 'balance' from the API is
+    account-wide free cash (after ALL bots' positions are paid for). To prevent
+    all bots from trying to use the same cash simultaneously, each bot only
+    uses balance / NUM_CONCURRENT_BOTS.
+    """
+    available, total = get_balance_usd(client)
+    if available is None:
+        return None, None
+    # Each bot gets an equal share of the free cash
+    bot_available = available / max(1, NUM_CONCURRENT_BOTS)
+    my_cost = position_tracker.total_cost_usd()
+    log.info(
+        f"[BOT BALANCE] {BOT_ID}: account=${available:.2f} / {NUM_CONCURRENT_BOTS} bots "
+        f"= ${bot_available:.2f} per bot | my_positions_cost=${my_cost:.2f}"
+    )
+    return bot_available, total
+
+
+def _generate_client_order_id() -> str:
+    """Generate a unique client_order_id tagged with this bot's identity.
+    Format: {BOT_ID}-{timestamp_ms}-{random_hex}
+    This lets any bot identify which orders belong to it."""
+    import uuid
+    ts = int(time.time() * 1000)
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"{BOT_ID}-{ts}-{short_uuid}"
+
+
 def build_order_payload(
     market_ticker: str,
     action: str,
@@ -1144,6 +1186,7 @@ def build_order_payload(
         "side": side,
         "type": "limit",
         "count": int(count),
+        "client_order_id": _generate_client_order_id(),
     }
     if side == "yes":
         body["yes_price"] = int(price_cents)
@@ -1853,6 +1896,98 @@ class ProbTrend:
         if n < PROB_TREND_MIN_SAMPLES:
             return f"prob_trend=warming({n}/{PROB_TREND_MIN_SAMPLES})"
         return f"prob_trend={direction}({change:+.0%}/{seconds:.0f}s/{n}pts)"
+
+
+@dataclass
+class InternalPosition:
+    """A position this bot placed and confirmed, tracked independently of the
+    account-wide Kalshi position feed. This prevents cross-contamination
+    between multiple bots sharing one Kalshi account."""
+    market_id: str
+    side: str              # "yes" or "no"
+    entry_price_cents: int
+    qty: int
+    order_id: str
+    fill_timestamp: float
+
+
+class BotPositionTracker:
+    """Track this bot's own positions by internal fill records only.
+
+    The Kalshi API position feed shows ALL positions across the account,
+    so when 4 bots share one account, each bot sees the others' positions.
+    This tracker solves that: a position only exists here if THIS bot
+    placed the order and got a fill confirmation.
+    """
+
+    def __init__(self, bot_id: str):
+        self.bot_id = bot_id
+        self.positions: Dict[str, InternalPosition] = {}  # market_id -> position
+
+    def record_fill(self, market_id: str, side: str, entry_price_cents: int,
+                    qty: int, order_id: str) -> None:
+        """Record a confirmed fill for this bot."""
+        existing = self.positions.get(market_id)
+        if existing and existing.side == side:
+            # Adding to existing position (e.g., scalp add-on)
+            # Weighted average entry price
+            total_qty = existing.qty + qty
+            if total_qty > 0:
+                avg_price = int(
+                    (existing.entry_price_cents * existing.qty +
+                     entry_price_cents * qty) / total_qty
+                )
+            else:
+                avg_price = entry_price_cents
+            self.positions[market_id] = InternalPosition(
+                market_id=market_id, side=side,
+                entry_price_cents=avg_price, qty=total_qty,
+                order_id=order_id, fill_timestamp=time.time(),
+            )
+        else:
+            # New position or flip (different side replaces old)
+            self.positions[market_id] = InternalPosition(
+                market_id=market_id, side=side,
+                entry_price_cents=entry_price_cents, qty=qty,
+                order_id=order_id, fill_timestamp=time.time(),
+            )
+        log.info(
+            f"[POS TRACK] RECORDED {self.bot_id} {side.upper()} × {qty} "
+            f"@ {entry_price_cents}¢ in {market_id} (order={order_id})"
+        )
+
+    def clear_position(self, market_id: str) -> None:
+        """Remove position after dump, settlement, or market roll."""
+        removed = self.positions.pop(market_id, None)
+        if removed:
+            log.info(
+                f"[POS TRACK] CLEARED {self.bot_id} {removed.side.upper()} × {removed.qty} "
+                f"@ {removed.entry_price_cents}¢ in {market_id}"
+            )
+
+    def get_position(self, market_id: str) -> Optional[InternalPosition]:
+        """Get this bot's position in a specific market, or None."""
+        return self.positions.get(market_id)
+
+    def has_position(self, market_id: str) -> bool:
+        p = self.positions.get(market_id)
+        return p is not None and p.qty > 0
+
+    def get_signed_qty(self, market_id: str) -> int:
+        """Return position qty with sign: positive=YES, negative=NO, 0=none.
+        Matches the convention of parse_position_for_market."""
+        p = self.positions.get(market_id)
+        if p is None or p.qty <= 0:
+            return 0
+        return p.qty if p.side == "yes" else -p.qty
+
+    def total_cost_usd(self) -> float:
+        """Total entry cost across all open positions (for cash reservation)."""
+        total = 0.0
+        for p in self.positions.values():
+            if p.qty > 0:
+                total += p.entry_price_cents * p.qty / 100.0
+        return total
 
 
 @dataclass
@@ -3014,6 +3149,7 @@ def main() -> None:
     session = SessionState()
     yes_tracker = YesHourlyTracker()
     fill_tracker = FillRateTracker()
+    position_tracker = BotPositionTracker(BOT_ID)
     trend = SpotTrend()  # 60-min long-term trend
     trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
@@ -3062,19 +3198,24 @@ def main() -> None:
             except Exception as e:
                 log.warning(f"[RECON] cancel strays failed: {e}")
 
-        try:
-            pos = parse_position_for_market(get_positions(client), new_market)
-        except Exception:
-            pos = 0
+        # Check internal tracker for THIS bot's position in the new market
+        pos = position_tracker.get_signed_qty(new_market)
 
         if pos != 0:
             st.sm = SM.HOLD
             st.market = new_market
             st.traded_this_market = True
             st.order_id = None
-            # Determine which side we're holding
             st.side = "yes" if pos > 0 else "no"
-            log.warning(f"[RECON] found existing position in {new_market}: pos={pos} side={st.side}. Enter HOLD.")
+            ipos = position_tracker.get_position(new_market)
+            if ipos:
+                st.entry_price_cents = ipos.entry_price_cents
+                st.qty = ipos.qty
+                st.entry_time = ipos.fill_timestamp
+            log.warning(
+                f"[RECON] found OWN position in {new_market}: pos={pos} side={st.side} "
+                f"entry={st.entry_price_cents}¢ qty={st.qty} (bot={BOT_ID}). Enter HOLD."
+            )
             return
 
         st.sm = SM.IDLE
@@ -3178,24 +3319,24 @@ def main() -> None:
 
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
-                        # Reconcile st.qty with actual position before computing P&L.
-                        # Resting orders may not have filled (or only partially filled).
+                        # Reconcile st.qty with internal tracker (not account-wide API).
+                        ipos = position_tracker.get_position(old_market)
+                        if ipos and ipos.qty != st.qty:
+                            log.warning(
+                                f"[RECON] Position mismatch: st.qty={st.qty} tracker={ipos.qty} "
+                                f"— using tracker for P&L (bot={BOT_ID})"
+                            )
+                            st.qty = ipos.qty
+                        # Cancel any resting orders for this market
                         try:
-                            actual_pos = abs(parse_position_for_market(get_positions(client), old_market))
-                            if actual_pos != st.qty:
-                                log.warning(
-                                    f"[RECON] Position mismatch: st.qty={st.qty} actual={actual_pos} "
-                                    f"— using actual for P&L"
-                                )
-                                st.qty = actual_pos
-                            # Cancel any resting orders for this market
                             if getattr(st, 'order_id', None):
                                 cancel_order_status(client, st.order_id)
                         except Exception as e:
-                            log.warning(f"[RECON] Position check failed: {e} — using st.qty={st.qty}")
+                            log.warning(f"[RECON] Cancel resting order failed: {e}")
 
                         if st.qty == 0:
                             log.warning(f"[ROLL] No position filled in {old_market} — skipping P&L")
+                            position_tracker.clear_position(old_market)
                             session.reset_for_new_market()
                             ev, market_ticker, market_obj = ev2, mt2, mobj2
                             st = BotState(market=mt2)
@@ -3260,6 +3401,7 @@ def main() -> None:
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
                     prob_trend.reset(mt2)
+                    position_tracker.clear_position(old_market)  # Clear internal tracker for settled market
 
                     st.event = ev2
                     st.market = mt2
@@ -3291,19 +3433,26 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = int(close_ts - int(time.time()))
 
-        pos = 0
-        try:
-            pos = parse_position_for_market(get_positions(client), st.market)
-        except Exception as e:
-            log.warning(f"[INV] positions fetch failed: {e}")
+        # Use INTERNAL position tracker — not the account-wide Kalshi API.
+        # The API shows all 4 bots' positions; we only want THIS bot's.
+        pos = position_tracker.get_signed_qty(st.market)
 
-        # MODIFIED: In HOLD state, check for dump conditions
+        # HOLD state: only enter if THIS bot has a position
         if pos != 0:
             if st.sm != SM.HOLD:
                 st.sm = SM.HOLD
                 st.traded_this_market = True
                 st.side = "yes" if pos > 0 else "no"
-                log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side}")
+                # Restore entry data from internal tracker (avoids no_entry_data dump bug)
+                ipos = position_tracker.get_position(st.market)
+                if ipos:
+                    st.entry_price_cents = st.entry_price_cents or ipos.entry_price_cents
+                    st.qty = ipos.qty
+                    st.entry_time = st.entry_time or ipos.fill_timestamp
+                log.warning(
+                    f"[HOLD] market={st.market} pos={pos} side={st.side} "
+                    f"entry={st.entry_price_cents}¢ qty={st.qty} (internal tracker, bot={BOT_ID})"
+                )
             
             # Check dump conditions continuously
             if ENABLE_DUMP and secs_to_close is not None:
@@ -3434,9 +3583,11 @@ def main() -> None:
                                     oid = place_order(client, exit_payload)
                                     log.warning(f"[BAIL] SELL order placed {oid} SELL {st.side.upper()} qty={dump_qty}")
                                     sell_ok = True
+                                    position_tracker.clear_position(st.market)
                                 else:
                                     log.warning(f"[DRY] Would bail: SELL {st.side.upper()} qty={dump_qty}")
                                     sell_ok = True
+                                    position_tracker.clear_position(st.market)
                             except Exception as e:
                                 log.error(f"[BAIL] Failed to place sell order: {e}")
 
@@ -3496,9 +3647,9 @@ def main() -> None:
                                     if can_flip:
                                         flip_edge = flip_prob - (flip_price / 100.0)
 
-                                        # Kelly bankroll sizing for flip
+                                        # Kelly bankroll sizing for flip (use per-bot share)
                                         try:
-                                            avail_usd, _ = get_balance_usd(client)
+                                            avail_usd, _ = get_bot_available_usd(client, position_tracker)
                                             if avail_usd and avail_usd > 0:
                                                 flip_qty = compute_qty_from_bankroll(
                                                     avail_usd, int(flip_price),
@@ -3562,6 +3713,7 @@ def main() -> None:
                                                 st.entry_market_prob = p_mkt
                                                 st.entry_spot_price = spot
                                                 st.qty = flip_filled  # Actual filled qty
+                                                position_tracker.record_fill(st.market, flip_side, int(flip_price), flip_filled, flip_oid)
                                                 st.peak_prob_for_side = flip_prob
                                                 st.prob_history = []  # Reset windowed peak tracking for flipped position
                                                 st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
@@ -3661,8 +3813,8 @@ def main() -> None:
                                 )
 
                                 try:
-                                    # Fetch fresh cash balance for the scalp order
-                                    scalp_avail, _ = get_balance_usd(client)
+                                    # Fetch fresh cash balance for the scalp order (per-bot share)
+                                    scalp_avail, _ = get_bot_available_usd(client, position_tracker)
                                     if scalp_avail is not None and scalp_avail >= MIN_FREE_USD_TO_TRADE:
                                         # Cap scalp so total position (existing + scalp) ≤ MAX_CONTRACTS
                                         existing_pos = abs(pos)  # pos from the HOLD loop
@@ -3715,6 +3867,7 @@ def main() -> None:
                                                 scalp_fill_status, scalp_filled = wait_for_fill(client, scalp_oid, st.market)
                                                 if scalp_fill_status in ("filled", "partial") and scalp_filled > 0:
                                                     fill_tracker.record_fill(st.side, "scalp", partial=(scalp_fill_status == "partial"))
+                                                    position_tracker.record_fill(st.market, st.side, int(scalp_px), scalp_filled, scalp_oid)
                                                     st.has_scalped = True
                                                     log.warning(f"[SCALP] Fill confirmed: {scalp_filled}/{scalp_qty} contracts")
                                                     if scalp_filled < scalp_qty:
@@ -4194,7 +4347,7 @@ def main() -> None:
             session._needs_trend_reset = False
             log.warning("[SESSION] Post-cooldown: trend data reset — re-evaluating from scratch")
 
-        available_usd, total_usd = get_balance_usd(client)
+        available_usd, total_usd = get_bot_available_usd(client, position_tracker)
 
         if chosen_side == "yes":
             edge_net = float(edge_yes)
@@ -4340,6 +4493,7 @@ def main() -> None:
                 st.entry_price_cents = int(chosen_px)
                 st.entry_time = now
                 st.qty = filled_qty  # Use actual filled qty, not intended
+                position_tracker.record_fill(st.market, chosen_side, int(chosen_px), filled_qty, oid)
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
                 st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
@@ -4359,6 +4513,7 @@ def main() -> None:
                 st.entry_price_cents = int(chosen_px)
                 st.entry_time = now
                 st.qty = qty
+                position_tracker.record_fill(st.market, chosen_side, int(chosen_px), qty, oid)
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
                 st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
@@ -4378,6 +4533,7 @@ def main() -> None:
                 st.entry_price_cents = int(chosen_px)
                 st.entry_time = now
                 st.qty = qty  # Intended qty — will reconcile from position on settlement
+                position_tracker.record_fill(st.market, chosen_side, int(chosen_px), qty, oid)
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
