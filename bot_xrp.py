@@ -955,10 +955,34 @@ def cancel_order_status(client: KalshiClient, order_id: str) -> str:
 
 
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
-    # ABSOLUTE SAFETY NET: clamp count to MAX_CONTRACTS at the API boundary
-    if payload.get("action") == "buy" and payload.get("count", 0) > MAX_CONTRACTS:
-        log.warning(f"[PLACE_ORDER] HARD_CAP count {payload['count']} -> {MAX_CONTRACTS}")
-        payload["count"] = MAX_CONTRACTS
+    if payload.get("action") == "buy":
+        count = payload.get("count", 0)
+        # HARD CAP 1: absolute contract limit
+        if count > MAX_CONTRACTS:
+            log.warning(f"[HARD CAP] Reduced order from {count} to {MAX_CONTRACTS} contracts")
+            count = MAX_CONTRACTS
+            payload["count"] = count
+
+        # HARD CAP 2: check existing position on this market via Kalshi API
+        ticker = payload.get("ticker", "")
+        if ticker:
+            try:
+                existing = abs(parse_position_for_market(get_positions(client), ticker))
+                if existing + count > MAX_CONTRACTS:
+                    old_count = count
+                    count = max(0, MAX_CONTRACTS - existing)
+                    payload["count"] = count
+                    log.warning(
+                        f"[HARD CAP] Already hold {existing} contracts on {ticker}, "
+                        f"reduced new order {old_count} -> {count} (max {MAX_CONTRACTS} total)"
+                    )
+            except Exception as e:
+                log.warning(f"[HARD CAP] Position check failed: {e} — using count={count}")
+
+        if count <= 0:
+            log.warning(f"[HARD CAP] Already at max position on {ticker}, skipping order")
+            return "BLOCKED_BY_HARD_CAP"
+
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
     if isinstance(resp, dict):
         if "order" in resp and isinstance(resp["order"], dict) and resp["order"].get("order_id"):
@@ -2740,6 +2764,11 @@ def main() -> None:
         f"YES_ONLY={YES_ONLY}"
     )
     log.warning(
+        f"[BOOTCFG] *** HARD CAP: MAX_CONTRACTS={MAX_CONTRACTS} *** "
+        f"(enforced at API boundary with position check, POST_ONLY={POST_ONLY}, "
+        f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}, MAX_LOSS_AT_EXPIRY=${MAX_LOSS_AT_EXPIRY_USD:.2f})"
+    )
+    log.warning(
         f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
         f"boundary_buffer=${BOUNDARY_BUFFER_USD:.4f} trend_block={TREND_AGAINST_BLOCK}"
     )
@@ -3090,6 +3119,23 @@ def main() -> None:
         # Use INTERNAL position tracker instead of Kalshi API positions.
         # This prevents seeing other bots' positions on the shared account.
         pos = position_tracker.get_signed_qty(st.market)
+
+        # If internal tracker is blank but API shows a position, adopt it
+        if pos == 0:
+            try:
+                api_pos = parse_position_for_market(get_positions(client), st.market)
+                if api_pos != 0:
+                    pos = api_pos
+                    st.side = "yes" if api_pos > 0 else "no"
+                    st.qty = abs(api_pos)
+                    if st.entry_price_cents is None or st.entry_price_cents == 0:
+                        st.entry_price_cents = 90
+                    log.warning(
+                        f"[POS_SYNC] Adopted API position: side={st.side} qty={st.qty} "
+                        f"api_pos={api_pos} market={st.market} — dump logic now active"
+                    )
+            except Exception:
+                pass
 
         if pos != 0:
             if st.sm != SM.HOLD:
