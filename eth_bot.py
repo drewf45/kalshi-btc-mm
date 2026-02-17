@@ -148,16 +148,16 @@ NO_ONLY = env_bool("NO_ONLY", False)     # Ultra gate replaces hard block — se
 # YES has been net negative (-$5.46 lifetime, 0-for-13), but rather than disable entirely,
 # we gate YES behind 4 simultaneous conditions so it ONLY fires on near-certain outcomes.
 # Expected: maybe 1-2 YES trades per day at most. All skips are logged with condition breakdown.
-YES_ULTRA_GATE_PROB = 0.95               # Condition 1: blended probability must exceed 95%
-YES_ULTRA_GATE_MOVE_PCT = 0.70           # Condition 2: ETH must have moved 70%+ of range toward center
-YES_ULTRA_GATE_TIME_SEC = 300            # Condition 3: must be < 5 minutes remaining
-YES_ULTRA_GATE_PRICE_CENTS = 93          # Condition 4: YES contract price must be >= 93¢ (market consensus)
-YES_KELLY_REDUCTION = 0.50               # YES gets 50% of normal Kelly sizing (half position)
-YES_CONVICTION_MULTIPLIER = 1.50         # Legacy 150% conviction (still applied in ok_yes threshold)
-YES_EDGE_MIN = 0.02                      # Same as NO — ultra gate is the real protection now
-YES_MAX_ENTRY_PRICE_CENTS = 99           # Effectively uncapped — ultra gate requires >= 93¢
-YES_KELLY_MULTIPLIER = 0.10              # 10% of Kelly sizing (legacy, ultra gate + YES_KELLY_REDUCTION is primary)
-YES_REQUIRE_TREND_ALIGNED = True         # All trends must be WITH the trade
+YES_ULTRA_GATE_PROB = 0.0                # DISABLED — was 0.95
+YES_ULTRA_GATE_MOVE_PCT = 0.0            # DISABLED — was 0.70
+YES_ULTRA_GATE_TIME_SEC = 99999          # DISABLED — was 300
+YES_ULTRA_GATE_PRICE_CENTS = 0           # DISABLED — was 93
+YES_KELLY_REDUCTION = 1.0                # DISABLED — was 0.50 (no reduction)
+YES_CONVICTION_MULTIPLIER = 1.0          # DISABLED — was 1.50 (no boost)
+YES_EDGE_MIN = 0.01                      # Same as EDGE_MIN — was 0.02
+YES_MAX_ENTRY_PRICE_CENTS = 93           # Same as MAX_ENTRY_PRICE_CENTS — was 99
+YES_KELLY_MULTIPLIER = 0.25              # Same as KELLY_MULTIPLIER — was 0.10
+YES_REQUIRE_TREND_ALIGNED = False        # DISABLED — was True
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -179,30 +179,26 @@ BOOTSTRAP_CANCEL_OPEN_ORDERS = env_bool("BOOTSTRAP_CANCEL_OPEN_ORDERS", True)
 #   OBSERVE (12min → 7min before close): gather trend data, watch book, DON'T buy
 #   BUY     (7min → 5s before close):   make the call, place the order, hold
 OBSERVE_START_SECONDS = 720  # Start watching at 12min — gather trend + prob data
-BUY_START_SECONDS = 420      # Can enter from T-420s (7 min) — book has liquidity, grab it before it locks up
+BUY_START_SECONDS = 600      # 10 minutes — match all other bots
 ENTRY_LAST_SECONDS = 5       # Can enter up to 5s before close (need time to fill)
 FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.80  # 80%+ to enter in last 3 min — $0.40 hard cap is the real protection now
-EDGE_MIN = 0.02  # 2% minimum edge — lower bar to increase volume, small sizes limit damage
-MAX_ENTRY_PRICE_CENTS = 93  # 93¢ max — win pays 7¢/ct, need ~13 wins per loss (90% WR supports this)
+PROB_MIN = 0.70  # 70%+ — trend analysis provides confidence, just lower the gate
+EDGE_MIN = 0.01  # 1% edge — collecting pennies per contract is the strategy
+MAX_ENTRY_PRICE_CENTS = 93  # 93¢ max — win pays 7¢/ct
 
-# NO VOLUME BOOST: ETH NO is 73% WR but only 2-4 trades/session. More trades = more profit.
-# Lower NO probability threshold by 5 points to increase volume.
-# YES conviction multiplier is computed from the BASE thresholds (above), not the adjusted ones.
-NO_PROB_ADJUSTMENT = -0.05  # NO enters 5 points easier (75% late, 78% mid, 82% early)
+# NO PROB ADJUSTMENT: removed — both sides use the same PROB_MIN
+NO_PROB_ADJUSTMENT = 0.0  # Disabled — flat PROB_MIN for both sides
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 7-min buy window) --------
-# Buy window is 7min → 5s before close. Require more certainty at the start
-# of the buy window (ETH still has time to move), relax near the end.
-# NOTE: observation phase (12min → 7min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 300   # 5-7 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.87            # >5min: need 87%+ (was 90% — too tight, killed overnight volume)
-PROB_MID_ENTRY_SECONDS = 180     # 3-5 min to close = "mid"
-PROB_MID_MIN = 0.83              # 3-5min: need 83%+ (was 86% — $0.40 cap protects, take more trades)
+# -------------- TIME-DEPENDENT CERTAINTY — DISABLED -------------------------
+# Single flat PROB_MIN gate. No early/mid tiers.
+PROB_EARLY_ENTRY_SECONDS = 0    # Disabled
+PROB_EARLY_MIN = PROB_MIN
+PROB_MID_ENTRY_SECONDS = 0      # Disabled
+PROB_MID_MIN = PROB_MIN
 # <3 min = PROB_MIN (0.80) — market has priced in the outcome, $0.40 hard cap is the real protection
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
@@ -212,20 +208,20 @@ PROB_TREND_WINDOW_SECONDS = 90    # Look at last 90 seconds of probability
 PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
 PROB_TREND_THRESHOLD = 0.05       # 5% swing in one direction = trend signal (was 8% — ETH moves less than BTC)
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
-PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
+PROB_TREND_ENTRY_ENABLED = False  # DISABLED — was True (trend analysis kept but doesn't gate entries)
 REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match ETH spot trend (borderline only)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
 # Rationale: 90%+ prob means ETH is well inside the range. The outcome is decisive.
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.85   # ≥85% prob = buy immediately, no trend check needed (was 90% — too tight)
-PROB_FAST_LANE_LATE_THRESHOLD = 0.83  # ≥83% prob in last 3 min = fast lane (market has priced in outcome)
+PROB_FAST_LANE_THRESHOLD = 0.70   # Set to PROB_MIN so everything qualifies — was 0.85
+PROB_FAST_LANE_LATE_THRESHOLD = 0.70  # Set to PROB_MIN so everything qualifies — was 0.83
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
 # At T-300s to T-180s, prob must have been on the same side for this many seconds.
-CONFIRMATION_HOLD_SECONDS = 8    # Signal must persist for 8s before early commitment (was 15 — too slow for ETH)
+CONFIRMATION_HOLD_SECONDS = 0    # DISABLED — was 8
 CONFIRMATION_HOLD_MIN_TIME = 180  # Only require confirmation hold above 3 min to close
 
 SPOT_SIGMA_USD_PER_SQRT_SEC = 0.35  # ETH: ~0.35 USD/√sec (BTC is ~12, ETH price ~35x lower with similar % vol)
@@ -245,7 +241,7 @@ KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 3            # Hard cap — 3 contracts max per trade (shared $23 bankroll across 4 bots)
 CROSS_BOT_DROP_THRESHOLD = 2.00  # If shared balance dropped >$2, another bot lost — halve next trade
 MIN_CONTRACTS = 1           # Floor
-MIN_FREE_USD_TO_TRADE = 5.0
+MIN_FREE_USD_TO_TRADE = 1.0  # $1 min — 3ct × 90c = $2.70, don't starve the bot
 # Legacy constants (kept for backward compat in safety checks)
 BASE_CONTRACTS = 3
 CONTRACT_INCREMENT = 1
@@ -354,12 +350,12 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 # Instead of just eating the loss, flip to the other side and hold THAT to settlement.
 # Example: bought YES at 94¢, ETH tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
 #          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
-# Safety: the flip still checks probability and price, but with a LOWER bar
-#         than a fresh entry — this is a recovery play, not a new trade.
-#         We already took the loss; the question is "can I claw some back?"
+# UNCONDITIONAL: the flip executes after EVERY dump. No probability, edge, confidence,
+#                or Kelly gates. Only hard limits: MAX_CONTRACTS=3, FLIP_MAX_ENTRY_PRICE,
+#                FLIP_MIN_TIME_REMAINING, and MAX_LOSS_AT_EXPIRY gate.
 FLIP_AFTER_DUMP = True              # ENABLED — with MAX_CONTRACTS=3 and 92¢ cap, max risk = $2.76 (acceptable)
 FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
-FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
+FLIP_MIN_PROB = 0.60                # UNUSED — flip is unconditional (kept for reference only)
 FLIP_MAX_ENTRY_PRICE = 92           # Capped at 92¢ — min payoff 8¢/contract (was 99¢ which is -EV)
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
@@ -428,11 +424,11 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.93)  # Must be genuinely certain — 85% @ 99¢ = -12¢/ct EV
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.70)  # Set to PROB_MIN — was 0.93
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 93)   # Capped — was 99¢ which allowed -EV entries
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
-LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
+LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 0)  # DISABLED — was 20
 LAST_CHANCE_MIN_PROB = env_float("LAST_CHANCE_MIN_PROB", 0.85)
 
 BOUNDARY_BUFFER_USD = env_float("BOUNDARY_BUFFER_USD", 1.50)  # $1.50 buffer — ETH-aware bail is the real safety net during hold
@@ -454,7 +450,7 @@ TREND_WITH_EDGE_DISCOUNT = 0.005   # Reduce required edge by 0.5% when trading w
 # is stale — the orderbook hasn't caught up yet. Entering on stale probability
 # is how you get the worst losses: you think 93% but it's really 60%.
 # Skip the entry entirely and wait for the market to settle.
-WHIPSAW_ENABLED = True
+WHIPSAW_ENABLED = False  # DISABLED — was True
 WHIPSAW_WINDOW_SECONDS = 45        # Look at last 45 seconds of spot prices
 WHIPSAW_THRESHOLD_USD = 5.0        # Skip if ETH moved > $5 in the window (BTC $150 ÷ ~30 ≈ $5 ETH)
 WHIPSAW_MIN_SAMPLES = 3            # Need at least 3 spot samples in the window
@@ -1966,12 +1962,9 @@ def choose_trade(
     p_yes_blend = max(0.0, min(1.0, p_yes_blend))
     p_no_blend = 1.0 - p_yes_blend
 
-    if POST_ONLY:
-        yes_px = postable_entry_price(yes_bid, yes_ask)
-        no_px = postable_entry_price(no_bid, no_ask)
-    else:
-        yes_px = yes_ask
-        no_px = no_ask
+    # Price = prob × 100 - 1 (guarantees positive edge at any fill)
+    yes_px = max(1, min(int(p_yes_blend * 100) - 1, MAX_ENTRY_PRICE_CENTS))
+    no_px = max(1, min(int(p_no_blend * 100) - 1, MAX_ENTRY_PRICE_CENTS))
 
     ok_book_yes = spread_ok(yes_bid, yes_ask)
     ok_book_no = spread_ok(no_bid, no_ask)
@@ -2856,8 +2849,8 @@ def main() -> None:
         f"btc_buffer_early=${DUMP_BTC_SAFE_BUFFER_EARLY:.0f} btc_buffer_late=${DUMP_BTC_SAFE_BUFFER_LATE:.0f}"
     )
     log.warning(
-        f"[BOOTCFG] FLIP: enabled={FLIP_AFTER_DUMP} min_time={FLIP_MIN_TIME_REMAINING}s "
-        f"min_prob={FLIP_MIN_PROB:.0%} max_price={FLIP_MAX_ENTRY_PRICE}¢ (one flip per market)"
+        f"[BOOTCFG] FLIP: enabled={FLIP_AFTER_DUMP} UNCONDITIONAL min_time={FLIP_MIN_TIME_REMAINING}s "
+        f"max_price={FLIP_MAX_ENTRY_PRICE}¢ (one flip per market, no prob/edge/confidence gates)"
     )
     log.warning(
         f"[BOOTCFG] SIZING: base_contracts={BASE_CONTRACTS} increment={CONTRACT_INCREMENT}/win "
@@ -3353,7 +3346,8 @@ def main() -> None:
                                     flip_yes_bid, flip_yes_ask, flip_no_bid, flip_no_ask = parse_best_yes_no(flip_ob)
                                     flip_side = "no" if dumped_side == "yes" else "yes"
                                     flip_prob = p_no_blend if dumped_side == "yes" else p_yes_blend
-                                    flip_price = flip_no_ask if flip_side == "no" else flip_yes_ask
+                                    # Price = prob × 100 - 1 (guarantees positive edge at any fill)
+                                    flip_price = max(1, min(int(flip_prob * 100) - 1, FLIP_MAX_ENTRY_PRICE))
 
                                     log.warning(
                                         f"[FLIP] Evaluating: side={flip_side} prob={flip_prob:.1%} "
@@ -3371,43 +3365,17 @@ def main() -> None:
                                         and not (NO_ONLY and flip_side == "yes")  # Don't flip to YES in NO_ONLY mode
                                     )
 
-                                    # FLIP: skip ultra gate — flips are recovery plays, not fresh entries.
-                                    # Ultra gate (95% prob + 70% move + <5min + >=93¢) is too restrictive
-                                    # and was blocking ALL ETH flips. The dual-path check below is sufficient.
-
-                                    # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
-                                    if can_flip:
-                                        market_confident = flip_price >= 80
-                                        model_agrees = flip_prob >= FLIP_MIN_PROB
-                                        if not market_confident and not model_agrees:
-                                            can_flip = False
+                                    # UNCONDITIONAL FLIP — no prob/confidence/edge/Kelly gates.
+                                    # The flip executes after every dump. Only hard limits
+                                    # (MAX_CONTRACTS, FLIP_MAX_ENTRY_PRICE, time) apply.
 
                                     if can_flip:
                                         flip_edge = flip_prob - (flip_price / 100.0)
 
-                                        # Kelly bankroll sizing for flip
+                                        # Unconditional flip sizing: MIN_CONTRACTS, capped by MAX_CONTRACTS
+                                        # No Kelly, no YES_KELLY_REDUCTION — flip is a recovery play.
                                         flip_cost_per = int(flip_price) / 100.0
-                                        try:
-                                            avail_usd, _ = get_balance_usd(client)
-                                            if avail_usd and avail_usd > 0:
-                                                flip_qty = compute_qty_from_bankroll(
-                                                    avail_usd, int(flip_price),
-                                                    edge_net=flip_edge, p_gate=flip_prob,
-                                                    session=session,
-                                                )
-                                            else:
-                                                flip_qty = MIN_CONTRACTS
-                                        except Exception:
-                                            flip_qty = MIN_CONTRACTS
-
-                                        # YES Kelly reduction for flips too
-                                        if flip_side == "yes" and flip_qty > 0:
-                                            _old_fq = flip_qty
-                                            flip_qty = max(1, int(flip_qty * YES_KELLY_REDUCTION))
-                                            log.warning(
-                                                f"[FLIP SIZE] YES Kelly reduction: {_old_fq} -> {flip_qty} "
-                                                f"({YES_KELLY_REDUCTION:.0%} of normal)"
-                                            )
+                                        flip_qty = min(MIN_CONTRACTS, MAX_CONTRACTS)
 
                                         # PRE-TRADE MAX LOSS GATE (flips too)
                                         flip_max_loss = (int(flip_price) * flip_qty) / 100.0
@@ -3424,12 +3392,14 @@ def main() -> None:
                                         )
 
                                     if can_flip:
-                                        flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
-                                            f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
+                                            f"[FLIP] UNCONDITIONAL flip to {flip_side.upper()} after bail — "
                                             f"prob={flip_prob:.1%} price={flip_price}¢ edge={flip_edge:.4f} "
                                             f"qty={flip_qty} t_close={secs_to_close}s"
                                         )
+
+                                        # 3-second cooldown before placing flip order
+                                        time.sleep(3)
 
                                         if not DRY_RUN:
                                             flip_payload = build_order_payload(
@@ -3494,8 +3464,6 @@ def main() -> None:
                                             reason_parts.append(f"time={secs_to_close}s<{FLIP_MIN_TIME_REMAINING}s")
                                         if flip_price is not None and flip_price > FLIP_MAX_ENTRY_PRICE:
                                             reason_parts.append(f"price={flip_price}¢>{FLIP_MAX_ENTRY_PRICE}¢")
-                                        if flip_price is not None and flip_price < 80 and flip_prob < FLIP_MIN_PROB:
-                                            reason_parts.append(f"prob={flip_prob:.1%}<{FLIP_MIN_PROB:.0%},mkt={flip_price}¢<80¢")
                                         if flip_price is None:
                                             reason_parts.append("no_ask")
 

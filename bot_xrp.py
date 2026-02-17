@@ -159,25 +159,23 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.85  # 85%+ to enter in last 5 min — lower bar for better fills, $0.40 cap protects
-EDGE_MIN = 0.02  # 2% minimum edge — POST_ONLY gives 1-3¢ better fills, so 2% is achievable and profitable
-MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
+PROB_MIN = 0.70  # 70%+ — trend analysis provides confidence, just lower the gate
+EDGE_MIN = 0.01  # 1% edge — collecting pennies per contract is the strategy
+MAX_ENTRY_PRICE_CENTS = 96  # At 96¢ entry, gain 4¢/win
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- TIME-DEPENDENT CERTAINTY (within the 10-min buy window) --------
-# Buy window is 10min → 5s before close. Require more certainty at the start
-# of the buy window (XRP still has time to move), relax near the end.
-# NOTE: observation phase (12min → 10min) gathers data but never buys.
-PROB_EARLY_ENTRY_SECONDS = 480   # 8-10 min to close = "early" part of buy window
-PROB_EARLY_MIN = 0.85            # >8min: need 85%+ — enter earlier for better fills
-PROB_MID_ENTRY_SECONDS = 300     # 5-8 min to close = "mid"
-PROB_MID_MIN = 0.85              # 5-8min: need 85%+ — enough certainty for fills
+# -------------- TIME-DEPENDENT CERTAINTY — DISABLED -------------------------
+# Single flat PROB_MIN gate. No early/mid tiers.
+PROB_EARLY_ENTRY_SECONDS = 0    # Disabled
+PROB_EARLY_MIN = PROB_MIN
+PROB_MID_ENTRY_SECONDS = 0      # Disabled
+PROB_MID_MIN = PROB_MIN
 # <5 min = PROB_MIN (0.85) — market has priced in the outcome, $0.40 cap protects
 
 # -------------- NO SIDE OVERRIDE (NO has been 100% profitable) -----------------
 # NO side can be more aggressive — allow entries at lower probability.
-NO_SIDE_MIN_PROB = 0.80           # NO entries allowed at 80%+ prob (vs 85%+ general)
-NO_SIDE_MIN_PRICE = 85            # NO contract price must be ≥85¢
+NO_SIDE_MIN_PROB = 0.70           # Disabled — same as PROB_MIN (was 0.80)
+NO_SIDE_MIN_PRICE = 0             # Disabled (was 85)
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -187,14 +185,14 @@ PROB_TREND_MIN_SAMPLES = 8        # Need at least 8 samples (~80s at 1/sec)
 PROB_TREND_THRESHOLD = 0.08       # 8% swing in one direction = trend signal
 PROB_TREND_MIN_CURRENT = 0.80     # Current prob must be ≥80% for trend-based entries
 PROB_TREND_ENTRY_ENABLED = True   # Enable trend-based entries (for borderline trades)
-REQUIRE_TREND_ALIGNMENT = True    # Prob trend must match XRP spot trend (borderline only)
+REQUIRE_TREND_ALIGNMENT = False   # Disabled (was True)
 # HIGH-CERTAINTY FAST LANE: if prob is this high, skip trend/momentum checks entirely
 # Rationale: 90%+ prob means XRP is well inside the range. The outcome is decisive.
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.85   # ≥85% prob = buy immediately, no trend check needed (was 90% — enter earlier)
-PROB_FAST_LANE_LATE_THRESHOLD = 0.80  # ≥80% prob in last 5 min = fast lane (market is decisive)
+PROB_FAST_LANE_THRESHOLD = 0.70   # Disabled — same as PROB_MIN (was 0.85)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.70  # Disabled — same as PROB_MIN (was 0.80)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
@@ -221,7 +219,7 @@ CROSS_BOT_DROP_THRESHOLD = 2.00  # If shared balance dropped >$2, another bot lo
                              # At 90¢ × 3 = $2.70 max loss WITHOUT gate. With $0.75 gate, effectively 1 contract at high prices.
                              # Belt-and-suspenders: gate caps dollar risk, this caps contract count.
 MIN_CONTRACTS = 1           # Floor
-MIN_FREE_USD_TO_TRADE = 5.0
+MIN_FREE_USD_TO_TRADE = 1.0  # $1 min — 3ct × 90c = $2.70, don't starve the bot
 # Legacy constants (kept for backward compat in safety checks)
 BASE_CONTRACTS = 3
 CONTRACT_INCREMENT = 1
@@ -437,7 +435,7 @@ HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 99)
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 90)     # Last 90s — at 3min XRP can still swing $0.005+ (was 180s)
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.92)  # Need 92%+ — was 85% which allowed too many marginal entries
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.70)  # Disabled — same as PROB_MIN (was 0.92)
 SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 97)   # Max 97¢ — never enter at 98-99¢ where one loss wipes 50+ wins
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
@@ -1960,12 +1958,9 @@ def choose_trade(
     p_yes_blend = max(0.0, min(1.0, p_yes_blend))
     p_no_blend = 1.0 - p_yes_blend
 
-    if POST_ONLY:
-        yes_px = postable_entry_price(yes_bid, yes_ask)
-        no_px = postable_entry_price(no_bid, no_ask)
-    else:
-        yes_px = yes_ask
-        no_px = no_ask
+    # Price = prob × 100 - 1 (guarantees positive edge at any fill)
+    yes_px = max(1, min(int(p_yes_blend * 100) - 1, MAX_ENTRY_PRICE_CENTS))
+    no_px = max(1, min(int(p_no_blend * 100) - 1, MAX_ENTRY_PRICE_CENTS))
 
     ok_book_yes = spread_ok(yes_bid, yes_ask)
     ok_book_no = spread_ok(no_bid, no_ask)
@@ -3214,7 +3209,8 @@ def main() -> None:
                                     flip_yes_bid, flip_yes_ask, flip_no_bid, flip_no_ask = parse_best_yes_no(flip_ob)
                                     flip_side = "no" if dumped_side == "yes" else "yes"
                                     flip_prob = p_no_blend if dumped_side == "yes" else p_yes_blend
-                                    flip_price = flip_no_ask if flip_side == "no" else flip_yes_ask
+                                    # Price = prob × 100 - 1 (guarantees positive edge at any fill)
+                                    flip_price = max(1, min(int(flip_prob * 100) - 1, FLIP_MAX_ENTRY_PRICE))
 
                                     log.warning(
                                         f"[FLIP] Evaluating: side={flip_side} prob={flip_prob:.1%} "
@@ -3231,12 +3227,9 @@ def main() -> None:
                                         and not (YES_ONLY and flip_side == "no")  # Don't flip to NO in YES_ONLY mode
                                     )
 
-                                    # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
-                                    if can_flip:
-                                        market_confident = flip_price >= 80
-                                        model_agrees = flip_prob >= FLIP_MIN_PROB
-                                        if not market_confident and not model_agrees:
-                                            can_flip = False
+                                    # UNCONDITIONAL flip — no prob/edge/confidence gates.
+                                    # Only structural guards above (enabled, not already flipped,
+                                    # time remaining, price cap, side restriction).
 
                                     if can_flip:
                                         flip_edge = flip_prob - (flip_price / 100.0)
@@ -3264,12 +3257,15 @@ def main() -> None:
                                             flip_qty = max(1, min(int(MAX_LOSS_AT_EXPIRY_USD / per_ct), MAX_CONTRACTS)) if per_ct > 0 else 1
                                             log.warning(f"[FLIP MAX LOSS] Reduced flip qty {old_fq} → {flip_qty} — max_loss ${flip_max_loss:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f}")
 
-                                        flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
+                                        flip_path = "unconditional"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
                                             f"prob={flip_prob:.1%} price={flip_price}¢ edge={flip_edge:.4f} "
                                             f"qty={flip_qty} t_close={secs_to_close}s"
                                         )
+
+                                        # Brief pause to let orderbook settle after dump
+                                        time.sleep(3)
 
                                         if not DRY_RUN:
                                             flip_client_oid = position_tracker.make_client_order_id()
@@ -3334,8 +3330,6 @@ def main() -> None:
                                             reason_parts.append(f"time={secs_to_close}s<{FLIP_MIN_TIME_REMAINING}s")
                                         if flip_price is not None and flip_price > FLIP_MAX_ENTRY_PRICE:
                                             reason_parts.append(f"price={flip_price}¢>{FLIP_MAX_ENTRY_PRICE}¢")
-                                        if flip_price is not None and flip_price < 80 and flip_prob < FLIP_MIN_PROB:
-                                            reason_parts.append(f"prob={flip_prob:.1%}<{FLIP_MIN_PROB:.0%},mkt={flip_price}¢<80¢")
                                         if flip_price is None:
                                             reason_parts.append("no_ask")
 
@@ -3868,9 +3862,7 @@ def main() -> None:
             continue
 
         available_usd, total_usd = get_balance_usd(client)
-        # Reserve fair share for other bots running on same account
-        if available_usd is not None and NUM_ACTIVE_BOTS > 1:
-            available_usd = available_usd / NUM_ACTIVE_BOTS
+        # No division — bots rarely need cash simultaneously (different 15min cycles)
 
         # CROSS-BOT DRAWDOWN: detect if another bot lost money since our last check
         _cross_bot_reduce = False
