@@ -298,10 +298,11 @@ DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what yo
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
-MAX_LOSS_AT_EXPIRY_USD = 0.40         # Pre-trade gate: max possible loss if contract settles at $0.
-                                      # Matches STOP_LOSS_USD. If market closes before stop-loss fires,
-                                      # position size ensures total loss <= $0.40.
-                                      # max_contracts = floor($0.40 / cost_per_contract).
+MAX_LOSS_AT_EXPIRY_USD = 1.00         # Pre-trade gate: max possible loss if contract settles at $0.
+                                      # Raised from $0.40 — the old value blocked all entries above 40¢
+                                      # (floor(0.40/0.85)=0 contracts). The dump feature's $0.40 stop-loss
+                                      # using actual bid prices is now the real loss protection.
+                                      # $1.00 allows 1 contract at any price up to 96¢.
 
 # -------------- PROFIT LOCK (protect winning sessions) -------------------------
 PNL_LOCK_TIER1_USD = 2.00            # At +$2.00 session P/L: reduce to 50% size
@@ -309,12 +310,14 @@ PNL_LOCK_TIER1_MULT = 0.50
 PNL_LOCK_TIER2_USD = 3.00            # At +$3.00 session P/L: reduce to 25% size
 PNL_LOCK_TIER2_MULT = 0.25
 
-# -------------- YES ENTRY GATE (tighter YES filter — XRP YES earned more freedom) --
-# All 4 conditions must be true to place a YES trade:
-YES_GATE_MIN_PROB = 0.85             # (1) Blend probability for YES must exceed 85% (was 88% — let gates breathe)
-YES_GATE_MIN_MOVE_PCT = 0.50         # (2) XRP moved ≥50% of expected move in YES direction
-YES_GATE_MAX_SECS = 600              # (3) Fewer than 10 minutes remaining (was 480 — match new buy window)
-YES_GATE_MIN_CONTRACT_PRICE = 85     # (4) YES contract price on Kalshi ≥ 85¢ (was 88¢ — earlier fills)
+# -------------- YES ENTRY GATE (simplified — removed redundant checks) --------
+# Only non-redundant conditions remain:
+#   - Confidence gate (88%) — higher than general prob gate (85%)
+#   - Price move check (50%) — unique to YES gate, not duplicated elsewhere
+# Removed: MAX_SECS (duplicated BUY_START_SECONDS=600), MIN_CONTRACT_PRICE
+#          (redundant with prob gate — 88%+ prob always implies ≥88¢ contract)
+YES_GATE_MIN_PROB = 0.88             # YES confidence gate: require 88% (higher than general 85%)
+YES_GATE_MIN_MOVE_PCT = 0.50         # XRP moved ≥50% of expected move in YES direction
 YES_GATE_WINDOW_SECONDS = 900.0      # Full 15-minute window for expected move calculation
 
 # -------------- STREAK CIRCUIT BREAKER (pause after losses) --------------------
@@ -2062,6 +2065,8 @@ def should_dump_position(
     secs_to_close: int,
     trend: Optional['SpotTrend'] = None,
     current_balance_usd: float = 0.0,
+    yes_bid: Optional[int] = None,
+    no_bid: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     BAIL logic: last resort only. Hold to close is the goal.
@@ -2084,17 +2089,24 @@ def should_dump_position(
 
     # =============================================================
     # === UNIVERSAL $0.40 HARD STOP-LOSS: fires FIRST, overrides ALL ===
-    # If unrealized loss >= $0.40, market sell immediately.
-    # No single trade can ever lose more than this amount.
+    # Uses ACTUAL BID price for exit estimate (not probability).
+    # Probability-based estimates masked real losses — entry at 89¢ with
+    # 85% prob showed only $0.04 loss when real bid could be much lower.
     # =============================================================
     if st.entry_price_cents is not None and st.qty > 0:
-        exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+        # Use actual bid for exit price (accurate), fall back to probability estimate
+        if st.side == "yes" and yes_bid is not None:
+            exit_price_est = yes_bid
+        elif st.side == "no" and no_bid is not None:
+            exit_price_est = no_bid
+        else:
+            exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
         loss_per_contract = st.entry_price_cents - exit_price_est
         total_loss_usd = (loss_per_contract * st.qty) / 100.0
         if total_loss_usd >= STOP_LOSS_USD:
             log.warning(
                 f"[STOP_LOSS_HIT] ts={int(time.time())} market_id={st.market} "
-                f"entry_price={st.entry_price_cents}¢ exit_price={exit_price_est}¢ "
+                f"entry_price={st.entry_price_cents}¢ exit_bid={exit_price_est}¢ "
                 f"loss_amount=${total_loss_usd:.2f} reason=STOP_LOSS_HIT — "
                 f"unrealized loss ≥ ${STOP_LOSS_USD:.2f}, market sell immediately"
             )
@@ -2986,21 +2998,26 @@ def main() -> None:
                             st, p_yes_blend, p_no_blend, p_mkt,
                             spot, lo, hi, sigma_used, secs_to_close, trend,
                             current_balance_usd=session.current_balance_usd,
+                            yes_bid=yes_bid, no_bid=no_bid,
                         )
 
-                        # Log dump check status periodically
-                        if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                            time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
-                            our_prob = p_yes_blend if st.side == "yes" else p_no_blend
-                            phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else "active"
-                            drop_from_peak = st.peak_prob_for_side - our_prob if st.peak_prob_for_side > 0 else 0
-                            log.info(
-                                f"[HOLD] {st.market} {st.side.upper()} pos={pos} "
-                                f"held={time_in_trade:.0f}s phase={phase} "
-                                f"our_p={our_prob:.1%} peak={st.peak_prob_for_side:.1%} drop={drop_from_peak:.1%} "
-                                f"dump={dump_reason or 'none'}"
-                            )
-                            last_state_log = now
+                        # === PER-CYCLE DUMP DIAGNOSTIC (every cycle, not periodic) ===
+                        time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
+                        our_prob = p_yes_blend if st.side == "yes" else p_no_blend
+                        if st.side == "yes":
+                            current_bid = yes_bid if yes_bid is not None else 0
+                        else:
+                            current_bid = no_bid if no_bid is not None else 0
+                        unrealized_pnl = ((current_bid - st.entry_price_cents) * st.qty) / 100.0 if st.entry_price_cents else 0.0
+                        log.warning(
+                            f"[DUMP CHECK] {st.market} {st.side.upper()} pos={pos} "
+                            f"entry={st.entry_price_cents}¢ bid={current_bid}¢ "
+                            f"unrealized_pnl=${unrealized_pnl:.2f} "
+                            f"stop_loss_threshold=${STOP_LOSS_USD:.2f} "
+                            f"dump_triggered={'YES' if should_dump else 'NO'} "
+                            f"reason={dump_reason or 'none'} "
+                            f"prob={our_prob:.1%} t={secs_to_close}s held={time_in_trade:.0f}s"
+                        )
 
                         if should_dump:
                             log.warning(f"[BAIL] Triggering bail: {dump_reason}")
@@ -3510,10 +3527,16 @@ def main() -> None:
                 f"| {prob_trend.summary()}"
             )
 
+        # === PER-CYCLE EVALUATION LOG ===
+        log.warning(
+            f"[EVAL] {st.market} t={secs_to_close}s spot=${spot:.4f} "
+            f"p_yes={p_yes_blend:.1%} p_no={p_no_blend:.1%} "
+            f"yes_ask={yes_ask} no_ask={no_ask} yes_bid={yes_bid} no_bid={no_bid} "
+            f"edge_yes={edge_yes:.4f} edge_no={edge_no:.4f} "
+            f"decision={chosen_side or 'NONE'}@{chosen_px or 'N/A'}¢"
+        )
+
         if chosen_side is None or chosen_px is None:
-            if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
-                log.warning(f"[OB] no usable entry: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})")
-                last_ob_warn = now
             time.sleep(POLL_SECONDS)
             continue
 
@@ -3656,9 +3679,8 @@ def main() -> None:
         # Check YES hourly summary (prints if an hour has passed)
         session.check_yes_hourly_summary()
 
-        # === YES ENTRY GATE: all 4 conditions must be true ===
-        # XRP YES has earned trust but still needs a safety filter.
-        # NO entries are not gated — this only applies to YES.
+        # === YES ENTRY GATE (simplified: confidence 88% + price move 50%) ===
+        # Redundant checks removed: time gate (=BUY_START_SECONDS), price gate (=prob gate)
         if chosen_side == "yes":
             # Calculate price move percentage in YES direction
             if lo is not None and sigma_used > 0:
@@ -3668,42 +3690,29 @@ def main() -> None:
             else:
                 price_move_pct = 1.0  # Can't compute — pass this check
 
-            minutes_remaining = secs_to_close / 60.0 if secs_to_close is not None else 99.0
-
-            # Check all 4 conditions
+            # Check 2 conditions: confidence + price move
             cond_prob = p_yes_blend >= YES_GATE_MIN_PROB
             cond_move = price_move_pct >= YES_GATE_MIN_MOVE_PCT
-            cond_time = secs_to_close is not None and secs_to_close <= YES_GATE_MAX_SECS
-            cond_price = chosen_px is not None and int(chosen_px) >= YES_GATE_MIN_CONTRACT_PRICE
 
-            if not (cond_prob and cond_move and cond_time and cond_price):
-                # Determine which condition(s) failed
+            if not (cond_prob and cond_move):
                 failed = []
                 if not cond_prob:
                     failed.append(f"prob={p_yes_blend:.1%}<{YES_GATE_MIN_PROB:.0%}")
                 if not cond_move:
                     failed.append(f"move={price_move_pct:.0%}<{YES_GATE_MIN_MOVE_PCT:.0%}")
-                if not cond_time:
-                    failed.append(f"time={minutes_remaining:.1f}min>8min")
-                if not cond_price:
-                    failed.append(f"price={chosen_px}¢<{YES_GATE_MIN_CONTRACT_PRICE}¢")
 
-                # Log the skip with all requested fields
                 first_fail = failed[0].split("=")[0] if failed else "unknown"
                 log.warning(
                     f"[YES GATE SKIP] ts={int(time.time())} market_id={st.market} "
                     f"confidence={p_yes_blend:.4f} price_move_pct={price_move_pct:.2f} "
-                    f"minutes_remaining={minutes_remaining:.1f} contract_price={chosen_px}¢ "
+                    f"contract_price={chosen_px}¢ t={secs_to_close}s "
                     f"which_condition_failed={','.join(failed)}"
                 )
 
-                # Track skip for hourly summary
                 session.record_yes_skip(first_fail)
-
                 time.sleep(POLL_SECONDS)
                 continue
             else:
-                # All conditions passed — track as executed
                 session.record_yes_executed()
 
         # Check session limits before trading
@@ -3793,20 +3802,15 @@ def main() -> None:
                 log_price_move_pct = (spot - lo) / log_expected_move if log_expected_move > 0 else 0.0
             else:
                 log_price_move_pct = 1.0
-            log_minutes_remaining = secs_to_close / 60.0 if secs_to_close is not None else 99.0
             log_g_prob = f"PASS({p_yes_blend:.1%}≥{YES_GATE_MIN_PROB:.0%})" if p_yes_blend >= YES_GATE_MIN_PROB else f"FAIL({p_yes_blend:.1%}<{YES_GATE_MIN_PROB:.0%})"
             log_g_move = f"PASS({log_price_move_pct:.0%}≥{YES_GATE_MIN_MOVE_PCT:.0%})" if log_price_move_pct >= YES_GATE_MIN_MOVE_PCT else f"FAIL({log_price_move_pct:.0%}<{YES_GATE_MIN_MOVE_PCT:.0%})"
-            log_g_time = f"PASS({log_minutes_remaining:.1f}min<8min)" if (secs_to_close is not None and secs_to_close <= YES_GATE_MAX_SECS) else f"FAIL({log_minutes_remaining:.1f}min≥8min)"
-            log_g_price = f"PASS({chosen_px}¢≥{YES_GATE_MIN_CONTRACT_PRICE}¢)" if int(chosen_px) >= YES_GATE_MIN_CONTRACT_PRICE else f"FAIL({chosen_px}¢<{YES_GATE_MIN_CONTRACT_PRICE}¢)"
         else:
             log_g_prob = "N/A(NO)"
             log_g_move = "N/A(NO)"
-            log_g_time = "N/A(NO)"
-            log_g_price = "N/A(NO)"
         log.warning(
             f"[TRADE LOG] side={chosen_side.upper()} contracts={qty} "
             f"cost_per_contract=${cost_per_contract:.2f} worst_case_loss=${worst_case_loss:.2f} "
-            f"gates: prob={log_g_prob} move={log_g_move} time={log_g_time} price={log_g_price}"
+            f"gates: prob={log_g_prob} move={log_g_move}"
         )
 
         payload = build_order_payload(

@@ -172,6 +172,11 @@ PROB_MID_MIN = 0.83              # 5-8min: need 83%+ — enough certainty for fi
 NO_SIDE_MIN_PROB = 0.80           # NO entries allowed at 80%+ prob (vs 83%+ general)
 NO_SIDE_MIN_PRICE = 85            # NO contract price must be ≥85¢
 
+# -------------- YES SIDE CONFIDENCE GATE ------------------------------------------
+# YES entries require higher confidence than general entry gate.
+# BTC: 92% (general gate is 83-85%). NO side is not gated by this.
+YES_CONFIDENCE_MIN = 0.92
+
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
 # When prob is high (90%+), the outcome speaks for itself — skip trend checks.
@@ -288,6 +293,9 @@ POSITION_SIZE_CAP_FRACTION = 0.02
 # afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
 # As bankroll grows to $220: $33 → 34 contracts at 97c.
 MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
+MAX_LOSS_AT_EXPIRY_USD = 1.00         # Pre-trade gate: max possible loss if contract settles at $0.
+                                      # $1.00 allows 1 contract at any price up to 96¢.
+                                      # The dump feature's $0.40 stop-loss using actual bid is the real protection.
 
 # -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
 DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
@@ -1917,6 +1925,8 @@ def should_dump_position(
     secs_to_close: int,
     trend: Optional['SpotTrend'] = None,
     current_balance_usd: float = 0.0,
+    yes_bid: Optional[int] = None,
+    no_bid: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     BAIL logic: last resort only. Hold to close is the goal.
@@ -1939,17 +1949,24 @@ def should_dump_position(
 
     # =============================================================
     # === UNIVERSAL $0.40 HARD STOP-LOSS: fires FIRST, overrides ALL ===
-    # If unrealized loss >= $0.40, market sell immediately.
-    # No single trade can ever lose more than this amount.
+    # Uses ACTUAL BID price for exit estimate (not probability).
+    # Probability-based estimates masked real losses — entry at 89¢ with
+    # 85% prob showed only $0.04 loss when real bid could be much lower.
     # =============================================================
     if st.entry_price_cents is not None and st.qty > 0:
-        exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+        # Use actual bid for exit price (accurate), fall back to probability estimate
+        if st.side == "yes" and yes_bid is not None:
+            exit_price_est = yes_bid
+        elif st.side == "no" and no_bid is not None:
+            exit_price_est = no_bid
+        else:
+            exit_price_est = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
         loss_per_contract = st.entry_price_cents - exit_price_est
         total_loss_usd = (loss_per_contract * st.qty) / 100.0
         if total_loss_usd >= STOP_LOSS_USD:
             log.warning(
                 f"[STOP_LOSS_HIT] ts={int(time.time())} market_id={st.market} "
-                f"entry_price={st.entry_price_cents}¢ exit_price={exit_price_est}¢ "
+                f"entry_price={st.entry_price_cents}¢ exit_bid={exit_price_est}¢ "
                 f"loss_amount=${total_loss_usd:.2f} reason=STOP_LOSS_HIT — "
                 f"unrealized loss ≥ ${STOP_LOSS_USD:.2f}, market sell immediately"
             )
@@ -2798,21 +2815,26 @@ def main() -> None:
                             st, p_yes_blend, p_no_blend, p_mkt,
                             spot, lo, hi, sigma_used, secs_to_close, trend,
                             current_balance_usd=session.current_balance_usd,
+                            yes_bid=yes_bid, no_bid=no_bid,
                         )
 
-                        # Log dump check status periodically
-                        if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                            time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
-                            our_prob = p_yes_blend if st.side == "yes" else p_no_blend
-                            phase = "grace" if time_in_trade < DUMP_GRACE_PERIOD_SECONDS else "active"
-                            drop_from_peak = st.peak_prob_for_side - our_prob if st.peak_prob_for_side > 0 else 0
-                            log.info(
-                                f"[HOLD] {st.market} {st.side.upper()} pos={pos} "
-                                f"held={time_in_trade:.0f}s phase={phase} "
-                                f"our_p={our_prob:.1%} peak={st.peak_prob_for_side:.1%} drop={drop_from_peak:.1%} "
-                                f"dump={dump_reason or 'none'}"
-                            )
-                            last_state_log = now
+                        # === PER-CYCLE DUMP DIAGNOSTIC (every cycle, not periodic) ===
+                        time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
+                        our_prob = p_yes_blend if st.side == "yes" else p_no_blend
+                        if st.side == "yes":
+                            current_bid = yes_bid if yes_bid is not None else 0
+                        else:
+                            current_bid = no_bid if no_bid is not None else 0
+                        unrealized_pnl = ((current_bid - st.entry_price_cents) * st.qty) / 100.0 if st.entry_price_cents else 0.0
+                        log.warning(
+                            f"[DUMP CHECK] {st.market} {st.side.upper()} pos={pos} "
+                            f"entry={st.entry_price_cents}¢ bid={current_bid}¢ "
+                            f"unrealized_pnl=${unrealized_pnl:.2f} "
+                            f"stop_loss_threshold=${STOP_LOSS_USD:.2f} "
+                            f"dump_triggered={'YES' if should_dump else 'NO'} "
+                            f"reason={dump_reason or 'none'} "
+                            f"prob={our_prob:.1%} t={secs_to_close}s held={time_in_trade:.0f}s"
+                        )
 
                         if should_dump:
                             log.warning(f"[BAIL] Triggering bail: {dump_reason}")
@@ -3243,10 +3265,28 @@ def main() -> None:
                 f"| {prob_trend.summary()}"
             )
 
+        # === PER-CYCLE EVALUATION LOG ===
+        current_prob_yes = p_yes_blend
+        current_prob_no = p_no_blend
+        log.warning(
+            f"[EVAL] {st.market} t={secs_to_close}s spot=${spot:.2f} "
+            f"p_yes={current_prob_yes:.1%} p_no={current_prob_no:.1%} "
+            f"yes_ask={yes_ask} no_ask={no_ask} yes_bid={yes_bid} no_bid={no_bid} "
+            f"edge_yes={edge_yes:.4f} edge_no={edge_no:.4f} "
+            f"decision={chosen_side or 'NONE'}@{chosen_px or 'N/A'}¢"
+        )
+
         if chosen_side is None or chosen_px is None:
-            if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
-                log.warning(f"[OB] no usable entry: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})")
-                last_ob_warn = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # === YES CONFIDENCE GATE (BTC: 92%) ===
+        # YES entries require higher confidence than general gate.
+        # NO entries are not restricted by this gate.
+        if chosen_side == "yes" and p_yes_blend < YES_CONFIDENCE_MIN:
+            log.warning(
+                f"[YES GATE SKIP] {st.market} YES confidence {p_yes_blend:.1%} < {YES_CONFIDENCE_MIN:.0%} required"
+            )
             time.sleep(POLL_SECONDS)
             continue
 
@@ -3411,6 +3451,23 @@ def main() -> None:
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
+
+        # === PRE-TRADE MAX LOSS CHECK ===
+        # Max loss = entry_price * contracts (contract settles at $0, you lose what you paid).
+        max_loss_at_expiry = (int(chosen_px) * qty) / 100.0
+        if max_loss_at_expiry > MAX_LOSS_AT_EXPIRY_USD:
+            max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(int(chosen_px), 1))
+            old_qty = qty
+            qty = max(1, min(qty, max_qty))
+            log.warning(
+                f"[MAX LOSS GATE] Reduced qty {old_qty} → {qty} — "
+                f"max_loss_at_expiry was ${max_loss_at_expiry:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f} cap"
+            )
+            if qty <= 0:
+                log.warning(f"[SKIP] {st.market} — can't size within ${MAX_LOSS_AT_EXPIRY_USD:.2f} max loss")
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
 
         use_post_only = POST_ONLY
         # AGGRESSIVE FILL: use taker orders when probability is high enough.
