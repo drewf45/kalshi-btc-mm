@@ -1998,13 +1998,13 @@ def choose_trade(
         and (no_px <= MAX_ENTRY_PRICE_CENTS)
         and div_gate_no
     )
-    # YES side: 150% CONVICTION thresholds (0-for-9 history — slam dunks only)
+    # YES side: 150% conviction thresholds + ultra gate (4-condition check later)
     ok_yes = (
         yes_px is not None
         and ok_book_yes
         and (p_yes_blend >= yes_prob_floor)   # 150% conviction: 95% late, 99% mid/early
-        and (edge_yes >= YES_EDGE_MIN)        # 8% edge (vs 2% for NO)
-        and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS)  # 75¢ max (vs 93¢ for NO)
+        and (edge_yes >= YES_EDGE_MIN)        # 2% edge (same as NO, ultra gate is real protection)
+        and (yes_px <= YES_MAX_ENTRY_PRICE_CENTS)  # 99¢ max (ultra gate requires ≥93¢)
         and div_gate_yes
     )
 
@@ -2193,6 +2193,26 @@ def choose_trade(
         if p_yes_model >= p_no_model:
             return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
         return "no", int(no_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
+
+    # ENTRY EVALUATION LOG: every cycle shows all conditions and final decision
+    _yes_prob_ok = (p_yes_blend >= yes_prob_floor) if yes_px is not None else False
+    _yes_edge_ok = (edge_yes >= YES_EDGE_MIN) if yes_px is not None else False
+    _yes_price_ok = (yes_px <= YES_MAX_ENTRY_PRICE_CENTS) if yes_px is not None else False
+    _no_prob_ok = (p_no_blend >= no_prob_min) if no_px is not None else False
+    _no_edge_ok = (edge_no >= EDGE_MIN) if no_px is not None else False
+    _no_price_ok = (no_px <= MAX_ENTRY_PRICE_CENTS) if no_px is not None else False
+    final_side = "YES" if (ok_yes and ok_no and edge_yes >= edge_no) else ("YES" if ok_yes else ("NO" if ok_no else "NONE"))
+    log.info(
+        f"[EVAL] t={secs_to_close}s spot=${spot:.2f} "
+        f"YES: prob={p_yes_blend:.1%}({'OK' if _yes_prob_ok else 'FAIL'}≥{yes_prob_floor:.0%}) "
+        f"edge={edge_yes:.4f}({'OK' if _yes_edge_ok else 'FAIL'}) "
+        f"px={yes_px}¢({'OK' if _yes_price_ok else 'FAIL'}≤{YES_MAX_ENTRY_PRICE_CENTS}) "
+        f"ok={ok_yes} | "
+        f"NO: prob={p_no_blend:.1%}({'OK' if _no_prob_ok else 'FAIL'}≥{no_prob_min:.0%}) "
+        f"edge={edge_no:.4f}({'OK' if _no_edge_ok else 'FAIL'}) "
+        f"px={no_px}¢({'OK' if _no_price_ok else 'FAIL'}≤{MAX_ENTRY_PRICE_CENTS}) "
+        f"ok={ok_no} → {final_side}"
+    )
 
     if ok_yes:
         return "yes", int(yes_px), p_yes_model, p_no_model, p_yes_blend, p_no_blend, p_mkt, div_yes, sigma_used, float(edge_yes), float(edge_no)
@@ -2572,15 +2592,6 @@ def compute_qty_from_bankroll(
         log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, returning 0")
         return 0
 
-    # Check if even 1 contract exceeds the loss cap
-    _cost_1ct = float(entry_cents) / 100.0
-    if _cost_1ct > DUMP_MAX_LOSS_USD:
-        log.warning(
-            f"[SIZE] 1 contract costs ${_cost_1ct:.2f} > ${DUMP_MAX_LOSS_USD:.2f} cap — "
-            f"cannot trade at {entry_cents}¢, returning 0"
-        )
-        return 0
-
     if available_usd is None or available_usd <= 0:
         log.warning(f"[SIZE] available_usd is None or <=0, returning MIN_CONTRACTS={MIN_CONTRACTS}")
         return MIN_CONTRACTS
@@ -2618,36 +2629,26 @@ def compute_qty_from_bankroll(
     # Convert fraction to contract count
     target_qty = int(available_usd * fraction / cost_per)
 
-    # POSITION SIZE CAP: max_risk = min(2% of portfolio, $0.40 hard cap).
-    # Worst case = lose entire entry cost at settlement. Cap contracts so
-    # max possible loss never exceeds max_risk. This makes blowups physically impossible.
-    # CRITICAL: if even 1 contract exceeds the cap, return 0 — DO NOT TRADE.
+    # POSITION SIZE CAP: 2% of portfolio max exposure per trade.
+    # The ACTIVE stop-loss ($0.40 unrealized P&L) is the primary loss protection.
+    # This cap limits total exposure so even if the stop can't fire (settlement),
+    # the damage is bounded. At $25 bankroll: 2% = $0.50, so max ~1 contract at 50¢.
+    # NOTE: DUMP_MAX_LOSS_USD ($0.40) is the ACTIVE stop-loss threshold, NOT a sizing cap.
+    # The stop-loss monitors every 1s and exits when unrealized loss hits $0.40.
     if cost_per > 0 and available_usd > 0:
         max_risk_pct = available_usd * MAX_SETTLEMENT_LOSS_FRACTION  # 2% of portfolio
-        max_risk = min(max_risk_pct, DUMP_MAX_LOSS_USD)              # min(2% portfolio, $0.40)
-        max_qty_for_loss_cap = int(max_risk / cost_per)
-        if max_qty_for_loss_cap <= 0:
-            # Even 1 contract exceeds the loss cap — cannot trade at this price
-            log.warning(
-                f"[SIZE_BLOCKED] cost_per=${cost_per:.2f} > max_risk=${max_risk:.2f} — "
-                f"even 1 contract exceeds ${DUMP_MAX_LOSS_USD:.2f} cap. Returning 0."
-            )
-            return 0
+        max_qty_for_loss_cap = int(max_risk_pct / cost_per)
+        if max_qty_for_loss_cap < MIN_CONTRACTS:
+            max_qty_for_loss_cap = MIN_CONTRACTS  # Always allow at least 1 contract
         if target_qty > max_qty_for_loss_cap:
             log.warning(
                 f"[SIZE_CAPPED] suggested={target_qty} capped={max_qty_for_loss_cap} "
-                f"portfolio=${available_usd:.2f} max_risk=${max_risk:.2f} "
-                f"(min({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}=${max_risk_pct:.2f}, "
-                f"${DUMP_MAX_LOSS_USD:.2f} hard cap)) entry={entry_cents}¢"
+                f"portfolio=${available_usd:.2f} max_risk=${max_risk_pct:.2f} "
+                f"({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}) entry={entry_cents}¢"
             )
             target_qty = max_qty_for_loss_cap
 
-    # Clamp: MIN_CONTRACTS floor only if it doesn't violate the loss cap
-    if cost_per > 0 and MIN_CONTRACTS * cost_per > DUMP_MAX_LOSS_USD:
-        # MIN_CONTRACTS would exceed $0.40 cap — use 0 instead
-        qty = min(target_qty, MAX_CONTRACTS)
-    else:
-        qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
+    qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
     log.info(
         f"[SIZE] Kelly bankroll sizing: contracts={qty} kelly_f={kf:.3f} "
@@ -3206,6 +3207,26 @@ def main() -> None:
                             yes_bid=yes_bid, no_bid=no_bid,
                         )
 
+                        # DUMP DIAGNOSTIC: log EVERY check cycle with full P&L details
+                        if st.entry_price_cents is not None and st.qty > 0:
+                            _diag_our_bid = (yes_bid if st.side == "yes" else no_bid)
+                            _diag_model_exit = int((p_yes_blend if st.side == "yes" else p_no_blend) * 100)
+                            _diag_exit = min(_diag_model_exit, _diag_our_bid) if _diag_our_bid is not None else _diag_model_exit
+                            _diag_loss_per_ct = st.entry_price_cents - _diag_exit
+                            _diag_unrealized_pnl = (_diag_loss_per_ct * st.qty) / -100.0  # negative = loss
+                            _diag_position_value = (_diag_exit * st.qty) / 100.0
+                            _diag_position_cost = (st.entry_price_cents * st.qty) / 100.0
+                            log.info(
+                                f"[DUMP_CHECK] {st.side.upper()} entry={st.entry_price_cents}¢ "
+                                f"est_exit={_diag_exit}¢ (model={_diag_model_exit}¢ bid={_diag_our_bid}¢) "
+                                f"qty={st.qty} pos_cost=${_diag_position_cost:.2f} "
+                                f"pos_value=${_diag_position_value:.2f} "
+                                f"unrealized_pnl=${_diag_unrealized_pnl:.2f} "
+                                f"dump_threshold=${DUMP_MAX_LOSS_USD:.2f} "
+                                f"dump_triggered={'YES' if should_dump else 'NO'} "
+                                f"reason={dump_reason} t_close={secs_to_close}s"
+                            )
+
                         # Log dump check status periodically
                         if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                             time_in_trade = time.time() - st.entry_time if st.entry_time > 0 else 0
@@ -3343,9 +3364,9 @@ def main() -> None:
                                                     session=session,
                                                 )
                                             else:
-                                                flip_qty = max(1, int(DUMP_MAX_LOSS_USD / flip_cost_per)) if flip_cost_per > 0 else 0
+                                                flip_qty = MIN_CONTRACTS
                                         except Exception:
-                                            flip_qty = max(1, int(DUMP_MAX_LOSS_USD / flip_cost_per)) if flip_cost_per > 0 else 0
+                                            flip_qty = MIN_CONTRACTS
 
                                         # YES Kelly reduction for flips too
                                         if flip_side == "yes" and flip_qty > 0:
@@ -3356,21 +3377,12 @@ def main() -> None:
                                                 f"({YES_KELLY_REDUCTION:.0%} of normal)"
                                             )
 
-                                        # FLIP $0.40 CAP: if flip would exceed cap, reduce or skip
-                                        flip_worst_loss = flip_cost_per * flip_qty
-                                        if flip_worst_loss > DUMP_MAX_LOSS_USD:
-                                            flip_qty = int(DUMP_MAX_LOSS_USD / flip_cost_per)
-                                            if flip_qty <= 0:
-                                                log.warning(
-                                                    f"[FLIP] Skipped — 1 contract costs ${flip_cost_per:.2f} > "
-                                                    f"${DUMP_MAX_LOSS_USD:.2f} cap"
-                                                )
-                                                can_flip = False
-                                            else:
-                                                log.warning(
-                                                    f"[FLIP SIZE CAP] Reduced flip qty to {flip_qty} "
-                                                    f"(loss=${flip_qty * flip_cost_per:.2f} <= ${DUMP_MAX_LOSS_USD:.2f})"
-                                                )
+                                        # FLIP EXPOSURE LOG: the active stop-loss ($0.40) protects mid-trade
+                                        flip_exposure = flip_cost_per * flip_qty
+                                        log.info(
+                                            f"[FLIP SIZE] qty={flip_qty} @ {flip_price}¢ "
+                                            f"exposure=${flip_exposure:.2f} (active stop=${DUMP_MAX_LOSS_USD:.2f})"
+                                        )
 
                                     if can_flip:
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
@@ -3933,44 +3945,22 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # INDEPENDENT MAX LOSS GATE — last line of defense before order
-        # This runs AFTER all sizing logic and cannot be bypassed.
-        # BOTH SIDES: max loss = entry_price × contracts (you pay entry_price, get $0 if wrong)
-        # On Kalshi: YES + NO = 100¢. Buying NO at 92¢ means you pay 92¢, lose 92¢ if wrong.
-        # CRITICAL: if even 1 contract exceeds $0.40, SKIP the trade entirely.
+        # PRE-ORDER EXPOSURE CHECK: total position exposure vs 2% bankroll cap.
+        # The ACTIVE stop-loss ($0.40 unrealized P&L) is the primary loss protection.
+        # This gate limits TOTAL EXPOSURE (settlement risk), not the active stop trigger.
+        # At $25 bankroll: 2% = $0.50. At 92¢/contract: max 0 → floor to 1 (active stop protects).
         cost_per_ct = int(chosen_px) / 100.0
-        max_possible_loss_usd = cost_per_ct * qty
-        if max_possible_loss_usd > DUMP_MAX_LOSS_USD:
+        max_exposure = available_usd * MAX_SETTLEMENT_LOSS_FRACTION if available_usd > 0 else DUMP_MAX_LOSS_USD
+        total_exposure = cost_per_ct * qty
+        if total_exposure > max_exposure and qty > MIN_CONTRACTS:
             old_qty = qty
-            qty = int(DUMP_MAX_LOSS_USD / cost_per_ct)
-            if qty <= 0:
-                log.warning(
-                    f"[MAX LOSS GATE] {chosen_side.upper()} @ {chosen_px}¢ — "
-                    f"1 contract costs ${cost_per_ct:.2f} > ${DUMP_MAX_LOSS_USD:.2f} cap — "
-                    f"CANNOT TRADE at this price, skipping"
-                )
-                st.traded_this_market = True
-                time.sleep(POLL_SECONDS)
-                continue
+            qty = max(MIN_CONTRACTS, int(max_exposure / cost_per_ct))
             log.warning(
-                f"[MAX LOSS GATE] {chosen_side.upper()} @ {chosen_px}¢ × {old_qty} "
-                f"= ${old_qty * cost_per_ct:.2f} max loss > ${DUMP_MAX_LOSS_USD:.2f} cap — "
-                f"reduced to {qty} contracts (loss=${qty * cost_per_ct:.2f})"
+                f"[EXPOSURE GATE] {chosen_side.upper()} @ {chosen_px}¢ × {old_qty} "
+                f"= ${total_exposure:.2f} exposure > ${max_exposure:.2f} "
+                f"({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}) — "
+                f"reduced to {qty} contracts (active stop-loss at ${DUMP_MAX_LOSS_USD:.2f} protects mid-trade)"
             )
-
-        # ABSOLUTE FINAL SAFETY CHECK: if after ALL sizing logic the worst-case
-        # loss still exceeds $0.40, refuse to trade. This should never fire if the
-        # upstream caps are working, but it's the last line of defense.
-        final_loss = (int(chosen_px) / 100.0) * qty
-        if final_loss > DUMP_MAX_LOSS_USD:
-            log.warning(
-                f"[FINAL CAP BLOCK] {chosen_side.upper()} @ {chosen_px}¢ × {qty} "
-                f"= ${final_loss:.2f} > ${DUMP_MAX_LOSS_USD:.2f} — REFUSING TO TRADE "
-                f"(this should not happen — upstream sizing is broken)"
-            )
-            st.traded_this_market = True
-            time.sleep(POLL_SECONDS)
-            continue
 
         use_post_only = POST_ONLY
         # AGGRESSIVE FILL: use taker orders when probability is high enough.
@@ -3987,7 +3977,7 @@ def main() -> None:
 
         # COMPREHENSIVE PRE-TRADE LOG: every trade is logged with full context.
         cost_per_contract = int(chosen_px) / 100.0
-        worst_case_loss = qty * cost_per_contract
+        total_exposure = qty * cost_per_contract
         if chosen_side == "yes":
             # Compute ultra gate values for the log
             _log_gate_passed, _log_gate_failed, _log_gate_details = yes_ultra_gate(
@@ -3995,7 +3985,7 @@ def main() -> None:
             )
             log.warning(
                 f"[PRE-TRADE] side=YES contracts={qty} cost_per={cost_per_contract:.2f} "
-                f"worst_case_loss=${worst_case_loss:.2f} (cap=${DUMP_MAX_LOSS_USD:.2f}) "
+                f"total_exposure=${total_exposure:.2f} (2%_cap=${max_exposure:.2f}) "
                 f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} "
                 f"| ULTRA_GATE: prob={_log_gate_details['prob']:.4f}({'PASS' if _log_gate_details['prob'] >= YES_ULTRA_GATE_PROB else 'FAIL'}) "
                 f"move={_log_gate_details['move_pct']:.1%}({'PASS' if _log_gate_details['move_pct'] >= YES_ULTRA_GATE_MOVE_PCT else 'FAIL'}) "
@@ -4007,8 +3997,9 @@ def main() -> None:
         else:
             log.warning(
                 f"[PRE-TRADE] side=NO contracts={qty} cost_per={cost_per_contract:.2f} "
-                f"worst_case_loss=${worst_case_loss:.2f} (cap=${DUMP_MAX_LOSS_USD:.2f}) "
+                f"total_exposure=${total_exposure:.2f} (2%_cap=${max_exposure:.2f}) "
                 f"edge={edge_net:.4f} p_gate={p_gate:.4f} bankroll=${available_usd:.2f} "
+                f"stop_loss=${DUMP_MAX_LOSS_USD:.2f} "
                 f"spot=${spot:.2f} lo={lo} hi={hi} t={secs_to_close}s"
             )
 
