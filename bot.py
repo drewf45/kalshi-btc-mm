@@ -128,14 +128,13 @@ YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the
 NO_ONLY = env_bool("NO_ONLY", False)      # Trade only NO side (overrides YES_ONLY if both set)
 
 # -------------- ASYMMETRIC SIDE REQUIREMENTS --------------------------------
-# YES has been net negative across ALL sessions (4/4). NO wins at 87%.
-# The probability model is miscalibrated for YES — says 95% but true rate is <88%.
-# Don't trust the model for YES. Instead, only allow YES when the outcome
-# is PHYSICALLY LOCKED: BTC so far from the strike with so little time left
-# that a reversal is mathematically impossible (distance > 3σ√t).
-# Treat YES like a scalp — last 60 seconds, locked outcome, bonus money.
-YES_PROB_BONUS = 0.14       # YES needs 97% prob in last 3 min (impossible earlier)
-YES_EDGE_BONUS = 0.04       # YES needs 7% total edge
+# YES is filtered by the ultra-strict gate (92% prob, 60% move, 10min, 85¢+, etc).
+# NO extra bonus on prob/edge in choose_trade — the ultra-strict gate is the
+# real filter. Adding bonuses HERE made YES impossible (97-104% prob required)
+# which killed volume. Let choose_trade pass YES through, then let the
+# ultra-strict gate decide.
+YES_PROB_BONUS = 0.0        # Ultra-strict gate handles YES filtering at 92% — no extra bonus here
+YES_EDGE_BONUS = 0.0        # Ultra-strict gate handles YES filtering — no extra edge here
 YES_MAX_ENTRY_PRICE = 96    # YES price cap in choose_trade (ultra-strict gate enforces >=92¢ minimum)
 YES_REQUIRE_TREND = True    # YES always requires trend alignment — no fast lane
 YES_REQUIRE_BOTH_TRENDS = True  # YES must have BOTH 60-min AND 30-min BTC trend aligned
@@ -2014,9 +2013,9 @@ def choose_trade(
         effective_prob_min = PROB_MIN         # <3min: 83%+ — market has priced in the outcome
 
     # ASYMMETRIC GATES: YES must clear a higher bar than NO
-    yes_prob_min = effective_prob_min + YES_PROB_BONUS  # YES: +5% prob required
-    yes_edge_min = EDGE_MIN + YES_EDGE_BONUS            # YES: +2% edge required (5% total)
-    yes_max_price = YES_MAX_ENTRY_PRICE                  # YES: capped at 91¢
+    yes_prob_min = effective_prob_min + YES_PROB_BONUS  # YES: same as NO here; ultra-strict gate enforces 92%
+    yes_edge_min = EDGE_MIN + YES_EDGE_BONUS            # YES: same as NO here; ultra-strict gate filters
+    yes_max_price = YES_MAX_ENTRY_PRICE                  # YES: capped at 96¢ (ultra-strict gate enforces >=85¢)
     no_prob_min = effective_prob_min                      # NO: standard thresholds
     no_edge_min = EDGE_MIN                               # NO: standard 3% edge
 
@@ -3347,6 +3346,24 @@ def main() -> None:
                             yes_bid=yes_bid, no_bid=no_bid,
                         )
 
+                        # DUMP DIAGNOSTIC: log every cycle so we can trace stop-loss behavior
+                        if st.entry_price_cents is not None and st.qty > 0:
+                            if st.side == "yes":
+                                _diag_bid = yes_bid if yes_bid is not None else int(p_yes_blend * 100)
+                            else:
+                                _diag_bid = no_bid if no_bid is not None else int(p_no_blend * 100)
+                            _diag_unrealized = (_diag_bid - st.entry_price_cents) * st.qty / 100.0
+                            _diag_worst_case = st.qty * st.entry_price_cents / 100.0
+                            log.info(
+                                f"[DUMP CHECK] market={st.market} side={st.side.upper()} "
+                                f"entry={st.entry_price_cents}¢ qty={st.qty} "
+                                f"bid={_diag_bid}¢ unrealized_pnl=${_diag_unrealized:.2f} "
+                                f"worst_case=${_diag_worst_case:.2f} "
+                                f"hard_stop=${HARD_STOP_LOSS_USD:.2f} soft_stop=${SOFT_STOP_LOSS_USD:.2f} "
+                                f"t={secs_to_close}s dump={'YES' if should_dump else 'no'}"
+                                + (f" reason={dump_reason}" if should_dump else "")
+                            )
+
                         # --- TRAILING STOP ON WINNERS ---
                         # Once position is up $0.15, trail $0.10 below peak.
                         # Uses bid price for accurate P&L (not model estimate).
@@ -3855,8 +3872,22 @@ def main() -> None:
             )
 
         if chosen_side is None or chosen_px is None:
+            # EVAL LOG: show why no side was chosen (both sides failed choose_trade)
+            _eval_p_yes = p_yes_blend
+            _eval_p_no = p_no_blend
+            _eval_yes_px = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
+            _eval_no_px = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
+            _eval_edge_y = compute_edge(_eval_p_yes, _eval_yes_px, FEE_CENTS_PER_CONTRACT) if _eval_yes_px else -9
+            _eval_edge_n = compute_edge(_eval_p_no, _eval_no_px, FEE_CENTS_PER_CONTRACT) if _eval_no_px else -9
             if (now - last_ob_warn) >= OB_WARN_EVERY_SECONDS:
-                log.warning(f"[OB] no usable entry: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})")
+                log.warning(
+                    f"[EVAL SKIP] {st.market} t={secs_to_close}s NEITHER side passed | "
+                    f"YES: prob={_eval_p_yes:.1%} px={_eval_yes_px} edge={_eval_edge_y:.4f} "
+                    f"need_prob>={PROB_MIN:.0%} need_edge>={EDGE_MIN + YES_EDGE_BONUS:.2f} max_px={YES_MAX_ENTRY_PRICE} | "
+                    f"NO: prob={_eval_p_no:.1%} px={_eval_no_px} edge={_eval_edge_n:.4f} "
+                    f"need_prob>={PROB_MIN:.0%} need_edge>={EDGE_MIN:.2f} max_px={MAX_ENTRY_PRICE_CENTS} | "
+                    f"book: yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})"
+                )
                 last_ob_warn = now
             time.sleep(POLL_SECONDS)
             continue
@@ -3875,6 +3906,15 @@ def main() -> None:
         # ================================================================
         current_prob_for_side = p_yes_blend if chosen_side == "yes" else p_no_blend
         in_settlement_lock = secs_to_close is not None and secs_to_close <= SETTLEMENT_LOCK_SECONDS
+
+        # EVAL LOG: log every evaluation cycle with all gate values
+        _eval_edge = float(edge_yes) if chosen_side == "yes" else float(edge_no)
+        log.info(
+            f"[EVAL] {st.market} t={secs_to_close}s side={chosen_side.upper()} "
+            f"px={chosen_px}¢ prob={current_prob_for_side:.1%} edge={_eval_edge:.4f} "
+            f"settle_lock={'Y' if in_settlement_lock else 'N'} "
+            f"spot=${spot:.2f} | entering filter pipeline"
+        )
 
         # Time-dependent fast lane threshold
         if secs_to_close <= SETTLEMENT_LOCK_SECONDS:
@@ -4073,18 +4113,8 @@ def main() -> None:
                 except Exception as e:
                     log.warning(f"[YES DAYTIME] Timezone check failed: {e} — allowing trade")
 
-            # Gate 0: Time — YES only in the last 60 seconds (outcome must be decided)
-            if secs_to_close is not None and secs_to_close > YES_MAX_SECONDS:
-                log.warning(
-                    f"[YES ULTRA SKIP] timestamp={datetime.now(timezone.utc).isoformat()}Z "
-                    f"market_id={st.market} confidence={_yes_prob:.1%} "
-                    f"price_move_pct={_yes_move_pct:.1%} "
-                    f"minutes_remaining={_yes_mins_remaining:.1f} price={_yes_price}¢ "
-                    f"which_condition_failed=time_lock_60s"
-                )
-                yes_tracker.record_opportunity_skipped(["time_lock_60s"])
-                time.sleep(POLL_SECONDS)
-                continue
+            # Gate 0 (time lock) REMOVED — now identical to ultra-strict condition 3.
+            # YES_MAX_SECONDS == YES_ULTRA_MAX_SECONDS == 600s; gate was always redundant.
 
             # Gate 1: Both BTC trends must align (60-min AND 30-min pointing up)
             if YES_REQUIRE_BOTH_TRENDS:
