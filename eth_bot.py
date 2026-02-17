@@ -2569,11 +2569,20 @@ def compute_qty_from_bankroll(
     No streak counter needed — compounding is in the math.
     """
     if entry_cents is None or entry_cents <= 0:
-        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, falling back to MIN_CONTRACTS={MIN_CONTRACTS}")
-        return MIN_CONTRACTS
+        log.warning(f"[SIZE] Invalid entry_cents={entry_cents}, returning 0")
+        return 0
+
+    # Check if even 1 contract exceeds the loss cap
+    _cost_1ct = float(entry_cents) / 100.0
+    if _cost_1ct > DUMP_MAX_LOSS_USD:
+        log.warning(
+            f"[SIZE] 1 contract costs ${_cost_1ct:.2f} > ${DUMP_MAX_LOSS_USD:.2f} cap — "
+            f"cannot trade at {entry_cents}¢, returning 0"
+        )
+        return 0
 
     if available_usd is None or available_usd <= 0:
-        log.warning(f"[SIZE] available_usd is None or <=0, falling back to MIN_CONTRACTS={MIN_CONTRACTS}")
+        log.warning(f"[SIZE] available_usd is None or <=0, returning MIN_CONTRACTS={MIN_CONTRACTS}")
         return MIN_CONTRACTS
 
     if available_usd < MIN_FREE_USD_TO_TRADE:
@@ -2612,12 +2621,18 @@ def compute_qty_from_bankroll(
     # POSITION SIZE CAP: max_risk = min(2% of portfolio, $0.40 hard cap).
     # Worst case = lose entire entry cost at settlement. Cap contracts so
     # max possible loss never exceeds max_risk. This makes blowups physically impossible.
+    # CRITICAL: if even 1 contract exceeds the cap, return 0 — DO NOT TRADE.
     if cost_per > 0 and available_usd > 0:
         max_risk_pct = available_usd * MAX_SETTLEMENT_LOSS_FRACTION  # 2% of portfolio
         max_risk = min(max_risk_pct, DUMP_MAX_LOSS_USD)              # min(2% portfolio, $0.40)
         max_qty_for_loss_cap = int(max_risk / cost_per)
-        if max_qty_for_loss_cap < MIN_CONTRACTS:
-            max_qty_for_loss_cap = MIN_CONTRACTS
+        if max_qty_for_loss_cap <= 0:
+            # Even 1 contract exceeds the loss cap — cannot trade at this price
+            log.warning(
+                f"[SIZE_BLOCKED] cost_per=${cost_per:.2f} > max_risk=${max_risk:.2f} — "
+                f"even 1 contract exceeds ${DUMP_MAX_LOSS_USD:.2f} cap. Returning 0."
+            )
+            return 0
         if target_qty > max_qty_for_loss_cap:
             log.warning(
                 f"[SIZE_CAPPED] suggested={target_qty} capped={max_qty_for_loss_cap} "
@@ -2627,7 +2642,12 @@ def compute_qty_from_bankroll(
             )
             target_qty = max_qty_for_loss_cap
 
-    qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
+    # Clamp: MIN_CONTRACTS floor only if it doesn't violate the loss cap
+    if cost_per > 0 and MIN_CONTRACTS * cost_per > DUMP_MAX_LOSS_USD:
+        # MIN_CONTRACTS would exceed $0.40 cap — use 0 instead
+        qty = min(target_qty, MAX_CONTRACTS)
+    else:
+        qty = clamp_int(target_qty, MIN_CONTRACTS, MAX_CONTRACTS)
 
     log.info(
         f"[SIZE] Kelly bankroll sizing: contracts={qty} kelly_f={kf:.3f} "
@@ -3313,6 +3333,7 @@ def main() -> None:
                                         flip_edge = flip_prob - (flip_price / 100.0)
 
                                         # Kelly bankroll sizing for flip
+                                        flip_cost_per = int(flip_price) / 100.0
                                         try:
                                             avail_usd, _ = get_balance_usd(client)
                                             if avail_usd and avail_usd > 0:
@@ -3322,19 +3343,36 @@ def main() -> None:
                                                     session=session,
                                                 )
                                             else:
-                                                flip_qty = MIN_CONTRACTS
+                                                flip_qty = max(1, int(DUMP_MAX_LOSS_USD / flip_cost_per)) if flip_cost_per > 0 else 0
                                         except Exception:
-                                            flip_qty = MIN_CONTRACTS
+                                            flip_qty = max(1, int(DUMP_MAX_LOSS_USD / flip_cost_per)) if flip_cost_per > 0 else 0
 
                                         # YES Kelly reduction for flips too
                                         if flip_side == "yes" and flip_qty > 0:
                                             _old_fq = flip_qty
-                                            flip_qty = max(MIN_CONTRACTS, int(flip_qty * YES_KELLY_REDUCTION))
+                                            flip_qty = max(1, int(flip_qty * YES_KELLY_REDUCTION))
                                             log.warning(
                                                 f"[FLIP SIZE] YES Kelly reduction: {_old_fq} -> {flip_qty} "
                                                 f"({YES_KELLY_REDUCTION:.0%} of normal)"
                                             )
 
+                                        # FLIP $0.40 CAP: if flip would exceed cap, reduce or skip
+                                        flip_worst_loss = flip_cost_per * flip_qty
+                                        if flip_worst_loss > DUMP_MAX_LOSS_USD:
+                                            flip_qty = int(DUMP_MAX_LOSS_USD / flip_cost_per)
+                                            if flip_qty <= 0:
+                                                log.warning(
+                                                    f"[FLIP] Skipped — 1 contract costs ${flip_cost_per:.2f} > "
+                                                    f"${DUMP_MAX_LOSS_USD:.2f} cap"
+                                                )
+                                                can_flip = False
+                                            else:
+                                                log.warning(
+                                                    f"[FLIP SIZE CAP] Reduced flip qty to {flip_qty} "
+                                                    f"(loss=${flip_qty * flip_cost_per:.2f} <= ${DUMP_MAX_LOSS_USD:.2f})"
+                                                )
+
+                                    if can_flip:
                                         flip_path = "market_confident" if (flip_price >= 80) else "model_confirmed"
                                         log.warning(
                                             f"[FLIP] Flipping to {flip_side.upper()} after bail ({flip_path}) — "
@@ -3875,7 +3913,7 @@ def main() -> None:
         # Even when the ultra gate passes, YES positions are half-sized for protection.
         if chosen_side == "yes" and qty > 0:
             old_qty_yes = qty
-            qty = max(MIN_CONTRACTS, int(qty * YES_KELLY_REDUCTION))
+            qty = max(1, int(qty * YES_KELLY_REDUCTION))
             log.warning(
                 f"[SIZE] YES Kelly reduction: {old_qty_yes} -> {qty} contracts "
                 f"({YES_KELLY_REDUCTION:.0%} of normal)"
@@ -3885,7 +3923,7 @@ def main() -> None:
         size_mult = session.get_size_multiplier()
         if size_mult < 1.0 and qty > 0:
             old_qty = qty
-            qty = max(MIN_CONTRACTS, int(qty * size_mult))
+            qty = max(1, int(qty * size_mult))
             if qty < old_qty:
                 log.info(f"[SIZE] Drawdown resume: {old_qty} -> {qty} contracts ({size_mult:.0%} size)")
 
@@ -3899,17 +3937,40 @@ def main() -> None:
         # This runs AFTER all sizing logic and cannot be bypassed.
         # BOTH SIDES: max loss = entry_price × contracts (you pay entry_price, get $0 if wrong)
         # On Kalshi: YES + NO = 100¢. Buying NO at 92¢ means you pay 92¢, lose 92¢ if wrong.
-        # The old formula used (100 - entry_price) for NO which calculated profit, not loss.
-        max_possible_loss_usd = (chosen_px * qty) / 100.0
+        # CRITICAL: if even 1 contract exceeds $0.40, SKIP the trade entirely.
+        cost_per_ct = int(chosen_px) / 100.0
+        max_possible_loss_usd = cost_per_ct * qty
         if max_possible_loss_usd > DUMP_MAX_LOSS_USD:
             old_qty = qty
-            qty = int(DUMP_MAX_LOSS_USD * 100 / chosen_px)
-            qty = max(MIN_CONTRACTS, qty)
+            qty = int(DUMP_MAX_LOSS_USD / cost_per_ct)
+            if qty <= 0:
+                log.warning(
+                    f"[MAX LOSS GATE] {chosen_side.upper()} @ {chosen_px}¢ — "
+                    f"1 contract costs ${cost_per_ct:.2f} > ${DUMP_MAX_LOSS_USD:.2f} cap — "
+                    f"CANNOT TRADE at this price, skipping"
+                )
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
             log.warning(
                 f"[MAX LOSS GATE] {chosen_side.upper()} @ {chosen_px}¢ × {old_qty} "
-                f"= ${max_possible_loss_usd:.2f} max loss > ${DUMP_MAX_LOSS_USD:.2f} cap — "
-                f"reduced to {qty} contracts"
+                f"= ${old_qty * cost_per_ct:.2f} max loss > ${DUMP_MAX_LOSS_USD:.2f} cap — "
+                f"reduced to {qty} contracts (loss=${qty * cost_per_ct:.2f})"
             )
+
+        # ABSOLUTE FINAL SAFETY CHECK: if after ALL sizing logic the worst-case
+        # loss still exceeds $0.40, refuse to trade. This should never fire if the
+        # upstream caps are working, but it's the last line of defense.
+        final_loss = (int(chosen_px) / 100.0) * qty
+        if final_loss > DUMP_MAX_LOSS_USD:
+            log.warning(
+                f"[FINAL CAP BLOCK] {chosen_side.upper()} @ {chosen_px}¢ × {qty} "
+                f"= ${final_loss:.2f} > ${DUMP_MAX_LOSS_USD:.2f} — REFUSING TO TRADE "
+                f"(this should not happen — upstream sizing is broken)"
+            )
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
 
         use_post_only = POST_ONLY
         # AGGRESSIVE FILL: use taker orders when probability is high enough.
