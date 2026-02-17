@@ -3740,7 +3740,7 @@ def main() -> None:
             continue
 
         if secs_to_close < ENTRY_LAST_SECONDS:
-            if pos == 0 and secs_to_close < 0:
+            if st.qty == 0 and secs_to_close < 0:
                 # Market already closed, no position — force roll and wait
                 log.warning(f"[SKIP] {st.market} already closed (t_close={secs_to_close}s), no position — waiting for next market")
                 last_meta = 0.0  # Trigger meta refresh on next loop
