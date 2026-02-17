@@ -249,6 +249,7 @@ KELLY_MULTIPLIER = 0.20     # ROLLED BACK — 0.35 caused -$2.61/-$2.70 losses. 
 KELLY_FLOOR_FRACTION = 0.05 # ROLLED BACK from 0.08 — minimum 5% of bankroll
 KELLY_CAP_FRACTION = 0.50   # ROLLED BACK from 0.65 — never risk more than 50% of bankroll in one trade
 MAX_CONTRACTS = 3            # Hard cap — SOL should never hold more than 3 contracts.
+CROSS_BOT_DROP_THRESHOLD = 2.00  # If shared balance dropped >$2, another bot lost — halve next trade
                              # Belt-and-suspenders: gate caps dollar risk, this caps contract count.
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
@@ -1065,6 +1066,10 @@ def cancel_order_status(client: KalshiClient, order_id: str) -> str:
 
 
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
+    # ABSOLUTE SAFETY NET: clamp count to MAX_CONTRACTS at the API boundary
+    if payload.get("action") == "buy" and payload.get("count", 0) > MAX_CONTRACTS:
+        log.warning(f"[PLACE_ORDER] HARD_CAP count {payload['count']} -> {MAX_CONTRACTS}")
+        payload["count"] = MAX_CONTRACTS
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
     if isinstance(resp, dict):
         if "order" in resp and isinstance(resp["order"], dict) and resp["order"].get("order_id"):
@@ -3088,6 +3093,18 @@ def main() -> None:
     )
     log.warning("[HEARTBEAT] main() entered — SOL SCALPER is running")
 
+    # WATCHDOG: force-restart if main loop hangs for >5 minutes (e.g. API timeout)
+    _watchdog_ts = [time.time()]
+    WATCHDOG_TIMEOUT_SEC = 300  # 5 minutes
+    def _watchdog():
+        while True:
+            time.sleep(60)
+            age = time.time() - _watchdog_ts[0]
+            if age > WATCHDOG_TIMEOUT_SEC:
+                log.error(f"[WATCHDOG] Main loop stale for {age:.0f}s (>{WATCHDOG_TIMEOUT_SEC}s) — force restart")
+                os._exit(1)
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
 
@@ -3112,6 +3129,7 @@ def main() -> None:
             log.warning(f"[SESSION] Starting balance: ${av:.2f} (75% hard stop at ${av * 0.25:.2f})")
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
+    _prev_balance = [session.current_balance_usd]  # Track for cross-bot drop detection
 
     last_meta = 0.0
     last_state_log = 0.0
@@ -3176,6 +3194,7 @@ def main() -> None:
 
     while True:
         now = time.time()
+        _watchdog_ts[0] = now  # Feed the watchdog
 
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
             log.warning(
@@ -3703,7 +3722,7 @@ def main() -> None:
                                         flip_worst = flip_cost_per * flip_qty
                                         if flip_worst > DUMP_HARD_MAX_LOSS_USD and flip_qty > 1:
                                             old_fq2 = flip_qty
-                                            flip_qty = max(1, int(DUMP_HARD_MAX_LOSS_USD / flip_cost_per))
+                                            flip_qty = max(1, min(int(DUMP_HARD_MAX_LOSS_USD / flip_cost_per), MAX_CONTRACTS))
                                             log.warning(
                                                 f"[FLIP CAP] {old_fq2} -> {flip_qty} contracts "
                                                 f"(worst ${flip_worst:.2f} > ${DUMP_HARD_MAX_LOSS_USD:.2f} cap)"
@@ -4223,6 +4242,19 @@ def main() -> None:
 
         available_usd, total_usd = get_balance_usd(client)
 
+        # CROSS-BOT DRAWDOWN: detect if another bot lost money since our last check
+        _cross_bot_reduce = False
+        if available_usd is not None and _prev_balance[0] > 0:
+            _bal_drop = _prev_balance[0] - available_usd
+            if _bal_drop >= CROSS_BOT_DROP_THRESHOLD:
+                _cross_bot_reduce = True
+                log.warning(
+                    f"[CROSS-BOT] Balance dropped ${_bal_drop:.2f} since last check "
+                    f"(${_prev_balance[0]:.2f} -> ${available_usd:.2f}) — "
+                    f"another bot may have lost, halving position size"
+                )
+            _prev_balance[0] = available_usd
+
         if chosen_side == "yes":
             edge_net = float(edge_yes)
             p_gate = float(p_yes_blend)
@@ -4295,6 +4327,12 @@ def main() -> None:
                 f"{session.drawdown_resume_trades_remaining} trades left at reduced size)"
             )
 
+        # 4. CROSS-BOT DRAWDOWN: halve size if shared balance dropped
+        if _cross_bot_reduce and qty > 1:
+            old_qty = qty
+            qty = max(1, qty // 2)
+            log.warning(f"[CROSS-BOT SIZE] {old_qty} -> {qty} contracts (50% due to balance drop)")
+
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
@@ -4329,7 +4367,7 @@ def main() -> None:
         # Cap 1: absolute dollar cap — reduce qty but always allow 1
         if max_possible_loss > DUMP_HARD_MAX_LOSS_USD and qty > 1:
             old_qty = qty
-            qty = max(1, int(DUMP_HARD_MAX_LOSS_USD / cost_per_contract))
+            qty = max(1, min(int(DUMP_HARD_MAX_LOSS_USD / cost_per_contract), MAX_CONTRACTS))
             log.warning(
                 f"[PRE-TRADE CAP] max_loss=${max_possible_loss:.2f} > ${DUMP_HARD_MAX_LOSS_USD:.2f}: "
                 f"reducing {old_qty} -> {qty} contracts (dump monitor is primary protection)"
@@ -4340,7 +4378,7 @@ def main() -> None:
         max_risk_usd = session.current_balance_usd * PORTFOLIO_RISK_FRACTION
         if max_risk_usd > 0 and max_possible_loss > max_risk_usd:
             suggested = qty
-            qty = max(1, int(max_risk_usd / cost_per_contract))
+            qty = max(1, min(int(max_risk_usd / cost_per_contract), MAX_CONTRACTS))
             if cost_per_contract * qty > max_risk_usd and qty > 1:
                 qty -= 1
             log.warning(
@@ -4349,18 +4387,7 @@ def main() -> None:
                 f"max_risk_amount=${max_risk_usd:.2f}"
             )
 
-        use_post_only = POST_ONLY
-        # AGGRESSIVE FILL: use taker orders when probability is high enough.
-        # Getting filled is worth more than saving maker/taker spread.
-        # Not participating costs 100% of the edge; crossing the spread costs 1-2¢.
-        # TIME-DEPENDENT: require higher prob for taker early (avoid crossing spread on uncertain signals)
-        taker_prob_thresh = 0.90 if secs_to_close > SETTLEMENT_LOCK_SECONDS else 0.85
-        if p_gate >= taker_prob_thresh:
-            use_post_only = False
-            log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ {taker_prob_thresh:.0%}, fills > maker savings")
-        elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
-            use_post_only = False
-            log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+        use_post_only = POST_ONLY  # Always maker — taker override removed
 
         # COMPREHENSIVE PRE-TRADE LOG — every trade gets a full audit trail
         final_worst_case = cost_per_contract * qty
@@ -4505,5 +4532,9 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: bot crashed: {e}")
+        log.exception(
+            f"FATAL: bot crashed: {e} | "
+            f"PROB_MIN={PROB_MIN} MAX_CONTRACTS={MAX_CONTRACTS} POST_ONLY={POST_ONLY} "
+            f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}"
+        )
         raise

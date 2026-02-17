@@ -141,7 +141,7 @@ META_REFRESH_SECONDS = env_float("META_REFRESH", 10.0)
 
 DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
-POST_ONLY = env_bool("POST_ONLY", False)  # Use market orders for faster fills
+POST_ONLY = env_bool("POST_ONLY", True)   # Maker orders — save spread, improve fill quality
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade YES only
 NO_ONLY = env_bool("NO_ONLY", False)     # Ultra gate replaces hard block — see YES_ULTRA_GATE_*
 # YES ULTRA GATE (v10): replaces NO_ONLY=True hard block.
@@ -242,7 +242,8 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = 0.35  # ETH: ~0.35 USD/√sec (BTC is ~12, ETH pri
 KELLY_MULTIPLIER = 0.25     # Quarter-Kelly — $0.40 hard cap is the real size limiter now
 KELLY_FLOOR_FRACTION = 0.05 # Minimum 5% of bankroll when we decide to trade at all
 KELLY_CAP_FRACTION = 0.50   # Never risk more than 50% of bankroll in one trade
-MAX_CONTRACTS = 100          # Hard cap — safety limit (bankroll fraction is the real cap)
+MAX_CONTRACTS = 3            # Hard cap — 3 contracts max per trade (shared $23 bankroll across 4 bots)
+CROSS_BOT_DROP_THRESHOLD = 2.00  # If shared balance dropped >$2, another bot lost — halve next trade
 MIN_CONTRACTS = 1           # Floor
 MIN_FREE_USD_TO_TRADE = 5.0
 # Legacy constants (kept for backward compat in safety checks)
@@ -316,6 +317,7 @@ MIN_TAKE_PROFIT_TIME_REMAINING = 120      # Only apply the hold if >2 min remain
 # This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
 DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.02  # 2% of current balance = max single-trade loss (was 3% — tighter cap)
 DUMP_MAX_LOSS_USD = 0.40                  # HARD $0.40 CAP — absolute max loss per trade regardless of balance
+MAX_LOSS_AT_EXPIRY_USD = 1.00             # Pre-trade gate: max possible loss if contract settles at $0
 # 10-session analysis: 13 blowups totaling -$39.37. $1.00 cap wasn't tight enough.
 # $0.40 makes blowups physically survivable — need <3 wins to recover each loss.
 # Also cap at 50% of position cost — if you paid $3, max loss is $1.50
@@ -355,10 +357,10 @@ DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
 # Safety: the flip still checks probability and price, but with a LOWER bar
 #         than a fresh entry — this is a recovery play, not a new trade.
 #         We already took the loss; the question is "can I claw some back?"
-FLIP_AFTER_DUMP = False             # DISABLED — flip is -EV with low prob thresholds (60% @ 99¢ = -39¢/ct)
+FLIP_AFTER_DUMP = True              # ENABLED — with MAX_CONTRACTS=3 and 92¢ cap, max risk = $2.76 (acceptable)
 FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
 FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 99           # Edge = settlement payout, even 1¢/contract at scale
+FLIP_MAX_ENTRY_PRICE = 92           # Capped at 92¢ — min payoff 8¢/contract (was 99¢ which is -EV)
 
 # -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
 # With <60s left and ETH far from the strike, the outcome is locked.
@@ -967,6 +969,10 @@ def cancel_order_status(client: KalshiClient, order_id: str) -> str:
 
 
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
+    # ABSOLUTE SAFETY NET: clamp count to MAX_CONTRACTS at the API boundary
+    if payload.get("action") == "buy" and payload.get("count", 0) > MAX_CONTRACTS:
+        log.warning(f"[PLACE_ORDER] HARD_CAP count {payload['count']} -> {MAX_CONTRACTS}")
+        payload["count"] = MAX_CONTRACTS
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
     if isinstance(resp, dict):
         if "order" in resp and isinstance(resp["order"], dict) and resp["order"].get("order_id"):
@@ -2875,6 +2881,18 @@ def main() -> None:
     )
     log.warning("[HEARTBEAT] main() entered — ETH SCALPER is running")
 
+    # WATCHDOG: force-restart if main loop hangs for >5 minutes (e.g. API timeout)
+    _watchdog_ts = [time.time()]
+    WATCHDOG_TIMEOUT_SEC = 300  # 5 minutes
+    def _watchdog():
+        while True:
+            time.sleep(60)
+            age = time.time() - _watchdog_ts[0]
+            if age > WATCHDOG_TIMEOUT_SEC:
+                log.error(f"[WATCHDOG] Main loop stale for {age:.0f}s (>{WATCHDOG_TIMEOUT_SEC}s) — force restart")
+                os._exit(1)
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     if not API_KEY_ID or not PRIVATE_KEY_PEM_B64:
         raise RuntimeError("Missing KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PEM_BASE64")
 
@@ -2907,6 +2925,7 @@ def main() -> None:
             )
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
+    _prev_balance = [session.current_balance_usd]  # Track for cross-bot drop detection
 
     last_meta = 0.0
     last_state_log = 0.0
@@ -2971,6 +2990,7 @@ def main() -> None:
 
     while True:
         now = time.time()
+        _watchdog_ts[0] = now  # Feed the watchdog
 
         if (now - last_heartbeat) >= float(HEARTBEAT_SECONDS):
             log.warning(
@@ -3351,30 +3371,9 @@ def main() -> None:
                                         and not (NO_ONLY and flip_side == "yes")  # Don't flip to YES in NO_ONLY mode
                                     )
 
-                                    # YES flip: apply ultra gate (same 4-condition check as choose_trade)
-                                    if can_flip and flip_side == "yes":
-                                        _fg_passed, _fg_failed, _fg_details = yes_ultra_gate(
-                                            flip_prob, spot, lo, hi, secs_to_close,
-                                            int(flip_price) if flip_price is not None else None,
-                                        )
-                                        if not _fg_passed:
-                                            _fg_str = ",".join(_fg_failed)
-                                            log.warning(
-                                                f"[FLIP] YES flip blocked — ultra gate: failed={_fg_str} "
-                                                f"prob={_fg_details['prob']:.4f} move={_fg_details['move_pct']:.1%} "
-                                                f"time={_fg_details['secs']}s price={_fg_details['price']}¢"
-                                            )
-                                            can_flip = False
-                                            if _yes_summary is not None:
-                                                _yes_summary.record_opportunity(False, _fg_failed)
-                                        else:
-                                            log.warning(
-                                                f"[FLIP] YES flip passed ultra gate — "
-                                                f"prob={_fg_details['prob']:.4f} move={_fg_details['move_pct']:.1%} "
-                                                f"time={_fg_details['secs']}s price={_fg_details['price']}¢"
-                                            )
-                                            if _yes_summary is not None:
-                                                _yes_summary.record_opportunity(True, [])
+                                    # FLIP: skip ultra gate — flips are recovery plays, not fresh entries.
+                                    # Ultra gate (95% prob + 70% move + <5min + >=93¢) is too restrictive
+                                    # and was blocking ALL ETH flips. The dual-path check below is sufficient.
 
                                     # Two paths: model agrees (prob >= 60%) or market confident (price >= 80¢)
                                     if can_flip:
@@ -3410,11 +3409,18 @@ def main() -> None:
                                                 f"({YES_KELLY_REDUCTION:.0%} of normal)"
                                             )
 
-                                        # FLIP EXPOSURE LOG: the active stop-loss ($0.40) protects mid-trade
+                                        # PRE-TRADE MAX LOSS GATE (flips too)
+                                        flip_max_loss = (int(flip_price) * flip_qty) / 100.0
+                                        if flip_max_loss > MAX_LOSS_AT_EXPIRY_USD:
+                                            per_ct = int(flip_price) / 100.0
+                                            old_fq = flip_qty
+                                            flip_qty = max(1, min(int(MAX_LOSS_AT_EXPIRY_USD / per_ct), MAX_CONTRACTS)) if per_ct > 0 else 1
+                                            log.warning(f"[FLIP MAX LOSS] Reduced flip qty {old_fq} -> {flip_qty} — max_loss ${flip_max_loss:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f}")
+
                                         flip_exposure = flip_cost_per * flip_qty
                                         log.info(
                                             f"[FLIP SIZE] qty={flip_qty} @ {flip_price}¢ "
-                                            f"exposure=${flip_exposure:.2f} (active stop=${DUMP_MAX_LOSS_USD:.2f})"
+                                            f"exposure=${flip_exposure:.2f} (max_loss_cap=${MAX_LOSS_AT_EXPIRY_USD:.2f})"
                                         )
 
                                     if can_flip:
@@ -3950,6 +3956,19 @@ def main() -> None:
 
         available_usd, total_usd = get_balance_usd(client)
 
+        # CROSS-BOT DRAWDOWN: detect if another bot lost money since our last check
+        _cross_bot_reduce = False
+        if available_usd is not None and _prev_balance[0] > 0:
+            _bal_drop = _prev_balance[0] - available_usd
+            if _bal_drop >= CROSS_BOT_DROP_THRESHOLD:
+                _cross_bot_reduce = True
+                log.warning(
+                    f"[CROSS-BOT] Balance dropped ${_bal_drop:.2f} since last check "
+                    f"(${_prev_balance[0]:.2f} -> ${available_usd:.2f}) — "
+                    f"another bot may have lost, halving position size"
+                )
+            _prev_balance[0] = available_usd
+
         if chosen_side == "yes":
             edge_net = float(edge_yes)
             p_gate = float(p_yes_blend)
@@ -3977,41 +3996,38 @@ def main() -> None:
             if qty < old_qty:
                 log.info(f"[SIZE] Drawdown resume: {old_qty} -> {qty} contracts ({size_mult:.0%} size)")
 
+        # CROSS-BOT DRAWDOWN: halve size if shared balance dropped
+        if _cross_bot_reduce and qty > 1:
+            old_qty = qty
+            qty = max(1, qty // 2)
+            log.warning(f"[CROSS-BOT SIZE] {old_qty} -> {qty} contracts (50% due to balance drop)")
+
         if qty <= 0:
             log.warning(f"[SKIP] {st.market} qty=0")
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
-        # PRE-ORDER EXPOSURE CHECK: total position exposure vs 2% bankroll cap.
-        # The ACTIVE stop-loss ($0.40 unrealized P&L) is the primary loss protection.
-        # This gate limits TOTAL EXPOSURE (settlement risk), not the active stop trigger.
-        # At $25 bankroll: 2% = $0.50. At 92¢/contract: max 0 → floor to 1 (active stop protects).
-        cost_per_ct = int(chosen_px) / 100.0
-        max_exposure = available_usd * MAX_SETTLEMENT_LOSS_FRACTION if available_usd > 0 else DUMP_MAX_LOSS_USD
-        total_exposure = cost_per_ct * qty
-        if total_exposure > max_exposure and qty > MIN_CONTRACTS:
+        # === PRE-TRADE MAX LOSS CHECK ===
+        # Max loss at expiry = entry_price * contracts (contract settles at $0).
+        # This is the HARD gate — no bypasses, no MIN_CONTRACTS override.
+        max_loss_at_expiry = (int(chosen_px) * qty) / 100.0
+        if max_loss_at_expiry > MAX_LOSS_AT_EXPIRY_USD:
+            max_qty = int(MAX_LOSS_AT_EXPIRY_USD * 100 / max(int(chosen_px), 1))
             old_qty = qty
-            qty = max(MIN_CONTRACTS, int(max_exposure / cost_per_ct))
+            qty = max(1, min(qty, max_qty))
             log.warning(
-                f"[EXPOSURE GATE] {chosen_side.upper()} @ {chosen_px}¢ × {old_qty} "
-                f"= ${total_exposure:.2f} exposure > ${max_exposure:.2f} "
-                f"({MAX_SETTLEMENT_LOSS_FRACTION:.0%} of ${available_usd:.2f}) — "
-                f"reduced to {qty} contracts (active stop-loss at ${DUMP_MAX_LOSS_USD:.2f} protects mid-trade)"
+                f"[MAX LOSS GATE] Reduced qty {old_qty} -> {qty} — "
+                f"max_loss_at_expiry was ${max_loss_at_expiry:.2f} > ${MAX_LOSS_AT_EXPIRY_USD:.2f} cap"
             )
+            if qty <= 0:
+                log.warning(f"[SKIP] {st.market} — can't size within ${MAX_LOSS_AT_EXPIRY_USD:.2f} max loss")
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
+        max_exposure = available_usd * MAX_SETTLEMENT_LOSS_FRACTION if available_usd > 0 else DUMP_MAX_LOSS_USD
 
-        use_post_only = POST_ONLY
-        # AGGRESSIVE FILL: use taker orders when probability is high enough.
-        # Getting filled is worth more than saving maker/taker spread.
-        # Not participating costs 100% of the edge; crossing the spread costs 1-2¢.
-        # TIME-DEPENDENT: require higher prob for taker early (avoid crossing spread on uncertain signals)
-        taker_prob_thresh = 0.90 if secs_to_close > SETTLEMENT_LOCK_SECONDS else 0.85
-        if p_gate >= taker_prob_thresh:
-            use_post_only = False
-            log.info(f"[TAKER] Using taker order — p={p_gate:.4f} ≥ {taker_prob_thresh:.0%}, fills > maker savings")
-        elif secs_to_close < LAST_CHANCE_TIME_SEC and p_gate >= LAST_CHANCE_MIN_PROB:
-            use_post_only = False
-            log.info(f"[LAST_CHANCE] Allowing taker at T-{secs_to_close}s (p={p_gate:.4f})")
+        use_post_only = POST_ONLY  # Always maker — 98% taker rate was bleeding edge
 
         # COMPREHENSIVE PRE-TRADE LOG: every trade is logged with full context.
         cost_per_contract = int(chosen_px) / 100.0
@@ -4136,5 +4152,9 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: bot crashed: {e}")
+        log.exception(
+            f"FATAL: bot crashed: {e} | "
+            f"PROB_MIN={PROB_MIN} MAX_CONTRACTS={MAX_CONTRACTS} POST_ONLY={POST_ONLY} "
+            f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}"
+        )
         raise
