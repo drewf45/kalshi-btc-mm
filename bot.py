@@ -170,6 +170,10 @@ PROB_MID_MIN = 0.83              # 5-8min: need 83%+ — loosen to improve fill 
 # NO-side can be more aggressive — NO has been consistently profitable
 NO_PROB_FLOOR = 0.80  # NO never requires more than 80% probability regardless of time tier
 
+# -------------- YES CONFIDENCE GATE (simple probability threshold) --------
+YES_GATE_ENABLED = True
+YES_GATE_PROB_MIN = 0.92           # Only enter YES when probability > 92%
+
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
 # When prob is high (90%+), the outcome speaks for itself — skip trend checks.
@@ -1874,6 +1878,18 @@ def choose_trade(
                 f"max={max_settle_px}¢ edge={edge_no:.4f} t={secs_to_close}s"
             )
 
+    # === YES CONFIDENCE GATE (simple probability threshold) ===
+    if YES_GATE_ENABLED and ok_yes:
+        if p_yes_blend < YES_GATE_PROB_MIN:
+            log.info(
+                f"[YES GATE SKIP] prob={p_yes_blend:.1%} < {YES_GATE_PROB_MIN:.0%} threshold"
+            )
+            ok_yes = False
+        else:
+            log.warning(
+                f"[YES GATE PASS] prob={p_yes_blend:.1%} >= {YES_GATE_PROB_MIN:.0%} — YES entry allowed"
+            )
+
     # YES_ONLY: Master one direction before adding the other.
     # Block all NO entries — overrides high-certainty and settlement lock too.
     if YES_ONLY and ok_no and not ok_yes:
@@ -3187,6 +3203,17 @@ def main() -> None:
             log.warning(f"[DECIDE] choose_trade failed: {e}")
             time.sleep(POLL_SECONDS)
             continue
+
+        # PER-CYCLE EVALUATION LOG — shows every evaluation so we can diagnose volume
+        _yes_px_eval = postable_entry_price(yes_bid, yes_ask) if POST_ONLY else yes_ask
+        _no_px_eval = postable_entry_price(no_bid, no_ask) if POST_ONLY else no_ask
+        log.info(
+            f"[EVAL] {st.market} t={secs_to_close}s | "
+            f"p_yes={p_yes_blend:.1%} p_no={p_no_blend:.1%} | "
+            f"yes_px={_yes_px_eval}¢ no_px={_no_px_eval}¢ | "
+            f"edge_yes={edge_yes:.4f} edge_no={edge_no:.4f} | "
+            f"decision={chosen_side or 'SKIP'} px={chosen_px or '-'}¢"
+        )
 
         # Record probability for trend detection (every poll — observe AND buy phases)
         prob_trend.record(p_yes_blend)
