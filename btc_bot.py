@@ -184,9 +184,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.70  # 70%+ — trend analysis provides confidence, just lower the gate
+PROB_MIN = 0.85  # 85%+ — proven 81.3% accuracy means this gate ensures high-confidence entries only
 EDGE_MIN = 0.01  # 1% edge — collecting pennies per contract is the strategy
-MAX_ENTRY_PRICE_CENTS = 96  # Raised from 93¢ — at 96¢ entry, gain 4¢/win, need ~24 wins per loss
+MAX_ENTRY_PRICE_CENTS = 97  # 97¢ max — entries above 97¢ are the ONLY negative-edge bucket (IRON RULE 3)
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY — DISABLED -------------------------
@@ -267,56 +267,12 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- BAIL CONFIGURATION (LAST RESORT — salvage only when truly cooked) ----
-ENABLE_DUMP = True
-# Philosophy: we entered with high conviction and hold to close. Bail ONLY if
-# BTC has actually moved against us AND the book confirms it. A book spike
-# while BTC is $150 on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND BTC confirms, bail (was 50% — too late, already lost 40¢+)
-DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
-DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
-DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
-DUMP_ON_PRICE_DANGER = False  # Disabled - trust BTC price, not book noise
-
-# -------------- BTC-AWARE BAIL (the key fix: don't dump winners) ---------------
-# Before ANY bail trigger fires, check: is BTC on our side of the boundary?
-# YES side: spot > lo + buffer → BTC is safely above range floor → HOLD
-# NO side:  spot < hi - buffer → BTC is safely below range ceiling → HOLD
-# If BTC is on our side, the book is lying (thin book, spike, manipulation).
-# ONLY bail if BTC has actually crossed or is dangerously close to boundary.
-DUMP_BTC_SAFE_BUFFER_EARLY = 75.0    # >2min to close: need $75 buffer (was $100 — hold more winners, σ√120=$131 still provides margin)
-DUMP_BTC_SAFE_BUFFER_LATE = 40.0     # <2min to close: need $40 buffer (was $50 — σ√60=$93, $40 is safe enough)
-DUMP_BTC_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
-
-# -------------- REVERSAL BAIL (only after BTC check fails) --------------------
-DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
-DUMP_REVERSAL_MIN_SAMPLES = 5
-DUMP_EARLY_EXIT_ENABLED = True
-# Reversal during early settling phase uses a wider threshold (not blocked entirely)
-DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
-
-# -------------- HARD DOLLAR STOP-LOSS (absolute max loss per trade, no exceptions) -----
-# This fires FIRST, before grace period, before BTC check, before everything.
-# If a trade is losing more than this dollar amount, GET OUT. Period.
-# $0.40 hard cap: at 70%+ WR with $0.10-0.15 avg win, one $0.40 loss = ~3 wins erased.
-# Never allow a single trade to lose more than $0.40 under any circumstances.
-HARD_STOP_LOSS_USD = 0.40  # Absolute max dollar loss per trade — overrides all other exit logic
-MAX_LOSS_AT_EXPIRY_USD = 1.00  # Pre-trade gate: max possible loss if contract settles at $0
-SOFT_STOP_LOSS_USD = 0.30  # Soft stop: at -$0.30 unrealized, immediately market-sell to exit
-
-# -------------- YES TIME-OF-DAY RESTRICTION ---------------------------------
-# YES is net negative in 5/6 sessions. Only profitable session was overnight.
-# Disable YES during daytime (8am-8pm EST) where it consistently bleeds.
-# Allow YES overnight (8pm-8am EST) where it showed +$1.00 at 75% WR.
-# Combined with the "physically locked" gate, YES can only fire overnight
-# in the last 60s when BTC is $200+ above floor. Extremely selective.
-YES_DAYTIME_DISABLED = False           # Kill YES trades during 8am-8pm EST
-YES_DAYTIME_START_HOUR = 8            # 8am EST
-YES_DAYTIME_END_HOUR = 20             # 8pm EST
-YES_DAYTIME_TIMEZONE = "America/New_York"
+# -------------- IRON RULES (NEVER CHANGE) ------------------------------------
+# RULE 1: One direction per market — once positioned, DONE (no adding/flipping/hedging)
+# RULE 2: Max 3 contracts per market — 3 enforcement layers (pre-sizing, final gate, post-verify)
+# RULE 3: No entries above 97¢ — enforced via MAX_ENTRY_PRICE_CENTS above
+ENABLE_DUMP = False  # DISABLED — no dump/exit/stop-loss. Hold to settlement. (IRON RULE 1)
+MAX_LOSS_AT_EXPIRY_USD = 2.91  # 3 contracts × 97¢ = max possible loss at settlement
 
 # -------------- SESSION DRAWDOWN BREAKER ------------------------------------
 # If down $2.00+ in a rolling 2-hour window, pause 30 min, resume at 50% size.
@@ -328,58 +284,11 @@ DRAWDOWN_PAUSE_SECONDS = 1800         # Pause for 30 minutes
 DRAWDOWN_RESUME_SIZE_MULT = 0.50      # Resume at 50% position size
 DRAWDOWN_RESUME_TRADES = 3            # Run 3 trades at reduced size before full size
 
-# -------------- EARLY EXIT ON UNDERWATER POSITIONS --------------------------
-# If position is down >30% of max possible loss within first 5 minutes,
-# exit early — don't let underwater positions ride to expiry.
-EARLY_EXIT_ENABLED = True
-EARLY_EXIT_LOSS_FRACTION = 0.30       # 30% of max possible loss
-EARLY_EXIT_WINDOW_SECONDS = 300       # First 5 minutes of holding
-
-# -------------- MINIMUM EXPECTED PAYOUT (stop making penny trades) ----------
-# If projected win is $0.02-$0.03, the risk/reward is terrible.
-# Require minimum expected profit before entering any trade.
-# expected_payout = qty × (100 - entry_cents) / 100
-MIN_EXPECTED_PAYOUT_USD = 0.0  # Don't enter trades with < $0.10 projected win
-
-# -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
-# Never lose more than X% of current balance on a single trade.
-# At $35: max loss = $1.05.  At $350: max loss = $10.50.  Scales naturally.
-# This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
-# Also cap at 50% of position cost — if you paid $3, max loss is $1.50
-DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
-# ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
-# With the EV price cap (price ≤ prob), entries are always +EV, so we can
-# afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
-# As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Max 8% of balance at risk per trade — one loss hurts but doesn't wreck you
-
-# -------------- NUKE PREVENTION (cap how many wins one loss can erase) ----------
-# At 96¢ entry: win=$0.04, loss=$0.96 → nuke ratio = 24:1.
-# Without a cap, one bad trade erases 24 good ones.
-# This limits position size so worst-case settlement loss ≤ N × expected win.
-# Example at entry=96¢, NUKE_MAX_WINS_ERASED=5:
-#   max_loss_allowed = 5 × (100-96)/100 × qty → qty ≤ 5 × win_per / cost_per
-#   Effectively: qty ≤ 5 × ($0.04/$0.96) × bankroll_fraction → much smaller at high prices
-NUKE_MAX_WINS_ERASED = 5  # One loss should never wipe more than 5 winning trades
-
-# -------------- NO-SIDE CONTRACT CEILING (BTC-specific) -----------------------
-# 5 of 6 BTC blowups were NO side. Even with Kelly + nuke cap, a high-confidence
-# NO signal can result in too many contracts. Hard ceiling prevents that.
-MAX_NO_CONTRACTS = 3  # Hard cap on NO contracts (must not exceed MAX_CONTRACTS)
-
-# -------------- BTC-SPECIFIC SIDE ADJUSTMENTS --------------------------------
-# YES has excessive losses — reduce YES position size by 50%.
-# NO is entering at insufficient confidence — raise minimum to 85%.
-YES_POSITION_SIZE_MULT = 1.0    # Multiply all YES position sizes by 0.5
-NO_MIN_CONFIDENCE = 0.0         # NO side requires 80% confidence (was 85% — NO is 100% profitable, let it breathe)
-
-# -------------- TRAILING STOP ON WINNERS --------------------------------------
-# Too many BTC trades go to +$0.30-$0.50 then give it all back at settlement.
-# Once up $0.15, trail $0.10 below peak unrealized P&L. Lock in gains.
-TRAILING_STOP_ENABLED = True
-TRAILING_STOP_ACTIVATE_USD = 0.15  # Activate once unrealized P&L hits +$0.15
-TRAILING_STOP_TRAIL_USD = 0.10     # Exit if P&L drops $0.10 below peak
+# -------------- REMOVED BY REDESIGN (Feb 2026 data analysis) ----------------
+# All dump/exit/stop-loss/flip/scalp/trailing-stop logic REMOVED.
+# Reason: dump+flip caused $4,339 in losses from mixed-direction trading.
+# Once positioned, HOLD TO SETTLEMENT. Max loss = 3 × 97¢ = $2.91.
+MAX_NO_CONTRACTS = 3  # Same as MAX_CONTRACTS — uniform sizing
 
 # -------------- PORTFOLIO MILESTONE TRACKING ----------------------------------
 # Track portfolio balance after every trade. Log milestones at every $5 increment.
@@ -389,66 +298,10 @@ MILESTONE_INCREMENT = 5.0          # Log milestone every $5
 MILESTONE_START = 30.0             # First milestone at $30
 MILESTONE_PROFIT_CAP = 100.0      # Above $100, withdraw all excess
 
-# -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
-DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
-
-# -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after BTC check (was 15¢ — tighter to salvage more)
-# CATASTROPHIC STOP: fires BEFORE BTC check — absolute max loss regardless of anything
-# Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
-DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
-
-# -------------- WINDOWED PEAK TRACKING (avoid false reversals from book spikes) -----
-# All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
-# false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
-# Use a rolling window max instead: peak = max(prob over last N seconds).
-DUMP_PEAK_WINDOW_SECONDS = 30  # Use max prob over last 30s as "peak" (not all-time)
-
-# -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
-# If probability drops very fast (>4% in 10s), something is seriously wrong.
-# Bail even during settling period — fast drops mean BTC is actively moving against us.
-DUMP_RAPID_DROP_THRESHOLD = 0.04   # 4% drop in the rapid window = emergency
-DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
-
-# -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
-# If we bail because BTC moved against us, the OTHER side is now the high-prob winner.
-# Instead of just eating the loss, flip to the other side and hold THAT to settlement.
-# Example: bought YES at 94¢, BTC tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
-#          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
-# Safety: the flip still checks probability and price, but with a LOWER bar
-#         than a fresh entry — this is a recovery play, not a new trade.
-#         We already took the loss; the question is "can I claw some back?"
-FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
-FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 92           # Min payoff 8¢/contract — no more 99¢ recovery flips
-
-# -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
-# With <60s left and BTC far from the strike, the outcome is locked.
-# Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
-# Key safety: distance from strike.  If BTC is $300 above the floor with 60s left,
-# it CANNOT reverse.  sigma * sqrt(60) ≈ $93 at 12σ — $300 is >3x the max move.
-#
-# Risk/reward at 99¢ × 33 contracts:
-#   Win (99.5%+ of the time): +$0.33
-#   Lose (BTC reverses $300+ in 60s): -$32.67
-# Over 96 markets/day: ~$31/day extra income if hit rate matches.
-SCALP_ENABLED = True
-SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
-SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 50.0      # BTC must be ≥$50 from strike (lowered — vol gate is the real safety)
-# Distance tiers: farther from strike = more aggressive sizing
-# Each tier: (min_distance_usd, bankroll_fraction)
-SCALP_DISTANCE_TIERS = [
-    (400.0, 0.85),   # $400+ from strike: extremely safe, size up hard
-    (200.0, 0.65),   # $200-400: very safe, go bigger
-    (100.0, 0.45),   # $100-200: safe, meaningful size
-    (50.0,  0.25),   # $50-100: moderate — compound the edge
-]
-SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
-SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.15    # Never risk more than 15% of cash on a scalp
+# -------------- FLIP/SCALP/DUMP — ALL DISABLED BY REDESIGN --------------------
+FLIP_AFTER_DUMP = False  # DISABLED — no flipping (IRON RULE 1: one direction per market)
+SCALP_ENABLED = False    # DISABLED — no scalping (IRON RULE 1: one entry per market)
+TRAILING_STOP_ENABLED = False  # DISABLED — hold to settlement
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -1012,31 +865,31 @@ def cancel_order_status(client: KalshiClient, order_id: str) -> str:
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     if payload.get("action") == "buy":
         count = payload.get("count", 0)
-        # HARD CAP 1: absolute contract limit
+        ticker = payload.get("ticker", "")
+
+        # IRON RULE 2 Layer B: absolute contract limit
         if count > MAX_CONTRACTS:
-            log.warning(f"[HARD CAP] Reduced order from {count} to {MAX_CONTRACTS} contracts")
+            log.warning(f"[RULE 2B] Reduced order from {count} to {MAX_CONTRACTS} contracts")
             count = MAX_CONTRACTS
             payload["count"] = count
 
-        # HARD CAP 2: check existing position on this market via Kalshi API
-        ticker = payload.get("ticker", "")
+        # IRON RULE 1 + RULE 2 Layer A: check existing position via Kalshi API
         if ticker:
             try:
                 existing = abs(parse_position_for_market(get_positions(client), ticker))
-                if existing + count > MAX_CONTRACTS:
-                    old_count = count
-                    count = max(0, MAX_CONTRACTS - existing)
-                    payload["count"] = count
+                if existing > 0:
+                    # IRON RULE 1: Already positioned on this market → BLOCK entirely
                     log.warning(
-                        f"[HARD CAP] Already hold {existing} contracts on {ticker}, "
-                        f"reduced new order {old_count} -> {count} (max {MAX_CONTRACTS} total)"
+                        f"[RULE 1] Already hold {existing} contracts on {ticker} — "
+                        f"BLOCKED (one direction per market, no adding)"
                     )
+                    return "BLOCKED_BY_RULE_1"
             except Exception as e:
-                log.warning(f"[HARD CAP] Position check failed: {e} — using count={count}")
+                log.warning(f"[RULE 2] Position check failed: {e} — proceeding with caution")
 
         if count <= 0:
-            log.warning(f"[HARD CAP] Already at max position on {ticker}, skipping order")
-            return "BLOCKED_BY_HARD_CAP"
+            log.warning(f"[RULE 2] Zero quantity on {ticker}, skipping order")
+            return "BLOCKED_ZERO_QTY"
 
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
     if isinstance(resp, dict):
@@ -1168,9 +1021,9 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
 
 def get_bot_available_usd(
     client: KalshiClient,
-    position_tracker: 'BotPositionTracker',
+    position_tracker=None,  # Legacy parameter — ignored (API is source of truth)
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Get this bot's fair share of available cash.
+    """Get available cash from Kalshi API.
 
     Multiple bots share one Kalshi account. Each bot checks: is there enough
     cash for my next trade? If yes, trade. If no, skip. First-come-first-served.
@@ -1178,12 +1031,7 @@ def get_bot_available_usd(
     available, total = get_balance_usd(client)
     if available is None:
         return None, None
-    # No division — bots rarely need cash simultaneously (different 15min cycles)
-    my_cost = position_tracker.total_cost_usd()
-    log.info(
-        f"[BOT BALANCE] {BOT_ID}: account=${available:.2f} "
-        f"| my_positions_cost=${my_cost:.2f}"
-    )
+    log.info(f"[BOT BALANCE] {BOT_ID}: account=${available:.2f}")
     return available, total
 
 
@@ -1246,14 +1094,14 @@ def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> No
 
 
 # -----------------------------
-# State machine (MODIFIED FOR DUMP LOGIC)
+# State machine (REDESIGNED — no dump/flip states)
 # -----------------------------
 class SM:
     IDLE = "IDLE"
     ARMED = "ARMED"
     ORDER_WAIT = "ORDER_WAIT"
-    HOLD = "HOLD"  # Now actively monitors for dump conditions
-    DUMPED = "DUMPED"  # NEW: Position was dumped early
+    HOLD = "HOLD"  # Positioned — hold to settlement (no exit logic)
+    DUMPED = "DUMPED"  # Legacy — kept for compatibility but never entered
     ROLL = "ROLL"
     COOLDOWN = "COOLDOWN"  # Paused due to session limits
 
@@ -3107,52 +2955,17 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning(
+        f"[BOOTCFG] === REDESIGNED BOT (Feb 2026 data analysis) ==="
+    )
+    log.warning(
+        f"[BOOTCFG] IRON RULES: "
+        f"RULE1=one_direction_per_market RULE2=max_{MAX_CONTRACTS}_contracts RULE3=max_{MAX_ENTRY_PRICE_CENTS}c_entry"
+    )
+    log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s BUY={BUY_START_SECONDS}s "
         f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
-        f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
-        f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
-        f"YES_ONLY={YES_ONLY} NO_ONLY={NO_ONLY}"
-    )
-    log.warning(
-        f"[BOOTCFG] *** HARD CAP: MAX_CONTRACTS={MAX_CONTRACTS} *** "
-        f"(enforced at API boundary with position check, POST_ONLY={POST_ONLY}, "
-        f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}, MAX_LOSS_AT_EXPIRY=${MAX_LOSS_AT_EXPIRY_USD:.2f})"
-    )
-    log.warning(
-        f"[BOOTCFG] ASYMMETRIC: YES_PROB_BONUS={YES_PROB_BONUS:.0%} YES_EDGE_BONUS={YES_EDGE_BONUS:.0%} "
-        f"YES_MAX_ENTRY={YES_MAX_ENTRY_PRICE}¢ YES_REQUIRE_TREND={YES_REQUIRE_TREND} "
-        f"HARD_STOP=${HARD_STOP_LOSS_USD:.2f} MIN_PAYOUT=${MIN_EXPECTED_PAYOUT_USD:.2f}"
-    )
-    log.warning(
-        f"[BOOTCFG] YES GATE: ultra_min_price={YES_ULTRA_MIN_PRICE}¢ ultra_min_prob={YES_ULTRA_MIN_PROB:.0%} "
-        f"ultra_max_secs={YES_ULTRA_MAX_SECONDS}s ultra_min_move={YES_ULTRA_MIN_MOVE_PCT:.0%} "
-        f"time_lock={YES_MAX_SECONDS}s | NO_MIN_CONF={NO_MIN_CONFIDENCE:.0%} "
-        f"BUY_WINDOW={BUY_START_SECONDS}s"
-    )
-    # IMPORTANT: Flag hard stop vs YES price interaction
-    _max_yes_for_hard_stop = int(HARD_STOP_LOSS_USD * 100)  # Max YES price allowing ≥1 contract
-    if YES_ULTRA_MIN_PRICE > _max_yes_for_hard_stop:
-        log.warning(
-            f"[BOOTCFG] *** NOTE: YES min price ({YES_ULTRA_MIN_PRICE}¢) > hard stop allows "
-            f"({_max_yes_for_hard_stop}¢ max for 1 contract). YES trades effectively BLOCKED "
-            f"by $0.40 hard stop. This is SAFE — raise hard stop to enable YES. ***"
-        )
-    log.warning(
-        f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
-        f"boundary_buffer=${BOUNDARY_BUFFER_USD:.0f} trend_block={TREND_AGAINST_BLOCK}"
-    )
-    log.warning(
-        f"[BOOTCFG] BAIL: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
-        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract "
-        f"btc_buffer_early=${DUMP_BTC_SAFE_BUFFER_EARLY:.0f} btc_buffer_late=${DUMP_BTC_SAFE_BUFFER_LATE:.0f}"
-    )
-    log.warning(
-        f"[BOOTCFG] FLIP: enabled={FLIP_AFTER_DUMP} UNCONDITIONAL min_time={FLIP_MIN_TIME_REMAINING}s "
-        f"max_price={FLIP_MAX_ENTRY_PRICE}¢ max_qty={MAX_CONTRACTS} (one flip per market, no prob/edge/confidence gates)"
-    )
-    log.warning(
-        f"[BOOTCFG] SIZING: base_contracts={BASE_CONTRACTS} increment={CONTRACT_INCREMENT}/win "
-        f"max={MAX_CONTRACTS} (resets to base on loss)"
+        f"MAX_CONTRACTS={MAX_CONTRACTS} POST_ONLY={POST_ONLY} "
+        f"DUMP=DISABLED FLIP=DISABLED SCALP=DISABLED"
     )
     log.warning(
         f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
@@ -3164,12 +2977,7 @@ def main() -> None:
         f"strong=${TREND_STRONG_THRESHOLD} moderate=${TREND_MODERATE_THRESHOLD} "
         f"block_against={TREND_AGAINST_BLOCK} edge_boost={TREND_AGAINST_EDGE_BOOST}"
     )
-    log.warning(
-        f"[BOOTCFG] SCALP: enabled={SCALP_ENABLED} window={SCALP_MIN_SECONDS}-{SCALP_MAX_SECONDS}s "
-        f"min_dist=${SCALP_MIN_DISTANCE_USD:.0f} min_prob={SCALP_MIN_PROB:.0%} "
-        f"max_loss={SCALP_MAX_LOSS_FRACTION:.0%} tiers={len(SCALP_DISTANCE_TIERS)}"
-    )
-    log.warning("[HEARTBEAT] main() entered — SCALPER is running")
+    log.warning("[HEARTBEAT] main() entered — REDESIGNED bot running (hold-to-settlement, no dump/flip)")
 
     # WATCHDOG: force-restart if main loop hangs for >5 minutes (e.g. API timeout)
     _watchdog_ts = [time.time()]
@@ -3243,8 +3051,11 @@ def main() -> None:
             except Exception as e:
                 log.warning(f"[RECON] cancel strays failed: {e}")
 
-        # Check internal tracker for THIS bot's position in the new market
-        pos = position_tracker.get_signed_qty(new_market)
+        # IRON RULE 1: Use Kalshi API as sole source of truth
+        try:
+            pos = parse_position_for_market(get_positions(client), new_market)
+        except Exception:
+            pos = 0
 
         if pos != 0:
             st.sm = SM.HOLD
@@ -3252,14 +3063,10 @@ def main() -> None:
             st.traded_this_market = True
             st.order_id = None
             st.side = "yes" if pos > 0 else "no"
-            ipos = position_tracker.get_position(new_market)
-            if ipos:
-                st.entry_price_cents = ipos.entry_price_cents
-                st.qty = ipos.qty
-                st.entry_time = ipos.fill_timestamp
+            st.qty = abs(pos)
             log.warning(
-                f"[RECON] found OWN position in {new_market}: pos={pos} side={st.side} "
-                f"entry={st.entry_price_cents}¢ qty={st.qty} (bot={BOT_ID}). Enter HOLD."
+                f"[RECON] API shows position in {new_market}: pos={pos} side={st.side} "
+                f"qty={st.qty} — entering HOLD (wait for settlement)"
             )
             return
 
@@ -3365,14 +3172,6 @@ def main() -> None:
 
                     # Record P&L for settled position (if we had one)
                     if st.traded_this_market and st.entry_price_cents is not None and st.side is not None:
-                        # Reconcile st.qty with internal tracker (not account-wide API).
-                        ipos = position_tracker.get_position(old_market)
-                        if ipos and ipos.qty != st.qty:
-                            log.warning(
-                                f"[RECON] Position mismatch: st.qty={st.qty} tracker={ipos.qty} "
-                                f"— using tracker for P&L (bot={BOT_ID})"
-                            )
-                            st.qty = ipos.qty
                         # Cancel any resting orders for this market
                         try:
                             if getattr(st, 'order_id', None):
@@ -3382,7 +3181,6 @@ def main() -> None:
 
                         if st.qty == 0:
                             log.warning(f"[ROLL] No position filled in {old_market} — skipping P&L")
-                            position_tracker.clear_position(old_market)
                             session.reset_for_new_market()
                             ev, market_ticker, market_obj = ev2, mt2, mobj2
                             st = BotState(market=mt2)
@@ -3447,7 +3245,7 @@ def main() -> None:
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
                     prob_trend.reset(mt2)
-                    position_tracker.clear_position(old_market)  # Clear internal tracker for settled market
+                    # (position_tracker removed — API is sole source of truth)
 
                     st.event = ev2
                     st.market = mt2
@@ -3479,46 +3277,39 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = int(close_ts - int(time.time()))
 
-        # Use INTERNAL position tracker — not the account-wide Kalshi API.
-        # The API shows all 4 bots' positions; we only want THIS bot's.
-        pos = position_tracker.get_signed_qty(st.market)
+        # IRON RULE 1: Use Kalshi API as sole source of truth for positions
+        # (replaces internal PositionTracker — prevents position drift)
+        pos = 0
+        try:
+            pos = parse_position_for_market(get_positions(client), st.market)
+        except Exception:
+            pass
 
-        # If internal tracker is blank but API shows a position, adopt it
-        # (handles restart recovery — don't leave positions unmonitored)
-        if pos == 0:
-            try:
-                api_pos = parse_position_for_market(get_positions(client), st.market)
-                if api_pos != 0:
-                    pos = api_pos  # Adopt for this cycle so HOLD/dump logic activates
-                    st.side = "yes" if api_pos > 0 else "no"
-                    st.qty = abs(api_pos)
-                    if st.entry_price_cents is None or st.entry_price_cents == 0:
-                        st.entry_price_cents = 90
-                    log.warning(
-                        f"[POS_SYNC] Adopted API position: side={st.side} qty={st.qty} "
-                        f"api_pos={api_pos} market={st.market} — dump logic now active"
-                    )
-            except Exception:
-                pass
-
-        # HOLD state: only enter if THIS bot has a position
+        # HOLD state: already positioned → wait for settlement
+        # IRON RULE 1: No dump, no flip, no hedge, no add. One entry, one settlement.
         if pos != 0:
             if st.sm != SM.HOLD:
                 st.sm = SM.HOLD
                 st.traded_this_market = True
                 st.side = "yes" if pos > 0 else "no"
-                # Restore entry data from internal tracker (avoids no_entry_data dump bug)
-                ipos = position_tracker.get_position(st.market)
-                if ipos:
-                    st.entry_price_cents = st.entry_price_cents or ipos.entry_price_cents
-                    st.qty = ipos.qty
-                    st.entry_time = st.entry_time or ipos.fill_timestamp
+                st.qty = abs(pos)
                 log.warning(
-                    f"[HOLD] market={st.market} pos={pos} side={st.side} "
-                    f"entry={st.entry_price_cents}¢ qty={st.qty} (internal tracker, bot={BOT_ID})"
+                    f"[HOLD] Positioned on {st.market}: {st.side.upper()} x{st.qty} — "
+                    f"waiting for settlement (IRON RULE 1: no exit/dump/flip)"
                 )
             
-            # Check dump conditions continuously
+            # IRON RULE 1: Hold to settlement — no dump/flip/scalp
+            if secs_to_close is not None and (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.info(
+                    f"[HOLD] {st.market} {st.side.upper()} qty={st.qty} "
+                    f"t_close={secs_to_close}s — holding to settlement"
+                )
+                last_state_log = now
+
+            time.sleep(POLL_SECONDS)
+            continue
+
+        if False:  # Dead code — dump/flip/scalp logic removed by redesign
             if ENABLE_DUMP and secs_to_close is not None:
                 spot = fetch_btc_spot_usd(http)
                 if spot is not None:
@@ -4049,8 +3840,8 @@ def main() -> None:
             continue
 
         # ============================================================
-        # PHASE 3: BUY WINDOW — last 7 min, make the call
-        # By now we have 5 minutes of trend data to inform the decision
+        # PHASE 3: BUY WINDOW — make the call
+        # IRON RULE 1: Only enter if no existing position on this market
         # ============================================================
         st.sm = SM.ARMED
 
@@ -4578,7 +4369,7 @@ def main() -> None:
                 st.entry_price_cents = int(chosen_px)
                 st.entry_time = now
                 st.qty = filled_qty  # Use actual filled qty, not intended
-                position_tracker.record_fill(st.market, chosen_side, int(chosen_px), filled_qty, oid)
+                # (position_tracker removed — API is sole source of truth)
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
                 st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
@@ -4587,6 +4378,18 @@ def main() -> None:
                     cancel_order_status(client, oid)
                 else:
                     log.warning(f"[FILL] Full fill confirmed: {filled_qty} contracts")
+                # IRON RULE 2 Layer C: Post-verification
+                try:
+                    verify_pos = abs(parse_position_for_market(get_positions(client), st.market))
+                    if verify_pos > MAX_CONTRACTS:
+                        log.error(
+                            f"[RULE 2C] EMERGENCY: Position {verify_pos} exceeds cap {MAX_CONTRACTS} "
+                            f"on {st.market} — blocking further orders"
+                        )
+                    else:
+                        log.info(f"[RULE 2C] Post-verify OK: {verify_pos} contracts on {st.market}")
+                except Exception as e:
+                    log.warning(f"[RULE 2C] Post-verification failed: {e}")
             elif fill_status == "unknown":
                 # API error — assume filled to be safe (position check will reconcile)
                 st.traded_this_market = True
@@ -4598,17 +4401,12 @@ def main() -> None:
                 st.entry_price_cents = int(chosen_px)
                 st.entry_time = now
                 st.qty = qty
-                position_tracker.record_fill(st.market, chosen_side, int(chosen_px), qty, oid)
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
-                st.prob_history = []  # Reset windowed peak tracking for new position
-                st.peak_unrealized_pnl = 0.0  # Reset trailing stop tracker
-                log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
+                st.prob_history = []
+                st.peak_unrealized_pnl = 0.0
+                log.warning(f"[FILL] Could not verify fill — assuming filled, API will reconcile")
             elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
-                # At 97-99¢ with ≥98% prob, the book is often locked (no asks).
-                # Whether post_only or LAST_CHANCE taker, there's no counterparty
-                # to fill against. Let it rest — we're the highest bid. Any seller
-                # fills against us. Costs nothing if it expires unfilled at settlement.
                 st.traded_this_market = True
                 st.sm = SM.HOLD
                 st.side = chosen_side
@@ -4617,8 +4415,7 @@ def main() -> None:
                 st.entry_spot_price = spot
                 st.entry_price_cents = int(chosen_px)
                 st.entry_time = now
-                st.qty = qty  # Intended qty — will reconcile from position on settlement
-                position_tracker.record_fill(st.market, chosen_side, int(chosen_px), qty, oid)
+                st.qty = qty
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
@@ -4647,6 +4444,6 @@ if __name__ == "__main__":
         log.exception(
             f"FATAL: bot crashed: {e} | "
             f"PROB_MIN={PROB_MIN} MAX_CONTRACTS={MAX_CONTRACTS} POST_ONLY={POST_ONLY} "
-            f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}"
+            f"MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ DUMP=DISABLED"
         )
         raise

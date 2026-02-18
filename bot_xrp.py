@@ -159,9 +159,9 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.70  # 70%+ — trend analysis provides confidence, just lower the gate
+PROB_MIN = 0.85  # IRON RULE 3 companion — 85%+ probability required for entry
 EDGE_MIN = 0.01  # 1% edge — collecting pennies per contract is the strategy
-MAX_ENTRY_PRICE_CENTS = 96  # At 96¢ entry, gain 4¢/win
+MAX_ENTRY_PRICE_CENTS = 97  # IRON RULE 3: No entries above 97¢ — at 97¢ entry, gain 3¢/win
 FEE_CENTS_PER_CONTRACT = 0
 
 # -------------- TIME-DEPENDENT CERTAINTY — DISABLED -------------------------
@@ -172,10 +172,9 @@ PROB_MID_ENTRY_SECONDS = 0      # Disabled
 PROB_MID_MIN = PROB_MIN
 # <5 min = PROB_MIN (0.85) — market has priced in the outcome, $0.40 cap protects
 
-# -------------- NO SIDE OVERRIDE (NO has been 100% profitable) -----------------
-# NO side can be more aggressive — allow entries at lower probability.
-NO_SIDE_MIN_PROB = 0.70           # Disabled — same as PROB_MIN (was 0.80)
-NO_SIDE_MIN_PRICE = 0             # Disabled (was 85)
+# -------------- NO SIDE OVERRIDE — DISABLED (unified PROB_MIN gate) ------------
+NO_SIDE_MIN_PROB = PROB_MIN       # Disabled — same as PROB_MIN
+NO_SIDE_MIN_PRICE = 0             # Disabled
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -191,8 +190,8 @@ REQUIRE_TREND_ALIGNMENT = False   # Disabled (was True)
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.70   # Disabled — same as PROB_MIN (was 0.85)
-PROB_FAST_LANE_LATE_THRESHOLD = 0.70  # Disabled — same as PROB_MIN (was 0.80)
+PROB_FAST_LANE_THRESHOLD = PROB_MIN   # Same as PROB_MIN — effectively always fast lane
+PROB_FAST_LANE_LATE_THRESHOLD = PROB_MIN  # Same as PROB_MIN
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
@@ -243,50 +242,32 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- BAIL CONFIGURATION (LAST RESORT — salvage only when truly cooked) ----
-ENABLE_DUMP = True
-# Philosophy: we entered with high conviction and hold to close. Bail ONLY if
-# XRP has actually moved against us AND the book confirms it. A book spike
-# while XRP is $0.004 on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND XRP confirms, bail (was 50% — too late, already lost 40¢+)
-DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
-DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
-DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
-DUMP_ON_PRICE_DANGER = False  # Disabled - trust XRP price, not book noise
+# -------------- BAIL CONFIGURATION — DISABLED (IRON RULE 1: hold to settlement) ----
+ENABLE_DUMP = False  # IRON RULE 1: One direction per market — hold to settlement, no dump/flip/hedge
+# Legacy constants below kept for backward compatibility but never fire with ENABLE_DUMP=False
+DUMP_PROB_FLIP = 0.60
+DUMP_PROB_DROP_PERCENT = 1.0
+DUMP_MARKET_FLIP_THRESHOLD = 0.50
+DUMP_MIN_TIME_REMAINING = 8
+DUMP_ON_PRICE_DANGER = False
 
-# -------------- XRP-AWARE BAIL (the key fix: don't dump winners) ---------------
-# Before ANY bail trigger fires, check: is XRP on our side of the boundary?
-# YES side: spot > lo + buffer → XRP is safely above range floor → HOLD
-# NO side:  spot < hi - buffer → XRP is safely below range ceiling → HOLD
-# If XRP is on our side, the book is lying (thin book, spike, manipulation).
-# ONLY bail if XRP has actually crossed or is dangerously close to boundary.
-DUMP_XRP_SAFE_BUFFER_EARLY = 0.004   # >2min to close: need $0.004 buffer — XRP is volatile, wider margin
-DUMP_XRP_SAFE_BUFFER_LATE = 0.002    # <2min to close: need $0.002 buffer — still need room for XRP swings
-DUMP_XRP_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
-
-# -------------- REVERSAL BAIL (only after XRP check fails) --------------------
-DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.06  # 6% drop from peak — bail fast (was 8% — still too slow, 6% catches reversals earlier)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04  # 4% when profitable — protect gains aggressively (was 6%)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
+# -------------- LEGACY BAIL/DUMP CONSTANTS (ALL DISABLED — IRON RULE 1) --------
+# These constants are retained for backward compatibility with should_dump_position()
+# but ENABLE_DUMP=False means they never fire.
+DUMP_XRP_SAFE_BUFFER_EARLY = 0.004
+DUMP_XRP_SAFE_BUFFER_LATE = 0.002
+DUMP_XRP_SAFE_CUTOFF_SECONDS = 120
+DUMP_ON_PROB_REVERSAL = False  # Disabled — IRON RULE 1
+DUMP_REVERSAL_THRESHOLD = 0.06
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.04
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03
 DUMP_REVERSAL_MIN_SAMPLES = 5
-DUMP_EARLY_EXIT_ENABLED = True
-# Reversal during early settling phase uses a wider threshold (not blocked entirely)
-DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
-
-# -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
-# Never lose more than X% of current balance on a single trade.
-# At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
-# This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # 3% of current balance = max single-trade loss (was 5% — too much at small bankroll)
-DUMP_SOFT_MAX_LOSS_USD = 0.50             # SOFT cap: at -$0.50 unrealized, try limit sell to exit gracefully
-DUMP_HARD_MAX_LOSS_USD = 0.75             # HARD cap: at -$0.75 unrealized, market sell immediately — no exceptions
-
-# -------------- UNIVERSAL $0.40 HARD STOP-LOSS --------------------------------
-# If unrealized loss on any single position reaches $0.40, market sell immediately.
-# Overrides ALL other sizing and exit logic. No single trade can ever lose more.
-# Active monitoring runs every POLL_SECONDS (1.0s) — well under the 5s minimum.
-STOP_LOSS_USD = 0.40
+DUMP_EARLY_EXIT_ENABLED = False  # Disabled — IRON RULE 1
+DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03
+DUMP_SOFT_MAX_LOSS_USD = 0.50
+DUMP_HARD_MAX_LOSS_USD = 0.75
+STOP_LOSS_USD = 0.40  # Legacy — never fires with ENABLE_DUMP=False
 
 # -------------- POSITION SIZE CAP (2% of portfolio) ---------------------------
 # Before placing any trade, max_risk = portfolio_balance * 0.02.
@@ -326,74 +307,47 @@ YES_GATE_MIN_PROB = 0.88             # YES confidence gate: require 88% (higher 
 YES_GATE_MIN_MOVE_PCT = 0.50         # XRP moved ≥50% of expected move in YES direction
 YES_GATE_WINDOW_SECONDS = 900.0      # Full 15-minute window for expected move calculation
 
-# -------------- STREAK CIRCUIT BREAKER (pause after losses) --------------------
-LOSS_PAUSE_THRESHOLD_USD = 0.50       # Single loss > $0.50 → pause 30 min
-LOSS_PAUSE_SINGLE_MINUTES = 30
-LOSS_PAUSE_DOUBLE_WINDOW_SEC = 3600   # 2 losses within 60 min → pause 60 min
-LOSS_PAUSE_DOUBLE_MINUTES = 60
-LOSS_RESUME_SIZE_MULT = 0.50          # Resume at 50% size
-LOSS_RESUME_TRADES = 3                # Full size after 3 trades at reduced size
+# -------------- STREAK CIRCUIT BREAKER — DISABLED (trust the math, not emotions) ---
+LOSS_PAUSE_THRESHOLD_USD = 999.0      # Effectively disabled — never triggers
+LOSS_PAUSE_SINGLE_MINUTES = 0
+LOSS_PAUSE_DOUBLE_WINDOW_SEC = 3600
+LOSS_PAUSE_DOUBLE_MINUTES = 0
+LOSS_RESUME_SIZE_MULT = 1.0           # No reduction on resume
+LOSS_RESUME_TRADES = 0                # Immediate full size
 
-# -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
-DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
+# -------------- BAIL TIMING — DISABLED (IRON RULE 1: hold to settlement) ------
+DUMP_GRACE_PERIOD_SECONDS = 10      # Legacy
+DUMP_PROACTIVE_AFTER_SECONDS = 30   # Legacy
 
-# -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after XRP check (was 15¢ — tighter to salvage more)
-# CATASTROPHIC STOP: fires BEFORE XRP check — absolute max loss regardless of anything
-# Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
-DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
+# -------------- HARD P&L STOP — DISABLED (IRON RULE 1: hold to settlement) ---
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Legacy
+DUMP_CATASTROPHIC_LOSS_CENTS = 20      # Legacy
 
-# -------------- WINDOWED PEAK TRACKING (avoid false reversals from book spikes) -----
-# All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
-# false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
-# Use a rolling window max instead: peak = max(prob over last N seconds).
-DUMP_PEAK_WINDOW_SECONDS = 30  # Use max prob over last 30s as "peak" (not all-time)
+# -------------- WINDOWED PEAK / RAPID DROP — DISABLED (IRON RULE 1) -----------
+DUMP_PEAK_WINDOW_SECONDS = 30       # Legacy
+DUMP_RAPID_DROP_THRESHOLD = 0.04    # Legacy
+DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Legacy
 
-# -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
-# If probability drops very fast (>4% in 10s), something is seriously wrong.
-# Bail even during settling period — fast drops mean XRP is actively moving against us.
-DUMP_RAPID_DROP_THRESHOLD = 0.04   # 4% drop in the rapid window = emergency
-DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
+# -------------- FLIP AFTER DUMP — DISABLED (IRON RULE 1: no direction changes) ----
+FLIP_AFTER_DUMP = False             # IRON RULE 1: DISABLED — no flipping after dump
+FLIP_MIN_TIME_REMAINING = 15        # Legacy
+FLIP_MIN_PROB = 0.60                # Legacy
+FLIP_MAX_ENTRY_PRICE = 92           # Legacy
 
-# -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
-# If we bail because XRP moved against us, the OTHER side is now the high-prob winner.
-# Instead of just eating the loss, flip to the other side and hold THAT to settlement.
-# Example: bought YES at 94¢, XRP tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
-#          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
-# Safety: the flip still checks probability and price, but with a LOWER bar
-#         than a fresh entry — this is a recovery play, not a new trade.
-#         We already took the loss; the question is "can I claw some back?"
-FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
-FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 92           # Min payoff 8¢/contract — no more 99¢ recovery flips
-
-# -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
-# With <60s left and XRP far from the strike, the outcome is locked.
-# Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
-# Key safety: distance from strike.  If XRP is $0.008 above the floor with 60s left,
-# it CANNOT reverse.  sigma * sqrt(60) ≈ $0.0046 at 0.0006σ — $0.008 is >1.7x the max move.
-#
-# Risk/reward at 99¢ × 33 contracts:
-#   Win (99.5%+ of the time): +$0.33
-#   Lose (XRP reverses $0.008+ in 60s): -$32.67
-# Over 96 markets/day: ~$31/day extra income if hit rate matches.
-SCALP_ENABLED = True
-SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
-SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 0.0015    # XRP must be ≥$0.0015 from strike (vol gate is the real safety)
-# Distance tiers: farther from strike = more aggressive sizing
-# Each tier: (min_distance_usd, bankroll_fraction)
+# -------------- LAST-MINUTE SCALP — DISABLED (IRON RULE 1: one entry per market) ----
+SCALP_ENABLED = False              # IRON RULE 1: DISABLED — no adding to positions
+SCALP_MAX_SECONDS = 60             # Legacy
+SCALP_MIN_SECONDS = 5              # Legacy
+SCALP_MIN_DISTANCE_USD = 0.0015   # Legacy
 SCALP_DISTANCE_TIERS = [
-    (0.010, 0.50),   # $0.01+ from strike: very safe, but cap sizing
-    (0.005, 0.35),   # $0.005-0.01: safe, moderate size
-    (0.003, 0.20),   # $0.003-0.005: cautious size
-    (0.0015, 0.10),  # $0.0015-0.003: minimum — XRP moves fast
+    (0.010, 0.50),
+    (0.005, 0.35),
+    (0.003, 0.20),
+    (0.0015, 0.10),
 ]
-SCALP_MAX_ENTRY_PRICE = 99        # Max 99¢ — even 1¢/contract × many contracts at scale
-SCALP_MIN_PROB = 0.90             # Higher bar for XRP — price swings harder, need more certainty
-SCALP_MAX_LOSS_FRACTION = 0.08    # Never risk more than 8% of cash on a scalp — XRP scalps are riskier
+SCALP_MAX_ENTRY_PRICE = 99        # Legacy
+SCALP_MIN_PROB = 0.90             # Legacy
+SCALP_MAX_LOSS_FRACTION = 0.08    # Legacy
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -957,31 +911,31 @@ def cancel_order_status(client: KalshiClient, order_id: str) -> str:
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     if payload.get("action") == "buy":
         count = payload.get("count", 0)
-        # HARD CAP 1: absolute contract limit
+        ticker = payload.get("ticker", "")
+
+        # IRON RULE 2, Layer B: absolute contract limit
         if count > MAX_CONTRACTS:
-            log.warning(f"[HARD CAP] Reduced order from {count} to {MAX_CONTRACTS} contracts")
+            log.warning(f"[IRON RULE 2B] Reduced order from {count} to {MAX_CONTRACTS} contracts")
             count = MAX_CONTRACTS
             payload["count"] = count
 
-        # HARD CAP 2: check existing position on this market via Kalshi API
-        ticker = payload.get("ticker", "")
+        # IRON RULE 1: One direction per market — if we already have ANY position, BLOCK entirely
+        # IRON RULE 2, Layer B: also enforces max contracts cap
         if ticker:
             try:
                 existing = abs(parse_position_for_market(get_positions(client), ticker))
-                if existing + count > MAX_CONTRACTS:
-                    old_count = count
-                    count = max(0, MAX_CONTRACTS - existing)
-                    payload["count"] = count
+                if existing > 0:
                     log.warning(
-                        f"[HARD CAP] Already hold {existing} contracts on {ticker}, "
-                        f"reduced new order {old_count} -> {count} (max {MAX_CONTRACTS} total)"
+                        f"[IRON RULE 1] BLOCKED — already hold {existing} contracts on {ticker}. "
+                        f"One direction per market, no adding/flipping/hedging."
                     )
+                    return "BLOCKED_BY_RULE_1"
             except Exception as e:
-                log.warning(f"[HARD CAP] Position check failed: {e} — using count={count}")
+                log.warning(f"[IRON RULE 1] Position check failed: {e} — using count={count}")
 
         if count <= 0:
-            log.warning(f"[HARD CAP] Already at max position on {ticker}, skipping order")
-            return "BLOCKED_BY_HARD_CAP"
+            log.warning(f"[IRON RULE 2B] Count is 0 for {ticker}, skipping order")
+            return "BLOCKED_BY_RULE_1"
 
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
     if isinstance(resp, dict):
@@ -1168,8 +1122,8 @@ class SM:
     IDLE = "IDLE"
     ARMED = "ARMED"
     ORDER_WAIT = "ORDER_WAIT"
-    HOLD = "HOLD"  # Now actively monitors for dump conditions
-    DUMPED = "DUMPED"  # NEW: Position was dumped early
+    HOLD = "HOLD"  # IRON RULE 1: once positioned, hold to settlement — no dump/flip/scalp
+    DUMPED = "DUMPED"  # Legacy — never entered (IRON RULE 1 prevents all dumps)
     ROLL = "ROLL"
     COOLDOWN = "COOLDOWN"  # Paused due to session limits
 
@@ -2871,19 +2825,7 @@ def main() -> None:
             except Exception as e:
                 log.warning(f"[RECON] cancel strays failed: {e}")
 
-        # Check INTERNAL tracker first (normal case)
-        pos = position_tracker.get_signed_qty(new_market)
-        if pos != 0:
-            st.sm = SM.HOLD
-            st.market = new_market
-            st.traded_this_market = True
-            st.order_id = None
-            st.side = "yes" if pos > 0 else "no"
-            log.warning(f"[RECON] internal tracker has position in {new_market}: pos={pos} side={st.side}. Enter HOLD.")
-            return
-
-        # Crash recovery fallback: check Kalshi API for positions from a previous run.
-        # Only this bot's asset type trades this market, so API position is ours.
+        # IRON RULE 1: Use API positions directly (no internal tracker)
         try:
             api_pos = parse_position_for_market(get_positions(client), new_market)
         except Exception:
@@ -2891,13 +2833,13 @@ def main() -> None:
 
         if api_pos != 0:
             side = "yes" if api_pos > 0 else "no"
-            position_tracker.record_fill(new_market, side, abs(api_pos), 0, "crash-recovery")
             st.sm = SM.HOLD
             st.market = new_market
             st.traded_this_market = True
             st.order_id = None
             st.side = side
-            log.warning(f"[RECON] CRASH RECOVERY — found API position in {new_market}: pos={api_pos} side={side}. Recorded in tracker.")
+            st.qty = abs(api_pos)
+            log.warning(f"[RECON] Found API position in {new_market}: pos={api_pos} side={side} qty={abs(api_pos)}. Enter HOLD (IRON RULE 1).")
             return
 
         st.sm = SM.IDLE
@@ -3116,37 +3058,29 @@ def main() -> None:
         if close_ts is not None:
             secs_to_close = int(close_ts - int(time.time()))
 
-        # Use INTERNAL position tracker instead of Kalshi API positions.
-        # This prevents seeing other bots' positions on the shared account.
-        pos = position_tracker.get_signed_qty(st.market)
-
-        # If internal tracker is blank but API shows a position, adopt it
-        if pos == 0:
-            try:
-                api_pos = parse_position_for_market(get_positions(client), st.market)
-                if api_pos != 0:
-                    pos = api_pos
-                    st.side = "yes" if api_pos > 0 else "no"
-                    st.qty = abs(api_pos)
-                    if st.entry_price_cents is None or st.entry_price_cents == 0:
-                        st.entry_price_cents = 90
-                    log.warning(
-                        f"[POS_SYNC] Adopted API position: side={st.side} qty={st.qty} "
-                        f"api_pos={api_pos} market={st.market} — dump logic now active"
-                    )
-            except Exception:
-                pass
+        # IRON RULE 1: Query API for actual position (replaces internal position_tracker)
+        pos = parse_position_for_market(get_positions(client), st.market)
 
         if pos != 0:
+            # IRON RULE 1: Once positioned, HOLD to settlement — no dump/flip/scalp/hedge
             if st.sm != SM.HOLD:
                 st.sm = SM.HOLD
                 st.traded_this_market = True
                 st.side = "yes" if pos > 0 else "no"
-                log.warning(f"[HOLD] market={st.market} pos={pos} side={st.side} (internal tracker)")
-            
-            # Check dump conditions continuously (every POLL_SECONDS = 1.0s).
-            # The $0.40 stop-loss fires FIRST in should_dump_position(),
-            # monitoring unrealized P&L every poll cycle (well under 5s minimum).
+                st.qty = abs(pos)
+                log.warning(f"[HOLD] Positioned on {st.market}: {st.side.upper()} x{st.qty} — waiting for settlement (IRON RULE 1)")
+            if secs_to_close is not None and (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                log.info(f"[HOLD] {st.market} {st.side.upper()} qty={st.qty} t_close={secs_to_close}s — holding to settlement")
+                last_state_log = now
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # ====================================================================
+        # LEGACY DUMP/FLIP/SCALP/EXPIRY CODE — DISABLED BY IRON RULE 1
+        # Wrapped in `if False:` to preserve for reference. Never executes.
+        # The old code caused $5,382 in losses from mixed-direction trading.
+        # ====================================================================
+        if False:  # pragma: no cover — IRON RULE 1 bypass
             if ENABLE_DUMP and secs_to_close is not None:
                 spot = fetch_xrp_spot_usd(http)
                 if spot is not None:

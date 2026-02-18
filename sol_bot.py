@@ -1,33 +1,25 @@
 # sol_bot.py
-# Kalshi rolling 15m SOL — Find mispriced contracts, hold to close, scale bankroll
+# Kalshi rolling 15m SOL — IRON RULES REDESIGN (Feb 2026)
+#
+# THREE IRON RULES (from $5,382 loss analysis):
+#   RULE 1: One direction per market — once positioned, DONE (no adding/flipping/hedging)
+#   RULE 2: Max 3 contracts per market (3 enforcement layers: sizing, place_order, post-fill)
+#   RULE 3: No entries above 97¢
 #
 # STRATEGY:
 # - Arms at T-720s (12 min) to OBSERVE market, SOL price, trends, book
-# - Buys mispriced contracts in 3-7 min window where model has info advantage
+# - Buys mispriced contracts in the buy window where model has info advantage
 # - Trusts the MARKET (orderbook) over the model near settlement
-# - Requires 3%+ real edge — only enters when model sees genuine mispricing
 # - HOLDS TO SETTLEMENT — collect the full payout for being right
-# - Dump is ABORT ONLY — safety net, not a regular exit
+# - NO dump/flip/scalp/trailing stop — hold every position to settlement
 # - Scales bankroll: wins compound via quarter-Kelly, 96 markets/day
-#
-# KEY SETTINGS:
-# - TIME-DEPENDENT PROB: 92% if >5min, 88% if 3-5min, 85% if <3min
-# - EDGE_MIN=0.04 (4% real edge — loosened from 5% to increase volume)
-# - MIN_PAYOFF=8¢/contract (hard floor — no penny wins, max entry=92¢)
-# - HARD_MAX_LOSS=$0.40 (absolute ceiling — never lose more than $0.40 on any trade)
-# - COLD_START: first 2 trades after restart at half size
-# - KELLY=0.20 (fifth-Kelly — proven sizing from +$0.84 session)
-# - SOL-AWARE BAIL: only dump if SOL has moved against us, not book noise
-# - MULTI-TIMEFRAME TRENDS: 60-min + 30-min SpotTrend, per-minute ProbTrend
-# - BANKROLL STOPS: max loss = 3% of balance or 8% settlement loss cap
-# - Dump abort: 6% reversal, 30s patience, catastrophic 20¢ backstop
 #
 # ADAPTED FROM bot.py (BTC) — key differences:
 # - Series ticker: KXSOL15M (Solana 15-minute markets)
 # - Spot feed: Coinbase SOL-USD (not BTC-USD)
 # - Sigma: ~0.07 USD/√sec (SOL ~$200, ~2x higher % vol than BTC/ETH)
 # - All USD-denominated thresholds scaled ~500x down from BTC for SOL's price regime
-# - Boundary buffers, trend thresholds, scalp distances all adjusted for SOL
+# - Boundary buffers, trend thresholds adjusted for SOL
 
 import os
 import time
@@ -140,23 +132,17 @@ ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", True)  # POST_ONLY: post at bid, capture spread as edge — SOL needs maker fills to be profitable
 YES_ONLY = env_bool("YES_ONLY", False)    # Trade both YES and NO — double the addressable markets
 
-# -------------- SIDE BIAS (data-driven: NO produces consistent small wins, YES had blowup) --------
-# SOL NO: +$1.80 lifetime, consistent small wins, ideal R:R
-# SOL YES: -$1.65 lifetime, -$1.81 blowup — needs smaller sizing
-# Size NO up 20%, YES down 40%.  Entry logic unchanged — only sizing affected.
+# -------------- SIDE BIAS — DISABLED (Iron Rules redesign) --------
 SIDE_BIAS_ENABLED = False
-NO_SIZING_MULTIPLIER = 1.0    # DISABLED — was 1.20 (NO positions sized 20% larger)
-YES_SIZING_MULTIPLIER = 1.0   # DISABLED — was 0.60 (YES positions sized 40% smaller)
-NO_PROB_DISCOUNT = 0.0         # No entry threshold changes — keep the proven model
-NO_EDGE_BONUS = 0.0            # No edge threshold changes
-# Legacy alias (referenced in choose_trade tiebreaker)
+NO_SIZING_MULTIPLIER = 1.0
+YES_SIZING_MULTIPLIER = 1.0
+NO_PROB_DISCOUNT = 0.0
+NO_EDGE_BONUS = 0.0
 NO_BIAS_ENABLED = SIDE_BIAS_ENABLED
 
-# -------------- YES CONFIDENCE GATE (simple probability threshold) --------
-# SOL YES needs high conviction. Single gate: probability must exceed threshold.
-# The 4-condition ultra-strict gate killed volume — replaced with simple threshold.
+# -------------- YES CONFIDENCE GATE — DISABLED (Iron Rules redesign) --------
 YES_GATE_ENABLED = False
-YES_GATE_PROB_MIN = 0.70           # DISABLED — was 0.93 (set to PROB_MIN)
+YES_GATE_PROB_MIN = 0.70
 
 ORDER_QTY = env_int("ORDER_QTY", 1)
 
@@ -184,30 +170,21 @@ FILL_WAIT_SECONDS = 20
 ALLOW_TAKER_AT_LAST = True
 CANCEL_UNFILLED_AT_CLOSE = True
 
-PROB_MIN = 0.70  # 70%+ — trend analysis provides confidence, just lower the gate
+PROB_MIN = 0.85  # IRON RULE 3 companion: 85%+ probability required
 EDGE_MIN = 0.01  # 1% edge — collecting pennies per contract is the strategy
-MAX_ENTRY_PRICE_CENTS = 92  # At 92¢ entry, gain 8¢/win — matches MIN_PAYOFF_CENTS
+MAX_ENTRY_PRICE_CENTS = 97  # IRON RULE 3: No entries above 97¢ (replaces MIN_PAYOFF_CENTS)
 FEE_CENTS_PER_CONTRACT = 0
 
-# -------------- MINIMUM PAYOFF THRESHOLD (the key fix for SOL) ----------
-# SOL was winning $0.01–$0.02 and losing $0.25–$0.53.  At those ratios you
-# need 25–50 wins per loss — impossible.  This hard gate blocks ANY trade
-# (including scalps, flips, settlement locks, high-certainty overrides)
-# where the payoff per contract is below this floor.
-# At 8¢: entry ≤92¢.  Win=8¢, worst loss=92¢ → need ~12 wins/loss.
-# This single gate closes every backdoor path to penny-payoff trades.
-MIN_PAYOFF_CENTS = 8  # HARD FLOOR: no trade where win < 8¢/contract (max entry = 92¢)
+# MIN_PAYOFF_CENTS removed — replaced by MAX_ENTRY_PRICE_CENTS = 97 (IRON RULE 3)
+MIN_PAYOFF_CENTS = 3  # Legacy: 100 - 97 = 3¢ minimum payoff (derived from MAX_ENTRY_PRICE_CENTS)
 
 # -------------- TIME-DEPENDENT CERTAINTY — DISABLED -------------------------
-# Single flat PROB_MIN gate. No early/mid tiers.
 PROB_EARLY_ENTRY_SECONDS = 0    # Disabled
 PROB_EARLY_MIN = PROB_MIN
 PROB_MID_ENTRY_SECONDS = 0      # Disabled
 PROB_MID_MIN = PROB_MIN
-# <5 min = PROB_MIN (0.78) — market has priced in the outcome, $0.40 cap protects
 
-# NO-side can be more aggressive — NO has been consistently profitable
-NO_PROB_FLOOR = 0.70  # DISABLED — was 0.80 (set to PROB_MIN)
+NO_PROB_FLOOR = 0.85  # Matches PROB_MIN (Iron Rules redesign)
 
 # -------------- PROBABILITY TREND DETECTION (confirm borderline trades) --------
 # When prob is borderline (80-89%), require momentum confirmation.
@@ -223,8 +200,8 @@ REQUIRE_TREND_ALIGNMENT = False    # DISABLED — was True (trend data kept, jus
 # Don't wait for trend alignment when the outcome is clear.
 # TIME-DEPENDENT: early in buy window, require higher prob (92%) for fast lane.
 # Near close (<3 min), 85% is enough because the market has priced in the outcome.
-PROB_FAST_LANE_THRESHOLD = 0.70   # DISABLED — was 0.88 (set to PROB_MIN)
-PROB_FAST_LANE_LATE_THRESHOLD = 0.70  # DISABLED — was 0.83 (set to PROB_MIN)
+PROB_FAST_LANE_THRESHOLD = 0.85   # Matches PROB_MIN (Iron Rules redesign)
+PROB_FAST_LANE_LATE_THRESHOLD = 0.85  # Matches PROB_MIN (Iron Rules redesign)
 
 # CONFIRMATION HOLD: require signal to be stable for N seconds before early entry
 # Prevents snap entries on transient orderbook spikes at T-420s.
@@ -276,88 +253,46 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 JOIN_UP_CENTS = env_int("JOIN_UP_CENTS", 0)
 OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 
-# -------------- BAIL CONFIGURATION (LAST RESORT — salvage only when truly cooked) ----
-ENABLE_DUMP = True
-# Philosophy: we entered with high conviction and hold to close. Bail ONLY if
-# SOL has actually moved against us AND the book confirms it. A book spike
-# while SOL is $0.50 on our side is NOT a reason to bail.
-DUMP_PROB_FLIP = 0.60  # Floor: if prob drops to 60% AND SOL confirms, bail (was 50% — too late, already lost 40¢+)
-DUMP_PROB_DROP_PERCENT = 1.0  # Disabled
-DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Floor
-DUMP_MIN_TIME_REMAINING = 8   # Can bail until 8s before settlement (was 15s — more time to dump)
-DUMP_ON_PRICE_DANGER = False  # Disabled - trust SOL price, not book noise
+# ============================================================================
+# IRON RULES REDESIGN — All dump/flip/scalp/trailing stop DISABLED
+# These constants are kept for backward compatibility but are never active.
+# ============================================================================
 
-# -------------- SOL-AWARE BAIL (the key fix: don't dump winners) ---------------
-# Before ANY bail trigger fires, check: is SOL on our side of the boundary?
-# YES side: spot > lo + buffer → SOL is safely above range floor → HOLD
-# NO side:  spot < hi - buffer → SOL is safely below range ceiling → HOLD
-# If SOL is on our side, the book is lying (thin book, spike, manipulation).
-# ONLY bail if SOL has actually crossed or is dangerously close to boundary.
-DUMP_SOL_SAFE_BUFFER_EARLY = 0.50    # >2min to close: need $0.50 buffer (SOL σ√120=$0.77, $0.50 provides margin — wider to avoid noise bails)
-DUMP_SOL_SAFE_BUFFER_LATE = 0.30     # <2min to close: need $0.30 buffer (SOL σ√60=$0.54, $0.30 is safe — was $0.18, too tight)
-DUMP_SOL_SAFE_CUTOFF_SECONDS = 120   # Boundary between early/late buffer
+# -------------- DUMP/BAIL — DISABLED (IRON RULE 1: hold to settlement) --------
+ENABLE_DUMP = False  # IRON RULE 1: No dumps — hold every position to settlement
+DUMP_PROB_FLIP = 0.60          # Legacy — never used (ENABLE_DUMP=False)
+DUMP_PROB_DROP_PERCENT = 1.0   # Legacy
+DUMP_MARKET_FLIP_THRESHOLD = 0.50  # Legacy
+DUMP_MIN_TIME_REMAINING = 8   # Legacy
+DUMP_ON_PRICE_DANGER = False   # Legacy
+DUMP_SOL_SAFE_BUFFER_EARLY = 0.50   # Legacy
+DUMP_SOL_SAFE_BUFFER_LATE = 0.30    # Legacy
+DUMP_SOL_SAFE_CUTOFF_SECONDS = 120  # Legacy
+DUMP_ON_PROB_REVERSAL = False  # DISABLED
+DUMP_REVERSAL_THRESHOLD = 0.08     # Legacy
+DUMP_REVERSAL_THRESHOLD_PROFIT = 0.06  # Legacy
+DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Legacy
+DUMP_REVERSAL_MIN_SAMPLES = 5     # Legacy
+DUMP_EARLY_EXIT_ENABLED = False    # DISABLED
+DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # Legacy
+DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # Legacy
+DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Legacy
+MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # Still used in sizing (pre-trade gate)
+MAX_LOSS_AT_EXPIRY_USD = 1.00       # Still used in sizing (pre-trade gate)
+DUMP_SOFT_MAX_LOSS_USD = 0.50      # Legacy
+DUMP_HARD_MAX_LOSS_USD = 0.75      # Legacy (still referenced in sizing caps)
+PORTFOLIO_RISK_FRACTION = 0.02     # Still used in sizing (pre-trade gate)
 
-# -------------- REVERSAL BAIL (only after SOL check fails) --------------------
-DUMP_ON_PROB_REVERSAL = True   # Still enabled as safety net
-DUMP_REVERSAL_THRESHOLD = 0.08  # 8% drop from peak — wider for SOL noise (was 6% — too hair-trigger, bailed on normal SOL swings)
-DUMP_REVERSAL_THRESHOLD_PROFIT = 0.06  # 6% when profitable — wider to let winners run (was 4% — too tight for SOL)
-DUMP_PROFIT_TIGHTEN_ABOVE_ENTRY = 0.03  # Tighten after 3%+ gain (was 5% — start protecting earlier)
-DUMP_REVERSAL_MIN_SAMPLES = 5
-DUMP_EARLY_EXIT_ENABLED = True
-# Reversal during early settling phase uses a wider threshold (not blocked entirely)
-DUMP_REVERSAL_THRESHOLD_SETTLING = 0.10  # 10% drop in first 30s = something is very wrong, bail even early
+# -------------- STOP-LOSS — DISABLED (IRON RULE 1: hold to settlement) --------
+STOP_LOSS_USD = 0.40               # Legacy
+SOFT_STOP_LOSS_USD = 0.30          # Legacy
+OVERNIGHT_SOFT_STOP_USD = 0.30     # Legacy
+INDEPENDENT_STOP_LOSS_ENABLED = False  # DISABLED — hold to settlement
 
-# -------------- BANKROLL-PROPORTIONAL LOSS CAP (scales with your balance) -----
-# Never lose more than X% of current balance on a single trade.
-# At $35: max loss = $1.75.  At $350: max loss = $17.50.  Scales naturally.
-# This fires BEFORE the fixed catastrophic stop and replaces it as the primary cap.
-DUMP_MAX_LOSS_FRACTION_OF_BALANCE = 0.03  # ROLLED BACK from 0.05 — 3% of current balance = max single-trade loss
-# Also cap at 50% of position cost — if you paid $3, max loss is $1.50
-DUMP_MAX_LOSS_FRACTION_OF_POSITION = 0.50  # Never lose more than 50% of what you put in
-# ENTRY-SIDE cap: worst case = settlement loss = full entry cost.
-# With the EV price cap (price ≤ prob), entries are always +EV, so we can
-# afford to size up.  15% of $22 = $3.30 → 3 contracts at 97c.
-# As bankroll grows to $220: $33 → 34 contracts at 97c.
-MAX_SETTLEMENT_LOSS_FRACTION = 0.08  # ROLLED BACK from 0.14 — max 8% of balance at risk per trade
-MAX_LOSS_AT_EXPIRY_USD = 1.00         # Pre-trade gate: max possible loss if contract settles at $0.
-                                      # The dump feature's $0.40 stop-loss using actual bid prices
-                                      # is the real loss protection. $1.00 allows 1 contract at any
-                                      # price up to 96¢.
-
-# -------------- TWO-TIER DUMP CAPS ------------------
-# Soft cap: try limit sell to exit gracefully. Hard cap: market sell immediately.
-# The STOP_LOSS_USD ($0.40) using actual bid prices fires FIRST (in should_dump_position).
-# These two-tier caps fire on probability-based estimates as secondary protection.
-DUMP_SOFT_MAX_LOSS_USD = 0.50             # SOFT cap: at -$0.50 unrealized, try limit sell to exit gracefully
-DUMP_HARD_MAX_LOSS_USD = 0.75             # HARD cap: at -$0.75 unrealized, market sell immediately — no exceptions
-PORTFOLIO_RISK_FRACTION = 0.02  # Max risk per trade = 2% of portfolio balance
-# -------------- UNIVERSAL $0.40 HARD STOP-LOSS --------------------------------
-# If unrealized loss on any single position reaches $0.40, market sell immediately.
-# Overrides ALL other sizing and exit logic. No single trade can ever lose more.
-# Active monitoring runs every POLL_SECONDS (1.0s) — well under the 5s minimum.
-STOP_LOSS_USD = 0.40
-SOFT_STOP_LOSS_USD = 0.30 # SOFT CAP: at -$0.30 unrealized, submit limit sell to exit gracefully
-# Overnight uses tighter soft stop
-OVERNIGHT_SOFT_STOP_USD = 0.30  # disabled: was 0.25 — now matches SOFT_STOP_LOSS_USD (same stop day and night)
-
-# -------------- INDEPENDENT STOP-LOSS (runs BEFORE strategy, CANNOT be overridden) --------
-# This is the #1 risk fix. Previous stop-loss was embedded in should_dump_position()
-# which uses probability-based exit estimates and can be overridden by SOL safety check.
-# This monitor uses ACTUAL BID PRICES and fires unconditionally.
-# It calculates: unrealized_loss = (entry_price - best_bid) * qty / 100
-# If unrealized_loss >= DUMP_HARD_MAX_LOSS_USD → immediate market sell, no exceptions.
-# If unrealized_loss >= soft_stop → limit sell at best_bid to exit gracefully.
-INDEPENDENT_STOP_LOSS_ENABLED = True
-
-# -------------- TRAILING STOP (lock in profits on winners) --------
-# SOL YES wins are often small ($0.07-$0.10) that could be bigger.
-# Once a position is up $0.10, set a trailing stop $0.06 below the peak.
-# If the trade runs to +$0.30 the stop trails to +$0.24.
-# Lets occasional big wins through while protecting realized gains.
-# Only applies to YES during daytime (YES is disabled overnight anyway).
-TRAILING_STOP_ENABLED = True
-TRAILING_STOP_ACTIVATION_USD = 0.10  # Start trailing once profit >= $0.10
-TRAILING_STOP_TRAIL_USD = 0.06       # Trail $0.06 below peak unrealized P&L
+# -------------- TRAILING STOP — DISABLED (IRON RULE 1) --------
+TRAILING_STOP_ENABLED = False      # DISABLED
+TRAILING_STOP_ACTIVATION_USD = 0.10  # Legacy
+TRAILING_STOP_TRAIL_USD = 0.06       # Legacy
 
 # -------------- DAYTIME vs OVERNIGHT SIZING --------
 # SOL daytime (8am-8pm EST): +$3.61 combined across 4 profitable sessions, R:R 1.41-2.90
@@ -368,15 +303,11 @@ DAYTIME_START_HOUR_EST = 8       # 8:00 AM EST
 DAYTIME_END_HOUR_EST = 20        # 8:00 PM EST
 MAX_TRADES_PER_HOUR_OVERNIGHT = 3  # Cap overnight volume — less data = less edge
 
-# -------------- COLD-START PROTECTION (first trades after restart at graduated size) --------
-# After a restart the bot has NO trend data, NO prob history, NO market context.
-# The -$2.61 loss was likely a memory-loss blowup — entering blind at full size.
-# Graduated ramp-up: 25% → 50% → 100% over first 6 trades.
-COLD_START_TIER_1_TRADES = 2     # Trades 1-2: 25% size
-COLD_START_TIER_1_MULT = 1.0  # disabled: was 0.25 — cold-start ramp is now a no-op
-COLD_START_TIER_2_TRADES = 5     # Trades 3-5: 50% size
-COLD_START_TIER_2_MULT = 1.0  # disabled: was 0.50 — cold-start ramp is now a no-op
-# Trades 6+: full size (1.0)
+# -------------- COLD-START — DISABLED (Iron Rules redesign) --------
+COLD_START_TIER_1_TRADES = 2     # Legacy
+COLD_START_TIER_1_MULT = 1.0     # DISABLED — no cold-start ramp
+COLD_START_TIER_2_TRADES = 5     # Legacy
+COLD_START_TIER_2_MULT = 1.0     # DISABLED — no cold-start ramp
 
 # -------------- SESSION DRAWDOWN BREAKER --------
 # If bot is down $3.00 in a rolling 2-hour window, pause for 60 min.
@@ -387,67 +318,39 @@ SESSION_DRAWDOWN_PAUSE_SECONDS = 1800    # Pause 30 min (matches spec)
 SESSION_DRAWDOWN_RESUME_SIZE_MULT = 0.50 # Resume at 50% size for first 3 trades
 SESSION_DRAWDOWN_RESUME_TRADES = 3
 
-# -------------- BAIL TIMING (hold to close — but bail fast when it's wrong) ----
-DUMP_GRACE_PERIOD_SECONDS = 10      # 10s grace period (was 15s — start monitoring sooner)
-DUMP_PROACTIVE_AFTER_SECONDS = 30   # Proactive bail after 30s (was 60s — detect reversals earlier, bankroll cap covers the gap)
+# -------------- BAIL TIMING — Legacy (ENABLE_DUMP=False) --------
+DUMP_GRACE_PERIOD_SECONDS = 10      # Legacy
+DUMP_PROACTIVE_AFTER_SECONDS = 30   # Legacy
 
-# -------------- HARD P&L STOP (last-resort backstop) -------------------------
-DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Hard stop after SOL check (was 15¢ — tighter to salvage more)
-# CATASTROPHIC STOP: fires BEFORE SOL check — absolute max loss regardless of anything
-# Prevents a $2.65 loss when the hard stop is supposed to cap at 10¢/contract
-DUMP_CATASTROPHIC_LOSS_CENTS = 20      # If losing >20¢/contract, bail no matter what (was 30¢ — too much damage)
+# -------------- HARD P&L STOP / CATASTROPHIC — Legacy (ENABLE_DUMP=False) --------
+DUMP_MAX_LOSS_CENTS_PER_CONTRACT = 10  # Legacy
+DUMP_CATASTROPHIC_LOSS_CENTS = 20      # Legacy
 
-# -------------- WINDOWED PEAK TRACKING (avoid false reversals from book spikes) -----
-# All-time peak ratchets up on thin-book spikes (e.g., 99% for 3 seconds) creating
-# false reversal signals when prob returns to normal (e.g., 94% looks like 5% drop).
-# Use a rolling window max instead: peak = max(prob over last N seconds).
-DUMP_PEAK_WINDOW_SECONDS = 45  # Use max prob over last 45s as "peak" (was 30s — SOL books spike more, wider window avoids false reversals)
+# -------------- WINDOWED PEAK / RAPID DROP — Legacy (ENABLE_DUMP=False) --------
+DUMP_PEAK_WINDOW_SECONDS = 45     # Legacy
+DUMP_RAPID_DROP_THRESHOLD = 0.06  # Legacy
+DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Legacy
 
-# -------------- RAPID DROP BAIL (emergency exit on fast moves) -------------------
-# If probability drops very fast (>4% in 10s), something is seriously wrong.
-# Bail even during settling period — fast drops mean SOL is actively moving against us.
-DUMP_RAPID_DROP_THRESHOLD = 0.06   # 6% drop in the rapid window = emergency (was 4% — SOL books are noisy, 4% is normal)
-DUMP_RAPID_DROP_WINDOW_SECONDS = 10  # Look at last 10 seconds for rapid drops
+# -------------- FLIP AFTER DUMP — DISABLED (IRON RULE 1: one direction per market) --------
+FLIP_AFTER_DUMP = False            # DISABLED — no flipping
+FLIP_MIN_TIME_REMAINING = 15       # Legacy
+FLIP_MIN_PROB = 0.60               # Legacy
+FLIP_MAX_ENTRY_PRICE = 97          # Legacy (updated to match IRON RULE 3)
 
-# -------------- FLIP AFTER DUMP (double-dip: dump losing side, buy winning side) ----
-# If we bail because SOL moved against us, the OTHER side is now the high-prob winner.
-# Instead of just eating the loss, flip to the other side and hold THAT to settlement.
-# Example: bought YES at 94¢, SOL tanks, dump YES at 40¢ (lose 54¢), buy NO at 60¢,
-#          NO settles at $1 → +40¢. Net loss 14¢ instead of 54¢.
-# Safety: the flip still checks probability and price, but with a LOWER bar
-#         than a fresh entry — this is a recovery play, not a new trade.
-#         We already took the loss; the question is "can I claw some back?"
-FLIP_AFTER_DUMP = True              # Enable flip-to-other-side after bail
-FLIP_MIN_TIME_REMAINING = 15        # Just need time to place the order and settle
-FLIP_MIN_PROB = 0.60                # Lower bar: 60% on other side is enough for recovery
-FLIP_MAX_ENTRY_PRICE = 92           # Capped by MIN_PAYOFF_CENTS=8 — no more 99¢ recovery flips that win 1¢
-
-# -------------- LAST-MINUTE SCALP (compound on near-certain outcomes) -----------
-# With <60s left and SOL far from the strike, the outcome is locked.
-# Buy a boatload of contracts at 98-99¢ and collect 1-2¢/contract at settlement.
-# Key safety: distance from strike.  If SOL is $0.50 above the floor with 60s left,
-# it CANNOT reverse.  sigma * sqrt(60) ≈ $0.39 at 0.05σ — $0.50 is >1.3x the max move.
-#
-# Risk/reward at 99¢ × 33 contracts:
-#   Win (99.5%+ of the time): +$0.33
-#   Lose (SOL reverses $1+ in 60s): -$32.67
-# Over 96 markets/day: ~$31/day extra income if hit rate matches.
-SCALP_ENABLED = True
-SCALP_MAX_SECONDS = 60             # Only scalp in the last 60 seconds
-SCALP_MIN_SECONDS = 5              # Don't scalp in the last 5s (order might not fill)
-SCALP_MIN_DISTANCE_USD = 0.20      # SOL must be ≥$0.20 from strike (was $0.10 — too thin, SOL can gap $0.10 easily)
-# Distance tiers: farther from strike = more aggressive sizing
-# Each tier: (min_distance_usd, bankroll_fraction)
-# ROLLED BACK scalp tiers to proven values (0.90/0.75/0.55/0.35 caused oversized losses)
+# -------------- LAST-MINUTE SCALP — DISABLED (IRON RULE 1: no adding to positions) --------
+SCALP_ENABLED = False              # DISABLED — no scalping
+SCALP_MAX_SECONDS = 60             # Legacy
+SCALP_MIN_SECONDS = 5              # Legacy
+SCALP_MIN_DISTANCE_USD = 0.20     # Legacy
 SCALP_DISTANCE_TIERS = [
-    (1.20, 0.85),    # $1.20+ from strike: extremely safe, size up hard
-    (0.60, 0.65),    # $0.60-1.20: very safe, go bigger
-    (0.35, 0.45),    # $0.35-0.60: safe, meaningful size
-    (0.20, 0.25),    # $0.20-0.35: moderate — compound the edge
+    (1.20, 0.85),
+    (0.60, 0.65),
+    (0.35, 0.45),
+    (0.20, 0.25),
 ]
-SCALP_MAX_ENTRY_PRICE = 92        # Capped by MIN_PAYOFF_CENTS=8 — no more 1¢ scalps (was 99¢, the #1 source of penny wins)
-SCALP_MIN_PROB = 0.80             # Low bar — distance + volatility gate is the real safety, not blend prob
-SCALP_MAX_LOSS_FRACTION = 0.15    # ROLLED BACK from 0.25 — never risk more than 15% of cash on a scalp
+SCALP_MAX_ENTRY_PRICE = 97        # Legacy (updated to match IRON RULE 3)
+SCALP_MIN_PROB = 0.80             # Legacy
+SCALP_MAX_LOSS_FRACTION = 0.15    # Legacy
 
 # -------------- A-LEVEL ADDITIONS --------------
 USE_MARKET_IMPLIED = env_bool("USE_MARKET_IMPLIED", True)
@@ -483,14 +386,14 @@ A_PLUS_FRACTION = env_float("A_PLUS_FRACTION", 0.40)  # ROLLED BACK from 0.60 �
 
 HIGH_CERTAINTY_PROB = env_float("HIGH_CERTAINTY_PROB", 0.95)  # Slightly lower
 HIGH_CERTAINTY_TIME_SEC = env_int("HIGH_CERTAINTY_TIME_SEC", 15)
-HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 92)  # Capped by MIN_PAYOFF_CENTS=8
+HIGH_CERTAINTY_MAX_PRICE = env_int("HIGH_CERTAINTY_MAX_PRICE", 97)  # IRON RULE 3: max 97¢
 
 # SETTLEMENT LOCK: near expiry, model edge is unreliable because it blends a
 # conservative BS estimate against market price.  With <2 min left the market
 # price IS the probability.  If blend prob is high, buy even with thin/no edge.
 SETTLEMENT_LOCK_SECONDS = env_int("SETTLEMENT_LOCK_SECONDS", 180)    # Last 3 min only — earlier window still needs trend/prob checks
-SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.70)  # DISABLED — was 0.85 (set to PROB_MIN)
-SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 92)   # Capped by MIN_PAYOFF_CENTS=8 (was 99 — settlement lock was the worst offender)
+SETTLEMENT_LOCK_MIN_PROB = env_float("SETTLEMENT_LOCK_MIN_PROB", 0.85)  # Matches PROB_MIN (Iron Rules redesign)
+SETTLEMENT_LOCK_MAX_PRICE = env_int("SETTLEMENT_LOCK_MAX_PRICE", 97)   # IRON RULE 3: max 97¢
 SETTLEMENT_LOCK_MIN_BID = env_int("SETTLEMENT_LOCK_MIN_BID", 90)      # locked book: if bid ≥ 90¢ but no ask, join bid queue
 
 LAST_CHANCE_TIME_SEC = env_int("LAST_CHANCE_TIME_SEC", 20)
@@ -1066,31 +969,29 @@ def cancel_order_status(client: KalshiClient, order_id: str) -> str:
 def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     if payload.get("action") == "buy":
         count = payload.get("count", 0)
-        # HARD CAP 1: absolute contract limit
+        # IRON RULE 2 — Layer B: absolute contract limit
         if count > MAX_CONTRACTS:
-            log.warning(f"[HARD CAP] Reduced order from {count} to {MAX_CONTRACTS} contracts")
+            log.warning(f"[IRON RULE 2B] Reduced order from {count} to {MAX_CONTRACTS} contracts")
             count = MAX_CONTRACTS
             payload["count"] = count
 
-        # HARD CAP 2: check existing position on this market via Kalshi API
+        # IRON RULE 1: One direction per market — if already positioned, BLOCK entirely
         ticker = payload.get("ticker", "")
         if ticker:
             try:
                 existing = abs(parse_position_for_market(get_positions(client), ticker))
-                if existing + count > MAX_CONTRACTS:
-                    old_count = count
-                    count = max(0, MAX_CONTRACTS - existing)
-                    payload["count"] = count
+                if existing > 0:
                     log.warning(
-                        f"[HARD CAP] Already hold {existing} contracts on {ticker}, "
-                        f"reduced new order {old_count} -> {count} (max {MAX_CONTRACTS} total)"
+                        f"[IRON RULE 1] BLOCKED: Already hold {existing} contracts on {ticker}. "
+                        f"One direction per market — no adding/flipping/hedging."
                     )
+                    return "BLOCKED_BY_RULE_1"
             except Exception as e:
-                log.warning(f"[HARD CAP] Position check failed: {e} — using count={count}")
+                log.warning(f"[IRON RULE 1] Position check failed: {e} — allowing order with count={count}")
 
         if count <= 0:
-            log.warning(f"[HARD CAP] Already at max position on {ticker}, skipping order")
-            return "BLOCKED_BY_HARD_CAP"
+            log.warning(f"[IRON RULE 2B] Count is 0 for {ticker}, skipping order")
+            return "BLOCKED_BY_RULE_1"
 
     resp = client.request("POST", "/portfolio/orders", json_body=payload)
     if isinstance(resp, dict):
@@ -1355,14 +1256,14 @@ def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> No
 
 
 # -----------------------------
-# State machine (MODIFIED FOR DUMP LOGIC)
+# State machine (IRON RULES REDESIGN — hold to settlement, no dumps)
 # -----------------------------
 class SM:
     IDLE = "IDLE"
     ARMED = "ARMED"
     ORDER_WAIT = "ORDER_WAIT"
-    HOLD = "HOLD"  # Now actively monitors for dump conditions
-    DUMPED = "DUMPED"  # NEW: Position was dumped early
+    HOLD = "HOLD"  # Positioned — waiting for settlement (IRON RULE 1)
+    DUMPED = "DUMPED"  # Legacy — never entered (dumps disabled by IRON RULE 1)
     ROLL = "ROLL"
     COOLDOWN = "COOLDOWN"  # Paused due to session limits
 
