@@ -9,21 +9,29 @@
 
 # ======================== IRON RULES ========================
 # RULE 1: One direction per market — once positioned, DONE
-# RULE 2: Maximum 1 contract per market — ALWAYS
+# RULE 2: Risk-based position sizing (max $3 risk per market, max 30 contracts)
 # RULE 3: Max entry price per asset (data-driven caps below)
-# RULE 4: Never buy both YES and NO on the same market
+# RULE 4: Never buy both YES and NO on same market
 # =============================================================
 
 # -------------- MAX ENTRY PRICE PER ASSET (DATA-DRIVEN) -----
-# Conservative starting caps — capture 95% of historical profit.
-# Data shows profit up to 80¢ BTC / 90¢ ETH, but starting at 50¢
-# maximizes risk-adjusted returns.
+# Data shows profit up to 80¢ BTC / 90¢ ETH.
+# ETH raised to 90¢ because ETH YES 81-90¢ bucket is profitable.
 MAX_ENTRY_PRICE_CENTS = {
     'BTC': 50,
-    'ETH': 50,
+    'ETH': 90,
     'SOL': 50,
     'XRP': 50,
 }
+
+# -------------- RISK-BASED POSITION SIZING -------------------
+# contracts = floor(MAX_RISK_PER_MARKET / entry_price_dollars)
+# Capped at MAX_CONTRACTS and bankroll limit.
+MAX_RISK_PER_MARKET = 3.00       # Max $3.00 risk per market
+MAX_CONTRACTS = 30               # Hard cap per market
+MIN_CONTRACTS = 1                # Always buy at least 1
+MAX_BANKROLL_PER_TRADE = 0.50    # Never risk >50% of available balance
+MIN_EV_PER_CONTRACT = 0.001      # Minimum $0.001 EV per contract
 
 # -------------- MINIMUM CONFIDENCE (loose gate) -------------
 # The price gate does the real filtering work.

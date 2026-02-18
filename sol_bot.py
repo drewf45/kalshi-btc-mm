@@ -1,16 +1,17 @@
-# sol_bot.py — Kalshi 15-minute SOL market bot (DATA-DRIVEN REDESIGN Feb 2026)
+# sol_bot.py — Kalshi 15-minute BTC market bot (DATA-DRIVEN REDESIGN Feb 2026)
 #
 # STRATEGY (from 1,749 market analysis):
 #   - 81.3% directional accuracy is PROVEN — keep existing signal
 #   - 95% of profit comes from buying CHEAP contracts (1-50¢)
-#   - Expensive entries (81-99¢) are net NEGATIVE even at 90% accuracy
-#   - Buy exactly 1 contract on the predicted winning side when it's cheap
+#   - Risk-based sizing: buy MORE contracts when entry is cheap
+#   - contracts = floor($3.00 / entry_price), capped at 30
+#   - Liquidity-aware: only order what the book can fill
 #   - Hold to settlement — 15-minute markets, no exit logic needed
 #
 # IRON RULES:
 #   1. One direction per market — once positioned, DONE (API-enforced)
-#   2. Maximum 1 contract per market — ALWAYS
-#   3. Max entry price 50¢ (data-driven cap)
+#   2. Risk-based sizing: contracts = floor($3.00 / entry_price), max 30
+#   3. Max entry price per asset (BTC 50¢, ETH 90¢, SOL 50¢, XRP 50¢)
 #   4. Never buy both YES and NO on same market (enforced by Rule 1)
 
 import os
@@ -40,6 +41,8 @@ from config import (
     ENABLE_SESSION_LIMITS, DAILY_MAX_LOSS_PERCENT,
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
+    MAX_RISK_PER_MARKET, MAX_CONTRACTS, MIN_CONTRACTS,
+    MAX_BANKROLL_PER_TRADE, MIN_EV_PER_CONTRACT,
 )
 
 # ======================== BOOT BANNER ========================
@@ -534,8 +537,8 @@ def place_order(client: KalshiClient, payload: Dict[str, Any]) -> str:
     ticker = payload.get("ticker", "")
 
     if payload.get("action") == "buy":
-        # IRON RULE 2: exactly 1 contract
-        payload["count"] = 1
+        # IRON RULE 2: enforce max contracts cap
+        payload["count"] = max(MIN_CONTRACTS, min(MAX_CONTRACTS, int(payload.get("count", 1))))
 
         # IRON RULE 1: check existing position via API
         if ticker:
@@ -631,13 +634,13 @@ def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> No
             except Exception:
                 pass
 
-def build_order_payload(market_ticker: str, side: str, price_cents: int) -> Dict[str, Any]:
+def build_order_payload(market_ticker: str, side: str, price_cents: int, count: int = 1) -> Dict[str, Any]:
     body = {
         "ticker": market_ticker,
         "action": "buy",
         "side": side,
         "type": "limit",
-        "count": 1,  # IRON RULE 2
+        "count": max(1, int(count)),
         "client_order_id": f"{BOT_ID}-{uuid.uuid4().hex[:12]}",
     }
     if side == "yes":
@@ -720,6 +723,78 @@ def should_enter(p_yes: float, p_no: float, yes_ask: Optional[int],
         return None
 
     return (predicted_side, entry_price)
+
+
+# ======================== POSITION SIZING ====================
+def calculate_position_size(entry_price_cents: int, available_balance_usd: float) -> int:
+    """
+    Risk-based position sizing.
+    contracts = floor(MAX_RISK_PER_MARKET / entry_price_dollars)
+    Capped by MAX_CONTRACTS and bankroll limit.
+    """
+    entry_price_usd = entry_price_cents / 100.0
+    if entry_price_usd <= 0:
+        return MIN_CONTRACTS
+
+    # Core formula: risk budget / cost per contract
+    contracts = int(MAX_RISK_PER_MARKET / entry_price_usd)
+
+    # Bankroll limit: never risk more than 50% of available balance
+    max_from_bankroll = int((available_balance_usd * MAX_BANKROLL_PER_TRADE) / entry_price_usd)
+    contracts = min(contracts, max_from_bankroll)
+
+    # Hard caps
+    contracts = max(MIN_CONTRACTS, min(MAX_CONTRACTS, contracts))
+    return contracts
+
+
+def get_orderbook_depth(ob: Dict[str, Any], side: str) -> int:
+    """
+    Check how many contracts are available on the ask side of the orderbook.
+    Returns total quantity available at the best ask price level.
+    """
+    if not isinstance(ob, dict):
+        return 0
+    root = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
+
+    if side == "yes":
+        levels = None
+        if isinstance(root, dict):
+            y = root.get("yes", {})
+            if isinstance(y, dict):
+                levels = y.get("asks", y.get("sell", []))
+            elif isinstance(y, list):
+                levels = y
+    else:
+        levels = None
+        if isinstance(root, dict):
+            n = root.get("no", {})
+            if isinstance(n, dict):
+                levels = n.get("asks", n.get("sell", []))
+            elif isinstance(n, list):
+                levels = n
+
+    if not levels or not isinstance(levels, list):
+        return 0
+
+    total_qty = 0
+    for lv in levels:
+        qty = 0
+        if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+            try:
+                qty = int(lv[1])
+            except Exception:
+                pass
+        elif isinstance(lv, dict):
+            for k in ("quantity", "qty", "count", "size"):
+                if k in lv:
+                    try:
+                        qty = int(lv[k])
+                        break
+                    except Exception:
+                        pass
+        total_qty += qty
+    return total_qty
 
 
 # ======================== SESSION STATE ======================
@@ -858,13 +933,13 @@ def main() -> None:
     log.warning("=" * 70)
     log.warning(f"[IRON RULES] {ASSET} Bot — DATA-DRIVEN REDESIGN (Feb 2026)")
     log.warning(f"[IRON RULES] RULE 1: One direction per market — once positioned, DONE")
-    log.warning(f"[IRON RULES] RULE 2: Max 1 contract per market — ALWAYS")
+    log.warning(f"[IRON RULES] RULE 2: Risk-based sizing: ${MAX_RISK_PER_MARKET:.2f} risk / entry, max {MAX_CONTRACTS}ct")
     log.warning(f"[IRON RULES] RULE 3: Max entry price {MAX_PRICE}¢ (data-driven)")
     log.warning(f"[IRON RULES] RULE 4: Never buy both YES and NO on same market")
     log.warning("=" * 70)
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s "
-        f"BUY={BUY_START_SECONDS}s MAX_ENTRY={MAX_PRICE}¢ "
+        f"BUY={BUY_START_SECONDS}s MAX_ENTRY={MAX_PRICE}¢ MAX_RISK=${MAX_RISK_PER_MARKET:.2f} "
         f"MIN_CONF={MIN_CONFIDENCE:.0%} POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
     log.warning(
@@ -1194,30 +1269,60 @@ def main() -> None:
 
         # Balance check
         available, _ = get_balance_usd(client)
-        cost_usd = chosen_price / 100.0
-        if available is None or available < cost_usd:
-            log.warning(f"[SKIP] Insufficient balance: ${available} < ${cost_usd:.2f}")
+        cost_per_contract = chosen_price / 100.0
+        if available is None or available < cost_per_contract:
+            log.warning(f"[SKIP] Insufficient balance: ${available} < ${cost_per_contract:.2f}")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # Position sizing
+        desired_qty = calculate_position_size(chosen_price, available)
+
+        # Liquidity check: don't order more than what's on the book
+        book_depth = get_orderbook_depth(ob, chosen_side)
+        if book_depth > 0:
+            order_qty = min(desired_qty, book_depth)
+        else:
+            order_qty = min(desired_qty, 1)  # Conservative if depth unknown
+
+        # Final balance check with actual order size
+        total_cost_usd = (chosen_price / 100.0) * order_qty
+        if total_cost_usd > available:
+            order_qty = max(1, int(available / cost_per_contract))
+            total_cost_usd = cost_per_contract * order_qty
+
+        # EV and risk calculations
+        ev_per_contract = (conf * (100 - chosen_price) - (1 - conf) * chosen_price) / 100.0
+        total_ev = ev_per_contract * order_qty
+        max_loss = total_cost_usd
+        max_gain = ((100 - chosen_price) / 100.0) * order_qty
+        reward_risk = max_gain / max_loss if max_loss > 0 else 0.0
+
+        # Skip if EV per contract too low
+        if ev_per_contract < MIN_EV_PER_CONTRACT:
+            log.info(f"[SKIP] EV too low: ${ev_per_contract:.4f} < ${MIN_EV_PER_CONTRACT}")
             time.sleep(POLL_SECONDS)
             continue
 
         # Historical accuracy
         hist = get_historical_accuracy(chosen_side, chosen_price)
         hist_str = f"acc={hist[0]:.0%} n={hist[1]}" if hist else "no_hist_data"
-        ev_usd = (conf * (100 - chosen_price) - (1 - conf) * chosen_price) / 100.0
 
         log.warning(
-            f"[TRADE] {st.market} {chosen_side.upper()} 1ct @ {chosen_price}¢ | "
-            f"cost=${cost_usd:.2f} | {hist_str} | EV=${ev_usd:.3f} | bal=${available:.2f}"
+            f"[TRADE] {st.market} {chosen_side.upper()} {order_qty}ct @ {chosen_price}¢ | "
+            f"cost=${total_cost_usd:.2f} risk=${max_loss:.2f} | "
+            f"EV/ct=${ev_per_contract:.3f} totalEV=${total_ev:.3f} R:R={reward_risk:.1f}x | "
+            f"{hist_str} | depth={book_depth} desired={desired_qty} | bal=${available:.2f}"
         )
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] Would buy {chosen_side} @ {chosen_price}¢")
+            log.warning(f"[DRY] Would buy {order_qty}ct {chosen_side} @ {chosen_price}¢")
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
         try:
-            payload = build_order_payload(st.market, chosen_side, chosen_price)
+            payload = build_order_payload(st.market, chosen_side, chosen_price, order_qty)
             oid = place_order(client, payload)
 
             if oid.startswith("BLOCKED"):
@@ -1226,7 +1331,7 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            log.warning(f"[ORDER] Placed {oid} BUY {chosen_side.upper()} @ {chosen_price}¢")
+            log.warning(f"[ORDER] Placed {oid} BUY {order_qty}ct {chosen_side.upper()} @ {chosen_price}¢")
             fill_status, filled_qty = wait_for_fill(client, oid, st.market)
 
             if fill_status in ("filled", "partial") and filled_qty > 0:
@@ -1235,20 +1340,20 @@ def main() -> None:
                 st.entry_price_cents = chosen_price
                 st.qty = filled_qty
                 st.order_id = oid
-                log.warning(f"[FILL] {filled_qty}ct {chosen_side.upper()} @ {chosen_price}¢")
+                log.warning(f"[FILL] {filled_qty}ct {chosen_side.upper()} @ {chosen_price}¢ cost=${(chosen_price/100.0)*filled_qty:.2f}")
             elif fill_status == "resting":
                 st.traded_this_market = True
                 st.side = chosen_side
                 st.entry_price_cents = chosen_price
-                st.qty = 1
+                st.qty = order_qty
                 st.order_id = oid
-                log.warning(f"[FILL] Resting @ {chosen_price}¢")
+                log.warning(f"[FILL] Resting {order_qty}ct @ {chosen_price}¢")
             elif fill_status == "unknown":
                 st.traded_this_market = True
                 st.side = chosen_side
                 st.entry_price_cents = chosen_price
-                st.qty = 1
-                log.warning("[FILL] Unknown — marking traded")
+                st.qty = order_qty
+                log.warning(f"[FILL] Unknown — marking traded {order_qty}ct")
             else:
                 log.warning(f"[FILL] Not filled ({fill_status}) — canceling")
                 cancel_order_status(client, oid)
