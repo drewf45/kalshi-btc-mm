@@ -2710,51 +2710,30 @@ def _start_health_server():
 def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
+    log.warning("=" * 72)
+    log.warning("[IRON RULES] THREE IRON RULES — ENFORCED AT ALL LAYERS")
+    log.warning(f"[IRON RULE 1] One direction per market — once positioned, DONE (no adding/flipping/hedging)")
+    log.warning(f"[IRON RULE 2] Max {MAX_CONTRACTS} contracts per market (3 enforcement layers: sizing, place_order API check, post-fill verification)")
+    log.warning(f"[IRON RULE 3] No entries above {MAX_ENTRY_PRICE_CENTS}c — PROB_MIN={PROB_MIN:.0%}")
+    log.warning("=" * 72)
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s BUY={BUY_START_SECONDS}s "
-        f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}¢ "
-        f"BANKROLL_FRACTION={BANKROLL_FRACTION} ENABLE_DUMP={ENABLE_DUMP} "
-        f"DUMP_PROB_FLIP={DUMP_PROB_FLIP} DUMP_PROB_DROP={DUMP_PROB_DROP_PERCENT} "
-        f"YES_ONLY={YES_ONLY}"
+        f"PROB_MIN={PROB_MIN} EDGE_MIN={EDGE_MIN} MAX_ENTRY={MAX_ENTRY_PRICE_CENTS}c "
+        f"YES_ONLY={YES_ONLY} POST_ONLY={POST_ONLY}"
     )
     log.warning(
-        f"[BOOTCFG] *** HARD CAP: MAX_CONTRACTS={MAX_CONTRACTS} *** "
-        f"(enforced at API boundary with position check, POST_ONLY={POST_ONLY}, "
-        f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}, MAX_LOSS_AT_EXPIRY=${MAX_LOSS_AT_EXPIRY_USD:.2f})"
+        f"[BOOTCFG] SIZING: MAX_CONTRACTS={MAX_CONTRACTS} KELLY={KELLY_MULTIPLIER} "
+        f"MAX_LOSS_AT_EXPIRY=${MAX_LOSS_AT_EXPIRY_USD:.2f}"
     )
     log.warning(
-        f"[BOOTCFG] ENTRY: fast_lane={PROB_FAST_LANE_THRESHOLD:.0%} (≥{PROB_FAST_LANE_THRESHOLD:.0%} skips trend checks) "
-        f"boundary_buffer=${BOUNDARY_BUFFER_USD:.4f} trend_block={TREND_AGAINST_BLOCK}"
+        f"[BOOTCFG] DISABLED: ENABLE_DUMP={ENABLE_DUMP} FLIP_AFTER_DUMP={FLIP_AFTER_DUMP} "
+        f"SCALP_ENABLED={SCALP_ENABLED} DUMP_ON_PROB_REVERSAL={DUMP_ON_PROB_REVERSAL}"
     )
     log.warning(
-        f"[BOOTCFG] BAIL: grace={DUMP_GRACE_PERIOD_SECONDS}s settling={DUMP_PROACTIVE_AFTER_SECONDS}s "
-        f"reversal={DUMP_REVERSAL_THRESHOLD:.0%} hard_stop={DUMP_MAX_LOSS_CENTS_PER_CONTRACT}¢/contract "
-        f"xrp_buffer_early=${DUMP_XRP_SAFE_BUFFER_EARLY:.4f} xrp_buffer_late=${DUMP_XRP_SAFE_BUFFER_LATE:.4f}"
-    )
-    log.warning(
-        f"[BOOTCFG] FLIP: enabled={FLIP_AFTER_DUMP} min_time={FLIP_MIN_TIME_REMAINING}s "
-        f"min_prob={FLIP_MIN_PROB:.0%} max_price={FLIP_MAX_ENTRY_PRICE}¢ (one flip per market)"
-    )
-    log.warning(
-        f"[BOOTCFG] SIZING: base_contracts={BASE_CONTRACTS} increment={CONTRACT_INCREMENT}/win "
-        f"max={MAX_CONTRACTS} (resets to base on loss)"
-    )
-    log.warning(
-        f"[BOOTCFG] LIMITS: enabled={ENABLE_SESSION_LIMITS} daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
-        f"consec_losses={SESSION_CONSECUTIVE_LOSSES_LIMIT} cooldown={SESSION_COOLDOWN_MINUTES}min "
+        f"[BOOTCFG] LIMITS: daily_hard_stop={DAILY_MAX_LOSS_PERCENT:.0%} "
         f"balance_check_delay={BALANCE_CHECK_DELAY_SECONDS}s"
     )
-    log.warning(
-        f"[BOOTCFG] TREND: windows={TREND_WINDOW_MINUTES}min+{TREND_SHORT_WINDOW_MINUTES}min "
-        f"strong=${TREND_STRONG_THRESHOLD:.4f} moderate=${TREND_MODERATE_THRESHOLD:.4f} "
-        f"block_against={TREND_AGAINST_BLOCK} edge_boost={TREND_AGAINST_EDGE_BOOST}"
-    )
-    log.warning(
-        f"[BOOTCFG] SCALP: enabled={SCALP_ENABLED} window={SCALP_MIN_SECONDS}-{SCALP_MAX_SECONDS}s "
-        f"min_dist=${SCALP_MIN_DISTANCE_USD:.4f} min_prob={SCALP_MIN_PROB:.0%} "
-        f"max_loss={SCALP_MAX_LOSS_FRACTION:.0%} tiers={len(SCALP_DISTANCE_TIERS)}"
-    )
-    log.warning("[HEARTBEAT] main() entered — SCALPER is running")
+    log.warning("[HEARTBEAT] main() entered — HOLD-TO-SETTLEMENT mode (IRON RULES active)")
 
     # WATCHDOG: force-restart if main loop hangs for >5 minutes (e.g. API timeout)
     _watchdog_ts = [time.time()]
@@ -2776,7 +2755,7 @@ def main() -> None:
 
     st = BotState()
     session = SessionState()
-    position_tracker = PositionTracker(BOT_ID)
+    position_tracker = PositionTracker(BOT_ID)  # Legacy — kept for make_client_order_id() only
     trend = SpotTrend()  # 60-min long-term trend
     trend_short = SpotTrend(window_minutes=TREND_SHORT_WINDOW_MINUTES)  # 30-min short-term trend
     prob_trend = ProbTrend()
@@ -2953,7 +2932,6 @@ def main() -> None:
                                     f"— using actual for P&L"
                                 )
                                 st.qty = actual_pos
-                                position_tracker.update_qty(old_market, actual_pos)
                             # Cancel any resting orders for this market
                             if getattr(st, 'order_id', None):
                                 cancel_order_status(client, st.order_id)
@@ -3020,9 +2998,6 @@ def main() -> None:
                                 was_dump=False,
                             )
                             log.warning(f"[ROLL] Settled {old_market}: {st.side.upper()} result={result} pnl={pnl_cents}¢")
-
-                    # Clear old market from internal position tracker
-                    position_tracker.record_exit(old_market)
 
                     # Reset per-market session state (keeps daily P&L intact)
                     session.reset_for_new_market()
