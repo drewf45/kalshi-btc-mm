@@ -258,6 +258,10 @@ SESSION_CONSECUTIVE_LOSSES_LIMIT = 4  # Pause after 4 consecutive losses — sit
 SESSION_COOLDOWN_MINUTES = 15  # Cooldown after consecutive loss limit hit
 BALANCE_CHECK_DELAY_SECONDS = 300  # Wait 5 min after settlement to fetch true balance
 
+# -------------- STOP-LOSS THRESHOLDS (Legacy — kept for safety-check references) ----
+HARD_STOP_LOSS_USD = 0.40  # Absolute max dollar loss per trade — overrides all other exit logic
+SOFT_STOP_LOSS_USD = 0.30  # Soft stop: at -$0.30 unrealized, immediately market-sell to exit
+
 ONE_TRADE_PER_MARKET = env_bool("ONE_TRADE_PER_MARKET", True)
 CANCEL_ALL_STRAYS_ALWAYS = env_bool("CANCEL_ALL_STRAYS_ALWAYS", True)
 
