@@ -278,6 +278,12 @@ OB_WARN_EVERY_SECONDS = env_float("OB_WARN_EVERY_SECONDS", 2.0)
 ENABLE_DUMP = False  # DISABLED — no dump/exit/stop-loss. Hold to settlement. (IRON RULE 1)
 MAX_LOSS_AT_EXPIRY_USD = 2.91  # 3 contracts × 97¢ = max possible loss at settlement
 
+# -------------- YES DAYTIME GATE (Legacy) ------------------------------------
+YES_DAYTIME_DISABLED = False           # Kill YES trades during 8am-8pm EST
+YES_DAYTIME_START_HOUR = 8            # 8am EST
+YES_DAYTIME_END_HOUR = 20             # 8pm EST
+YES_DAYTIME_TIMEZONE = "America/New_York"
+
 # -------------- SESSION DRAWDOWN BREAKER ------------------------------------
 # If down $2.00+ in a rolling 2-hour window, pause 30 min, resume at 50% size.
 # Prevents cascade sessions like the -$7.93 morning.
