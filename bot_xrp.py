@@ -3964,12 +3964,26 @@ def main() -> None:
                 st.qty = filled_qty  # Use actual filled qty, not intended
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
-                position_tracker.record_fill(st.market, chosen_side, filled_qty, int(chosen_px), oid)
                 if filled_qty < qty:
                     log.warning(f"[FILL] Partial fill: got {filled_qty}/{qty} contracts — canceling remainder")
                     cancel_order_status(client, oid)
                 else:
                     log.warning(f"[FILL] Full fill confirmed: {filled_qty} contracts")
+
+                # IRON RULE 2, Layer C: Post-fill API position verification
+                try:
+                    verified_pos = abs(parse_position_for_market(get_positions(client), st.market))
+                    if verified_pos > MAX_CONTRACTS:
+                        log.error(
+                            f"[IRON RULE 2C] POST-FILL VIOLATION: API shows {verified_pos} contracts "
+                            f"on {st.market} (max={MAX_CONTRACTS}). This should never happen. "
+                            f"Investigate immediately."
+                        )
+                    else:
+                        log.info(f"[IRON RULE 2C] Post-fill verified: {verified_pos} contracts on {st.market} (max={MAX_CONTRACTS})")
+                except Exception as e:
+                    log.warning(f"[IRON RULE 2C] Post-fill verification failed: {e}")
+
             elif fill_status == "unknown":
                 # API error — assume filled to be safe (position check will reconcile)
                 st.traded_this_market = True
@@ -3983,7 +3997,6 @@ def main() -> None:
                 st.qty = qty
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
-                position_tracker.record_fill(st.market, chosen_side, qty, int(chosen_px), oid)
                 log.warning(f"[FILL] Could not verify fill — assuming filled, position check will reconcile")
             elif use_post_only or (int(chosen_px) >= 97 and p_gate >= PROB_FAST_LANE_THRESHOLD):
                 # Order resting on the book — intentional in locked-book scenarios.
@@ -4003,7 +4016,6 @@ def main() -> None:
                 st.order_id = oid
                 st.peak_prob_for_side = p_yes_blend if chosen_side == "yes" else (1.0 - p_yes_blend)
                 st.prob_history = []  # Reset windowed peak tracking for new position
-                position_tracker.record_fill(st.market, chosen_side, qty, int(chosen_px), oid)
                 resting_reason = "maker" if use_post_only else "locked_book"
                 log.warning(
                     f"[FILL] Order {oid} resting ({resting_reason}) @ {chosen_px}¢ × {qty} — "
@@ -4027,6 +4039,6 @@ if __name__ == "__main__":
         log.exception(
             f"FATAL: bot crashed: {e} | "
             f"PROB_MIN={PROB_MIN} MAX_CONTRACTS={MAX_CONTRACTS} POST_ONLY={POST_ONLY} "
-            f"FLIP_AFTER_DUMP={FLIP_AFTER_DUMP}"
+            f"IRON_RULES=active ENABLE_DUMP={ENABLE_DUMP} FLIP={FLIP_AFTER_DUMP} SCALP={SCALP_ENABLED}"
         )
         raise
