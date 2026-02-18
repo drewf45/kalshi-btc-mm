@@ -748,35 +748,10 @@ def calculate_position_size(entry_price_cents: int, available_balance_usd: float
     return contracts
 
 
-def get_orderbook_depth(ob: Dict[str, Any], side: str) -> int:
-    """
-    Check how many contracts are available on the ask side of the orderbook.
-    Returns total quantity available at the best ask price level.
-    """
-    if not isinstance(ob, dict):
-        return 0
-    root = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
-
-    if side == "yes":
-        levels = None
-        if isinstance(root, dict):
-            y = root.get("yes", {})
-            if isinstance(y, dict):
-                levels = y.get("asks", y.get("sell", []))
-            elif isinstance(y, list):
-                levels = y
-    else:
-        levels = None
-        if isinstance(root, dict):
-            n = root.get("no", {})
-            if isinstance(n, dict):
-                levels = n.get("asks", n.get("sell", []))
-            elif isinstance(n, list):
-                levels = n
-
+def _sum_qty_from_levels(levels: Any) -> int:
+    """Sum up contract quantities from orderbook levels."""
     if not levels or not isinstance(levels, list):
         return 0
-
     total_qty = 0
     for lv in levels:
         qty = 0
@@ -795,6 +770,34 @@ def get_orderbook_depth(ob: Dict[str, Any], side: str) -> int:
                         pass
         total_qty += qty
     return total_qty
+
+
+def get_orderbook_depth(ob: Dict[str, Any], side: str) -> int:
+    """
+    Check how many contracts we can BUY on the given side.
+
+    Kalshi orderbook: {"orderbook": {"yes": [[price, qty], ...], "no": [...]}}
+    The "yes" array = YES bids, "no" array = NO bids.
+    To BUY YES, we need YES asks, which come from NO bids (opposite side).
+    To BUY NO, we need NO asks, which come from YES bids (opposite side).
+    """
+    if not isinstance(ob, dict):
+        return 0
+    root = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
+    if not isinstance(root, dict):
+        return 0
+
+    # Look at OPPOSITE side — their bids are our asks
+    opposite = "no" if side == "yes" else "yes"
+    levels = root.get(opposite)
+
+    if isinstance(levels, dict):
+        # Dict format with bids/asks keys
+        levels = levels.get("bids", levels.get("buy", []))
+    elif not isinstance(levels, list):
+        levels = []
+
+    return _sum_qty_from_levels(levels)
 
 
 # ======================== SESSION STATE ======================
@@ -1277,19 +1280,37 @@ def main() -> None:
 
         # Position sizing
         desired_qty = calculate_position_size(chosen_price, available)
+        log.warning(
+            f"[SIZE] {st.market} @ {chosen_price}¢ → {desired_qty}ct "
+            f"(risk=${desired_qty * chosen_price / 100:.2f}, bankroll=${available:.2f})"
+        )
 
-        # Liquidity check: don't order more than what's on the book
+        # Liquidity check: cap at book depth if known, otherwise trust sizing
         book_depth = get_orderbook_depth(ob, chosen_side)
         if book_depth > 0:
             order_qty = min(desired_qty, book_depth)
         else:
-            order_qty = min(desired_qty, 1)  # Conservative if depth unknown
+            # Depth unknown — trust the sizing function, don't fall back to 1
+            order_qty = desired_qty
 
         # Final balance check with actual order size
         total_cost_usd = (chosen_price / 100.0) * order_qty
         if total_cost_usd > available:
             order_qty = max(1, int(available / cost_per_contract))
             total_cost_usd = cost_per_contract * order_qty
+
+        # HARD SAFETY: enforce risk cap even if sizing has a bug
+        total_risk_usd = order_qty * cost_per_contract
+        if total_risk_usd > MAX_RISK_PER_MARKET * 1.10:
+            order_qty = max(1, int(MAX_RISK_PER_MARKET / cost_per_contract))
+            total_cost_usd = order_qty * cost_per_contract
+            log.warning(f"[RISK-CAP] Reduced to {order_qty}ct (${total_cost_usd:.2f} ≤ ${MAX_RISK_PER_MARKET})")
+
+        # HARD SAFETY: redundant price cap (belt-and-suspenders)
+        if chosen_price > MAX_PRICE:
+            log.warning(f"[PRICE-CAP] {st.market} {chosen_side} @ {chosen_price}¢ > cap {MAX_PRICE}¢ — BLOCKED")
+            time.sleep(POLL_SECONDS)
+            continue
 
         # EV and risk calculations
         ev_per_contract = (conf * (100 - chosen_price) - (1 - conf) * chosen_price) / 100.0
@@ -1322,6 +1343,10 @@ def main() -> None:
             continue
 
         try:
+            log.warning(
+                f"[ORDER-CHECK] Placing {order_qty}ct of {chosen_side} @ {chosen_price}¢ "
+                f"on {st.market} | risk=${order_qty * chosen_price / 100:.2f}"
+            )
             payload = build_order_payload(st.market, chosen_side, chosen_price, order_qty)
             oid = place_order(client, payload)
 
