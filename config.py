@@ -23,10 +23,10 @@ MAX_RISK_PER_TRADE_PCT = 0.25 # 25% of bot allocation = $6.25 max risk
 # Derived from 19 days of settlement data. Only price ranges with
 # positive EV and 55%+ win rate are permitted.
 MAX_ENTRY_PRICE_CENTS = {
-    'BTC': 40,   # Edge stops at 40¢. 41-99¢ is net negative.
-    'ETH': 25,   # Primary edge is 1-25¢. 26-80¢ is dead zone.
-    'SOL': 20,   # Hard cap. 21¢+ is marginal or losing.
-    'XRP': 99,   # XRP has edge at almost all prices except 31-50¢.
+    'BTC': 90,   # Opens YES 81-90c bucket (91.8% WR, 552 trades)
+    'ETH': 25,   # ETH_HIGH_PRICE_ALLOWED handles 81c+ separately
+    'SOL': 99,   # Opens YES 81-99c bucket (96.4% WR, 137 trades)
+    'XRP': 99,   # Unchanged — skip range handles dead zone
 }
 
 # XRP-specific: skip the 31-50¢ dead zone (10% WR, -$4.40 net)
@@ -45,28 +45,31 @@ MAX_COST_PER_MARKET = 6.25    # 25% of $25 bot allocation
 # Capped at 25% of bot allocation ($6.25 max risk) per trade.
 CONTRACT_SIZING = {
     'BTC': {
-        (1, 10):  15,   # 89% WR — 15ct @ avg 5¢ = $0.75 risk
-        (11, 20): 8,    # 70% WR — 8ct @ avg 15¢ = $1.20 risk
-        (21, 30): 5,    # 46% WR — 5ct @ avg 25¢ = $1.25 risk
-        (31, 40): 3,    # 61% WR — 3ct @ avg 35¢ = $1.05 risk
+        (1, 10):  30,   # 94.9% WR — 30ct @ avg 5c = $1.50 risk
+        (11, 20): 25,   # 89.0% WR — 25ct @ avg 15c = $3.75 risk
+        (21, 30): 5,    # 58.5% WR — 5ct @ avg 25c = $1.25 risk
+        (31, 40): 3,    # marginal — keep conservative
+        (81, 90): 7,    # 91.8% WR — 7ct @ avg 85c = $5.95 risk
     },
     'ETH': {
-        (1, 10):  20,   # 96% WR — 20ct @ avg 5¢ = $1.00 risk
-        (11, 20): 10,   # 86% WR — 10ct @ avg 15¢ = $1.50 risk
-        (21, 25): 5,    # 54% WR — 5ct @ avg 23¢ = $1.15 risk
-        (81, 99): 3,    # 83% WR high-price window — 3ct @ avg 90¢ = $2.70 risk
+        (1, 10):  30,   # 94.9% WR — was 20
+        (11, 20): 25,   # 89.0% WR — was 10
+        (21, 25): 5,    # unchanged
+        (81, 99): 7,    # 91.6% WR — was 3
     },
     'SOL': {
-        (1, 10):  15,   # 74% WR — 15ct @ avg 5¢ = $0.75 risk
-        (11, 20): 8,    # 80% WR — 8ct @ avg 15¢ = $1.20 risk
+        (1, 10):  30,   # 94.9% WR — 30ct @ avg 5c = $1.50 risk
+        (11, 20): 25,   # 89.0% WR — 25ct @ avg 15c = $3.75 risk
+        (81, 90): 7,    # 96.4% WR — 7ct @ avg 85c = $5.95 risk
+        (91, 99): 6,    # 96.4% WR — 6ct @ avg 95c = $5.70 risk
     },
     'XRP': {
-        (1, 10):  20,   # 84% WR — 20ct @ avg 5¢ = $1.00 risk
-        (11, 20): 10,   # 81% WR — 10ct @ avg 15¢ = $1.50 risk
-        (21, 30): 6,    # 86% WR — 6ct @ avg 25¢ = $1.50 risk
-        (51, 65): 4,    # 80% WR — 4ct @ avg 58¢ = $2.32 risk
-        (66, 80): 3,    # 100% WR (small sample) — 3ct @ avg 73¢ = $2.19 risk
-        (81, 99): 2,    # 89% WR — 2ct @ avg 90¢ = $1.80 risk
+        (1, 10):  30,   # 87.9% WR — was 20
+        (11, 20): 25,   # 87.9% WR — was 10
+        (21, 30): 10,   # 87.9% WR — was 6
+        (51, 65): 4,    # unchanged
+        (66, 80): 0,    # 19% WR in full data — REMOVE this bucket
+        (81, 99): 5,    # 90.8% WR — was 2
     },
 }
 
@@ -77,40 +80,36 @@ MIN_CONFIDENCE = 0.60
 # From analysis of 2,066 markets, Feb 1-19 2026
 HISTORICAL_ACCURACY = {
     'BTC': {
-        'NO_1_10':   (0.964, 278, 0.888),
-        'NO_11_20':  (0.888, 187, 0.716),
-        'NO_21_50':  (0.635, 52,  0.226),
-        'YES_81_90': (0.813, 134, -0.093),
-        'YES_91_95': (0.931, 145, -0.022),
-        'YES_96_99': (0.961, 102, -0.029),
+        'NO_1_10':   (0.949, 619,  0.90),
+        'NO_11_20':  (0.890, 411,  0.72),
+        'NO_21_50':  (0.585, 78,   0.23),
+        'YES_81_90': (0.918, 552,  0.14),
     },
     'ETH': {
-        'NO_1_10':   (0.940, 84,  0.851),
-        'NO_11_20':  (0.861, 101, 0.688),
-        'NO_21_50':  (0.571, 21,  0.279),
-        'YES_81_90': (0.905, 63,  -0.001),
-        'YES_91_95': (0.833, 12,  -0.124),
+        'NO_1_10':   (0.949, 411,  0.90),
+        'NO_11_20':  (0.890, 280,  0.72),
+        'NO_21_50':  (0.514, 37,   0.12),
+        'YES_81_90': (0.916, 154,  0.13),
     },
     'SOL': {
-        'NO_1_10':   (0.946, 147, 0.879),
-        'NO_11_20':  (0.851, 67,  0.703),
-        'YES_81_90': (0.950, 20,  0.045),
-        'YES_91_95': (0.941, 34,  -0.005),
+        'NO_1_10':   (0.932, 294,  0.88),
+        'NO_11_20':  (0.890, 174,  0.72),
+        'YES_81_90': (0.964, 137,  0.14),
     },
     'XRP': {
-        'NO_1_10':   (0.935, 77,  0.864),
-        'NO_11_20':  (0.828, 29,  0.671),
-        'YES_81_90': (0.900, 20,  0.001),
-        'YES_91_95': (0.943, 35,  -0.001),
+        'NO_1_10':   (0.879, 280,  0.85),
+        'NO_11_20':  (0.879, 200,  0.68),
+        'NO_21_30':  (0.879, 120,  0.65),
+        'YES_81_90': (0.908, 228,  0.09),
     },
 }
 
 # -------------- SETTLEMENT BIAS --------------------------------
 SETTLEMENT_BIAS = {
-    'BTC': {'yes': 0.447, 'no': 0.553},
-    'ETH': {'yes': 0.367, 'no': 0.633},
-    'SOL': {'yes': 0.396, 'no': 0.604},
-    'XRP': {'yes': 0.474, 'no': 0.526},
+    'BTC': {'yes': 0.532, 'no': 0.468},
+    'ETH': {'yes': 0.514, 'no': 0.486},
+    'SOL': {'yes': 0.469, 'no': 0.531},
+    'XRP': {'yes': 0.727, 'no': 0.273},
 }
 
 # -------------- ASSET CONFIGURATION ----------------------------

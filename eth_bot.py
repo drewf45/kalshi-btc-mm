@@ -738,6 +738,22 @@ def price_is_allowed(price_cents: int) -> Tuple[bool, str]:
             return True, "OK (ETH high-price window)"
         return False, f"ETH {price_cents}¢ in dead zone (26-80¢)"
 
+    # BTC and SOL: allow low prices + YES high-price window, block dead zone
+    if ASSET == 'BTC':
+        if price_cents <= 40:
+            return True, "OK"
+        if price_cents >= 81 and price_cents <= 90:
+            return True, "OK (BTC YES high-price window)"
+        return False, f"BTC {price_cents}¢ in dead zone (41-80¢)"
+
+    if ASSET == 'SOL':
+        if price_cents <= 20:
+            return True, "OK"
+        if price_cents >= 81:
+            return True, "OK (SOL YES high-price window)"
+        return False, f"SOL {price_cents}¢ in dead zone (21-80¢)"
+
+    # Generic fallback for any other asset
     if price_cents <= MAX_PRICE:
         return True, "OK"
     return False, f"{ASSET} {price_cents}¢ > {MAX_PRICE}¢ cap"
@@ -953,6 +969,8 @@ class BotState:
     qty: int = 0
     entry_price_cents: Optional[int] = None
     order_id: Optional[str] = None
+    last_evaluated_yes_ask: Optional[int] = None
+    last_evaluated_no_ask: Optional[int] = None
     # Deferred settlement
     pending_settlement_market: Optional[str] = None
     pending_settlement_side: Optional[str] = None
@@ -1073,6 +1091,8 @@ def main() -> None:
         st.qty = 0
         st.order_id = None
         st.entry_price_cents = None
+        st.last_evaluated_yes_ask = None
+        st.last_evaluated_no_ask = None
 
     ev, mt, mobj = refresh_active_market()
     active_market_obj = mobj or {}
@@ -1180,6 +1200,8 @@ def main() -> None:
                     st.qty = 0
                     st.order_id = None
                     st.entry_price_cents = None
+                    st.last_evaluated_yes_ask = None
+                    st.last_evaluated_no_ask = None
                     reconcile_on_market_change(mt2)
                 else:
                     if isinstance(mobj2, dict) and mobj2:
@@ -1276,6 +1298,14 @@ def main() -> None:
             p_yes = p_yes_model
         p_no = 1.0 - p_yes
 
+        # FAST GUARD: ALWAYS first — before any other check
+        if st.market in TRADED_TICKERS:
+            if not st.traded_this_market:
+                st.traded_this_market = True
+                log.warning(f"[SKIP-FAST] {st.market} in TRADED_TICKERS — blocking re-entry")
+            time.sleep(POLL_SECONDS)
+            continue
+
         # OBSERVE phase
         if secs_to_close > BUY_START_SECONDS:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
@@ -1287,7 +1317,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # ========== BUY WINDOW ==========
+        # Too late — close window
         if secs_to_close < ENTRY_LAST_SECONDS:
             if secs_to_close < 0:
                 last_meta = 0.0
@@ -1297,13 +1327,17 @@ def main() -> None:
                 st.traded_this_market = True
             continue
 
-        # FAST GUARD: if we already traded this market, skip everything
-        if st.market in TRADED_TICKERS:
-            if not st.traded_this_market:
-                st.traded_this_market = True
-                log.warning(f"[SKIP-FAST] {st.market} in TRADED_TICKERS — blocking re-entry")
+        # Only re-evaluate if orderbook has changed
+        # Prevents 595 identical evaluations on same market
+        book_changed = (
+            yes_ask != st.last_evaluated_yes_ask or
+            no_ask != st.last_evaluated_no_ask
+        )
+        if not book_changed and st.last_evaluated_yes_ask is not None:
             time.sleep(POLL_SECONDS)
             continue
+        st.last_evaluated_yes_ask = yes_ask
+        st.last_evaluated_no_ask = no_ask
 
         # Evaluate entry
         entry = should_enter(p_yes, p_no, yes_ask, no_ask)
