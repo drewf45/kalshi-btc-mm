@@ -1,84 +1,111 @@
-# config.py — Shared constants, historical accuracy tables, entry price caps
+# config.py — Shared constants, data-driven sizing, price caps
 # Used by all 4 bots (BTC, ETH, SOL, XRP)
 #
-# DATA-DRIVEN REDESIGN (Feb 2026)
-# Analysis of 1,749 markets showed:
-#   - 95% of profit comes from buying cheap contracts (1-20¢)
-#   - Expensive entries (81-99¢) are net negative even at 90% accuracy
-#   - NO side wins more often across all assets (settlement bias)
+# DATA-DRIVEN V4 (Feb 19, 2026)
+# Full historical analysis: 2,066 settled 15M markets, Feb 1-19 2026
+# Kelly-criterion contract sizing per asset per price bucket
 
 # ======================== IRON RULES ========================
 # RULE 1: One direction per market — once positioned, DONE
-# RULE 2: Risk-based position sizing (max $3 risk per market, max 30 contracts)
-# RULE 3: Max entry price per asset (data-driven caps below)
+# RULE 2: Data-driven contract sizing per asset per price bucket
+# RULE 3: Asset-specific price caps with dead zone skips
 # RULE 4: Never buy both YES and NO on same market
+# RULE 5: Single entry per market — TRADED_TICKERS + API check
 # =============================================================
 
-# -------------- MAX ENTRY PRICE PER ASSET (DATA-DRIVEN) -----
-# Side-specific caps based on 135 trades of live data (Feb 16-19 2026).
-# YES above 65¢: 41 trades, $0.20 total profit, 0.2x W/L — not worth it.
-# NO entries: 79 trades, $119.30 total profit, up to 17x W/L.
-MAX_YES_PRICE_CENTS = 65  # Hard cap for YES on ALL assets
+# -------------- BANKROLL ALLOCATION ----------------------------
+TOTAL_BANKROLL = 100.00
+BOT_ALLOCATION = 25.00        # Per bot ($100 / 4 bots)
+MIN_BOT_BALANCE = 5.00        # Pause if balance drops below this
+MAX_RISK_PER_TRADE_PCT = 0.25 # 25% of bot allocation = $6.25 max risk
 
-MAX_NO_PRICE_CENTS = {
-    'BTC': 50,
-    'ETH': 70,   # ETH NO up to 70¢ is profitable per data
-    'SOL': 50,
-    'XRP': 50,
+# -------------- PRICE CAPS (DATA-DRIVEN PER ASSET) -------------
+# Derived from 19 days of settlement data. Only price ranges with
+# positive EV and 55%+ win rate are permitted.
+MAX_ENTRY_PRICE_CENTS = {
+    'BTC': 40,   # Edge stops at 40¢. 41-99¢ is net negative.
+    'ETH': 25,   # Primary edge is 1-25¢. 26-80¢ is dead zone.
+    'SOL': 20,   # Hard cap. 21¢+ is marginal or losing.
+    'XRP': 99,   # XRP has edge at almost all prices except 31-50¢.
 }
 
-# Hard cost ceiling per market (belt-and-suspenders with risk sizing)
-MAX_COST_PER_MARKET = 3.50  # $3 target + small rounding buffer
+# XRP-specific: skip the 31-50¢ dead zone (10% WR, -$4.40 net)
+XRP_SKIP_RANGE = (31, 50)
 
-# -------------- RISK-BASED POSITION SIZING -------------------
-# contracts = floor(MAX_RISK_PER_MARKET / entry_price_dollars)
-# Capped at MAX_CONTRACTS and bankroll limit.
-MAX_RISK_PER_MARKET = 3.00       # Max $3.00 risk per market
-MAX_CONTRACTS = 30               # Hard cap per market
-MIN_CONTRACTS = 1                # Always buy at least 1
-MAX_BANKROLL_PER_TRADE = 0.50    # Never risk >50% of available balance
-MIN_EV_PER_CONTRACT = 0.001      # Minimum $0.001 EV per contract
+# ETH high-price window: allow 81-99¢ entries (83% WR, +$708 net)
+ETH_HIGH_PRICE_ALLOWED = True
+ETH_HIGH_PRICE_MIN = 81
 
-# -------------- MINIMUM CONFIDENCE (loose gate) -------------
-# The price gate does the real filtering work.
-# Confidence just filters out coin-flip situations.
+# Hard cost ceiling per market (belt-and-suspenders)
+MAX_COST_PER_MARKET = 6.25    # 25% of $25 bot allocation
+
+# -------------- CONTRACT SIZING TABLE --------------------------
+# Kelly criterion applied to 19 days of actual win rates per bucket.
+# (asset, price_bucket) → exact contract count
+# Capped at 25% of bot allocation ($6.25 max risk) per trade.
+CONTRACT_SIZING = {
+    'BTC': {
+        (1, 10):  15,   # 89% WR — 15ct @ avg 5¢ = $0.75 risk
+        (11, 20): 8,    # 70% WR — 8ct @ avg 15¢ = $1.20 risk
+        (21, 30): 5,    # 46% WR — 5ct @ avg 25¢ = $1.25 risk
+        (31, 40): 3,    # 61% WR — 3ct @ avg 35¢ = $1.05 risk
+    },
+    'ETH': {
+        (1, 10):  20,   # 96% WR — 20ct @ avg 5¢ = $1.00 risk
+        (11, 20): 10,   # 86% WR — 10ct @ avg 15¢ = $1.50 risk
+        (21, 25): 5,    # 54% WR — 5ct @ avg 23¢ = $1.15 risk
+        (81, 99): 3,    # 83% WR high-price window — 3ct @ avg 90¢ = $2.70 risk
+    },
+    'SOL': {
+        (1, 10):  15,   # 74% WR — 15ct @ avg 5¢ = $0.75 risk
+        (11, 20): 8,    # 80% WR — 8ct @ avg 15¢ = $1.20 risk
+    },
+    'XRP': {
+        (1, 10):  20,   # 84% WR — 20ct @ avg 5¢ = $1.00 risk
+        (11, 20): 10,   # 81% WR — 10ct @ avg 15¢ = $1.50 risk
+        (21, 30): 6,    # 86% WR — 6ct @ avg 25¢ = $1.50 risk
+        (51, 65): 4,    # 80% WR — 4ct @ avg 58¢ = $2.32 risk
+        (66, 80): 3,    # 100% WR (small sample) — 3ct @ avg 73¢ = $2.19 risk
+        (81, 99): 2,    # 89% WR — 2ct @ avg 90¢ = $1.80 risk
+    },
+}
+
+# -------------- MINIMUM CONFIDENCE (loose gate) ----------------
 MIN_CONFIDENCE = 0.60
 
-# -------------- HISTORICAL ACCURACY BY PRICE BUCKET ----------
-# From analysis of 1,749 markets, Feb 1-18 2026
-# Format: (accuracy, sample_size, avg_net_profit_per_trade)
+# -------------- HISTORICAL ACCURACY BY PRICE BUCKET -------------
+# From analysis of 2,066 markets, Feb 1-19 2026
 HISTORICAL_ACCURACY = {
     'BTC': {
         'NO_1_10':   (0.964, 278, 0.888),
         'NO_11_20':  (0.888, 187, 0.716),
         'NO_21_50':  (0.635, 52,  0.226),
-        'YES_81_90': (0.813, 134, -0.093),  # NEGATIVE — avoid
-        'YES_91_95': (0.931, 145, -0.022),  # NEGATIVE — avoid
-        'YES_96_99': (0.961, 102, -0.029),  # NEGATIVE — avoid
+        'YES_81_90': (0.813, 134, -0.093),
+        'YES_91_95': (0.931, 145, -0.022),
+        'YES_96_99': (0.961, 102, -0.029),
     },
     'ETH': {
         'NO_1_10':   (0.940, 84,  0.851),
         'NO_11_20':  (0.861, 101, 0.688),
         'NO_21_50':  (0.571, 21,  0.279),
-        'YES_81_90': (0.905, 63,  -0.001),  # Breakeven at best
-        'YES_91_95': (0.833, 12,  -0.124),  # NEGATIVE
+        'YES_81_90': (0.905, 63,  -0.001),
+        'YES_91_95': (0.833, 12,  -0.124),
     },
     'SOL': {
         'NO_1_10':   (0.946, 147, 0.879),
         'NO_11_20':  (0.851, 67,  0.703),
         'YES_81_90': (0.950, 20,  0.045),
-        'YES_91_95': (0.941, 34,  -0.005),  # Breakeven
+        'YES_91_95': (0.941, 34,  -0.005),
     },
     'XRP': {
         'NO_1_10':   (0.935, 77,  0.864),
         'NO_11_20':  (0.828, 29,  0.671),
-        'YES_81_90': (0.900, 20,  0.001),   # Breakeven
-        'YES_91_95': (0.943, 35,  -0.001),  # Breakeven
+        'YES_81_90': (0.900, 20,  0.001),
+        'YES_91_95': (0.943, 35,  -0.001),
     },
 }
 
-# -------------- SETTLEMENT BIAS ---------------------------------
-# NO wins more often across all assets
+# -------------- SETTLEMENT BIAS --------------------------------
 SETTLEMENT_BIAS = {
     'BTC': {'yes': 0.447, 'no': 0.553},
     'ETH': {'yes': 0.367, 'no': 0.633},
@@ -127,15 +154,15 @@ ASSET_CONFIG = {
 }
 
 # -------------- TIMING ----------------------------------------
-OBSERVE_START_SECONDS = 720   # Start watching at 12 min before close
-BUY_START_SECONDS = 600       # Can enter from 10 min before close
-ENTRY_LAST_SECONDS = 5        # Stop entering at 5s before close
-POLL_SECONDS = 1.0            # Check every second
-META_REFRESH_SECONDS = 10.0   # Refresh market list every 10 seconds
+OBSERVE_START_SECONDS = 720
+BUY_START_SECONDS = 600
+ENTRY_LAST_SECONDS = 5
+POLL_SECONDS = 1.0
+META_REFRESH_SECONDS = 10.0
 
 # -------------- SESSION LIMITS ---------------------------------
 ENABLE_SESSION_LIMITS = True
-DAILY_MAX_LOSS_PERCENT = 0.75  # Stop at 75% daily loss
+DAILY_MAX_LOSS_PERCENT = 0.75
 SESSION_CONSECUTIVE_LOSSES_LIMIT = 4
 SESSION_COOLDOWN_MINUTES = 15
 BALANCE_CHECK_DELAY_SECONDS = 300
