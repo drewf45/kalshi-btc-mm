@@ -1286,6 +1286,7 @@ def main() -> None:
                 last_meta = 0.0
                 time.sleep(10.0)
             else:
+                TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
             continue
 
@@ -1392,6 +1393,7 @@ def main() -> None:
 
         if not ENABLE_TRADING or DRY_RUN:
             log.warning(f"[DRY] Would buy {order_qty}ct {chosen_side} @ {chosen_price}¢")
+            TRADED_TICKERS.add(st.market)
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
@@ -1402,15 +1404,17 @@ def main() -> None:
         )
         if not allowed:
             log.warning(f"[BLOCKED] {st.market}: {block_reason}")
+            TRADED_TICKERS.add(st.market)
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
-        # === COMMIT: Mark traded BEFORE sending order ===
+        # === COMMIT: Lock ticker BEFORE sending order ===
         # Once we pass validate_order, we are committed to this market.
         # Set BOTH guards immediately — no code path can re-enter.
         TRADED_TICKERS.add(st.market)
         st.traded_this_market = True
+        log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS — proceeding to order")
 
         try:
             log.warning(
