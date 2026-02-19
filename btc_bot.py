@@ -1198,12 +1198,17 @@ def main() -> None:
 
         # HOLD: already positioned
         if pos != 0:
+            # Always sync side/qty from API — handles case where order filled
+            # but fill branch didn't set st.side (e.g., filled_qty=0 race)
+            api_side = "yes" if pos > 0 else "no"
+            api_qty = abs(pos)
             if not st.traded_this_market:
                 st.traded_this_market = True
-                st.side = "yes" if pos > 0 else "no"
-                st.qty = abs(pos)
-                TRADED_TICKERS.add(st.market)  # Sync fast guard
-                log.warning(f"[HOLD] {st.market} {st.side.upper()} x{st.qty}")
+                TRADED_TICKERS.add(st.market)
+                log.warning(f"[HOLD] {st.market} {api_side.upper()} x{api_qty}")
+            if st.side is None:
+                st.side = api_side
+            st.qty = api_qty
             if secs_to_close is not None and (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                 log.info(f"[HOLD] {st.market} {st.side.upper()} x{st.qty} t={secs_to_close}s")
                 last_state_log = now
