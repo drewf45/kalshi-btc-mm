@@ -34,7 +34,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
 from config import (
-    MAX_ENTRY_PRICE_CENTS, MIN_CONFIDENCE, HISTORICAL_ACCURACY,
+    MAX_YES_PRICE_CENTS, MAX_NO_PRICE_CENTS, MAX_COST_PER_MARKET,
+    MIN_CONFIDENCE, HISTORICAL_ACCURACY,
     SETTLEMENT_BIAS, ASSET_CONFIG, OBSERVE_START_SECONDS, BUY_START_SECONDS,
     ENTRY_LAST_SECONDS, POLL_SECONDS, META_REFRESH_SECONDS,
     FEE_CENTS_PER_CONTRACT, NUM_CONCURRENT_BOTS,
@@ -104,7 +105,8 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = ASSET_CFG['default_sigma']
 SIGMA_FLOOR = ASSET_CFG['sigma_floor']
 SIGMA_CEIL = ASSET_CFG['sigma_ceil']
 BOUNDARY_BUFFER_USD = ASSET_CFG['boundary_buffer_usd']
-MAX_PRICE = MAX_ENTRY_PRICE_CENTS[ASSET]  # 50¢
+MAX_YES_PRICE = MAX_YES_PRICE_CENTS                    # 65¢ for all assets
+MAX_NO_PRICE = MAX_NO_PRICE_CENTS.get(ASSET, 50)       # BTC=50, ETH=70, SOL=50, XRP=50
 
 # ======================== API CONFIG =========================
 API_BASE = getenv_first(["KALSHI_API_BASE"], "https://api.elections.kalshi.com").rstrip("/")
@@ -652,6 +654,38 @@ def build_order_payload(market_ticker: str, side: str, price_cents: int, count: 
     return body
 
 
+def validate_order(client: KalshiClient, ticker: str, side: str,
+                   quantity: int, price_cents: int) -> Tuple[bool, str]:
+    """
+    Hard validation gate. Called immediately before EVERY order placement.
+    Returns (allowed, reason).
+    """
+    # GATE 1: Side-specific price cap
+    if side == "yes" and price_cents > MAX_YES_PRICE:
+        return False, f"YES @{price_cents}¢ > {MAX_YES_PRICE}¢ cap"
+    if side == "no" and price_cents > MAX_NO_PRICE:
+        return False, f"NO @{price_cents}¢ > {MAX_NO_PRICE}¢ cap"
+
+    # GATE 2: Max contracts
+    if quantity > MAX_CONTRACTS:
+        return False, f"{quantity}ct > {MAX_CONTRACTS} max"
+
+    # GATE 3: Cost cap
+    proposed_cost = quantity * (price_cents / 100.0)
+    if proposed_cost > MAX_COST_PER_MARKET:
+        return False, f"{quantity}ct × {price_cents}¢ = ${proposed_cost:.2f} > ${MAX_COST_PER_MARKET} max"
+
+    # GATE 4: Existing position check (API, not local state)
+    try:
+        existing = abs(parse_position_for_market(get_positions(client), ticker))
+        if existing > 0:
+            return False, f"Already own {existing}ct on {ticker}"
+    except Exception as e:
+        log.warning(f"[VALIDATE] Position check failed: {e} — allowing with caution")
+
+    return True, "OK"
+
+
 # ======================== PRICE BUCKET LOOKUP ================
 def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float, int, float]]:
     """Returns (accuracy, sample_size, avg_profit) for this price bucket."""
@@ -685,15 +719,12 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
 def should_enter(p_yes: float, p_no: float, yes_ask: Optional[int],
                  no_ask: Optional[int]) -> Optional[Tuple[str, int]]:
     """
-    Data-driven entry decision.
+    Data-driven entry decision with side-specific price caps.
     Returns (side, price_cents) or None.
 
-    Decision flow:
-    1. What does the signal predict?
-    2. What does the winning side's contract cost?
-    3. Is it under our price cap?
-    4. Is confidence above minimum?
-    5. Is expected value positive?
+    Based on 135 trades of live data:
+    - YES above 65¢: 41 trades, $0.20 total profit, 0.2x W/L — skip
+    - NO 1-50¢: 79 trades, $119.30 total profit, up to 17x W/L — core edge
     """
     # Step 1: Determine predicted winner
     if p_yes > p_no:
@@ -709,8 +740,12 @@ def should_enter(p_yes: float, p_no: float, yes_ask: Optional[int],
     if entry_price is None:
         return None
 
-    # Step 3: Price gate (THE key filter — this is where 95% of value comes from)
-    if entry_price > MAX_PRICE:
+    # Step 3: Side-specific price caps (data-driven)
+    if predicted_side == "yes" and entry_price > MAX_YES_PRICE:
+        log.info(f"[SKIP] {ASSET} YES @{entry_price}¢ > {MAX_YES_PRICE}¢ YES cap")
+        return None
+    if predicted_side == "no" and entry_price > MAX_NO_PRICE:
+        log.info(f"[SKIP] {ASSET} NO @{entry_price}¢ > {MAX_NO_PRICE}¢ NO cap")
         return None
 
     # Step 4: Minimum confidence
@@ -729,8 +764,8 @@ def should_enter(p_yes: float, p_no: float, yes_ask: Optional[int],
 def calculate_position_size(entry_price_cents: int, available_balance_usd: float) -> int:
     """
     Risk-based position sizing.
-    contracts = floor(MAX_RISK_PER_MARKET / entry_price_dollars)
-    Capped by MAX_CONTRACTS and bankroll limit.
+    10¢ → 30ct. 20¢ → 15ct. 50¢ → 6ct.
+    Enforces: $3 risk cap, 30ct max, 50% bankroll, $3.50 cost ceiling.
     """
     entry_price_usd = entry_price_cents / 100.0
     if entry_price_usd <= 0:
@@ -742,6 +777,10 @@ def calculate_position_size(entry_price_cents: int, available_balance_usd: float
     # Bankroll limit: never risk more than 50% of available balance
     max_from_bankroll = int((available_balance_usd * MAX_BANKROLL_PER_TRADE) / entry_price_usd)
     contracts = min(contracts, max_from_bankroll)
+
+    # Hard cost ceiling: total cost must not exceed MAX_COST_PER_MARKET
+    max_from_cost_cap = int(MAX_COST_PER_MARKET / entry_price_usd)
+    contracts = min(contracts, max_from_cost_cap)
 
     # Hard caps
     contracts = max(MIN_CONTRACTS, min(MAX_CONTRACTS, contracts))
@@ -937,12 +976,14 @@ def main() -> None:
     log.warning(f"[IRON RULES] {ASSET} Bot — DATA-DRIVEN REDESIGN (Feb 2026)")
     log.warning(f"[IRON RULES] RULE 1: One direction per market — once positioned, DONE")
     log.warning(f"[IRON RULES] RULE 2: Risk-based sizing: ${MAX_RISK_PER_MARKET:.2f} risk / entry, max {MAX_CONTRACTS}ct")
-    log.warning(f"[IRON RULES] RULE 3: Max entry price {MAX_PRICE}¢ (data-driven)")
+    log.warning(f"[IRON RULES] RULE 3: YES cap {MAX_YES_PRICE}¢ | NO cap {MAX_NO_PRICE}¢ | cost cap ${MAX_COST_PER_MARKET}")
     log.warning(f"[IRON RULES] RULE 4: Never buy both YES and NO on same market")
+    log.warning(f"[IRON RULES] RULE 5: validate_order() gate before EVERY order — no bypass")
     log.warning("=" * 70)
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s "
-        f"BUY={BUY_START_SECONDS}s MAX_ENTRY={MAX_PRICE}¢ MAX_RISK=${MAX_RISK_PER_MARKET:.2f} "
+        f"BUY={BUY_START_SECONDS}s YES_CAP={MAX_YES_PRICE}¢ NO_CAP={MAX_NO_PRICE}¢ "
+        f"MAX_RISK=${MAX_RISK_PER_MARKET:.2f} MAX_COST=${MAX_COST_PER_MARKET} "
         f"MIN_CONF={MIN_CONFIDENCE:.0%} POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
     log.warning(
@@ -1236,6 +1277,7 @@ def main() -> None:
         # Log evaluation
         predicted = "yes" if p_yes > p_no else "no"
         conf = max(p_yes, p_no)
+        price_cap = MAX_YES_PRICE if predicted == "yes" else MAX_NO_PRICE
         if entry:
             decision = f"ENTER {entry[0]}@{entry[1]}¢"
         else:
@@ -1243,8 +1285,8 @@ def main() -> None:
             pred_ask = yes_ask if predicted == "yes" else no_ask
             if pred_ask is None:
                 decision = "SKIP_NO_ASK"
-            elif pred_ask > MAX_PRICE:
-                decision = f"SKIP_PRICE({pred_ask}¢>{MAX_PRICE}¢)"
+            elif pred_ask > price_cap:
+                decision = f"SKIP_PRICE({pred_ask}¢>{price_cap}¢)"
             elif conf < MIN_CONFIDENCE:
                 decision = f"SKIP_CONF({conf:.0%})"
             else:
@@ -1278,7 +1320,7 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Position sizing
+        # Position sizing (enforces $3 risk, 30ct max, 50% bankroll, $3.50 cost cap)
         desired_qty = calculate_position_size(chosen_price, available)
         log.warning(
             f"[SIZE] {st.market} @ {chosen_price}¢ → {desired_qty}ct "
@@ -1290,7 +1332,6 @@ def main() -> None:
         if book_depth > 0:
             order_qty = min(desired_qty, book_depth)
         else:
-            # Depth unknown — trust the sizing function, don't fall back to 1
             order_qty = desired_qty
 
         # Final balance check with actual order size
@@ -1298,19 +1339,6 @@ def main() -> None:
         if total_cost_usd > available:
             order_qty = max(1, int(available / cost_per_contract))
             total_cost_usd = cost_per_contract * order_qty
-
-        # HARD SAFETY: enforce risk cap even if sizing has a bug
-        total_risk_usd = order_qty * cost_per_contract
-        if total_risk_usd > MAX_RISK_PER_MARKET * 1.10:
-            order_qty = max(1, int(MAX_RISK_PER_MARKET / cost_per_contract))
-            total_cost_usd = order_qty * cost_per_contract
-            log.warning(f"[RISK-CAP] Reduced to {order_qty}ct (${total_cost_usd:.2f} ≤ ${MAX_RISK_PER_MARKET})")
-
-        # HARD SAFETY: redundant price cap (belt-and-suspenders)
-        if chosen_price > MAX_PRICE:
-            log.warning(f"[PRICE-CAP] {st.market} {chosen_side} @ {chosen_price}¢ > cap {MAX_PRICE}¢ — BLOCKED")
-            time.sleep(POLL_SECONDS)
-            continue
 
         # EV and risk calculations
         ev_per_contract = (conf * (100 - chosen_price) - (1 - conf) * chosen_price) / 100.0
@@ -1338,6 +1366,16 @@ def main() -> None:
 
         if not ENABLE_TRADING or DRY_RUN:
             log.warning(f"[DRY] Would buy {order_qty}ct {chosen_side} @ {chosen_price}¢")
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # ====== VALIDATE_ORDER: HARD GATE — NO ORDER BYPASSES THIS ======
+        allowed, block_reason = validate_order(
+            client, st.market, chosen_side, order_qty, chosen_price
+        )
+        if not allowed:
+            log.warning(f"[BLOCKED] {st.market}: {block_reason}")
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
@@ -1393,5 +1431,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: {e} | {ASSET} MAX_ENTRY={MAX_PRICE}¢")
+        log.exception(f"FATAL: {e} | {ASSET} YES_CAP={MAX_YES_PRICE}¢ NO_CAP={MAX_NO_PRICE}¢")
         sys.exit(1)

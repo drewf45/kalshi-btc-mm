@@ -15,14 +15,20 @@
 # =============================================================
 
 # -------------- MAX ENTRY PRICE PER ASSET (DATA-DRIVEN) -----
-# Data shows profit up to 80¢ BTC / 90¢ ETH.
-# ETH raised to 90¢ because ETH YES 81-90¢ bucket is profitable.
-MAX_ENTRY_PRICE_CENTS = {
+# Side-specific caps based on 135 trades of live data (Feb 16-19 2026).
+# YES above 65¢: 41 trades, $0.20 total profit, 0.2x W/L — not worth it.
+# NO entries: 79 trades, $119.30 total profit, up to 17x W/L.
+MAX_YES_PRICE_CENTS = 65  # Hard cap for YES on ALL assets
+
+MAX_NO_PRICE_CENTS = {
     'BTC': 50,
-    'ETH': 90,
+    'ETH': 70,   # ETH NO up to 70¢ is profitable per data
     'SOL': 50,
     'XRP': 50,
 }
+
+# Hard cost ceiling per market (belt-and-suspenders with risk sizing)
+MAX_COST_PER_MARKET = 3.50  # $3 target + small rounding buffer
 
 # -------------- RISK-BASED POSITION SIZING -------------------
 # contracts = floor(MAX_RISK_PER_MARKET / entry_price_dollars)
