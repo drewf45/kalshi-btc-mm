@@ -108,6 +108,9 @@ BOUNDARY_BUFFER_USD = ASSET_CFG['boundary_buffer_usd']
 MAX_YES_PRICE = MAX_YES_PRICE_CENTS                    # 65¢ for all assets
 MAX_NO_PRICE = MAX_NO_PRICE_CENTS.get(ASSET, 50)       # BTC=50, ETH=70, SOL=50, XRP=50
 
+# Fast local guard: prevents re-entry during API lag
+TRADED_TICKERS: set = set()
+
 # ======================== API CONFIG =========================
 API_BASE = getenv_first(["KALSHI_API_BASE"], "https://api.elections.kalshi.com").rstrip("/")
 API_PREFIX = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2").rstrip("/")
@@ -658,8 +661,12 @@ def validate_order(client: KalshiClient, ticker: str, side: str,
                    quantity: int, price_cents: int) -> Tuple[bool, str]:
     """
     Hard validation gate. Called immediately before EVERY order placement.
-    Returns (allowed, reason).
+    Returns (allowed, reason). FAIL-CLOSED: if any check errors, block.
     """
+    # GATE 0: Fast local guard — catches re-entry during API lag
+    if ticker in TRADED_TICKERS:
+        return False, f"Already in TRADED_TICKERS (fast guard)"
+
     # GATE 1: Side-specific price cap
     if side == "yes" and price_cents > MAX_YES_PRICE:
         return False, f"YES @{price_cents}¢ > {MAX_YES_PRICE}¢ cap"
@@ -675,13 +682,15 @@ def validate_order(client: KalshiClient, ticker: str, side: str,
     if proposed_cost > MAX_COST_PER_MARKET:
         return False, f"{quantity}ct × {price_cents}¢ = ${proposed_cost:.2f} > ${MAX_COST_PER_MARKET} max"
 
-    # GATE 4: Existing position check (API, not local state)
+    # GATE 4: Existing position check (API, not local state) — FAIL-CLOSED
     try:
         existing = abs(parse_position_for_market(get_positions(client), ticker))
         if existing > 0:
+            TRADED_TICKERS.add(ticker)  # Sync fast guard with API reality
             return False, f"Already own {existing}ct on {ticker}"
     except Exception as e:
-        log.warning(f"[VALIDATE] Position check failed: {e} — allowing with caution")
+        log.warning(f"[VALIDATE] Position check failed: {e} — BLOCKING (fail-closed)")
+        return False, f"Position check failed: {e}"
 
     return True, "OK"
 
@@ -1049,6 +1058,7 @@ def main() -> None:
             st.traded_this_market = True
             st.side = "yes" if pos > 0 else "no"
             st.qty = abs(pos)
+            TRADED_TICKERS.add(new_market)  # Sync fast guard with API
             log.warning(f"[RECON] Position on {new_market}: {st.side} x{st.qty} — HOLD")
             return
         st.traded_this_market = False
@@ -1073,7 +1083,8 @@ def main() -> None:
         if (now - last_heartbeat) >= HEARTBEAT_SECONDS:
             wr = (session.total_wins / max(1, session.total_wins + session.total_losses)) * 100
             log.warning(
-                f"[HEARTBEAT] market={st.market} traded={st.traded_this_market} | "
+                f"[HEARTBEAT] market={st.market} traded={st.traded_this_market} "
+                f"traded_set={len(TRADED_TICKERS)} | "
                 f"pnl=${session.daily_pnl_usd:+.2f} bal=${session.current_balance_usd:.2f} "
                 f"W/L={session.total_wins}/{session.total_losses} ({wr:.0f}%)"
             )
@@ -1153,6 +1164,7 @@ def main() -> None:
                             st.pending_settlement_ts = time.time()
                             log.warning(f"[ROLL] Deferring settlement for {old_market}")
 
+                    TRADED_TICKERS.discard(old_market)
                     st.event = ev2
                     st.market = mt2
                     active_market_obj = mobj2 or {}
@@ -1386,6 +1398,10 @@ def main() -> None:
                 f"on {st.market} | risk=${order_qty * chosen_price / 100:.2f}"
             )
             payload = build_order_payload(st.market, chosen_side, chosen_price, order_qty)
+
+            # Mark BEFORE sending — prevents re-entry during API lag
+            TRADED_TICKERS.add(st.market)
+
             oid = place_order(client, payload)
 
             if oid.startswith("BLOCKED"):
