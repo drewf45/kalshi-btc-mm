@@ -1202,6 +1202,7 @@ def main() -> None:
                 st.traded_this_market = True
                 st.side = "yes" if pos > 0 else "no"
                 st.qty = abs(pos)
+                TRADED_TICKERS.add(st.market)  # Sync fast guard
                 log.warning(f"[HOLD] {st.market} {st.side.upper()} x{st.qty}")
             if secs_to_close is not None and (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                 log.info(f"[HOLD] {st.market} {st.side.upper()} x{st.qty} t={secs_to_close}s")
@@ -1281,6 +1282,14 @@ def main() -> None:
                 time.sleep(10.0)
             else:
                 st.traded_this_market = True
+            continue
+
+        # FAST GUARD: if we already traded this market, skip everything
+        if st.market in TRADED_TICKERS:
+            if not st.traded_this_market:
+                st.traded_this_market = True
+                log.warning(f"[SKIP-FAST] {st.market} in TRADED_TICKERS — blocking re-entry")
+            time.sleep(POLL_SECONDS)
             continue
 
         # Evaluate entry
@@ -1392,21 +1401,22 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
+        # === COMMIT: Mark traded BEFORE sending order ===
+        # Once we pass validate_order, we are committed to this market.
+        # Set BOTH guards immediately — no code path can re-enter.
+        TRADED_TICKERS.add(st.market)
+        st.traded_this_market = True
+
         try:
             log.warning(
                 f"[ORDER-CHECK] Placing {order_qty}ct of {chosen_side} @ {chosen_price}¢ "
                 f"on {st.market} | risk=${order_qty * chosen_price / 100:.2f}"
             )
             payload = build_order_payload(st.market, chosen_side, chosen_price, order_qty)
-
-            # Mark BEFORE sending — prevents re-entry during API lag
-            TRADED_TICKERS.add(st.market)
-
             oid = place_order(client, payload)
 
             if oid.startswith("BLOCKED"):
                 log.warning(f"[ORDER] {oid}")
-                st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -1414,21 +1424,18 @@ def main() -> None:
             fill_status, filled_qty = wait_for_fill(client, oid, st.market)
 
             if fill_status in ("filled", "partial") and filled_qty > 0:
-                st.traded_this_market = True
                 st.side = chosen_side
                 st.entry_price_cents = chosen_price
                 st.qty = filled_qty
                 st.order_id = oid
                 log.warning(f"[FILL] {filled_qty}ct {chosen_side.upper()} @ {chosen_price}¢ cost=${(chosen_price/100.0)*filled_qty:.2f}")
             elif fill_status == "resting":
-                st.traded_this_market = True
                 st.side = chosen_side
                 st.entry_price_cents = chosen_price
                 st.qty = order_qty
                 st.order_id = oid
                 log.warning(f"[FILL] Resting {order_qty}ct @ {chosen_price}¢")
             elif fill_status == "unknown":
-                st.traded_this_market = True
                 st.side = chosen_side
                 st.entry_price_cents = chosen_price
                 st.qty = order_qty
@@ -1438,7 +1445,7 @@ def main() -> None:
                 cancel_order_status(client, oid)
 
         except Exception as e:
-            log.warning(f"[ORDER] Failed: {e}")
+            log.warning(f"[ORDER] Failed: {e} — market still marked as traded")
 
         time.sleep(POLL_SECONDS)
 
