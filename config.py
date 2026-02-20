@@ -247,3 +247,19 @@ BALANCE_CHECK_DELAY_SECONDS = 300
 # -------------- SHARED CONSTANTS ------------------------------
 FEE_CENTS_PER_CONTRACT = 0
 NUM_CONCURRENT_BOTS = 4
+
+# -------------- POSTER BOT SETTINGS --------------------------
+# Bot now operates as maker/poster, not taker
+# Posts NO contracts immediately at market open, amends price every 30s
+# Auto-expires unfilled remainder 90s before close
+
+POSTER_START_SECONDS = 800     # Enter at 13m20s remaining (early for fill window)
+POSTER_AMEND_INTERVAL = 30     # Amend price every 30 seconds
+POSTER_EXPIRY_BUFFER = 90      # Auto-cancel unfilled remainder 90s before close
+POSTER_PRICE_FLOOR = 10        # Minimum NO posting price in cents
+POSTER_PRICE_CEILING = 50      # Maximum NO posting price in cents
+POSTER_QUEUE_DISCOUNT = 2      # Post 2¢ below best NO ask to front-run queue
+
+# NOTE: CONTRACT_SIZING table still applies
+# Posting price determines which bucket → how many contracts to post
+# If book NO ask is 35¢, post price = 33¢ → use 31-50¢ bucket sizing

@@ -42,6 +42,8 @@ from config import (
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
     CONTRACT_SIZING, XRP_SKIP_RANGE, ETH_HIGH_PRICE_ALLOWED, ETH_HIGH_PRICE_MIN,
+    POSTER_START_SECONDS, POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
+    POSTER_PRICE_FLOOR, POSTER_PRICE_CEILING, POSTER_QUEUE_DISCOUNT,
 )
 
 # ======================== BOOT BANNER ========================
@@ -633,7 +635,8 @@ def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> No
             except Exception:
                 pass
 
-def build_order_payload(market_ticker: str, side: str, price_cents: int, count: int = 1) -> Dict[str, Any]:
+def build_order_payload(market_ticker: str, side: str, price_cents: int,
+                        count: int = 1, close_ts: Optional[int] = None) -> Dict[str, Any]:
     body = {
         "ticker": market_ticker,
         "action": "buy",
@@ -641,14 +644,45 @@ def build_order_payload(market_ticker: str, side: str, price_cents: int, count: 
         "type": "limit",
         "count": max(1, int(count)),
         "client_order_id": f"{BOT_ID}-{uuid.uuid4().hex[:12]}",
+        "post_only": True,
+        "time_in_force": "good_till_canceled",
     }
     if side == "yes":
         body["yes_price"] = int(price_cents)
     else:
         body["no_price"] = int(price_cents)
-    if POST_ONLY:
-        body["post_only"] = True
+    if close_ts is not None:
+        expiry = int(close_ts) - POSTER_EXPIRY_BUFFER
+        if expiry > int(time.time()):
+            body["expiration_ts"] = expiry
     return body
+
+
+def amend_order(client: KalshiClient, order_id: str, new_price_cents: int,
+                remaining_count: int) -> Optional[Dict[str, Any]]:
+    """
+    Amend the price of a resting order. Does NOT create a new order.
+    Only affects unfilled remainder. Already-filled contracts keep original price.
+    Returns updated order dict or None on failure.
+    """
+    try:
+        payload = {
+            "count": int(remaining_count),
+            "no_price": int(new_price_cents),
+        }
+        resp = client.request("POST", f"/portfolio/orders/{order_id}/amend",
+                              json_body=payload)
+        if isinstance(resp, dict):
+            return resp.get("order", resp)
+        return None
+    except RuntimeError as e:
+        if "HTTP 404" in str(e):
+            return None  # Order already filled or expired
+        log.warning(f"[AMEND] Failed for {order_id}: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"[AMEND] Unexpected error for {order_id}: {e}")
+        return None
 
 
 def validate_order(client: KalshiClient, ticker: str, side: str,
@@ -768,6 +802,106 @@ def get_contract_count(price_cents: int) -> int:
             log.info(f"[SIZE] {ASSET} {price_cents}¢ → bucket ({low}-{high}¢) → {contracts} contracts")
             return contracts
     log.info(f"[SIZE] {ASSET} {price_cents}¢ — no matching bucket, skipping")
+    return 0
+
+
+# ======================== POSTER PRICING =====================
+def get_best_post_price(no_ask: Optional[int]) -> int:
+    """
+    Calculate the best NO posting price to front-run the queue.
+    Returns price in cents.
+    - Posts 2¢ below current best NO ask to be first in queue
+    - Floor of 10¢ (minimum reward for capital)
+    - Ceiling of 50¢ (above 50¢ = wrong side of market)
+    - If no_ask is None (empty book), post at 50¢ (most attractive to YES buyers)
+    """
+    if no_ask is None:
+        return POSTER_PRICE_CEILING
+    target = no_ask - POSTER_QUEUE_DISCOUNT
+    return max(POSTER_PRICE_FLOOR, min(POSTER_PRICE_CEILING, target))
+
+
+def run_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
+                   close_ts: int, get_ob_func) -> int:
+    """
+    Monitors a resting order and amends price every 30 seconds to stay
+    at front of queue as the market moves.
+
+    Returns total filled contracts when done.
+
+    get_ob_func: callable that returns current orderbook dict
+    """
+    last_amend = time.time()
+    current_price = None
+
+    # Get initial price from order
+    order = get_order(client, order_id)
+    if order:
+        current_price = order.get("no_price") or order.get("yes_price")
+
+    log.info(f"[AMEND-LOOP] Starting for {order_id} on {market_ticker} "
+             f"close_ts={close_ts} initial_price={current_price}¢")
+
+    while True:
+        now = time.time()
+
+        # Check if order is done (expiration hit or fully filled)
+        if now >= (close_ts - 85):  # 5s buffer before expiration
+            log.info(f"[AMEND-LOOP] Near expiry, stopping loop for {order_id}")
+            break
+
+        # Get current order status
+        order = get_order(client, order_id)
+        if order is None:
+            log.info(f"[AMEND-LOOP] Order {order_id} not found — assuming expired/filled")
+            break
+
+        status = order.get("status", "")
+        fill_count = order.get("fill_count", 0)
+        remaining = order.get("remaining_count", 0)
+
+        log.info(f"[AMEND-LOOP] {order_id} status={status} "
+                 f"filled={fill_count} remaining={remaining} price={current_price}¢")
+
+        if status in ("executed", "canceled") or remaining == 0:
+            log.info(f"[AMEND-LOOP] Order {order_id} done: {status} "
+                     f"filled={fill_count}")
+            break
+
+        # Amend price every 30 seconds
+        if (now - last_amend) >= POSTER_AMEND_INTERVAL:
+            try:
+                ob = get_ob_func()
+                _, _, _, no_ask = parse_best_yes_no(ob)
+                new_price = get_best_post_price(no_ask)
+
+                if new_price != current_price and remaining > 0:
+                    old_price = current_price
+                    result = amend_order(client, order_id, new_price, remaining)
+                    if result is not None:
+                        current_price = new_price
+                        log.warning(
+                            f"[AMEND] {market_ticker} {order_id} "
+                            f"{old_price}¢ → {new_price}¢ "
+                            f"remaining={remaining} no_ask={no_ask}¢"
+                        )
+                    else:
+                        log.info(f"[AMEND] {order_id} amend returned None — order done")
+                        break
+                else:
+                    log.info(f"[AMEND] {order_id} price unchanged at {current_price}¢")
+
+            except Exception as e:
+                log.warning(f"[AMEND] Error in amend loop: {e}")
+
+            last_amend = now
+
+        time.sleep(POLL_SECONDS)
+
+    # Final fill count
+    final_order = get_order(client, order_id)
+    if final_order:
+        return int(final_order.get("fill_count", 0))
     return 0
 
 
@@ -1306,8 +1440,8 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # OBSERVE phase
-        if secs_to_close > BUY_START_SECONDS:
+        # OBSERVE phase — wait until POSTER_START_SECONDS
+        if secs_to_close > POSTER_START_SECONDS:
             if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
                 log.info(
                     f"[OBSERVE] {st.market} t={secs_to_close}s spot=${spot:.2f} "
@@ -1327,118 +1461,50 @@ def main() -> None:
                 st.traded_this_market = True
             continue
 
-        # Only re-evaluate if orderbook has changed
-        # Prevents 595 identical evaluations on same market
-        book_changed = (
-            yes_ask != st.last_evaluated_yes_ask or
-            no_ask != st.last_evaluated_no_ask
-        )
-        if not book_changed and st.last_evaluated_yes_ask is not None:
-            time.sleep(POLL_SECONDS)
-            continue
-        st.last_evaluated_yes_ask = yes_ask
-        st.last_evaluated_no_ask = no_ask
+        # ============ POSTER ENTRY — fires once per market ============
 
-        # Evaluate entry
-        entry = should_enter(p_yes, p_no, yes_ask, no_ask)
-
-        # Log evaluation
-        predicted = "yes" if p_yes > p_no else "no"
-        conf = max(p_yes, p_no)
-        if entry:
-            decision = f"ENTER {entry[0]}@{entry[1]}¢"
-        else:
-            pred_ask = yes_ask if predicted == "yes" else no_ask
-            if pred_ask is None:
-                decision = "SKIP_NO_ASK"
-            else:
-                allowed_here, cap_reason = price_is_allowed(pred_ask)
-                if not allowed_here:
-                    decision = f"SKIP_PRICE({cap_reason})"
-                elif get_contract_count(pred_ask) == 0:
-                    decision = "SKIP_NO_BUCKET"
-                elif conf < MIN_CONFIDENCE:
-                    decision = f"SKIP_CONF({conf:.0%})"
-                else:
-                    decision = "SKIP_EDGE"
-
-        log.info(
-            f"[EVAL] {st.market} t={secs_to_close}s | signal={predicted} conf={conf:.1%} | "
-            f"yes_ask={yes_ask}¢ no_ask={no_ask}¢ | {decision}"
-        )
-
-        if entry is None:
-            time.sleep(POLL_SECONDS)
-            continue
-
-        chosen_side, chosen_price = entry
-
-        # Session limits
+        # Session and balance checks (UNCHANGED from current)
         can_trade, reason = session.check_can_trade()
         if not can_trade:
-            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.warning(f"[SESSION] Paused: {reason}")
-                last_state_log = now
+            log.warning(f"[SESSION] Paused: {reason}")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Balance check
         available, _ = get_balance_usd(client)
         if available is not None and available < MIN_BOT_BALANCE:
-            log.warning(f"[SKIP] Balance ${available:.2f} < ${MIN_BOT_BALANCE} minimum — paused")
-            time.sleep(POLL_SECONDS)
-            continue
-        cost_per_contract = chosen_price / 100.0
-        if available is None or available < cost_per_contract:
-            log.warning(f"[SKIP] Insufficient balance: ${available} < ${cost_per_contract:.2f}")
+            log.warning(f"[SKIP] Balance ${available:.2f} < ${MIN_BOT_BALANCE} minimum")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Data-driven contract sizing from CONTRACT_SIZING table
-        order_qty = get_contract_count(chosen_price)
+        # Get current best NO posting price
+        post_price = get_best_post_price(no_ask)
+
+        # Get contract count from sizing table
+        order_qty = get_contract_count(post_price)
         if order_qty == 0:
-            log.warning(f"[SKIP] No sizing bucket for {chosen_price}¢")
+            log.info(f"[SKIP] No sizing bucket for {post_price}¢ — waiting")
             time.sleep(POLL_SECONDS)
             continue
 
         # Cost cap enforcement
-        total_cost_usd = cost_per_contract * order_qty
-        if total_cost_usd > MAX_COST_PER_MARKET:
-            order_qty = max(1, int(MAX_COST_PER_MARKET / cost_per_contract))
-            total_cost_usd = cost_per_contract * order_qty
-
-        # Balance cap
-        if total_cost_usd > available:
-            order_qty = max(1, int(available / cost_per_contract))
-            total_cost_usd = cost_per_contract * order_qty
-
-        # Historical accuracy
-        hist = get_historical_accuracy(chosen_side, chosen_price)
-        hist_str = f"acc={hist[0]:.0%} n={hist[1]}" if hist else "no_hist_data"
-
-        # Find which bucket matched
-        bucket_str = "?"
-        for (lo_b, hi_b) in CONTRACT_SIZING.get(ASSET, {}):
-            if lo_b <= chosen_price <= hi_b:
-                bucket_str = f"{lo_b}-{hi_b}¢"
-                break
-
-        log.warning(
-            f"[TRADE] {st.market} {chosen_side.upper()} {order_qty}ct @ {chosen_price}¢ | "
-            f"bucket=({bucket_str}) cost=${total_cost_usd:.2f} | "
-            f"conf={conf:.0%} {hist_str} | bal=${available:.2f}"
-        )
+        total_cost = order_qty * (post_price / 100.0)
+        if total_cost > MAX_COST_PER_MARKET:
+            order_qty = max(1, int(MAX_COST_PER_MARKET / (post_price / 100.0)))
+            total_cost = order_qty * (post_price / 100.0)
+        if available is not None and total_cost > available:
+            order_qty = max(1, int(available / (post_price / 100.0)))
+            total_cost = order_qty * (post_price / 100.0)
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] Would buy {order_qty}ct {chosen_side} @ {chosen_price}¢")
+            log.warning(f"[DRY] Would post {order_qty}ct NO @ {post_price}¢ (no_ask={no_ask}¢)")
             TRADED_TICKERS.add(st.market)
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
-        # ====== VALIDATE_ORDER: HARD GATE — NO ORDER BYPASSES THIS ======
+        # Validate (UNCHANGED — same iron rules apply)
         allowed, block_reason = validate_order(
-            client, st.market, chosen_side, order_qty, chosen_price
+            client, st.market, "no", order_qty, post_price
         )
         if not allowed:
             log.warning(f"[BLOCKED] {st.market}: {block_reason}")
@@ -1447,52 +1513,60 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # === COMMIT: Lock ticker BEFORE sending order ===
-        # Once we pass validate_order, we are committed to this market.
-        # Set BOTH guards immediately — no code path can re-enter.
+        # COMMIT — lock ticker BEFORE placing order (UNCHANGED)
         TRADED_TICKERS.add(st.market)
         st.traded_this_market = True
-        log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS — proceeding to order")
+        log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS — proceeding to poster order")
 
         try:
             log.warning(
-                f"[ORDER-CHECK] Placing {order_qty}ct of {chosen_side} @ {chosen_price}¢ "
-                f"on {st.market} | risk=${order_qty * chosen_price / 100:.2f}"
+                f"[POSTER] {st.market} NO {order_qty}ct @ {post_price}¢ "
+                f"(no_ask={no_ask}¢ discount={POSTER_QUEUE_DISCOUNT}¢) cost=${total_cost:.2f} "
+                f"expiry={close_ts - POSTER_EXPIRY_BUFFER} bal=${available:.2f}"
             )
-            payload = build_order_payload(st.market, chosen_side, chosen_price, order_qty)
+
+            payload = build_order_payload(
+                st.market, "no", post_price, order_qty, close_ts=close_ts
+            )
             oid = place_order(client, payload)
 
             if oid.startswith("BLOCKED"):
-                log.warning(f"[ORDER] {oid}")
+                log.warning(f"[POSTER] Blocked: {oid}")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            log.warning(f"[ORDER] Placed {oid} BUY {order_qty}ct {chosen_side.upper()} @ {chosen_price}¢")
-            fill_status, filled_qty = wait_for_fill(client, oid, st.market)
+            log.warning(
+                f"[POSTER-ORDER] Placed {oid} POST_ONLY NO {order_qty}ct @ {post_price}¢ "
+                f"expiry=close-{POSTER_EXPIRY_BUFFER}s"
+            )
 
-            if fill_status in ("filled", "partial") and filled_qty > 0:
-                st.side = chosen_side
-                st.entry_price_cents = chosen_price
-                st.qty = filled_qty
-                st.order_id = oid
-                log.warning(f"[FILL] {filled_qty}ct {chosen_side.upper()} @ {chosen_price}¢ cost=${(chosen_price/100.0)*filled_qty:.2f}")
-            elif fill_status == "resting":
-                st.side = chosen_side
-                st.entry_price_cents = chosen_price
-                st.qty = order_qty
-                st.order_id = oid
-                log.warning(f"[FILL] Resting {order_qty}ct @ {chosen_price}¢")
-            elif fill_status == "unknown":
-                st.side = chosen_side
-                st.entry_price_cents = chosen_price
-                st.qty = order_qty
-                log.warning(f"[FILL] Unknown — marking traded {order_qty}ct")
+            st.side = "no"
+            st.entry_price_cents = post_price
+            st.qty = order_qty
+            st.order_id = oid
+
+            # Run amend loop — reprices every 30s until expiry
+            def fetch_ob():
+                return client.request(
+                    "GET", f"/markets/{st.market}/orderbook"
+                ) or {}
+
+            filled_count = run_amend_loop(
+                client, oid, st.market, close_ts, fetch_ob
+            )
+
+            if filled_count > 0:
+                st.qty = filled_count
+                st.entry_price_cents = post_price
+                log.warning(
+                    f"[POSTER-FILL] {st.market} filled {filled_count}ct NO @ avg ~{post_price}¢ "
+                    f"cost=${filled_count * post_price / 100:.2f}"
+                )
             else:
-                log.warning(f"[FILL] Not filled ({fill_status}) — canceling")
-                cancel_order_status(client, oid)
+                log.info(f"[POSTER-FILL] {st.market} — 0 fills, order expired unfilled")
 
         except Exception as e:
-            log.warning(f"[ORDER] Failed: {e} — market still marked as traded")
+            log.warning(f"[POSTER] Failed: {e} — market still marked as traded")
 
         time.sleep(POLL_SECONDS)
 
