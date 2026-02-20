@@ -1,9 +1,24 @@
 # config.py — Shared constants, data-driven sizing, price caps
 # Used by all 4 bots (BTC, ETH, SOL, XRP)
 #
-# DATA-DRIVEN V4 (Feb 19, 2026)
-# Full historical analysis: 2,066 settled 15M markets, Feb 1-19 2026
-# Kelly-criterion contract sizing per asset per price bucket
+# DATA-DRIVEN V6 (Feb 20, 2026)
+# Full historical analysis: 2,221 settled 15M markets across all data
+#
+# CORE FINDING: All edge lives in NO contracts at low prices.
+# YES 81-99¢ entries are net NEGATIVE on every single asset.
+# BTC has no edge above NO 20¢. Killed all losing buckets.
+#
+# PROVEN WINNERS ONLY:
+#   XRP  NO 1-10¢:  $4.07/trade, 80% WR  ← best bucket in system
+#   XRP  NO 11-20¢: $3.24/trade, 69% WR
+#   ETH  NO 1-10¢:  $3.02/trade, 86% WR
+#   BTC  NO 1-10¢:  $2.93/trade, 78% WR
+#   ETH  NO 11-20¢: $2.22/trade, 73% WR
+#   BTC  NO 11-20¢: $1.80/trade, 60% WR
+#   SOL  NO 11-20¢: $1.34/trade, 68% WR
+#   SOL  NO 1-10¢:  $1.09/trade, 56% WR
+#   ETH  NO 21-30¢: $1.01/trade, 58% WR
+#   XRP  NO 31-50¢: $0.95/trade, 67% WR
 
 # ======================== IRON RULES ========================
 # RULE 1: One direction per market — once positioned, DONE
@@ -23,18 +38,19 @@ MAX_RISK_PER_TRADE_PCT = 0.25 # 25% of bot allocation = $6.25 max risk
 # Derived from 19 days of settlement data. Only price ranges with
 # positive EV and 55%+ win rate are permitted.
 MAX_ENTRY_PRICE_CENTS = {
-    'BTC': 90,   # Opens YES 81-90c bucket (91.8% WR, 552 trades)
-    'ETH': 25,   # ETH_HIGH_PRICE_ALLOWED handles 81c+ separately
-    'SOL': 99,   # Opens YES 81-99c bucket (96.4% WR, 137 trades)
-    'XRP': 99,   # Unchanged — skip range handles dead zone
+    'BTC': 20,   # Data: only NO 1-10¢ and NO 11-20¢ are net positive
+    'ETH': 30,   # Data: NO 1-10¢, NO 11-20¢, NO 21-30¢ all net positive
+    'SOL': 20,   # Data: only NO 1-10¢ and NO 11-20¢ are net positive
+    'XRP': 50,   # Data: edge extends to NO 31-50¢ ($0.95/trade, 67% WR)
 }
 
-# XRP-specific: skip the 31-50¢ dead zone (10% WR, -$4.40 net)
-XRP_SKIP_RANGE = (31, 50)
+# XRP-specific: skip the 21-30¢ dead zone (insufficient sample size, 5 trades)
+# XRP NO 31-50¢ IS now a valid bucket (21 trades, 67% WR)
+XRP_SKIP_RANGE = (21, 30)
 
-# ETH high-price window: allow 81-99¢ entries (83% WR, +$708 net)
-ETH_HIGH_PRICE_ALLOWED = True
-ETH_HIGH_PRICE_MIN = 81
+# ETH high-price window: DISABLED — YES 81-99¢ is net -$154 across all data
+ETH_HIGH_PRICE_ALLOWED = False
+ETH_HIGH_PRICE_MIN = 81          # kept for reference, flag is False
 
 # Hard cost ceiling per market (belt-and-suspenders)
 MAX_COST_PER_MARKET = 6.25    # 25% of $25 bot allocation
@@ -44,32 +60,40 @@ MAX_COST_PER_MARKET = 6.25    # 25% of $25 bot allocation
 # (asset, price_bucket) → exact contract count
 # Capped at 25% of bot allocation ($6.25 max risk) per trade.
 CONTRACT_SIZING = {
+    # BTC: only NO 1-20¢ has edge
+    # NO 1-10¢:  78% WR, $2.93/trade net
+    # NO 11-20¢: 60% WR, $1.80/trade net
     'BTC': {
-        (1, 10):  30,   # 94.9% WR — 30ct @ avg 5c = $1.50 risk
-        (11, 20): 25,   # 89.0% WR — 25ct @ avg 15c = $3.75 risk
-        (21, 30): 5,    # 58.5% WR — 5ct @ avg 25c = $1.25 risk
-        (31, 40): 3,    # marginal — keep conservative
-        (81, 90): 7,    # 91.8% WR — 7ct @ avg 85c = $5.95 risk
+        (1, 10):  30,   # 78% WR — 30ct @ avg 5¢  = $1.50 risk
+        (11, 20): 15,   # 60% WR — lower confidence, reduce from 25 to 15
     },
+
+    # ETH: NO 1-10¢, 11-20¢, 21-30¢ all net positive
+    # NO 1-10¢:  86% WR, $3.02/trade net
+    # NO 11-20¢: 73% WR, $2.22/trade net
+    # NO 21-30¢: 58% WR, $1.01/trade net
     'ETH': {
-        (1, 10):  30,   # 94.9% WR — was 20
-        (11, 20): 25,   # 89.0% WR — was 10
-        (21, 25): 5,    # unchanged
-        (81, 99): 7,    # 91.6% WR — was 3
+        (1, 10):  30,   # 86% WR — 30ct @ avg 5¢  = $1.50 risk
+        (11, 20): 20,   # 73% WR — 20ct @ avg 15¢ = $3.00 risk
+        (21, 30): 8,    # 58% WR — 8ct  @ avg 25¢ = $2.00 risk
     },
+
+    # SOL: NO 1-10¢ and NO 11-20¢ only
+    # NO 1-10¢:  56% WR, $1.09/trade net
+    # NO 11-20¢: 68% WR, $1.34/trade net
     'SOL': {
-        (1, 10):  30,   # 94.9% WR — 30ct @ avg 5c = $1.50 risk
-        (11, 20): 25,   # 89.0% WR — 25ct @ avg 15c = $3.75 risk
-        (81, 90): 7,    # 96.4% WR — 7ct @ avg 85c = $5.95 risk
-        (91, 99): 6,    # 96.4% WR — 6ct @ avg 95c = $5.70 risk
+        (1, 10):  20,   # 56% WR — reduce sizing, thinner edge
+        (11, 20): 20,   # 68% WR — 20ct @ avg 15¢ = $3.00 risk
     },
+
+    # XRP: edge extends further than other assets
+    # NO 1-10¢:  80% WR, $4.07/trade net  ← BEST BUCKET IN ENTIRE SYSTEM
+    # NO 11-20¢: 69% WR, $3.24/trade net
+    # NO 31-50¢: 67% WR, $0.95/trade net
     'XRP': {
-        (1, 10):  30,   # 87.9% WR — was 20
-        (11, 20): 25,   # 87.9% WR — was 10
-        (21, 30): 10,   # 87.9% WR — was 6
-        (51, 65): 4,    # unchanged
-        (66, 80): 0,    # 19% WR in full data — REMOVE this bucket
-        (81, 99): 5,    # 90.8% WR — was 2
+        (1, 10):  30,   # 80% WR — 30ct @ avg 5¢  = $1.50 risk
+        (11, 20): 20,   # 69% WR — 20ct @ avg 15¢ = $3.00 risk
+        (31, 50): 8,    # 67% WR — 8ct  @ avg 40¢ = $3.20 risk
     },
 }
 
@@ -77,30 +101,25 @@ CONTRACT_SIZING = {
 MIN_CONFIDENCE = 0.60
 
 # -------------- HISTORICAL ACCURACY BY PRICE BUCKET -------------
-# From analysis of 2,066 markets, Feb 1-19 2026
+# From full analysis of 2,221 settled markets across all data
 HISTORICAL_ACCURACY = {
     'BTC': {
-        'NO_1_10':   (0.949, 619,  0.90),
-        'NO_11_20':  (0.890, 411,  0.72),
-        'NO_21_50':  (0.585, 78,   0.23),
-        'YES_81_90': (0.918, 552,  0.14),
+        'NO_1_10':   (0.780, 288, 0.90),   # live data: 78% WR, 288 trades
+        'NO_11_20':  (0.600, 200, 0.72),   # live data: 60% WR, 200 trades
     },
     'ETH': {
-        'NO_1_10':   (0.949, 411,  0.90),
-        'NO_11_20':  (0.890, 280,  0.72),
-        'NO_21_50':  (0.514, 37,   0.12),
-        'YES_81_90': (0.916, 154,  0.13),
+        'NO_1_10':   (0.857, 98,  0.90),   # live data: 86% WR, 98 trades
+        'NO_11_20':  (0.730, 133, 0.72),   # live data: 73% WR, 133 trades
+        'NO_21_30':  (0.576, 33,  0.55),   # live data: 58% WR, 33 trades
     },
     'SOL': {
-        'NO_1_10':   (0.932, 294,  0.88),
-        'NO_11_20':  (0.890, 174,  0.72),
-        'YES_81_90': (0.964, 137,  0.14),
+        'NO_1_10':   (0.556, 153, 0.85),   # live data: 56% WR, 153 trades
+        'NO_11_20':  (0.684, 76,  0.72),   # live data: 68% WR, 76 trades
     },
     'XRP': {
-        'NO_1_10':   (0.879, 280,  0.85),
-        'NO_11_20':  (0.879, 200,  0.68),
-        'NO_21_30':  (0.879, 120,  0.65),
-        'YES_81_90': (0.908, 228,  0.09),
+        'NO_1_10':   (0.798, 84,  0.90),   # live data: 80% WR, 84 trades
+        'NO_11_20':  (0.688, 48,  0.72),   # live data: 69% WR, 48 trades
+        'NO_31_50':  (0.667, 21,  0.55),   # live data: 67% WR, 21 trades
     },
 }
 
