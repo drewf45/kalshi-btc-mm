@@ -755,42 +755,22 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
 # ======================== PRICE GATING =========================
 def price_is_allowed(price_cents: int) -> Tuple[bool, str]:
     """
-    Asset-specific price gate with dead zone skips.
-    Returns (allowed, reason).
+    Poster model price gate — NO contracts only.
+    Dead zones removed. Poster posts at best available price up to asset ceiling.
+    Ceiling set by MAX_ENTRY_PRICE_CENTS in config:
+      BTC: 50¢  ETH: 50¢  SOL: 20¢  XRP: 40¢
+    XRP additionally skips 21-50¢ range (XRP_SKIP_RANGE).
     """
     if ASSET == 'XRP':
         if XRP_SKIP_RANGE[0] <= price_cents <= XRP_SKIP_RANGE[1]:
-            return False, f"XRP {price_cents}¢ in dead zone ({XRP_SKIP_RANGE[0]}-{XRP_SKIP_RANGE[1]}¢)"
+            return False, f"XRP {price_cents}¢ in skip range ({XRP_SKIP_RANGE[0]}-{XRP_SKIP_RANGE[1]}¢)"
         if price_cents <= MAX_PRICE:
             return True, "OK"
-        return False, f"XRP {price_cents}¢ > {MAX_PRICE}¢ cap"
+        return False, f"XRP {price_cents}¢ above {MAX_PRICE}¢ ceiling"
 
-    if ASSET == 'ETH':
-        if price_cents <= MAX_PRICE:
-            return True, "OK"
-        if ETH_HIGH_PRICE_ALLOWED and price_cents >= ETH_HIGH_PRICE_MIN:
-            return True, "OK (ETH high-price window)"
-        return False, f"ETH {price_cents}¢ in dead zone (26-80¢)"
-
-    # BTC and SOL: allow low prices + YES high-price window, block dead zone
-    if ASSET == 'BTC':
-        if price_cents <= 40:
-            return True, "OK"
-        if price_cents >= 81 and price_cents <= 90:
-            return True, "OK (BTC YES high-price window)"
-        return False, f"BTC {price_cents}¢ in dead zone (41-80¢)"
-
-    if ASSET == 'SOL':
-        if price_cents <= 20:
-            return True, "OK"
-        if price_cents >= 81:
-            return True, "OK (SOL YES high-price window)"
-        return False, f"SOL {price_cents}¢ in dead zone (21-80¢)"
-
-    # Generic fallback for any other asset
     if price_cents <= MAX_PRICE:
         return True, "OK"
-    return False, f"{ASSET} {price_cents}¢ > {MAX_PRICE}¢ cap"
+    return False, f"{ASSET} {price_cents}¢ above {MAX_PRICE}¢ poster ceiling"
 
 
 # ======================== CONTRACT SIZING =====================
