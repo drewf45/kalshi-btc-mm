@@ -50,6 +50,26 @@ from config import (
 # Asset-specific book premium — SOL has medium spreads
 POSTER_BOOK_PREMIUM = 2  # SOL — medium spreads
 
+# SOL gap thresholds by book price zone
+# Note: SOL NO 51-65¢ was a true negative (33% WR) — blocked at 99¢
+# Zones 21-40¢ and 66-80¢ have no clean data — blocked
+SOL_GAP_THRESHOLDS = [
+    (1,  10,  4),   # 92.9% WR — strong zone
+    (11, 20,  5),   # 88.2% WR — good zone
+    (21, 40, 99),   # No clean data — block
+    (41, 50,  6),   # 83.3% WR — small sample, moderate gate
+    (51, 65, 99),   # 33% WR — true negative, block
+    (66, 80, 99),   # No clean data — block
+    (81, 90,  5),   # 90.0% WR — strong zone
+    (91, 99,  4),   # 95.0% WR — near-certain
+]
+
+def get_min_gap(book_price: int) -> int:
+    for (lo, hi, gap) in SOL_GAP_THRESHOLDS:
+        if lo <= book_price <= hi:
+            return gap
+    return 99
+
 # ======================== BOOT BANNER ========================
 print(f"BOOT: sol_bot.py loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)
 
@@ -813,18 +833,19 @@ def evaluate_poster_entry(p_yes: float, p_no: float,
     if yes_ask is not None:
         fair_yes = int(round(p_yes * 100))
         gap = fair_yes - yes_ask
-        post_price = yes_ask + POSTER_BOOK_PREMIUM
-        post_price = max(1, min(99, post_price))
+        min_gap = get_min_gap(yes_ask)
 
         log.info(
             f"[EVAL-YES] p_yes={p_yes:.1%} fair={fair_yes}¢ "
             f"yes_ask={yes_ask}¢ gap={gap:+d}¢ "
-            f"min_gap={POSTER_MIN_GAP_CENTS}¢"
+            f"min_gap={min_gap}¢"
         )
 
-        if gap >= POSTER_MIN_GAP_CENTS:
+        if gap >= min_gap:
+            post_price = yes_ask + POSTER_BOOK_PREMIUM
+            post_price = max(1, min(99, post_price))
             log.warning(
-                f"[TRIGGER-YES] gap={gap:+d}¢ >= {POSTER_MIN_GAP_CENTS}¢ "
+                f"[TRIGGER-YES] gap={gap:+d}¢ >= {min_gap}¢ "
                 f"— POSTING YES at {post_price}¢"
             )
             return ("yes", post_price, gap)
@@ -833,18 +854,19 @@ def evaluate_poster_entry(p_yes: float, p_no: float,
     if no_ask is not None:
         fair_no = int(round(p_no * 100))
         gap = fair_no - no_ask
-        post_price = no_ask + POSTER_BOOK_PREMIUM
-        post_price = max(1, min(99, post_price))
+        min_gap = get_min_gap(no_ask)
 
         log.info(
             f"[EVAL-NO] p_no={p_no:.1%} fair={fair_no}¢ "
             f"no_ask={no_ask}¢ gap={gap:+d}¢ "
-            f"min_gap={POSTER_MIN_GAP_CENTS}¢"
+            f"min_gap={min_gap}¢"
         )
 
-        if gap >= POSTER_MIN_GAP_CENTS:
+        if gap >= min_gap:
+            post_price = no_ask + POSTER_BOOK_PREMIUM
+            post_price = max(1, min(99, post_price))
             log.warning(
-                f"[TRIGGER-NO] gap={gap:+d}¢ >= {POSTER_MIN_GAP_CENTS}¢ "
+                f"[TRIGGER-NO] gap={gap:+d}¢ >= {min_gap}¢ "
                 f"— POSTING NO at {post_price}¢"
             )
             return ("no", post_price, gap)
@@ -975,11 +997,11 @@ def run_gap_amend_loop(client, order_id: str,
                     f"gap={gap:+d}¢ cancel_gap={POSTER_CANCEL_GAP}¢"
                 )
 
-                # ── CANCEL IF GAP INVERTED ─────────────────────
-                if gap <= POSTER_CANCEL_GAP:
+                # ── CANCEL IF GAP BELOW ZONE THRESHOLD ─────────
+                min_gap = get_min_gap(book_ask) if book_ask is not None else 99
+                if gap < min_gap:
                     log.warning(
-                        f"[GAP-AMEND] Gap collapsed "
-                        f"({gap:+d}¢ <= {POSTER_CANCEL_GAP}¢) "
+                        f"[GAP-AMEND] Gap {gap:+d}¢ < zone min {min_gap}¢ "
                         f"— canceling {order_id}"
                     )
                     cancel_order_status(client, order_id)
