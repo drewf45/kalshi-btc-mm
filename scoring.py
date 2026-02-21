@@ -333,6 +333,9 @@ def evaluate_entry(
     Positive gap = model thinks it's worth more than the book is charging.
     That's the edge.
     """
+    if model_fair_cents <= book_ask:
+        return None
+
     gap_cents = float(model_fair_cents - book_ask)
 
     # Negative gap = model thinks contract is overpriced relative to book
