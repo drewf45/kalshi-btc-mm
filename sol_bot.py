@@ -1405,8 +1405,19 @@ def main() -> None:
                 continue
 
             # ── SCORE-DRIVEN ENTRY EVALUATION (V9) ──
-            eval_side        = 'yes' if p_yes > p_no else 'no'
-            book_ask         = yes_ask if eval_side == 'yes' else no_ask
+            # Always evaluate both sides — binary market, one is always tradeable
+            if p_yes >= p_no:
+                eval_side = 'yes'
+                book_ask  = yes_ask if yes_ask is not None else (100 - no_bid) if no_bid is not None else None
+            else:
+                eval_side = 'no'
+                book_ask  = no_ask if no_ask is not None else (100 - yes_bid) if yes_bid is not None else None
+
+            # If still no ask, derive from opposite side
+            if book_ask is None:
+                eval_side = 'no' if eval_side == 'yes' else 'yes'
+                book_ask  = no_ask if eval_side == 'no' else yes_ask
+
             model_fair_cents = round(p_yes * 100) if eval_side == 'yes' else round(p_no * 100)
 
             if book_ask is None:
