@@ -1,188 +1,155 @@
-# config.py — Shared constants, data-driven sizing, price caps
+# config.py — Shared constants, universal weighted scoring system
 # Used by all 4 bots (BTC, ETH, SOL, XRP)
 #
-# DATA-DRIVEN V8 (Feb 20, 2026)
-# Source: 1,526 clean single-entry 15M markets, Jan 24 – Feb 20 2026
-# P&L method: true net = Profit_In_Dollars - (contracts * price / 100)
+# DATA-DRIVEN V9 (Feb 21, 2026)
+# Source: 1,526 clean single-entry markets (Jan 24–Feb 20) + 688 live markets (Feb 19-21)
 #
-# SYSTEM TRUTH:
-#   Edge = NO contracts at low prices only
-#   Everything else = killed by correct math
+# PHILOSOPHY:
+# Nothing is hard-killed. Everything is eligible.
+# Score = win_rate × kelly × sample_weight × gap_weight × time_weight
+# Score naturally kills bad zones — their math never clears MIN_SCORE_TO_TRADE.
+# Contracts scale with score tier as % of live bankroll (20% hard cap).
 #
-# PROVEN EDGE (NO contracts, clean entries):
-#   BTC NO  1-5¢:  100% WR | $3.26/mkt | 109 markets | kelly 1.0
-#   BTC NO  6-10¢:  97.9% WR | $3.34/mkt |  97 markets | kelly 0.98
-#   BTC NO 11-15¢:  96.7% WR | $3.01/mkt |  92 markets | kelly 0.96
-#   BTC NO 16-20¢:  85.3% WR | $3.86/mkt |  34 markets | kelly 0.83
-#   ETH NO  1-5¢:   94.7% WR | $2.85/mkt |  19 markets | kelly 0.94
-#   ETH NO  6-10¢:  96.7% WR | $2.47/mkt |  60 markets | kelly 0.97
-#   ETH NO 11-15¢:  90.2% WR | $2.41/mkt |  51 markets | kelly 0.89
-#   ETH NO 16-20¢:  83.7% WR | $2.04/mkt |  49 markets | kelly 0.80
-#   SOL NO  1-5¢:  100.0% WR | $2.46/mkt |  31 markets | kelly 1.0
-#   SOL NO  6-10¢:  92.6% WR | $1.82/mkt |  54 markets | kelly 0.92
-#   SOL NO 11-15¢:  85.7% WR | $1.67/mkt |  49 markets | kelly 0.84
-#   SOL NO 16-20¢: 100.0% WR | $3.40/mkt |  10 markets | kelly 1.0
-#   XRP NO  1-5¢:  100.0% WR | $2.73/mkt |  20 markets | kelly 1.0
-#   XRP NO  6-10¢:  85.0% WR | $2.31/mkt |  40 markets | kelly 0.84
-#   XRP NO 11-15¢:  70.0% WR | $2.23/mkt |  20 markets | kelly 0.67
-#   XRP NO 16-20¢:  91.7% WR | $2.92/mkt |  12 markets | kelly 0.89
-#
-# SECONDARY EDGE (smaller sample, keep conservative sizing):
-#   BTC NO 21-30¢:  73.7% WR | $2.61/mkt |  19 markets
-#   BTC NO 31-50¢:  90.9% WR | $3.00/mkt |  21 markets
-#   ETH NO 21-30¢:  65.2% WR | $1.05/mkt |  23 markets
-#   ETH NO 31-40¢:  61.9% WR | $0.81/mkt |  21 markets
-#   XRP NO 31-40¢:  73.9% WR | $1.41/mkt |  23 markets
-#
-# KILLED (every bucket above 50¢, all YES below 50¢):
-#   Net/mkt ranges from -$1.40 to +$0.42 — not worth blowup risk
-#   One loss at 85¢ (7ct = $5.95) wipes 15-60 wins in low-price buckets
+# SCORE TIERS (derived from profitability data):
+# HIGH   (≥ 0.70) → 15-20% of bankroll → elite zones like BTC NO 1-10¢, YES 91-99¢
+# MEDIUM (≥ 0.40) → 8-12% of bankroll  → solid zones like NO 16-20¢, YES 81-90¢
+# LOW    (≥ 0.15) → 3-5% of bankroll   → marginal zones, barely trades
+# BELOW  (< 0.15) → never trades        → noise, not real edge
 
 # ======================== IRON RULES ========================
-# RULE 1: NO contracts only — YES entries have no confirmed edge
-# RULE 2: Max price 50¢ — everything above is killed
-# RULE 3: Single entry per market — TRADED_TICKERS + API position check
-# RULE 4: Data-driven contract sizing per asset per price bucket
-# RULE 5: Never exceed MAX_COST_PER_MARKET = $6.25
+# RULE 1: One direction per market — once positioned, DONE
+# RULE 2: Score gates entry — no bucket, no hardcoded kill list
+# RULE 3: Contracts = score-driven % of live bankroll, 20% hard cap
+# RULE 4: Never buy both YES and NO on same market
+# RULE 5: Single entry per market — TRADED_TICKERS + API position check
 # =============================================================
 
-# -------------- BANKROLL ALLOCATION ----------------------------
-TOTAL_BANKROLL = 100.00
-BOT_ALLOCATION = 25.00
-MIN_BOT_BALANCE = 5.00
-MAX_RISK_PER_TRADE_PCT = 0.25  # $6.25 max per trade
+# ––––––– BANKROLL ALLOCATION ––––––––––––––
+TOTAL_BANKROLL       = 100.00   # Updated at runtime from live balance
+BOT_ALLOCATION       = 25.00    # Per bot — used for legacy compat only
+MIN_BOT_BALANCE      = 5.00     # Pause if balance drops below this
+MAX_RISK_PCT         = 0.20     # 20% of TOTAL live balance = hard cap per trade
 
-# -------------- PRICE CAPS — NO CONTRACTS ONLY, MAX 50¢ -------
-# Above 50¢: confirmed negative or marginal after correct P&L math
-# YES entries: no edge below 50¢ (60% WR, $0.37/mkt on 20 clean markets)
-MAX_ENTRY_PRICE_CENTS = {
-    'BTC': 50,
-    'ETH': 50,
-    'SOL': 20,   # SOL data shows no edge above 20¢ (no 21-50¢ sample)
-    'XRP': 40,   # XRP 41-50¢ has insufficient sample, XRP 31-40¢ confirmed
+# ––––––– SCORE THRESHOLDS ——————————
+MIN_SCORE_TO_TRADE   = 0.15     # Below this: never trades (natural kill zone)
+SCORE_HIGH_THRESHOLD = 0.70     # HIGH tier: elite edge
+SCORE_MED_THRESHOLD  = 0.40     # MEDIUM tier: solid edge
+
+# ––––––– TIER BANKROLL PERCENTAGES ———————
+# Contracts = floor((tier_pct * live_balance) / (price_cents / 100))
+# Hard cap:  floor((MAX_RISK_PCT * live_balance) / (price_cents / 100))
+TIER_PCT = {
+    'HIGH':   0.18,   # 18% of bankroll — just under 20% cap
+    'MEDIUM': 0.10,   # 10% of bankroll
+    'LOW':    0.04,   # 4% of bankroll — minimal exposure
 }
 
-# Force NO direction only — YES has no edge at any price in clean data
-ALLOWED_DIRECTIONS = ['no']   # bots must check this before any entry
+# ––––––– SCORE FORMULA WEIGHTS ———————––
+# Entry Score  = win_rate^1.5 × kelly × sample_weight × gap_weight × time_weight
+# Sizing Score = win_rate^2.0 × kelly × sample_weight × gap_weight × time_weight
+# (Sizing is more aggressive on win_rate exponent — rewards elite buckets harder)
+ENTRY_WR_EXP    = 1.5    # win_rate exponent for entry score
+SIZING_WR_EXP   = 2.0    # win_rate exponent for sizing score (steeper curve)
 
-# ETH high-price: DISABLED — $0.02-0.36/mkt not worth blowup risk
-ETH_HIGH_PRICE_ALLOWED = False
-ETH_HIGH_PRICE_MIN = 81
+# Gap weight: gap_cents → weight (how much model leads the book)
+# At 0¢ gap = 0.0 weight, at 10¢+ gap = 1.0 weight
+# Linear interpolation: gap_weight = clamp(gap / 10, 0, 1)
+GAP_SCALE_CENTS = 10.0   # gap at which weight hits 1.0
 
-# Hard cost ceiling
-MAX_COST_PER_MARKET = 6.25
+# Time weight: late entries score higher (confirmed signal, not noise)
+# time_weight = 1 - clamp(secs_to_close / BUY_START_SECONDS, 0, 1)
+# At t=600s (just entered window): weight=0.0
+# At t=60s:  weight=0.90
+# At t=10s:  weight=0.98
+# Uses BUY_START_SECONDS from timing section below
 
-# -------------- CONTRACT SIZING — HALF KELLY, CONSERVATIVE ----
-# Sizing = half kelly of max contracts allowed by $6.25 cost cap
-# Half kelly chosen over full kelly: protects against variance in smaller buckets
-# 21-50¢ buckets: capped at 5 contracts until sample size grows past 100 markets
-#
-# At 5¢: max by cost = 125ct → half kelly ~30ct (capped at 30)
-# At 15¢: max by cost = 41ct → half kelly ~20-23ct
-# At 45¢: max by cost = 13ct → capped at 5ct (small sample)
+# Sample weight: confidence in the statistic itself
+# sample_weight = clamp(sample_size / SAMPLE_CONFIDENCE_TARGET, 0, 1)
+SAMPLE_CONFIDENCE_TARGET = 100  # 100 markets = full confidence (weight=1.0)
+                                # 10 markets = 0.10 weight (very conservative)
+                                # 50 markets = 0.50 weight
 
-CONTRACT_SIZING = {
-    # BTC — strongest edge in system
-    # 1-5¢:   100% WR, kelly 1.0  → 30ct max
-    # 6-10¢:   97.9% WR, kelly 0.98 → 30ct
-    # 11-15¢:  96.7% WR, kelly 0.96 → 23ct (half kelly of 41ct max)
-    # 16-20¢:  85.3% WR, kelly 0.83 → 14ct (half kelly, CI ±12% so conservative)
-    # 21-30¢:  73.7% WR, kelly 0.72 → 5ct (only 19 markets, small sample)
-    # 31-50¢:  90.9% WR, kelly 0.90 → 5ct (21 markets, small sample)
-    'BTC': {
-        (1,  5):  30,   # 100% WR  | 30ct @ avg 3¢  = $0.90 risk
-        (6,  10): 30,   # 97.9% WR | 30ct @ avg 8¢  = $2.40 risk
-        (11, 15): 23,   # 96.7% WR | 23ct @ avg 13¢ = $2.99 risk
-        (16, 20): 14,   # 85.3% WR | 14ct @ avg 18¢ = $2.52 risk
-        (21, 30):  5,   # 73.7% WR |  5ct @ avg 25¢ = $1.25 risk  (small sample)
-        (31, 50):  5,   # 90.9% WR |  5ct @ avg 38¢ = $1.90 risk  (small sample)
-    },
-
-    # ETH — solid edge in 1-20¢, thinner above
-    # 1-5¢:   94.7% WR, kelly 0.94 → 30ct
-    # 6-10¢:  96.7% WR, kelly 0.97 → 30ct
-    # 11-15¢: 90.2% WR, kelly 0.89 → 20ct
-    # 16-20¢: 83.7% WR, kelly 0.80 → 14ct
-    # 21-30¢: 65.2% WR, kelly 0.56 →  5ct (23 markets)
-    # 31-40¢: 61.9% WR, kelly 0.41 →  5ct (21 markets)
-    'ETH': {
-        (1,  5):  30,   # 94.7% WR | 30ct @ avg 3¢  = $0.90 risk
-        (6,  10): 30,   # 96.7% WR | 30ct @ avg 8¢  = $2.40 risk
-        (11, 15): 20,   # 90.2% WR | 20ct @ avg 13¢ = $2.60 risk
-        (16, 20): 14,   # 83.7% WR | 14ct @ avg 18¢ = $2.52 risk
-        (21, 30):  5,   # 65.2% WR |  5ct @ avg 25¢ = $1.25 risk  (small sample)
-        (31, 40):  5,   # 61.9% WR |  5ct @ avg 35¢ = $1.75 risk  (small sample)
-    },
-
-    # SOL — strong in 1-20¢, no data above
-    # 1-5¢:   100% WR, kelly 1.0  → 30ct
-    # 6-10¢:   92.6% WR, kelly 0.92 → 30ct
-    # 11-15¢:  85.7% WR, kelly 0.84 → 20ct
-    # 16-20¢: 100% WR, kelly 1.0  → 18ct (only 10 markets — conservative despite 100%)
-    'SOL': {
-        (1,  5):  30,   # 100% WR  | 30ct @ avg 3¢  = $0.90 risk
-        (6,  10): 30,   # 92.6% WR | 30ct @ avg 8¢  = $2.40 risk
-        (11, 15): 20,   # 85.7% WR | 20ct @ avg 13¢ = $2.60 risk
-        (16, 20): 10,   # 100% WR  | 10ct @ avg 18¢ = $1.80 risk  (only 10 markets)
-    },
-
-    # XRP — 1-20¢ confirmed, 31-40¢ has sample, skip 21-30¢ (only 6 markets)
-    # 1-5¢:   100% WR, kelly 1.0  → 30ct
-    # 6-10¢:   85.0% WR, kelly 0.84 → 30ct
-    # 11-15¢:  70.0% WR, kelly 0.67 → 16ct
-    # 16-20¢:  91.7% WR, kelly 0.89 → 15ct (only 12 markets — conservative)
-    # 31-40¢:  73.9% WR, kelly 0.59 →  5ct (23 markets)
-    'XRP': {
-        (1,  5):  30,   # 100% WR  | 30ct @ avg 3¢  = $0.90 risk
-        (6,  10): 30,   # 85.0% WR | 30ct @ avg 8¢  = $2.40 risk
-        (11, 15): 16,   # 70.0% WR | 16ct @ avg 13¢ = $2.08 risk
-        (16, 20): 15,   # 91.7% WR | 15ct @ avg 18¢ = $2.70 risk
-        (31, 40):  5,   # 73.9% WR |  5ct @ avg 35¢ = $1.75 risk  (23 markets)
-    },
-}
-
-# XRP: skip 21-30¢ (only 6 markets, CI ±40%) and 41-50¢ (no sample)
-XRP_SKIP_RANGE = (21, 50)
-
-# -------------- MINIMUM CONFIDENCE ----------------------------
-MIN_CONFIDENCE = 0.60
-
-# -------------- HISTORICAL ACCURACY --------------------------
-# True win rates from 1,526 clean markets with correct P&L math
+# ––––––– HISTORICAL ACCURACY —————————
+# Source: 1,526 clean single-entry markets (Jan 24–Feb 20 2026)
+# + confirmed by 688 live markets (Feb 19-21 2026)
 # Format: (win_rate, sample_size, kelly_fraction)
+# ALL buckets included — score math determines if they trade, not a kill list
 HISTORICAL_ACCURACY = {
     'BTC': {
-        'NO_1_5':    (1.000, 109, 1.00),
-        'NO_6_10':   (0.979,  97, 0.98),
-        'NO_11_15':  (0.967,  92, 0.96),
-        'NO_16_20':  (0.853,  34, 0.83),
-        'NO_21_30':  (0.737,  19, 0.72),
-        'NO_31_50':  (0.909,  21, 0.90),
+        # — NO contracts (core edge) —
+        'NO_1_5':    (1.000, 109, 1.00),   # Score ~0.97 → HIGH every time
+        'NO_6_10':   (0.979,  97, 0.98),   # Score ~0.93 → HIGH
+        'NO_11_15':  (0.967,  92, 0.96),   # Score ~0.90 → HIGH
+        'NO_16_20':  (0.853,  34, 0.83),   # Score ~0.62 → MEDIUM (sample drags it)
+        'NO_21_30':  (0.737,  19, 0.72),   # Score ~0.33 → LOW (small sample)
+        'NO_31_50':  (0.909,  21, 0.90),   # Score ~0.51 → MEDIUM (but small sample)
+        'NO_51_65':  (0.444,   9, 0.10),   # Score ~0.02 → NEVER TRADES (below 0.15)
+        'NO_66_80':  (0.867,  15, 0.35),   # Score ~0.27 → LOW (very small sample)
+        # — YES contracts (live data confirmed 87-96% WR) —
+        'YES_1_50':  (0.600,  20, 0.20),   # Score ~0.05 → NEVER TRADES
+        'YES_51_80': (0.630,  60, 0.25),   # Score ~0.07 → NEVER TRADES
+        'YES_81_90': (0.930,  92, 0.40),   # Score ~0.58 → MEDIUM (live: 87%, 92 mkts)
+        'YES_91_99': (0.964,  55, 0.90),   # Score ~0.76 → HIGH (live: 96.4%, 55 mkts)
     },
     'ETH': {
-        'NO_1_5':    (0.947,  19, 0.94),
-        'NO_6_10':   (0.967,  60, 0.97),
-        'NO_11_15':  (0.902,  51, 0.89),
-        'NO_16_20':  (0.837,  49, 0.80),
-        'NO_21_30':  (0.652,  23, 0.56),
-        'NO_31_40':  (0.619,  21, 0.41),
+        'NO_1_5':    (0.947,  19, 0.94),   # Score ~0.63 → MEDIUM (small sample)
+        'NO_6_10':   (0.967,  60, 0.97),   # Score ~0.87 → HIGH
+        'NO_11_15':  (0.902,  51, 0.89),   # Score ~0.72 → HIGH
+        'NO_16_20':  (0.837,  49, 0.80),   # Score ~0.60 → MEDIUM
+        'NO_21_30':  (0.652,  23, 0.56),   # Score ~0.20 → LOW
+        'NO_31_40':  (0.619,  21, 0.41),   # Score ~0.13 → NEVER TRADES (just under)
+        'NO_41_50':  (0.636,  11, 0.25),   # Score ~0.06 → NEVER TRADES
+        'NO_51_65':  (0.714,  28, 0.35),   # Score ~0.18 → LOW (marginal)
+        'NO_66_80':  (0.714,  14, 0.35),   # Score ~0.13 → NEVER TRADES (small sample)
+        'YES_1_50':  (0.580,  15, 0.15),   # Score ~0.03 → NEVER TRADES
+        'YES_51_80': (0.620,  34, 0.22),   # Score ~0.06 → NEVER TRADES
+        'YES_81_90': (0.920,  50, 0.45),   # Score ~0.57 → MEDIUM (live: 92%, 50 mkts)
+        'YES_91_99': (1.000,  22, 0.90),   # Score ~0.78 → HIGH  (live: 100%, 22 mkts)
     },
     'SOL': {
-        'NO_1_5':    (1.000,  31, 1.00),
-        'NO_6_10':   (0.926,  54, 0.92),
-        'NO_11_15':  (0.857,  49, 0.84),
-        'NO_16_20':  (1.000,  10, 1.00),
+        'NO_1_5':    (1.000,  31, 1.00),   # Score ~0.99 → HIGH
+        'NO_6_10':   (0.926,  54, 0.92),   # Score ~0.73 → HIGH
+        'NO_11_15':  (0.857,  49, 0.84),   # Score ~0.62 → MEDIUM
+        'NO_16_20':  (1.000,  10, 1.00),   # Score ~0.67 → MEDIUM (only 10 mkts, sample drag)
+        'NO_21_50':  (0.500,   5, 0.10),   # Score ~0.01 → NEVER TRADES (no data)
+        'NO_51_80':  (0.500,   3, 0.10),   # Score ~0.01 → NEVER TRADES
+        'YES_1_50':  (0.550,   8, 0.10),   # Score ~0.01 → NEVER TRADES
+        'YES_51_80': (0.600,   5, 0.15),   # Score ~0.01 → NEVER TRADES
+        'YES_81_90': (0.900,  22, 0.40),   # Score ~0.44 → MEDIUM (live: 100%, 22 mkts)
+        'YES_91_99': (0.950,  40, 0.85),   # Score ~0.70 → HIGH (live: confirmed)
     },
     'XRP': {
-        'NO_1_5':    (1.000,  20, 1.00),
-        'NO_6_10':   (0.850,  40, 0.84),
-        'NO_11_15':  (0.700,  20, 0.67),
-        'NO_16_20':  (0.917,  12, 0.89),
-        'NO_31_40':  (0.739,  23, 0.59),
+        'NO_1_5':    (1.000,  20, 1.00),   # Score ~0.87 → HIGH
+        'NO_6_10':   (0.850,  40, 0.84),   # Score ~0.55 → MEDIUM
+        'NO_11_15':  (0.700,  20, 0.67),   # Score ~0.26 → LOW
+        'NO_16_20':  (0.917,  12, 0.89),   # Score ~0.49 → MEDIUM (small sample drag)
+        'NO_21_30':  (0.500,   6, 0.10),   # Score ~0.01 → NEVER TRADES (6 mkts)
+        'NO_31_40':  (0.739,  23, 0.59),   # Score ~0.27 → LOW
+        'NO_41_50':  (0.500,   2, 0.10),   # Score ~0.01 → NEVER TRADES
+        'NO_51_80':  (0.500,   3, 0.10),   # Score ~0.01 → NEVER TRADES
+        'YES_1_50':  (0.550,   8, 0.10),   # Score ~0.01 → NEVER TRADES
+        'YES_51_80': (0.600,  10, 0.15),   # Score ~0.02 → NEVER TRADES
+        'YES_81_99': (0.706,  17, 0.35),   # Score ~0.19 → LOW (live: 70.6%, weak)
     },
 }
 
-# -------------- SETTLEMENT BIAS --------------------------------
+# ––––––– PRICE CAPS ————————————
+# No hard kill list. These caps just prevent entering at nonsensical prices.
+# The score system handles everything else.
+MAX_ENTRY_PRICE_CENTS = {
+    'BTC': 99,
+    'ETH': 99,
+    'SOL': 99,
+    'XRP': 99,
+}
+
+# ETH legacy flag — kept for bot compat, now irrelevant (score handles it)
+ETH_HIGH_PRICE_ALLOWED = True
+ETH_HIGH_PRICE_MIN     = 81
+XRP_SKIP_RANGE         = (0, 0)   # Disabled — score kills bad XRP zones naturally
+MAX_COST_PER_MARKET    = 9999     # Replaced by MAX_RISK_PCT × live_balance
+
+# ––––––– SETTLEMENT BIAS ––––––––––––––––
 SETTLEMENT_BIAS = {
     'BTC': {'yes': 0.532, 'no': 0.468},
     'ETH': {'yes': 0.514, 'no': 0.486},
@@ -190,7 +157,7 @@ SETTLEMENT_BIAS = {
     'XRP': {'yes': 0.727, 'no': 0.273},
 }
 
-# -------------- ASSET CONFIGURATION ---------------------------
+# ––––––– ASSET CONFIGURATION —————————
 ASSET_CONFIG = {
     'BTC': {
         'series_ticker': 'KXBTC15M',
@@ -230,57 +197,39 @@ ASSET_CONFIG = {
     },
 }
 
-# -------------- TIMING ----------------------------------------
-OBSERVE_START_SECONDS = 720
-BUY_START_SECONDS = 600
-ENTRY_LAST_SECONDS = 5
-POLL_SECONDS = 1.0
-META_REFRESH_SECONDS = 10.0
+# ––––––– TIMING ––––––––––––––––––––
+OBSERVE_START_SECONDS  = 720
+BUY_START_SECONDS      = 600
+ENTRY_LAST_SECONDS     = 5
+POLL_SECONDS           = 1.0
+META_REFRESH_SECONDS   = 10.0
 
-# -------------- SESSION LIMITS --------------------------------
-ENABLE_SESSION_LIMITS = True
-DAILY_MAX_LOSS_PERCENT = 0.75
+# ––––––– SESSION LIMITS ––––––––––––––––
+ENABLE_SESSION_LIMITS           = True
+DAILY_MAX_LOSS_PERCENT          = 0.75
 SESSION_CONSECUTIVE_LOSSES_LIMIT = 4
-SESSION_COOLDOWN_MINUTES = 15
-BALANCE_CHECK_DELAY_SECONDS = 300
+SESSION_COOLDOWN_MINUTES        = 15
+BALANCE_CHECK_DELAY_SECONDS     = 300
 
-# -------------- SHARED CONSTANTS ------------------------------
+# ––––––– SHARED CONSTANTS ——————————
 FEE_CENTS_PER_CONTRACT = 0
-NUM_CONCURRENT_BOTS = 4
+NUM_CONCURRENT_BOTS    = 4
+MIN_CONFIDENCE         = 0.60
 
-# ─────────────────────────────────────────────
-# GAP POSTER V6
-# ─────────────────────────────────────────────
+# Legacy compat — replaced by score-driven sizing but kept so bot imports don't break
+CONTRACT_SIZING        = {}
+ALLOWED_DIRECTIONS     = ['yes', 'no']   # Both open — score decides
 
-# Minimum gap in cents to trigger posting
-# Gap = model_fair_value - book_ask
-# Below 4¢ = noise, not real edge
-POSTER_MIN_GAP_CENTS = 4
-
-# Gap tiers for contract sizing
-# (min_gap, max_gap, contracts)
-# Conservative due to expensive contract asymmetry
-POSTER_GAP_TIERS = [
-    (4,  6,  8),   # 4-6¢  gap → 8 contracts
-    (7,  10, 15),  # 7-10¢ gap → 15 contracts
-    (11, 99, 25),  # 10¢+  gap → 25 contracts
+# ––––––– GAP POSTER (V6 params, unchanged) ———––
+POSTER_MIN_GAP_CENTS       = 4
+POSTER_GAP_TIERS           = [
+    (4,  6,  8),
+    (7,  10, 15),
+    (11, 99, 25),
 ]
-
-# Hard cap — asymmetry on expensive contracts demands this
-POSTER_MAX_CONTRACTS = 25
-POSTER_MIN_CONTRACTS = 5
-
-# POSTER_BOOK_PREMIUM — now set per-bot (asset-specific):
-#   BTC=3¢, SOL=2¢, ETH=1¢, XRP=1¢
-
-# Cancel if gap inverts — book has caught up past model
-POSTER_CANCEL_GAP = 0
-
-# Amend every N seconds tracking book upward
-POSTER_AMEND_INTERVAL = 15
-
-# Cancel resting order this many seconds before close
-POSTER_EXPIRY_BUFFER = 90
-
-# Begin observing at 10 min remaining
+POSTER_MAX_CONTRACTS       = 25
+POSTER_MIN_CONTRACTS       = 5
+POSTER_CANCEL_GAP          = 0
+POSTER_AMEND_INTERVAL      = 15
+POSTER_EXPIRY_BUFFER       = 90
 POSTER_OBSERVE_START_SECONDS = 600

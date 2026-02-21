@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
 from config import (
-    MIN_CONFIDENCE, HISTORICAL_ACCURACY,
+    MIN_CONFIDENCE,
     SETTLEMENT_BIAS, ASSET_CONFIG, BUY_START_SECONDS,
     ENTRY_LAST_SECONDS, POLL_SECONDS, META_REFRESH_SECONDS,
     FEE_CENTS_PER_CONTRACT, NUM_CONCURRENT_BOTS,
@@ -41,46 +41,10 @@ from config import (
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
-    POSTER_GAP_TIERS,
-    POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
     POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
     POSTER_OBSERVE_START_SECONDS,
 )
-
-# Asset-specific book premium — ETH has tight spreads
-POSTER_BOOK_PREMIUM = 1  # ETH — tight spreads
-
-# ETH Zone win rates from clean-entry markets
-ETH_ZONE_WIN_RATES = [
-    (1,  10,  0.961),  # 96.1% WR — 77 markets
-    (11, 20,  0.871),  # 87.1% WR — 93 markets
-    (21, 30,  0.667),  # 66.7% WR — 24 markets
-    (31, 40,  0.619),  # 61.9% WR — 21 markets
-    (41, 50,  0.636),  # 63.6% WR — 11 markets
-    (51, 65,  0.714),  # 71.4% WR — 28 markets
-    (66, 80,  0.714),  # 71.4% WR — 14 markets
-    (81, 99,  0.912),  # 91.2% WR — 102 markets
-]
-
-ETH_SCORE_THRESHOLD = 2.5
-
-def get_zone_win_rate(book_price: int) -> float:
-    for (lo, hi, wr) in ETH_ZONE_WIN_RATES:
-        if lo <= book_price <= hi:
-            return wr
-    return 0.0
-
-def get_time_weight(secs_to_close: float) -> float:
-    """
-    Time decay multiplier. Later = more certain = higher weight.
-    Market runs 900s → 0s. We observe 600s → 90s.
-    """
-    if secs_to_close > 400:
-        return 0.6   # Early — direction uncertain
-    elif secs_to_close > 200:
-        return 0.8   # Mid — direction forming
-    else:
-        return 1.2   # Late — time confirming direction
+from scoring import evaluate_entry
 
 # ======================== BOOT BANNER ========================
 print(f"BOOT: eth_bot.py loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)
@@ -789,134 +753,6 @@ def validate_order(client: KalshiClient, ticker: str, side: str,
     return True, "OK"
 
 
-# ======================== PRICE BUCKET LOOKUP ================
-def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float, int, float]]:
-    """Returns (accuracy, sample_size, avg_profit) for this price bucket."""
-    asset_data = HISTORICAL_ACCURACY.get(ASSET, {})
-    if side == "no":
-        if 1 <= price_cents <= 10:
-            bucket = "NO_1_10"
-        elif 11 <= price_cents <= 20:
-            bucket = "NO_11_20"
-        elif 21 <= price_cents <= 50:
-            bucket = "NO_21_50"
-        else:
-            return None
-    elif side == "yes":
-        if 1 <= price_cents <= 50:
-            return None  # No historical data for cheap YES — rare bucket
-        elif 81 <= price_cents <= 90:
-            bucket = "YES_81_90"
-        elif 91 <= price_cents <= 95:
-            bucket = "YES_91_95"
-        elif 96 <= price_cents <= 99:
-            bucket = "YES_96_99"
-        else:
-            return None
-    else:
-        return None
-    return asset_data.get(bucket)
-
-
-# ======================== SCORE POSTER V7 ===========================
-def evaluate_poster_entry(p_yes: float, p_no: float,
-                           yes_ask: Optional[int],
-                           no_ask: Optional[int],
-                           secs_to_close: float
-                           ) -> Optional[Tuple[str, int, int]]:
-    """
-    Score-based poster entry (V7).
-    score = gap × zone_win_rate × time_weight
-    Fire when score >= SCORE_THRESHOLD.
-    Returns (side, post_price, gap_cents) or None.
-    """
-    time_weight = get_time_weight(secs_to_close)
-
-    # YES side
-    if yes_ask is not None:
-        fair_yes = int(round(p_yes * 100))
-        gap = fair_yes - yes_ask
-        wr = get_zone_win_rate(yes_ask)
-        score = gap * wr * time_weight
-
-        log.info(
-            f"[EVAL-YES] fair={fair_yes}¢ ask={yes_ask}¢ "
-            f"gap={gap:+d}¢ wr={wr:.1%} tw={time_weight} "
-            f"score={score:.2f} threshold={ETH_SCORE_THRESHOLD}"
-        )
-
-        if gap > 0 and score >= ETH_SCORE_THRESHOLD:
-            post_price = yes_ask + POSTER_BOOK_PREMIUM
-            post_price = max(1, min(99, post_price))
-            log.warning(
-                f"[TRIGGER-YES] score={score:.2f} >= {ETH_SCORE_THRESHOLD} "
-                f"post={post_price}¢"
-            )
-            return ("yes", post_price, gap)
-
-    # NO side
-    if no_ask is not None:
-        fair_no = int(round(p_no * 100))
-        gap = fair_no - no_ask
-        wr = get_zone_win_rate(no_ask)
-        score = gap * wr * time_weight
-
-        log.info(
-            f"[EVAL-NO] fair={fair_no}¢ ask={no_ask}¢ "
-            f"gap={gap:+d}¢ wr={wr:.1%} tw={time_weight} "
-            f"score={score:.2f} threshold={ETH_SCORE_THRESHOLD}"
-        )
-
-        if gap > 0 and score >= ETH_SCORE_THRESHOLD:
-            post_price = no_ask + POSTER_BOOK_PREMIUM
-            post_price = max(1, min(99, post_price))
-            log.warning(
-                f"[TRIGGER-NO] score={score:.2f} >= {ETH_SCORE_THRESHOLD} "
-                f"post={post_price}¢"
-            )
-            return ("no", post_price, gap)
-
-    return None
-
-
-def get_gap_contract_count(gap_cents: int, post_price: int,
-                            available_balance_cents: int) -> int:
-    """
-    Tiered contract sizing based on gap magnitude.
-
-    POSTER_GAP_TIERS = [
-        (4,  6,  8),   # 4-6¢  gap → 8 contracts
-        (7,  10, 15),  # 7-10¢ gap → 15 contracts
-        (11, 99, 25),  # 11¢+  gap → 25 contracts
-    ]
-    """
-    contracts = POSTER_MIN_CONTRACTS
-    for lo_gap, hi_gap, qty in POSTER_GAP_TIERS:
-        if lo_gap <= gap_cents <= hi_gap:
-            contracts = qty
-            break
-
-    contracts = max(POSTER_MIN_CONTRACTS, min(POSTER_MAX_CONTRACTS, contracts))
-
-    # Cost cap per market
-    cost_cents = contracts * post_price
-    max_cost_cents = int(MAX_COST_PER_MARKET * 100)
-    if cost_cents > max_cost_cents:
-        contracts = max(1, max_cost_cents // post_price)
-
-    # Balance cap — never spend more than available
-    cost_cents = contracts * post_price
-    if cost_cents > available_balance_cents:
-        contracts = max(1, available_balance_cents // post_price)
-
-    log.info(
-        f"[SIZE] gap={gap_cents}¢ contracts={contracts} "
-        f"cost=${contracts * post_price / 100:.2f}"
-    )
-
-    return contracts
-
-
 def run_gap_amend_loop(client, order_id: str,
                         market_ticker: str, close_ts: float,
                         get_ob_func, get_spot_func,
@@ -996,31 +832,35 @@ def run_gap_amend_loop(client, order_id: str,
                 book_ask = yes_ask if side == "yes" else no_ask
                 gap = (fair_value - book_ask) if book_ask is not None else 0
 
-                wr = get_zone_win_rate(book_ask) if book_ask is not None else 0.0
-                time_wt = get_time_weight(secs_to_close)
-                score = gap * wr * time_wt
+                # V9 re-evaluation using scoring module
+                if book_ask is not None:
+                    re_entry = evaluate_entry(
+                        ASSET, side, book_ask, fair_value,
+                        float(secs_to_close), 1000.0
+                    )
+                else:
+                    re_entry = None
 
                 log.info(
                     f"[GAP-AMEND] Re-eval: side={side} "
                     f"fair={fair_value}¢ book_ask={book_ask}¢ "
-                    f"gap={gap:+d}¢ wr={wr:.1%} tw={time_wt} "
-                    f"score={score:.2f}"
+                    f"gap={gap:+d}¢ v9={'pass' if re_entry else 'fail'}"
                 )
 
-                # ── CANCEL IF SCORE BELOW THRESHOLD ───────────
-                if gap <= 0 or score < ETH_SCORE_THRESHOLD:
+                # ── CANCEL IF V9 SCORE BELOW THRESHOLD ───────────
+                if re_entry is None:
                     log.warning(
-                        f"[GAP-AMEND] Score dropped "
-                        f"({score:.2f} < {ETH_SCORE_THRESHOLD}) "
+                        f"[GAP-AMEND] V9 score below threshold "
                         f"— canceling {order_id}"
                     )
                     cancel_order_status(client, order_id)
                     break
 
-                # ── AMEND UPWARD AS BOOK CATCHES UP ──────────
+                new_post_price, _, _, _, _ = re_entry
+
+                # ── AMEND TO V9 POST PRICE ──────────
                 if book_ask is not None:
-                    new_price = book_ask + POSTER_BOOK_PREMIUM
-                    new_price = max(1, min(99, new_price))
+                    new_price = new_post_price
 
                     if new_price != current_price and remaining > 0:
                         result = amend_order(
@@ -1238,22 +1078,20 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
-    log.warning(f"[IRON RULES] {ASSET} Bot — SCORE POSTER V7 (Feb 2026)")
+    log.warning(f"[IRON RULES] {ASSET} Bot — UNIFIED SCORER V9 (Feb 2026)")
     log.warning(f"[IRON RULES] RULE 1: Single entry per market — TRADED_TICKERS + API check")
-    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — score is the gate")
-    log.warning(f"[IRON RULES] RULE 3: Score >= {ETH_SCORE_THRESHOLD} to post | cost cap ${MAX_COST_PER_MARKET}")
-    log.warning(f"[IRON RULES] RULE 4: Post ABOVE book — market catches up")
+    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — V9 score is the gate")
+    log.warning(f"[IRON RULES] RULE 3: Score-driven sizing + posting | cost cap ${MAX_COST_PER_MARKET}")
+    log.warning(f"[IRON RULES] RULE 4: V9 post price — score tier drives aggressiveness")
     log.warning(f"[IRON RULES] RULE 5: Triple cancel — expiry + score drop + sweep")
     log.warning("=" * 70)
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} "
-        f"SCORE_THRESHOLD={ETH_SCORE_THRESHOLD} "
         f"MAX_COST=${MAX_COST_PER_MARKET} ALLOC=${BOT_ALLOCATION} "
         f"POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
     log.warning(
-        f"[BOOTCFG] Book premium={POSTER_BOOK_PREMIUM}¢ "
-        f"tiers={POSTER_GAP_TIERS} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
+        f"[BOOTCFG] V9 scoring module active | "
         f"amend_interval={POSTER_AMEND_INTERVAL}s expiry_buffer={POSTER_EXPIRY_BUFFER}s"
     )
     log.warning(
@@ -1556,63 +1394,58 @@ def main() -> None:
                 continue
 
             # Balance check
-            available, available_cents = get_balance_usd(client)
+            available, _ = get_balance_usd(client)
+            if available is not None:
+                session.current_balance_usd = available
             if available is not None and available < MIN_BOT_BALANCE:
                 log.warning(f"[SKIP] Balance ${available:.2f} < floor")
                 time.sleep(POLL_SECONDS)
                 continue
-
-            available_cents = int((available or 0) * 100)
 
             # Silent before 10 minutes — book too chaotic, gap signals unreliable
             if secs_to_close > POSTER_OBSERVE_START_SECONDS:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Evaluate entry — score-based, checks YES and NO every cycle
-            entry = evaluate_poster_entry(p_yes, p_no, yes_ask, no_ask, secs_to_close)
+            # ── SCORE-DRIVEN ENTRY EVALUATION (V9) ──
+            eval_side        = 'yes' if p_yes > p_no else 'no'
+            book_ask         = yes_ask if eval_side == 'yes' else no_ask
+            model_fair_cents = round(p_yes * 100) if eval_side == 'yes' else round(p_no * 100)
+
+            if book_ask is None:
+                log.info(f"[SKIP] {st.market} — no ask on {eval_side} side")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            entry = evaluate_entry(
+                ASSET,
+                eval_side,
+                book_ask,
+                model_fair_cents,
+                float(secs_to_close),
+                session.current_balance_usd,
+            )
 
             if entry is None:
-                # Log observe state periodically
-                if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                    fair_yes = int(round(p_yes * 100))
-                    fair_no = int(round(p_no * 100))
-                    yes_gap = (fair_yes - yes_ask) if yes_ask is not None else 0
-                    no_gap = (fair_no - no_ask) if no_ask is not None else 0
-                    tw = get_time_weight(secs_to_close)
-                    yes_wr = get_zone_win_rate(yes_ask) if yes_ask is not None else 0.0
-                    no_wr = get_zone_win_rate(no_ask) if no_ask is not None else 0.0
-                    yes_score = yes_gap * yes_wr * tw
-                    no_score = no_gap * no_wr * tw
-                    log.info(
-                        f"[OBSERVE] {st.market} t={secs_to_close:.0f}s "
-                        f"yes_score={yes_score:.2f} no_score={no_score:.2f} "
-                        f"threshold={ETH_SCORE_THRESHOLD} "
-                        f"yes_ask={yes_ask}¢ no_ask={no_ask}¢"
-                    )
-                    last_state_log = now
+                log.info(
+                    f"[SKIP] {st.market} t={secs_to_close}s | "
+                    f"signal={eval_side} book_ask={book_ask}¢ model={model_fair_cents}¢ | "
+                    f"gap={model_fair_cents - book_ask}¢ — score below threshold"
+                )
                 time.sleep(POLL_SECONDS)
                 continue
 
-            side, post_price, gap = entry
+            post_price, order_qty, score_tier, entry_score, sizing_score = entry
+            side = eval_side
 
-            # Tiered contract sizing
-            order_qty = get_gap_contract_count(
-                gap, post_price, available_cents
+            log.warning(
+                f"[ENTER] {st.market} {side.upper()}@{post_price}¢ "
+                f"tier={score_tier} entry_score={entry_score:.3f} sizing_score={sizing_score:.3f} "
+                f"contracts={order_qty} cost=${order_qty * post_price / 100:.2f} "
+                f"t={secs_to_close}s gap={model_fair_cents - book_ask}¢"
             )
-            if order_qty < 1:
-                log.info(f"[SKIP] Insufficient balance for 1 contract")
-                time.sleep(POLL_SECONDS)
-                continue
-
-            total_cost = order_qty * post_price / 100.0
 
             try:
-                log.warning(
-                    f"[V6-POSTER] {st.market} {side.upper()} {order_qty}ct "
-                    f"@ {post_price}¢ gap={gap:+d}¢ "
-                    f"cost=${total_cost:.2f}"
-                )
 
                 payload = build_order_payload(
                     st.market, side, post_price, order_qty,
@@ -1636,7 +1469,7 @@ def main() -> None:
                 log.warning(f"[LOCKED] {st.market} side={side} order={oid}")
 
                 log.warning(
-                    f"[V6-POSTER-ORDER] {oid} {side.upper()} "
+                    f"[V9-ORDER] {oid} {side.upper()} "
                     f"{order_qty}ct @ {post_price}¢"
                 )
 
@@ -1661,13 +1494,13 @@ def main() -> None:
                 if filled_count > 0:
                     payout = filled_count * (100 - post_price) / 100.0
                     log.warning(
-                        f"[V6-POSTER-FILL] {st.market} "
+                        f"[V9-FILL] {st.market} "
                         f"filled={filled_count}ct {side.upper()} @ {post_price}¢ "
                         f"potential_profit=${payout:.2f} if {side.upper()} wins"
                     )
                 else:
                     log.info(
-                        f"[V6-POSTER-FILL] {st.market} 0 fills — "
+                        f"[V9-FILL] {st.market} 0 fills — "
                         f"gap collapsed or expiry hit"
                     )
 
@@ -1679,16 +1512,16 @@ def main() -> None:
                         f"market NOT locked, will retry next tick"
                     )
                 else:
-                    log.warning(f"[V6-POSTER] Exception: {e}")
+                    log.warning(f"[V9-POSTER] Exception: {e}")
 
             time.sleep(POLL_SECONDS)
             continue
-        # ── END V6 POSTER ────────────────────────────────────────────
+        # ── END V9 POSTER ────────────────────────────────────────────
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: {e} | {ASSET} V7 SCORE={ETH_SCORE_THRESHOLD} ALLOC=${BOT_ALLOCATION}")
+        log.exception(f"FATAL: {e} | {ASSET} V9 ALLOC=${BOT_ALLOCATION}")
         sys.exit(1)
