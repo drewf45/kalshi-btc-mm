@@ -802,7 +802,8 @@ def get_best_post_price(no_ask: Optional[int]) -> int:
 
 
 def run_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
-                   close_ts: int, get_ob_func) -> int:
+                   close_ts: int, get_ob_func,
+                   stop_event: Optional[threading.Event] = None) -> int:
     """
     Monitors a resting order and amends price every 30 seconds to stay
     at front of queue as the market moves.
@@ -824,6 +825,15 @@ def run_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
 
     while True:
         now = time.time()
+
+        # Check if signaled to stop (market rolled)
+        if stop_event is not None and stop_event.is_set():
+            log.info(f"[AMEND-LOOP] Stop signaled (market rolled), canceling {order_id}")
+            try:
+                cancel_order_status(client, order_id)
+            except Exception:
+                pass
+            break
 
         # Check if order is done (expiration hit or fully filled)
         if now >= (close_ts - 85):  # 5s buffer before expiration
@@ -1214,6 +1224,7 @@ def main() -> None:
     st.event = ev
     reconcile_on_market_change(mt)
     last_meta = time.time()
+    amend_stop_event = None  # Signal to stop background amend loop on ROLL
 
     # ======================== MAIN LOOP ======================
     while True:
@@ -1274,6 +1285,12 @@ def main() -> None:
                 if mt2 != st.market:
                     old_market = st.market
                     log.warning(f"[ROLL] {old_market} -> {mt2}")
+
+                    # Signal amend loop to stop if running in background
+                    if amend_stop_event is not None:
+                        amend_stop_event.set()
+                        log.info(f"[ROLL] Signaled amend loop to stop for {old_market}")
+                        amend_stop_event = None
 
                     if st.traded_this_market and st.entry_price_cents is not None and st.side and st.qty > 0:
                         result = None
@@ -1525,25 +1542,37 @@ def main() -> None:
             st.qty = order_qty
             st.order_id = oid
 
-            # Run amend loop — reprices every 30s until expiry
+            # Run amend loop in background thread — main loop stays free for ROLL detection
+            amend_stop_event = threading.Event()
+            launched_market = st.market
+            launched_price = post_price
+
             def fetch_ob():
                 return client.request(
-                    "GET", f"/markets/{st.market}/orderbook"
+                    "GET", f"/markets/{launched_market}/orderbook"
                 ) or {}
 
-            filled_count = run_amend_loop(
-                client, oid, st.market, close_ts, fetch_ob
-            )
-
-            if filled_count > 0:
-                st.qty = filled_count
-                st.entry_price_cents = post_price
-                log.warning(
-                    f"[POSTER-FILL] {st.market} filled {filled_count}ct NO @ avg ~{post_price}¢ "
-                    f"cost=${filled_count * post_price / 100:.2f}"
+            def _amend_worker():
+                filled_count = run_amend_loop(
+                    client, oid, launched_market, close_ts, fetch_ob,
+                    stop_event=amend_stop_event
                 )
-            else:
-                log.info(f"[POSTER-FILL] {st.market} — 0 fills, order expired unfilled")
+                # Only update state if market hasn't rolled
+                if st.market == launched_market:
+                    if filled_count > 0:
+                        st.qty = filled_count
+                        st.entry_price_cents = launched_price
+                        log.warning(
+                            f"[POSTER-FILL] {launched_market} filled {filled_count}ct NO @ avg ~{launched_price}¢ "
+                            f"cost=${filled_count * launched_price / 100:.2f}"
+                        )
+                    else:
+                        log.info(f"[POSTER-FILL] {launched_market} — 0 fills, order expired unfilled")
+                else:
+                    log.info(f"[AMEND-THREAD] Market rolled past {launched_market}, skipping state update")
+
+            threading.Thread(target=_amend_worker, daemon=True, name=f"amend-{oid[:8]}").start()
+            log.info(f"[AMEND-LOOP] Started background thread for {oid} on {st.market}")
 
         except Exception as e:
             log.warning(f"[POSTER] Failed: {e} — market still marked as traded")
