@@ -248,29 +248,51 @@ BALANCE_CHECK_DELAY_SECONDS = 300
 FEE_CENTS_PER_CONTRACT = 0
 NUM_CONCURRENT_BOTS = 4
 
-# -------------- POSTER BOT SETTINGS --------------------------
-# Bot now operates as maker/poster, not taker
-# Posts NO contracts immediately at market open, amends price every 30s
-# Auto-expires unfilled remainder 90s before close
+# ─────────────────────────────────────────────
+# PURE EDGE POSTER SETTINGS
+# ─────────────────────────────────────────────
 
 POSTER_START_SECONDS = 800     # Enter at 13m20s remaining (early for fill window)
-POSTER_AMEND_INTERVAL = 30     # Amend price every 30 seconds
-POSTER_EXPIRY_BUFFER = 90      # Auto-cancel unfilled remainder 90s before close
-POSTER_PRICE_FLOOR = 10        # Minimum NO posting price in cents
-POSTER_PRICE_CEILING = 50      # Maximum NO posting price in cents
-POSTER_QUEUE_DISCOUNT = 2      # Post 2¢ below best NO ask to front-run queue
 
-# NOTE: CONTRACT_SIZING table still applies
-# Posting price determines which bucket → how many contracts to post
-# If book NO ask is 35¢, post price = 33¢ → use 31-50¢ bucket sizing
+# Minimum edge in cents to post at all
+# Edge = model fair value NO - market NO ask
+# Must be positive and at least this large to post
+POSTER_MIN_EDGE_CENTS = 6
 
-# -------------- SMART POSTER SETTINGS ------------------------
-# Post only when market offers discount vs model fair value
-# Cancel when edge disappears
+# Fee per contract in cents (Kalshi maker fee)
+# Edge must exceed this to be profitable at all
+POSTER_FEE_CENTS = 1
 
-POSTER_MIN_EDGE_CENTS = 5      # Market must offer at least 5¢ below fair value
-POSTER_POST_DISCOUNT = 2       # Post 2¢ below market NO ask (queue position)
-POSTER_CANCEL_THRESHOLD = 3    # Cancel if market NO ask drops within 3¢ of fair value
-POSTER_MAX_CONTRACTS = 20      # Maximum contracts per market
-POSTER_MIN_PRICE = 15          # Never post NO below 15¢ (bad risk/reward)
-POSTER_MAX_PRICE = 85          # Never post NO above 85¢ (model uncertain at extremes)
+# Post this many cents below market NO ask
+# Gets us to front of queue without giving up edge
+POSTER_QUEUE_DISCOUNT = 2
+
+# Edge-to-contracts scaling
+# Contracts = floor(edge_cents * POSTER_EDGE_SCALE)
+# Edge of 10¢ * scale 2.0 = 20 contracts
+# Edge of 20¢ * scale 2.0 = 40 contracts
+# Edge of 6¢ * scale 2.0 = 12 contracts (minimum)
+POSTER_EDGE_SCALE = 2.0
+
+# Hard caps regardless of edge
+POSTER_MIN_CONTRACTS = 5       # Always post at least 5 if edge exists
+POSTER_MAX_CONTRACTS = 50      # Never more than 50 per market
+
+# Cancel amend loop if edge drops below this
+POSTER_CANCEL_EDGE = 2
+
+# Amend price every N seconds
+POSTER_AMEND_INTERVAL = 30
+
+# Auto-expire order N seconds before market close
+POSTER_EXPIRY_BUFFER = 90
+
+# Absolute minimum post price — below this fees eat all profit
+# At 2¢ price, winning pays 98¢, you risked 2¢, profit 96¢ per contract
+# But if fills are rare at 2¢ it's not worth the capital lock
+# Set to 3¢ minimum — adjust down if fills prove reliable at low prices
+POSTER_ABSOLUTE_MIN_PRICE = 3
+
+# Absolute maximum post price
+# Above 97¢ you're risking 97¢ to win 3¢ — bad even with edge
+POSTER_ABSOLUTE_MAX_PRICE = 97

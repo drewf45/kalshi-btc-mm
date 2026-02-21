@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
 from config import (
-    MAX_ENTRY_PRICE_CENTS, MIN_CONFIDENCE, HISTORICAL_ACCURACY,
+    MIN_CONFIDENCE, HISTORICAL_ACCURACY,
     SETTLEMENT_BIAS, ASSET_CONFIG, OBSERVE_START_SECONDS, BUY_START_SECONDS,
     ENTRY_LAST_SECONDS, POLL_SECONDS, META_REFRESH_SECONDS,
     FEE_CENTS_PER_CONTRACT, NUM_CONCURRENT_BOTS,
@@ -41,11 +41,10 @@ from config import (
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
-    CONTRACT_SIZING, XRP_SKIP_RANGE, ETH_HIGH_PRICE_ALLOWED, ETH_HIGH_PRICE_MIN,
     POSTER_START_SECONDS, POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
-    POSTER_PRICE_FLOOR, POSTER_PRICE_CEILING, POSTER_QUEUE_DISCOUNT,
-    POSTER_MIN_EDGE_CENTS, POSTER_POST_DISCOUNT, POSTER_CANCEL_THRESHOLD,
-    POSTER_MAX_CONTRACTS, POSTER_MIN_PRICE, POSTER_MAX_PRICE,
+    POSTER_MIN_EDGE_CENTS, POSTER_FEE_CENTS, POSTER_QUEUE_DISCOUNT,
+    POSTER_EDGE_SCALE, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
+    POSTER_CANCEL_EDGE, POSTER_ABSOLUTE_MIN_PRICE, POSTER_ABSOLUTE_MAX_PRICE,
 )
 
 # ======================== BOOT BANNER ========================
@@ -107,7 +106,6 @@ SPOT_SIGMA_USD_PER_SQRT_SEC = ASSET_CFG['default_sigma']
 SIGMA_FLOOR = ASSET_CFG['sigma_floor']
 SIGMA_CEIL = ASSET_CFG['sigma_ceil']
 BOUNDARY_BUFFER_USD = ASSET_CFG['boundary_buffer_usd']
-MAX_PRICE = MAX_ENTRY_PRICE_CENTS.get(ASSET, 50)
 
 # Fast local guard: prevents re-entry during API lag
 TRADED_TICKERS: set = set()
@@ -738,22 +736,12 @@ def validate_order(client: KalshiClient, ticker: str, side: str,
     if ticker in TRADED_TICKERS:
         return False, f"Already in TRADED_TICKERS (fast guard)"
 
-    # GATE 1: Asset-specific price cap (with dead zones)
-    allowed, cap_reason = price_is_allowed(price_cents)
-    if not allowed:
-        return False, cap_reason
-
-    # GATE 2: Must have sizing bucket
-    expected_qty = get_contract_count(price_cents)
-    if expected_qty == 0:
-        return False, f"No sizing bucket for {price_cents}¢"
-
-    # GATE 3: Cost cap
+    # GATE 1: Cost cap
     proposed_cost = quantity * (price_cents / 100.0)
     if proposed_cost > MAX_COST_PER_MARKET:
         return False, f"{quantity}ct × {price_cents}¢ = ${proposed_cost:.2f} > ${MAX_COST_PER_MARKET} max"
 
-    # GATE 4: Existing position check (API, not local state) — FAIL-CLOSED
+    # GATE 2: Existing position check (API, not local state) — FAIL-CLOSED
     try:
         existing = abs(parse_position_for_market(get_positions(client), ticker))
         if existing > 0:
@@ -795,93 +783,101 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
     return asset_data.get(bucket)
 
 
-# ======================== PRICE GATING =========================
-def price_is_allowed(price_cents: int) -> Tuple[bool, str]:
+# ======================== EDGE POSTER PRICING ================
+def get_edge_post_price(no_ask: Optional[int],
+                         fair_value_no: int) -> Tuple[Optional[int], int]:
     """
-    Poster model price gate — NO contracts only.
-    Dead zones removed. Poster posts at best available price up to asset ceiling.
-    Ceiling set by MAX_ENTRY_PRICE_CENTS in config:
-      BTC: 50¢  ETH: 50¢  SOL: 20¢  XRP: 40¢
-    XRP additionally skips 21-50¢ range (XRP_SKIP_RANGE).
-    """
-    if ASSET == 'XRP':
-        if XRP_SKIP_RANGE[0] <= price_cents <= XRP_SKIP_RANGE[1]:
-            return False, f"XRP {price_cents}¢ in skip range ({XRP_SKIP_RANGE[0]}-{XRP_SKIP_RANGE[1]}¢)"
-        if price_cents <= MAX_PRICE:
-            return True, "OK"
-        return False, f"XRP {price_cents}¢ above {MAX_PRICE}¢ ceiling"
+    Pure edge calculation. No price ranges. No dead zones.
 
-    if price_cents <= MAX_PRICE:
-        return True, "OK"
-    return False, f"{ASSET} {price_cents}¢ above {MAX_PRICE}¢ poster ceiling"
+    Returns (post_price, edge_cents) or (None, edge_cents) if no edge.
 
+    Edge = fair_value_no - no_ask
+    - Positive edge: market underprices NO vs model — we have advantage
+    - Negative edge: market overprices NO — skip, no advantage
 
-# ======================== CONTRACT SIZING =====================
-def get_contract_count(price_cents: int) -> int:
-    """Look up exact contract count from data-driven sizing table."""
-    sizing = CONTRACT_SIZING.get(ASSET, {})
-    for (low, high), contracts in sizing.items():
-        if low <= price_cents <= high:
-            log.info(f"[SIZE] {ASSET} {price_cents}¢ → bucket ({low}-{high}¢) → {contracts} contracts")
-            return contracts
-    log.info(f"[SIZE] {ASSET} {price_cents}¢ — no matching bucket, skipping")
-    return 0
+    Post price = no_ask - POSTER_QUEUE_DISCOUNT
+    Clamped to POSTER_ABSOLUTE_MIN_PRICE / POSTER_ABSOLUTE_MAX_PRICE only.
+    No asset-specific caps. No dead zones.
 
-
-# ======================== SMART POSTER PRICING ===============
-def get_smart_post_price(no_ask: Optional[int], fair_value_no: int) -> Optional[int]:
-    """
-    Calculate smart posting price using model fair value vs market price.
-
-    Returns posting price in cents, or None if no edge exists.
-
-    Logic:
-    - Edge = fair_value_no - no_ask (how much market underprices NO vs model)
-    - If edge < POSTER_MIN_EDGE_CENTS: no edge, return None (don't post)
-    - If edge >= POSTER_MIN_EDGE_CENTS: post at no_ask - POSTER_POST_DISCOUNT
-      (undercut market slightly to get to front of queue)
-    - Enforce floor and ceiling on final price
-
-    Examples:
-    - Model says NO worth 75¢. Market NO ask = 65¢. Edge = 10¢. Post at 63¢.
-    - Model says NO worth 75¢. Market NO ask = 72¢. Edge = 3¢ < 5¢ min. Skip.
-    - Model says NO worth 40¢. Market NO ask = 60¢. Edge = -20¢ (market overprices). Skip.
+    Minimum edge check:
+    - Must exceed POSTER_MIN_EDGE_CENTS to post
+    - Must exceed POSTER_FEE_CENTS to be profitable at all
     """
     if no_ask is None:
-        return None
+        return None, 0
 
     edge = fair_value_no - no_ask
 
     log.info(
-        f"[EDGE] fair_value={fair_value_no}¢ market_no_ask={no_ask}¢ "
-        f"edge={edge:+d}¢ min_required={POSTER_MIN_EDGE_CENTS}¢"
+        f"[EDGE] fair={fair_value_no}¢ no_ask={no_ask}¢ "
+        f"edge={edge:+d}¢ min={POSTER_MIN_EDGE_CENTS}¢ fee={POSTER_FEE_CENTS}¢"
     )
 
+    # Must have real edge above fees
     if edge < POSTER_MIN_EDGE_CENTS:
-        return None  # No edge — don't post
+        return None, edge
 
-    post_price = no_ask - POSTER_POST_DISCOUNT
-    post_price = max(POSTER_MIN_PRICE, min(POSTER_MAX_PRICE, post_price))
+    # Must be profitable after fees
+    if edge <= POSTER_FEE_CENTS:
+        return None, edge
 
-    return post_price
+    post_price = no_ask - POSTER_QUEUE_DISCOUNT
+    post_price = max(POSTER_ABSOLUTE_MIN_PRICE, min(POSTER_ABSOLUTE_MAX_PRICE, post_price))
+
+    return post_price, edge
 
 
-def run_smart_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
-                          close_ts: int, get_ob_func, get_spot_func,
-                          lo: Optional[float], hi: Optional[float],
-                          http_session: requests.Session,
-                          stop_event: Optional[threading.Event] = None) -> int:
+def get_edge_contract_count(edge_cents: int, post_price: int,
+                             available_balance_cents: int) -> int:
     """
-    Smart amend loop — reprices every 30 seconds using model fair value.
+    Scale contracts to edge size. Bigger edge = more contracts.
+    No price buckets. No historical taker data needed.
 
-    Key difference from basic amend loop:
-    - Recalculates model fair value every 30 seconds
-    - If edge disappears (market no ask < fair value - POSTER_CANCEL_THRESHOLD):
-      CANCEL the order immediately — don't collect bad fills
-    - If edge still exists: amend to new best price
-    - Stops at expiry or full fill
+    Formula: contracts = floor(edge_cents * POSTER_EDGE_SCALE)
+    Clamped to POSTER_MIN_CONTRACTS and POSTER_MAX_CONTRACTS.
+    Further clamped by available balance.
 
-    Returns total filled contracts.
+    Examples at POSTER_EDGE_SCALE = 2.0:
+    - edge  6¢ → 12 contracts (minimum threshold)
+    - edge  8¢ → 16 contracts
+    - edge 10¢ → 20 contracts
+    - edge 15¢ → 30 contracts
+    - edge 20¢ → 40 contracts
+    - edge 25¢ → 50 contracts (max cap)
+
+    Balance cap: never spend more than MAX_COST_PER_MARKET
+    or more than available balance.
+    """
+    raw = int(edge_cents * POSTER_EDGE_SCALE)
+    contracts = max(POSTER_MIN_CONTRACTS, min(POSTER_MAX_CONTRACTS, raw))
+
+    # Cost cap
+    cost_cents = contracts * post_price
+    max_cost_cents = int(MAX_COST_PER_MARKET * 100)
+    if cost_cents > max_cost_cents:
+        contracts = max(1, max_cost_cents // post_price)
+
+    # Balance cap
+    if cost_cents > available_balance_cents:
+        contracts = max(1, available_balance_cents // post_price)
+
+    log.info(
+        f"[SIZE-EDGE] edge={edge_cents}¢ scale={POSTER_EDGE_SCALE} "
+        f"raw={raw} capped={contracts} "
+        f"cost=${contracts * post_price / 100:.2f}"
+    )
+
+    return contracts
+
+
+def run_edge_amend_loop(client, order_id, market_ticker, close_ts,
+                         get_ob_func, get_spot_func, lo, hi,
+                         http_session) -> int:
+    """
+    Amend loop using pure edge logic.
+    Recalculates fair value and edge every POSTER_AMEND_INTERVAL seconds.
+    Cancels if edge drops below POSTER_CANCEL_EDGE.
+    Amends price if edge still exists and price has changed.
     """
     last_amend = time.time()
     current_price = None
@@ -890,161 +886,83 @@ def run_smart_amend_loop(client: KalshiClient, order_id: str, market_ticker: str
     if order:
         current_price = order.get("no_price") or order.get("yes_price")
 
-    log.info(
-        f"[SMART-AMEND] Starting for {order_id} on {market_ticker} "
-        f"close_ts={close_ts} initial_price={current_price}¢"
-    )
+    log.info(f"[EDGE-AMEND] Start {order_id} initial_price={current_price}¢")
 
     while True:
         now = time.time()
         secs_to_close = close_ts - now
 
-        # Check if signaled to stop (market rolled)
-        if stop_event is not None and stop_event.is_set():
-            log.info(f"[SMART-AMEND] Stop signaled (market rolled), canceling {order_id}")
-            try:
-                cancel_order_status(client, order_id)
-            except Exception:
-                pass
-            break
-
-        # Stop near expiry
         if secs_to_close <= (POSTER_EXPIRY_BUFFER + 5):
-            log.info(f"[SMART-AMEND] Near expiry, stopping loop for {order_id}")
+            log.info(f"[EDGE-AMEND] Expiry approaching, stopping")
             break
 
-        # Check order status
         order = get_order(client, order_id)
         if order is None:
-            log.info(f"[SMART-AMEND] Order {order_id} not found — expired/filled")
             break
 
         status = order.get("status", "")
         fill_count = order.get("fill_count", 0)
         remaining = order.get("remaining_count", 0)
 
-        log.info(
-            f"[SMART-AMEND] {order_id} status={status} "
-            f"filled={fill_count} remaining={remaining} price={current_price}¢"
-        )
-
         if status in ("executed", "canceled") or remaining == 0:
-            log.info(f"[SMART-AMEND] Done: {status} filled={fill_count}")
+            log.info(f"[EDGE-AMEND] Done: {status} filled={fill_count}")
             break
 
-        # Re-evaluate every 30 seconds
         if (now - last_amend) >= POSTER_AMEND_INTERVAL:
             try:
-                # Get fresh data
                 ob = get_ob_func()
                 spot = get_spot_func()
                 yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
 
                 if spot is None or no_ask is None:
-                    log.info(f"[SMART-AMEND] Missing spot or no_ask — skipping amend")
                     last_amend = now
                     time.sleep(POLL_SECONDS)
                     continue
 
-                # Recalculate fair value
                 sigma = get_sigma_cached(http_session)
                 fair_value = calculate_fair_value_no(
                     spot, lo, hi, sigma, secs_to_close,
                     yes_bid, yes_ask, no_bid, no_ask
                 )
 
-                # Check if edge still exists
-                edge = fair_value - no_ask
+                new_price, edge = get_edge_post_price(no_ask, fair_value)
 
                 log.info(
-                    f"[SMART-AMEND] Re-eval: fair={fair_value}¢ "
+                    f"[EDGE-AMEND] Re-eval: fair={fair_value}¢ "
                     f"no_ask={no_ask}¢ edge={edge:+d}¢"
                 )
 
-                # CANCEL if edge has disappeared
-                if edge < POSTER_CANCEL_THRESHOLD:
+                # Cancel if edge gone
+                if edge < POSTER_CANCEL_EDGE:
                     log.warning(
-                        f"[SMART-AMEND] Edge gone ({edge:+d}¢ < {POSTER_CANCEL_THRESHOLD}¢ min) "
-                        f"— CANCELING {order_id} to avoid bad fills"
+                        f"[EDGE-AMEND] Edge gone ({edge:+d}¢) — "
+                        f"CANCEL {order_id}"
                     )
                     cancel_order_status(client, order_id)
                     break
 
-                # Edge still exists — amend to new best price
-                new_price = no_ask - POSTER_POST_DISCOUNT
-                new_price = max(POSTER_MIN_PRICE, min(POSTER_MAX_PRICE, new_price))
-
-                if new_price != current_price and remaining > 0:
-                    old_price = current_price
+                # Amend if price changed
+                if new_price is not None and new_price != current_price:
                     result = amend_order(client, order_id, new_price, remaining)
                     if result is not None:
-                        current_price = new_price
                         log.warning(
-                            f"[SMART-AMEND] {market_ticker} {order_id} "
-                            f"{old_price}¢ → {new_price}¢ "
+                            f"[EDGE-AMEND] {market_ticker} "
+                            f"{current_price}¢ → {new_price}¢ "
                             f"edge={edge:+d}¢ fair={fair_value}¢"
                         )
+                        current_price = new_price
                     else:
-                        log.info(f"[SMART-AMEND] Amend returned None — order done")
                         break
 
             except Exception as e:
-                log.warning(f"[SMART-AMEND] Error: {e}")
+                log.warning(f"[EDGE-AMEND] Error: {e}")
 
             last_amend = now
 
         time.sleep(POLL_SECONDS)
 
-    # Return final fill count
-    final_order = get_order(client, order_id)
-    if final_order:
-        return int(final_order.get("fill_count", 0))
-    return 0
-
-
-# ======================== ENTRY DECISION =====================
-def should_enter(p_yes: float, p_no: float, yes_ask: Optional[int],
-                 no_ask: Optional[int]) -> Optional[Tuple[str, int]]:
-    """
-    Data-driven entry decision with asset-specific price caps.
-    Returns (side, price_cents) or None.
-    """
-    # Step 1: Determine predicted winner
-    if p_yes > p_no:
-        predicted_side = "yes"
-        entry_price = yes_ask
-        confidence = p_yes
-    else:
-        predicted_side = "no"
-        entry_price = no_ask
-        confidence = p_no
-
-    # Step 2: No ask available
-    if entry_price is None:
-        return None
-
-    # Step 3: Asset-specific price gate (with dead zones)
-    allowed, reason = price_is_allowed(entry_price)
-    if not allowed:
-        log.info(f"[SKIP] {reason}")
-        return None
-
-    # Step 4: Must have a sizing bucket — no bucket = no trade
-    contracts = get_contract_count(entry_price)
-    if contracts == 0:
-        log.info(f"[SKIP] {ASSET} @{entry_price}¢ — no sizing bucket")
-        return None
-
-    # Step 5: Minimum confidence
-    if confidence < MIN_CONFIDENCE:
-        return None
-
-    # Step 6: Edge check — is expected value positive?
-    breakeven = (entry_price + FEE_CENTS_PER_CONTRACT) / 100.0
-    if confidence < breakeven:
-        return None
-
-    return (predicted_side, entry_price)
+    final = get_order(client, order_id)
+    return int(final.get("fill_count", 0)) if final else 0
 
 
 
@@ -1239,18 +1157,20 @@ def main() -> None:
     log.warning(f"[IRON RULES] {ASSET} Bot — DATA-DRIVEN V4 (Feb 2026)")
     log.warning(f"[IRON RULES] RULE 1: One direction per market — once positioned, DONE")
     log.warning(f"[IRON RULES] RULE 2: Data-driven contract sizing per price bucket")
-    log.warning(f"[IRON RULES] RULE 3: Price cap {MAX_PRICE}¢ | cost cap ${MAX_COST_PER_MARKET}")
+    log.warning(f"[IRON RULES] RULE 3: Edge min {POSTER_MIN_EDGE_CENTS}¢ | cost cap ${MAX_COST_PER_MARKET}")
     log.warning(f"[IRON RULES] RULE 4: Never buy both YES and NO on same market")
     log.warning(f"[IRON RULES] RULE 5: Single entry — TRADED_TICKERS + API check")
     log.warning("=" * 70)
-    sizing_buckets = CONTRACT_SIZING.get(ASSET, {})
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s "
-        f"BUY={BUY_START_SECONDS}s PRICE_CAP={MAX_PRICE}¢ "
+        f"POSTER_START={POSTER_START_SECONDS}s MIN_EDGE={POSTER_MIN_EDGE_CENTS}¢ "
         f"MAX_COST=${MAX_COST_PER_MARKET} ALLOC=${BOT_ALLOCATION} "
         f"MIN_CONF={MIN_CONFIDENCE:.0%} POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
-    log.warning(f"[BOOTCFG] Sizing buckets: {sizing_buckets}")
+    log.warning(
+        f"[BOOTCFG] Edge scale={POSTER_EDGE_SCALE} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
+        f"cancel_edge={POSTER_CANCEL_EDGE}¢ queue_discount={POSTER_QUEUE_DISCOUNT}¢"
+    )
     log.warning(
         f"[BOOTCFG] Settlement bias: YES={SETTLEMENT_BIAS[ASSET]['yes']:.1%} "
         f"NO={SETTLEMENT_BIAS[ASSET]['no']:.1%}"
@@ -1331,8 +1251,6 @@ def main() -> None:
     st.event = ev
     reconcile_on_market_change(mt)
     last_meta = time.time()
-    amend_stop_event = None  # Signal to stop background amend loop on ROLL
-
     # ======================== MAIN LOOP ======================
     while True:
         now = time.time()
@@ -1392,12 +1310,6 @@ def main() -> None:
                 if mt2 != st.market:
                     old_market = st.market
                     log.warning(f"[ROLL] {old_market} -> {mt2}")
-
-                    # Signal amend loop to stop if running in background
-                    if amend_stop_event is not None:
-                        amend_stop_event.set()
-                        log.info(f"[ROLL] Signaled amend loop to stop for {old_market}")
-                        amend_stop_event = None
 
                     if st.traded_this_market and st.entry_price_cents is not None and st.side and st.qty > 0:
                         result = None
@@ -1565,89 +1477,60 @@ def main() -> None:
                 st.traded_this_market = True
             continue
 
-        # ============ SMART POSTER ENTRY ============
+        # ============ PURE EDGE POSTER ENTRY ============
 
-        # Session and balance checks (UNCHANGED)
+        # Session check
         can_trade, reason = session.check_can_trade()
         if not can_trade:
             log.warning(f"[SESSION] Paused: {reason}")
             time.sleep(POLL_SECONDS)
             continue
 
+        # Balance check
         available, _ = get_balance_usd(client)
         if available is not None and available < MIN_BOT_BALANCE:
-            log.warning(f"[SKIP] Balance ${available:.2f} < ${MIN_BOT_BALANCE} minimum")
+            log.warning(f"[SKIP] Balance ${available:.2f} < floor")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Calculate model fair value
+        available_cents = int((available or 0) * 100)
+
+        # Calculate fair value
         fair_value = calculate_fair_value_no(
             spot, lo, hi, sigma, secs_to_close,
             yes_bid, yes_ask, no_bid, no_ask
         )
 
-        # Get smart posting price — None if no edge
-        post_price = get_smart_post_price(no_ask, fair_value)
+        # Get post price and edge — no dead zones, no price caps
+        post_price, edge = get_edge_post_price(no_ask, fair_value)
 
         if post_price is None:
             log.info(
                 f"[SKIP-EDGE] {st.market} fair={fair_value}¢ "
-                f"no_ask={no_ask}¢ — insufficient edge, waiting"
+                f"no_ask={no_ask}¢ edge={edge:+d}¢ — no edge"
             )
             time.sleep(POLL_SECONDS)
             continue
 
-        # Get contract count from sizing table
-        order_qty = get_contract_count(post_price)
-        if order_qty == 0:
-            log.info(f"[SKIP] No sizing bucket for {post_price}¢")
+        # Scale contracts to edge
+        order_qty = get_edge_contract_count(edge, post_price, available_cents)
+        if order_qty < 1:
+            log.info(f"[SKIP] Insufficient balance for even 1 contract")
             time.sleep(POLL_SECONDS)
             continue
 
-        # Cap contracts
-        order_qty = min(order_qty, POSTER_MAX_CONTRACTS)
-
-        # Cost cap enforcement
-        total_cost = order_qty * (post_price / 100.0)
-        if total_cost > MAX_COST_PER_MARKET:
-            order_qty = max(1, int(MAX_COST_PER_MARKET / (post_price / 100.0)))
-            total_cost = order_qty * (post_price / 100.0)
-        if available is not None and total_cost > available:
-            order_qty = max(1, int(available / (post_price / 100.0)))
-            total_cost = order_qty * (post_price / 100.0)
-
-        if not ENABLE_TRADING or DRY_RUN:
-            log.warning(
-                f"[DRY] Would post {order_qty}ct NO @ {post_price}¢ "
-                f"fair={fair_value}¢ edge={fair_value - (no_ask or 0):+d}¢"
-            )
-            TRADED_TICKERS.add(st.market)
-            st.traded_this_market = True
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # Validate (UNCHANGED iron rules)
-        allowed, block_reason = validate_order(
-            client, st.market, "no", order_qty, post_price
-        )
-        if not allowed:
-            log.warning(f"[BLOCKED] {st.market}: {block_reason}")
-            TRADED_TICKERS.add(st.market)
-            st.traded_this_market = True
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # COMMIT — lock BEFORE order (UNCHANGED)
+        # COMMIT — lock before order (Rule 1 — never changes)
         TRADED_TICKERS.add(st.market)
         st.traded_this_market = True
         log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS")
 
+        total_cost = order_qty * post_price / 100.0
+
         try:
             log.warning(
-                f"[SMART-POSTER] {st.market} NO {order_qty}ct @ {post_price}¢ "
-                f"fair={fair_value}¢ no_ask={no_ask}¢ "
-                f"edge={fair_value - (no_ask or 0):+d}¢ "
-                f"cost=${total_cost:.2f} bal=${available:.2f}"
+                f"[EDGE-POSTER] {st.market} NO {order_qty}ct @ {post_price}¢ "
+                f"fair={fair_value}¢ no_ask={no_ask}¢ edge={edge:+d}¢ "
+                f"contracts={order_qty} cost=${total_cost:.2f}"
             )
 
             payload = build_order_payload(
@@ -1656,12 +1539,12 @@ def main() -> None:
             oid = place_order(client, payload)
 
             if oid.startswith("BLOCKED"):
-                log.warning(f"[SMART-POSTER] Blocked: {oid}")
+                log.warning(f"[EDGE-POSTER] Blocked: {oid}")
                 time.sleep(POLL_SECONDS)
                 continue
 
             log.warning(
-                f"[SMART-POSTER-ORDER] Placed {oid} POST_ONLY NO "
+                f"[EDGE-POSTER-ORDER] {oid} POST_ONLY NO "
                 f"{order_qty}ct @ {post_price}¢"
             )
 
@@ -1670,17 +1553,10 @@ def main() -> None:
             st.qty = order_qty
             st.order_id = oid
 
-            # Run smart amend loop in background thread
-            amend_stop_event = threading.Event()
-            launched_market = st.market
-            launched_price = post_price
-            launched_lo = lo
-            launched_hi = hi
-
             def fetch_ob():
                 try:
                     return client.request(
-                        "GET", f"/markets/{launched_market}/orderbook"
+                        "GET", f"/markets/{st.market}/orderbook"
                     ) or {}
                 except Exception:
                     return {}
@@ -1688,41 +1564,36 @@ def main() -> None:
             def fetch_spot():
                 return fetch_spot_usd(http)
 
-            def _amend_worker():
-                filled_count = run_smart_amend_loop(
-                    client, oid, launched_market, close_ts,
-                    fetch_ob, fetch_spot, launched_lo, launched_hi, http,
-                    stop_event=amend_stop_event
-                )
-                # Only update state if market hasn't rolled
-                if st.market == launched_market:
-                    if filled_count > 0:
-                        st.qty = filled_count
-                        st.entry_price_cents = launched_price
-                        log.warning(
-                            f"[SMART-POSTER-FILL] {launched_market} filled {filled_count}ct "
-                            f"NO @ {launched_price}¢ cost=${filled_count * launched_price / 100:.2f}"
-                        )
-                    else:
-                        log.info(
-                            f"[SMART-POSTER-FILL] {launched_market} — 0 fills "
-                            f"(no edge or expired unfilled)"
-                        )
-                else:
-                    log.info(f"[AMEND-THREAD] Market rolled past {launched_market}, skipping state update")
+            filled_count = run_edge_amend_loop(
+                client, oid, st.market, close_ts,
+                fetch_ob, fetch_spot, lo, hi, http
+            )
 
-            threading.Thread(target=_amend_worker, daemon=True, name=f"amend-{oid[:8]}").start()
-            log.info(f"[SMART-AMEND] Started background thread for {oid} on {st.market}")
+            if filled_count > 0:
+                st.qty = filled_count
+                log.warning(
+                    f"[EDGE-POSTER-FILL] {st.market} "
+                    f"filled={filled_count}ct @ {post_price}¢ "
+                    f"revenue=${filled_count * (100 - post_price) / 100:.2f} if NO wins"
+                )
+            else:
+                log.info(
+                    f"[EDGE-POSTER-FILL] {st.market} 0 fills — "
+                    f"expired or edge gone"
+                )
 
         except Exception as e:
-            log.warning(f"[SMART-POSTER] Failed: {e} — market still marked traded")
+            log.warning(
+                f"[EDGE-POSTER] Exception: {e} — market locked, no retry"
+            )
 
         time.sleep(POLL_SECONDS)
+        continue
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: {e} | {ASSET} PRICE_CAP={MAX_PRICE}¢ ALLOC=${BOT_ALLOCATION}")
+        log.exception(f"FATAL: {e} | {ASSET} EDGE_MIN={POSTER_MIN_EDGE_CENTS}¢ ALLOC=${BOT_ALLOCATION}")
         sys.exit(1)
