@@ -41,10 +41,10 @@ from config import (
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
-    POSTER_ENTRY_WINDOW_SECONDS, POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
-    POSTER_MIN_EDGE_CENTS, POSTER_FEE_CENTS, POSTER_QUEUE_DISCOUNT,
+    POSTER_CONFIDENCE_THRESHOLD, POSTER_CANCEL_THRESHOLD,
+    POSTER_MIN_EDGE_CENTS, POSTER_BOOK_PREMIUM,
     POSTER_EDGE_SCALE, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
-    POSTER_CANCEL_EDGE, POSTER_MIN_NO_PRICE, POSTER_MAX_NO_PRICE,
+    POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
 )
 
 # ======================== BOOT BANNER ========================
@@ -700,16 +700,16 @@ def build_order_payload(market_ticker: str, side: str, price_cents: int,
 
 
 def amend_order(client: KalshiClient, order_id: str, new_price_cents: int,
-                remaining_count: int) -> Optional[Dict[str, Any]]:
+                remaining_count: int, side: str = "no") -> Optional[Dict[str, Any]]:
     """
-    Amend the price of a resting order. Does NOT create a new order.
-    Only affects unfilled remainder. Already-filled contracts keep original price.
-    Returns updated order dict or None on failure.
+    Amend resting limit order price.
+    Handles both YES and NO sides.
     """
     try:
+        price_key = "yes_price" if side == "yes" else "no_price"
         payload = {
             "count": int(remaining_count),
-            "no_price": int(new_price_cents),
+            price_key: int(new_price_cents),
         }
         resp = client.request("POST", f"/portfolio/orders/{order_id}/amend",
                               json_body=payload)
@@ -783,121 +783,155 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
     return asset_data.get(bucket)
 
 
-# ======================== EDGE POSTER PRICING ================
-def get_edge_post_price(no_ask: Optional[int],
-                         fair_value_no: int) -> Tuple[Optional[int], int]:
+# ======================== PROBABILITY POSTER V5 ================
+def evaluate_poster_entry(p_yes: float, p_no: float,
+                           yes_ask: Optional[int],
+                           no_ask: Optional[int]
+                           ) -> Optional[Tuple[str, int, int]]:
     """
-    Pure edge poster — correct binary market logic.
+    Pure probability poster entry.
+    Checks both YES and NO every call.
+    Returns (side, post_price, edge_cents) or None.
 
-    NO price IS the probability NO wins.
-    We want NO priced 55-92¢ where market underestimates certainty.
+    Trigger: model >= 85% confident on either side.
+    Post: ask_price + POSTER_BOOK_PREMIUM (above book).
+    Edge: fair_value - post_price >= POSTER_MIN_EDGE_CENTS.
 
-    Price floor (55¢): Below this market thinks movement likely — skip.
-    Price ceiling (92¢): Above this market already knows — little edge left.
-    Edge minimum (8¢): Model must disagree with market by at least 8¢.
+    YES example:
+      p_yes=0.87, yes_ask=75¢
+      fair=87¢, post=78¢, edge=9¢ → POST YES at 78¢
 
-    Returns (post_price, edge_cents) or (None, edge_cents).
+    NO example:
+      p_no=0.86, no_ask=74¢
+      fair=86¢, post=77¢, edge=9¢ → POST NO at 77¢
     """
-    if no_ask is None:
-        return None, 0
 
-    # Price floor — don't post when market thinks movement likely
-    if no_ask < POSTER_MIN_NO_PRICE:
+    # Check YES side first
+    if p_yes >= POSTER_CONFIDENCE_THRESHOLD and yes_ask is not None:
+        fair_yes = int(round(p_yes * 100))
+        post_price = yes_ask + POSTER_BOOK_PREMIUM
+        post_price = max(1, min(99, post_price))
+        edge = fair_yes - post_price
+
         log.info(
-            f"[SKIP-PRICE] no_ask={no_ask}¢ below floor {POSTER_MIN_NO_PRICE}¢ "
-            f"— market thinks movement likely, not a sure win"
+            f"[EVAL-YES] p_yes={p_yes:.1%} fair={fair_yes}¢ "
+            f"yes_ask={yes_ask}¢ post={post_price}¢ edge={edge:+d}¢ "
+            f"min={POSTER_MIN_EDGE_CENTS}¢"
         )
-        return None, 0
 
-    # Price ceiling — market already certain, little edge to capture
-    if no_ask > POSTER_MAX_NO_PRICE:
+        if edge >= POSTER_MIN_EDGE_CENTS:
+            log.warning(
+                f"[TRIGGER-YES] p_yes={p_yes:.1%} >= {POSTER_CONFIDENCE_THRESHOLD:.0%} "
+                f"edge={edge:+d}¢ — POSTING YES at {post_price}¢"
+            )
+            return ("yes", post_price, edge)
+
+    # Check NO side
+    if p_no >= POSTER_CONFIDENCE_THRESHOLD and no_ask is not None:
+        fair_no = int(round(p_no * 100))
+        post_price = no_ask + POSTER_BOOK_PREMIUM
+        post_price = max(1, min(99, post_price))
+        edge = fair_no - post_price
+
         log.info(
-            f"[SKIP-PRICE] no_ask={no_ask}¢ above ceiling {POSTER_MAX_NO_PRICE}¢ "
-            f"— market already certain, edge too thin"
+            f"[EVAL-NO] p_no={p_no:.1%} fair={fair_no}¢ "
+            f"no_ask={no_ask}¢ post={post_price}¢ edge={edge:+d}¢ "
+            f"min={POSTER_MIN_EDGE_CENTS}¢"
         )
-        return None, 0
 
-    edge = fair_value_no - no_ask
+        if edge >= POSTER_MIN_EDGE_CENTS:
+            log.warning(
+                f"[TRIGGER-NO] p_no={p_no:.1%} >= {POSTER_CONFIDENCE_THRESHOLD:.0%} "
+                f"edge={edge:+d}¢ — POSTING NO at {post_price}¢"
+            )
+            return ("no", post_price, edge)
 
-    log.info(
-        f"[EDGE] fair={fair_value_no}¢ no_ask={no_ask}¢ "
-        f"edge={edge:+d}¢ min={POSTER_MIN_EDGE_CENTS}¢"
-    )
-
-    # Must have meaningful edge — model must disagree with market
-    if edge < POSTER_MIN_EDGE_CENTS:
-        return None, edge
-
-    # Must be profitable after fees
-    if edge <= POSTER_FEE_CENTS:
-        return None, edge
-
-    post_price = no_ask - POSTER_QUEUE_DISCOUNT
-    post_price = max(POSTER_MIN_NO_PRICE, min(POSTER_MAX_NO_PRICE, post_price))
-
-    return post_price, edge
+    return None
 
 
-def get_edge_contract_count(edge_cents: int, post_price: int,
-                             available_balance_cents: int) -> int:
+def get_poster_contract_count(edge_cents: int, post_price: int,
+                               available_balance_cents: int) -> int:
     """
-    Scale contracts to edge size.
-    Bigger edge = market more wrong = more contracts.
+    Scale contracts to edge size and available bankroll.
+    Each bot manages its own allocation independently.
+    As bankroll grows, contracts scale up automatically.
 
-    At POSTER_EDGE_SCALE = 3.0:
+    Formula: contracts = floor(edge_cents * POSTER_EDGE_SCALE)
+
+    Examples at scale 3.0:
+    edge  3¢ →  9 contracts (minimum threshold)
+    edge  5¢ → 15 contracts
     edge  8¢ → 24 contracts
     edge 10¢ → 30 contracts
     edge 15¢ → 45 contracts
-    edge 20¢ → 50 contracts (capped)
+    edge 20¢ → 60 contracts
+    edge 30¢ → 90 contracts
+    edge 34¢ → 100 contracts (max cap)
     """
     raw = int(edge_cents * POSTER_EDGE_SCALE)
     contracts = max(POSTER_MIN_CONTRACTS, min(POSTER_MAX_CONTRACTS, raw))
 
-    # Cost cap
+    # Cost cap per market
     cost_cents = contracts * post_price
     max_cost_cents = int(MAX_COST_PER_MARKET * 100)
     if cost_cents > max_cost_cents:
         contracts = max(1, max_cost_cents // post_price)
 
-    # Balance cap
+    # Balance cap — never spend more than available
+    cost_cents = contracts * post_price
     if cost_cents > available_balance_cents:
         contracts = max(1, available_balance_cents // post_price)
 
     log.info(
-        f"[SIZE-EDGE] edge={edge_cents}¢ scale={POSTER_EDGE_SCALE} "
-        f"raw={raw} capped={contracts} "
+        f"[SIZE] edge={edge_cents}¢ scale={POSTER_EDGE_SCALE} "
+        f"raw={raw} contracts={contracts} "
         f"cost=${contracts * post_price / 100:.2f}"
     )
 
     return contracts
 
 
-def run_edge_amend_loop(client, order_id, market_ticker, close_ts,
-                         get_ob_func, get_spot_func, lo, hi,
-                         http_session) -> int:
+def run_probability_amend_loop(client, order_id: str,
+                                market_ticker: str, close_ts: float,
+                                get_ob_func, get_spot_func,
+                                lo: float, hi: float,
+                                http_session, side: str) -> int:
     """
-    Amend loop using pure edge logic.
-    Recalculates fair value and edge every POSTER_AMEND_INTERVAL seconds.
-    Cancels if edge drops below POSTER_CANCEL_EDGE.
-    Amends price if edge still exists and price has changed.
+    Amend loop for probability poster.
+    Tracks book price upward as market catches up to fair value.
+    Cancels if confidence drops below POSTER_CANCEL_THRESHOLD.
+    Cancels explicitly when expiry buffer triggers.
+    Never leaves a stray order on the book.
+
+    side: 'yes' or 'no'
     """
     last_amend = time.time()
     current_price = None
 
     order = get_order(client, order_id)
     if order:
-        current_price = order.get("no_price") or order.get("yes_price")
+        current_price = (order.get("yes_price") if side == "yes"
+                        else order.get("no_price"))
 
-    log.info(f"[EDGE-AMEND] Start {order_id} initial_price={current_price}¢")
+    log.info(
+        f"[PROB-AMEND] Start {order_id} side={side} "
+        f"price={current_price}¢"
+    )
 
     while True:
         now = time.time()
         secs_to_close = close_ts - now
 
-        if secs_to_close <= (POSTER_EXPIRY_BUFFER + 5):
-            log.info(f"[EDGE-AMEND] Expiry approaching, stopping")
+        # ── EXPIRY BUFFER — cancel and exit ──────────────────
+        if secs_to_close <= POSTER_EXPIRY_BUFFER:
+            log.warning(
+                f"[PROB-AMEND] Expiry buffer reached "
+                f"({secs_to_close:.0f}s left) — canceling {order_id}"
+            )
+            cancel_order_status(client, order_id)
             break
 
+        # ── CHECK ORDER STATUS ────────────────────────────────
         order = get_order(client, order_id)
         if order is None:
             break
@@ -907,64 +941,83 @@ def run_edge_amend_loop(client, order_id, market_ticker, close_ts,
         remaining = order.get("remaining_count", 0)
 
         if status in ("executed", "canceled") or remaining == 0:
-            log.info(f"[EDGE-AMEND] Done: {status} filled={fill_count}")
+            log.info(
+                f"[PROB-AMEND] Done: status={status} "
+                f"filled={fill_count}"
+            )
             break
 
+        # ── AMEND INTERVAL ────────────────────────────────────
         if (now - last_amend) >= POSTER_AMEND_INTERVAL:
             try:
                 ob = get_ob_func()
                 spot = get_spot_func()
                 yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
 
-                if spot is None or no_ask is None:
+                if spot is None:
                     last_amend = now
                     time.sleep(POLL_SECONDS)
                     continue
 
                 sigma = get_sigma_cached(http_session)
-                fair_value = calculate_fair_value_no(
+                fair_no = calculate_fair_value_no(
                     spot, lo, hi, sigma, secs_to_close,
                     yes_bid, yes_ask, no_bid, no_ask
                 )
+                p_no = fair_no / 100.0
+                p_yes = 1.0 - p_no
 
-                new_price, edge = get_edge_post_price(no_ask, fair_value)
+                confidence = p_yes if side == "yes" else p_no
+                book_ask = yes_ask if side == "yes" else no_ask
 
                 log.info(
-                    f"[EDGE-AMEND] Re-eval: fair={fair_value}¢ "
-                    f"no_ask={no_ask}¢ edge={edge:+d}¢"
+                    f"[PROB-AMEND] Re-eval: side={side} "
+                    f"confidence={confidence:.1%} book_ask={book_ask}¢ "
+                    f"cancel_threshold={POSTER_CANCEL_THRESHOLD:.0%}"
                 )
 
-                # Cancel if edge gone
-                if edge < POSTER_CANCEL_EDGE:
+                # ── CANCEL IF CONFIDENCE DROPPED ─────────────
+                if confidence < POSTER_CANCEL_THRESHOLD:
                     log.warning(
-                        f"[EDGE-AMEND] Edge gone ({edge:+d}¢) — "
-                        f"CANCEL {order_id}"
+                        f"[PROB-AMEND] Confidence dropped "
+                        f"({confidence:.1%} < "
+                        f"{POSTER_CANCEL_THRESHOLD:.0%}) "
+                        f"— canceling {order_id}"
                     )
                     cancel_order_status(client, order_id)
                     break
 
-                # Amend if price changed
-                if new_price is not None and new_price != current_price:
-                    result = amend_order(client, order_id, new_price, remaining)
-                    if result is not None:
-                        log.warning(
-                            f"[EDGE-AMEND] {market_ticker} "
-                            f"{current_price}¢ → {new_price}¢ "
-                            f"edge={edge:+d}¢ fair={fair_value}¢"
+                # ── AMEND UPWARD AS BOOK CATCHES UP ──────────
+                if book_ask is not None:
+                    new_price = book_ask + POSTER_BOOK_PREMIUM
+                    new_price = max(1, min(99, new_price))
+
+                    if new_price != current_price and remaining > 0:
+                        result = amend_order(
+                            client, order_id,
+                            new_price, remaining, side
                         )
-                        current_price = new_price
-                    else:
-                        break
+                        if result is not None:
+                            log.warning(
+                                f"[PROB-AMEND] {market_ticker} "
+                                f"{current_price}¢ → {new_price}¢ "
+                                f"confidence={confidence:.1%}"
+                            )
+                            current_price = new_price
+                        else:
+                            break
 
             except Exception as e:
-                log.warning(f"[EDGE-AMEND] Error: {e}")
+                log.warning(f"[PROB-AMEND] Error: {e}")
 
             last_amend = now
 
         time.sleep(POLL_SECONDS)
 
     final = get_order(client, order_id)
-    return int(final.get("fill_count", 0)) if final else 0
+    filled = int(final.get("fill_count", 0)) if final else 0
+    log.info(f"[PROB-AMEND] Exit {order_id} filled={filled}")
+    return filled
 
 
 
@@ -1156,23 +1209,25 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
-    log.warning(f"[IRON RULES] {ASSET} Bot — DATA-DRIVEN V4 (Feb 2026)")
-    log.warning(f"[IRON RULES] RULE 1: One direction per market — once positioned, DONE")
-    log.warning(f"[IRON RULES] RULE 2: Data-driven contract sizing per price bucket")
-    log.warning(f"[IRON RULES] RULE 3: Edge min {POSTER_MIN_EDGE_CENTS}¢ | cost cap ${MAX_COST_PER_MARKET}")
-    log.warning(f"[IRON RULES] RULE 4: Never buy both YES and NO on same market")
-    log.warning(f"[IRON RULES] RULE 5: Single entry — TRADED_TICKERS + API check")
+    log.warning(f"[IRON RULES] {ASSET} Bot — PROBABILITY POSTER V5 (Feb 2026)")
+    log.warning(f"[IRON RULES] RULE 1: Single entry per market — TRADED_TICKERS + API check")
+    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — probability is the gate")
+    log.warning(f"[IRON RULES] RULE 3: Confidence >= {POSTER_CONFIDENCE_THRESHOLD:.0%} to post | cost cap ${MAX_COST_PER_MARKET}")
+    log.warning(f"[IRON RULES] RULE 4: Post ABOVE book — market catches up")
+    log.warning(f"[IRON RULES] RULE 5: Triple cancel — expiry + confidence + sweep")
     log.warning("=" * 70)
     log.warning(
-        f"[BOOTCFG] SERIES={SERIES_TICKER} OBSERVE={OBSERVE_START_SECONDS}s "
-        f"ENTRY_WINDOW={POSTER_ENTRY_WINDOW_SECONDS}s MIN_EDGE={POSTER_MIN_EDGE_CENTS}¢ "
+        f"[BOOTCFG] SERIES={SERIES_TICKER} "
+        f"CONF_THRESHOLD={POSTER_CONFIDENCE_THRESHOLD:.0%} "
+        f"CANCEL_THRESHOLD={POSTER_CANCEL_THRESHOLD:.0%} "
+        f"MIN_EDGE={POSTER_MIN_EDGE_CENTS}¢ "
         f"MAX_COST=${MAX_COST_PER_MARKET} ALLOC=${BOT_ALLOCATION} "
-        f"MIN_CONF={MIN_CONFIDENCE:.0%} POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
+        f"POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
     log.warning(
-        f"[BOOTCFG] NO_price={POSTER_MIN_NO_PRICE}-{POSTER_MAX_NO_PRICE}¢ "
+        f"[BOOTCFG] Book premium={POSTER_BOOK_PREMIUM}¢ "
         f"Edge scale={POSTER_EDGE_SCALE} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
-        f"cancel_edge={POSTER_CANCEL_EDGE}¢ queue_discount={POSTER_QUEUE_DISCOUNT}¢"
+        f"amend_interval={POSTER_AMEND_INTERVAL}s expiry_buffer={POSTER_EXPIRY_BUFFER}s"
     )
     log.warning(
         f"[BOOTCFG] Settlement bias: YES={SETTLEMENT_BIAS[ASSET]['yes']:.1%} "
@@ -1459,17 +1514,6 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # OBSERVE phase — wait until POSTER_ENTRY_WINDOW_SECONDS
-        if secs_to_close > POSTER_ENTRY_WINDOW_SECONDS:
-            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.info(
-                    f"[OBSERVE] {st.market} t={secs_to_close}s spot=${spot:.2f} "
-                    f"p_yes={p_yes:.1%} yes=({yes_bid},{yes_ask}) no=({no_bid},{no_ask})"
-                )
-                last_state_log = now
-            time.sleep(POLL_SECONDS)
-            continue
-
         # Too late — close window
         if secs_to_close < ENTRY_LAST_SECONDS:
             if secs_to_close < 0:
@@ -1480,123 +1524,134 @@ def main() -> None:
                 st.traded_this_market = True
             continue
 
-        # ============ PURE EDGE POSTER ENTRY ============
+        # ── PURE PROBABILITY POSTER V5 ────────────────────────────────
+        # Observe entire market. Post when model hits 85% on YES or NO.
+        # Both sides valid. Post above book. Market catches up. Scale.
+        if not st.traded_this_market:
 
-        # Session check
-        can_trade, reason = session.check_can_trade()
-        if not can_trade:
-            log.warning(f"[SESSION] Paused: {reason}")
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # Balance check
-        available, _ = get_balance_usd(client)
-        if available is not None and available < MIN_BOT_BALANCE:
-            log.warning(f"[SKIP] Balance ${available:.2f} < floor")
-            time.sleep(POLL_SECONDS)
-            continue
-
-        available_cents = int((available or 0) * 100)
-
-        # Calculate fair value
-        fair_value = calculate_fair_value_no(
-            spot, lo, hi, sigma, secs_to_close,
-            yes_bid, yes_ask, no_bid, no_ask
-        )
-
-        # Get post price and edge — no dead zones, no price caps
-        post_price, edge = get_edge_post_price(no_ask, fair_value)
-
-        if post_price is None:
-            log.info(
-                f"[SKIP-EDGE] {st.market} fair={fair_value}¢ "
-                f"no_ask={no_ask}¢ edge={edge:+d}¢ — no edge"
-            )
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # Scale contracts to edge
-        order_qty = get_edge_contract_count(edge, post_price, available_cents)
-        if order_qty < 1:
-            log.info(f"[SKIP] Insufficient balance for even 1 contract")
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # COMMIT — lock before order (Rule 1 — never changes)
-        TRADED_TICKERS.add(st.market)
-        st.traded_this_market = True
-        log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS")
-
-        total_cost = order_qty * post_price / 100.0
-
-        try:
-            log.warning(
-                f"[EDGE-POSTER] {st.market} NO {order_qty}ct @ {post_price}¢ "
-                f"fair={fair_value}¢ no_ask={no_ask}¢ edge={edge:+d}¢ "
-                f"contracts={order_qty} cost=${total_cost:.2f}"
-            )
-
-            payload = build_order_payload(
-                st.market, "no", post_price, order_qty, close_ts=close_ts
-            )
-            oid = place_order(client, payload)
-
-            if oid.startswith("BLOCKED"):
-                log.warning(f"[EDGE-POSTER] Blocked: {oid}")
+            # Session check
+            can_trade, reason = session.check_can_trade()
+            if not can_trade:
+                log.warning(f"[SESSION] Paused: {reason}")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            log.warning(
-                f"[EDGE-POSTER-ORDER] {oid} POST_ONLY NO "
-                f"{order_qty}ct @ {post_price}¢"
-            )
+            # Balance check
+            available, available_cents = get_balance_usd(client)
+            if available is not None and available < MIN_BOT_BALANCE:
+                log.warning(f"[SKIP] Balance ${available:.2f} < floor")
+                time.sleep(POLL_SECONDS)
+                continue
 
-            st.side = "no"
+            available_cents = int((available or 0) * 100)
+
+            # Evaluate entry — checks YES and NO every second
+            entry = evaluate_poster_entry(p_yes, p_no, yes_ask, no_ask)
+
+            if entry is None:
+                # Log observe state periodically
+                if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
+                    dominant = "YES" if p_yes > p_no else "NO"
+                    conf = max(p_yes, p_no)
+                    log.info(
+                        f"[OBSERVE] {st.market} t={secs_to_close:.0f}s "
+                        f"leading={dominant} conf={conf:.1%} "
+                        f"threshold={POSTER_CONFIDENCE_THRESHOLD:.0%} "
+                        f"yes_ask={yes_ask}¢ no_ask={no_ask}¢"
+                    )
+                    last_state_log = now
+                time.sleep(POLL_SECONDS)
+                continue
+
+            side, post_price, edge = entry
+
+            # Scale contracts to edge and bankroll
+            order_qty = get_poster_contract_count(
+                edge, post_price, available_cents
+            )
+            if order_qty < 1:
+                log.info(f"[SKIP] Insufficient balance for 1 contract")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # COMMIT — Rule 1 never changes
+            # Lock before placing order — no double entry ever
+            TRADED_TICKERS.add(st.market)
+            st.traded_this_market = True
+            st.side = side
             st.entry_price_cents = post_price
             st.qty = order_qty
-            st.order_id = oid
+            log.warning(f"[LOCKED] {st.market} side={side} added to TRADED_TICKERS")
 
-            def fetch_ob():
-                try:
-                    return client.request(
-                        "GET", f"/markets/{st.market}/orderbook"
-                    ) or {}
-                except Exception:
-                    return {}
+            total_cost = order_qty * post_price / 100.0
+            conf = p_yes if side == "yes" else p_no
 
-            def fetch_spot():
-                return fetch_spot_usd(http)
-
-            filled_count = run_edge_amend_loop(
-                client, oid, st.market, close_ts,
-                fetch_ob, fetch_spot, lo, hi, http
-            )
-
-            if filled_count > 0:
-                st.qty = filled_count
+            try:
                 log.warning(
-                    f"[EDGE-POSTER-FILL] {st.market} "
-                    f"filled={filled_count}ct @ {post_price}¢ "
-                    f"revenue=${filled_count * (100 - post_price) / 100:.2f} if NO wins"
-                )
-            else:
-                log.info(
-                    f"[EDGE-POSTER-FILL] {st.market} 0 fills — "
-                    f"expired or edge gone"
+                    f"[V5-POSTER] {st.market} {side.upper()} {order_qty}ct "
+                    f"@ {post_price}¢ conf={conf:.1%} edge={edge:+d}¢ "
+                    f"cost=${total_cost:.2f}"
                 )
 
-        except Exception as e:
-            log.warning(
-                f"[EDGE-POSTER] Exception: {e} — market locked, no retry"
-            )
+                payload = build_order_payload(
+                    st.market, side, post_price, order_qty,
+                    close_ts=close_ts
+                )
+                oid = place_order(client, payload)
 
-        time.sleep(POLL_SECONDS)
-        continue
+                if oid.startswith("BLOCKED"):
+                    log.warning(f"[V5-POSTER] Order blocked: {oid}")
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                st.order_id = oid
+                log.warning(
+                    f"[V5-POSTER-ORDER] {oid} {side.upper()} "
+                    f"{order_qty}ct @ {post_price}¢"
+                )
+
+                def fetch_ob():
+                    try:
+                        return client.request(
+                            "GET", f"/markets/{st.market}/orderbook"
+                        ) or {}
+                    except Exception:
+                        return {}
+
+                def fetch_spot():
+                    return fetch_spot_usd(http)
+
+                filled_count = run_probability_amend_loop(
+                    client, oid, st.market, close_ts,
+                    fetch_ob, fetch_spot, lo, hi, http, side
+                )
+
+                st.qty = filled_count
+
+                if filled_count > 0:
+                    payout = filled_count * (100 - post_price) / 100.0
+                    log.warning(
+                        f"[V5-POSTER-FILL] {st.market} "
+                        f"filled={filled_count}ct {side.upper()} @ {post_price}¢ "
+                        f"potential_profit=${payout:.2f} if {side.upper()} wins"
+                    )
+                else:
+                    log.info(
+                        f"[V5-POSTER-FILL] {st.market} 0 fills — "
+                        f"confidence dropped or expiry hit"
+                    )
+
+            except Exception as e:
+                log.warning(f"[V5-POSTER] Exception: {e}")
+
+            time.sleep(POLL_SECONDS)
+            continue
+        # ── END V5 POSTER ─────────────────────────────────────────────
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: {e} | {ASSET} EDGE_MIN={POSTER_MIN_EDGE_CENTS}¢ ALLOC=${BOT_ALLOCATION}")
+        log.exception(f"FATAL: {e} | {ASSET} V5 CONF={POSTER_CONFIDENCE_THRESHOLD:.0%} ALLOC=${BOT_ALLOCATION}")
         sys.exit(1)

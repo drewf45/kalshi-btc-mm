@@ -237,14 +237,6 @@ ENTRY_LAST_SECONDS = 5
 POLL_SECONDS = 1.0
 META_REFRESH_SECONDS = 10.0
 
-# POSTER TIMING — late window only
-# Only post when market is nearly settled
-# 180s = last 3 minutes — tight, certain edge only
-# 240s = last 4 minutes — slightly more opportunity
-# 300s = last 5 minutes — more fills, more early noise risk
-# Start at 240s, adjust based on fill rate data
-POSTER_ENTRY_WINDOW_SECONDS = 240
-
 # -------------- SESSION LIMITS --------------------------------
 ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75
@@ -257,53 +249,34 @@ FEE_CENTS_PER_CONTRACT = 0
 NUM_CONCURRENT_BOTS = 4
 
 # ─────────────────────────────────────────────
-# PURE EDGE POSTER V4 SETTINGS
+# PURE PROBABILITY POSTER V5
 # ─────────────────────────────────────────────
 
-# Minimum NO post price
-# Below 55¢ the market thinks movement is likely — not a sure win
-# We want to post when market is already leaning NO but underestimates how certain
-POSTER_MIN_NO_PRICE = 55
+# Probability threshold to trigger posting on either YES or NO
+POSTER_CONFIDENCE_THRESHOLD = 0.85   # 85%
 
-# Maximum NO post price
-# Above 92¢ the market is nearly certain — little edge left to capture
-# Also at 95¢+ the $0.05 win per contract barely covers fees
-POSTER_MAX_NO_PRICE = 92
+# Cancel if confidence drops below this during amend loop
+POSTER_CANCEL_THRESHOLD = 0.80       # 80%
 
-# Minimum edge in cents to post
-# Model must say NO is worth at least this much MORE than market asks
-# Below 8¢ edge the mispricing is too small to be reliable signal
-POSTER_MIN_EDGE_CENTS = 8
+# Minimum edge in cents after posting above book
+# fair_value - post_price must be >= this
+POSTER_MIN_EDGE_CENTS = 3
 
-# Fee per contract (Kalshi maker = 0 fees, but keep buffer)
-POSTER_FEE_CENTS = 1
+# How far above current book ask to post
+# Posts ABOVE book so market catches up to your order
+POSTER_BOOK_PREMIUM = 3
 
-# Post this many cents below market NO ask to front-run queue
-POSTER_QUEUE_DISCOUNT = 2
-
-# Edge-to-contracts scaling
+# Contract scaling — bigger edge = more contracts
 # contracts = floor(edge_cents * POSTER_EDGE_SCALE)
-# Edge 8¢  * 3.0 = 24 contracts (minimum threshold)
-# Edge 10¢ * 3.0 = 30 contracts
-# Edge 15¢ * 3.0 = 45 contracts
-# Edge 20¢ * 3.0 = 50 contracts (capped)
 POSTER_EDGE_SCALE = 3.0
 
 # Contract caps
-POSTER_MIN_CONTRACTS = 10
-POSTER_MAX_CONTRACTS = 50
+POSTER_MIN_CONTRACTS = 5
+POSTER_MAX_CONTRACTS = 100
 
-# Cancel if edge drops below this during amend loop
-# If market catches up to fair value — cancel, don't collect bad fills
-POSTER_CANCEL_EDGE = 3
+# Amend price every N seconds tracking book upward
+POSTER_AMEND_INTERVAL = 15
 
-# Amend every N seconds
-POSTER_AMEND_INTERVAL = 30
-
-# Auto-expire N seconds before close
+# Cancel resting order this many seconds before market close
+# Prevents stray orders accumulating on account
 POSTER_EXPIRY_BUFFER = 90
-
-# Late window entry — only post in last 4 minutes
-# Early market = thin book, unreliable edge signals
-# Last 4 minutes = settled market, real edge only
-POSTER_ENTRY_WINDOW_SECONDS = 240
