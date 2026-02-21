@@ -44,6 +44,8 @@ from config import (
     CONTRACT_SIZING, XRP_SKIP_RANGE, ETH_HIGH_PRICE_ALLOWED, ETH_HIGH_PRICE_MIN,
     POSTER_START_SECONDS, POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
     POSTER_PRICE_FLOOR, POSTER_PRICE_CEILING, POSTER_QUEUE_DISCOUNT,
+    POSTER_MIN_EDGE_CENTS, POSTER_POST_DISCOUNT, POSTER_CANCEL_THRESHOLD,
+    POSTER_MAX_CONTRACTS, POSTER_MIN_PRICE, POSTER_MAX_PRICE,
 )
 
 # ======================== BOOT BANNER ========================
@@ -417,6 +419,47 @@ def get_sigma_cached(http: requests.Session) -> float:
     return float(_last_sigma_val)
 
 
+def calculate_fair_value_no(spot: float, lo: Optional[float], hi: Optional[float],
+                             sigma: float, secs_to_close: float,
+                             yes_bid: Optional[int], yes_ask: Optional[int],
+                             no_bid: Optional[int], no_ask: Optional[int]) -> int:
+    """
+    Calculate model fair value for NO contracts in cents.
+
+    Uses the same blended probability model already in the bot:
+    - Gaussian model: probability YES price ends in range
+    - Blended with market implied probability
+    - Returns fair value in cents (1-99)
+
+    Fair value = p_no × 100
+    If model says 75% NO wins, fair value = 75¢
+    If market offers NO at 65¢, that's a 10¢ discount = edge
+    """
+    # Step 1: Model probability
+    t_eff = max(5.0, float(min(secs_to_close, 120)))
+    sd = sigma * math.sqrt(t_eff)
+    p_yes_model = prob_yes_in_range(spot, lo, hi, sd)
+
+    # Step 2: Blend with market implied
+    p_mkt = implied_prob_from_book(yes_bid, yes_ask, no_bid, no_ask) if USE_MARKET_IMPLIED else None
+    if p_mkt is not None:
+        if secs_to_close <= 60:
+            alpha = 0.0
+        elif secs_to_close <= BUY_START_SECONDS:
+            alpha = MODEL_BLEND_ALPHA * (secs_to_close - 60) / float(BUY_START_SECONDS - 60)
+        else:
+            alpha = MODEL_BLEND_ALPHA
+        p_yes = max(0.0, min(1.0, alpha * p_yes_model + (1.0 - alpha) * float(p_mkt)))
+    else:
+        p_yes = p_yes_model
+
+    p_no = 1.0 - p_yes
+
+    # Step 3: Convert to cents and clamp
+    fair_value = int(round(p_no * 100))
+    return max(1, min(99, fair_value))
+
+
 # ======================== ORDERBOOK PARSING ==================
 def _best_from_levels(levels: Any, want: str) -> Optional[int]:
     if not isinstance(levels, list) or not levels:
@@ -785,85 +828,151 @@ def get_contract_count(price_cents: int) -> int:
     return 0
 
 
-# ======================== POSTER PRICING =====================
-def get_best_post_price(no_ask: Optional[int]) -> int:
+# ======================== SMART POSTER PRICING ===============
+def get_smart_post_price(no_ask: Optional[int], fair_value_no: int) -> Optional[int]:
     """
-    Calculate the best NO posting price to front-run the queue.
-    Returns price in cents.
-    - Posts 2¢ below current best NO ask to be first in queue
-    - Floor of 10¢ (minimum reward for capital)
-    - Ceiling of 50¢ (above 50¢ = wrong side of market)
-    - If no_ask is None (empty book), post at 50¢ (most attractive to YES buyers)
+    Calculate smart posting price using model fair value vs market price.
+
+    Returns posting price in cents, or None if no edge exists.
+
+    Logic:
+    - Edge = fair_value_no - no_ask (how much market underprices NO vs model)
+    - If edge < POSTER_MIN_EDGE_CENTS: no edge, return None (don't post)
+    - If edge >= POSTER_MIN_EDGE_CENTS: post at no_ask - POSTER_POST_DISCOUNT
+      (undercut market slightly to get to front of queue)
+    - Enforce floor and ceiling on final price
+
+    Examples:
+    - Model says NO worth 75¢. Market NO ask = 65¢. Edge = 10¢. Post at 63¢.
+    - Model says NO worth 75¢. Market NO ask = 72¢. Edge = 3¢ < 5¢ min. Skip.
+    - Model says NO worth 40¢. Market NO ask = 60¢. Edge = -20¢ (market overprices). Skip.
     """
     if no_ask is None:
-        return POSTER_PRICE_CEILING
-    target = no_ask - POSTER_QUEUE_DISCOUNT
-    return max(POSTER_PRICE_FLOOR, min(POSTER_PRICE_CEILING, target))
+        return None
+
+    edge = fair_value_no - no_ask
+
+    log.info(
+        f"[EDGE] fair_value={fair_value_no}¢ market_no_ask={no_ask}¢ "
+        f"edge={edge:+d}¢ min_required={POSTER_MIN_EDGE_CENTS}¢"
+    )
+
+    if edge < POSTER_MIN_EDGE_CENTS:
+        return None  # No edge — don't post
+
+    post_price = no_ask - POSTER_POST_DISCOUNT
+    post_price = max(POSTER_MIN_PRICE, min(POSTER_MAX_PRICE, post_price))
+
+    return post_price
 
 
-def run_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
-                   close_ts: int, get_ob_func,
-                   stop_event: Optional[threading.Event] = None) -> int:
+def run_smart_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
+                          close_ts: int, get_ob_func, get_spot_func,
+                          lo: Optional[float], hi: Optional[float],
+                          http_session: requests.Session,
+                          stop_event: Optional[threading.Event] = None) -> int:
     """
-    Monitors a resting order and amends price every 30 seconds to stay
-    at front of queue as the market moves.
+    Smart amend loop — reprices every 30 seconds using model fair value.
 
-    Returns total filled contracts when done.
+    Key difference from basic amend loop:
+    - Recalculates model fair value every 30 seconds
+    - If edge disappears (market no ask < fair value - POSTER_CANCEL_THRESHOLD):
+      CANCEL the order immediately — don't collect bad fills
+    - If edge still exists: amend to new best price
+    - Stops at expiry or full fill
 
-    get_ob_func: callable that returns current orderbook dict
+    Returns total filled contracts.
     """
     last_amend = time.time()
     current_price = None
 
-    # Get initial price from order
     order = get_order(client, order_id)
     if order:
         current_price = order.get("no_price") or order.get("yes_price")
 
-    log.info(f"[AMEND-LOOP] Starting for {order_id} on {market_ticker} "
-             f"close_ts={close_ts} initial_price={current_price}¢")
+    log.info(
+        f"[SMART-AMEND] Starting for {order_id} on {market_ticker} "
+        f"close_ts={close_ts} initial_price={current_price}¢"
+    )
 
     while True:
         now = time.time()
+        secs_to_close = close_ts - now
 
         # Check if signaled to stop (market rolled)
         if stop_event is not None and stop_event.is_set():
-            log.info(f"[AMEND-LOOP] Stop signaled (market rolled), canceling {order_id}")
+            log.info(f"[SMART-AMEND] Stop signaled (market rolled), canceling {order_id}")
             try:
                 cancel_order_status(client, order_id)
             except Exception:
                 pass
             break
 
-        # Check if order is done (expiration hit or fully filled)
-        if now >= (close_ts - 85):  # 5s buffer before expiration
-            log.info(f"[AMEND-LOOP] Near expiry, stopping loop for {order_id}")
+        # Stop near expiry
+        if secs_to_close <= (POSTER_EXPIRY_BUFFER + 5):
+            log.info(f"[SMART-AMEND] Near expiry, stopping loop for {order_id}")
             break
 
-        # Get current order status
+        # Check order status
         order = get_order(client, order_id)
         if order is None:
-            log.info(f"[AMEND-LOOP] Order {order_id} not found — assuming expired/filled")
+            log.info(f"[SMART-AMEND] Order {order_id} not found — expired/filled")
             break
 
         status = order.get("status", "")
         fill_count = order.get("fill_count", 0)
         remaining = order.get("remaining_count", 0)
 
-        log.info(f"[AMEND-LOOP] {order_id} status={status} "
-                 f"filled={fill_count} remaining={remaining} price={current_price}¢")
+        log.info(
+            f"[SMART-AMEND] {order_id} status={status} "
+            f"filled={fill_count} remaining={remaining} price={current_price}¢"
+        )
 
         if status in ("executed", "canceled") or remaining == 0:
-            log.info(f"[AMEND-LOOP] Order {order_id} done: {status} "
-                     f"filled={fill_count}")
+            log.info(f"[SMART-AMEND] Done: {status} filled={fill_count}")
             break
 
-        # Amend price every 30 seconds
+        # Re-evaluate every 30 seconds
         if (now - last_amend) >= POSTER_AMEND_INTERVAL:
             try:
+                # Get fresh data
                 ob = get_ob_func()
-                _, _, _, no_ask = parse_best_yes_no(ob)
-                new_price = get_best_post_price(no_ask)
+                spot = get_spot_func()
+                yes_bid, yes_ask, no_bid, no_ask = parse_best_yes_no(ob)
+
+                if spot is None or no_ask is None:
+                    log.info(f"[SMART-AMEND] Missing spot or no_ask — skipping amend")
+                    last_amend = now
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                # Recalculate fair value
+                sigma = get_sigma_cached(http_session)
+                fair_value = calculate_fair_value_no(
+                    spot, lo, hi, sigma, secs_to_close,
+                    yes_bid, yes_ask, no_bid, no_ask
+                )
+
+                # Check if edge still exists
+                edge = fair_value - no_ask
+
+                log.info(
+                    f"[SMART-AMEND] Re-eval: fair={fair_value}¢ "
+                    f"no_ask={no_ask}¢ edge={edge:+d}¢"
+                )
+
+                # CANCEL if edge has disappeared
+                if edge < POSTER_CANCEL_THRESHOLD:
+                    log.warning(
+                        f"[SMART-AMEND] Edge gone ({edge:+d}¢ < {POSTER_CANCEL_THRESHOLD}¢ min) "
+                        f"— CANCELING {order_id} to avoid bad fills"
+                    )
+                    cancel_order_status(client, order_id)
+                    break
+
+                # Edge still exists — amend to new best price
+                new_price = no_ask - POSTER_POST_DISCOUNT
+                new_price = max(POSTER_MIN_PRICE, min(POSTER_MAX_PRICE, new_price))
 
                 if new_price != current_price and remaining > 0:
                     old_price = current_price
@@ -871,24 +980,22 @@ def run_amend_loop(client: KalshiClient, order_id: str, market_ticker: str,
                     if result is not None:
                         current_price = new_price
                         log.warning(
-                            f"[AMEND] {market_ticker} {order_id} "
+                            f"[SMART-AMEND] {market_ticker} {order_id} "
                             f"{old_price}¢ → {new_price}¢ "
-                            f"remaining={remaining} no_ask={no_ask}¢"
+                            f"edge={edge:+d}¢ fair={fair_value}¢"
                         )
                     else:
-                        log.info(f"[AMEND] {order_id} amend returned None — order done")
+                        log.info(f"[SMART-AMEND] Amend returned None — order done")
                         break
-                else:
-                    log.info(f"[AMEND] {order_id} price unchanged at {current_price}¢")
 
             except Exception as e:
-                log.warning(f"[AMEND] Error in amend loop: {e}")
+                log.warning(f"[SMART-AMEND] Error: {e}")
 
             last_amend = now
 
         time.sleep(POLL_SECONDS)
 
-    # Final fill count
+    # Return final fill count
     final_order = get_order(client, order_id)
     if final_order:
         return int(final_order.get("fill_count", 0))
@@ -1458,9 +1565,9 @@ def main() -> None:
                 st.traded_this_market = True
             continue
 
-        # ============ POSTER ENTRY — fires once per market ============
+        # ============ SMART POSTER ENTRY ============
 
-        # Session and balance checks (UNCHANGED from current)
+        # Session and balance checks (UNCHANGED)
         can_trade, reason = session.check_can_trade()
         if not can_trade:
             log.warning(f"[SESSION] Paused: {reason}")
@@ -1473,15 +1580,32 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # Get current best NO posting price
-        post_price = get_best_post_price(no_ask)
+        # Calculate model fair value
+        fair_value = calculate_fair_value_no(
+            spot, lo, hi, sigma, secs_to_close,
+            yes_bid, yes_ask, no_bid, no_ask
+        )
+
+        # Get smart posting price — None if no edge
+        post_price = get_smart_post_price(no_ask, fair_value)
+
+        if post_price is None:
+            log.info(
+                f"[SKIP-EDGE] {st.market} fair={fair_value}¢ "
+                f"no_ask={no_ask}¢ — insufficient edge, waiting"
+            )
+            time.sleep(POLL_SECONDS)
+            continue
 
         # Get contract count from sizing table
         order_qty = get_contract_count(post_price)
         if order_qty == 0:
-            log.info(f"[SKIP] No sizing bucket for {post_price}¢ — waiting")
+            log.info(f"[SKIP] No sizing bucket for {post_price}¢")
             time.sleep(POLL_SECONDS)
             continue
+
+        # Cap contracts
+        order_qty = min(order_qty, POSTER_MAX_CONTRACTS)
 
         # Cost cap enforcement
         total_cost = order_qty * (post_price / 100.0)
@@ -1493,13 +1617,16 @@ def main() -> None:
             total_cost = order_qty * (post_price / 100.0)
 
         if not ENABLE_TRADING or DRY_RUN:
-            log.warning(f"[DRY] Would post {order_qty}ct NO @ {post_price}¢ (no_ask={no_ask}¢)")
+            log.warning(
+                f"[DRY] Would post {order_qty}ct NO @ {post_price}¢ "
+                f"fair={fair_value}¢ edge={fair_value - (no_ask or 0):+d}¢"
+            )
             TRADED_TICKERS.add(st.market)
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
-        # Validate (UNCHANGED — same iron rules apply)
+        # Validate (UNCHANGED iron rules)
         allowed, block_reason = validate_order(
             client, st.market, "no", order_qty, post_price
         )
@@ -1510,16 +1637,17 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # COMMIT — lock ticker BEFORE placing order (UNCHANGED)
+        # COMMIT — lock BEFORE order (UNCHANGED)
         TRADED_TICKERS.add(st.market)
         st.traded_this_market = True
-        log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS — proceeding to poster order")
+        log.warning(f"[LOCKED] {st.market} added to TRADED_TICKERS")
 
         try:
             log.warning(
-                f"[POSTER] {st.market} NO {order_qty}ct @ {post_price}¢ "
-                f"(no_ask={no_ask}¢ discount={POSTER_QUEUE_DISCOUNT}¢) cost=${total_cost:.2f} "
-                f"expiry={close_ts - POSTER_EXPIRY_BUFFER} bal=${available:.2f}"
+                f"[SMART-POSTER] {st.market} NO {order_qty}ct @ {post_price}¢ "
+                f"fair={fair_value}¢ no_ask={no_ask}¢ "
+                f"edge={fair_value - (no_ask or 0):+d}¢ "
+                f"cost=${total_cost:.2f} bal=${available:.2f}"
             )
 
             payload = build_order_payload(
@@ -1528,13 +1656,13 @@ def main() -> None:
             oid = place_order(client, payload)
 
             if oid.startswith("BLOCKED"):
-                log.warning(f"[POSTER] Blocked: {oid}")
+                log.warning(f"[SMART-POSTER] Blocked: {oid}")
                 time.sleep(POLL_SECONDS)
                 continue
 
             log.warning(
-                f"[POSTER-ORDER] Placed {oid} POST_ONLY NO {order_qty}ct @ {post_price}¢ "
-                f"expiry=close-{POSTER_EXPIRY_BUFFER}s"
+                f"[SMART-POSTER-ORDER] Placed {oid} POST_ONLY NO "
+                f"{order_qty}ct @ {post_price}¢"
             )
 
             st.side = "no"
@@ -1542,19 +1670,28 @@ def main() -> None:
             st.qty = order_qty
             st.order_id = oid
 
-            # Run amend loop in background thread — main loop stays free for ROLL detection
+            # Run smart amend loop in background thread
             amend_stop_event = threading.Event()
             launched_market = st.market
             launched_price = post_price
+            launched_lo = lo
+            launched_hi = hi
 
             def fetch_ob():
-                return client.request(
-                    "GET", f"/markets/{launched_market}/orderbook"
-                ) or {}
+                try:
+                    return client.request(
+                        "GET", f"/markets/{launched_market}/orderbook"
+                    ) or {}
+                except Exception:
+                    return {}
+
+            def fetch_spot():
+                return fetch_spot_usd(http)
 
             def _amend_worker():
-                filled_count = run_amend_loop(
-                    client, oid, launched_market, close_ts, fetch_ob,
+                filled_count = run_smart_amend_loop(
+                    client, oid, launched_market, close_ts,
+                    fetch_ob, fetch_spot, launched_lo, launched_hi, http,
                     stop_event=amend_stop_event
                 )
                 # Only update state if market hasn't rolled
@@ -1563,19 +1700,22 @@ def main() -> None:
                         st.qty = filled_count
                         st.entry_price_cents = launched_price
                         log.warning(
-                            f"[POSTER-FILL] {launched_market} filled {filled_count}ct NO @ avg ~{launched_price}¢ "
-                            f"cost=${filled_count * launched_price / 100:.2f}"
+                            f"[SMART-POSTER-FILL] {launched_market} filled {filled_count}ct "
+                            f"NO @ {launched_price}¢ cost=${filled_count * launched_price / 100:.2f}"
                         )
                     else:
-                        log.info(f"[POSTER-FILL] {launched_market} — 0 fills, order expired unfilled")
+                        log.info(
+                            f"[SMART-POSTER-FILL] {launched_market} — 0 fills "
+                            f"(no edge or expired unfilled)"
+                        )
                 else:
                     log.info(f"[AMEND-THREAD] Market rolled past {launched_market}, skipping state update")
 
             threading.Thread(target=_amend_worker, daemon=True, name=f"amend-{oid[:8]}").start()
-            log.info(f"[AMEND-LOOP] Started background thread for {oid} on {st.market}")
+            log.info(f"[SMART-AMEND] Started background thread for {oid} on {st.market}")
 
         except Exception as e:
-            log.warning(f"[POSTER] Failed: {e} — market still marked as traded")
+            log.warning(f"[SMART-POSTER] Failed: {e} — market still marked traded")
 
         time.sleep(POLL_SECONDS)
 

@@ -263,3 +263,14 @@ POSTER_QUEUE_DISCOUNT = 2      # Post 2¢ below best NO ask to front-run queue
 # NOTE: CONTRACT_SIZING table still applies
 # Posting price determines which bucket → how many contracts to post
 # If book NO ask is 35¢, post price = 33¢ → use 31-50¢ bucket sizing
+
+# -------------- SMART POSTER SETTINGS ------------------------
+# Post only when market offers discount vs model fair value
+# Cancel when edge disappears
+
+POSTER_MIN_EDGE_CENTS = 5      # Market must offer at least 5¢ below fair value
+POSTER_POST_DISCOUNT = 2       # Post 2¢ below market NO ask (queue position)
+POSTER_CANCEL_THRESHOLD = 3    # Cancel if market NO ask drops within 3¢ of fair value
+POSTER_MAX_CONTRACTS = 20      # Maximum contracts per market
+POSTER_MIN_PRICE = 15          # Never post NO below 15¢ (bad risk/reward)
+POSTER_MAX_PRICE = 85          # Never post NO above 85¢ (model uncertain at extremes)
