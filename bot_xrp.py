@@ -41,11 +41,10 @@ from config import (
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
-    POSTER_START_SECONDS, POSTER_ENTRY_WINDOW_SECONDS,
-    POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
+    POSTER_ENTRY_WINDOW_SECONDS, POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
     POSTER_MIN_EDGE_CENTS, POSTER_FEE_CENTS, POSTER_QUEUE_DISCOUNT,
     POSTER_EDGE_SCALE, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
-    POSTER_CANCEL_EDGE, POSTER_ABSOLUTE_MIN_PRICE, POSTER_ABSOLUTE_MAX_PRICE,
+    POSTER_CANCEL_EDGE, POSTER_MIN_NO_PRICE, POSTER_MAX_NO_PRICE,
 )
 
 # ======================== BOOT BANNER ========================
@@ -788,33 +787,44 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
 def get_edge_post_price(no_ask: Optional[int],
                          fair_value_no: int) -> Tuple[Optional[int], int]:
     """
-    Pure edge calculation. No price ranges. No dead zones.
+    Pure edge poster — correct binary market logic.
 
-    Returns (post_price, edge_cents) or (None, edge_cents) if no edge.
+    NO price IS the probability NO wins.
+    We want NO priced 55-92¢ where market underestimates certainty.
 
-    Edge = fair_value_no - no_ask
-    - Positive edge: market underprices NO vs model — we have advantage
-    - Negative edge: market overprices NO — skip, no advantage
+    Price floor (55¢): Below this market thinks movement likely — skip.
+    Price ceiling (92¢): Above this market already knows — little edge left.
+    Edge minimum (8¢): Model must disagree with market by at least 8¢.
 
-    Post price = no_ask - POSTER_QUEUE_DISCOUNT
-    Clamped to POSTER_ABSOLUTE_MIN_PRICE / POSTER_ABSOLUTE_MAX_PRICE only.
-    No asset-specific caps. No dead zones.
-
-    Minimum edge check:
-    - Must exceed POSTER_MIN_EDGE_CENTS to post
-    - Must exceed POSTER_FEE_CENTS to be profitable at all
+    Returns (post_price, edge_cents) or (None, edge_cents).
     """
     if no_ask is None:
+        return None, 0
+
+    # Price floor — don't post when market thinks movement likely
+    if no_ask < POSTER_MIN_NO_PRICE:
+        log.info(
+            f"[SKIP-PRICE] no_ask={no_ask}¢ below floor {POSTER_MIN_NO_PRICE}¢ "
+            f"— market thinks movement likely, not a sure win"
+        )
+        return None, 0
+
+    # Price ceiling — market already certain, little edge to capture
+    if no_ask > POSTER_MAX_NO_PRICE:
+        log.info(
+            f"[SKIP-PRICE] no_ask={no_ask}¢ above ceiling {POSTER_MAX_NO_PRICE}¢ "
+            f"— market already certain, edge too thin"
+        )
         return None, 0
 
     edge = fair_value_no - no_ask
 
     log.info(
         f"[EDGE] fair={fair_value_no}¢ no_ask={no_ask}¢ "
-        f"edge={edge:+d}¢ min={POSTER_MIN_EDGE_CENTS}¢ fee={POSTER_FEE_CENTS}¢"
+        f"edge={edge:+d}¢ min={POSTER_MIN_EDGE_CENTS}¢"
     )
 
-    # Must have real edge above fees
+    # Must have meaningful edge — model must disagree with market
     if edge < POSTER_MIN_EDGE_CENTS:
         return None, edge
 
@@ -823,7 +833,7 @@ def get_edge_post_price(no_ask: Optional[int],
         return None, edge
 
     post_price = no_ask - POSTER_QUEUE_DISCOUNT
-    post_price = max(POSTER_ABSOLUTE_MIN_PRICE, min(POSTER_ABSOLUTE_MAX_PRICE, post_price))
+    post_price = max(POSTER_MIN_NO_PRICE, min(POSTER_MAX_NO_PRICE, post_price))
 
     return post_price, edge
 
@@ -831,23 +841,14 @@ def get_edge_post_price(no_ask: Optional[int],
 def get_edge_contract_count(edge_cents: int, post_price: int,
                              available_balance_cents: int) -> int:
     """
-    Scale contracts to edge size. Bigger edge = more contracts.
-    No price buckets. No historical taker data needed.
+    Scale contracts to edge size.
+    Bigger edge = market more wrong = more contracts.
 
-    Formula: contracts = floor(edge_cents * POSTER_EDGE_SCALE)
-    Clamped to POSTER_MIN_CONTRACTS and POSTER_MAX_CONTRACTS.
-    Further clamped by available balance.
-
-    Examples at POSTER_EDGE_SCALE = 2.0:
-    - edge  6¢ → 12 contracts (minimum threshold)
-    - edge  8¢ → 16 contracts
-    - edge 10¢ → 20 contracts
-    - edge 15¢ → 30 contracts
-    - edge 20¢ → 40 contracts
-    - edge 25¢ → 50 contracts (max cap)
-
-    Balance cap: never spend more than MAX_COST_PER_MARKET
-    or more than available balance.
+    At POSTER_EDGE_SCALE = 3.0:
+    edge  8¢ → 24 contracts
+    edge 10¢ → 30 contracts
+    edge 15¢ → 45 contracts
+    edge 20¢ → 50 contracts (capped)
     """
     raw = int(edge_cents * POSTER_EDGE_SCALE)
     contracts = max(POSTER_MIN_CONTRACTS, min(POSTER_MAX_CONTRACTS, raw))
@@ -1169,7 +1170,8 @@ def main() -> None:
         f"MIN_CONF={MIN_CONFIDENCE:.0%} POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
     log.warning(
-        f"[BOOTCFG] Edge scale={POSTER_EDGE_SCALE} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
+        f"[BOOTCFG] NO_price={POSTER_MIN_NO_PRICE}-{POSTER_MAX_NO_PRICE}¢ "
+        f"Edge scale={POSTER_EDGE_SCALE} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
         f"cancel_edge={POSTER_CANCEL_EDGE}¢ queue_discount={POSTER_QUEUE_DISCOUNT}¢"
     )
     log.warning(

@@ -257,50 +257,53 @@ FEE_CENTS_PER_CONTRACT = 0
 NUM_CONCURRENT_BOTS = 4
 
 # ─────────────────────────────────────────────
-# PURE EDGE POSTER SETTINGS
+# PURE EDGE POSTER V4 SETTINGS
 # ─────────────────────────────────────────────
 
-POSTER_START_SECONDS = 800     # Enter at 13m20s remaining (early for fill window)
+# Minimum NO post price
+# Below 55¢ the market thinks movement is likely — not a sure win
+# We want to post when market is already leaning NO but underestimates how certain
+POSTER_MIN_NO_PRICE = 55
 
-# Minimum edge in cents to post at all
-# Edge = model fair value NO - market NO ask
-# Must be positive and at least this large to post
-POSTER_MIN_EDGE_CENTS = 6
+# Maximum NO post price
+# Above 92¢ the market is nearly certain — little edge left to capture
+# Also at 95¢+ the $0.05 win per contract barely covers fees
+POSTER_MAX_NO_PRICE = 92
 
-# Fee per contract in cents (Kalshi maker fee)
-# Edge must exceed this to be profitable at all
+# Minimum edge in cents to post
+# Model must say NO is worth at least this much MORE than market asks
+# Below 8¢ edge the mispricing is too small to be reliable signal
+POSTER_MIN_EDGE_CENTS = 8
+
+# Fee per contract (Kalshi maker = 0 fees, but keep buffer)
 POSTER_FEE_CENTS = 1
 
-# Post this many cents below market NO ask
-# Gets us to front of queue without giving up edge
+# Post this many cents below market NO ask to front-run queue
 POSTER_QUEUE_DISCOUNT = 2
 
 # Edge-to-contracts scaling
-# Contracts = floor(edge_cents * POSTER_EDGE_SCALE)
-# Edge of 10¢ * scale 2.0 = 20 contracts
-# Edge of 20¢ * scale 2.0 = 40 contracts
-# Edge of 6¢ * scale 2.0 = 12 contracts (minimum)
-POSTER_EDGE_SCALE = 2.0
+# contracts = floor(edge_cents * POSTER_EDGE_SCALE)
+# Edge 8¢  * 3.0 = 24 contracts (minimum threshold)
+# Edge 10¢ * 3.0 = 30 contracts
+# Edge 15¢ * 3.0 = 45 contracts
+# Edge 20¢ * 3.0 = 50 contracts (capped)
+POSTER_EDGE_SCALE = 3.0
 
-# Hard caps regardless of edge
-POSTER_MIN_CONTRACTS = 5       # Always post at least 5 if edge exists
-POSTER_MAX_CONTRACTS = 50      # Never more than 50 per market
+# Contract caps
+POSTER_MIN_CONTRACTS = 10
+POSTER_MAX_CONTRACTS = 50
 
-# Cancel amend loop if edge drops below this
-POSTER_CANCEL_EDGE = 2
+# Cancel if edge drops below this during amend loop
+# If market catches up to fair value — cancel, don't collect bad fills
+POSTER_CANCEL_EDGE = 3
 
-# Amend price every N seconds
+# Amend every N seconds
 POSTER_AMEND_INTERVAL = 30
 
-# Auto-expire order N seconds before market close
+# Auto-expire N seconds before close
 POSTER_EXPIRY_BUFFER = 90
 
-# Absolute minimum post price — below this fees eat all profit
-# At 2¢ price, winning pays 98¢, you risked 2¢, profit 96¢ per contract
-# But if fills are rare at 2¢ it's not worth the capital lock
-# Set to 3¢ minimum — adjust down if fills prove reliable at low prices
-POSTER_ABSOLUTE_MIN_PRICE = 3
-
-# Absolute maximum post price
-# Above 97¢ you're risking 97¢ to win 3¢ — bad even with edge
-POSTER_ABSOLUTE_MAX_PRICE = 97
+# Late window entry — only post in last 4 minutes
+# Early market = thin book, unreliable edge signals
+# Last 4 minutes = settled market, real edge only
+POSTER_ENTRY_WINDOW_SECONDS = 240
