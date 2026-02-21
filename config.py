@@ -237,6 +237,14 @@ ENTRY_LAST_SECONDS = 5
 POLL_SECONDS = 1.0
 META_REFRESH_SECONDS = 10.0
 
+# POSTER TIMING — late window only
+# Only post when market is nearly settled
+# 180s = last 3 minutes — tight, certain edge only
+# 240s = last 4 minutes — slightly more opportunity
+# 300s = last 5 minutes — more fills, more early noise risk
+# Start at 240s, adjust based on fill rate data
+POSTER_ENTRY_WINDOW_SECONDS = 240
+
 # -------------- SESSION LIMITS --------------------------------
 ENABLE_SESSION_LIMITS = True
 DAILY_MAX_LOSS_PERCENT = 0.75
