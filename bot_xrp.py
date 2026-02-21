@@ -42,10 +42,13 @@ from config import (
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
     POSTER_MIN_GAP_CENTS, POSTER_GAP_TIERS, POSTER_CANCEL_GAP,
-    POSTER_BOOK_PREMIUM, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
+    POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
     POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
     POSTER_OBSERVE_START_SECONDS,
 )
+
+# Asset-specific book premium — XRP has tightest spreads, best fills
+POSTER_BOOK_PREMIUM = 1  # XRP — tightest spreads, best fills
 
 # ======================== BOOT BANNER ========================
 print(f"BOOT: bot_xrp.py loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)

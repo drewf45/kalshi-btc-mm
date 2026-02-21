@@ -270,9 +270,8 @@ POSTER_GAP_TIERS = [
 POSTER_MAX_CONTRACTS = 25
 POSTER_MIN_CONTRACTS = 5
 
-# Post this many cents above current book ask
-# Gets order ahead of where market is going
-POSTER_BOOK_PREMIUM = 3
+# POSTER_BOOK_PREMIUM — now set per-bot (asset-specific):
+#   BTC=3¢, SOL=2¢, ETH=1¢, XRP=1¢
 
 # Cancel if gap inverts — book has caught up past model
 POSTER_CANCEL_GAP = 0
