@@ -1394,12 +1394,9 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Balance check
-            available, _ = get_balance_usd(client)
-            if available is not None:
-                session.current_balance_usd = available
-            if available is not None and available < MIN_BOT_BALANCE:
-                log.warning(f"[SKIP] Balance ${available:.2f} < floor")
+            # Balance floor check (balance kept fresh by needs_balance_check guard)
+            if session.current_balance_usd < MIN_BOT_BALANCE:
+                log.warning(f"[SKIP] Balance ${session.current_balance_usd:.2f} < floor")
                 time.sleep(POLL_SECONDS)
                 continue
 
