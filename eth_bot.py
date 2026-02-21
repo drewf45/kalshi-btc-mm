@@ -34,7 +34,7 @@ from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
 from config import (
     MIN_CONFIDENCE, HISTORICAL_ACCURACY,
-    SETTLEMENT_BIAS, ASSET_CONFIG, OBSERVE_START_SECONDS, BUY_START_SECONDS,
+    SETTLEMENT_BIAS, ASSET_CONFIG, BUY_START_SECONDS,
     ENTRY_LAST_SECONDS, POLL_SECONDS, META_REFRESH_SECONDS,
     FEE_CENTS_PER_CONTRACT, NUM_CONCURRENT_BOTS,
     ENABLE_SESSION_LIMITS, DAILY_MAX_LOSS_PERCENT,
@@ -1458,14 +1458,6 @@ def main() -> None:
 
         if secs_to_close is None:
             last_meta = 0.0
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # Too early
-        if secs_to_close > OBSERVE_START_SECONDS:
-            if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                log.info(f"[IDLE] {st.market} t={secs_to_close}s")
-                last_state_log = now
             time.sleep(POLL_SECONDS)
             continue
 
