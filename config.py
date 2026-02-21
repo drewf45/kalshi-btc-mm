@@ -282,3 +282,6 @@ POSTER_AMEND_INTERVAL = 15
 
 # Cancel resting order this many seconds before close
 POSTER_EXPIRY_BUFFER = 90
+
+# Begin observing at 10 min remaining
+POSTER_OBSERVE_START_SECONDS = 600

@@ -44,6 +44,7 @@ from config import (
     POSTER_MIN_GAP_CENTS, POSTER_GAP_TIERS, POSTER_CANCEL_GAP,
     POSTER_BOOK_PREMIUM, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
     POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
+    POSTER_OBSERVE_START_SECONDS,
 )
 
 # ======================== BOOT BANNER ========================
@@ -1529,6 +1530,11 @@ def main() -> None:
 
             available_cents = int((available or 0) * 100)
 
+            # Silent before 10 minutes — book too chaotic, gap signals unreliable
+            if secs_to_close > POSTER_OBSERVE_START_SECONDS:
+                time.sleep(POLL_SECONDS)
+                continue
+
             # Evaluate entry — gap-based, checks YES and NO every cycle
             entry = evaluate_poster_entry(p_yes, p_no, yes_ask, no_ask)
 
@@ -1560,14 +1566,6 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # COMMIT — Rule 1 never changes
-            TRADED_TICKERS.add(st.market)
-            st.traded_this_market = True
-            st.side = side
-            st.entry_price_cents = post_price
-            st.qty = order_qty
-            log.warning(f"[LOCKED] {st.market} side={side} added to TRADED_TICKERS")
-
             total_cost = order_qty * post_price / 100.0
 
             try:
@@ -1583,12 +1581,21 @@ def main() -> None:
                 )
                 oid = place_order(client, payload)
 
-                if oid.startswith("BLOCKED"):
-                    log.warning(f"[V6-POSTER] Order blocked: {oid}")
+                # Only lock AFTER confirmed order placed
+                if oid is None or oid.startswith("BLOCKED") or oid.startswith("ERROR"):
+                    log.warning(f"[ORDER-FAIL] {oid} — market NOT locked, will retry next tick")
                     time.sleep(POLL_SECONDS)
                     continue
 
+                # Order confirmed — NOW lock the market
+                TRADED_TICKERS.add(st.market)
+                st.traded_this_market = True
+                st.side = side
+                st.entry_price_cents = post_price
+                st.qty = order_qty
                 st.order_id = oid
+                log.warning(f"[LOCKED] {st.market} side={side} order={oid}")
+
                 log.warning(
                     f"[V6-POSTER-ORDER] {oid} {side.upper()} "
                     f"{order_qty}ct @ {post_price}¢"
@@ -1626,7 +1633,14 @@ def main() -> None:
                     )
 
             except Exception as e:
-                log.warning(f"[V6-POSTER] Exception: {e}")
+                err = str(e)
+                if "post only cross" in err:
+                    log.warning(
+                        f"[CROSS] Order would cross spread — "
+                        f"market NOT locked, will retry next tick"
+                    )
+                else:
+                    log.warning(f"[V6-POSTER] Exception: {e}")
 
             time.sleep(POLL_SECONDS)
             continue
