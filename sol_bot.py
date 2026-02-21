@@ -41,9 +41,8 @@ from config import (
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
-    POSTER_CONFIDENCE_THRESHOLD, POSTER_CANCEL_THRESHOLD,
-    POSTER_MIN_EDGE_CENTS, POSTER_BOOK_PREMIUM,
-    POSTER_EDGE_SCALE, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
+    POSTER_MIN_GAP_CENTS, POSTER_GAP_TIERS, POSTER_CANCEL_GAP,
+    POSTER_BOOK_PREMIUM, POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
     POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
 )
 
@@ -783,93 +782,90 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
     return asset_data.get(bucket)
 
 
-# ======================== PROBABILITY POSTER V5 ================
+# ======================== GAP POSTER V6 ===========================
 def evaluate_poster_entry(p_yes: float, p_no: float,
                            yes_ask: Optional[int],
                            no_ask: Optional[int]
                            ) -> Optional[Tuple[str, int, int]]:
     """
-    Pure probability poster entry.
-    Checks both YES and NO every call.
-    Returns (side, post_price, edge_cents) or None.
+    Gap-based poster entry.
+    Gap = model_fair_value - book_ask (in cents).
+    Checks YES then NO.
+    Returns (side, post_price, gap_cents) or None.
 
-    Trigger: model >= 85% confident on either side.
-    Post: ask_price + POSTER_BOOK_PREMIUM (above book).
-    Edge: fair_value - post_price >= POSTER_MIN_EDGE_CENTS.
+    Trigger: gap >= POSTER_MIN_GAP_CENTS (4¢).
+    Post: ask + POSTER_BOOK_PREMIUM (above book).
 
     YES example:
-      p_yes=0.87, yes_ask=75¢
-      fair=87¢, post=78¢, edge=9¢ → POST YES at 78¢
+      p_yes=0.82, yes_ask=75¢
+      fair=82¢, gap=7¢ >= 4¢ → post=78¢ → POST YES at 78¢
 
     NO example:
-      p_no=0.86, no_ask=74¢
-      fair=86¢, post=77¢, edge=9¢ → POST NO at 77¢
+      p_no=0.78, no_ask=70¢
+      fair=78¢, gap=8¢ >= 4¢ → post=73¢ → POST NO at 73¢
     """
 
     # Check YES side first
-    if p_yes >= POSTER_CONFIDENCE_THRESHOLD and yes_ask is not None:
+    if yes_ask is not None:
         fair_yes = int(round(p_yes * 100))
+        gap = fair_yes - yes_ask
         post_price = yes_ask + POSTER_BOOK_PREMIUM
         post_price = max(1, min(99, post_price))
-        edge = fair_yes - post_price
 
         log.info(
             f"[EVAL-YES] p_yes={p_yes:.1%} fair={fair_yes}¢ "
-            f"yes_ask={yes_ask}¢ post={post_price}¢ edge={edge:+d}¢ "
-            f"min={POSTER_MIN_EDGE_CENTS}¢"
+            f"yes_ask={yes_ask}¢ gap={gap:+d}¢ "
+            f"min_gap={POSTER_MIN_GAP_CENTS}¢"
         )
 
-        if edge >= POSTER_MIN_EDGE_CENTS:
+        if gap >= POSTER_MIN_GAP_CENTS:
             log.warning(
-                f"[TRIGGER-YES] p_yes={p_yes:.1%} >= {POSTER_CONFIDENCE_THRESHOLD:.0%} "
-                f"edge={edge:+d}¢ — POSTING YES at {post_price}¢"
+                f"[TRIGGER-YES] gap={gap:+d}¢ >= {POSTER_MIN_GAP_CENTS}¢ "
+                f"— POSTING YES at {post_price}¢"
             )
-            return ("yes", post_price, edge)
+            return ("yes", post_price, gap)
 
     # Check NO side
-    if p_no >= POSTER_CONFIDENCE_THRESHOLD and no_ask is not None:
+    if no_ask is not None:
         fair_no = int(round(p_no * 100))
+        gap = fair_no - no_ask
         post_price = no_ask + POSTER_BOOK_PREMIUM
         post_price = max(1, min(99, post_price))
-        edge = fair_no - post_price
 
         log.info(
             f"[EVAL-NO] p_no={p_no:.1%} fair={fair_no}¢ "
-            f"no_ask={no_ask}¢ post={post_price}¢ edge={edge:+d}¢ "
-            f"min={POSTER_MIN_EDGE_CENTS}¢"
+            f"no_ask={no_ask}¢ gap={gap:+d}¢ "
+            f"min_gap={POSTER_MIN_GAP_CENTS}¢"
         )
 
-        if edge >= POSTER_MIN_EDGE_CENTS:
+        if gap >= POSTER_MIN_GAP_CENTS:
             log.warning(
-                f"[TRIGGER-NO] p_no={p_no:.1%} >= {POSTER_CONFIDENCE_THRESHOLD:.0%} "
-                f"edge={edge:+d}¢ — POSTING NO at {post_price}¢"
+                f"[TRIGGER-NO] gap={gap:+d}¢ >= {POSTER_MIN_GAP_CENTS}¢ "
+                f"— POSTING NO at {post_price}¢"
             )
-            return ("no", post_price, edge)
+            return ("no", post_price, gap)
 
     return None
 
 
-def get_poster_contract_count(edge_cents: int, post_price: int,
-                               available_balance_cents: int) -> int:
+def get_gap_contract_count(gap_cents: int, post_price: int,
+                            available_balance_cents: int) -> int:
     """
-    Scale contracts to edge size and available bankroll.
-    Each bot manages its own allocation independently.
-    As bankroll grows, contracts scale up automatically.
+    Tiered contract sizing based on gap magnitude.
 
-    Formula: contracts = floor(edge_cents * POSTER_EDGE_SCALE)
-
-    Examples at scale 3.0:
-    edge  3¢ →  9 contracts (minimum threshold)
-    edge  5¢ → 15 contracts
-    edge  8¢ → 24 contracts
-    edge 10¢ → 30 contracts
-    edge 15¢ → 45 contracts
-    edge 20¢ → 60 contracts
-    edge 30¢ → 90 contracts
-    edge 34¢ → 100 contracts (max cap)
+    POSTER_GAP_TIERS = [
+        (4,  6,  8),   # 4-6¢  gap → 8 contracts
+        (7,  10, 15),  # 7-10¢ gap → 15 contracts
+        (11, 99, 25),  # 11¢+  gap → 25 contracts
+    ]
     """
-    raw = int(edge_cents * POSTER_EDGE_SCALE)
-    contracts = max(POSTER_MIN_CONTRACTS, min(POSTER_MAX_CONTRACTS, raw))
+    contracts = POSTER_MIN_CONTRACTS
+    for lo_gap, hi_gap, qty in POSTER_GAP_TIERS:
+        if lo_gap <= gap_cents <= hi_gap:
+            contracts = qty
+            break
+
+    contracts = max(POSTER_MIN_CONTRACTS, min(POSTER_MAX_CONTRACTS, contracts))
 
     # Cost cap per market
     cost_cents = contracts * post_price
@@ -883,25 +879,23 @@ def get_poster_contract_count(edge_cents: int, post_price: int,
         contracts = max(1, available_balance_cents // post_price)
 
     log.info(
-        f"[SIZE] edge={edge_cents}¢ scale={POSTER_EDGE_SCALE} "
-        f"raw={raw} contracts={contracts} "
+        f"[SIZE] gap={gap_cents}¢ contracts={contracts} "
         f"cost=${contracts * post_price / 100:.2f}"
     )
 
     return contracts
 
 
-def run_probability_amend_loop(client, order_id: str,
-                                market_ticker: str, close_ts: float,
-                                get_ob_func, get_spot_func,
-                                lo: float, hi: float,
-                                http_session, side: str) -> int:
+def run_gap_amend_loop(client, order_id: str,
+                        market_ticker: str, close_ts: float,
+                        get_ob_func, get_spot_func,
+                        lo: float, hi: float,
+                        http_session, side: str) -> int:
     """
-    Amend loop for probability poster.
-    Tracks book price upward as market catches up to fair value.
-    Cancels if confidence drops below POSTER_CANCEL_THRESHOLD.
+    Gap-based amend loop.
+    Tracks book price upward as market catches up.
+    Cancels if gap <= POSTER_CANCEL_GAP (0¢ = gap inverted).
     Cancels explicitly when expiry buffer triggers.
-    Never leaves a stray order on the book.
 
     side: 'yes' or 'no'
     """
@@ -914,7 +908,7 @@ def run_probability_amend_loop(client, order_id: str,
                         else order.get("no_price"))
 
     log.info(
-        f"[PROB-AMEND] Start {order_id} side={side} "
+        f"[GAP-AMEND] Start {order_id} side={side} "
         f"price={current_price}¢"
     )
 
@@ -925,7 +919,7 @@ def run_probability_amend_loop(client, order_id: str,
         # ── EXPIRY BUFFER — cancel and exit ──────────────────
         if secs_to_close <= POSTER_EXPIRY_BUFFER:
             log.warning(
-                f"[PROB-AMEND] Expiry buffer reached "
+                f"[GAP-AMEND] Expiry buffer reached "
                 f"({secs_to_close:.0f}s left) — canceling {order_id}"
             )
             cancel_order_status(client, order_id)
@@ -942,7 +936,7 @@ def run_probability_amend_loop(client, order_id: str,
 
         if status in ("executed", "canceled") or remaining == 0:
             log.info(
-                f"[PROB-AMEND] Done: status={status} "
+                f"[GAP-AMEND] Done: status={status} "
                 f"filled={fill_count}"
             )
             break
@@ -967,21 +961,21 @@ def run_probability_amend_loop(client, order_id: str,
                 p_no = fair_no / 100.0
                 p_yes = 1.0 - p_no
 
-                confidence = p_yes if side == "yes" else p_no
+                fair_value = int(round((p_yes if side == "yes" else p_no) * 100))
                 book_ask = yes_ask if side == "yes" else no_ask
+                gap = (fair_value - book_ask) if book_ask is not None else 0
 
                 log.info(
-                    f"[PROB-AMEND] Re-eval: side={side} "
-                    f"confidence={confidence:.1%} book_ask={book_ask}¢ "
-                    f"cancel_threshold={POSTER_CANCEL_THRESHOLD:.0%}"
+                    f"[GAP-AMEND] Re-eval: side={side} "
+                    f"fair={fair_value}¢ book_ask={book_ask}¢ "
+                    f"gap={gap:+d}¢ cancel_gap={POSTER_CANCEL_GAP}¢"
                 )
 
-                # ── CANCEL IF CONFIDENCE DROPPED ─────────────
-                if confidence < POSTER_CANCEL_THRESHOLD:
+                # ── CANCEL IF GAP INVERTED ─────────────────────
+                if gap <= POSTER_CANCEL_GAP:
                     log.warning(
-                        f"[PROB-AMEND] Confidence dropped "
-                        f"({confidence:.1%} < "
-                        f"{POSTER_CANCEL_THRESHOLD:.0%}) "
+                        f"[GAP-AMEND] Gap collapsed "
+                        f"({gap:+d}¢ <= {POSTER_CANCEL_GAP}¢) "
                         f"— canceling {order_id}"
                     )
                     cancel_order_status(client, order_id)
@@ -999,16 +993,16 @@ def run_probability_amend_loop(client, order_id: str,
                         )
                         if result is not None:
                             log.warning(
-                                f"[PROB-AMEND] {market_ticker} "
+                                f"[GAP-AMEND] {market_ticker} "
                                 f"{current_price}¢ → {new_price}¢ "
-                                f"confidence={confidence:.1%}"
+                                f"gap={gap:+d}¢"
                             )
                             current_price = new_price
                         else:
                             break
 
             except Exception as e:
-                log.warning(f"[PROB-AMEND] Error: {e}")
+                log.warning(f"[GAP-AMEND] Error: {e}")
 
             last_amend = now
 
@@ -1016,7 +1010,7 @@ def run_probability_amend_loop(client, order_id: str,
 
     final = get_order(client, order_id)
     filled = int(final.get("fill_count", 0)) if final else 0
-    log.info(f"[PROB-AMEND] Exit {order_id} filled={filled}")
+    log.info(f"[GAP-AMEND] Exit {order_id} filled={filled}")
     return filled
 
 
@@ -1208,24 +1202,23 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
-    log.warning(f"[IRON RULES] {ASSET} Bot — PROBABILITY POSTER V5 (Feb 2026)")
+    log.warning(f"[IRON RULES] {ASSET} Bot — GAP POSTER V6 (Feb 2026)")
     log.warning(f"[IRON RULES] RULE 1: Single entry per market — TRADED_TICKERS + API check")
-    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — probability is the gate")
-    log.warning(f"[IRON RULES] RULE 3: Confidence >= {POSTER_CONFIDENCE_THRESHOLD:.0%} to post | cost cap ${MAX_COST_PER_MARKET}")
+    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — gap is the gate")
+    log.warning(f"[IRON RULES] RULE 3: Gap >= {POSTER_MIN_GAP_CENTS}¢ to post | cost cap ${MAX_COST_PER_MARKET}")
     log.warning(f"[IRON RULES] RULE 4: Post ABOVE book — market catches up")
-    log.warning(f"[IRON RULES] RULE 5: Triple cancel — expiry + confidence + sweep")
+    log.warning(f"[IRON RULES] RULE 5: Triple cancel — expiry + gap inversion + sweep")
     log.warning("=" * 70)
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} "
-        f"CONF_THRESHOLD={POSTER_CONFIDENCE_THRESHOLD:.0%} "
-        f"CANCEL_THRESHOLD={POSTER_CANCEL_THRESHOLD:.0%} "
-        f"MIN_EDGE={POSTER_MIN_EDGE_CENTS}¢ "
+        f"MIN_GAP={POSTER_MIN_GAP_CENTS}¢ "
+        f"CANCEL_GAP={POSTER_CANCEL_GAP}¢ "
         f"MAX_COST=${MAX_COST_PER_MARKET} ALLOC=${BOT_ALLOCATION} "
         f"POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
     log.warning(
         f"[BOOTCFG] Book premium={POSTER_BOOK_PREMIUM}¢ "
-        f"Edge scale={POSTER_EDGE_SCALE} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
+        f"tiers={POSTER_GAP_TIERS} contracts={POSTER_MIN_CONTRACTS}-{POSTER_MAX_CONTRACTS} "
         f"amend_interval={POSTER_AMEND_INTERVAL}s expiry_buffer={POSTER_EXPIRY_BUFFER}s"
     )
     log.warning(
@@ -1515,9 +1508,9 @@ def main() -> None:
                 st.traded_this_market = True
             continue
 
-        # ── PURE PROBABILITY POSTER V5 ────────────────────────────────
-        # Observe entire market. Post when model hits 85% on YES or NO.
-        # Both sides valid. Post above book. Market catches up. Scale.
+        # ── GAP POSTER V6 ────────────────────────────────────────────
+        # Observe entire market. Post when model leads book by MIN_GAP.
+        # Both sides valid. Tiered sizing. Gap = fair_value - book_ask.
         if not st.traded_this_market:
 
             # Session check
@@ -1536,29 +1529,31 @@ def main() -> None:
 
             available_cents = int((available or 0) * 100)
 
-            # Evaluate entry — checks YES and NO every second
+            # Evaluate entry — gap-based, checks YES and NO every cycle
             entry = evaluate_poster_entry(p_yes, p_no, yes_ask, no_ask)
 
             if entry is None:
                 # Log observe state periodically
                 if (now - last_state_log) >= LOG_STATE_EVERY_SECONDS:
-                    dominant = "YES" if p_yes > p_no else "NO"
-                    conf = max(p_yes, p_no)
+                    fair_yes = int(round(p_yes * 100))
+                    fair_no = int(round(p_no * 100))
+                    yes_gap = (fair_yes - yes_ask) if yes_ask is not None else 0
+                    no_gap = (fair_no - no_ask) if no_ask is not None else 0
                     log.info(
                         f"[OBSERVE] {st.market} t={secs_to_close:.0f}s "
-                        f"leading={dominant} conf={conf:.1%} "
-                        f"threshold={POSTER_CONFIDENCE_THRESHOLD:.0%} "
+                        f"yes_gap={yes_gap:+d}¢ no_gap={no_gap:+d}¢ "
+                        f"min_gap={POSTER_MIN_GAP_CENTS}¢ "
                         f"yes_ask={yes_ask}¢ no_ask={no_ask}¢"
                     )
                     last_state_log = now
                 time.sleep(POLL_SECONDS)
                 continue
 
-            side, post_price, edge = entry
+            side, post_price, gap = entry
 
-            # Scale contracts to edge and bankroll
-            order_qty = get_poster_contract_count(
-                edge, post_price, available_cents
+            # Tiered contract sizing
+            order_qty = get_gap_contract_count(
+                gap, post_price, available_cents
             )
             if order_qty < 1:
                 log.info(f"[SKIP] Insufficient balance for 1 contract")
@@ -1566,7 +1561,6 @@ def main() -> None:
                 continue
 
             # COMMIT — Rule 1 never changes
-            # Lock before placing order — no double entry ever
             TRADED_TICKERS.add(st.market)
             st.traded_this_market = True
             st.side = side
@@ -1575,12 +1569,11 @@ def main() -> None:
             log.warning(f"[LOCKED] {st.market} side={side} added to TRADED_TICKERS")
 
             total_cost = order_qty * post_price / 100.0
-            conf = p_yes if side == "yes" else p_no
 
             try:
                 log.warning(
-                    f"[V5-POSTER] {st.market} {side.upper()} {order_qty}ct "
-                    f"@ {post_price}¢ conf={conf:.1%} edge={edge:+d}¢ "
+                    f"[V6-POSTER] {st.market} {side.upper()} {order_qty}ct "
+                    f"@ {post_price}¢ gap={gap:+d}¢ "
                     f"cost=${total_cost:.2f}"
                 )
 
@@ -1591,13 +1584,13 @@ def main() -> None:
                 oid = place_order(client, payload)
 
                 if oid.startswith("BLOCKED"):
-                    log.warning(f"[V5-POSTER] Order blocked: {oid}")
+                    log.warning(f"[V6-POSTER] Order blocked: {oid}")
                     time.sleep(POLL_SECONDS)
                     continue
 
                 st.order_id = oid
                 log.warning(
-                    f"[V5-POSTER-ORDER] {oid} {side.upper()} "
+                    f"[V6-POSTER-ORDER] {oid} {side.upper()} "
                     f"{order_qty}ct @ {post_price}¢"
                 )
 
@@ -1612,7 +1605,7 @@ def main() -> None:
                 def fetch_spot():
                     return fetch_spot_usd(http)
 
-                filled_count = run_probability_amend_loop(
+                filled_count = run_gap_amend_loop(
                     client, oid, st.market, close_ts,
                     fetch_ob, fetch_spot, lo, hi, http, side
                 )
@@ -1622,27 +1615,27 @@ def main() -> None:
                 if filled_count > 0:
                     payout = filled_count * (100 - post_price) / 100.0
                     log.warning(
-                        f"[V5-POSTER-FILL] {st.market} "
+                        f"[V6-POSTER-FILL] {st.market} "
                         f"filled={filled_count}ct {side.upper()} @ {post_price}¢ "
                         f"potential_profit=${payout:.2f} if {side.upper()} wins"
                     )
                 else:
                     log.info(
-                        f"[V5-POSTER-FILL] {st.market} 0 fills — "
-                        f"confidence dropped or expiry hit"
+                        f"[V6-POSTER-FILL] {st.market} 0 fills — "
+                        f"gap collapsed or expiry hit"
                     )
 
             except Exception as e:
-                log.warning(f"[V5-POSTER] Exception: {e}")
+                log.warning(f"[V6-POSTER] Exception: {e}")
 
             time.sleep(POLL_SECONDS)
             continue
-        # ── END V5 POSTER ─────────────────────────────────────────────
+        # ── END V6 POSTER ────────────────────────────────────────────
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: {e} | {ASSET} V5 CONF={POSTER_CONFIDENCE_THRESHOLD:.0%} ALLOC=${BOT_ALLOCATION}")
+        log.exception(f"FATAL: {e} | {ASSET} V6 GAP={POSTER_MIN_GAP_CENTS}¢ ALLOC=${BOT_ALLOCATION}")
         sys.exit(1)

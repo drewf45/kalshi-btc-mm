@@ -249,34 +249,36 @@ FEE_CENTS_PER_CONTRACT = 0
 NUM_CONCURRENT_BOTS = 4
 
 # ─────────────────────────────────────────────
-# PURE PROBABILITY POSTER V5
+# GAP POSTER V6
 # ─────────────────────────────────────────────
 
-# Probability threshold to trigger posting on either YES or NO
-POSTER_CONFIDENCE_THRESHOLD = 0.85   # 85%
+# Minimum gap in cents to trigger posting
+# Gap = model_fair_value - book_ask
+# Below 4¢ = noise, not real edge
+POSTER_MIN_GAP_CENTS = 4
 
-# Cancel if confidence drops below this during amend loop
-POSTER_CANCEL_THRESHOLD = 0.80       # 80%
+# Gap tiers for contract sizing
+# (min_gap, max_gap, contracts)
+# Conservative due to expensive contract asymmetry
+POSTER_GAP_TIERS = [
+    (4,  6,  8),   # 4-6¢  gap → 8 contracts
+    (7,  10, 15),  # 7-10¢ gap → 15 contracts
+    (11, 99, 25),  # 10¢+  gap → 25 contracts
+]
 
-# Minimum edge in cents after posting above book
-# fair_value - post_price must be >= this
-POSTER_MIN_EDGE_CENTS = 3
+# Hard cap — asymmetry on expensive contracts demands this
+POSTER_MAX_CONTRACTS = 25
+POSTER_MIN_CONTRACTS = 5
 
-# How far above current book ask to post
-# Posts ABOVE book so market catches up to your order
+# Post this many cents above current book ask
+# Gets order ahead of where market is going
 POSTER_BOOK_PREMIUM = 3
 
-# Contract scaling — bigger edge = more contracts
-# contracts = floor(edge_cents * POSTER_EDGE_SCALE)
-POSTER_EDGE_SCALE = 3.0
+# Cancel if gap inverts — book has caught up past model
+POSTER_CANCEL_GAP = 0
 
-# Contract caps
-POSTER_MIN_CONTRACTS = 5
-POSTER_MAX_CONTRACTS = 100
-
-# Amend price every N seconds tracking book upward
+# Amend every N seconds tracking book upward
 POSTER_AMEND_INTERVAL = 15
 
-# Cancel resting order this many seconds before market close
-# Prevents stray orders accumulating on account
+# Cancel resting order this many seconds before close
 POSTER_EXPIRY_BUFFER = 90
