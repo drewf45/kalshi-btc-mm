@@ -31,6 +31,7 @@ from config import (
     SAMPLE_CONFIDENCE_TARGET,
     ENTRY_WR_EXP,
     SIZING_WR_EXP,
+    MIN_CONFIDENCE,
     MIN_SCORE_TO_TRADE,
     SCORE_HIGH_THRESHOLD,
     SCORE_MED_THRESHOLD,
@@ -344,13 +345,13 @@ def evaluate_entry(
         asset, side, book_ask, max(0.0, gap_cents), secs_to_close
     )
 
-    tier = score_to_tier(entry_score)
-    if tier is None:
-        log.info(
-            f"[EVAL] {asset} {side}@{book_ask}¢ gap={gap_cents:.1f}¢ "
-            f"t={secs_to_close:.0f}s | entry_score={entry_score:.3f} → NO TRADE"
-        )
+    p_yes = model_fair_cents / 100.0
+    p_no = 1.0 - p_yes
+    confidence = max(p_yes, p_no)
+    if confidence < MIN_CONFIDENCE:
         return None
+
+    tier = score_to_tier(entry_score)
 
     post_price = compute_post_price(entry_score, book_ask, model_fair_cents, side)
     contracts  = compute_contracts(sizing_score, post_price, live_balance)
