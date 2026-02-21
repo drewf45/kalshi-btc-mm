@@ -41,7 +41,7 @@ from config import (
     SESSION_CONSECUTIVE_LOSSES_LIMIT, SESSION_COOLDOWN_MINUTES,
     BALANCE_CHECK_DELAY_SECONDS,
     BOT_ALLOCATION, MIN_BOT_BALANCE, MAX_COST_PER_MARKET,
-    POSTER_MIN_GAP_CENTS, POSTER_GAP_TIERS, POSTER_CANCEL_GAP,
+    POSTER_GAP_TIERS,
     POSTER_MIN_CONTRACTS, POSTER_MAX_CONTRACTS,
     POSTER_AMEND_INTERVAL, POSTER_EXPIRY_BUFFER,
     POSTER_OBSERVE_START_SECONDS,
@@ -50,25 +50,39 @@ from config import (
 # Asset-specific book premium — SOL has medium spreads
 POSTER_BOOK_PREMIUM = 2  # SOL — medium spreads
 
-# SOL gap thresholds by book price zone
-# Note: SOL NO 51-65¢ was a true negative (33% WR) — blocked at 99¢
+# SOL Zone win rates from clean-entry markets
+# Note: SOL NO 51-65¢ was a true negative (33% WR) — blocked
 # Zones 21-40¢ and 66-80¢ have no clean data — blocked
-SOL_GAP_THRESHOLDS = [
-    (1,  10,  4),   # 92.9% WR — strong zone
-    (11, 20,  5),   # 88.2% WR — good zone
-    (21, 40, 99),   # No clean data — block
-    (41, 50,  6),   # 83.3% WR — small sample, moderate gate
-    (51, 65, 99),   # 33% WR — true negative, block
-    (66, 80, 99),   # No clean data — block
-    (81, 90,  5),   # 90.0% WR — strong zone
-    (91, 99,  4),   # 95.0% WR — near-certain
+SOL_ZONE_WIN_RATES = [
+    (1,  10,  0.929),  # 92.9% WR — 85 markets
+    (11, 20,  0.882),  # 88.2% WR — 51 markets
+    (21, 40,  0.0),    # No clean data — blocked
+    (41, 50,  0.833),  # 83.3% WR — 6 markets (small sample)
+    (51, 65,  0.0),    # 33% WR — true negative, blocked
+    (66, 80,  0.0),    # No clean data — blocked
+    (81, 90,  0.900),  # 90.0% WR — 10 markets
+    (91, 99,  0.950),  # 95.0% WR — 40 markets
 ]
 
-def get_min_gap(book_price: int) -> int:
-    for (lo, hi, gap) in SOL_GAP_THRESHOLDS:
+SOL_SCORE_THRESHOLD = 2.5
+
+def get_zone_win_rate(book_price: int) -> float:
+    for (lo, hi, wr) in SOL_ZONE_WIN_RATES:
         if lo <= book_price <= hi:
-            return gap
-    return 99
+            return wr
+    return 0.0
+
+def get_time_weight(secs_to_close: float) -> float:
+    """
+    Time decay multiplier. Later = more certain = higher weight.
+    Market runs 900s → 0s. We observe 600s → 90s.
+    """
+    if secs_to_close > 400:
+        return 0.6   # Early — direction uncertain
+    elif secs_to_close > 200:
+        return 0.8   # Mid — direction forming
+    else:
+        return 1.2   # Late — time confirming direction
 
 # ======================== BOOT BANNER ========================
 print(f"BOOT: sol_bot.py loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)
@@ -806,68 +820,61 @@ def get_historical_accuracy(side: str, price_cents: int) -> Optional[Tuple[float
     return asset_data.get(bucket)
 
 
-# ======================== GAP POSTER V6 ===========================
+# ======================== SCORE POSTER V7 ===========================
 def evaluate_poster_entry(p_yes: float, p_no: float,
                            yes_ask: Optional[int],
-                           no_ask: Optional[int]
+                           no_ask: Optional[int],
+                           secs_to_close: float
                            ) -> Optional[Tuple[str, int, int]]:
     """
-    Gap-based poster entry.
-    Gap = model_fair_value - book_ask (in cents).
-    Checks YES then NO.
+    Score-based poster entry (V7).
+    score = gap × zone_win_rate × time_weight
+    Fire when score >= SCORE_THRESHOLD.
     Returns (side, post_price, gap_cents) or None.
-
-    Trigger: gap >= POSTER_MIN_GAP_CENTS (4¢).
-    Post: ask + POSTER_BOOK_PREMIUM (above book).
-
-    YES example:
-      p_yes=0.82, yes_ask=75¢
-      fair=82¢, gap=7¢ >= 4¢ → post=78¢ → POST YES at 78¢
-
-    NO example:
-      p_no=0.78, no_ask=70¢
-      fair=78¢, gap=8¢ >= 4¢ → post=73¢ → POST NO at 73¢
     """
+    time_weight = get_time_weight(secs_to_close)
 
-    # Check YES side first
+    # YES side
     if yes_ask is not None:
         fair_yes = int(round(p_yes * 100))
         gap = fair_yes - yes_ask
-        min_gap = get_min_gap(yes_ask)
+        wr = get_zone_win_rate(yes_ask)
+        score = gap * wr * time_weight
 
         log.info(
-            f"[EVAL-YES] p_yes={p_yes:.1%} fair={fair_yes}¢ "
-            f"yes_ask={yes_ask}¢ gap={gap:+d}¢ "
-            f"min_gap={min_gap}¢"
+            f"[EVAL-YES] fair={fair_yes}¢ ask={yes_ask}¢ "
+            f"gap={gap:+d}¢ wr={wr:.1%} tw={time_weight} "
+            f"score={score:.2f} threshold={SOL_SCORE_THRESHOLD}"
         )
 
-        if gap >= min_gap:
+        if gap > 0 and score >= SOL_SCORE_THRESHOLD:
             post_price = yes_ask + POSTER_BOOK_PREMIUM
             post_price = max(1, min(99, post_price))
             log.warning(
-                f"[TRIGGER-YES] gap={gap:+d}¢ >= {min_gap}¢ "
-                f"— POSTING YES at {post_price}¢"
+                f"[TRIGGER-YES] score={score:.2f} >= {SOL_SCORE_THRESHOLD} "
+                f"post={post_price}¢"
             )
             return ("yes", post_price, gap)
 
-    # Check NO side
+    # NO side
     if no_ask is not None:
         fair_no = int(round(p_no * 100))
         gap = fair_no - no_ask
-        min_gap = get_min_gap(no_ask)
+        wr = get_zone_win_rate(no_ask)
+        score = gap * wr * time_weight
 
         log.info(
-            f"[EVAL-NO] p_no={p_no:.1%} fair={fair_no}¢ "
-            f"no_ask={no_ask}¢ gap={gap:+d}¢ "
-            f"min_gap={min_gap}¢"
+            f"[EVAL-NO] fair={fair_no}¢ ask={no_ask}¢ "
+            f"gap={gap:+d}¢ wr={wr:.1%} tw={time_weight} "
+            f"score={score:.2f} threshold={SOL_SCORE_THRESHOLD}"
         )
 
-        if gap >= min_gap:
+        if gap > 0 and score >= SOL_SCORE_THRESHOLD:
             post_price = no_ask + POSTER_BOOK_PREMIUM
             post_price = max(1, min(99, post_price))
             log.warning(
-                f"[TRIGGER-NO] gap={gap:+d}¢ >= {min_gap}¢ "
-                f"— POSTING NO at {post_price}¢"
+                f"[TRIGGER-NO] score={score:.2f} >= {SOL_SCORE_THRESHOLD} "
+                f"post={post_price}¢"
             )
             return ("no", post_price, gap)
 
@@ -920,7 +927,7 @@ def run_gap_amend_loop(client, order_id: str,
     """
     Gap-based amend loop.
     Tracks book price upward as market catches up.
-    Cancels if gap <= POSTER_CANCEL_GAP (0¢ = gap inverted).
+    Cancels if score drops below threshold.
     Cancels explicitly when expiry buffer triggers.
 
     side: 'yes' or 'no'
@@ -991,17 +998,22 @@ def run_gap_amend_loop(client, order_id: str,
                 book_ask = yes_ask if side == "yes" else no_ask
                 gap = (fair_value - book_ask) if book_ask is not None else 0
 
+                wr = get_zone_win_rate(book_ask) if book_ask is not None else 0.0
+                time_wt = get_time_weight(secs_to_close)
+                score = gap * wr * time_wt
+
                 log.info(
                     f"[GAP-AMEND] Re-eval: side={side} "
                     f"fair={fair_value}¢ book_ask={book_ask}¢ "
-                    f"gap={gap:+d}¢ cancel_gap={POSTER_CANCEL_GAP}¢"
+                    f"gap={gap:+d}¢ wr={wr:.1%} tw={time_wt} "
+                    f"score={score:.2f}"
                 )
 
-                # ── CANCEL IF GAP BELOW ZONE THRESHOLD ─────────
-                min_gap = get_min_gap(book_ask) if book_ask is not None else 99
-                if gap < min_gap:
+                # ── CANCEL IF SCORE BELOW THRESHOLD ───────────
+                if gap <= 0 or score < SOL_SCORE_THRESHOLD:
                     log.warning(
-                        f"[GAP-AMEND] Gap {gap:+d}¢ < zone min {min_gap}¢ "
+                        f"[GAP-AMEND] Score dropped "
+                        f"({score:.2f} < {SOL_SCORE_THRESHOLD}) "
                         f"— canceling {order_id}"
                     )
                     cancel_order_status(client, order_id)
@@ -1228,17 +1240,16 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
-    log.warning(f"[IRON RULES] {ASSET} Bot — GAP POSTER V6 (Feb 2026)")
+    log.warning(f"[IRON RULES] {ASSET} Bot — SCORE POSTER V7 (Feb 2026)")
     log.warning(f"[IRON RULES] RULE 1: Single entry per market — TRADED_TICKERS + API check")
-    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — gap is the gate")
-    log.warning(f"[IRON RULES] RULE 3: Gap >= {POSTER_MIN_GAP_CENTS}¢ to post | cost cap ${MAX_COST_PER_MARKET}")
+    log.warning(f"[IRON RULES] RULE 2: Both YES and NO valid — score is the gate")
+    log.warning(f"[IRON RULES] RULE 3: Score >= {SOL_SCORE_THRESHOLD} to post | cost cap ${MAX_COST_PER_MARKET}")
     log.warning(f"[IRON RULES] RULE 4: Post ABOVE book — market catches up")
-    log.warning(f"[IRON RULES] RULE 5: Triple cancel — expiry + gap inversion + sweep")
+    log.warning(f"[IRON RULES] RULE 5: Triple cancel — expiry + score drop + sweep")
     log.warning("=" * 70)
     log.warning(
         f"[BOOTCFG] SERIES={SERIES_TICKER} "
-        f"MIN_GAP={POSTER_MIN_GAP_CENTS}¢ "
-        f"CANCEL_GAP={POSTER_CANCEL_GAP}¢ "
+        f"SCORE_THRESHOLD={SOL_SCORE_THRESHOLD} "
         f"MAX_COST=${MAX_COST_PER_MARKET} ALLOC=${BOT_ALLOCATION} "
         f"POST_ONLY={POST_ONLY} DRY_RUN={DRY_RUN}"
     )
@@ -1560,8 +1571,8 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Evaluate entry — gap-based, checks YES and NO every cycle
-            entry = evaluate_poster_entry(p_yes, p_no, yes_ask, no_ask)
+            # Evaluate entry — score-based, checks YES and NO every cycle
+            entry = evaluate_poster_entry(p_yes, p_no, yes_ask, no_ask, secs_to_close)
 
             if entry is None:
                 # Log observe state periodically
@@ -1570,10 +1581,15 @@ def main() -> None:
                     fair_no = int(round(p_no * 100))
                     yes_gap = (fair_yes - yes_ask) if yes_ask is not None else 0
                     no_gap = (fair_no - no_ask) if no_ask is not None else 0
+                    tw = get_time_weight(secs_to_close)
+                    yes_wr = get_zone_win_rate(yes_ask) if yes_ask is not None else 0.0
+                    no_wr = get_zone_win_rate(no_ask) if no_ask is not None else 0.0
+                    yes_score = yes_gap * yes_wr * tw
+                    no_score = no_gap * no_wr * tw
                     log.info(
                         f"[OBSERVE] {st.market} t={secs_to_close:.0f}s "
-                        f"yes_gap={yes_gap:+d}¢ no_gap={no_gap:+d}¢ "
-                        f"min_gap={POSTER_MIN_GAP_CENTS}¢ "
+                        f"yes_score={yes_score:.2f} no_score={no_score:.2f} "
+                        f"threshold={SOL_SCORE_THRESHOLD} "
                         f"yes_ask={yes_ask}¢ no_ask={no_ask}¢"
                     )
                     last_state_log = now
@@ -1676,5 +1692,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"FATAL: {e} | {ASSET} V6 GAP={POSTER_MIN_GAP_CENTS}¢ ALLOC=${BOT_ALLOCATION}")
+        log.exception(f"FATAL: {e} | {ASSET} V7 SCORE={SOL_SCORE_THRESHOLD} ALLOC=${BOT_ALLOCATION}")
         sys.exit(1)
