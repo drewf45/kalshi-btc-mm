@@ -658,10 +658,11 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
     balance_cents = resp.get("balance")
     portfolio_cents = resp.get("portfolio_value", 0)
     if balance_cents is not None:
-        available = float(balance_cents) / 100.0
-        total = float(balance_cents + portfolio_cents) / 100.0
-        log.info(f"[BALANCE] {balance_cents}¢ (${available:.2f}), portfolio={portfolio_cents}¢")
-        return available, total
+        cash = float(balance_cents) / 100.0
+        portfolio = float(portfolio_cents) / 100.0
+        total = cash + portfolio
+        log.info(f"[BALANCE] cash=${cash:.2f} portfolio=${portfolio:.2f} total=${total:.2f}")
+        return total, portfolio
     return None, None
 
 def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> None:
@@ -1053,6 +1054,7 @@ class BotState:
     # Watch-confirm state
     certainty_counter: int = 0
     certainty_side: Optional[str] = None
+    watch_active: bool = False
     # Deferred settlement
     pending_settlement_market: Optional[str] = None
     pending_settlement_side: Optional[str] = None
@@ -1166,6 +1168,7 @@ def main() -> None:
         st.last_evaluated_no_ask = None
         st.certainty_counter = 0
         st.certainty_side = None
+        st.watch_active = False
 
     ev, mt, mobj = refresh_active_market()
     active_market_obj = mobj or {}
@@ -1276,6 +1279,7 @@ def main() -> None:
                     st.last_evaluated_no_ask = None
                     st.certainty_counter = 0
                     st.certainty_side = None
+                    st.watch_active = False
                     reconcile_on_market_change(mt2)
                 else:
                     if isinstance(mobj2, dict) and mobj2:
@@ -1410,8 +1414,20 @@ def main() -> None:
                     log.info(f"[RESET] {st.market} outside watch window — counter cleared")
                     st.certainty_counter = 0
                     st.certainty_side = None
+                st.watch_active = False
                 time.sleep(POLL_SECONDS)
                 continue
+
+            # First tick inside watch window — log activation
+            if not st.watch_active:
+                st.watch_active = True
+                log.warning(f"[WATCH-START] {st.market} entering 5-min window at t={secs_to_close:.0f}s")
+
+            # Tick heartbeat inside watch window
+            log.info(
+                f"[TICK] {st.market} t={secs_to_close:.0f}s "
+                f"yes={yes_bid}¢ no={no_bid}¢"
+            )
 
             # Check which side is at or above threshold
             yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
@@ -1463,7 +1479,7 @@ def main() -> None:
                 live_bal, _ = get_balance_usd(client)
                 if live_bal is not None:
                     session.update_balance(live_bal)
-                    log.info(f"[BALANCE-REFRESH] Live balance: ${live_bal:.2f}")
+                    log.info(f"[BALANCE-REFRESH] Live balance (cash+positions): ${live_bal:.2f}")
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
