@@ -122,6 +122,11 @@ DRY_RUN = env_bool("DRY_RUN", False)
 ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Taker by default for cheap contracts
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
+
+# ── CERTAINTY POSTING STRATEGY CONSTANTS ──
+ENTRY_THRESHOLD = 92       # cents — bid must be >= this to enter
+POST_PRICE = 97            # cents — fixed post price (not 98, not 99)
+ENTRY_WINDOW_SECONDS = 90  # seconds before close to start evaluating
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 # Sigma (volatility) caching
@@ -1078,14 +1083,13 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
-    log.warning(f"[RULES] {ASSET} — CERTAINTY STRATEGY (Feb 2026)")
-    log.warning(f"[RULES] Source: 3,500 trades, 2,188 settlements analyzed")
-    log.warning(f"[RULES] RULE 1: Only enter at t <= 120s (certainty window)")
-    log.warning(f"[RULES] RULE 2: YES >= 80c → buy YES (85-95% WR)")
-    log.warning(f"[RULES] RULE 3: NO <= 20c → buy NO (92% WR)")
-    log.warning(f"[RULES] RULE 4: SOL skips YES 80c+ (only 65.9% WR)")
-    log.warning(f"[RULES] RULE 5: Request 100ct YES / 30ct NO")
-    log.warning(f"[RULES] RULE 6: Single entry per market — no stacking")
+    log.warning(f"[RULES] {ASSET} — CERTAINTY POSTING STRATEGY (Feb 2026)")
+    log.warning(f"[RULES] RULE 1: Enter at t <= {ENTRY_WINDOW_SECONDS}s — final confirmation window")
+    log.warning(f"[RULES] RULE 2: Either side bid >= {ENTRY_THRESHOLD}c → post on that side")
+    log.warning(f"[RULES] RULE 3: Fixed post price = {POST_PRICE}c (collect 3c/ct)")
+    log.warning(f"[RULES] RULE 4: Size = 20% of live balance / {POST_PRICE}c")
+    log.warning(f"[RULES] RULE 5: Single entry per market — no stacking")
+    log.warning(f"[RULES] RULE 6: Live balance fetch before every order")
     log.warning("=" * 70)
 
     # Watchdog
@@ -1388,18 +1392,12 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Silent before 10 minutes — book too chaotic, gap signals unreliable
-            if secs_to_close > POSTER_OBSERVE_START_SECONDS:
-                time.sleep(POLL_SECONDS)
-                continue
+            # ── CERTAINTY-BASED POSTING ──────────────────────────────────
+            # Post on the winning side at 97¢ in the final 90s window.
+            # Collect 2-3¢ per contract. Repeat every market.
+            # Entry: either side bid >= 92¢. Post: 97¢. Size: 20% of balance.
 
-            # ── CERTAINTY-BASED ENTRY ─────────────────────────────────────
-            # Strategy: wait for near-certain outcome, buy winner, post for fills.
-            # Price IS the signal — no model needed.
-            # Source: 3,500 trades analyzed Feb 8-21, 2026.
-
-            # Don't enter if too early — outcome not certain yet
-            if secs_to_close > 120:
+            if secs_to_close > ENTRY_WINDOW_SECONDS:
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -1412,50 +1410,40 @@ def main() -> None:
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Determine what to trade
+            # Determine side — whichever side's bid >= 92¢
             side = None
-            post_price = None
-            order_qty = None
-
-            # ZONE 1: YES is nearly certain winner (bid >= 80c)
-            # YES @ 80-99c wins 85-95% of the time (737 markets of data)
-            if yes_bid is not None and yes_bid >= 80:
+            if yes_bid is not None and yes_bid >= ENTRY_THRESHOLD:
                 side = 'yes'
-                post_price = max(yes_bid - 2, 80)  # Post 2c below bid, min 80c
-                order_qty = 100  # Request 100, get what fills
-
-            # ZONE 2: NO is nearly certain winner (ask <= 20c)
-            # NO @ 1-20c wins 91.9% of the time (1,011 markets of data)
-            elif no_ask is not None and no_ask <= 20:
+            elif no_bid is not None and no_bid >= ENTRY_THRESHOLD:
                 side = 'no'
-                post_price = no_ask  # Take the ask on cheap NO
-                order_qty = 30
 
-            # No edge — skip
             if side is None:
                 log.info(
                     f"[SKIP] {st.market} t={secs_to_close}s "
-                    f"yes_bid={yes_bid}c no_ask={no_ask}c — no edge zone"
+                    f"yes_bid={yes_bid}c no_bid={no_bid}c — below {ENTRY_THRESHOLD}c threshold"
                 )
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Cap order quantity to what balance can actually afford
-            max_affordable = int(session.current_balance_usd * 100 / post_price) if post_price > 0 else 0
-            if max_affordable < 1:
+            # Fixed post price + bankroll-driven sizing
+            post_price = POST_PRICE
+            allocation = session.current_balance_usd * 0.20
+            order_qty = int(allocation / (post_price / 100))
+            order_qty = max(1, min(500, order_qty))
+
+            # Can we afford at least 1 contract?
+            if session.current_balance_usd < (post_price / 100):
                 log.warning(
                     f"[SKIP] {st.market} — balance ${session.current_balance_usd:.2f} "
                     f"can't afford 1ct at {post_price}c"
                 )
                 time.sleep(POLL_SECONDS)
                 continue
-            order_qty = min(order_qty, max_affordable)
 
             log.warning(
-                f"[TRADE] {st.market} {side.upper()} "
-                f"post={post_price}c x{order_qty}ct "
-                f"t={secs_to_close}s bal=${session.current_balance_usd:.2f} "
-                f"| win=${order_qty*(100-post_price)/100:.0f} if {side.upper()}"
+                f"[ENTER] {st.market} {side.upper()}@{post_price}¢ "
+                f"contracts={order_qty} cost=${order_qty * post_price / 100:.2f} "
+                f"t={secs_to_close}s bal=${session.current_balance_usd:.2f}"
             )
 
             try:
@@ -1471,7 +1459,7 @@ def main() -> None:
                     time.sleep(POLL_SECONDS)
                     continue
 
-                # Order confirmed — NOW lock the market
+                # Order confirmed — lock the market
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 st.side = side
@@ -1480,40 +1468,35 @@ def main() -> None:
                 st.order_id = oid
                 log.warning(f"[LOCKED] {st.market} side={side} order={oid}")
 
-                log.warning(
-                    f"[V9-ORDER] {oid} {side.upper()} "
-                    f"{order_qty}ct @ {post_price}¢"
-                )
-
-                def fetch_ob():
+                # Wait for fills until market close
+                filled_count = 0
+                deadline = close_ts - 5
+                while time.time() < deadline:
                     try:
-                        return client.request(
-                            "GET", f"/markets/{st.market}/orderbook"
-                        ) or {}
+                        order_info = client.request("GET", f"/portfolio/orders/{oid}")
+                        if order_info:
+                            filled_count = order_info.get("quantity_filled", 0) or 0
+                            remaining = (order_info.get("quantity", 0) or 0) - filled_count
+                            status = order_info.get("status", "")
+                            if status in ("canceled", "filled") or remaining == 0:
+                                break
                     except Exception:
-                        return {}
-
-                def fetch_spot():
-                    return fetch_spot_usd(http)
-
-                filled_count = run_gap_amend_loop(
-                    client, oid, st.market, close_ts,
-                    fetch_ob, fetch_spot, lo, hi, http, side
-                )
+                        pass
+                    time.sleep(5)
 
                 st.qty = filled_count
 
                 if filled_count > 0:
                     payout = filled_count * (100 - post_price) / 100.0
                     log.warning(
-                        f"[V9-FILL] {st.market} "
+                        f"[FILL] {st.market} "
                         f"filled={filled_count}ct {side.upper()} @ {post_price}¢ "
                         f"potential_profit=${payout:.2f} if {side.upper()} wins"
                     )
                 else:
                     log.info(
-                        f"[V9-FILL] {st.market} 0 fills — "
-                        f"gap collapsed or expiry hit"
+                        f"[FILL] {st.market} 0 fills — "
+                        f"order expired or not matched"
                     )
 
             except Exception as e:
@@ -1523,7 +1506,6 @@ def main() -> None:
                         f"[SKIP] Insufficient balance for {st.market} "
                         f"— locking market to prevent retry spam"
                     )
-                    # Fetch real balance so next market is sized correctly
                     try:
                         live_bal, _ = get_balance_usd(client)
                         if live_bal is not None:
@@ -1531,7 +1513,6 @@ def main() -> None:
                             log.warning(f"[BALANCE-REFRESH] Updated after insufficient_balance: ${live_bal:.2f}")
                     except Exception:
                         pass
-                    # Lock this market so we stop retrying it
                     TRADED_TICKERS.add(st.market)
                     st.traded_this_market = True
                     time.sleep(POLL_SECONDS)
@@ -1542,11 +1523,11 @@ def main() -> None:
                         f"market NOT locked, will retry next tick"
                     )
                 else:
-                    log.warning(f"[V9-POSTER] Exception: {e}")
+                    log.warning(f"[POSTER] Exception: {e}")
 
             time.sleep(POLL_SECONDS)
             continue
-        # ── END V9 POSTER ────────────────────────────────────────────
+        # ── END POSTER ──────────────────────────────────────────────
 
 
 if __name__ == "__main__":
