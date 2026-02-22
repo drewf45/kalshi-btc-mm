@@ -1403,6 +1403,15 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
+            # Fetch live balance from Kalshi API before sizing
+            try:
+                live_bal, _ = get_balance_usd(client)
+                if live_bal is not None:
+                    session.update_balance(live_bal)
+                    log.info(f"[BALANCE-REFRESH] Live balance: ${live_bal:.2f}")
+            except Exception as bal_err:
+                log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
+
             # Determine what to trade
             side = None
             post_price = None
@@ -1416,11 +1425,6 @@ def main() -> None:
                     side = 'yes'
                     post_price = max(yes_bid - 2, 80)  # Post 2c below bid, min 80c
                     order_qty = 100  # Request 100, get what fills
-                    log.warning(
-                        f"[TRADE] {st.market} YES confidence={yes_bid}c "
-                        f"post={post_price}c x{order_qty}ct "
-                        f"t={secs_to_close}s | win=${order_qty*(100-post_price)/100:.0f} if YES"
-                    )
 
             # ZONE 2: NO is nearly certain winner (ask <= 20c)
             # NO @ 1-20c wins 91.9% of the time (1,011 markets of data)
@@ -1428,11 +1432,6 @@ def main() -> None:
                 side = 'no'
                 post_price = no_ask  # Take the ask on cheap NO
                 order_qty = 30
-                log.warning(
-                    f"[TRADE] {st.market} NO certainty={100-no_ask}% "
-                    f"price={post_price}c x{order_qty}ct "
-                    f"t={secs_to_close}s | win=${order_qty*(100-post_price)/100:.0f} if NO"
-                )
 
             # No edge — skip
             if side is None:
@@ -1443,17 +1442,25 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Fetch live balance from Kalshi API before placing order
-            try:
-                live_bal, _ = get_balance_usd(client)
-                if live_bal is not None:
-                    session.update_balance(live_bal)
-                    log.info(f"[BALANCE-REFRESH] Live balance: ${live_bal:.2f}")
-            except Exception as bal_err:
-                log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
+            # Cap order quantity to what balance can actually afford
+            max_affordable = int(session.current_balance_usd * 100 / post_price) if post_price > 0 else 0
+            if max_affordable < 1:
+                log.warning(
+                    f"[SKIP] {st.market} — balance ${session.current_balance_usd:.2f} "
+                    f"can't afford 1ct at {post_price}c"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+            order_qty = min(order_qty, max_affordable)
+
+            log.warning(
+                f"[TRADE] {st.market} {side.upper()} "
+                f"post={post_price}c x{order_qty}ct "
+                f"t={secs_to_close}s bal=${session.current_balance_usd:.2f} "
+                f"| win=${order_qty*(100-post_price)/100:.0f} if {side.upper()}"
+            )
 
             try:
-
                 payload = build_order_payload(
                     st.market, side, post_price, order_qty,
                     close_ts=close_ts
