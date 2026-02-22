@@ -1443,6 +1443,15 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
+            # Fetch live balance from Kalshi API before placing order
+            try:
+                live_bal, _ = get_balance_usd(client)
+                if live_bal is not None:
+                    session.update_balance(live_bal)
+                    log.info(f"[BALANCE-REFRESH] Live balance: ${live_bal:.2f}")
+            except Exception as bal_err:
+                log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
+
             try:
 
                 payload = build_order_payload(
@@ -1504,7 +1513,25 @@ def main() -> None:
 
             except Exception as e:
                 err = str(e)
-                if "post only cross" in err:
+                if "insufficient_balance" in err or "insufficient balance" in err.lower():
+                    log.warning(
+                        f"[SKIP] Insufficient balance for {st.market} "
+                        f"— locking market to prevent retry spam"
+                    )
+                    # Fetch real balance so next market is sized correctly
+                    try:
+                        live_bal, _ = get_balance_usd(client)
+                        if live_bal is not None:
+                            session.update_balance(live_bal)
+                            log.warning(f"[BALANCE-REFRESH] Updated after insufficient_balance: ${live_bal:.2f}")
+                    except Exception:
+                        pass
+                    # Lock this market so we stop retrying it
+                    TRADED_TICKERS.add(st.market)
+                    st.traded_this_market = True
+                    time.sleep(POLL_SECONDS)
+                    continue
+                elif "post only cross" in err:
                     log.warning(
                         f"[CROSS] Order would cross spread — "
                         f"market NOT locked, will retry next tick"
