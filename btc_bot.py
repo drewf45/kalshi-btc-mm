@@ -123,10 +123,10 @@ ENABLE_TRADING = env_bool("ENABLE_TRADING", True)
 POST_ONLY = env_bool("POST_ONLY", False)  # Taker by default for cheap contracts
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
-# ── CERTAINTY POSTING STRATEGY CONSTANTS ──
-ENTRY_THRESHOLD = 92       # cents — bid must be >= this to enter
-POST_PRICE = 97            # cents — fixed post price (not 98, not 99)
-ENTRY_WINDOW_SECONDS = 90  # seconds before close to start evaluating
+# ── WATCH-CONFIRM STRATEGY CONSTANTS ──
+WATCH_WINDOW_SECONDS = 300   # Start watching at 5 minutes left
+CONFIRM_THRESHOLD = 92       # Cents — either side must hold this
+CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 # Sigma (volatility) caching
@@ -1050,6 +1050,9 @@ class BotState:
     order_id: Optional[str] = None
     last_evaluated_yes_ask: Optional[int] = None
     last_evaluated_no_ask: Optional[int] = None
+    # Watch-confirm state
+    certainty_counter: int = 0
+    certainty_side: Optional[str] = None
     # Deferred settlement
     pending_settlement_market: Optional[str] = None
     pending_settlement_side: Optional[str] = None
@@ -1084,11 +1087,11 @@ def main() -> None:
     _start_health_server()
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
-    log.warning(f"[RULES] {ASSET} — CERTAINTY POSTING STRATEGY (Feb 2026)")
-    log.warning(f"[RULES] RULE 1: Enter at t <= {ENTRY_WINDOW_SECONDS}s — final confirmation window")
-    log.warning(f"[RULES] RULE 2: Either side bid >= {ENTRY_THRESHOLD}c → post on that side")
-    log.warning(f"[RULES] RULE 3: Fixed post price = {POST_PRICE}c (collect 3c/ct)")
-    log.warning(f"[RULES] RULE 4: Size = 20% of live balance / {POST_PRICE}c")
+    log.warning(f"[RULES] {ASSET} — WATCH-CONFIRM STRATEGY (Feb 2026)")
+    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (5 min)")
+    log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD}c on either side")
+    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks above threshold → buy at ask")
+    log.warning(f"[RULES] RULE 4: Size = 20% of live balance / ask price")
     log.warning(f"[RULES] RULE 5: Single entry per market — no stacking")
     log.warning(f"[RULES] RULE 6: Live balance fetch before every order")
     log.warning("=" * 70)
@@ -1161,6 +1164,8 @@ def main() -> None:
         st.entry_price_cents = None
         st.last_evaluated_yes_ask = None
         st.last_evaluated_no_ask = None
+        st.certainty_counter = 0
+        st.certainty_side = None
 
     ev, mt, mobj = refresh_active_market()
     active_market_obj = mobj or {}
@@ -1269,6 +1274,8 @@ def main() -> None:
                     st.entry_price_cents = None
                     st.last_evaluated_yes_ask = None
                     st.last_evaluated_no_ask = None
+                    st.certainty_counter = 0
+                    st.certainty_side = None
                     reconcile_on_market_change(mt2)
                 else:
                     if isinstance(mobj2, dict) and mobj2:
@@ -1393,14 +1400,63 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ── CERTAINTY-BASED POSTING ──────────────────────────────────
-            # Post on the winning side at 97¢ in the final 90s window.
-            # Collect 2-3¢ per contract. Repeat every market.
-            # Entry: either side bid >= 92¢. Post: 97¢. Size: 20% of balance.
+            # ── WATCH-CONFIRM ENTRY ──────────────────────────────────────
+            # Watch final 5 min. If either side holds bid >= 92¢ for 4
+            # consecutive checks, buy at ask. Size: 20% of live balance.
 
-            if secs_to_close > ENTRY_WINDOW_SECONDS:
+            # Outside watch window — reset and wait
+            if secs_to_close > WATCH_WINDOW_SECONDS:
+                if st.certainty_counter > 0:
+                    log.info(f"[RESET] {st.market} outside watch window — counter cleared")
+                    st.certainty_counter = 0
+                    st.certainty_side = None
                 time.sleep(POLL_SECONDS)
                 continue
+
+            # Check which side is at or above threshold
+            yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
+            no_certain = no_bid is not None and no_bid >= CONFIRM_THRESHOLD
+
+            if yes_certain:
+                if st.certainty_side == 'yes':
+                    st.certainty_counter += 1
+                else:
+                    st.certainty_side = 'yes'
+                    st.certainty_counter = 1
+                log.info(
+                    f"[WATCH] {st.market} yes={yes_bid}¢ "
+                    f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
+                )
+            elif no_certain:
+                if st.certainty_side == 'no':
+                    st.certainty_counter += 1
+                else:
+                    st.certainty_side = 'no'
+                    st.certainty_counter = 1
+                log.info(
+                    f"[WATCH] {st.market} no={no_bid}¢ "
+                    f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
+                )
+            else:
+                # Below threshold — reset
+                if st.certainty_counter > 0:
+                    log.info(f"[RESET] {st.market} dropped below {CONFIRM_THRESHOLD}¢ — counter reset t={secs_to_close:.0f}s")
+                st.certainty_counter = 0
+                st.certainty_side = None
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Not enough consecutive checks yet
+            if st.certainty_counter < CONFIRM_CHECKS:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # ── CONFIRMED: buy at ask ──
+            side = st.certainty_side
+            if side == 'yes':
+                buy_price = yes_ask if yes_ask is not None else 99
+            else:
+                buy_price = no_ask if no_ask is not None else 99
 
             # Fetch live balance from Kalshi API before sizing
             try:
@@ -1411,45 +1467,31 @@ def main() -> None:
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Determine side — whichever side's bid >= 92¢
-            side = None
-            if yes_bid is not None and yes_bid >= ENTRY_THRESHOLD:
-                side = 'yes'
-            elif no_bid is not None and no_bid >= ENTRY_THRESHOLD:
-                side = 'no'
-
-            if side is None:
-                log.info(
-                    f"[SKIP] {st.market} t={secs_to_close}s "
-                    f"yes_bid={yes_bid}c no_bid={no_bid}c — below {ENTRY_THRESHOLD}c threshold"
-                )
-                time.sleep(POLL_SECONDS)
-                continue
-
-            # Fixed post price + bankroll-driven sizing
-            post_price = POST_PRICE
+            # Bankroll-driven sizing: 20% of balance
             allocation = session.current_balance_usd * 0.20
-            order_qty = int(allocation / (post_price / 100))
+            order_qty = int(allocation / (buy_price / 100))
             order_qty = max(1, min(500, order_qty))
 
             # Can we afford at least 1 contract?
-            if session.current_balance_usd < (post_price / 100):
+            if session.current_balance_usd < (buy_price / 100):
                 log.warning(
                     f"[SKIP] {st.market} — balance ${session.current_balance_usd:.2f} "
-                    f"can't afford 1ct at {post_price}c"
+                    f"can't afford 1ct at {buy_price}c"
                 )
                 time.sleep(POLL_SECONDS)
                 continue
 
+            cost = order_qty * buy_price / 100
             log.warning(
-                f"[ENTER] {st.market} {side.upper()}@{post_price}¢ "
-                f"contracts={order_qty} cost=${order_qty * post_price / 100:.2f} "
-                f"t={secs_to_close}s bal=${session.current_balance_usd:.2f}"
+                f"[ENTER] {st.market} {side.upper()}@{buy_price}¢ "
+                f"contracts={order_qty} cost=${cost:.2f} "
+                f"counter={st.certainty_counter} t={secs_to_close:.0f}s "
+                f"bal=${session.current_balance_usd:.2f}"
             )
 
             try:
                 payload = build_order_payload(
-                    st.market, side, post_price, order_qty,
+                    st.market, side, buy_price, order_qty,
                     close_ts=close_ts
                 )
                 oid = place_order(client, payload)
@@ -1464,7 +1506,7 @@ def main() -> None:
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 st.side = side
-                st.entry_price_cents = post_price
+                st.entry_price_cents = buy_price
                 st.qty = order_qty
                 st.order_id = oid
                 log.warning(f"[LOCKED] {st.market} side={side} order={oid}")
@@ -1488,10 +1530,10 @@ def main() -> None:
                 st.qty = filled_count
 
                 if filled_count > 0:
-                    payout = filled_count * (100 - post_price) / 100.0
+                    payout = filled_count * (100 - buy_price) / 100.0
                     log.warning(
                         f"[FILL] {st.market} "
-                        f"filled={filled_count}ct {side.upper()} @ {post_price}¢ "
+                        f"filled={filled_count}ct {side.upper()} @ {buy_price}¢ "
                         f"potential_profit=${payout:.2f} if {side.upper()} wins"
                     )
                 else:
