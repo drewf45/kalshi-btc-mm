@@ -1467,14 +1467,10 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ── CONFIRMED: buy at 4th tick price ──
+            # ── CONFIRMED: retry on each tick until filled ──
             side = st.certainty_side
-            if side == 'yes':
-                buy_price = yes_bid if yes_bid is not None else 99
-            else:
-                buy_price = no_bid if no_bid is not None else 99
 
-            # Fetch live balance from Kalshi API before sizing
+            # Fetch live balance once before the retry loop
             try:
                 live_bal, _ = get_balance_usd(client)
                 if live_bal is not None:
@@ -1483,101 +1479,173 @@ def main() -> None:
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Bankroll-driven sizing: 20% of balance
+            # Initial sizing from current book
+            init_price = (yes_bid if side == 'yes' else no_bid) or 99
             allocation = session.current_balance_usd * 0.20
-            order_qty = int(allocation / (buy_price / 100))
+            order_qty = int(allocation / (init_price / 100))
             order_qty = max(1, min(500, order_qty))
 
-            # Can we afford at least 1 contract?
-            if session.current_balance_usd < (buy_price / 100):
+            if session.current_balance_usd < (init_price / 100):
                 log.warning(
                     f"[SKIP] {st.market} — balance ${session.current_balance_usd:.2f} "
-                    f"can't afford 1ct at {buy_price}c"
+                    f"can't afford 1ct at {init_price}c"
                 )
                 time.sleep(POLL_SECONDS)
                 continue
 
-            cost = order_qty * buy_price / 100
             log.warning(
-                f"[ENTER] {st.market} {side.upper()}@{buy_price}¢ "
-                f"contracts={order_qty} cost=${cost:.2f} "
-                f"counter={st.certainty_counter} t={secs_to_close:.0f}s "
-                f"bal=${session.current_balance_usd:.2f}"
+                f"[RETRY-LOOP] {st.market} ENTERING {side.upper()} "
+                f"qty={order_qty} bal=${session.current_balance_usd:.2f} "
+                f"t={secs_to_close:.0f}s"
             )
 
-            try:
-                payload = build_order_payload(
-                    st.market, side, buy_price, order_qty,
-                    close_ts=close_ts
-                )
-                oid = place_order(client, payload)
+            # Lock market immediately to prevent re-entry
+            TRADED_TICKERS.add(st.market)
+            st.traded_this_market = True
+            st.side = side
+            st.qty = 0
 
-                # Only lock AFTER confirmed order placed
-                if oid is None or oid.startswith("BLOCKED") or oid.startswith("ERROR"):
-                    log.warning(f"[ORDER-FAIL] {oid} — market NOT locked, will retry next tick")
+            resting_oid = None
+            total_filled = 0
+            attempt = 0
+            last_price = None
+            deadline = close_ts - 5
+
+            while time.time() < deadline:
+                attempt += 1
+
+                # Fetch fresh orderbook
+                try:
+                    fresh_ob = client.request("GET", f"/markets/{st.market}/orderbook")
+                    yb, ya, nb, na = parse_best_yes_no(fresh_ob)
+                except Exception as ob_err:
+                    log.warning(f"[RETRY] #{attempt} orderbook fetch failed: {ob_err}")
                     time.sleep(POLL_SECONDS)
                     continue
 
-                # Order confirmed — lock the market
-                TRADED_TICKERS.add(st.market)
-                st.traded_this_market = True
-                st.side = side
-                st.entry_price_cents = buy_price
-                st.qty = order_qty
-                st.order_id = oid
-                log.warning(f"[LOCKED] {st.market} side={side} order={oid}")
+                # Determine buy price: ask + 1¢
+                if side == 'yes':
+                    current_ask = ya
+                else:
+                    current_ask = na
 
-                # Wait for fills until market close
-                filled_count = 0
-                deadline = close_ts - 5
-                while time.time() < deadline:
+                if current_ask is not None:
+                    buy_price = min(current_ask + 1, 99)
+                else:
+                    buy_price = 99
+
+                # Check if resting order already filled
+                if resting_oid:
                     try:
-                        order_info = client.request("GET", f"/portfolio/orders/{oid}")
+                        order_info = client.request("GET", f"/portfolio/orders/{resting_oid}")
                         if order_info:
-                            filled_count = order_info.get("quantity_filled", 0) or 0
-                            remaining = (order_info.get("quantity", 0) or 0) - filled_count
+                            filled_now = order_info.get("quantity_filled", 0) or 0
                             status = order_info.get("status", "")
-                            if status in ("canceled", "filled") or remaining == 0:
+                            if filled_now >= order_qty or status == "filled":
+                                total_filled = filled_now
+                                log.warning(
+                                    f"[FILLED] {st.market} #{attempt} "
+                                    f"filled={total_filled}ct {side.upper()} order={resting_oid}"
+                                )
+                                resting_oid = None
                                 break
+                            if filled_now > 0:
+                                total_filled = filled_now
                     except Exception:
                         pass
-                    time.sleep(5)
 
-                st.qty = filled_count
+                # Cancel resting order if price changed
+                if resting_oid and buy_price != last_price:
+                    try:
+                        cancel_order_status(client, resting_oid)
+                        log.info(f"[CANCEL] {st.market} #{attempt} canceled order {resting_oid} (price moved {last_price}→{buy_price})")
+                    except Exception as ce:
+                        log.warning(f"[CANCEL] #{attempt} failed: {ce}")
+                    # Re-check fills after cancel
+                    try:
+                        order_info = client.request("GET", f"/portfolio/orders/{resting_oid}")
+                        if order_info:
+                            filled_now = order_info.get("quantity_filled", 0) or 0
+                            if filled_now > total_filled:
+                                total_filled = filled_now
+                    except Exception:
+                        pass
+                    resting_oid = None
 
-                if filled_count > 0:
-                    payout = filled_count * (100 - buy_price) / 100.0
+                # If fully filled from partial checks, stop
+                if total_filled >= order_qty:
+                    log.warning(f"[FILLED] {st.market} fully filled {total_filled}ct")
+                    break
+
+                # Place new order if no resting order
+                if not resting_oid:
+                    remaining_qty = order_qty - total_filled
+                    if remaining_qty <= 0:
+                        break
+                    cost = remaining_qty * buy_price / 100
                     log.warning(
-                        f"[FILL] {st.market} "
-                        f"filled={filled_count}ct {side.upper()} @ {buy_price}¢ "
-                        f"potential_profit=${payout:.2f} if {side.upper()} wins"
-                    )
-                else:
-                    log.info(
-                        f"[FILL] {st.market} 0 fills — "
-                        f"order expired or not matched"
-                    )
-
-            except Exception as e:
-                err = str(e)
-                if "insufficient_balance" in err or "insufficient balance" in err.lower():
-                    log.warning(
-                        f"[SKIP] Insufficient balance for {st.market} "
-                        f"— locking market to prevent retry spam"
+                        f"[RETRY] {st.market} #{attempt} {side.upper()}@{buy_price}¢ "
+                        f"qty={remaining_qty} cost=${cost:.2f} t={close_ts - time.time():.0f}s"
                     )
                     try:
-                        live_bal, _ = get_balance_usd(client)
-                        if live_bal is not None:
-                            session.update_balance(live_bal)
-                            log.warning(f"[BALANCE-REFRESH] Updated after insufficient_balance: ${live_bal:.2f}")
-                    except Exception:
-                        pass
-                    TRADED_TICKERS.add(st.market)
-                    st.traded_this_market = True
-                    time.sleep(POLL_SECONDS)
-                    continue
-                else:
-                    log.warning(f"[POSTER] Exception: {e}")
+                        payload = build_order_payload(
+                            st.market, side, buy_price, remaining_qty,
+                            close_ts=close_ts
+                        )
+                        oid = place_order(client, payload)
+
+                        if oid and not oid.startswith("BLOCKED") and not oid.startswith("ERROR"):
+                            resting_oid = oid
+                            last_price = buy_price
+                            st.order_id = oid
+                            st.entry_price_cents = buy_price
+                        else:
+                            log.warning(f"[ORDER-FAIL] #{attempt} {oid}")
+                    except Exception as e:
+                        err = str(e)
+                        if "insufficient_balance" in err or "insufficient balance" in err.lower():
+                            log.warning(f"[RETRY] #{attempt} insufficient balance — stopping retry loop")
+                            try:
+                                live_bal, _ = get_balance_usd(client)
+                                if live_bal is not None:
+                                    session.update_balance(live_bal)
+                            except Exception:
+                                pass
+                            break
+                        else:
+                            log.warning(f"[RETRY] #{attempt} order exception: {e}")
+
+                time.sleep(POLL_SECONDS)
+
+            # Cancel any resting order at end of loop
+            if resting_oid:
+                try:
+                    cancel_order_status(client, resting_oid)
+                    log.info(f"[CANCEL-FINAL] {st.market} canceled resting order {resting_oid}")
+                    # Check final fill count
+                    order_info = client.request("GET", f"/portfolio/orders/{resting_oid}")
+                    if order_info:
+                        filled_now = order_info.get("quantity_filled", 0) or 0
+                        if filled_now > total_filled:
+                            total_filled = filled_now
+                except Exception:
+                    pass
+
+            st.qty = total_filled
+            st.entry_price_cents = last_price
+
+            if total_filled > 0:
+                payout = total_filled * (100 - (last_price or 99)) / 100.0
+                log.warning(
+                    f"[RESULT] {st.market} "
+                    f"filled={total_filled}ct {side.upper()} @ {last_price}¢ "
+                    f"potential_profit=${payout:.2f} attempts={attempt}"
+                )
+            else:
+                log.info(
+                    f"[RESULT] {st.market} 0 fills after {attempt} attempts — "
+                    f"order expired or not matched"
+                )
 
             time.sleep(POLL_SECONDS)
             continue
