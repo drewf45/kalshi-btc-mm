@@ -125,7 +125,7 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
 WATCH_WINDOW_SECONDS = 300   # Start watching at 5 minutes left
-CONFIRM_THRESHOLD = 92       # Cents — either side must hold this
+CONFIRM_THRESHOLD = 96       # Cents — either side must hold this
 CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
