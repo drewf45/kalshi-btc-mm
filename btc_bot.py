@@ -662,7 +662,7 @@ def get_balance_usd(client: KalshiClient) -> Tuple[Optional[float], Optional[flo
         portfolio = float(portfolio_cents) / 100.0
         total = cash + portfolio
         log.info(f"[BALANCE] cash=${cash:.2f} portfolio=${portfolio:.2f} total=${total:.2f}")
-        return total, portfolio
+        return cash, portfolio
     return None, None
 
 def cancel_all_strays_for_market(client: KalshiClient, market_ticker: str) -> None:
@@ -1475,14 +1475,14 @@ def main() -> None:
                 live_bal, _ = get_balance_usd(client)
                 if live_bal is not None:
                     session.update_balance(live_bal)
-                    log.info(f"[BALANCE-REFRESH] Live balance (cash+positions): ${live_bal:.2f}")
+                    log.info(f"[BALANCE-REFRESH] cash=${live_bal:.2f}")
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Initial sizing from current book
+            # Sizing: cash / 4 (one quarter per bot)
             init_price = (yes_bid if side == 'yes' else no_bid) or 99
-            allocation = session.current_balance_usd * 0.20
-            order_qty = int(allocation / (init_price / 100))
+            position_size = session.current_balance_usd / 4
+            order_qty = int(position_size / (init_price / 100))
             order_qty = max(1, min(500, order_qty))
 
             if session.current_balance_usd < (init_price / 100):
