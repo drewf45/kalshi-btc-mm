@@ -1587,28 +1587,9 @@ def main() -> None:
                     continue
                 elif "post only cross" in err:
                     log.warning(
-                        f"[CROSS] Order would cross spread at {buy_price}¢ — "
-                        f"retrying once as taker at 99¢"
+                        f"[SKIP] Order crossed spread at {buy_price}¢ — "
+                        f"skipping market"
                     )
-                    # One final attempt at 99¢ as a taker (no post_only)
-                    try:
-                        retry_payload = build_order_payload(
-                            st.market, side, 99, order_qty,
-                            close_ts=close_ts
-                        )
-                        retry_payload["post_only"] = False
-                        retry_oid = place_order(client, retry_payload)
-                        if retry_oid and not retry_oid.startswith("BLOCKED") and not retry_oid.startswith("ERROR"):
-                            log.warning(f"[CROSS-RETRY] 99¢ taker filled — oid={retry_oid}")
-                            st.order_id = retry_oid
-                            st.side = side
-                            st.entry_price_cents = 99
-                            st.qty = order_qty
-                        else:
-                            log.warning(f"[CROSS-RETRY] 99¢ taker failed: {retry_oid}")
-                    except Exception as retry_err:
-                        log.warning(f"[CROSS-RETRY] 99¢ taker exception: {retry_err}")
-                    # Lock regardless — do NOT retry again
                     TRADED_TICKERS.add(st.market)
                     st.traded_this_market = True
                     time.sleep(POLL_SECONDS)

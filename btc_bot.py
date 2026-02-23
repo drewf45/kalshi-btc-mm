@@ -125,9 +125,16 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
 WATCH_WINDOW_SECONDS = 300   # Start watching at 5 minutes left
-CONFIRM_THRESHOLD = 93       # Cents — either side must hold this
+CONFIRM_THRESHOLD_EARLY = 96 # >60s left — need strong signal
+CONFIRM_THRESHOLD_LATE = 90  # ≤60s left — market is committed
 CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
+
+def get_threshold(secs_to_close: float) -> int:
+    """Time-weighted threshold: strict early, relaxed in final 60s."""
+    if secs_to_close > 60:
+        return CONFIRM_THRESHOLD_EARLY
+    return CONFIRM_THRESHOLD_LATE
 
 # Sigma (volatility) caching
 USE_DYNAMIC_SIGMA = env_bool("USE_DYNAMIC_SIGMA", True)
@@ -1091,7 +1098,7 @@ def main() -> None:
     log.warning("=" * 70)
     log.warning(f"[RULES] {ASSET} — WATCH-CONFIRM STRATEGY (Feb 2026)")
     log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (5 min)")
-    log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD}c on either side")
+    log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD_EARLY}c (>60s) / {CONFIRM_THRESHOLD_LATE}c (≤60s)")
     log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks above threshold → buy at ask")
     log.warning(f"[RULES] RULE 4: Size = 20% of live balance / ask price")
     log.warning(f"[RULES] RULE 5: Single entry per market — no stacking")
@@ -1429,9 +1436,12 @@ def main() -> None:
                 f"yes={yes_bid}¢ no={no_bid}¢"
             )
 
+            # Time-weighted threshold
+            threshold = get_threshold(secs_to_close)
+
             # Check which side is at or above threshold
-            yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
-            no_certain = no_bid is not None and no_bid >= CONFIRM_THRESHOLD
+            yes_certain = yes_bid is not None and yes_bid >= threshold
+            no_certain = no_bid is not None and no_bid >= threshold
 
             if yes_certain:
                 if st.certainty_side == 'yes':
@@ -1440,7 +1450,7 @@ def main() -> None:
                     st.certainty_side = 'yes'
                     st.certainty_counter = 1
                 log.info(
-                    f"[WATCH] {st.market} yes={yes_bid}¢ "
+                    f"[WATCH] {st.market} yes={yes_bid}¢ thr={threshold}¢ "
                     f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
                 )
             elif no_certain:
@@ -1450,13 +1460,13 @@ def main() -> None:
                     st.certainty_side = 'no'
                     st.certainty_counter = 1
                 log.info(
-                    f"[WATCH] {st.market} no={no_bid}¢ "
+                    f"[WATCH] {st.market} no={no_bid}¢ thr={threshold}¢ "
                     f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
                 )
             else:
                 # Below threshold — reset
                 if st.certainty_counter > 0:
-                    log.info(f"[RESET] {st.market} dropped below {CONFIRM_THRESHOLD}¢ — counter reset t={secs_to_close:.0f}s")
+                    log.info(f"[RESET] {st.market} dropped below {threshold}¢ — counter reset t={secs_to_close:.0f}s")
                 st.certainty_counter = 0
                 st.certainty_side = None
                 time.sleep(POLL_SECONDS)
@@ -1578,28 +1588,9 @@ def main() -> None:
                     continue
                 elif "post only cross" in err:
                     log.warning(
-                        f"[CROSS] Order would cross spread at {buy_price}¢ — "
-                        f"retrying once as taker at 99¢"
+                        f"[SKIP] Order crossed spread at {buy_price}¢ — "
+                        f"skipping market"
                     )
-                    # One final attempt at 99¢ as a taker (no post_only)
-                    try:
-                        retry_payload = build_order_payload(
-                            st.market, side, 99, order_qty,
-                            close_ts=close_ts
-                        )
-                        retry_payload["post_only"] = False
-                        retry_oid = place_order(client, retry_payload)
-                        if retry_oid and not retry_oid.startswith("BLOCKED") and not retry_oid.startswith("ERROR"):
-                            log.warning(f"[CROSS-RETRY] 99¢ taker filled — oid={retry_oid}")
-                            st.order_id = retry_oid
-                            st.side = side
-                            st.entry_price_cents = 99
-                            st.qty = order_qty
-                        else:
-                            log.warning(f"[CROSS-RETRY] 99¢ taker failed: {retry_oid}")
-                    except Exception as retry_err:
-                        log.warning(f"[CROSS-RETRY] 99¢ taker exception: {retry_err}")
-                    # Lock regardless — do NOT retry again
                     TRADED_TICKERS.add(st.market)
                     st.traded_this_market = True
                     time.sleep(POLL_SECONDS)
