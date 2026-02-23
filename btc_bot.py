@@ -124,17 +124,11 @@ POST_ONLY = env_bool("POST_ONLY", False)  # Taker by default for cheap contracts
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
-WATCH_WINDOW_SECONDS = 300   # Start watching at 5 minutes left
-CONFIRM_THRESHOLD_EARLY = 96 # >60s left — need strong signal
-CONFIRM_THRESHOLD_LATE = 90  # ≤60s left — market is committed
+WATCH_WINDOW_SECONDS = 180   # Start watching at 3 minutes left
+CONFIRM_THRESHOLD = 93       # Cents — either side must hold this
 CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
+MAX_BUY_PRICE = 98           # Hard cap — never buy above 98¢
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
-
-def get_threshold(secs_to_close: float) -> int:
-    """Time-weighted threshold: strict early, relaxed in final 60s."""
-    if secs_to_close > 60:
-        return CONFIRM_THRESHOLD_EARLY
-    return CONFIRM_THRESHOLD_LATE
 
 # Sigma (volatility) caching
 USE_DYNAMIC_SIGMA = env_bool("USE_DYNAMIC_SIGMA", True)
@@ -1097,10 +1091,10 @@ def main() -> None:
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
     log.warning(f"[RULES] {ASSET} — WATCH-CONFIRM STRATEGY (Feb 2026)")
-    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (5 min)")
-    log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD_EARLY}c (>60s) / {CONFIRM_THRESHOLD_LATE}c (≤60s)")
-    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks above threshold → buy at ask")
-    log.warning(f"[RULES] RULE 4: Size = 20% of live balance / ask price")
+    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (3 min)")
+    log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD}c on either side")
+    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks → buy at ask+1c (cap {MAX_BUY_PRICE}c)")
+    log.warning(f"[RULES] RULE 4: Size = 20% of live balance / buy price")
     log.warning(f"[RULES] RULE 5: Single entry per market — no stacking")
     log.warning(f"[RULES] RULE 6: Live balance fetch before every order")
     log.warning("=" * 70)
@@ -1428,7 +1422,7 @@ def main() -> None:
             # First tick inside watch window — log activation
             if not st.watch_active:
                 st.watch_active = True
-                log.warning(f"[WATCH-START] {st.market} entering 5-min window at t={secs_to_close:.0f}s")
+                log.warning(f"[WATCH-START] {st.market} entering 3-min window at t={secs_to_close:.0f}s")
 
             # Tick heartbeat inside watch window
             log.info(
@@ -1436,12 +1430,9 @@ def main() -> None:
                 f"yes={yes_bid}¢ no={no_bid}¢"
             )
 
-            # Time-weighted threshold
-            threshold = get_threshold(secs_to_close)
-
             # Check which side is at or above threshold
-            yes_certain = yes_bid is not None and yes_bid >= threshold
-            no_certain = no_bid is not None and no_bid >= threshold
+            yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
+            no_certain = no_bid is not None and no_bid >= CONFIRM_THRESHOLD
 
             if yes_certain:
                 if st.certainty_side == 'yes':
@@ -1450,7 +1441,7 @@ def main() -> None:
                     st.certainty_side = 'yes'
                     st.certainty_counter = 1
                 log.info(
-                    f"[WATCH] {st.market} yes={yes_bid}¢ thr={threshold}¢ "
+                    f"[WATCH] {st.market} yes={yes_bid}¢ "
                     f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
                 )
             elif no_certain:
@@ -1460,13 +1451,13 @@ def main() -> None:
                     st.certainty_side = 'no'
                     st.certainty_counter = 1
                 log.info(
-                    f"[WATCH] {st.market} no={no_bid}¢ thr={threshold}¢ "
+                    f"[WATCH] {st.market} no={no_bid}¢ "
                     f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
                 )
             else:
                 # Below threshold — reset
                 if st.certainty_counter > 0:
-                    log.info(f"[RESET] {st.market} dropped below {threshold}¢ — counter reset t={secs_to_close:.0f}s")
+                    log.info(f"[RESET] {st.market} dropped below {CONFIRM_THRESHOLD}¢ — counter reset t={secs_to_close:.0f}s")
                 st.certainty_counter = 0
                 st.certainty_side = None
                 time.sleep(POLL_SECONDS)
@@ -1477,12 +1468,13 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ── CONFIRMED: buy at ask ──
+            # ── CONFIRMED: buy at ask + 1¢ (cap 98¢) ──
             side = st.certainty_side
             if side == 'yes':
-                buy_price = yes_ask if yes_ask is not None else 99
+                raw_ask = yes_ask if yes_ask is not None else 97
             else:
-                buy_price = no_ask if no_ask is not None else 99
+                raw_ask = no_ask if no_ask is not None else 97
+            buy_price = min(raw_ask + 1, MAX_BUY_PRICE)
 
             # Fetch live balance from Kalshi API before sizing
             try:
