@@ -127,7 +127,6 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 WATCH_WINDOW_SECONDS = 180   # Start watching at 3 minutes left
 CONFIRM_THRESHOLD = 93       # Cents — either side must hold this
 CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
-MAX_BUY_PRICE = 98           # Hard cap — never buy above 98¢
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 # Sigma (volatility) caching
@@ -1093,7 +1092,7 @@ def main() -> None:
     log.warning(f"[RULES] {ASSET} — WATCH-CONFIRM STRATEGY (Feb 2026)")
     log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (3 min)")
     log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD}c on either side")
-    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks → buy at ask+1c (cap {MAX_BUY_PRICE}c)")
+    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks → buy at 4th tick price")
     log.warning(f"[RULES] RULE 4: Size = 20% of live balance / buy price")
     log.warning(f"[RULES] RULE 5: Single entry per market — no stacking")
     log.warning(f"[RULES] RULE 6: Live balance fetch before every order")
@@ -1468,13 +1467,12 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ── CONFIRMED: buy at ask + 1¢ (cap 98¢) ──
+            # ── CONFIRMED: buy at 4th tick price ──
             side = st.certainty_side
             if side == 'yes':
-                raw_ask = yes_ask if yes_ask is not None else 97
+                buy_price = yes_bid if yes_bid is not None else 99
             else:
-                raw_ask = no_ask if no_ask is not None else 97
-            buy_price = min(raw_ask + 1, MAX_BUY_PRICE)
+                buy_price = no_bid if no_bid is not None else 99
 
             # Fetch live balance from Kalshi API before sizing
             try:
