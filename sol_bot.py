@@ -1478,9 +1478,9 @@ def main() -> None:
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Sizing: cash / 4 (one quarter per bot)
+            # Sizing: cash / 8 (half size — 88% WR)
             init_price = (yes_bid if side == 'yes' else no_bid) or 99
-            position_size = session.current_balance_usd / 4
+            position_size = session.current_balance_usd / 8
             order_qty = int(position_size / (init_price / 100))
             order_qty = max(1, min(500, order_qty))
 
