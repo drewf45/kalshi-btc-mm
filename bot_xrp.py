@@ -691,7 +691,7 @@ def build_order_payload(market_ticker: str, side: str, price_cents: int,
         "type": "limit",
         "count": max(1, int(count)),
         "client_order_id": f"{BOT_ID}-{uuid.uuid4().hex[:12]}",
-        "post_only": True,
+        "post_only": False,
         "time_in_force": "good_till_canceled",
     }
     if side == "yes":
@@ -1573,15 +1573,6 @@ def main() -> None:
                             log.warning(f"[BALANCE-REFRESH] Updated after insufficient_balance: ${live_bal:.2f}")
                     except Exception:
                         pass
-                    TRADED_TICKERS.add(st.market)
-                    st.traded_this_market = True
-                    time.sleep(POLL_SECONDS)
-                    continue
-                elif "post only cross" in err:
-                    log.warning(
-                        f"[SKIP] Order crossed spread at {buy_price}¢ — "
-                        f"skipping market"
-                    )
                     TRADED_TICKERS.add(st.market)
                     st.traded_this_market = True
                     time.sleep(POLL_SECONDS)
