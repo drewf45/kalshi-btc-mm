@@ -1428,58 +1428,76 @@ def main() -> None:
                 f"yes={yes_bid}¢ no={no_bid}¢"
             )
 
-            # Instant entry at 99¢ — no confirmation ticks needed
-            instant_side = None
-            if yes_bid is not None and yes_bid >= 99:
-                instant_side = 'yes'
-            elif no_bid is not None and no_bid >= 99:
-                instant_side = 'no'
-            if instant_side is not None:
+            # SAFETY NET — 15 seconds remaining, no position taken
+            if secs_to_close <= 15:
+                prices = []
+                if yes_bid is not None:
+                    prices.append(('yes', yes_bid))
+                if no_bid is not None:
+                    prices.append(('no', no_bid))
+                if not prices:
+                    time.sleep(POLL_SECONDS)
+                    continue
+                best_side, best_price = max(prices, key=lambda x: x[1])
                 log.warning(
-                    f"[INSTANT] {st.market} {instant_side.upper()} locked at "
-                    f"{'yes=' + str(yes_bid) if instant_side == 'yes' else 'no=' + str(no_bid)}¢ "
-                    f"— entering immediately t={secs_to_close:.0f}s"
+                    f"[SAFETY-NET] {st.market} t={secs_to_close:.0f}s no position yet "
+                    f"— firing {best_side.upper()}@{best_price}¢"
                 )
-                st.certainty_side = instant_side
-                st.certainty_counter = CONFIRM_CHECKS  # skip straight to entry
-
-            # Check which side is at or above threshold
-            yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
-            no_certain = no_bid is not None and no_bid >= CONFIRM_THRESHOLD
-
-            if yes_certain:
-                if st.certainty_side == 'yes':
-                    st.certainty_counter += 1
-                else:
-                    st.certainty_side = 'yes'
-                    st.certainty_counter = 1
-                log.info(
-                    f"[WATCH] {st.market} yes={yes_bid}¢ "
-                    f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
-                )
-            elif no_certain:
-                if st.certainty_side == 'no':
-                    st.certainty_counter += 1
-                else:
-                    st.certainty_side = 'no'
-                    st.certainty_counter = 1
-                log.info(
-                    f"[WATCH] {st.market} no={no_bid}¢ "
-                    f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
-                )
+                st.certainty_side = best_side
+                st.certainty_counter = CONFIRM_CHECKS
             else:
-                # Below threshold — reset
-                if st.certainty_counter > 0:
-                    log.info(f"[RESET] {st.market} dropped below {CONFIRM_THRESHOLD}¢ — counter reset t={secs_to_close:.0f}s")
-                st.certainty_counter = 0
-                st.certainty_side = None
-                time.sleep(POLL_SECONDS)
-                continue
+                # Instant entry at 99¢ — no confirmation ticks needed
+                instant_side = None
+                if yes_bid is not None and yes_bid >= 99:
+                    instant_side = 'yes'
+                elif no_bid is not None and no_bid >= 99:
+                    instant_side = 'no'
+                if instant_side is not None:
+                    log.warning(
+                        f"[INSTANT] {st.market} {instant_side.upper()} locked at "
+                        f"{'yes=' + str(yes_bid) if instant_side == 'yes' else 'no=' + str(no_bid)}¢ "
+                        f"— entering immediately t={secs_to_close:.0f}s"
+                    )
+                    st.certainty_side = instant_side
+                    st.certainty_counter = CONFIRM_CHECKS  # skip straight to entry
 
-            # Not enough consecutive checks yet
-            if st.certainty_counter < CONFIRM_CHECKS:
-                time.sleep(POLL_SECONDS)
-                continue
+                # Check which side is at or above threshold
+                yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
+                no_certain = no_bid is not None and no_bid >= CONFIRM_THRESHOLD
+
+                if yes_certain:
+                    if st.certainty_side == 'yes':
+                        st.certainty_counter += 1
+                    else:
+                        st.certainty_side = 'yes'
+                        st.certainty_counter = 1
+                    log.info(
+                        f"[WATCH] {st.market} yes={yes_bid}¢ "
+                        f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
+                    )
+                elif no_certain:
+                    if st.certainty_side == 'no':
+                        st.certainty_counter += 1
+                    else:
+                        st.certainty_side = 'no'
+                        st.certainty_counter = 1
+                    log.info(
+                        f"[WATCH] {st.market} no={no_bid}¢ "
+                        f"counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s"
+                    )
+                else:
+                    # Below threshold — reset
+                    if st.certainty_counter > 0:
+                        log.info(f"[RESET] {st.market} dropped below {CONFIRM_THRESHOLD}¢ — counter reset t={secs_to_close:.0f}s")
+                    st.certainty_counter = 0
+                    st.certainty_side = None
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                # Not enough consecutive checks yet
+                if st.certainty_counter < CONFIRM_CHECKS:
+                    time.sleep(POLL_SECONDS)
+                    continue
 
             # ── CONFIRMED: retry on each tick until filled, pivot on flip ──
             side = st.certainty_side
