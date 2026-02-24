@@ -124,9 +124,9 @@ POST_ONLY = env_bool("POST_ONLY", False)  # Taker by default for cheap contracts
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
-WATCH_WINDOW_SECONDS = 180   # Start watching at 3 minutes left
-CONFIRM_THRESHOLD = 93       # Cents — either side must hold this
-CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
+WATCH_WINDOW_SECONDS = 90    # Start watching at 90 seconds left
+CONFIRM_THRESHOLD = 96       # Cents — either side must hold this
+CONFIRM_CHECKS = 5           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 # Sigma (volatility) caching
@@ -1089,12 +1089,12 @@ def main() -> None:
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
     log.warning(f"[RULES] {ASSET} — WATCH-CONFIRM STRATEGY (Feb 2026)")
-    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (3 min)")
+    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (90s)")
     log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD}c on either side")
-    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks → buy at 4th tick price")
-    log.warning(f"[RULES] RULE 4: Size = 20% of live balance / buy price")
-    log.warning(f"[RULES] RULE 5: Single entry per market — no stacking")
-    log.warning(f"[RULES] RULE 6: Live balance fetch before every order")
+    log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks → buy at ask+1")
+    log.warning(f"[RULES] RULE 4: Instant entry at 99c — no ticks needed")
+    log.warning(f"[RULES] RULE 5: Size = cash/4 (halved at 5am EST)")
+    log.warning(f"[RULES] RULE 6: Single entry per market — no stacking")
     log.warning("=" * 70)
 
     # Watchdog
@@ -1420,13 +1420,28 @@ def main() -> None:
             # First tick inside watch window — log activation
             if not st.watch_active:
                 st.watch_active = True
-                log.warning(f"[WATCH-START] {st.market} entering 3-min window at t={secs_to_close:.0f}s")
+                log.warning(f"[WATCH-START] {st.market} entering 90s window at t={secs_to_close:.0f}s")
 
             # Tick heartbeat inside watch window
             log.info(
                 f"[TICK] {st.market} t={secs_to_close:.0f}s "
                 f"yes={yes_bid}¢ no={no_bid}¢"
             )
+
+            # Instant entry at 99¢ — no confirmation ticks needed
+            instant_side = None
+            if yes_bid is not None and yes_bid >= 99:
+                instant_side = 'yes'
+            elif no_bid is not None and no_bid >= 99:
+                instant_side = 'no'
+            if instant_side is not None:
+                log.warning(
+                    f"[INSTANT] {st.market} {instant_side.upper()} locked at "
+                    f"{'yes=' + str(yes_bid) if instant_side == 'yes' else 'no=' + str(no_bid)}¢ "
+                    f"— entering immediately t={secs_to_close:.0f}s"
+                )
+                st.certainty_side = instant_side
+                st.certainty_counter = CONFIRM_CHECKS  # skip straight to entry
 
             # Check which side is at or above threshold
             yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
@@ -1478,11 +1493,11 @@ def main() -> None:
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Sizing: cash/8 (half size — 88% WR), halved again during 5am EST
+            # Sizing: cash/4, halved during 5am EST (London open)
             hour_est = (datetime.utcnow().hour - 5) % 24
             is_london_open = (hour_est == 5)
             init_price = (yes_bid if side == 'yes' else no_bid) or 99
-            position_size = session.current_balance_usd / 8
+            position_size = session.current_balance_usd / 4
             if is_london_open:
                 position_size = position_size / 2
                 log.info(f"[5AM] London open hour — half sizing: ${position_size:.2f}")
