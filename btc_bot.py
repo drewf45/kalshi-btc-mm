@@ -1467,7 +1467,7 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ── CONFIRMED: retry on each tick until filled ──
+            # ── CONFIRMED: retry on each tick until filled, pivot on flip ──
             side = st.certainty_side
 
             # Fetch live balance once before the retry loop
@@ -1479,9 +1479,14 @@ def main() -> None:
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
 
-            # Sizing: cash / 4 (one quarter per bot)
+            # Sizing: cash/4, halved during 5am EST (London open)
+            hour_est = (datetime.utcnow().hour - 5) % 24
+            is_london_open = (hour_est == 5)
             init_price = (yes_bid if side == 'yes' else no_bid) or 99
             position_size = session.current_balance_usd / 4
+            if is_london_open:
+                position_size = position_size / 2
+                log.info(f"[5AM] London open hour — half sizing: ${position_size:.2f}")
             order_qty = int(position_size / (init_price / 100))
             order_qty = max(1, min(500, order_qty))
 
@@ -1509,6 +1514,7 @@ def main() -> None:
             total_filled = 0
             attempt = 0
             last_price = None
+            current_side = side
             deadline = close_ts - 5
 
             while time.time() < deadline:
@@ -1523,8 +1529,43 @@ def main() -> None:
                     time.sleep(POLL_SECONDS)
                     continue
 
-                # Determine buy price: ask + 1¢
-                if side == 'yes':
+                # Read both sides' bids
+                yes_price = yb
+                no_price = nb
+
+                # Check for side flip: other side >= threshold AND current side < threshold
+                other_side = 'no' if current_side == 'yes' else 'yes'
+                current_bid = yes_price if current_side == 'yes' else no_price
+                other_bid = no_price if current_side == 'yes' else yes_price
+
+                if (other_bid is not None and other_bid >= CONFIRM_THRESHOLD and
+                        (current_bid is None or current_bid < CONFIRM_THRESHOLD)):
+                    # Market flipped — cancel resting order and pivot
+                    if resting_oid:
+                        try:
+                            cancel_order_status(client, resting_oid)
+                            # Capture any partial fills before canceling
+                            order_info = client.request("GET", f"/portfolio/orders/{resting_oid}")
+                            if order_info:
+                                filled_now = order_info.get("quantity_filled", 0) or 0
+                                if filled_now > total_filled:
+                                    total_filled = filled_now
+                        except Exception:
+                            pass
+                        resting_oid = None
+
+                    log.warning(
+                        f"[PIVOT] {st.market} #{attempt} flipped {current_side.upper()}→{other_side.upper()} "
+                        f"cur_bid={current_bid} other_bid={other_bid} filled_so_far={total_filled}"
+                    )
+                    current_side = other_side
+                    st.side = current_side
+                    last_price = None
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                # Determine buy price on current side: ask + 1¢
+                if current_side == 'yes':
                     current_ask = ya
                 else:
                     current_ask = na
@@ -1545,7 +1586,7 @@ def main() -> None:
                                 total_filled = filled_now
                                 log.warning(
                                     f"[FILLED] {st.market} #{attempt} "
-                                    f"filled={total_filled}ct {side.upper()} order={resting_oid}"
+                                    f"filled={total_filled}ct {current_side.upper()} order={resting_oid}"
                                 )
                                 resting_oid = None
                                 break
@@ -1584,12 +1625,12 @@ def main() -> None:
                         break
                     cost = remaining_qty * buy_price / 100
                     log.warning(
-                        f"[RETRY] {st.market} #{attempt} {side.upper()}@{buy_price}¢ "
+                        f"[RETRY] {st.market} #{attempt} {current_side.upper()}@{buy_price}¢ "
                         f"qty={remaining_qty} cost=${cost:.2f} t={close_ts - time.time():.0f}s"
                     )
                     try:
                         payload = build_order_payload(
-                            st.market, side, buy_price, remaining_qty,
+                            st.market, current_side, buy_price, remaining_qty,
                             close_ts=close_ts
                         )
                         oid = place_order(client, payload)
@@ -1632,13 +1673,14 @@ def main() -> None:
                     pass
 
             st.qty = total_filled
+            st.side = current_side
             st.entry_price_cents = last_price
 
             if total_filled > 0:
                 payout = total_filled * (100 - (last_price or 99)) / 100.0
                 log.warning(
                     f"[RESULT] {st.market} "
-                    f"filled={total_filled}ct {side.upper()} @ {last_price}¢ "
+                    f"filled={total_filled}ct {current_side.upper()} @ {last_price}¢ "
                     f"potential_profit=${payout:.2f} attempts={attempt}"
                 )
             else:
