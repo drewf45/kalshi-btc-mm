@@ -41,7 +41,7 @@ EMAIL_PASS         = os.getenv('EMAIL_PASS', '')        # Gmail App Password (16
 EMAIL_ENABLED      = os.getenv('EMAIL_ENABLED', 'true').lower() == 'true'
 
 SEND_HOUR_INTERVAL = 3600       # seconds between hourly emails
-SCRAPE_FLOOR       = 200.00     # withdraw 100% of balance above this
+SCRAPE_FLOOR       = 100.00     # withdraw 100% of balance above this
 SCRAPE_HOURS_EST   = {9, 21}    # 9am and 9pm EST  (21 = 9pm in 24hr)
 ALERT_HOURLY_LOSS  = -30.00     # send immediate alert if combined hour P&L <= this
 
