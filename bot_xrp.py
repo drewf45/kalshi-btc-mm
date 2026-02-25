@@ -1118,11 +1118,11 @@ def main() -> None:
     session = SessionState()
 
     try:
-        av, _ = get_balance_usd(client)
+        av, pv = get_balance_usd(client)
         if av is not None:
             session.starting_balance_usd = av
             session.current_balance_usd = av
-            email_reporter.update_balance(av)
+            email_reporter.update_balance(av + (pv or 0))
             log.warning(f"[SESSION] Starting balance: ${av:.2f}")
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
@@ -1226,10 +1226,10 @@ def main() -> None:
         # Balance check
         if session.needs_balance_check():
             try:
-                bal, _ = get_balance_usd(client)
+                bal, pv = get_balance_usd(client)
                 if bal is not None:
                     session.update_balance(bal)
-                    email_reporter.update_balance(bal)
+                    email_reporter.update_balance(bal + (pv or 0))
                 session.clear_balance_check()
             except Exception:
                 pass
@@ -1514,10 +1514,10 @@ def main() -> None:
 
             # Fetch live balance once before the retry loop
             try:
-                live_bal, _ = get_balance_usd(client)
+                live_bal, live_pv = get_balance_usd(client)
                 if live_bal is not None:
                     session.update_balance(live_bal)
-                    email_reporter.update_balance(live_bal)
+                    email_reporter.update_balance(live_bal + (live_pv or 0))
                     log.info(f"[BALANCE-REFRESH] cash=${live_bal:.2f}")
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
@@ -1690,10 +1690,10 @@ def main() -> None:
                         if "insufficient_balance" in err or "insufficient balance" in err.lower():
                             log.warning(f"[RETRY] #{attempt} insufficient balance — stopping retry loop")
                             try:
-                                live_bal, _ = get_balance_usd(client)
+                                live_bal, live_pv = get_balance_usd(client)
                                 if live_bal is not None:
                                     session.update_balance(live_bal)
-                                    email_reporter.update_balance(live_bal)
+                                    email_reporter.update_balance(live_bal + (live_pv or 0))
                             except Exception:
                                 pass
                             break
