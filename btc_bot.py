@@ -124,7 +124,7 @@ POST_ONLY = env_bool("POST_ONLY", False)  # Taker by default for cheap contracts
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
-WATCH_WINDOW_SECONDS = 180   # Start watching at 3 minutes left
+WATCH_WINDOW_SECONDS = 90    # Start watching at 90 seconds left
 CONFIRM_THRESHOLD = 93       # Cents — either side must hold this
 CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
@@ -1090,7 +1090,7 @@ def main() -> None:
     log.warning(f"[ENV] Detected KALSHI_* keys: {env_keys_with_prefix('KALSHI_')}")
     log.warning("=" * 70)
     log.warning(f"[RULES] {ASSET} — WATCH-CONFIRM STRATEGY (Feb 2026)")
-    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (3 min)")
+    log.warning(f"[RULES] RULE 1: Watch window = last {WATCH_WINDOW_SECONDS}s (90s)")
     log.warning(f"[RULES] RULE 2: Confirm threshold = {CONFIRM_THRESHOLD}c on either side")
     log.warning(f"[RULES] RULE 3: {CONFIRM_CHECKS} consecutive checks → buy at 4th tick price")
     log.warning(f"[RULES] RULE 4: Size = 20% of live balance / buy price")
@@ -1421,7 +1421,7 @@ def main() -> None:
             # First tick inside watch window — log activation
             if not st.watch_active:
                 st.watch_active = True
-                log.warning(f"[WATCH-START] {st.market} entering 3-min window at t={secs_to_close:.0f}s")
+                log.warning(f"[WATCH-START] {st.market} entering 90s window at t={secs_to_close:.0f}s")
 
             # Tick heartbeat inside watch window
             log.info(
