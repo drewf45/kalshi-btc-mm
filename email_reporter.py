@@ -25,8 +25,11 @@ import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 import logging
+
+EST = ZoneInfo('America/New_York')
 
 log = logging.getLogger('email_reporter')
 
@@ -71,7 +74,7 @@ def register_trade(asset: str, side: str, price_cents: int,
         h['trades'].append({
             'side': side, 'price': price_cents,
             'qty': qty, 'pnl': pnl_cents, 'won': won,
-            'ts': datetime.now(timezone.utc).strftime('%H:%M')
+            'ts': datetime.now(EST).strftime('%H:%M')
         })
 
 
@@ -93,7 +96,7 @@ def start():
 # ── EMAIL BUILDERS ─────────────────────────────────────────────────────────────
 
 def _build_hourly_email() -> str:
-    now_str   = datetime.now().strftime('%b %d, %Y  %I:%M %p')
+    now_str   = datetime.now(EST).strftime('%b %d, %Y  %I:%M %p %Z')
     daily_pnl = _portfolio_balance - _start_of_day_balance
     pnl_sign  = '+' if daily_pnl >= 0 else ''
     status_color = '#2ecc71' if daily_pnl >= 0 else '#e74c3c'
@@ -171,7 +174,7 @@ def _build_hourly_email() -> str:
 
 def _build_scrape_email(balance: float) -> tuple:
     withdraw = max(0.0, balance - SCRAPE_FLOOR)
-    ts       = datetime.now().strftime('%I:%M %p')
+    ts       = datetime.now(EST).strftime('%I:%M %p %Z')
     color    = '#2ecc71' if withdraw > 0 else '#e74c3c'
     subj     = f'💰 Kalshi Scrape Time {ts} | Withdraw ${withdraw:.2f}'
     html     = f"""
@@ -261,9 +264,9 @@ def _reporter_loop():
                 bal      = _portfolio_balance
                 hour_pnl = sum(v['pnl_cents'] for v in _hourly.values()) / 100
 
-            ts           = datetime.now().strftime('%I:%M %p')
-            current_hour = datetime.now().hour   # NOTE: make sure Render timezone = EST
-                                                 # or set TZ=America/New_York on Render
+            now_est      = datetime.now(EST)
+            ts           = now_est.strftime('%I:%M %p %Z')
+            current_hour = now_est.hour
 
             # 1. Standard hourly digest
             _send_email(f'Kalshi Bot Report {ts} | Balance: ${bal:.2f}', body)
