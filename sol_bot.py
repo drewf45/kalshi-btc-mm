@@ -45,6 +45,7 @@ from config import (
     POSTER_OBSERVE_START_SECONDS,
 )
 from scoring import evaluate_entry
+import email_reporter
 
 # ======================== BOOT BANNER ========================
 print(f"BOOT: sol_bot.py loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)
@@ -54,6 +55,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-sol")
 log.warning("BOOT: logger initialized")
+email_reporter.start()
 
 print(f"DEBUG: KALSHI_API_KEY_ID exists: {bool(os.getenv('KALSHI_API_KEY_ID'))}", flush=True)
 print(f"DEBUG: KALSHI_PRIVATE_KEY_PEM_BASE64 exists: {bool(os.getenv('KALSHI_PRIVATE_KEY_PEM_BASE64'))}", flush=True)
@@ -1120,6 +1122,7 @@ def main() -> None:
         if av is not None:
             session.starting_balance_usd = av
             session.current_balance_usd = av
+            email_reporter.update_balance(av)
             log.warning(f"[SESSION] Starting balance: ${av:.2f}")
     except Exception as e:
         log.warning(f"[SESSION] Could not fetch starting balance: {e}")
@@ -1209,6 +1212,9 @@ def main() -> None:
                         pnl = (100 - e) * q if result == s else -e * q
                         session.record_trade(st.pending_settlement_market, s, e,
                                              100 if result == s else 0, q, pnl)
+                        email_reporter.register_trade(
+                            asset=ASSET, side=s, price_cents=e,
+                            qty=q, pnl_cents=pnl, won=(result == s))
                         log.warning(
                             f"[SETTLE] Deferred: {st.pending_settlement_market} {s.upper()} "
                             f"result={result} pnl={pnl}¢"
@@ -1223,6 +1229,7 @@ def main() -> None:
                 bal, _ = get_balance_usd(client)
                 if bal is not None:
                     session.update_balance(bal)
+                    email_reporter.update_balance(bal)
                 session.clear_balance_check()
             except Exception:
                 pass
@@ -1253,6 +1260,9 @@ def main() -> None:
                                    else -st.entry_price_cents * st.qty)
                             session.record_trade(old_market, st.side, st.entry_price_cents,
                                                  100 if result == st.side else 0, st.qty, pnl)
+                            email_reporter.register_trade(
+                                asset=ASSET, side=st.side, price_cents=st.entry_price_cents,
+                                qty=st.qty, pnl_cents=pnl, won=(result == st.side))
                             log.warning(
                                 f"[SETTLE] {old_market} {st.side.upper()} @ {st.entry_price_cents}¢ "
                                 f"result={result} pnl={pnl}¢"
@@ -1507,6 +1517,7 @@ def main() -> None:
                 live_bal, _ = get_balance_usd(client)
                 if live_bal is not None:
                     session.update_balance(live_bal)
+                    email_reporter.update_balance(live_bal)
                     log.info(f"[BALANCE-REFRESH] cash=${live_bal:.2f}")
             except Exception as bal_err:
                 log.warning(f"[BALANCE-REFRESH] Failed to fetch live balance: {bal_err}")
@@ -1682,6 +1693,7 @@ def main() -> None:
                                 live_bal, _ = get_balance_usd(client)
                                 if live_bal is not None:
                                     session.update_balance(live_bal)
+                                    email_reporter.update_balance(live_bal)
                             except Exception:
                                 pass
                             break
