@@ -30,7 +30,8 @@ EMAIL_TO           = os.getenv('EMAIL_TO', '')          # where to send reports
 EMAIL_PASS         = os.getenv('EMAIL_PASS', '')        # Gmail App Password (16 chars)
 EMAIL_ENABLED      = os.getenv('EMAIL_ENABLED', 'true').lower() == 'true'
 
-SCRAPE_FLOOR       = 110.00     # withdraw 100% of balance above this
+SCRAPE_TRIGGER     = 110.00     # email when balance exceeds this
+SCRAPE_FLOOR       = 100.00     # withdraw down to this amount
 SCRAPE_MIN_AMOUNT  = 20.00      # only email when withdrawable amount >= this
 
 # ── SHARED STATE ───────────────────────────────────────────────────────────────
@@ -48,8 +49,8 @@ def update_balance(balance_usd: float):
     global _portfolio_balance, _scrape_sent
     with _lock:
         _portfolio_balance = balance_usd
-        withdraw = balance_usd - SCRAPE_FLOOR
-        if withdraw >= SCRAPE_MIN_AMOUNT:
+        if balance_usd >= SCRAPE_TRIGGER:
+            withdraw = balance_usd - SCRAPE_FLOOR
             if not _scrape_sent:
                 _scrape_sent = True
                 subj, html = _build_scrape_email(balance_usd)
@@ -67,8 +68,8 @@ def register_trade(**kwargs):
 
 def start():
     """Call once at bot startup. Logs config — no background thread needed."""
-    log.info(f'[EMAIL] Scrape alerts active — floor=${SCRAPE_FLOOR:.0f}, '
-             f'min=${SCRAPE_MIN_AMOUNT:.0f}')
+    log.info(f'[EMAIL] Scrape alerts active — trigger=${SCRAPE_TRIGGER:.0f}, '
+             f'floor=${SCRAPE_FLOOR:.0f}')
 
 # ── EMAIL BUILDER ─────────────────────────────────────────────────────────────
 
