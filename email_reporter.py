@@ -30,7 +30,7 @@ EMAIL_TO           = os.getenv('EMAIL_TO', '')          # where to send reports
 EMAIL_PASS         = os.getenv('EMAIL_PASS', '')        # Gmail App Password (16 chars)
 EMAIL_ENABLED      = os.getenv('EMAIL_ENABLED', 'true').lower() == 'true'
 
-SCRAPE_FLOOR       = 100.00     # withdraw 100% of balance above this
+SCRAPE_FLOOR       = 110.00     # withdraw 100% of balance above this
 SCRAPE_MIN_AMOUNT  = 20.00      # only email when withdrawable amount >= this
 
 # ── SHARED STATE ───────────────────────────────────────────────────────────────
