@@ -124,9 +124,9 @@ POST_ONLY = env_bool("POST_ONLY", False)  # Taker by default for cheap contracts
 LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
-WATCH_WINDOW_SECONDS = 180   # Start watching at 3 minutes left
+WATCH_WINDOW_SECONDS = 60    # Start watching at 60 seconds left
 CONFIRM_THRESHOLD = 90       # Cents — was 93, data: 90-99¢ is 96-99% accurate
-CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
+CONFIRM_CHECKS = 1           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
 # Sigma (volatility) caching
