@@ -125,7 +125,7 @@ LOG_STATE_EVERY_SECONDS = env_float("LOG_STATE_EVERY_SECONDS", 10.0)
 
 # ── WATCH-CONFIRM STRATEGY CONSTANTS ──
 WATCH_WINDOW_SECONDS = 180   # Start watching at 3 minutes left
-CONFIRM_THRESHOLD = 93       # Cents — either side must hold this
+CONFIRM_THRESHOLD = 90       # Cents — was 93, data: 90-99¢ is 96-99% accurate
 CONFIRM_CHECKS = 4           # Consecutive checks above threshold before buying
 HEARTBEAT_SECONDS = env_float("HEARTBEAT_SECONDS", 15.0)
 
@@ -1439,6 +1439,16 @@ def main() -> None:
                     time.sleep(POLL_SECONDS)
                     continue
                 best_side, best_price = max(prices, key=lambda x: x[1])
+                # DEAD ZONE GATE — sub-90¢ safety net fires are net negative
+                if best_price < 90:
+                    log.warning(
+                        f"[SAFETY-NET-SKIP] {st.market} t={secs_to_close:.0f}s "
+                        f"best={best_side.upper()}@{best_price}¢ < 90¢ threshold — SKIP"
+                    )
+                    TRADED_TICKERS.add(st.market)
+                    st.traded_this_market = True
+                    time.sleep(POLL_SECONDS)
+                    continue
                 log.warning(
                     f"[SAFETY-NET] {st.market} t={secs_to_close:.0f}s no position yet "
                     f"— firing {best_side.upper()}@{best_price}¢"
@@ -1507,6 +1517,16 @@ def main() -> None:
             order_qty = int(position_size / (init_price / 100))
             order_qty = max(1, min(500, order_qty))
 
+            # MIN TRADE SIZE GATE — sub-$1 trades accomplish nothing
+            proposed_cost = order_qty * init_price / 100
+            if proposed_cost < 1.00:
+                log.info(
+                    f"[SKIP] {st.market} proposed cost=${proposed_cost:.2f} "
+                    f"(qty={order_qty} @ {init_price}¢) below $1.00 minimum"
+                )
+                time.sleep(POLL_SECONDS)
+                continue
+
             if session.current_balance_usd < (init_price / 100):
                 log.warning(
                     f"[SKIP] {st.market} — balance ${session.current_balance_usd:.2f} "
@@ -1570,6 +1590,15 @@ def main() -> None:
                         except Exception:
                             pass
                         resting_oid = None
+
+                    # MIXED POSITION GUARD: if we already have fills on current side,
+                    # DO NOT pivot — holding both sides is a guaranteed loss
+                    if total_filled > 0:
+                        log.warning(
+                            f"[PIVOT-BLOCKED] {st.market} already filled {total_filled}ct "
+                            f"{current_side.upper()} — cannot pivot to {other_side.upper()}, holding"
+                        )
+                        break
 
                     log.warning(
                         f"[PIVOT] {st.market} #{attempt} flipped {current_side.upper()}→{other_side.upper()} "
