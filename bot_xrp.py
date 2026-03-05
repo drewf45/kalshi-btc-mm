@@ -83,7 +83,13 @@ DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
 WATCH_WINDOW_SECONDS = 180     # Start watching 180s before close — enter while book has depth
-CONFIRM_THRESHOLD    = 91      # XRP: thin book, 91¢ min signal in watch window      # Minimum bid (cents) to consider "certain"
+CONFIRM_THRESHOLD_START = 90   # XRP: threshold at start of watch window
+CONFIRM_THRESHOLD_END   = 70   # XRP: floor threshold at close (safety net)
+# Dynamic threshold: decays 3¢ every 30s from 90¢ → 70¢ over the 180s window
+def confirm_threshold(secs_to_close: float) -> int:
+    elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
+    steps = int(elapsed / 30)
+    return max(CONFIRM_THRESHOLD_END, CONFIRM_THRESHOLD_START - steps * 3)
 CONFIRM_CHECKS       = 2       # XRP: thin market, signals shorter-lived       # Consecutive ticks above threshold before buying
 SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
@@ -460,7 +466,7 @@ def main() -> None:
     log.warning("=" * 60)
     log.warning(f"[BOT] XRP 15m — PARTICIPATION-FIRST V5")
     log.warning(f"[BOT] Watch window:   last {WATCH_WINDOW_SECONDS}s")
-    log.warning(f"[BOT] Threshold:      {CONFIRM_THRESHOLD}¢ bid on either side")
+    log.warning(f"[BOT] Threshold:      {CONFIRM_THRESHOLD_START}¢→{CONFIRM_THRESHOLD_END}¢ (decays 3¢/30s over watch window)")
     log.warning(f"[BOT] Confirm checks: {CONFIRM_CHECKS} consecutive ticks")
     log.warning(f"[BOT] Size:           {int(MAX_RISK_PCT*100)}% of live balance")
     log.warning(f"[BOT] Min balance:    ${MIN_BALANCE_USD:.2f}")
@@ -647,8 +653,8 @@ def main() -> None:
                 continue
             best_side, best_price = max(prices, key=lambda x: x[1])
             # Always enter at safety net — market WILL settle yes or no
-            if best_price < 51:
-                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ — coin flip, skip")
+            if best_price < CONFIRM_THRESHOLD_END:
+                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ — below 70¢ floor, skip")
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
@@ -658,8 +664,8 @@ def main() -> None:
             st.certainty_counter = CONFIRM_CHECKS  # skip to confirmed
         else:
             # ── WATCH-CONFIRM ────────────────────────────────
-            yes_certain = yes_bid is not None and yes_bid >= CONFIRM_THRESHOLD
-            no_certain  = no_bid  is not None and no_bid  >= CONFIRM_THRESHOLD
+            yes_certain = yes_bid is not None and yes_bid >= confirm_threshold(secs_to_close)
+            no_certain  = no_bid  is not None and no_bid  >= confirm_threshold(secs_to_close)
 
             if yes_certain:
                 if st.certainty_side == "yes":
@@ -667,17 +673,17 @@ def main() -> None:
                 else:
                     st.certainty_side    = "yes"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] YES@{yes_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] YES@{yes_bid}¢ threshold={confirm_threshold(secs_to_close)}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             elif no_certain:
                 if st.certainty_side == "no":
                     st.certainty_counter += 1
                 else:
                     st.certainty_side    = "no"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] NO@{no_bid}¢ threshold={confirm_threshold(secs_to_close)}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
                 if st.certainty_counter > 0:
-                    log.info(f"[RESET] Dropped below {CONFIRM_THRESHOLD}¢ — counter reset")
+                    log.info(f"[RESET] Dropped below {confirm_threshold(secs_to_close)}¢ — counter reset")
                 st.certainty_counter = 0
                 st.certainty_side    = None
                 time.sleep(POLL_SECONDS)
@@ -747,8 +753,8 @@ def main() -> None:
             other_bid = nb if current_side == "yes" else yb
 
             # Pivot: other side is now more certain AND our side dropped
-            if (other_bid is not None and other_bid >= CONFIRM_THRESHOLD and
-                    (cur_bid is None or cur_bid < CONFIRM_THRESHOLD)):
+            if (other_bid is not None and other_bid >= confirm_threshold(secs_to_close) and
+                    (cur_bid is None or cur_bid < confirm_threshold(secs_to_close))):
                 if total_filled > 0:
                     log.warning(f"[PIVOT-BLOCKED] Already filled {total_filled}ct — holding {current_side}")
                     break
