@@ -563,10 +563,10 @@ def main() -> None:
         if time.time() - last_state_log > 10.0:
             spot = fetch_spot(http)
             lo, hi = market_bounds_usd(st.market_obj)
+            spot_str = f"${spot:.2f}" if spot else "n/a"
             log.info(
                 f"[STATE] {st.market} t={secs_to_close:.0f}s "
-                f"spot=${spot:.2f if spot else 'n/a'} "
-                f"boundary=[{lo},{hi}] "
+                f"spot={spot_str} boundary=[{lo},{hi}] "
                 f"traded={st.traded_this_market}"
             )
             last_state_log = time.time()
