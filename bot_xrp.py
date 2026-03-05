@@ -278,9 +278,12 @@ def parse_best_yes_no(ob: Any) -> Tuple[Optional[int], Optional[int], Optional[i
     no_bids  = ob_data.get("no",  [])
 
     yes_bid = best_bid(yes_bids)
-    yes_ask = best_ask(no_bids)    # NO sellers = YES ask (complement)
-    no_bid  = best_bid(no_bids)
-    no_ask  = best_ask(yes_bids)   # YES sellers = NO ask (complement)
+    _no_bid  = best_bid(no_bids)
+    _yes_bid = best_bid(yes_bids)
+    no_bid   = _no_bid
+    # YES ask = 100 - best NO bid (complement); NO ask = 100 - best YES bid
+    yes_ask = (100 - _no_bid)  if _no_bid  is not None else None
+    no_ask  = (100 - _yes_bid) if _yes_bid is not None else None
 
     return yes_bid, yes_ask, no_bid, no_ask
 
