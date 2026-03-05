@@ -83,7 +83,7 @@ DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
 WATCH_WINDOW_SECONDS = 90      # Start watching 90s before close
-CONFIRM_THRESHOLD    = 55      # XRP: buy the leading side      # Minimum bid (cents) to consider "certain"
+CONFIRM_THRESHOLD    = 91      # XRP: thin book, 91¢ min signal in watch window      # Minimum bid (cents) to consider "certain"
 CONFIRM_CHECKS       = 2       # XRP: thin market, signals shorter-lived       # Consecutive ticks above threshold before buying
 SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
