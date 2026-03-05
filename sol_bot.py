@@ -500,7 +500,7 @@ def main() -> None:
             except Exception:
                 mobj = {}
             return "<manual>", mt, mobj
-        params = {"series_ticker": SERIES_TICKER, "status": "open", "limit": 200}
+        params = {"series_ticker": SERIES_TICKER, "status": "active", "limit": 200}
         resp   = client.request("GET", "/markets", params=params)
         mkts   = resp.get("markets", []) if isinstance(resp, dict) else []
         if not mkts:
