@@ -86,9 +86,10 @@ WATCH_WINDOW_SECONDS = 180     # Start watching 180s before close — enter whil
 CONFIRM_THRESHOLD    = 90      # Minimum bid (cents) to consider "certain"
 CONFIRM_CHECKS       = 4       # Max consecutive ticks required (at watch window start)
 # Dynamic: requires 4 ticks at T=180s, reduces by 1 every 30s → min 1 at T=90s
+CONFIRM_STEP         = 30         # seconds per confirm reduction (15m bots: every 30s)
 def required_confirms(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
-    reduction = int(elapsed / 30)
+    reduction = int(elapsed / CONFIRM_STEP)
     return max(1, CONFIRM_CHECKS - reduction)
 SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval

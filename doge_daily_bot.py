@@ -82,13 +82,14 @@ MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<
 DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
-WATCH_WINDOW_SECONDS = 3600   # Daily: enter in last hour      # Start watching 90s before close
+WATCH_WINDOW_SECONDS = 1200  # 20 minutes before close   # Daily: enter in last hour      # Start watching 90s before close
 CONFIRM_THRESHOLD    = 90      # Minimum bid (cents) to consider "certain"
 CONFIRM_CHECKS       = 4       # Max consecutive ticks required (at watch window start)
 # Dynamic: requires 4 ticks at T=180s, reduces by 1 every 30s → min 1 at T=90s
+CONFIRM_STEP         = 300        # seconds per confirm reduction (daily bots: every 5min)
 def required_confirms(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
-    reduction = int(elapsed / 30)
+    reduction = int(elapsed / CONFIRM_STEP)
     return max(1, CONFIRM_CHECKS - reduction)
 SAFETY_NET_SECONDS   = 120    # Daily: fire if no fill with 2min left      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
