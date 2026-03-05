@@ -667,14 +667,14 @@ def main() -> None:
                 else:
                     st.certainty_side    = "yes"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] YES@{yes_bid}¢ counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] YES@{yes_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             elif no_certain:
                 if st.certainty_side == "no":
                     st.certainty_counter += 1
                 else:
                     st.certainty_side    = "no"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
                 if st.certainty_counter > 0:
                     log.info(f"[RESET] Dropped below {CONFIRM_THRESHOLD}¢ — counter reset")
@@ -683,7 +683,7 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            if st.certainty_counter < CONFIRM_CHECKS:
+            if st.certainty_counter < required_confirms(secs_to_close):
                 time.sleep(POLL_SECONDS)
                 continue
 

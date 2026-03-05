@@ -84,7 +84,12 @@ DRY_RUN         = env_bool("DRY_RUN", False)
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
 WATCH_WINDOW_SECONDS = 180     # Start watching 180s before close — enter while book has depth
 CONFIRM_THRESHOLD    = 90      # Minimum bid (cents) to consider "certain"
-CONFIRM_CHECKS       = 3       # Consecutive ticks above threshold before buying
+CONFIRM_CHECKS       = 4       # Max consecutive ticks required (at watch window start)
+# Dynamic: requires 4 ticks at T=180s, reduces by 1 every 30s → min 1 at T=90s
+def required_confirms(secs_to_close: float) -> int:
+    elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
+    reduction = int(elapsed / 30)
+    return max(1, CONFIRM_CHECKS - reduction)
 SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
 META_REFRESH_SECONDS = 10.0    # Active market refresh interval
@@ -667,14 +672,14 @@ def main() -> None:
                 else:
                     st.certainty_side    = "yes"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] YES@{yes_bid}¢ counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] YES@{yes_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             elif no_certain:
                 if st.certainty_side == "no":
                     st.certainty_counter += 1
                 else:
                     st.certainty_side    = "no"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{CONFIRM_CHECKS} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
                 if st.certainty_counter > 0:
                     log.info(f"[RESET] Dropped below {CONFIRM_THRESHOLD}¢ — counter reset")
@@ -683,7 +688,7 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            if st.certainty_counter < CONFIRM_CHECKS:
+            if st.certainty_counter < required_confirms(secs_to_close):
                 time.sleep(POLL_SECONDS)
                 continue
 
