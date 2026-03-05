@@ -188,6 +188,7 @@ def resolve_close_ts(mobj: Dict, ticker: str) -> Optional[int]:
 
 def market_bounds_usd(mobj: Dict) -> Tuple[Optional[float], Optional[float]]:
     rules = mobj.get("rules_primary") or mobj.get("rules", {}) or {}
+    if not isinstance(rules, dict): rules = {}
     lo = rules.get("lower_bound") or rules.get("lo") or rules.get("floor")
     hi = rules.get("upper_bound") or rules.get("hi") or rules.get("cap")
     try:
