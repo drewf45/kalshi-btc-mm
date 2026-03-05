@@ -518,13 +518,26 @@ def main() -> None:
             pos = parse_position_for_market(get_positions(client), new_ticker)
         except Exception:
             pos = 0
+        # Only block on existing position if the market is still ACTIVE and tradeable.
+        # If market is determined/finalized (pending settlement from previous deploy),
+        # treat as fresh — don't skip the window due to a pending payout.
+        market_still_active = False
         if pos != 0:
+            try:
+                mkt_resp = client.request("GET", f"/markets/{new_ticker}")
+                mkt_status = (mkt_resp.get("market") or mkt_resp).get("status", "")
+                market_still_active = mkt_status == "active"
+            except Exception:
+                market_still_active = True  # assume active if can't check
+        if pos != 0 and market_still_active:
             st.traded_this_market = True
             st.side = "yes" if pos > 0 else "no"
             st.qty  = abs(pos)
             TRADED_TICKERS.add(new_ticker)
             log.warning(f"[RECON] Existing position on {new_ticker}: {st.side} x{st.qty}")
         else:
+            if pos != 0:
+                log.warning(f"[RECON] Position on {new_ticker} but market not active — ignoring (pending settlement)")
             st.traded_this_market = False
             st.side               = None
             st.qty                = 0
