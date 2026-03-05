@@ -214,7 +214,10 @@ def pick_active_market(markets: List[Dict]) -> Tuple[str, str, Dict]:
     now = time.time()
     best = None
     best_secs = float("inf")
-    for m in markets:
+    # Prefer status=active; fall back to any non-finalized market
+    active = [m for m in markets if m.get("status") == "active"]
+    candidates = active if active else [m for m in markets if m.get("status") not in ("finalized","settled","closed")]
+    for m in candidates:
         ticker = m.get("ticker") or m.get("market_ticker", "")
         close_ts = resolve_close_ts(m, ticker)
         if close_ts is None:
@@ -500,7 +503,7 @@ def main() -> None:
             except Exception:
                 mobj = {}
             return "<manual>", mt, mobj
-        params = {"series_ticker": SERIES_TICKER, "status": "active", "limit": 200}
+        params = {"series_ticker": SERIES_TICKER, "limit": 200}
         resp   = client.request("GET", "/markets", params=params)
         mkts   = resp.get("markets", []) if isinstance(resp, dict) else []
         if not mkts:
