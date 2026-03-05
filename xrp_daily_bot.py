@@ -83,7 +83,7 @@ DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
 WATCH_WINDOW_SECONDS = 3600      # Daily: enter in last hour before close
-CONFIRM_THRESHOLD    = 91      # XRP: thin book, 91¢ min signal      # Minimum bid (cents) to consider "certain"
+CONFIRM_THRESHOLD    = 55      # XRP: buy the leading side      # Minimum bid (cents) to consider "certain"
 CONFIRM_CHECKS       = 2       # XRP: thin market, signals shorter-lived       # Consecutive ticks above threshold before buying
 SAFETY_NET_SECONDS   = 120     # Daily: fire if no fill with 2min left
 POLL_SECONDS         = 1.0     # Orderbook poll interval
@@ -631,8 +631,9 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
             best_side, best_price = max(prices, key=lambda x: x[1])
-            if best_price < CONFIRM_THRESHOLD:
-                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ < {CONFIRM_THRESHOLD}¢ — skip")
+            # Always enter at safety net — market WILL settle yes or no
+            if best_price < 51:
+                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ — coin flip, skip")
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)

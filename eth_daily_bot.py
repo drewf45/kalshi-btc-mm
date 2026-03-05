@@ -631,8 +631,9 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
             best_side, best_price = max(prices, key=lambda x: x[1])
-            if best_price < CONFIRM_THRESHOLD:
-                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ < {CONFIRM_THRESHOLD}¢ — skip")
+            # Always enter at safety net — market WILL settle yes or no
+            if best_price < 51:
+                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ — coin flip, skip")
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
