@@ -355,10 +355,7 @@ def cancel_strays(client: KalshiClient, ticker: str) -> None:
 
 def place_order(client: KalshiClient, ticker: str, side: str,
                 price_cents: int, count: int, close_ts: Optional[int]) -> str:
-    # GATE: fast local guard
-    if ticker in TRADED_TICKERS:
-        return "BLOCKED_FAST_GUARD"
-    # GATE: API position check
+    # GATE: API position check (TRADED_TICKERS gate removed — caller sets it before retry loop)
     try:
         existing = abs(parse_position_for_market(get_positions(client), ticker))
         if existing > 0:
