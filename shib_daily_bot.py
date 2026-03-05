@@ -854,6 +854,7 @@ def main() -> None:
             )
         else:
             log.warning(f"[RESULT] {st.market} 0 fills after {attempt} attempts")
+            log.warning(f"[MISS] {st.market} — entered but unfilled. Treat as lost market.")
 
         time.sleep(POLL_SECONDS)
 

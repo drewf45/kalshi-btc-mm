@@ -82,7 +82,7 @@ MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<
 DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
-WATCH_WINDOW_SECONDS = 90      # Start watching 90s before close
+WATCH_WINDOW_SECONDS = 180     # Start watching 180s before close — enter while book has depth
 CONFIRM_THRESHOLD    = 90      # Minimum bid (cents) to consider "certain"
 CONFIRM_CHECKS       = 3       # Consecutive ticks above threshold before buying
 SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
@@ -854,6 +854,7 @@ def main() -> None:
             )
         else:
             log.warning(f"[RESULT] {st.market} 0 fills after {attempt} attempts")
+            log.warning(f"[MISS] {st.market} — entered but unfilled. Treat as lost market.")
 
         time.sleep(POLL_SECONDS)
 
