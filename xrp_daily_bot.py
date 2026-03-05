@@ -690,6 +690,22 @@ def main() -> None:
         # ── CONFIRMED: enter ─────────────────────────────────
         side = st.certainty_side
 
+        # Counterparty check — verify opposite side has liquidity before entering
+        # If YES=None when buying NO (or vice versa), order will never fill
+        try:
+            cp_ob = client.request("GET", f"/markets/{st.market}/orderbook")
+            cp_yb, _, cp_nb, _ = parse_best_yes_no(cp_ob)
+            opposite_liquid = cp_nb if side == "yes" else cp_yb
+            if opposite_liquid is None:
+                log.warning(f"[NO-COUNTERPARTY] {st.market} want {side.upper()} but opposite side empty — waiting for liquidity")
+                st.traded_this_market = False
+                st.certainty_counter  = 0
+                st.certainty_side     = None
+                time.sleep(POLL_SECONDS)
+                continue
+        except Exception as e:
+            log.warning(f"[COUNTERPARTY-CHECK] {e} — proceeding anyway")
+
         # Refresh live balance before sizing
         try:
             cash, pv = get_balance_usd(client)
@@ -731,6 +747,7 @@ def main() -> None:
         deadline      = (close_ts or (time.time() + 30)) - EXPIRY_BUFFER_SEC
 
         while time.time() < deadline and total_filled < order_qty:
+            _watchdog_ts[0] = time.time()  # keep watchdog alive during retry
             attempt += 1
 
             # Fresh orderbook
