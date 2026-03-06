@@ -436,6 +436,7 @@ class BotState:
     certainty_counter:  int           = 0
     certainty_side:     Optional[str] = None
     watch_active:       bool          = False
+    watch_start_price:  Optional[float] = None
     live_balance_usd:   float         = 0.0
 
 
@@ -552,6 +553,7 @@ def main() -> None:
         st.certainty_counter = 0
         st.certainty_side    = None
         st.watch_active      = False
+        st.watch_start_price = None
 
     # ── MAIN LOOP ─────────────────────────────────────────────
     while True:
@@ -622,7 +624,9 @@ def main() -> None:
         # ── First tick in watch window ───────────────────────
         if not st.watch_active:
             st.watch_active = True
-            log.warning(f"[WATCH-START] {st.market} t={secs_to_close:.0f}s")
+            st.watch_start_price = fetch_spot(http)
+            spot_str = f"${st.watch_start_price:.2f}" if st.watch_start_price else "n/a"
+            log.warning(f"[WATCH-START] {st.market} t={secs_to_close:.0f}s spot={spot_str}")
 
         # ── Balance check ────────────────────────────────────
         if st.live_balance_usd < MIN_BALANCE_USD:
@@ -732,6 +736,19 @@ def main() -> None:
             log.info(f"[SKIP] Proposed cost < $1.00 — skip")
             time.sleep(POLL_SECONDS)
             continue
+
+        # ── Pre-trade price sanity check ─────────────────────
+        pre_price = fetch_spot(http)
+        if pre_price and st.watch_start_price:
+            delta = pre_price - st.watch_start_price
+            pct   = abs(delta) / st.watch_start_price * 100
+            arrow = "↑" if delta > 0 else "↓"
+            log.warning(
+                f"[PRICE-SANITY] watch_start=${st.watch_start_price:.2f} "
+                f"now=${pre_price:.2f} move={arrow}${abs(delta):.2f} ({pct:.3f}%)"
+            )
+        elif pre_price:
+            log.warning(f"[PRICE-SANITY] now=${pre_price:.2f} (no watch_start recorded)")
 
         log.warning(
             f"[ENTER] {st.market} {side.upper()}@{buy_price}¢ "
