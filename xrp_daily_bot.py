@@ -236,6 +236,58 @@ def pick_active_market(markets: List[Dict]) -> Tuple[str, str, Dict]:
     return m.get("event_ticker", ""), ticker, m
 
 
+def pick_near_money_market(markets: List[Dict], spot_price: Optional[float]) -> Tuple[str, str, Dict]:
+    """Pick the market with threshold closest to current spot price.
+    Falls back to pick_active_market if spot price unavailable or no parseable thresholds.
+    """
+    if spot_price is None:
+        return pick_active_market(markets)
+
+    now = time.time()
+    # Exclude finalized/settled markets
+    candidates = [m for m in markets
+                  if m.get("status") not in ("finalized", "settled", "closed")]
+    if not candidates:
+        return pick_active_market(markets)
+
+    def parse_threshold(ticker: str) -> Optional[float]:
+        """Extract numeric threshold from ticker like KXBTCD-26MAR0800-T70249.99"""
+        parts = ticker.split("-")
+        for part in parts:
+            if len(part) > 1 and part[0] in ("T", "B"):
+                try:
+                    return float(part[1:])
+                except ValueError:
+                    pass
+        return None
+
+    best = None
+    best_diff = float("inf")
+    for m in candidates:
+        ticker = m.get("ticker") or m.get("market_ticker", "")
+        threshold = parse_threshold(ticker)
+        if threshold is None:
+            continue
+        close_ts = resolve_close_ts(m, ticker)
+        if close_ts is None:
+            continue
+        secs = close_ts - now
+        if secs < -60:
+            continue
+        diff = abs(threshold - spot_price)
+        if diff < best_diff:
+            best_diff = diff
+            best = (m.get("event_ticker", ""), ticker, m)
+
+    if best:
+        log.warning(
+            f"[NEAR-MONEY] spot=${spot_price:.6g} threshold nearest={best[1]} "
+            f"diff={best_diff:.6g}"
+        )
+        return best
+    return pick_active_market(markets)
+
+
 # ======================== ORDERBOOK PARSING ==================
 def parse_best_yes_no(ob: Any) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
     """Returns (yes_bid, yes_ask, no_bid, no_ask) in cents."""
@@ -510,7 +562,9 @@ def main() -> None:
         mkts   = resp.get("markets", []) if isinstance(resp, dict) else []
         if not mkts:
             raise RuntimeError(f"No open markets for {SERIES_TICKER}")
-        return pick_active_market(mkts)
+        # Pick market with threshold nearest to current spot price
+        spot = fetch_spot(http)
+        return pick_near_money_market(mkts, spot)
 
     def on_new_market(new_ticker: str):
         cancel_strays(client, new_ticker)
