@@ -98,6 +98,13 @@ MAX_RISK_PCT         = 0.20    # 20% of live balance per trade (hard cap)
 MIN_BALANCE_USD      = 5.00    # Don't trade if balance drops below this
 EXPIRY_BUFFER_SEC    = 10      # Cancel resting orders this many seconds before close
 
+# ── RISK GUARDS (tunable via env vars, never full block unless truly terrible) ──
+PROXIMITY_SKIP_PCT  = env_float("PROXIMITY_SKIP_PCT",  0.20)
+PROXIMITY_HALF_PCT  = env_float("PROXIMITY_HALF_PCT",  0.75)
+VELOCITY_SKIP_USD   = env_float("VELOCITY_SKIP_USD",   0.0)
+VELOCITY_HALF_USD   = env_float("VELOCITY_HALF_USD",   0.0)
+SLOPE_DROP_SKIP     = env_int("SLOPE_DROP_SKIP",        6)
+
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
 SPOT_URL = "https://api.coinbase.com/v2/prices/SOL-USD/spot"
 
@@ -437,6 +444,7 @@ class BotState:
     certainty_side:     Optional[str] = None
     watch_active:       bool          = False
     watch_start_price:  Optional[float] = None
+    tick_history:       list          = field(default_factory=list)
     live_balance_usd:   float         = 0.0
 
 
@@ -554,6 +562,7 @@ def main() -> None:
         st.certainty_side    = None
         st.watch_active      = False
         st.watch_start_price = None
+        st.tick_history      = []
 
     # ── MAIN LOOP ─────────────────────────────────────────────
     while True:
@@ -677,6 +686,8 @@ def main() -> None:
                 else:
                     st.certainty_side    = "yes"
                     st.certainty_counter = 1
+                    st.tick_history      = []
+                st.tick_history.append(yes_bid)
                 log.info(f"[WATCH] YES@{yes_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             elif no_certain:
                 if st.certainty_side == "no":
@@ -684,6 +695,8 @@ def main() -> None:
                 else:
                     st.certainty_side    = "no"
                     st.certainty_counter = 1
+                    st.tick_history      = []
+                st.tick_history.append(no_bid)
                 log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
                 if st.certainty_counter > 0:
@@ -728,7 +741,7 @@ def main() -> None:
         init_ask   = (yes_ask if side == "yes" else no_ask)
         buy_price  = min((init_ask + 1) if init_ask is not None else init_bid, 99)
 
-        position_size = st.live_balance_usd * MAX_RISK_PCT
+        position_size = st.live_balance_usd * MAX_RISK_PCT * risk_size_multiplier
         order_qty     = max(1, min(500, int(position_size / (buy_price / 100))))
 
         # Minimum trade gate ($1 cost)
@@ -737,16 +750,69 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
 
-        # ── Pre-trade price sanity check ─────────────────────
-        pre_price = fetch_spot(http)
+        # ── RISK GUARDS ──────────────────────────────────────
+        risk_size_multiplier = 1.0
+
+        # Guard 1: Confidence slope — bid declining from peak = weakening signal
+        if len(st.tick_history) >= 2:
+            peak_bid = max(st.tick_history)
+            latest_bid = st.tick_history[-1]
+            drop = peak_bid - latest_bid
+            if drop >= SLOPE_DROP_SKIP:
+                log.warning(
+                    f"[SLOPE-SKIP] {st.market} bid dropped {drop}¢ from peak {peak_bid}¢ → {latest_bid}¢ "
+                    f"— signal weakening, skipping"
+                )
+                TRADED_TICKERS.add(st.market)
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
+
+        # Guard 2: Threshold proximity — price too close to strike = flash wick risk
+        spot_check = fetch_spot(http)
+        if spot_check:
+            _, threshold = market_bounds_usd(st.market_obj)
+            if threshold is not None and threshold > 0:
+                prox_pct = abs(spot_check - threshold) / threshold * 100
+                if prox_pct <= PROXIMITY_SKIP_PCT:
+                    log.warning(
+                        f"[PROXIMITY-SKIP] {st.market} spot=${spot_check:.4f} threshold=${threshold:.4f} "
+                        f"proximity={prox_pct:.3f}% ≤ {PROXIMITY_SKIP_PCT}% — too close, skipping"
+                    )
+                    TRADED_TICKERS.add(st.market)
+                    st.traded_this_market = True
+                    time.sleep(POLL_SECONDS)
+                    continue
+                elif prox_pct <= PROXIMITY_HALF_PCT:
+                    log.warning(
+                        f"[PROXIMITY-HALF] {st.market} spot=${spot_check:.4f} threshold=${threshold:.4f} "
+                        f"proximity={prox_pct:.3f}% ≤ {PROXIMITY_HALF_PCT}% — halving size"
+                    )
+                    risk_size_multiplier = 0.5
+
+        # Guard 3: Price velocity — coin moving fast during watch window = momentum risk
         if pre_price and st.watch_start_price:
-            delta = pre_price - st.watch_start_price
-            pct   = abs(delta) / st.watch_start_price * 100
-            arrow = "↑" if delta > 0 else "↓"
+            delta     = pre_price - st.watch_start_price
+            abs_delta = abs(delta)
+            pct       = abs_delta / st.watch_start_price * 100
+            arrow     = "↑" if delta > 0 else "↓"
             log.warning(
                 f"[PRICE-SANITY] watch_start=${st.watch_start_price:.2f} "
-                f"now=${pre_price:.2f} move={arrow}${abs(delta):.2f} ({pct:.3f}%)"
+                f"now=${pre_price:.2f} move={arrow}${abs_delta:.2f} ({pct:.3f}%)"
             )
+            if VELOCITY_SKIP_USD > 0 and abs_delta >= VELOCITY_SKIP_USD:
+                log.warning(
+                    f"[VELOCITY-SKIP] {st.market} move ${abs_delta:.2f} ≥ threshold ${VELOCITY_SKIP_USD:.2f} — skipping"
+                )
+                TRADED_TICKERS.add(st.market)
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
+            elif VELOCITY_HALF_USD > 0 and abs_delta >= VELOCITY_HALF_USD:
+                log.warning(
+                    f"[VELOCITY-HALF] {st.market} move ${abs_delta:.2f} ≥ ${VELOCITY_HALF_USD:.2f} — halving size"
+                )
+                risk_size_multiplier = min(risk_size_multiplier, 0.5)
         elif pre_price:
             log.warning(f"[PRICE-SANITY] now=${pre_price:.2f} (no watch_start recorded)")
 
