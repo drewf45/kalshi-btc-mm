@@ -87,7 +87,7 @@ DRY_RUN         = env_bool("DRY_RUN", False)
 #   - Betting price stays far from threshold (long duration, high certainty)
 #   - No correlated entry risk with other coins (independent bets)
 #   - Should use larger size and stricter safety net
-WATCH_WINDOW_SECONDS  = 1200    # Watch last 20 minutes before close
+WATCH_WINDOW_SECONDS  = 7200    # Watch full 2-hour window (10 PM → midnight ET)
 CONFIRM_THRESHOLD     = 92      # 92¢ bid required (higher bar than 15M scalp)
 CONFIRM_CHECKS        = 4       # Ticks required at start of watch window
 CONFIRM_STEP          = 300     # Reduce by 1 confirm every 5 min → min 1 at T=0

@@ -82,7 +82,7 @@ MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<
 DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── DAILY BOT CONFIG (high-conviction directional, NOT a scalp) ───────────────
-WATCH_WINDOW_SECONDS  = 1200
+WATCH_WINDOW_SECONDS  = 7200    # Watch full 2-hour window (10 PM → midnight ET)
 CONFIRM_THRESHOLD     = 92      # XRP: thin book but raised to match daily standard
 CONFIRM_CHECKS        = 2       # XRP: thin market, keep 2 confirms
 CONFIRM_STEP          = 300
