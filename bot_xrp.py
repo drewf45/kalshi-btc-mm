@@ -90,13 +90,19 @@ def confirm_threshold(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
     steps = int(elapsed / 30)
     return max(CONFIRM_THRESHOLD_END, CONFIRM_THRESHOLD_START - steps * 3)
-CONFIRM_CHECKS       = 2       # XRP: thin market, signals shorter-lived       # Consecutive ticks above threshold before buying
+CONFIRM_CHECKS       = 2       # XRP: thin market, signals shorter-lived
 SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
 META_REFRESH_SECONDS = 10.0    # Active market refresh interval
-MAX_RISK_PCT         = 0.20    # 20% of live balance per trade (hard cap)
+MAX_RISK_PCT         = 0.35    # 35% of live balance per trade (matches daily bot standard)
 MIN_BALANCE_USD      = 5.00    # Don't trade if balance drops below this
 EXPIRY_BUFFER_SEC    = 10      # Cancel resting orders this many seconds before close
+
+# ── CORRELATED-RISK & VOLATILE-WINDOW GUARDS ─────────────────
+VELOCITY_SKIP_PCT        = env_float("VELOCITY_SKIP_PCT",        0.30)  # skip if spot moved >0.30% during watch window
+VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",   3)     # +3¢ threshold during volatile windows
+VOLATILE_WINDOWS_ET      = [(12, 14), (20, 22)]  # 12PM-2PM ET and 8PM-10PM ET
+CORR_SCALE               = [1.0, 0.75, 0.55, 0.40]  # size multiplier by # of correlated bots
 
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
 SPOT_URL = "https://api.coinbase.com/v2/prices/XRP-USD/spot"
@@ -422,6 +428,38 @@ def fetch_spot(http: requests.Session) -> Optional[float]:
         return None
 
 
+# ======================== VOLATILE & CORR HELPERS ============
+def is_volatile_window() -> bool:
+    """True if current ET time falls in a known high-volatility window."""
+    h = datetime.now(ZoneInfo("America/New_York")).hour
+    return any(start <= h < end for start, end in VOLATILE_WINDOWS_ET)
+
+def effective_threshold(secs_to_close: float) -> int:
+    """Dynamic threshold + volatile window bonus."""
+    bonus = VOLATILE_THRESHOLD_BONUS if is_volatile_window() else 0
+    return confirm_threshold(secs_to_close) + bonus
+
+def correlated_bot_count(client: "KalshiClient", side: str, own_coin: str) -> int:
+    """Count OTHER 15M bots currently holding an open position in the same direction."""
+    try:
+        positions = get_positions(client)
+        count = 0
+        for p in positions:
+            ticker = p.get("ticker") or p.get("market_ticker", "")
+            if "15M" not in ticker:
+                continue
+            if own_coin.upper() in ticker.upper():
+                continue  # skip own coin
+            pos = p.get("position", 0)
+            if pos == 0:
+                continue
+            other_side = "yes" if pos > 0 else "no"
+            if other_side == side:
+                count += 1
+        return count
+    except Exception:
+        return 0
+
 # ======================== BOT STATE ==========================
 @dataclass
 class BotState:
@@ -436,6 +474,7 @@ class BotState:
     certainty_counter:  int           = 0
     certainty_side:     Optional[str] = None
     watch_active:       bool          = False
+    watch_start_price:  Optional[float] = None
     live_balance_usd:   float         = 0.0
 
 
@@ -552,6 +591,7 @@ def main() -> None:
         st.certainty_counter = 0
         st.certainty_side    = None
         st.watch_active      = False
+        st.watch_start_price = None
 
     # ── MAIN LOOP ─────────────────────────────────────────────
     while True:
@@ -622,7 +662,9 @@ def main() -> None:
         # ── First tick in watch window ───────────────────────
         if not st.watch_active:
             st.watch_active = True
-            log.warning(f"[WATCH-START] {st.market} t={secs_to_close:.0f}s")
+            st.watch_start_price = fetch_spot(http)
+            spot_str = f"${st.watch_start_price:.4f}" if st.watch_start_price else "n/a"
+            log.warning(f"[WATCH-START] {st.market} t={secs_to_close:.0f}s spot={spot_str}")
 
         # ── Balance check ────────────────────────────────────
         if st.live_balance_usd < MIN_BALANCE_USD:
@@ -664,8 +706,9 @@ def main() -> None:
             st.certainty_counter = CONFIRM_CHECKS  # skip to confirmed
         else:
             # ── WATCH-CONFIRM ────────────────────────────────
-            yes_certain = yes_bid is not None and yes_bid >= confirm_threshold(secs_to_close)
-            no_certain  = no_bid  is not None and no_bid  >= confirm_threshold(secs_to_close)
+            thresh = effective_threshold(secs_to_close)
+            yes_certain = yes_bid is not None and yes_bid >= thresh
+            no_certain  = no_bid  is not None and no_bid  >= thresh
 
             if yes_certain:
                 if st.certainty_side == "yes":
@@ -673,17 +716,17 @@ def main() -> None:
                 else:
                     st.certainty_side    = "yes"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] YES@{yes_bid}¢ threshold={confirm_threshold(secs_to_close)}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] YES@{yes_bid}¢ threshold={thresh}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             elif no_certain:
                 if st.certainty_side == "no":
                     st.certainty_counter += 1
                 else:
                     st.certainty_side    = "no"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] NO@{no_bid}¢ threshold={confirm_threshold(secs_to_close)}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] NO@{no_bid}¢ threshold={thresh}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
                 if st.certainty_counter > 0:
-                    log.info(f"[RESET] Dropped below {confirm_threshold(secs_to_close)}¢ — counter reset")
+                    log.info(f"[RESET] Dropped below {thresh}¢ — counter reset")
                 st.certainty_counter = 0
                 st.certainty_side    = None
                 time.sleep(POLL_SECONDS)
@@ -724,19 +767,64 @@ def main() -> None:
         init_ask   = (yes_ask if side == "yes" else no_ask)
         buy_price  = min((init_ask + 1) if init_ask is not None else init_bid, 99)
 
-        position_size = st.live_balance_usd * MAX_RISK_PCT
+        # ── RISK GUARDS (run BEFORE sizing) ──────────────────
+        risk_size_multiplier = 1.0
+
+        # Guard 1: Price velocity — skip if XRP moved >0.30% during watch window
+        spot_check = fetch_spot(http)
+        if spot_check and st.watch_start_price:
+            delta     = spot_check - st.watch_start_price
+            abs_delta = abs(delta)
+            pct       = abs_delta / st.watch_start_price * 100
+            arrow     = "↑" if delta > 0 else "↓"
+            log.warning(
+                f"[PRICE-SANITY] watch_start=${st.watch_start_price:.4f} "
+                f"now=${spot_check:.4f} move={arrow}${abs_delta:.4f} ({pct:.3f}%)"
+            )
+            if pct >= VELOCITY_SKIP_PCT:
+                log.warning(
+                    f"[VELOCITY-SKIP] {st.market} spot moved {pct:.3f}% ≥ {VELOCITY_SKIP_PCT}% — skipping"
+                )
+                TRADED_TICKERS.add(st.market)
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
+        elif spot_check:
+            log.warning(f"[PRICE-SANITY] now=${spot_check:.4f} (no watch_start recorded)")
+
+        # Guard 2: Correlated direction — scale down if other bots entering same way
+        corr_count = correlated_bot_count(client, side, BOT_ID)
+        if corr_count > 0:
+            scale_idx = min(corr_count, len(CORR_SCALE) - 1)
+            risk_size_multiplier = min(risk_size_multiplier, CORR_SCALE[scale_idx])
+            log.warning(
+                f"[CORR-SCALE] {corr_count} other bot(s) entering {side.upper()} — "
+                f"size multiplier → {risk_size_multiplier:.2f}"
+            )
+
+        # Guard 3: Volatile window context log
+        if is_volatile_window():
+            log.warning(
+                f"[VOLATILE-WINDOW] active — threshold was {effective_threshold(secs_to_close)}¢ "
+                f"(+{VOLATILE_THRESHOLD_BONUS}¢ bonus), size multiplier={risk_size_multiplier:.2f}"
+            )
+
+        # ── SIZE (calculated AFTER all guards have set multiplier) ───────────
+        position_size = st.live_balance_usd * MAX_RISK_PCT * risk_size_multiplier
         order_qty     = max(1, min(500, int(position_size / (buy_price / 100))))
 
         # Minimum trade gate ($1 cost)
         if order_qty * buy_price / 100 < 1.00:
             log.info(f"[SKIP] Proposed cost < $1.00 — skip")
+            TRADED_TICKERS.add(st.market)
+            st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
 
         log.warning(
             f"[ENTER] {st.market} {side.upper()}@{buy_price}¢ "
             f"qty={order_qty} cost=${order_qty * buy_price / 100:.2f} "
-            f"bal=${st.live_balance_usd:.2f} t={secs_to_close:.0f}s"
+            f"bal=${st.live_balance_usd:.2f} mult={risk_size_multiplier:.2f} t={secs_to_close:.0f}s"
         )
 
         # Lock immediately
