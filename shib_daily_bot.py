@@ -81,22 +81,27 @@ PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
 MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<none>")
 DRY_RUN         = env_bool("DRY_RUN", False)
 
-# ── PARTICIPATION CONSTANTS ───────────────────────────────────
-WATCH_WINDOW_SECONDS = 1200  # 20 minutes before close   # Daily: enter in last hour      # Start watching 90s before close
-CONFIRM_THRESHOLD    = 90      # Minimum bid (cents) to consider "certain"
-CONFIRM_CHECKS       = 4       # Max consecutive ticks required (at watch window start)
-# Dynamic: requires 4 ticks at T=180s, reduces by 1 every 30s → min 1 at T=90s
-CONFIRM_STEP         = 300        # seconds per confirm reduction (daily bots: every 5min)
+# ── DAILY BOT CONFIG (high-conviction directional, NOT a scalp) ───────────────
+# Daily bots are fundamentally different from 15M bots:
+#   - Once/twice per day, not 96x per day
+#   - Betting price stays far from threshold (long duration, high certainty)
+#   - No correlated entry risk with other coins (independent bets)
+#   - Should use larger size and stricter safety net
+WATCH_WINDOW_SECONDS  = 1200    # Watch last 20 minutes before close
+CONFIRM_THRESHOLD     = 92      # 92¢ bid required (higher bar than 15M scalp)
+CONFIRM_CHECKS        = 4       # Ticks required at start of watch window
+CONFIRM_STEP          = 300     # Reduce by 1 confirm every 5 min → min 1 at T=0
 def required_confirms(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
     reduction = int(elapsed / CONFIRM_STEP)
     return max(1, CONFIRM_CHECKS - reduction)
-SAFETY_NET_SECONDS   = 120    # Daily: fire if no fill with 2min left      # Fallback: buy best side at T=10s if no position yet
-POLL_SECONDS         = 1.0     # Orderbook poll interval
-META_REFRESH_SECONDS = 10.0    # Active market refresh interval
-MAX_RISK_PCT         = 0.20    # 20% of live balance per trade (hard cap)
-MIN_BALANCE_USD      = 5.00    # Don't trade if balance drops below this
-EXPIRY_BUFFER_SEC    = 10      # Cancel resting orders this many seconds before close
+SAFETY_NET_SECONDS    = 120     # Fire if no fill with 2 min left
+SAFETY_NET_MIN_BID    = 80      # Don't fire safety net below 80¢ — no coin flips on daily bets
+POLL_SECONDS          = 1.0
+META_REFRESH_SECONDS  = 10.0
+MAX_RISK_PCT          = 0.35    # 35% per trade (high-conviction, not scalp)
+MIN_BALANCE_USD       = 5.00
+EXPIRY_BUFFER_SEC     = 10
 
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
 SPOT_URL = "https://api.coinbase.com/v2/prices/SHIB-USD/spot"
@@ -707,8 +712,8 @@ def main() -> None:
                 continue
             best_side, best_price = max(prices, key=lambda x: x[1])
             # Always enter at safety net — market WILL settle yes or no
-            if best_price < 51:
-                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ — coin flip, skip")
+            if best_price < SAFETY_NET_MIN_BID:
+                log.warning(f"[SAFETY-SKIP] {st.market} best={best_side}@{best_price}¢ < {SAFETY_NET_MIN_BID}¢ min — skip")
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)

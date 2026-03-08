@@ -81,16 +81,22 @@ PRIVATE_KEY_PEM_B64 = getenv_first(["KALSHI_PRIVATE_KEY_PEM_BASE64"], "")
 MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<none>")
 DRY_RUN         = env_bool("DRY_RUN", False)
 
-# ── PARTICIPATION CONSTANTS ───────────────────────────────────
-WATCH_WINDOW_SECONDS = 1200  # 20 minutes before close      # Daily: enter in last hour before close
-CONFIRM_THRESHOLD    = 91      # XRP: thin book, 91¢ min signal in watch window      # Minimum bid (cents) to consider "certain"
-CONFIRM_CHECKS       = 2       # XRP: thin market, signals shorter-lived       # Consecutive ticks above threshold before buying
-SAFETY_NET_SECONDS   = 120     # Daily: fire if no fill with 2min left
-POLL_SECONDS         = 1.0     # Orderbook poll interval
-META_REFRESH_SECONDS = 10.0    # Active market refresh interval
-MAX_RISK_PCT         = 0.20    # 20% of live balance per trade (hard cap)
-MIN_BALANCE_USD      = 5.00    # Don't trade if balance drops below this
-EXPIRY_BUFFER_SEC    = 10      # Cancel resting orders this many seconds before close
+# ── DAILY BOT CONFIG (high-conviction directional, NOT a scalp) ───────────────
+WATCH_WINDOW_SECONDS  = 1200
+CONFIRM_THRESHOLD     = 92      # XRP: thin book but raised to match daily standard
+CONFIRM_CHECKS        = 2       # XRP: thin market, keep 2 confirms
+CONFIRM_STEP          = 300
+def required_confirms(secs_to_close: float) -> int:
+    elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
+    reduction = int(elapsed / CONFIRM_STEP)
+    return max(1, CONFIRM_CHECKS - reduction)
+SAFETY_NET_SECONDS    = 120
+SAFETY_NET_MIN_BID    = 80
+POLL_SECONDS          = 1.0
+META_REFRESH_SECONDS  = 10.0
+MAX_RISK_PCT          = 0.35
+MIN_BALANCE_USD       = 5.00
+EXPIRY_BUFFER_SEC     = 10
 
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
 SPOT_URL = "https://api.coinbase.com/v2/prices/XRP-USD/spot"
