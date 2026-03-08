@@ -112,7 +112,7 @@ SLOPE_DROP_SKIP     = env_int("SLOPE_DROP_SKIP",        6)    # ¢ drop from pea
 VELOCITY_SKIP_PCT       = env_float("VELOCITY_SKIP_PCT",       0.30)   # skip if spot moved >0.30% during watch window
 VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",  3)     # +3¢ threshold during volatile windows (→93¢)
 # Volatile windows (ET hours): 11AM-1PM (US/London overlap), 9PM-11PM (Asia open)
-VOLATILE_WINDOWS_ET     = [(11, 13), (21, 23)]
+VOLATILE_WINDOWS_ET     = [(12, 14), (20, 22)]  # 12PM-2PM ET (US afternoon) and 8PM-10PM ET (pre-Asia)
 # Size scaling by number of OTHER 15M bots in same direction: [0 others, 1, 2, 3+]
 CORR_SCALE              = [1.0, 0.75, 0.55, 0.40]
 

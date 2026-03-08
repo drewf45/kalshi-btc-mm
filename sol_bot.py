@@ -108,7 +108,7 @@ SLOPE_DROP_SKIP     = env_int("SLOPE_DROP_SKIP",        6)
 # ── CORRELATED-RISK & VOLATILE-WINDOW GUARDS ─────────────────
 VELOCITY_SKIP_PCT       = env_float("VELOCITY_SKIP_PCT",       0.30)
 VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",  3)
-VOLATILE_WINDOWS_ET     = [(11, 13), (21, 23)]
+VOLATILE_WINDOWS_ET     = [(12, 14), (20, 22)]  # 12PM-2PM ET (US afternoon) and 8PM-10PM ET (pre-Asia)
 CORR_SCALE              = [1.0, 0.75, 0.55, 0.40]
 
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
