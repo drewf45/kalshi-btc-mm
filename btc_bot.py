@@ -826,14 +826,15 @@ def main() -> None:
                     risk_size_multiplier = 0.5
 
         # Guard 3: Price velocity (pct-based) — coin moving fast = momentum risk
-        if pre_price and st.watch_start_price:
-            delta     = pre_price - st.watch_start_price
+        # spot_check was fetched in Guard 2 above; reuse it here
+        if spot_check and st.watch_start_price:
+            delta     = spot_check - st.watch_start_price
             abs_delta = abs(delta)
             pct       = abs_delta / st.watch_start_price * 100
             arrow     = "↑" if delta > 0 else "↓"
             log.warning(
                 f"[PRICE-SANITY] watch_start=${st.watch_start_price:.2f} "
-                f"now=${pre_price:.2f} move={arrow}${abs_delta:.2f} ({pct:.3f}%)"
+                f"now=${spot_check:.2f} move={arrow}${abs_delta:.2f} ({pct:.3f}%)"
             )
             if pct >= VELOCITY_SKIP_PCT:
                 log.warning(
@@ -843,8 +844,8 @@ def main() -> None:
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
                 continue
-        elif pre_price:
-            log.warning(f"[PRICE-SANITY] now=${pre_price:.2f} (no watch_start recorded)")
+        elif spot_check:
+            log.warning(f"[PRICE-SANITY] now=${spot_check:.2f} (no watch_start recorded)")
 
         # Guard 4: Correlated direction — scale down if other bots entering same way
         corr_count = correlated_bot_count(client, side, BOT_ID)
