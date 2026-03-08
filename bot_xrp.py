@@ -388,7 +388,7 @@ def place_order(client: KalshiClient, ticker: str, side: str,
         "type":            "limit",
         "count":           max(1, int(count)),
         "client_order_id": f"{BOT_ID}-{uuid.uuid4().hex[:12]}",
-        "post_only":       True,   # XRP: always maker — protect margins on thin book
+        "post_only":       False,  # taker orders — fills immediately, critical for thin 15M windows
         "time_in_force":   "good_till_canceled",
     }
     if side == "yes":
