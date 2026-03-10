@@ -82,9 +82,10 @@ MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<
 DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
+# BTC whipsaws $100+ per 5-min candle — needs higher certainty than ETH/SOL
 WATCH_WINDOW_SECONDS = 180     # Start watching 180s before close — enter while book has depth
-CONFIRM_THRESHOLD    = 90      # Minimum bid (cents) to consider "certain"
-CONFIRM_CHECKS       = 4       # Max consecutive ticks required (at watch window start)
+CONFIRM_THRESHOLD    = 94      # BTC-specific: raised from 90¢ — whipsaw requires stronger signal
+CONFIRM_CHECKS       = 5       # BTC-specific: raised from 4 — need more consecutive ticks
 # Dynamic: requires 4 ticks at T=180s, reduces by 1 every 30s → min 1 at T=90s
 CONFIRM_STEP         = 30         # seconds per confirm reduction (15m bots: every 30s)
 def required_confirms(secs_to_close: float) -> int:
@@ -99,17 +100,17 @@ MIN_BALANCE_USD      = 5.00    # Don't trade if balance drops below this
 EXPIRY_BUFFER_SEC    = 10      # Cancel resting orders this many seconds before close
 
 # ── RISK GUARDS (tunable via env vars, never full block unless truly terrible) ──
-# 1. Threshold proximity — how close to the strike price is too close?
-PROXIMITY_SKIP_PCT  = env_float("PROXIMITY_SKIP_PCT",  0.20)  # skip if within 0.20% of threshold
-PROXIMITY_HALF_PCT  = env_float("PROXIMITY_HALF_PCT",  0.75)  # half size if within 0.75%
+# 1. Threshold proximity — BTC raised: $101 avg 5m range means being close to threshold is fatal
+PROXIMITY_SKIP_PCT  = env_float("PROXIMITY_SKIP_PCT",  0.50)  # BTC: raised 0.20→0.50% — skip if within 0.50% of threshold
+PROXIMITY_HALF_PCT  = env_float("PROXIMITY_HALF_PCT",  1.50)  # BTC: raised 0.75→1.50% — half size within 1.50%
 # 2. Price velocity — how much can coin move during watch window before we skip?
 VELOCITY_SKIP_USD   = env_float("VELOCITY_SKIP_USD",   0.0)   # 0 = log only, no skip yet (needs data)
 VELOCITY_HALF_USD   = env_float("VELOCITY_HALF_USD",   0.0)   # 0 = disabled
 # 3. Confidence slope — if bid drops this many cents from peak during confirm, skip
-SLOPE_DROP_SKIP     = env_int("SLOPE_DROP_SKIP",        6)    # ¢ drop from peak = weakening signal
+SLOPE_DROP_SKIP     = env_int("SLOPE_DROP_SKIP",        4)    # BTC: tightened 6→4¢ — less slope tolerance
 
 # ── CORRELATED-RISK & VOLATILE-WINDOW GUARDS ─────────────────
-VELOCITY_SKIP_PCT       = env_float("VELOCITY_SKIP_PCT",       0.30)   # skip if spot moved >0.30% during watch window
+VELOCITY_SKIP_PCT       = env_float("VELOCITY_SKIP_PCT",       0.20)   # BTC: tightened 0.30→0.20% — less velocity tolerance
 VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",  3)     # +3¢ during afternoon/evening (→93¢)
 MORNING_THRESHOLD_BONUS  = env_int("MORNING_THRESHOLD_BONUS",   7)     # +7¢ during 8-10AM (→97¢)
 # Volatile windows: 8-10AM (market open), 12-2PM (US/London), 3-4PM, 8-10PM (Asia)
