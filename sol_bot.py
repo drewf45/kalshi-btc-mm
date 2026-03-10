@@ -31,6 +31,7 @@ from urllib.parse import urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+import scoring_v10
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
@@ -73,6 +74,7 @@ def now_ms() -> int:
 
 # ======================== CONFIGURATION ======================
 BOT_ID          = "SOL"
+ASSET           = "SOL"
 SERIES_TICKER   = getenv_first(["SERIES", "KALSHI_SERIES"], "KXSOL15M")
 API_BASE        = getenv_first(["KALSHI_API_BASE"], "https://api.elections.kalshi.com").rstrip("/")
 API_PREFIX      = getenv_first(["KALSHI_API_PREFIX"], "/trade-api/v2").rstrip("/")
@@ -885,6 +887,36 @@ def main() -> None:
                 st.live_balance_usd = cash
         except Exception as e:
             log.warning(f"[BALANCE-REFRESH] {e}")
+
+
+        # ── V10 SCORING — gate entry on live signal quality ──
+        _avg_range  = _trend_state.get("avg_range", 0)
+        _own_trend  = get_trend()
+        _btc_trend  = get_btc_trend() if hasattr(__builtins__, '__dict__') else "neutral"
+        try:
+            from scoring_v10 import evaluate_entry as _v10_eval
+            _v10_result = _v10_eval(
+                asset        = ASSET,
+                side         = side,
+                price_cents  = buy_price,
+                own_trend    = _own_trend,
+                btc_trend    = _btc_trend,
+                avg_range    = _avg_range,
+                secs_to_close= secs_to_close,
+                live_balance = st.live_balance_usd,
+            )
+            if _v10_result is None:
+                log.warning(f"[V10-SKIP] {st.market} {side.upper()}@{buy_price}¢ — score below threshold, skipping")
+                TRADED_TICKERS.add(st.market)
+                st.traded_this_market = True
+                time.sleep(POLL_SECONDS)
+                continue
+            _, v10_contracts, v10_tier, v10_score = _v10_result
+            log.warning(f"[V10-ENTER] {st.market} {side.upper()}@{buy_price}¢ tier={v10_tier} score={v10_score:.3f} contracts={v10_contracts}")
+        except Exception as _v10_err:
+            log.warning(f"[V10-ERROR] {_v10_err} — falling back to standard sizing")
+            v10_contracts = None
+            v10_tier = None
 
         init_bid   = (yes_bid if side == "yes" else no_bid) or 99
         init_ask   = (yes_ask if side == "yes" else no_ask)
