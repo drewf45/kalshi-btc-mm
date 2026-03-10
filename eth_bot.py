@@ -446,7 +446,7 @@ def fetch_spot(http: requests.Session) -> Optional[float]:
 
 # ======================== TREND AWARENESS ====================
 def fetch_trend(http: requests.Session) -> str:
-    """Pull last hour of 5-min candles, return 'bullish'/'bearish'/'neutral'."""
+    """Pull last hour of 5-min candles — compute trend AND volatility-adjusted threshold bonus."""
     try:
         r = http.get(CANDLES_URL, params={"granularity": 300}, timeout=5)
         r.raise_for_status()
@@ -460,7 +460,19 @@ def fetch_trend(http: requests.Session) -> str:
         direction = "bearish" if pct < -0.5 else "bullish" if pct > 0.5 else "neutral"
         _trend_state["direction"] = direction
         _trend_state["updated"]   = time.time()
-        log.warning(f"[TREND] {direction.upper()} 1h={pct:+.2f}% (${old_close:.2f}→${recent_close:.2f})")
+        ranges = [abs(float(c[2]) - float(c[3])) for c in candles[:6]]
+        avg_range = sum(ranges) / len(ranges)
+        _trend_state["avg_range"] = avg_range
+        if avg_range > 20:
+            vol_bonus = 6; vol_label = "EXTREME"
+        elif avg_range > 8:
+            vol_bonus = 4; vol_label = "HIGH"
+        elif avg_range > 2:
+            vol_bonus = 2; vol_label = "MED"
+        else:
+            vol_bonus = 0; vol_label = "LOW"
+        _trend_state["vol_bonus"] = vol_bonus
+        log.warning(f"[TREND] {direction.upper()} 1h={pct:+.2f}% | vol={vol_label} avg_range=${avg_range:.2f} → +{vol_bonus}¢")
         return direction
     except Exception as e:
         log.warning(f"[TREND] fetch failed: {e}")
@@ -468,6 +480,9 @@ def fetch_trend(http: requests.Session) -> str:
 
 def get_trend() -> str:
     return _trend_state.get("direction", "neutral")
+
+def get_vol_bonus() -> int:
+    return _trend_state.get("vol_bonus", 0)
 
 
 # ======================== VOLATILE & CORR HELPERS ============
@@ -477,7 +492,9 @@ def is_volatile_window() -> bool:
     return any(start <= h < end for start, end in VOLATILE_WINDOWS_ET)
 
 def effective_threshold(side: str = "yes") -> int:
-    """Bid threshold raised during volatile windows and against-trend entries."""
+    """Volatility-adjusted bid threshold.
+    Layers: base + volatile window + trend bias + vol discount (corrects orderbook overconfidence).
+    """
     h = datetime.now(ZoneInfo("America/New_York")).hour
     if 8 <= h < 10:
         base = CONFIRM_THRESHOLD + MORNING_THRESHOLD_BONUS
@@ -488,7 +505,11 @@ def effective_threshold(side: str = "yes") -> int:
     trend = get_trend()
     if (side == "yes" and trend == "bearish") or (side == "no" and trend == "bullish"):
         base = min(99, base + TREND_BIAS_BONUS)
-        log.info(f"[TREND-GUARD] {trend.upper()} — {side.upper()} threshold raised to {base}¢")
+        log.info(f"[TREND-GUARD] {trend.upper()} — {side.upper()} threshold +{TREND_BIAS_BONUS}¢ → {base}¢")
+    vol_bonus = get_vol_bonus()
+    if vol_bonus > 0:
+        base = min(99, base + vol_bonus)
+        log.info(f"[VOL-GUARD] avg_range=${_trend_state.get('avg_range',0):.2f} — threshold +{vol_bonus}¢ → {base}¢")
     return base
 
 def correlated_bot_count(client: "KalshiClient", side: str, own_coin: str) -> int:
