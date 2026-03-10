@@ -109,6 +109,9 @@ CORR_SCALE               = [1.0, 0.75, 0.55, 0.40]  # size multiplier by # of co
 # ── COINBASE SPOT + CANDLES ───────────────────────────────────
 SPOT_URL    = "https://api.coinbase.com/v2/prices/XRP-USD/spot"
 CANDLES_URL = "https://api.exchange.coinbase.com/products/XRP-USD/candles"
+# ── BTC MASTER SIGNAL (confirmation) ─────────────────────────
+BTC_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+_btc_trend_state: Dict = {"direction": "neutral", "updated": 0.0}
 
 # ── TREND AWARENESS ──────────────────────────────────────────
 TREND_WINDOW_CANDLES = 12
@@ -477,6 +480,29 @@ def get_trend() -> str:
 
 def get_vol_bonus() -> int:
     return _trend_state.get("vol_bonus", 0)
+def fetch_btc_trend(http: requests.Session) -> str:
+    """Fetch BTC master trend — the confirmation signal all alt-coin bots must check."""
+    try:
+        r = http.get(BTC_CANDLES_URL, params={"granularity": 300}, timeout=5)
+        r.raise_for_status()
+        candles = r.json()
+        if len(candles) < TREND_WINDOW_CANDLES:
+            return "neutral"
+        recent = float(candles[0][4])
+        old    = float(candles[TREND_WINDOW_CANDLES - 1][4])
+        pct    = (recent - old) / old * 100
+        direction = "bearish" if pct < -0.5 else "bullish" if pct > 0.5 else "neutral"
+        _btc_trend_state["direction"] = direction
+        _btc_trend_state["updated"]   = time.time()
+        log.warning(f"[BTC-TREND] {direction.upper()} 1h={pct:+.2f}% (master signal)")
+        return direction
+    except Exception as e:
+        log.warning(f"[BTC-TREND] fetch failed: {e}")
+        return _btc_trend_state.get("direction", "neutral")
+
+def get_btc_trend() -> str:
+    return _btc_trend_state.get("direction", "neutral")
+
 
 
 # ======================== VOLATILE & CORR HELPERS ============
@@ -497,6 +523,15 @@ def effective_threshold(secs_to_close: float, side: str = "yes") -> int:
     if vol_bonus > 0:
         base = min(99, base + vol_bonus)
         log.info(f"[VOL-GUARD] avg_range=${_trend_state.get('avg_range',0):.4f} — threshold +{vol_bonus}¢ → {base}¢")
+    # BTC master signal confirmation — own trend must agree with BTC
+    # If they conflict, add penalty; if BTC confirms, proceed with conviction
+    btc_trend = get_btc_trend()
+    own_trend = trend  # already computed above
+    if own_trend != "neutral" and btc_trend != "neutral" and own_trend != btc_trend:
+        base = min(99, base + 5)
+        log.warning(f"[UNCONFIRMED] {own_trend.upper()} vs BTC {btc_trend.upper()} — conflicting signals, +5¢ penalty → {base}¢")
+    elif own_trend == btc_trend and own_trend != "neutral":
+        log.info(f"[CONFIRMED] {own_trend.upper()} matches BTC master signal ✓")
     return base
 
 def correlated_bot_count(client: "KalshiClient", side: str, own_coin: str) -> int:
@@ -661,7 +696,8 @@ def main() -> None:
         # ── Refresh trend (every 5 min) ──────────────────────
         now = time.time()
         if now - last_trend > TREND_REFRESH_SEC:
-            fetch_trend(http)
+            fetch_trend(http)       # own coin trend
+            fetch_btc_trend(http)   # BTC master confirmation signal
             last_trend = now
 
         # ── Refresh active market ───────────────────────────
