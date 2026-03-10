@@ -107,8 +107,10 @@ SLOPE_DROP_SKIP     = env_int("SLOPE_DROP_SKIP",        6)
 
 # ── CORRELATED-RISK & VOLATILE-WINDOW GUARDS ─────────────────
 VELOCITY_SKIP_PCT       = env_float("VELOCITY_SKIP_PCT",       0.30)
-VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",  3)
-VOLATILE_WINDOWS_ET     = [(12, 14), (20, 22)]  # 12PM-2PM ET (US afternoon) and 8PM-10PM ET (pre-Asia)
+VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",  3)     # +3¢ during afternoon/evening (→93¢)
+MORNING_THRESHOLD_BONUS  = env_int("MORNING_THRESHOLD_BONUS",   7)     # +7¢ during 8-10AM (→97¢)
+# Volatile windows: 8-10AM (market open), 12-2PM (US/London), 3-4PM, 8-10PM (Asia)
+VOLATILE_WINDOWS_ET     = [(8, 10), (12, 14), (15, 16), (20, 22)]
 CORR_SCALE              = [1.0, 0.75, 0.55, 0.40]
 
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
@@ -443,8 +445,12 @@ def is_volatile_window() -> bool:
 
 def effective_threshold() -> int:
     """Bid threshold raised during volatile windows."""
-    bonus = VOLATILE_THRESHOLD_BONUS if is_volatile_window() else 0
-    return CONFIRM_THRESHOLD + bonus
+    h = datetime.now(ZoneInfo("America/New_York")).hour
+    if 8 <= h < 10:
+        return CONFIRM_THRESHOLD + MORNING_THRESHOLD_BONUS
+    elif is_volatile_window():
+        return CONFIRM_THRESHOLD + VOLATILE_THRESHOLD_BONUS
+    return CONFIRM_THRESHOLD
 
 def correlated_bot_count(client: "KalshiClient", side: str, own_coin: str) -> int:
     """Count OTHER 15M bots currently holding an open position in the same direction."""

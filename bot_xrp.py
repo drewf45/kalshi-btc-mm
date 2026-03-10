@@ -100,8 +100,10 @@ EXPIRY_BUFFER_SEC    = 10      # Cancel resting orders this many seconds before 
 
 # ── CORRELATED-RISK & VOLATILE-WINDOW GUARDS ─────────────────
 VELOCITY_SKIP_PCT        = env_float("VELOCITY_SKIP_PCT",        0.30)  # skip if spot moved >0.30% during watch window
-VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",   3)     # +3¢ threshold during volatile windows
-VOLATILE_WINDOWS_ET      = [(12, 14), (20, 22)]  # 12PM-2PM ET and 8PM-10PM ET
+VOLATILE_THRESHOLD_BONUS = env_int("VOLATILE_THRESHOLD_BONUS",   3)     # +3¢ during afternoon/evening (→94¢)
+MORNING_THRESHOLD_BONUS  = env_int("MORNING_THRESHOLD_BONUS",    7)     # +7¢ during 8-10AM (→98¢)
+# Volatile windows: 8-10AM (market open), 12-2PM (US/London), 3-4PM, 8-10PM (Asia)
+VOLATILE_WINDOWS_ET      = [(8, 10), (12, 14), (15, 16), (20, 22)]
 CORR_SCALE               = [1.0, 0.75, 0.55, 0.40]  # size multiplier by # of correlated bots
 
 # ── COINBASE SPOT (logging + soft sanity only) ────────────────
