@@ -106,8 +106,15 @@ MORNING_THRESHOLD_BONUS  = env_int("MORNING_THRESHOLD_BONUS",    7)     # +7¢ d
 VOLATILE_WINDOWS_ET      = [(8, 10), (12, 14), (15, 16), (20, 22)]
 CORR_SCALE               = [1.0, 0.75, 0.55, 0.40]  # size multiplier by # of correlated bots
 
-# ── COINBASE SPOT (logging + soft sanity only) ────────────────
-SPOT_URL = "https://api.coinbase.com/v2/prices/XRP-USD/spot"
+# ── COINBASE SPOT + CANDLES ───────────────────────────────────
+SPOT_URL    = "https://api.coinbase.com/v2/prices/XRP-USD/spot"
+CANDLES_URL = "https://api.exchange.coinbase.com/products/XRP-USD/candles"
+
+# ── TREND AWARENESS ──────────────────────────────────────────
+TREND_WINDOW_CANDLES = 12
+TREND_BIAS_BONUS     = 5
+TREND_REFRESH_SEC    = 300
+_trend_state: Dict = {"direction": "neutral", "updated": 0.0, "pct": 0.0}
 
 # Fast local guard — prevents re-entry during API lag
 TRADED_TICKERS: set = set()
@@ -430,16 +437,47 @@ def fetch_spot(http: requests.Session) -> Optional[float]:
         return None
 
 
+# ======================== TREND AWARENESS ====================
+def fetch_trend(http: requests.Session) -> str:
+    """Pull last hour of 5-min candles, return 'bullish'/'bearish'/'neutral'."""
+    try:
+        r = http.get(CANDLES_URL, params={"granularity": 300}, timeout=5)
+        r.raise_for_status()
+        candles = r.json()
+        if len(candles) < TREND_WINDOW_CANDLES:
+            return "neutral"
+        recent_close = float(candles[0][4])
+        old_close    = float(candles[TREND_WINDOW_CANDLES - 1][4])
+        pct = (recent_close - old_close) / old_close * 100
+        _trend_state["pct"] = pct
+        direction = "bearish" if pct < -0.5 else "bullish" if pct > 0.5 else "neutral"
+        _trend_state["direction"] = direction
+        _trend_state["updated"]   = time.time()
+        log.warning(f"[TREND] {direction.upper()} 1h={pct:+.2f}% (${old_close:.4f}→${recent_close:.4f})")
+        return direction
+    except Exception as e:
+        log.warning(f"[TREND] fetch failed: {e}")
+        return _trend_state.get("direction", "neutral")
+
+def get_trend() -> str:
+    return _trend_state.get("direction", "neutral")
+
+
 # ======================== VOLATILE & CORR HELPERS ============
 def is_volatile_window() -> bool:
     """True if current ET time falls in a known high-volatility window."""
     h = datetime.now(ZoneInfo("America/New_York")).hour
     return any(start <= h < end for start, end in VOLATILE_WINDOWS_ET)
 
-def effective_threshold(secs_to_close: float) -> int:
-    """Dynamic threshold + volatile window bonus."""
+def effective_threshold(secs_to_close: float, side: str = "yes") -> int:
+    """Dynamic threshold + volatile window bonus + trend bias."""
     bonus = VOLATILE_THRESHOLD_BONUS if is_volatile_window() else 0
-    return confirm_threshold(secs_to_close) + bonus
+    base = confirm_threshold(secs_to_close) + bonus
+    trend = get_trend()
+    if (side == "yes" and trend == "bearish") or (side == "no" and trend == "bullish"):
+        base = min(99, base + TREND_BIAS_BONUS)
+        log.info(f"[TREND-GUARD] {trend.upper()} — {side.upper()} threshold raised to {base}¢")
+    return base
 
 def correlated_bot_count(client: "KalshiClient", side: str, own_coin: str) -> int:
     """Count OTHER 15M bots currently holding an open position in the same direction."""
@@ -542,6 +580,7 @@ def main() -> None:
 
     last_meta      = 0.0
     last_state_log = 0.0
+    last_trend     = 0.0
 
     def refresh_market():
         if MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
@@ -598,6 +637,12 @@ def main() -> None:
     # ── MAIN LOOP ─────────────────────────────────────────────
     while True:
         _watchdog_ts[0] = time.time()
+
+        # ── Refresh trend (every 5 min) ──────────────────────
+        now = time.time()
+        if now - last_trend > TREND_REFRESH_SEC:
+            fetch_trend(http)
+            last_trend = now
 
         # ── Refresh active market ───────────────────────────
         now = time.time()
@@ -708,9 +753,10 @@ def main() -> None:
             st.certainty_counter = CONFIRM_CHECKS  # skip to confirmed
         else:
             # ── WATCH-CONFIRM ────────────────────────────────
-            thresh = effective_threshold(secs_to_close)
-            yes_certain = yes_bid is not None and yes_bid >= thresh
-            no_certain  = no_bid  is not None and no_bid  >= thresh
+            thresh_yes  = effective_threshold(secs_to_close, "yes")
+            thresh_no   = effective_threshold(secs_to_close, "no")
+            yes_certain = yes_bid is not None and yes_bid >= thresh_yes
+            no_certain  = no_bid  is not None and no_bid  >= thresh_no
 
             if yes_certain:
                 if st.certainty_side == "yes":
@@ -718,17 +764,17 @@ def main() -> None:
                 else:
                     st.certainty_side    = "yes"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] YES@{yes_bid}¢ threshold={thresh}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] YES@{yes_bid}¢ threshold={thresh_yes}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             elif no_certain:
                 if st.certainty_side == "no":
                     st.certainty_counter += 1
                 else:
                     st.certainty_side    = "no"
                     st.certainty_counter = 1
-                log.info(f"[WATCH] NO@{no_bid}¢ threshold={thresh}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
+                log.info(f"[WATCH] NO@{no_bid}¢ threshold={thresh_no}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
                 if st.certainty_counter > 0:
-                    log.info(f"[RESET] Dropped below {thresh}¢ — counter reset")
+                    log.info(f"[RESET] Dropped below threshold — counter reset")
                 st.certainty_counter = 0
                 st.certainty_side    = None
                 time.sleep(POLL_SECONDS)
