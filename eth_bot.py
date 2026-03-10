@@ -826,8 +826,11 @@ def main() -> None:
                     )
                     risk_size_multiplier = 0.5
 
-        # Guard 3: Price velocity (pct-based) — coin moving fast = momentum risk
-        # spot_check was fetched in Guard 2 above; reuse it here
+        # Guard 3: Price velocity (pct-based) — direction-aware momentum risk
+        # Only skip if velocity is AGAINST our position:
+        #   YES entry: price falling toward threshold = bad
+        #   NO entry:  price rising toward threshold = bad
+        #   Confirming direction = let it ride
         if spot_check and st.watch_start_price:
             delta     = spot_check - st.watch_start_price
             abs_delta = abs(delta)
@@ -837,14 +840,21 @@ def main() -> None:
                 f"[PRICE-SANITY] watch_start=${st.watch_start_price:.2f} "
                 f"now=${spot_check:.2f} move={arrow}${abs_delta:.2f} ({pct:.3f}%)"
             )
-            if pct >= VELOCITY_SKIP_PCT:
+            velocity_against = (side == "yes" and delta < 0) or (side == "no" and delta > 0)
+            if pct >= VELOCITY_SKIP_PCT and velocity_against:
                 log.warning(
-                    f"[VELOCITY-SKIP] {st.market} spot moved {pct:.3f}% ≥ {VELOCITY_SKIP_PCT}% — skipping"
+                    f"[VELOCITY-SKIP] {st.market} spot moved {pct:.3f}% ≥ {VELOCITY_SKIP_PCT}% "
+                    f"AGAINST {side.upper()} — skipping"
                 )
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
                 continue
+            elif pct >= VELOCITY_SKIP_PCT:
+                log.warning(
+                    f"[VELOCITY-CONFIRM] {st.market} spot moved {pct:.3f}% "
+                    f"CONFIRMING {side.upper()} — proceeding"
+                )
         elif spot_check:
             log.warning(f"[PRICE-SANITY] now=${spot_check:.2f} (no watch_start recorded)")
 

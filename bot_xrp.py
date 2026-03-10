@@ -783,14 +783,21 @@ def main() -> None:
                 f"[PRICE-SANITY] watch_start=${st.watch_start_price:.4f} "
                 f"now=${spot_check:.4f} move={arrow}${abs_delta:.4f} ({pct:.3f}%)"
             )
-            if pct >= VELOCITY_SKIP_PCT:
+            velocity_against = (side == "yes" and delta < 0) or (side == "no" and delta > 0)
+            if pct >= VELOCITY_SKIP_PCT and velocity_against:
                 log.warning(
-                    f"[VELOCITY-SKIP] {st.market} spot moved {pct:.3f}% ≥ {VELOCITY_SKIP_PCT}% — skipping"
+                    f"[VELOCITY-SKIP] {st.market} spot moved {pct:.3f}% ≥ {VELOCITY_SKIP_PCT}% "
+                    f"AGAINST {side.upper()} — skipping"
                 )
                 TRADED_TICKERS.add(st.market)
                 st.traded_this_market = True
                 time.sleep(POLL_SECONDS)
                 continue
+            elif pct >= VELOCITY_SKIP_PCT:
+                log.warning(
+                    f"[VELOCITY-CONFIRM] {st.market} spot moved {pct:.3f}% "
+                    f"CONFIRMING {side.upper()} — proceeding"
+                )
         elif spot_check:
             log.warning(f"[PRICE-SANITY] now=${spot_check:.4f} (no watch_start recorded)")
 
