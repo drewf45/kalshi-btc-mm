@@ -206,56 +206,67 @@ def compute_size(score: float, price: float, balance: float) -> float:
 
 # ── MARKET DISCOVERY ──────────────────────────────────────────
 
-ASSET_NAMES = {
-    "BTC": ["bitcoin"],
-    "ETH": ["ethereum"],
-    "SOL": ["solana"],
-    "XRP": ["xrp"],
+ASSET_SLUG = {
+    "BTC": "btc",
+    "ETH": "eth",
+    "SOL": "sol",
+    "XRP": "xrp",
 }
+GAMMA_EVENT_URL = "https://gamma-api.polymarket.com/events/slug"
+
+def _next_15min_timestamps(now: datetime) -> list:
+    """Return unix timestamps for next 2 upcoming 15-min window start times."""
+    m = now.minute
+    current_boundary = (m // 15) * 15
+    starts = []
+    for i in range(3):
+        boundary = current_boundary + i * 15
+        h_offset = boundary // 60
+        min_offset = boundary % 60
+        dt = now.replace(minute=min_offset, second=0, microsecond=0) + timedelta(hours=h_offset)
+        starts.append(int(dt.timestamp()))
+    return starts
 
 def find_next_market(now: datetime) -> Optional[dict]:
-    """Find the next open 'Up or Down' 5-min market for this asset."""
-    try:
-        r = requests.get(GAMMA_URL,
-            params={"active": True, "closed": False, "limit": 500},
-            timeout=10)
-        markets = [m for m in r.json() if isinstance(m, dict)]
-    except Exception as e:
-        log.warning(f"[MARKET-FIND] {e}")
-        return None
+    """Find next open 15-min Up/Down market via slug-based lookup."""
+    slug_prefix = ASSET_SLUG.get(ASSET, ASSET.lower())
+    timestamps = _next_15min_timestamps(now)
 
-    asset_keywords = ASSET_NAMES.get(ASSET, [ASSET.lower()])
-    # Match 15-min format only: "Bitcoin Up or Down - March 11, 1:15PM-1:30PM ET"
-    # Requires two HH:MM times (colon present in both) indicating a bounded window
-    pattern = re.compile(
-        r"(" + "|".join(asset_keywords) + r") up or down.+\d+:\d+[ap]m.+\d+:\d+[ap]m",
-        re.IGNORECASE
-    )
+    for ts in timestamps:
+        slug = f"{slug_prefix}-updown-15m-{ts}"
+        try:
+            r = requests.get(f"{GAMMA_EVENT_URL}/{slug}", timeout=8)
+            if r.status_code != 200:
+                continue
+            event = r.json()
+        except Exception as e:
+            log.warning(f"[MARKET-FIND] {e}")
+            continue
 
-    candidates = []
-    for m in markets:
-        q   = m.get("question", "")
+        markets = event.get("markets", [])
+        if not markets:
+            continue
+
+        # Use the single market in this event
+        m = markets[0]
         end = m.get("endDate", "") or ""
-        if not pattern.search(q): continue
-        if not m.get("clobTokenIds"): continue
+        if not m.get("clobTokenIds"):
+            continue
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
         except:
             continue
+
         secs = (end_dt - now).total_seconds()
-        if secs < 10 or secs > 1200:   # closing within 10s–20min
+        if secs < 10 or secs > 1200:
+            log.info(f"[SCAN] {ASSET} window found but not in entry range (secs={secs:.0f})")
             continue
+
         liq = float(m.get("liquidity", 0) or 0)
-        candidates.append({"market": m, "secs": secs, "liq": liq, "end_dt": end_dt})
+        log.info(f"[MARKET] {event.get('title','')[:65]} ends_in={secs:.0f}s liq=${liq:,.0f}")
+        return {"market": m, "secs": secs, "liq": liq, "end_dt": end_dt}
 
-    if not candidates:
-        return None
-
-    # Pick the soonest-closing with decent liquidity
-    candidates.sort(key=lambda x: x["secs"])
-    best = candidates[0]
-    log.info(f"[MARKET] {best['market']['question'][:65]} ends_in={best['secs']:.0f}s liq=${best['liq']:,.0f}")
-    return best
+    return None
 
 # ── ORDERBOOK READ ────────────────────────────────────────────
 
