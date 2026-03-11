@@ -338,32 +338,15 @@ def get_usdc_balance(client: ClobClient) -> float:
 TRADED_WINDOWS: set = set()
 
 def main():
-    global _last_trend
+    log.warning(f"🚀 Polymarket {ASSET} bot starting (V5 participation-first)")
 
-    log.warning(f"🚀 Polymarket {ASSET} bot starting (V10 scoring)")
-
-    http    = requests.Session()
     client  = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=1, funder=FUNDER)
     creds   = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
     log.warning(f"✅ Connected — API key {creds.api_key[:12]}...")
 
-    et = ZoneInfo("America/New_York")
-
-    # Initial trend fetch
-    fetch_trend(http)
-    fetch_btc_trend(http)
-    _last_trend = time.time()
-
     while True:
         now_utc = datetime.now(timezone.utc)
-        now_et  = now_utc.astimezone(et)
-
-        # Refresh trends every 5 min
-        if time.time() - _last_trend > TREND_REFRESH_SEC:
-            fetch_trend(http)
-            fetch_btc_trend(http)
-            _last_trend = time.time()
 
         # Find next market
         candidate = find_next_market(now_utc)
@@ -374,7 +357,6 @@ def main():
 
         m      = candidate["market"]
         secs   = candidate["secs"]
-        end_dt = candidate["end_dt"]
         q      = m["question"]
 
         # Already traded this window?
@@ -384,7 +366,7 @@ def main():
             time.sleep(10)
             continue
 
-        # Too early?
+        # Too early — wait
         if secs > ENTRY_WINDOW:
             log.info(f"[WAIT] {q[:50]} closes in {secs:.0f}s (watching at {ENTRY_WINDOW}s)")
             time.sleep(max(0, min(secs - ENTRY_WINDOW - 5, 30)))
@@ -411,47 +393,37 @@ def main():
             time.sleep(5)
             continue
 
-        # Determine best side and score — same V10 logic as Kalshi
-        # Score both sides, pick whichever scores above threshold
-        side, price, token_id, score = None, None, None, 0.0
-
-        if no_price is not None and no_price >= MIN_PRICE:
-            score_no = v10_score("no", no_price, secs)
-            if score_no >= MIN_SCORE:
-                side, price, token_id, score = "no", no_price, token_ids[1], score_no
+        # V5 participation-first: buy the high-confidence side (ask >= MIN_PRICE)
+        # Same logic as Kalshi btc_bot.py — trust the market, show up every window
+        side, price, token_id = None, None, None
 
         if yes_price is not None and yes_price >= MIN_PRICE:
-            score_yes = v10_score("yes", yes_price, secs)
-            if score_yes >= MIN_SCORE and (side is None or score_yes > score):
-                side, price, token_id, score = "yes", yes_price, token_ids[0], score_yes
+            side, price, token_id = "yes", yes_price, token_ids[0]
+
+        if no_price is not None and no_price >= MIN_PRICE:
+            if side is None or no_price > price:
+                side, price, token_id = "no", no_price, token_ids[1]
 
         if side is None:
-            log.warning(f"[V10-SKIP] {q[:50]} yes={yes_price} no={no_price} — score below threshold or price out of range")
+            log.warning(f"[SKIP] {q[:50]} yes={yes_price} no={no_price} — neither side >= {MIN_PRICE}")
             TRADED_WINDOWS.add(window_key)
             time.sleep(5)
             continue
 
-        # Get balance and size
+        # Get balance and size — 20% of balance like Kalshi
         balance = get_usdc_balance(client)
         if balance < 0.50:
-            log.warning(f"[LOW-BALANCE] CLOB reports ${balance:.2f} — using assumed ${ASSUMED_BALANCE:.2f} (custodial deposit pending on-chain)")
+            log.warning(f"[LOW-BALANCE] CLOB reports ${balance:.2f} — using assumed ${ASSUMED_BALANCE:.2f}")
             balance = ASSUMED_BALANCE
 
-        size = compute_size(score, price, balance)
-        # Enforce Polymarket minimum order size (5 shares)
-        size = max(size, MIN_ORDER_SHARES)
+        # Size = 20% of balance like Kalshi V5, min 5 shares, hard cap $10
+        usdc_risk = min(balance * MAX_RISK_PCT, MAX_USDC)
+        size = max(round(usdc_risk / price, 2), MIN_ORDER_SHARES)
         usdc_cost = size * price
-        if usdc_cost > MAX_USDC or usdc_cost > balance * MAX_RISK_PCT:
-            log.warning(f"[SIZE-SKIP] ${usdc_cost:.2f} exceeds risk limits")
-            TRADED_WINDOWS.add(window_key)
-            time.sleep(5)
-            continue
 
-        tier = score_to_tier(score)
         log.warning(
             f"[ENTER] {ASSET} {side.upper()}@{price:.2f} "
-            f"x{size:.2f} shares (${size*price:.2f}) tier={tier} score={score:.3f} "
-            f"bal=${balance:.2f} t={secs:.0f}s"
+            f"x{size:.2f} shares (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s"
         )
 
         success = place_order(client, token_id, price, size, side)
