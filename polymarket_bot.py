@@ -52,6 +52,11 @@ MAX_USDC      = 10.0     # never risk more than $10 on one Polymarket trade (sma
 MIN_PRICE     = 0.85     # don't enter below 85¢ (0.85) on Polymarket
 ENTRY_WINDOW  = 120      # enter when ≤120s from close
 
+# Fixed fallback sizing when CLOB balance API returns 0 (custodial wallet not yet on-chain)
+# Tiers: HIGH=$3, MEDIUM=$2, LOW=$1 — conservative until wallet is verified
+FIXED_TIER_USDC = {"HIGH": 3.0, "MEDIUM": 2.0, "LOW": 1.0}
+ASSUMED_BALANCE = 30.0  # Drew's actual deposit — used if CLOB returns $0
+
 # ── TREND STATE ───────────────────────────────────────────────
 TREND_REFRESH_SEC   = 300
 TREND_WINDOW_CANDLES = 12
@@ -185,7 +190,9 @@ def compute_size(score: float, price: float, balance: float) -> float:
     tier_pct    = TIER_PCT[tier]
     raw_usdc    = tier_pct * balance
     hard_cap    = MAX_RISK_PCT * balance
-    capped_usdc = min(raw_usdc, hard_cap, MAX_USDC)
+    # Also cap by fixed tier amounts (safe conservative floor while wallet is being verified)
+    fixed_cap   = FIXED_TIER_USDC.get(tier, 1.0)
+    capped_usdc = min(raw_usdc, hard_cap, MAX_USDC, fixed_cap)
     size        = capped_usdc / price
     log.info(f"[SIZE] tier={tier} ${capped_usdc:.2f} @ {price:.2f} = {size:.2f} shares")
     return round(size, 2)
@@ -399,9 +406,8 @@ def main():
         # Get balance and size
         balance = get_usdc_balance(client)
         if balance < 0.50:
-            log.warning(f"[LOW-BALANCE] ${balance:.2f} USDC — skipping")
-            time.sleep(30)
-            continue
+            log.warning(f"[LOW-BALANCE] CLOB reports ${balance:.2f} — using assumed ${ASSUMED_BALANCE:.2f} (custodial deposit pending on-chain)")
+            balance = ASSUMED_BALANCE
 
         size = compute_size(score, price, balance)
         if size < 0.01:
