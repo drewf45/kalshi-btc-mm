@@ -412,29 +412,22 @@ def main():
             time.sleep(5)
             continue
 
-        # Determine best side and score
-        # Edge comes from disagreeing with consensus:
-        #   BULLISH signal → buy YES when market underprices UP (yes_price low-to-mid)
-        #   BEARISH signal → buy NO when market underprices DOWN (no_price low-to-mid)
-        #   NEUTRAL → skip (no directional edge over consensus)
+        # Determine best side and score — same V10 logic as Kalshi
+        # Score both sides, pick whichever scores above threshold
         side, price, token_id, score = None, None, None, 0.0
-        own_trend = get_trend()
-        btc_trend = get_btc_trend()
-        is_bullish = own_trend == "bullish" or btc_trend == "bullish"
-        is_bearish = own_trend == "bearish" or btc_trend == "bearish"
 
-        if is_bullish and yes_price is not None and MIN_PRICE <= yes_price <= MAX_PRICE:
-            score_yes = v10_score("yes", yes_price, secs)
-            if score_yes >= MIN_SCORE:
-                side, price, token_id, score = "yes", yes_price, token_ids[0], score_yes
-
-        if side is None and is_bearish and no_price is not None and MIN_PRICE <= no_price <= MAX_PRICE:
+        if no_price is not None and MIN_PRICE <= no_price <= MAX_PRICE:
             score_no = v10_score("no", no_price, secs)
             if score_no >= MIN_SCORE:
                 side, price, token_id, score = "no", no_price, token_ids[1], score_no
 
+        if yes_price is not None and MIN_PRICE <= yes_price <= MAX_PRICE:
+            score_yes = v10_score("yes", yes_price, secs)
+            if score_yes >= MIN_SCORE and (side is None or score_yes > score):
+                side, price, token_id, score = "yes", yes_price, token_ids[0], score_yes
+
         if side is None:
-            log.warning(f"[V10-SKIP] {q[:50]} yes={yes_price} no={no_price} trend={own_trend}/{btc_trend} — no directional edge")
+            log.warning(f"[V10-SKIP] {q[:50]} yes={yes_price} no={no_price} — score below threshold or price out of range")
             TRADED_WINDOWS.add(window_key)
             time.sleep(5)
             continue
