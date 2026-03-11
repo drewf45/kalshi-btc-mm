@@ -64,8 +64,8 @@ MAX_USDC      = 10.0     # never risk more than $10 on one Polymarket trade (sma
 #   0.75 → need 82.5% win rate (tight)
 #   0.85 → need 93.5% win rate (too high — skip)
 # Target: enter when price is 0.50–0.72 with directional signal.
-MIN_PRICE     = 0.50     # don't enter below 50¢ (random noise)
-MAX_PRICE     = 0.72     # don't enter above 72¢ (fee eats all edge)
+MIN_PRICE     = 0.10     # don't enter below 10¢ (too extreme, market knows something)
+MAX_PRICE     = 0.65     # don't pay more than 65¢ — fee + price > 71.5¢ eats all edge
 MIN_ORDER_SHARES = 5     # Polymarket 15-min market minimum order size
 
 ENTRY_WINDOW  = 120      # enter when ≤120s from close
@@ -388,7 +388,7 @@ def main():
         # Too early?
         if secs > ENTRY_WINDOW:
             log.info(f"[WAIT] {q[:50]} closes in {secs:.0f}s (watching at {ENTRY_WINDOW}s)")
-            time.sleep(min(secs - ENTRY_WINDOW - 5, 30))
+            time.sleep(max(0, min(secs - ENTRY_WINDOW - 5, 30)))
             continue
 
         # Parse token IDs
@@ -413,21 +413,28 @@ def main():
             continue
 
         # Determine best side and score
-        # Only enter when price is in the sweet spot (50-72¢) where 10% fee leaves room for edge
+        # Edge comes from disagreeing with consensus:
+        #   BULLISH signal → buy YES when market underprices UP (yes_price low-to-mid)
+        #   BEARISH signal → buy NO when market underprices DOWN (no_price low-to-mid)
+        #   NEUTRAL → skip (no directional edge over consensus)
         side, price, token_id, score = None, None, None, 0.0
+        own_trend = get_trend()
+        btc_trend = get_btc_trend()
+        is_bullish = own_trend == "bullish" or btc_trend == "bullish"
+        is_bearish = own_trend == "bearish" or btc_trend == "bearish"
 
-        if no_price is not None and MIN_PRICE <= no_price <= MAX_PRICE:
-            score_no = v10_score("no", no_price, secs)
-            if score_no >= MIN_SCORE:
-                side, price, token_id, score = "no", no_price, token_ids[1], score_no
-
-        if side is None and yes_price is not None and MIN_PRICE <= yes_price <= MAX_PRICE:
+        if is_bullish and yes_price is not None and MIN_PRICE <= yes_price <= MAX_PRICE:
             score_yes = v10_score("yes", yes_price, secs)
             if score_yes >= MIN_SCORE:
                 side, price, token_id, score = "yes", yes_price, token_ids[0], score_yes
 
+        if side is None and is_bearish and no_price is not None and MIN_PRICE <= no_price <= MAX_PRICE:
+            score_no = v10_score("no", no_price, secs)
+            if score_no >= MIN_SCORE:
+                side, price, token_id, score = "no", no_price, token_ids[1], score_no
+
         if side is None:
-            log.warning(f"[V10-SKIP] {q[:50]} yes={yes_price} no={no_price} — price outside sweet spot or score too low")
+            log.warning(f"[V10-SKIP] {q[:50]} yes={yes_price} no={no_price} trend={own_trend}/{btc_trend} — no directional edge")
             TRADED_WINDOWS.add(window_key)
             time.sleep(5)
             continue
