@@ -64,8 +64,7 @@ MAX_USDC      = 10.0     # never risk more than $10 on one Polymarket trade (sma
 #   0.75 → need 82.5% win rate (tight)
 #   0.85 → need 93.5% win rate (too high — skip)
 # Target: enter when price is 0.50–0.72 with directional signal.
-MIN_PRICE     = 0.10     # don't enter below 10¢ (too extreme, market knows something)
-MAX_PRICE     = 0.65     # don't pay more than 65¢ — fee + price > 71.5¢ eats all edge
+MIN_PRICE     = 0.85     # same as Kalshi — only enter when market price is 85¢+
 MIN_ORDER_SHARES = 5     # Polymarket 15-min market minimum order size
 
 ENTRY_WINDOW  = 120      # enter when ≤120s from close
@@ -416,12 +415,12 @@ def main():
         # Score both sides, pick whichever scores above threshold
         side, price, token_id, score = None, None, None, 0.0
 
-        if no_price is not None and MIN_PRICE <= no_price <= MAX_PRICE:
+        if no_price is not None and no_price >= MIN_PRICE:
             score_no = v10_score("no", no_price, secs)
             if score_no >= MIN_SCORE:
                 side, price, token_id, score = "no", no_price, token_ids[1], score_no
 
-        if yes_price is not None and MIN_PRICE <= yes_price <= MAX_PRICE:
+        if yes_price is not None and yes_price >= MIN_PRICE:
             score_yes = v10_score("yes", yes_price, secs)
             if score_yes >= MIN_SCORE and (side is None or score_yes > score):
                 side, price, token_id, score = "yes", yes_price, token_ids[0], score_yes
