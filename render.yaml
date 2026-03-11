@@ -1,7 +1,40 @@
 services:
   - type: worker
-    name: kalshi-btc-mm
+    name: kalshi-btc-1h
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python polymarket_bot.py
+    envVars:
+      - key: ASSET
+        value: BTC
+
+  - type: worker
+    name: kalshi-ETh-1 hour
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python polymarket_bot.py
+    envVars:
+      - key: ASSET
+        value: ETH
+
+  - type: worker
+    name: kalshi-sol 1 hour
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python polymarket_bot.py
+    envVars:
+      - key: ASSET
+        value: SOL
+
+  - type: worker
+    name: kalshi-XRP-daily
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python polymarket_bot.py
+    envVars:
+      - key: ASSET
+        value: XRP
