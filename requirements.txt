@@ -1,8 +1,3 @@
 requests
-websockets
-python-dotenv
-cryptography
-PyJWT
-scipy
 eth-account
 py-clob-client
