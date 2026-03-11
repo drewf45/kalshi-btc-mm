@@ -31,15 +31,22 @@ CANDLES_URL     = {
 BTC_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 
 # ── SECRETS ───────────────────────────────────────────────────
-_raw = open("/Users/mr.fagaly/.openclaw/secrets.json").read()
-try:
-    _sec = json.loads(_raw)
-    PRIVATE_KEY = _sec["POLYMARKET_PRIVATE_KEY"]
-    FUNDER      = _sec["POLYMARKET_FUNDER_ADDRESS"]
-except Exception:
-    import re as _re
-    PRIVATE_KEY = _re.search(r'"POLYMARKET_PRIVATE_KEY"\s*:\s*"([^"]+)"', _raw).group(1)
-    FUNDER      = _re.search(r'"POLYMARKET_FUNDER_ADDRESS"\s*:\s*"([^"]+)"', _raw).group(1)
+# Prefer environment variables (Render), fall back to local secrets.json (dev)
+PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY")
+FUNDER      = os.environ.get("POLYMARKET_FUNDER_ADDRESS")
+
+if not PRIVATE_KEY or not FUNDER:
+    try:
+        _raw = open("/Users/mr.fagaly/.openclaw/secrets.json").read()
+        try:
+            _sec = json.loads(_raw)
+            PRIVATE_KEY = PRIVATE_KEY or _sec.get("POLYMARKET_PRIVATE_KEY")
+            FUNDER      = FUNDER      or _sec.get("POLYMARKET_FUNDER_ADDRESS")
+        except Exception:
+            PRIVATE_KEY = PRIVATE_KEY or re.search(r'"POLYMARKET_PRIVATE_KEY"\s*:\s*"([^"]+)"', _raw).group(1)
+            FUNDER      = FUNDER      or re.search(r'"POLYMARKET_FUNDER_ADDRESS"\s*:\s*"([^"]+)"', _raw).group(1)
+    except Exception:
+        raise RuntimeError("POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS must be set as env vars")
 
 # ── THRESHOLDS ────────────────────────────────────────────────
 # V10 score thresholds (same as Kalshi)
