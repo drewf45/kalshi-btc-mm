@@ -314,7 +314,7 @@ def main():
     log.warning(f"🚀 Polymarket {ASSET} bot starting (V10 scoring)")
 
     http    = requests.Session()
-    client  = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=0)
+    client  = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=1, funder=FUNDER)
     creds   = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
     log.warning(f"✅ Connected — API key {creds.api_key[:12]}...")
