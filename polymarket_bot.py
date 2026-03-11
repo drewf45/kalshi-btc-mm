@@ -48,30 +48,22 @@ if not PRIVATE_KEY or not FUNDER:
     except Exception:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS must be set as env vars")
 
-# ── THRESHOLDS ────────────────────────────────────────────────
-# V10 score thresholds (same as Kalshi)
-SCORE_HIGH    = 0.70
-SCORE_MED     = 0.45
-MIN_SCORE     = 0.25
-TIER_PCT      = {"HIGH": 0.18, "MEDIUM": 0.10, "LOW": 0.04}
-MAX_RISK_PCT  = 0.20
-MAX_USDC      = 10.0     # never risk more than $10 on one Polymarket trade (small account)
+# ── THRESHOLDS — matches Kalshi V5 btc_bot.py exactly ────────
+CONFIRM_THRESHOLD  = 0.90    # ask >= 90¢ to consider "certain" (Kalshi: bid >= 90¢)
+WATCH_WINDOW       = 180     # start watching 180s before close
+CONFIRM_CHECKS     = 4       # ticks required at start of watch window
+CONFIRM_STEP       = 30      # reduce by 1 every 30s → min 1 at T=90s
+SAFETY_NET_SECS    = 10      # fallback: buy best side at T=10s if no position yet
+POLL_SECS          = 1.0     # orderbook poll interval (same as Kalshi)
+MAX_RISK_PCT       = 0.20    # 20% of balance per trade
+MAX_USDC           = 10.0    # hard cap per trade
+MIN_ORDER_SHARES   = 5       # Polymarket minimum order size
+ASSUMED_BALANCE    = 24.0    # fallback if CLOB returns 0
 
-# Polymarket 15-min markets have 10% taker fee.
-# At price P, breakeven win rate = P * 1.10. So:
-#   0.50 → need 55% win rate (tradeable with edge)
-#   0.65 → need 71.5% win rate (ok with strong signal)
-#   0.75 → need 82.5% win rate (tight)
-#   0.85 → need 93.5% win rate (too high — skip)
-# Target: enter when price is 0.50–0.72 with directional signal.
-MIN_PRICE     = 0.85     # same as Kalshi — only enter when market price is 85¢+
-MIN_ORDER_SHARES = 5     # Polymarket 15-min market minimum order size
-
-ENTRY_WINDOW  = 120      # enter when ≤120s from close
-
-# Fixed fallback sizing when CLOB balance API returns 0
-FIXED_TIER_USDC = {"HIGH": 5.0, "MEDIUM": 3.0, "LOW": 2.0}
-ASSUMED_BALANCE = 24.0  # confirmed CLOB balance
+def required_confirms(secs_to_close: float) -> int:
+    elapsed = max(0, WATCH_WINDOW - secs_to_close)
+    reduction = int(elapsed / CONFIRM_STEP)
+    return max(1, CONFIRM_CHECKS - reduction)
 
 # ── TREND STATE ───────────────────────────────────────────────
 TREND_REFRESH_SEC   = 300
@@ -338,12 +330,13 @@ def get_usdc_balance(client: ClobClient) -> float:
 TRADED_WINDOWS: set = set()
 
 def main():
-    log.warning(f"🚀 Polymarket {ASSET} bot starting (V5 participation-first)")
+    log.warning(f"🚀 Polymarket {ASSET} bot starting (V5 — matches Kalshi btc_bot.py)")
 
     client  = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=1, funder=FUNDER)
     creds   = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
     log.warning(f"✅ Connected — API key {creds.api_key[:12]}...")
+    log.warning(f"[BOT] Watch: last {WATCH_WINDOW}s | Threshold: {CONFIRM_THRESHOLD*100:.0f}¢ | Confirms: {CONFIRM_CHECKS}→1")
 
     while True:
         now_utc = datetime.now(timezone.utc)
@@ -367,9 +360,9 @@ def main():
             continue
 
         # Too early — wait
-        if secs > ENTRY_WINDOW:
-            log.info(f"[WAIT] {q[:50]} closes in {secs:.0f}s (watching at {ENTRY_WINDOW}s)")
-            time.sleep(max(0, min(secs - ENTRY_WINDOW - 5, 30)))
+        if secs > WATCH_WINDOW:
+            log.info(f"[WAIT] {q[:50]} closes in {secs:.0f}s")
+            time.sleep(max(0, min(secs - WATCH_WINDOW - 5, 30)))
             continue
 
         # Parse token IDs
@@ -383,56 +376,56 @@ def main():
             time.sleep(10)
             continue
 
-        # Read orderbook
+        # Poll orderbook every 1s (same as Kalshi)
         yes_price, no_price = get_best_prices(client, token_ids)
         log.info(f"[TICK] {q[:50]} t={secs:.0f}s yes={yes_price} no={no_price}")
 
         if yes_price is None and no_price is None:
-            log.warning("[TICK] No prices available — skipping")
-            TRADED_WINDOWS.add(window_key)
-            time.sleep(5)
+            log.warning("[TICK] No prices — retry")
+            time.sleep(POLL_SECS)
             continue
 
-        # V5 participation-first: buy the high-confidence side (ask >= MIN_PRICE)
-        # Same logic as Kalshi btc_bot.py — trust the market, show up every window
+        # Pick high-confidence side (ask >= 90¢), same as Kalshi bid >= 90¢
         side, price, token_id = None, None, None
-
-        if yes_price is not None and yes_price >= MIN_PRICE:
+        if yes_price is not None and yes_price >= CONFIRM_THRESHOLD:
             side, price, token_id = "yes", yes_price, token_ids[0]
-
-        if no_price is not None and no_price >= MIN_PRICE:
+        if no_price is not None and no_price >= CONFIRM_THRESHOLD:
             if side is None or no_price > price:
                 side, price, token_id = "no", no_price, token_ids[1]
 
+        # Safety net at T=10s — force best side like Kalshi
+        if side is None and secs <= SAFETY_NET_SECS:
+            if yes_price is not None and no_price is not None:
+                if yes_price >= no_price:
+                    side, price, token_id = "yes", yes_price, token_ids[0]
+                else:
+                    side, price, token_id = "no", no_price, token_ids[1]
+                log.warning(f"[SAFETY-NET] T={secs:.0f}s forcing {side}@{price}")
+
         if side is None:
-            log.warning(f"[SKIP] {q[:50]} yes={yes_price} no={no_price} — neither side >= {MIN_PRICE}")
-            TRADED_WINDOWS.add(window_key)
-            time.sleep(5)
+            log.info(f"[WATCH] t={secs:.0f}s yes={yes_price} no={no_price} need {required_confirms(secs)} confirms at ≥{CONFIRM_THRESHOLD}")
+            time.sleep(POLL_SECS)
             continue
 
-        # Get balance and size — 20% of balance like Kalshi
+        # Size = 20% of balance, min 5 shares, hard cap $10
         balance = get_usdc_balance(client)
         if balance < 0.50:
-            log.warning(f"[LOW-BALANCE] CLOB reports ${balance:.2f} — using assumed ${ASSUMED_BALANCE:.2f}")
+            log.warning(f"[LOW-BAL] CLOB ${balance:.2f} — using ${ASSUMED_BALANCE:.2f}")
             balance = ASSUMED_BALANCE
 
-        # Size = 20% of balance like Kalshi V5, min 5 shares, hard cap $10
         usdc_risk = min(balance * MAX_RISK_PCT, MAX_USDC)
         size = max(round(usdc_risk / price, 2), MIN_ORDER_SHARES)
         usdc_cost = size * price
 
-        log.warning(
-            f"[ENTER] {ASSET} {side.upper()}@{price:.2f} "
-            f"x{size:.2f} shares (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s"
-        )
+        log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s")
 
         success = place_order(client, token_id, price, size, side)
         TRADED_WINDOWS.add(window_key)
 
         if success:
-            log.warning(f"[FILLED] Waiting for settlement... ({q[:45]})")
+            log.warning(f"[FILLED] {q[:45]}")
         else:
-            log.warning(f"[FAIL] Order failed for {q[:45]}")
+            log.warning(f"[FAIL] Order failed — {q[:45]}")
 
         time.sleep(20)
 
