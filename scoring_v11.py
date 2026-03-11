@@ -140,6 +140,12 @@ def _time_weight(secs_to_close: float, watch_window: float = 180.0) -> float:
 
 # ── MAIN SCORING ENTRY POINT ───────────────────────────────────
 
+def model_fair_cents(asset: str, side: str, price_cents: int) -> float:
+    """Historical win rate converted to fair price in cents."""
+    wr, _, _ = _historical(asset, side, price_cents)
+    return wr * 100.0
+
+
 def v11_score(
     asset: str,
     side: str,
@@ -151,17 +157,29 @@ def v11_score(
     """
     Returns V11 score in [0, ~2.0].
     Use MIN_SCORE as gate: < 0.10 → skip.
+
+    CRITICAL: returns 0.0 if price > model_fair (negative EV — no edge).
+    This blocks the V5 safety-net problem of entering at 98-99¢ with 96.4% WR.
     """
     wr, n, kelly = _historical(asset, side, price_cents)
+
+    # Hard EV gate: don't pay more than model fair value
+    fair = wr * 100.0
+    if price_cents > fair:
+        log.debug(f"[V11] {asset} {side}@{price_cents}¢ SKIP — price {price_cents}¢ > fair {fair:.1f}¢")
+        return 0.0
+
     sw   = _sample_weight(n)
     tm   = _trend_multiplier(side, btc_1h_pct)
     tw   = _time_weight(secs_to_close, watch_window)
 
+    # Gap bonus: reward entries further below fair value
+    gap_pct = (fair - price_cents) / fair   # 0.0 to 1.0
     base  = (wr ** 1.5) * kelly * sw
-    score = base * tm * (0.5 + 0.5 * tw)   # time boosts by up to 2x
+    score = base * tm * (0.5 + 0.5 * tw) * (0.7 + 0.3 * gap_pct)
 
     log.debug(
-        f"[V11] {asset} {side}@{price_cents}¢ "
+        f"[V11] {asset} {side}@{price_cents}¢ fair={fair:.1f}¢ gap={fair-price_cents:.1f}¢ "
         f"wr={wr:.3f} kelly={kelly:.2f} sw={sw:.2f} tm={tm:.2f} tw={tw:.2f} "
         f"base={base:.3f} score={score:.3f}"
     )
