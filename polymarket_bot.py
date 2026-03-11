@@ -259,7 +259,7 @@ def find_next_market(now: datetime) -> Optional[dict]:
             continue
 
         secs = (end_dt - now).total_seconds()
-        if secs < 10 or secs > 1200:
+        if secs <= 0 or secs > 1200:
             log.info(f"[SCAN] {ASSET} window found but not in entry range (secs={secs:.0f})")
             continue
 
