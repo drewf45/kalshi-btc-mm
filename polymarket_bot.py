@@ -17,6 +17,14 @@ from typing import Optional
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
+# ── PROXY (residential EU required to bypass Polymarket geoblock) ─
+# Set HTTPS_PROXY env var on Render: http://user:pass@host:port
+_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+if _proxy:
+    os.environ["HTTPS_PROXY"] = _proxy
+    os.environ["HTTP_PROXY"]  = _proxy
+    logging.getLogger("polymarket").warning(f"[PROXY] Routing through proxy")
+
 # ── CONFIG ────────────────────────────────────────────────────
 ASSET           = os.environ.get("ASSET", "BTC").upper()
 HOST            = "https://clob.polymarket.com"
