@@ -56,13 +56,23 @@ MIN_SCORE     = 0.25
 TIER_PCT      = {"HIGH": 0.18, "MEDIUM": 0.10, "LOW": 0.04}
 MAX_RISK_PCT  = 0.20
 MAX_USDC      = 10.0     # never risk more than $10 on one Polymarket trade (small account)
-MIN_PRICE     = 0.85     # don't enter below 85¢ (0.85) on Polymarket
+
+# Polymarket 15-min markets have 10% taker fee.
+# At price P, breakeven win rate = P * 1.10. So:
+#   0.50 → need 55% win rate (tradeable with edge)
+#   0.65 → need 71.5% win rate (ok with strong signal)
+#   0.75 → need 82.5% win rate (tight)
+#   0.85 → need 93.5% win rate (too high — skip)
+# Target: enter when price is 0.50–0.72 with directional signal.
+MIN_PRICE     = 0.50     # don't enter below 50¢ (random noise)
+MAX_PRICE     = 0.72     # don't enter above 72¢ (fee eats all edge)
+MIN_ORDER_SHARES = 5     # Polymarket 15-min market minimum order size
+
 ENTRY_WINDOW  = 120      # enter when ≤120s from close
 
-# Fixed fallback sizing when CLOB balance API returns 0 (custodial wallet not yet on-chain)
-# Tiers: HIGH=$3, MEDIUM=$2, LOW=$1 — conservative until wallet is verified
-FIXED_TIER_USDC = {"HIGH": 3.0, "MEDIUM": 2.0, "LOW": 1.0}
-ASSUMED_BALANCE = 30.0  # Drew's actual deposit — used if CLOB returns $0
+# Fixed fallback sizing when CLOB balance API returns 0
+FIXED_TIER_USDC = {"HIGH": 5.0, "MEDIUM": 3.0, "LOW": 2.0}
+ASSUMED_BALANCE = 24.0  # confirmed CLOB balance
 
 # ── TREND STATE ───────────────────────────────────────────────
 TREND_REFRESH_SEC   = 300
@@ -403,22 +413,21 @@ def main():
             continue
 
         # Determine best side and score
-        side, price, token_id = None, None, None
+        # Only enter when price is in the sweet spot (50-72¢) where 10% fee leaves room for edge
+        side, price, token_id, score = None, None, None, 0.0
 
-        if no_price is not None and no_price >= MIN_PRICE:
+        if no_price is not None and MIN_PRICE <= no_price <= MAX_PRICE:
             score_no = v10_score("no", no_price, secs)
             if score_no >= MIN_SCORE:
-                side, price, token_id = "no", no_price, token_ids[1]
-                score = score_no
+                side, price, token_id, score = "no", no_price, token_ids[1], score_no
 
-        if side is None and yes_price is not None and yes_price >= MIN_PRICE:
+        if side is None and yes_price is not None and MIN_PRICE <= yes_price <= MAX_PRICE:
             score_yes = v10_score("yes", yes_price, secs)
             if score_yes >= MIN_SCORE:
-                side, price, token_id = "yes", yes_price, token_ids[0]
-                score = score_yes
+                side, price, token_id, score = "yes", yes_price, token_ids[0], score_yes
 
         if side is None:
-            log.warning(f"[V10-SKIP] {q[:50]} — no side scored above threshold")
+            log.warning(f"[V10-SKIP] {q[:50]} yes={yes_price} no={no_price} — price outside sweet spot or score too low")
             TRADED_WINDOWS.add(window_key)
             time.sleep(5)
             continue
@@ -430,8 +439,11 @@ def main():
             balance = ASSUMED_BALANCE
 
         size = compute_size(score, price, balance)
-        if size < 0.01:
-            log.warning(f"[SIZE-SKIP] size={size:.2f} too small")
+        # Enforce Polymarket minimum order size (5 shares)
+        size = max(size, MIN_ORDER_SHARES)
+        usdc_cost = size * price
+        if usdc_cost > MAX_USDC or usdc_cost > balance * MAX_RISK_PCT:
+            log.warning(f"[SIZE-SKIP] ${usdc_cost:.2f} exceeds risk limits")
             TRADED_WINDOWS.add(window_key)
             time.sleep(5)
             continue
