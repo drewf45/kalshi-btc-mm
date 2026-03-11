@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, BUY
+from py_clob_client.clob_types import OrderArgs
 
 # ── CONFIG ────────────────────────────────────────────────────
 ASSET           = os.environ.get("ASSET", "BTC").upper()
@@ -285,7 +285,7 @@ def place_order(client: ClobClient, token_id: str, price: float, size: float, si
             token_id=token_id,
             price=price,
             size=size,
-            side=BUY,
+            side="BUY",
         )
         resp = client.create_and_post_order(order_args)
         log.warning(f"[ORDER] {side_str.upper()}@{price:.2f} x{size:.2f} → {resp}")
