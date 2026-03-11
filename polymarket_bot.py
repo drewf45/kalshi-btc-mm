@@ -79,6 +79,8 @@ TREND_WINDOW_CANDLES = 12
 _trend_state  = {"direction": "neutral", "updated": 0.0, "avg_range": 0.0}
 _btc_trend    = {"direction": "neutral", "updated": 0.0}
 _last_trend   = 0.0
+_btc_1h_pct   = 0.0   # V11: BTC 1h % change (numeric)
+_session_start_balance: float = 0.0  # V11: drawdown tracking
 
 # ── LOGGING ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -116,8 +118,15 @@ def fetch_trend(http: requests.Session) -> str:
     return direction
 
 def fetch_btc_trend(http: requests.Session) -> str:
+    global _btc_1h_pct
     if ASSET == "BTC":
         _btc_trend["direction"] = _trend_state["direction"]
+        # Grab pct from trend_state if available
+        candles = _fetch_candles(CANDLES_URL[ASSET])
+        if len(candles) >= TREND_WINDOW_CANDLES:
+            recent = float(candles[0][4])
+            old    = float(candles[TREND_WINDOW_CANDLES - 1][4])
+            _btc_1h_pct = (recent - old) / old * 100
         return _btc_trend["direction"]
     candles = _fetch_candles(BTC_CANDLES_URL)
     if len(candles) < TREND_WINDOW_CANDLES:
@@ -125,6 +134,7 @@ def fetch_btc_trend(http: requests.Session) -> str:
     recent = float(candles[0][4])
     old    = float(candles[TREND_WINDOW_CANDLES - 1][4])
     pct    = (recent - old) / old * 100
+    _btc_1h_pct = pct
     direction = "bearish" if pct < -0.5 else "bullish" if pct > 0.5 else "neutral"
     _btc_trend["direction"] = direction
     _btc_trend["updated"]   = time.time()
@@ -344,6 +354,16 @@ def main():
     creds   = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
     log.warning(f"✅ Connected — API key {creds.api_key[:12]}...")
+
+    # V11: set session start balance
+    global _session_start_balance
+    try:
+        _session_start_balance = get_usdc_balance(client)
+        if _session_start_balance < 0.50:
+            _session_start_balance = ASSUMED_BALANCE
+    except:
+        _session_start_balance = ASSUMED_BALANCE
+    log.warning(f"[V11] Session start balance: ${_session_start_balance:.2f}")
     log.warning(f"[BOT] Watch: last {WATCH_WINDOW}s | Threshold: {CONFIRM_THRESHOLD*100:.0f}¢ | Confirms: {CONFIRM_CHECKS}→1")
 
     while True:
@@ -415,17 +435,31 @@ def main():
             time.sleep(POLL_SECS)
             continue
 
-        # Size = 20% of balance, min 5 shares, hard cap $10
+        # V11 scoring gate
+        from scoring_v11 import v11_score, compute_shares_polymarket, score_to_tier, MIN_SCORE
+        v11 = v11_score(ASSET, side, int(price * 100), secs, _btc_1h_pct)
+        tier = score_to_tier(v11)
+        if v11 < MIN_SCORE:
+            log.warning(f"[V11-SKIP] {q[:45]} {side.upper()}@{price:.2f} score={v11:.3f} — skip")
+            TRADED_WINDOWS.add(window_key)
+            time.sleep(5)
+            continue
+
         balance = get_usdc_balance(client)
         if balance < 0.50:
             log.warning(f"[LOW-BAL] CLOB ${balance:.2f} — using ${ASSUMED_BALANCE:.2f}")
             balance = ASSUMED_BALANCE
 
-        usdc_risk = min(balance * MAX_RISK_PCT, MAX_USDC)
-        size = max(round(usdc_risk / price, 2), MIN_ORDER_SHARES)
+        size = compute_shares_polymarket(v11, price, balance, _session_start_balance)
+        if size == 0:
+            log.warning(f"[V11-SKIP] size=0 — skip")
+            TRADED_WINDOWS.add(window_key)
+            continue
+        # hard cap
+        size = min(size, MAX_USDC / price)
         usdc_cost = size * price
 
-        log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s")
+        log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) V11={v11:.3f} tier={tier} bal=${balance:.2f} t={secs:.0f}s")
 
         success = place_order(client, token_id, price, size, side)
         TRADED_WINDOWS.add(window_key)

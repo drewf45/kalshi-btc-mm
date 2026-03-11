@@ -34,7 +34,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
-print(f"BOOT: eth_bot.py v5 loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)
+print(f"BOOT: btc_bot.py v5 loaded at {datetime.now(timezone.utc).isoformat()}Z", flush=True)
 
 # ======================== LOGGING ============================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -103,6 +103,10 @@ SPOT_URL = "https://api.coinbase.com/v2/prices/ETH-USD/spot"
 
 # Fast local guard — prevents re-entry during API lag
 TRADED_TICKERS: set = set()
+
+# ── V11 GLOBALS ───────────────────────────────────────────────
+_btc_1h_pct: float = 0.0          # BTC 1-hour % change (updated every 5 min)
+_session_start_balance: float = 0.0   # Set on first successful balance read
 
 # ======================== KALSHI API CLIENT ==================
 class KalshiClient:
@@ -411,7 +415,7 @@ def get_order(client: KalshiClient, order_id: str) -> Optional[Dict]:
         return None
 
 
-# ======================== SPOT PRICE (logging only) ==========
+# ======================== SPOT PRICE + TREND =================
 def fetch_spot(http: requests.Session) -> Optional[float]:
     try:
         r = http.get(SPOT_URL, timeout=4)
@@ -420,6 +424,24 @@ def fetch_spot(http: requests.Session) -> Optional[float]:
         return float(amt) if amt else None
     except Exception:
         return None
+
+
+_spot_1h_ago: Optional[float] = None
+_spot_1h_ts:  float = 0.0
+
+def update_btc_trend(http: requests.Session) -> None:
+    """Fetch BTC spot, compute 1h % change, update _btc_1h_pct global."""
+    global _btc_1h_pct, _spot_1h_ago, _spot_1h_ts
+    now = time.time()
+    spot = fetch_spot(http)
+    if spot is None:
+        return
+    if _spot_1h_ago is None or (now - _spot_1h_ts) >= 3600:
+        _spot_1h_ago = spot
+        _spot_1h_ts  = now
+    _btc_1h_pct = (spot - _spot_1h_ago) / _spot_1h_ago * 100
+    direction = "BULLISH" if _btc_1h_pct >= 0.3 else ("BEARISH" if _btc_1h_pct <= -0.3 else "NEUTRAL")
+    log.info(f"[TREND] BTC 1h={_btc_1h_pct:+.2f}% → {direction}")
 
 
 # ======================== BOT STATE ==========================
@@ -464,7 +486,7 @@ def main() -> None:
     start_health_server()
 
     log.warning("=" * 60)
-    log.warning(f"[BOT] ETH 15m — PARTICIPATION-FIRST V5")
+    log.warning(f"[BOT] BTC 15m — PARTICIPATION-FIRST V5")
     log.warning(f"[BOT] Watch window:   last {WATCH_WINDOW_SECONDS}s")
     log.warning(f"[BOT] Threshold:      {CONFIRM_THRESHOLD}¢ bid on either side")
     log.warning(f"[BOT] Confirm checks: {CONFIRM_CHECKS} consecutive ticks")
@@ -499,8 +521,17 @@ def main() -> None:
     st.live_balance_usd = (cash or 0.0)
     log.warning(f"[START] Cash=${st.live_balance_usd:.2f} positions=${pv or 0:.2f}")
 
+    # V11: set session start balance for drawdown tracking
+    global _session_start_balance
+    _session_start_balance = st.live_balance_usd
+    log.warning(f"[V11] Session start balance: ${_session_start_balance:.2f}")
+
+    # V11: initial trend fetch
+    update_btc_trend(http)
+
     last_meta      = 0.0
     last_state_log = 0.0
+    last_trend_ts  = time.time()
 
     def refresh_market():
         if MARKET_OVERRIDE not in ("<none>", "none", "None", ""):
@@ -556,6 +587,12 @@ def main() -> None:
     # ── MAIN LOOP ─────────────────────────────────────────────
     while True:
         _watchdog_ts[0] = time.time()
+
+        # ── V11: Refresh BTC trend every 5 min ─────────────
+        now = time.time()
+        if now - last_trend_ts > 300:
+            update_btc_trend(http)
+            last_trend_ts = now
 
         # ── Refresh active market ───────────────────────────
         now = time.time()
@@ -724,8 +761,22 @@ def main() -> None:
         init_ask   = (yes_ask if side == "yes" else no_ask)
         buy_price  = min((init_ask + 1) if init_ask is not None else init_bid, 99)
 
-        position_size = st.live_balance_usd * MAX_RISK_PCT
-        order_qty     = max(1, min(500, int(position_size / (buy_price / 100))))
+        # ── V11 SCORING GATE ─────────────────────────────────
+        from scoring_v11 import v11_score, compute_contracts_kalshi, score_to_tier, MIN_SCORE
+        v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
+        tier = score_to_tier(v11)
+        if v11 < MIN_SCORE:
+            log.warning(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} < {MIN_SCORE} — skip")
+            TRADED_TICKERS.add(st.market)
+            st.traded_this_market = True
+            time.sleep(POLL_SECONDS)
+            continue
+
+        order_qty = compute_contracts_kalshi(v11, buy_price, st.live_balance_usd, _session_start_balance)
+        if order_qty == 0:
+            log.info(f"[SKIP] V11 size=0 — skip")
+            time.sleep(POLL_SECONDS)
+            continue
 
         # Minimum trade gate ($1 cost)
         if order_qty * buy_price / 100 < 1.00:
@@ -736,7 +787,7 @@ def main() -> None:
         log.warning(
             f"[ENTER] {st.market} {side.upper()}@{buy_price}¢ "
             f"qty={order_qty} cost=${order_qty * buy_price / 100:.2f} "
-            f"bal=${st.live_balance_usd:.2f} t={secs_to_close:.0f}s"
+            f"V11={v11:.3f} tier={tier} bal=${st.live_balance_usd:.2f} t={secs_to_close:.0f}s"
         )
 
         # Lock immediately
