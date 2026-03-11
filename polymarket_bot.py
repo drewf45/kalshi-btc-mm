@@ -225,8 +225,12 @@ def find_next_market(now: datetime) -> Optional[dict]:
         return None
 
     asset_keywords = ASSET_NAMES.get(ASSET, [ASSET.lower()])
+    # Match formats like:
+    #   "Bitcoin Up or Down - March 11, 1:15PM-1:30PM ET"  (15-min)
+    #   "Bitcoin Up or Down - March 11, 2PM ET"            (hourly)
+    #   "Bitcoin Up or Down on March 11?"                  (daily)
     pattern = re.compile(
-        r"(" + "|".join(asset_keywords) + r") up or down.*\d+:\d+(am|pm).*\d+:\d+(am|pm)",
+        r"(" + "|".join(asset_keywords) + r") up or down",
         re.IGNORECASE
     )
 
@@ -241,7 +245,7 @@ def find_next_market(now: datetime) -> Optional[dict]:
         except:
             continue
         secs = (end_dt - now).total_seconds()
-        if secs < 10 or secs > 600:   # only windows closing in 10s–10min
+        if secs < 10 or secs > 3600:   # windows closing in 10s–60min
             continue
         liq = float(m.get("liquidity", 0) or 0)
         candidates.append({"market": m, "secs": secs, "liq": liq, "end_dt": end_dt})
