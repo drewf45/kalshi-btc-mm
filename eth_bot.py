@@ -783,7 +783,7 @@ def main() -> None:
         log.warning(
             f"[ENTER] {st.market} {side.upper()}@{buy_price}¢ "
             f"qty={order_qty} cost=${order_qty * buy_price / 100:.2f} "
-            f"V11={v11:.3f} tier={tier} bal=${st.live_balance_usd:.2f} t={secs_to_close:.0f}s"
+            f"bal=${st.live_balance_usd:.2f} t={secs_to_close:.0f}s"
         )
 
         # Lock immediately
