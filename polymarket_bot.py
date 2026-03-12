@@ -341,8 +341,10 @@ def place_order(client: ClobClient, token_id: str, price: float, size: float, si
 
 def get_usdc_balance(client: ClobClient) -> float:
     try:
-        bal = client.get_balance_allowance(asset_type=0)  # 0=USDC
-        return float(bal.get("balance", 0)) / 1e6  # Polymarket USDC has 6 decimals
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        bal = client.get_balance_allowance(params=params)
+        return float(bal.get("balance", 0)) / 1e6
     except Exception as e:
         log.warning(f"[BALANCE] {e}")
         return 0.0
