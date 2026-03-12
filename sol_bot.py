@@ -766,7 +766,7 @@ def main() -> None:
         v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
         tier = score_to_tier(v11)
         # Safety net at T=10s with price ≥ 90¢: automatic entry
-        safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 90)
+        safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 75)
         if not safety_net_auto and v11 < MIN_SCORE:
             log.warning(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} < {MIN_SCORE} — skip")
             TRADED_TICKERS.add(st.market)
