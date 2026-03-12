@@ -449,7 +449,7 @@ def main():
         size = max(0.01, min(size, MAX_USDC / price))
         usdc_cost = size * price
 
-        log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) V11={v11:.3f} tier={tier} bal=${balance:.2f} t={secs:.0f}s")
+        log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s")
 
         success = place_order(client, token_id, price, size, side)
         TRADED_WINDOWS.add(window_key)
