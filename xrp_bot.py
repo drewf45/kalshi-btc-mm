@@ -928,6 +928,26 @@ def main() -> None:
                 f"{current_side.upper()}@{last_price}¢ "
                 f"potential_win=${net_win:.2f} attempts={attempt}"
             )
+            # Sim P&L outcome tracking for DRY_RUN
+            if DRY_RUN:
+                settled_result = None
+                for _ in range(60):
+                    time.sleep(1)
+                    try:
+                        m_info = client.request("GET", f"/markets/{st.market}")
+                        if m_info:
+                            r = (m_info.get("result") or "").lower()
+                            if r in ("yes", "no"):
+                                settled_result = r; break
+                    except: pass
+                if settled_result:
+                    cost   = total_filled * (last_price or 99) / 100.0
+                    payout = total_filled * 1.0 if settled_result == current_side else 0.0
+                    pnl    = payout - cost
+                    outcome = "WIN" if pnl > 0 else "LOSS"
+                    log.warning(f"[SIM-{outcome}] {st.market} {current_side.upper()}@{last_price}¢ x{total_filled} pnl=${pnl:+.2f}")
+                else:
+                    log.warning(f"[SIM-UNKNOWN] {st.market} — could not determine settlement")
         else:
             log.warning(f"[RESULT] {st.market} 0 fills after {attempt} attempts")
             log.warning(f"[MISS] {st.market} — entered but unfilled. Treat as lost market.")
