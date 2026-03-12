@@ -82,8 +82,8 @@ MARKET_OVERRIDE = getenv_first(["MARKET_OVERRIDE", "KALSHI_MARKET_OVERRIDE"], "<
 DRY_RUN         = env_bool("DRY_RUN", False)
 
 # ── PARTICIPATION CONSTANTS ───────────────────────────────────
-WATCH_WINDOW_SECONDS = 180     # Start watching 180s before close — enter while book has depth
-CONFIRM_THRESHOLD    = 85      # Minimum bid (cents) to consider "certain"
+WATCH_WINDOW_SECONDS = 60     # Start watching 180s before close — enter while book has depth
+CONFIRM_THRESHOLD    = 62      # Minimum bid (cents) to consider "certain"
 CONFIRM_CHECKS       = 4       # Max consecutive ticks required (at watch window start)
 # Dynamic: requires 4 ticks at T=180s, reduces by 1 every 30s → min 1 at T=90s
 CONFIRM_STEP         = 30         # seconds per confirm reduction (15m bots: every 30s)
