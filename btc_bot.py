@@ -719,10 +719,17 @@ def main() -> None:
                     st.certainty_counter = 1
                 log.info(f"[WATCH] NO@{no_bid}¢ counter={st.certainty_counter}/{required_confirms(secs_to_close)} t={secs_to_close:.0f}s")
             else:
-                if st.certainty_counter > 0:
-                    log.info(f"[RESET] Dropped below {CONFIRM_THRESHOLD}¢ — counter reset")
-                st.certainty_counter = 0
-                st.certainty_side    = None
+                # None prices = empty book — pause counter, don't reset
+                # Non-None but below threshold = lost conviction, reset
+                both_none = (yes_bid is None and no_bid is None)
+                if not both_none:
+                    if st.certainty_counter > 0:
+                        log.info(f"[RESET] Price dropped — counter reset (yes={yes_bid}¢ no={no_bid}¢)")
+                    st.certainty_counter = 0
+                    st.certainty_side    = None
+                else:
+                    if st.certainty_counter > 0:
+                        log.info(f"[PAUSE] Empty book — holding counter={st.certainty_counter} side={st.certainty_side}")
                 time.sleep(POLL_SECONDS)
                 continue
 
