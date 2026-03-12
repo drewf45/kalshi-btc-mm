@@ -77,7 +77,9 @@ def _bucket_key(side: str, price_cents: int) -> Optional[str]:
         elif p <= 40: return 'NO_31_40'
         elif p <= 50: return 'NO_41_50'
         elif p <= 65: return 'NO_51_65'
-        else:         return 'NO_66_80'
+        elif p <= 80: return 'NO_66_80'
+        elif p <= 90: return 'NO_81_90'
+        else:         return 'NO_91_99'
     elif s == 'yes':
         if   p <= 50: return 'YES_1_50'
         elif p <= 80: return 'YES_51_80'

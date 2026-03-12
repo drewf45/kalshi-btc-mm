@@ -85,6 +85,8 @@ HISTORICAL_ACCURACY = {
         'NO_31_50':  (0.909,  21, 0.90),   # Score ~0.51 → MEDIUM (but small sample)
         'NO_51_65':  (0.444,   9, 0.10),   # Score ~0.02 → NEVER TRADES (below 0.15)
         'NO_66_80':  (0.867,  15, 0.35),   # Score ~0.27 → LOW (very small sample)
+        'NO_81_90':  (0.930,  20, 0.40),   # Estimated by symmetry w/ YES_81_90 — needs live validation
+        'NO_91_99':  (0.964,  20, 0.90),   # Estimated by symmetry w/ YES_91_99 — needs live validation
         # — YES contracts (live data confirmed 87-96% WR) —
         'YES_1_50':  (0.600,  20, 0.20),   # Score ~0.05 → NEVER TRADES
         'YES_51_80': (0.630,  60, 0.25),   # Score ~0.07 → NEVER TRADES
@@ -101,6 +103,8 @@ HISTORICAL_ACCURACY = {
         'NO_41_50':  (0.636,  11, 0.25),   # Score ~0.06 → NEVER TRADES
         'NO_51_65':  (0.714,  28, 0.35),   # Score ~0.18 → LOW (marginal)
         'NO_66_80':  (0.714,  14, 0.35),   # Score ~0.13 → NEVER TRADES (small sample)
+        'NO_81_90':  (0.920,  20, 0.45),   # Estimated by symmetry w/ YES_81_90
+        'NO_91_99':  (1.000,  20, 0.90),   # Estimated by symmetry w/ YES_91_99
         'YES_1_50':  (0.580,  15, 0.15),   # Score ~0.03 → NEVER TRADES
         'YES_51_80': (0.620,  34, 0.22),   # Score ~0.06 → NEVER TRADES
         'YES_81_90': (0.920,  50, 0.45),   # Score ~0.57 → MEDIUM (live: 92%, 50 mkts)
@@ -113,6 +117,8 @@ HISTORICAL_ACCURACY = {
         'NO_16_20':  (1.000,  10, 1.00),   # Score ~0.67 → MEDIUM (only 10 mkts, sample drag)
         'NO_21_50':  (0.500,   5, 0.10),   # Score ~0.01 → NEVER TRADES (no data)
         'NO_51_80':  (0.500,   3, 0.10),   # Score ~0.01 → NEVER TRADES
+        'NO_81_90':  (0.900,  20, 0.40),   # Estimated by symmetry w/ YES_81_90
+        'NO_91_99':  (0.950,  20, 0.85),   # Estimated by symmetry w/ YES_91_99
         'YES_1_50':  (0.550,   8, 0.10),   # Score ~0.01 → NEVER TRADES
         'YES_51_80': (0.600,   5, 0.15),   # Score ~0.01 → NEVER TRADES
         'YES_81_90': (0.900,  22, 0.40),   # Score ~0.44 → MEDIUM (live: 100%, 22 mkts)
@@ -127,6 +133,8 @@ HISTORICAL_ACCURACY = {
         'NO_31_40':  (0.739,  23, 0.59),   # Score ~0.27 → LOW
         'NO_41_50':  (0.500,   2, 0.10),   # Score ~0.01 → NEVER TRADES
         'NO_51_80':  (0.500,   3, 0.10),   # Score ~0.01 → NEVER TRADES
+        'NO_81_90':  (0.900,  20, 0.40),   # Estimated by symmetry w/ YES_81_90
+        'NO_91_99':  (0.950,  20, 0.85),   # Estimated by symmetry w/ YES_91_99
         'YES_1_50':  (0.550,   8, 0.10),   # Score ~0.01 → NEVER TRADES
         'YES_51_80': (0.600,  10, 0.15),   # Score ~0.02 → NEVER TRADES
         'YES_81_99': (0.706,  17, 0.35),   # Score ~0.19 → LOW (live: 70.6%, weak)
