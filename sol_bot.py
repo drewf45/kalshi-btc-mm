@@ -733,7 +733,7 @@ def main() -> None:
         # ── CONFIRMED: enter ─────────────────────────────────
         side = st.certainty_side
 
-        # Counterparty check — verify opposite side has liquidity before entering
+        # Counterparty check — skip at safety net
         # If YES=None when buying NO (or vice versa), order will never fill
         try:
             cp_ob = client.request("GET", f"/markets/{st.market}/orderbook")
