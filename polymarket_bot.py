@@ -298,18 +298,31 @@ def get_best_prices(client: ClobClient, token_ids: list) -> tuple:
         yes_id = token_ids[0]
         no_id  = token_ids[1] if len(token_ids) > 1 else None
 
-        # YES price = best ask for YES token
-        yes_book = client.get_order_book(yes_id)
-        yes_price = None
-        if yes_book and yes_book.asks:
-            yes_price = float(sorted(yes_book.asks, key=lambda x: float(x.price))[0].price)
+        def best_price_from_book(book):
+            """Best available price: lowest ask, or highest bid, or None."""
+            if not book:
+                return None
+            # Prefer lowest ask (what we'd pay to buy)
+            if book.asks:
+                return float(sorted(book.asks, key=lambda x: float(x.price))[0].price)
+            # Fall back to highest bid (what market values it at)
+            if book.bids:
+                return float(sorted(book.bids, key=lambda x: -float(x.price))[0].price)
+            return None
 
-        # NO price = best ask for NO token
+        yes_book  = client.get_order_book(yes_id)
+        yes_price = best_price_from_book(yes_book)
+
         no_price = None
         if no_id:
-            no_book = client.get_order_book(no_id)
-            if no_book and no_book.asks:
-                no_price = float(sorted(no_book.asks, key=lambda x: float(x.price))[0].price)
+            no_book  = client.get_order_book(no_id)
+            no_price = best_price_from_book(no_book)
+
+        # Derive missing side: YES + NO ≈ 1.0
+        if yes_price is not None and no_price is None:
+            no_price = round(1.0 - yes_price, 4)
+        elif no_price is not None and yes_price is None:
+            yes_price = round(1.0 - no_price, 4)
 
         return yes_price, no_price
     except Exception as e:
