@@ -441,9 +441,9 @@ def main():
         tier = score_to_tier(v11)
         safety_net_auto = (secs <= SAFETY_NET_SECS and price >= 0.75)
         if not safety_net_auto and v11 < MIN_SCORE:
-            log.warning(f"[V11-SKIP] {q[:45]} {side.upper()}@{price:.2f} score={v11:.3f} — skip")
-            TRADED_WINDOWS.add(window_key)
-            time.sleep(5)
+            log.info(f"[V11-SKIP] {q[:45]} {side.upper()}@{price:.2f} score={v11:.3f} — waiting for safety net")
+            # Do NOT mark as traded — safety net at T=10s still gets a shot
+            time.sleep(3)
             continue
         if safety_net_auto and v11 < MIN_SCORE:
             # Certain win at T=10s — size at HIGH (20% max)
