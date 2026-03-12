@@ -57,7 +57,7 @@ if not PRIVATE_KEY or not FUNDER:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS must be set as env vars")
 
 # ── THRESHOLDS — matches Kalshi V5 btc_bot.py exactly ────────
-CONFIRM_THRESHOLD  = 0.90    # ask >= 90¢ to consider "certain" (Kalshi: bid >= 90¢)
+CONFIRM_THRESHOLD  = 0.85    # ask >= 90¢ to consider "certain" (Kalshi: bid >= 90¢)
 WATCH_WINDOW       = 180     # start watching 180s before close
 CONFIRM_CHECKS     = 4       # ticks required at start of watch window
 CONFIRM_STEP       = 30      # reduce by 1 every 30s → min 1 at T=90s

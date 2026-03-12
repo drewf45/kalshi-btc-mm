@@ -20,9 +20,9 @@
 #   Session down 25%+:   0.25x size  (still in the game, just tiny)
 #
 # TIERS:
-#   HIGH   >= 0.55  → 15% of balance
-#   MEDIUM >= 0.28  → 8%  of balance
-#   LOW    >= 0.10  → 3%  of balance
+#   HIGH   >= 0.55  → 20% of balance (max)
+#   MEDIUM >= 0.28  → 15% of balance
+#   LOW    >= 0.10  → 8%  of balance
 #   SKIP   <  0.10  → no trade (historical data says don't bother)
 
 import math
@@ -39,9 +39,9 @@ SCORE_HIGH   = 0.55
 SCORE_MED    = 0.28
 
 TIER_PCT = {
-    'HIGH':   0.15,
-    'MEDIUM': 0.08,
-    'LOW':    0.03,
+    'HIGH':   0.20,
+    'MEDIUM': 0.15,
+    'LOW':    0.08,
 }
 
 HARD_CAP_PCT = 0.20   # never exceed 20% of balance regardless of score
