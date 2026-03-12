@@ -259,11 +259,11 @@ def compute_shares_polymarket(
     price: float,          # decimal (0.0–1.0)
     balance: float,
     session_start: float,
-    min_shares: int = 5,
+    min_shares: int = 1,
 ) -> float:
-    """Returns share count for Polymarket (float, min 5)."""
+    """Returns share count for Polymarket (float). V11 score controls size — no forced minimum."""
     usdc = compute_usdc_risk(score, int(price * 100), balance, session_start)
-    if usdc <= 0 or price <= 0:
+    if usdc < 1.00 or price <= 0:
         return 0.0
     shares = round(usdc / price, 2)
     return max(float(min_shares), shares)
