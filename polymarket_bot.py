@@ -486,10 +486,39 @@ def main():
 
         if success:
             log.warning(f"[FILLED] {q[:45]}")
+            # Detect outcome for dry run sim P&L
+            if DRY_RUN:
+                global _sim_pnl, _sim_trades
+                _sim_trades += 1
+                # Wait for settlement — poll up to 35s for price to resolve
+                settled_yes = None
+                for _ in range(35):
+                    time.sleep(1)
+                    try:
+                        sy, sn = get_best_prices(client, token_ids)
+                        if sy is not None and sy >= 0.98:
+                            settled_yes = True; break
+                        if sy is not None and sy <= 0.02:
+                            settled_yes = False; break
+                        if sn is not None and sn >= 0.98:
+                            settled_yes = False; break
+                        if sn is not None and sn <= 0.02:
+                            settled_yes = True; break
+                    except:
+                        pass
+                if settled_yes is not None:
+                    won = (settled_yes and side == "yes") or (not settled_yes and side == "no")
+                    payout = size * (1.0 - price) if won else 0.0
+                    trade_pnl = payout - (0 if won else usdc_cost)
+                    _sim_pnl += trade_pnl
+                    result = "WIN" if won else "LOSS"
+                    log.warning(f"[SIM-{result}] {side.upper()}@{price:.2f} x{size:.2f} pnl=${trade_pnl:+.2f} running=${_sim_pnl:+.2f}")
+                else:
+                    log.warning(f"[SIM-UNKNOWN] Could not determine outcome")
         else:
             log.warning(f"[FAIL] Order failed — {q[:45]}")
 
-        time.sleep(20)
+        time.sleep(5)
 
 
 if __name__ == "__main__":
