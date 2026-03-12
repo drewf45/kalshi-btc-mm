@@ -363,13 +363,8 @@ def main():
 
     # V11: set session start balance
     global _session_start_balance
-    try:
-        _session_start_balance = get_usdc_balance(client)
-        if _session_start_balance < 0.50:
-            _session_start_balance = ASSUMED_BALANCE
-    except:
-        _session_start_balance = ASSUMED_BALANCE
-    log.warning(f"[V11] Session start balance: ${_session_start_balance:.2f}")
+    _session_start_balance = get_usdc_balance(client)
+    log.warning(f"[BOT] Session start balance: ${_session_start_balance:.2f}")
     log.warning(f"[BOT] Watch: last {WATCH_WINDOW}s | Threshold: {CONFIRM_THRESHOLD*100:.0f}¢ | Confirms: {CONFIRM_CHECKS}→1")
 
     while True:
@@ -472,8 +467,6 @@ def main():
 
             # Size and place
             balance = get_usdc_balance(client)
-            if balance < 0.50:
-                balance = ASSUMED_BALANCE
             usdc_risk = balance * MAX_RISK_PCT
             size = round(usdc_risk / price, 2)
             size = max(0.01, min(size, MAX_USDC / price))
