@@ -410,7 +410,7 @@ def main():
         certainty_counter = 0
 
         while True:
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            now_utc = datetime.now(timezone.utc)
             candidate2 = find_next_market(now_utc)
             if not candidate2:
                 log.info(f"[WINDOW-DONE] {q[:40]}")
