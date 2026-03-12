@@ -17,6 +17,17 @@ from typing import Optional
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
+# ── AUTO-REDEEM (on-chain via web3) ──────────────────────────
+try:
+    from web3 import Web3 as _Web3
+    _POLYGON_RPC    = "https://polygon.drpc.org"
+    _CTF_ADDRESS    = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+    _USDC_ADDRESS   = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    _CTF_ABI        = [{"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+    _WEB3_AVAILABLE = True
+except ImportError:
+    _WEB3_AVAILABLE = False
+
 # ── PROXY (residential EU required to bypass Polymarket geoblock) ─
 # Set HTTPS_PROXY env var on Render: http://user:pass@host:port
 _proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
@@ -366,6 +377,42 @@ def get_usdc_balance(client: ClobClient) -> float:
 
 TRADED_WINDOWS: set = set()
 
+def redeem_market_positions(condition_id: str, private_key: str) -> bool:
+    """Redeem all positions for a settled Polymarket market on-chain."""
+    if not _WEB3_AVAILABLE:
+        log.warning("[REDEEM] web3 not available — skipping")
+        return False
+    try:
+        w3 = _Web3(_Web3.HTTPProvider(_POLYGON_RPC, request_kwargs={"timeout": 10}))
+        if not w3.is_connected():
+            log.warning("[REDEEM] Polygon RPC not reachable — skipping")
+            return False
+        acct    = w3.eth.account.from_key(private_key)
+        matic   = w3.from_wei(w3.eth.get_balance(acct.address), "ether")
+        if matic < 0.001:
+            log.warning(f"[REDEEM] Insufficient MATIC ({matic:.6f}) — send ~$1 to {acct.address}")
+            return False
+        ctf     = w3.eth.contract(address=_Web3.to_checksum_address(_CTF_ADDRESS), abi=_CTF_ABI)
+        cid     = bytes.fromhex(condition_id.replace("0x", ""))
+        parent  = bytes(32)
+        txn     = ctf.functions.redeemPositions(
+            _Web3.to_checksum_address(_USDC_ADDRESS), parent, cid, [1, 2]
+        ).build_transaction({
+            "from": acct.address,
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 200000,
+            "gasPrice": w3.eth.gas_price,
+        })
+        signed  = acct.sign_transaction(txn)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        log.warning(f"[REDEEM] {condition_id[:16]}… tx={tx_hash.hex()[:16]}… status={'OK' if receipt.status==1 else 'FAIL'}")
+        return receipt.status == 1
+    except Exception as e:
+        log.warning(f"[REDEEM] {e}")
+        return False
+
+
 def main():
     log.warning(f"🚀 Polymarket {ASSET} bot starting (V5 — matches Kalshi btc_bot.py)")
 
@@ -408,11 +455,12 @@ def main():
             time.sleep(max(0, min(secs - WATCH_WINDOW - 5, 30)))
             continue
 
-        # Parse token IDs
+        # Parse token IDs and condition ID
         try:
             token_ids = json.loads(m.get("clobTokenIds", "[]"))
         except:
             token_ids = []
+        condition_id = m.get("condition_id") or m.get("conditionId") or ""
         if len(token_ids) < 2:
             log.warning(f"[SKIP] No token IDs for {q[:50]}")
             TRADED_WINDOWS.add(window_key)
@@ -510,6 +558,9 @@ def main():
                         log.warning(f"[SIM-{result}] {side.upper()}@{price:.2f} x{size:.2f} pnl=${trade_pnl:+.2f} running=${_sim_pnl:+.2f}")
                     else:
                         log.warning(f"[SIM-UNKNOWN] Could not determine outcome")
+                    # Auto-redeem on-chain (real mode only — dry run has no real positions)
+                    if not DRY_RUN and condition_id:
+                        redeem_market_positions(condition_id, PRIVATE_KEY)
             else:
                 log.warning(f"[FAIL] Order failed — {q[:45]}")
             break  # exit inner poll loop
