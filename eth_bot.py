@@ -763,16 +763,7 @@ def main() -> None:
         init_ask   = (yes_ask if side == "yes" else no_ask)
         buy_price  = min((init_ask + 1) if init_ask is not None else init_bid, 99)
 
-        # ── ENTRY GATE — Simple: 85-96¢ + confirms → enter ──
-        # Hard cap at 96¢: no counterparty liquidity at 97-99¢
-        if buy_price > 96:
-            log.info(f"[SKIP] {st.market} {side.upper()}@{buy_price}¢ > 96¢ cap — reset")
-            st.certainty_counter = 0
-            st.certainty_side    = None
-            st.watch_active      = False
-            time.sleep(POLL_SECONDS)
-            continue
-
+        # ── ENTRY GATE — fire if we can get filled ──────────
         # Size: 20% of live balance
         order_qty = max(1, int((st.live_balance_usd * MAX_RISK_PCT) / (buy_price / 100)))
 
