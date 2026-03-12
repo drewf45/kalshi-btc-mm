@@ -66,7 +66,7 @@ POLL_SECS          = 1.0     # orderbook poll interval (same as Kalshi)
 MAX_RISK_PCT       = 0.20    # 20% of balance per trade
 MAX_USDC           = 10.0    # hard cap per trade
 MIN_ORDER_SHARES   = 5       # Polymarket minimum order size
-ASSUMED_BALANCE    = 24.0    # fallback if CLOB returns 0
+ASSUMED_BALANCE    = 12.89    # fallback if CLOB returns 0
 
 def required_confirms(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW - secs_to_close)
@@ -439,7 +439,7 @@ def main():
         from scoring_v11 import v11_score, compute_shares_polymarket, score_to_tier, MIN_SCORE
         v11 = v11_score(ASSET, side, int(price * 100), secs, _btc_1h_pct)
         tier = score_to_tier(v11)
-        safety_net_auto = (secs <= SAFETY_NET_SECS and price >= 0.75)
+        safety_net_auto = (secs <= SAFETY_NET_SECS and 0.75 <= price <= 0.96)
         if not safety_net_auto and v11 < MIN_SCORE:
             log.info(f"[V11-SKIP] {q[:45]} {side.upper()}@{price:.2f} score={v11:.3f} — waiting for safety net")
             # Do NOT mark as traded — safety net at T=10s still gets a shot
