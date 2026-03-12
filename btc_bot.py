@@ -756,24 +756,7 @@ def main() -> None:
         # ── CONFIRMED: enter ─────────────────────────────────
         side = st.certainty_side
 
-        # Counterparty check — skip at safety net (T=10s), just place and let Kalshi handle it
-        _in_safety_net = (secs_to_close <= SAFETY_NET_SECONDS)
-        if not _in_safety_net:
-            try:
-                cp_ob = client.request("GET", f"/markets/{st.market}/orderbook")
-                cp_yb, _, cp_nb, _ = parse_best_yes_no(cp_ob)
-                opposite_liquid = cp_nb if side == "yes" else cp_yb
-                if opposite_liquid is None:
-                    log.warning(f"[NO-COUNTERPARTY] {st.market} want {side.upper()} but opposite side empty — waiting for liquidity")
-                    st.traded_this_market = False
-                    st.certainty_counter  = 0
-                    st.certainty_side     = None
-                    time.sleep(POLL_SECONDS)
-                    continue
-            except Exception as e:
-                log.warning(f"[COUNTERPARTY-CHECK] {e} — proceeding anyway")
-        else:
-            log.info(f"[SAFETY-NET] Skipping counterparty check at T={secs_to_close:.0f}s — placing order")
+        # No counterparty check — place the order, let Kalshi handle it
 
         # Refresh live balance before sizing
         try:
