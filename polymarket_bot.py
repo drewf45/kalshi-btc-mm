@@ -380,7 +380,8 @@ def main():
         m      = candidate["market"]
         secs   = candidate["secs"]
         q      = m["question"]
-        window_key = m.get("conditionId") or m.get("id") or q[:80]
+        end_dt     = candidate["end_dt"]
+        window_key = f"{ASSET}_{end_dt.strftime('%Y%m%d_%H%M')}"
 
         # Already traded this window?
         if window_key in TRADED_WINDOWS:
@@ -416,6 +417,11 @@ def main():
                 log.info(f"[WINDOW-DONE] {q[:40]}")
                 TRADED_WINDOWS.add(window_key)
                 break
+            c2_key = f"{ASSET}_{candidate2['end_dt'].strftime('%Y%m%d_%H%M')}"
+            if c2_key != window_key:
+                log.info(f"[WINDOW-DONE] {q[:40]} — new window")
+                TRADED_WINDOWS.add(window_key)
+                break
             secs = candidate2["secs"]
             if secs <= 0:
                 TRADED_WINDOWS.add(window_key)
@@ -437,7 +443,7 @@ def main():
                     best_side, best_price, best_token = "yes", yes_price, token_ids[0]
                 if no_price is not None and no_price > best_price:
                     best_side, best_price, best_token = "no", no_price, token_ids[1]
-                if best_side and best_price >= 0.51:
+                if best_side and best_price >= 0.51 and (1.0 - best_price) >= 0.03:
                     side, price, token_id = best_side, best_price, best_token
                     log.warning(f"[SAFETY-NET] T={secs:.0f}s forcing {side}@{price:.2f}")
                 else:
