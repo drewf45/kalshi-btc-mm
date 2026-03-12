@@ -383,16 +383,13 @@ def main():
         m      = candidate["market"]
         secs   = candidate["secs"]
         q      = m["question"]
+        window_key = m.get("conditionId") or m.get("id") or q[:80]
 
         # Already traded this window?
-        window_key = m.get("conditionId", q)
         if window_key in TRADED_WINDOWS:
             log.info(f"[SKIP] Already traded {q[:50]}")
             time.sleep(10)
             continue
-
-        certainty_side    = None
-        certainty_counter = 0
 
         # Too early — wait
         if secs > WATCH_WINDOW:
@@ -411,114 +408,106 @@ def main():
             time.sleep(10)
             continue
 
-        # Poll orderbook every 1s — Kalshi-identical confirm counting
-        yes_price, no_price = get_best_prices(client, token_ids)
-        log.info(f"[TICK] {q[:50]} t={secs:.0f}s yes={yes_price} no={no_price}")
+        # ── INNER POLL LOOP — Kalshi-identical logic ─────────────
+        certainty_side    = None
+        certainty_counter = 0
 
-        if yes_price is None and no_price is None:
-            log.info("[TICK] No prices — retry")
-            time.sleep(POLL_SECS)
-            continue
-
-        # Safety net at T=30s — fire best side if >= 51¢
-        if secs <= SAFETY_NET_SECS:
-            best_side, best_price, best_token = None, 0, None
-            if yes_price is not None and yes_price > best_price:
-                best_side, best_price, best_token = "yes", yes_price, token_ids[0]
-            if no_price is not None and no_price > best_price:
-                best_side, best_price, best_token = "no", no_price, token_ids[1]
-            if best_side and best_price >= 0.51:
-                side, price, token_id = best_side, best_price, best_token
-                log.warning(f"[SAFETY-NET] T={secs:.0f}s forcing {side}@{price:.2f}")
-                certainty_side = side
-                certainty_counter = required_confirms(secs)
-            else:
+        while True:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            candidate2 = find_next_market(now_utc)
+            if not candidate2:
+                log.info(f"[WINDOW-DONE] {q[:40]}")
                 TRADED_WINDOWS.add(window_key)
+                break
+            secs = candidate2["secs"]
+            if secs <= 0:
+                TRADED_WINDOWS.add(window_key)
+                break
+
+            yes_price, no_price = get_best_prices(client, token_ids)
+            log.info(f"[TICK] {q[:50]} t={secs:.0f}s yes={yes_price} no={no_price}")
+
+            if yes_price is None and no_price is None:
                 time.sleep(POLL_SECS)
                 continue
-        else:
-            # Confirm counting — same as Kalshi
-            yes_certain = yes_price is not None and yes_price >= CONFIRM_THRESHOLD
-            no_certain  = no_price  is not None and no_price  >= CONFIRM_THRESHOLD
 
-            if yes_certain:
-                if certainty_side == "yes":
-                    certainty_counter += 1
+            side, price, token_id = None, None, None
+
+            # Safety net at T≤30s
+            if secs <= SAFETY_NET_SECS:
+                best_side, best_price, best_token = None, 0, None
+                if yes_price is not None and yes_price > best_price:
+                    best_side, best_price, best_token = "yes", yes_price, token_ids[0]
+                if no_price is not None and no_price > best_price:
+                    best_side, best_price, best_token = "no", no_price, token_ids[1]
+                if best_side and best_price >= 0.51:
+                    side, price, token_id = best_side, best_price, best_token
+                    log.warning(f"[SAFETY-NET] T={secs:.0f}s forcing {side}@{price:.2f}")
                 else:
-                    certainty_side, certainty_counter = "yes", 1
-            elif no_certain:
-                if certainty_side == "no":
-                    certainty_counter += 1
-                else:
-                    certainty_side, certainty_counter = "no", 1
+                    TRADED_WINDOWS.add(window_key)
+                    break
             else:
-                if certainty_counter > 0:
+                yes_certain = yes_price is not None and yes_price >= CONFIRM_THRESHOLD
+                no_certain  = no_price  is not None and no_price  >= CONFIRM_THRESHOLD
+                if yes_certain:
+                    if certainty_side == "yes": certainty_counter += 1
+                    else: certainty_side, certainty_counter = "yes", 1
+                elif no_certain:
+                    if certainty_side == "no": certainty_counter += 1
+                    else: certainty_side, certainty_counter = "no", 1
+                else:
                     certainty_side, certainty_counter = None, 0
-                log.info(f"[WATCH] t={secs:.0f}s yes={yes_price} no={no_price} need {required_confirms(secs)} confirms at ≥{CONFIRM_THRESHOLD:.0%}")
-                time.sleep(POLL_SECS)
-                continue
+                    log.info(f"[WATCH] t={secs:.0f}s yes={yes_price} no={no_price} need {required_confirms(secs)} at ≥{CONFIRM_THRESHOLD:.0%}")
+                    time.sleep(POLL_SECS)
+                    continue
+                if certainty_counter < required_confirms(secs):
+                    log.info(f"[WATCH] {certainty_side.upper()}@{(yes_price if certainty_side=='yes' else no_price):.2f} {certainty_counter}/{required_confirms(secs)} t={secs:.0f}s")
+                    time.sleep(POLL_SECS)
+                    continue
+                side = certainty_side
+                price = yes_price if side == "yes" else no_price
+                token_id = token_ids[0] if side == "yes" else token_ids[1]
 
-            if certainty_counter < required_confirms(secs):
-                log.info(f"[WATCH] {certainty_side.upper()}@{(yes_price if certainty_side=='yes' else no_price):.2f} counter={certainty_counter}/{required_confirms(secs)} t={secs:.0f}s")
-                time.sleep(POLL_SECS)
-                continue
+            # Size and place
+            balance = get_usdc_balance(client)
+            if balance < 0.50:
+                balance = ASSUMED_BALANCE
+            usdc_risk = balance * MAX_RISK_PCT
+            size = round(usdc_risk / price, 2)
+            size = max(0.01, min(size, MAX_USDC / price))
+            usdc_cost = size * price
 
-            # Confirmed — set side/price/token
-            if certainty_side == "yes":
-                side, price, token_id = "yes", yes_price, token_ids[0]
+            log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s")
+            success = place_order(client, token_id, price, size, side)
+            TRADED_WINDOWS.add(window_key)
+
+            if success:
+                log.warning(f"[FILLED] {q[:45]}")
+                if DRY_RUN:
+                    global _sim_pnl, _sim_trades
+                    _sim_trades += 1
+                    settled_yes = None
+                    for _ in range(35):
+                        time.sleep(1)
+                        try:
+                            sy, sn = get_best_prices(client, token_ids)
+                            if sy is not None and sy >= 0.98: settled_yes = True; break
+                            if sy is not None and sy <= 0.02: settled_yes = False; break
+                            if sn is not None and sn >= 0.98: settled_yes = False; break
+                            if sn is not None and sn <= 0.02: settled_yes = True; break
+                        except: pass
+                    if settled_yes is not None:
+                        won = (settled_yes and side == "yes") or (not settled_yes and side == "no")
+                        payout = size * (1.0 - price) if won else 0.0
+                        trade_pnl = payout - (0 if won else usdc_cost)
+                        _sim_pnl += trade_pnl
+                        result = "WIN" if won else "LOSS"
+                        log.warning(f"[SIM-{result}] {side.upper()}@{price:.2f} x{size:.2f} pnl=${trade_pnl:+.2f} running=${_sim_pnl:+.2f}")
+                    else:
+                        log.warning(f"[SIM-UNKNOWN] Could not determine outcome")
             else:
-                side, price, token_id = "no", no_price, token_ids[1]
-
-        # Simple sizing: 20% of balance
-        balance = get_usdc_balance(client)
-        if balance < 0.50:
-            balance = ASSUMED_BALANCE
-
-        usdc_risk = balance * MAX_RISK_PCT
-        size = round(usdc_risk / price, 2)
-        size = max(0.01, min(size, MAX_USDC / price))
-        usdc_cost = size * price
-
-        log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) bal=${balance:.2f} t={secs:.0f}s")
-
-        success = place_order(client, token_id, price, size, side)
-        TRADED_WINDOWS.add(window_key)
-
-        if success:
-            log.warning(f"[FILLED] {q[:45]}")
-            # Detect outcome for dry run sim P&L
-            if DRY_RUN:
-                global _sim_pnl, _sim_trades
-                _sim_trades += 1
-                # Wait for settlement — poll up to 35s for price to resolve
-                settled_yes = None
-                for _ in range(35):
-                    time.sleep(1)
-                    try:
-                        sy, sn = get_best_prices(client, token_ids)
-                        if sy is not None and sy >= 0.98:
-                            settled_yes = True; break
-                        if sy is not None and sy <= 0.02:
-                            settled_yes = False; break
-                        if sn is not None and sn >= 0.98:
-                            settled_yes = False; break
-                        if sn is not None and sn <= 0.02:
-                            settled_yes = True; break
-                    except:
-                        pass
-                if settled_yes is not None:
-                    won = (settled_yes and side == "yes") or (not settled_yes and side == "no")
-                    payout = size * (1.0 - price) if won else 0.0
-                    trade_pnl = payout - (0 if won else usdc_cost)
-                    _sim_pnl += trade_pnl
-                    result = "WIN" if won else "LOSS"
-                    log.warning(f"[SIM-{result}] {side.upper()}@{price:.2f} x{size:.2f} pnl=${trade_pnl:+.2f} running=${_sim_pnl:+.2f}")
-                else:
-                    log.warning(f"[SIM-UNKNOWN] Could not determine outcome")
-        else:
-            log.warning(f"[FAIL] Order failed — {q[:45]}")
-
-        time.sleep(5)
+                log.warning(f"[FAIL] Order failed — {q[:45]}")
+            break  # exit inner poll loop
 
 
 if __name__ == "__main__":
