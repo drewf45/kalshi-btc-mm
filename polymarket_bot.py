@@ -391,6 +391,9 @@ def main():
             time.sleep(10)
             continue
 
+        certainty_side    = None
+        certainty_counter = 0
+
         # Too early — wait
         if secs > WATCH_WINDOW:
             log.info(f"[WAIT] {q[:50]} closes in {secs:.0f}s")
@@ -408,36 +411,63 @@ def main():
             time.sleep(10)
             continue
 
-        # Poll orderbook every 1s (same as Kalshi)
+        # Poll orderbook every 1s — Kalshi-identical confirm counting
         yes_price, no_price = get_best_prices(client, token_ids)
         log.info(f"[TICK] {q[:50]} t={secs:.0f}s yes={yes_price} no={no_price}")
 
         if yes_price is None and no_price is None:
-            log.warning("[TICK] No prices — retry")
+            log.info("[TICK] No prices — retry")
             time.sleep(POLL_SECS)
             continue
 
-        # Pick high-confidence side (ask >= 90¢), same as Kalshi bid >= 90¢
-        side, price, token_id = None, None, None
-        if yes_price is not None and yes_price >= CONFIRM_THRESHOLD:
-            side, price, token_id = "yes", yes_price, token_ids[0]
-        if no_price is not None and no_price >= CONFIRM_THRESHOLD:
-            if side is None or no_price > price:
-                side, price, token_id = "no", no_price, token_ids[1]
+        # Safety net at T=30s — fire best side if >= 51¢
+        if secs <= SAFETY_NET_SECS:
+            best_side, best_price, best_token = None, 0, None
+            if yes_price is not None and yes_price > best_price:
+                best_side, best_price, best_token = "yes", yes_price, token_ids[0]
+            if no_price is not None and no_price > best_price:
+                best_side, best_price, best_token = "no", no_price, token_ids[1]
+            if best_side and best_price >= 0.51:
+                side, price, token_id = best_side, best_price, best_token
+                log.warning(f"[SAFETY-NET] T={secs:.0f}s forcing {side}@{price:.2f}")
+                certainty_side = side
+                certainty_counter = required_confirms(secs)
+            else:
+                TRADED_WINDOWS.add(window_key)
+                time.sleep(POLL_SECS)
+                continue
+        else:
+            # Confirm counting — same as Kalshi
+            yes_certain = yes_price is not None and yes_price >= CONFIRM_THRESHOLD
+            no_certain  = no_price  is not None and no_price  >= CONFIRM_THRESHOLD
 
-        # Safety net at T=10s — force best side like Kalshi
-        if side is None and secs <= SAFETY_NET_SECS:
-            if yes_price is not None and no_price is not None:
-                if yes_price >= no_price:
-                    side, price, token_id = "yes", yes_price, token_ids[0]
+            if yes_certain:
+                if certainty_side == "yes":
+                    certainty_counter += 1
                 else:
-                    side, price, token_id = "no", no_price, token_ids[1]
-                log.warning(f"[SAFETY-NET] T={secs:.0f}s forcing {side}@{price}")
+                    certainty_side, certainty_counter = "yes", 1
+            elif no_certain:
+                if certainty_side == "no":
+                    certainty_counter += 1
+                else:
+                    certainty_side, certainty_counter = "no", 1
+            else:
+                if certainty_counter > 0:
+                    certainty_side, certainty_counter = None, 0
+                log.info(f"[WATCH] t={secs:.0f}s yes={yes_price} no={no_price} need {required_confirms(secs)} confirms at ≥{CONFIRM_THRESHOLD:.0%}")
+                time.sleep(POLL_SECS)
+                continue
 
-        if side is None:
-            log.info(f"[WATCH] t={secs:.0f}s yes={yes_price} no={no_price} need {required_confirms(secs)} confirms at ≥{CONFIRM_THRESHOLD}")
-            time.sleep(POLL_SECS)
-            continue
+            if certainty_counter < required_confirms(secs):
+                log.info(f"[WATCH] {certainty_side.upper()}@{(yes_price if certainty_side=='yes' else no_price):.2f} counter={certainty_counter}/{required_confirms(secs)} t={secs:.0f}s")
+                time.sleep(POLL_SECS)
+                continue
+
+            # Confirmed — set side/price/token
+            if certainty_side == "yes":
+                side, price, token_id = "yes", yes_price, token_ids[0]
+            else:
+                side, price, token_id = "no", no_price, token_ids[1]
 
         # Simple sizing: 20% of balance
         balance = get_usdc_balance(client)
