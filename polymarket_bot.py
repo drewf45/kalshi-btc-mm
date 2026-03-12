@@ -93,6 +93,8 @@ _btc_trend    = {"direction": "neutral", "updated": 0.0}
 _last_trend   = 0.0
 _btc_1h_pct   = 0.0   # V11: BTC 1h % change (numeric)
 _session_start_balance: float = 0.0  # V11: drawdown tracking
+_sim_pnl:    float = 0.0
+_sim_trades: int   = 0
 
 # ── LOGGING ───────────────────────────────────────────────────
 logging.basicConfig(
