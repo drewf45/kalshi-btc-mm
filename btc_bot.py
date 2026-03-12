@@ -764,25 +764,26 @@ def main() -> None:
         init_ask   = (yes_ask if side == "yes" else no_ask)
         buy_price  = min((init_ask + 1) if init_ask is not None else init_bid, 99)
 
-        # ── V11 SCORING GATE ─────────────────────────────────
+        # ── ENTRY GATE ─────────────────────────────────────
         from scoring_v11 import v11_score, compute_contracts_kalshi, score_to_tier, MIN_SCORE
-        # Safety net at T=10s with price ≥ 90¢: automatic entry — market has decided
-        safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 75)
-        v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
-        tier = score_to_tier(v11)
-        if not safety_net_auto and v11 < MIN_SCORE:
-            log.info(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} — waiting for safety net")
-            # Do NOT mark as traded — safety net at T=10s still gets a shot
+        # Hard cap: never enter above 96¢ — no counterparty liquidity at 97-99¢ near close
+        if buy_price > 96:
+            log.info(f"[SKIP] {st.market} {side.upper()}@{buy_price}¢ > 96¢ cap — no liquidity")
             st.certainty_counter = 0
             st.certainty_side    = None
             st.watch_active      = False
             time.sleep(POLL_SECONDS)
             continue
-        if safety_net_auto and v11 < MIN_SCORE:
-            # Certain win at T=10s — size at HIGH (20% max)
-            v11 = 0.60
-            tier = 'HIGH'
-            log.warning(f"[SAFETY-AUTO] {st.market} {side.upper()}@{buy_price}¢ at T=10s — sizing HIGH")
+        v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
+        tier = score_to_tier(v11)
+        safety_net_auto = False
+        if v11 < MIN_SCORE:
+            log.info(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} — skip")
+            st.certainty_counter = 0
+            st.certainty_side    = None
+            st.watch_active      = False
+            time.sleep(POLL_SECONDS)
+            continue
 
         order_qty = compute_contracts_kalshi(v11, buy_price, st.live_balance_usd, _session_start_balance)
         if order_qty == 0:
