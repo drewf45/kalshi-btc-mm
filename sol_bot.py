@@ -947,7 +947,8 @@ def main() -> None:
                     try:
                         m_info = client.request("GET", f"/markets/{st.market}")
                         if m_info:
-                            r = (m_info.get("result") or "").lower()
+                            mkt = m_info.get("market", m_info)
+                            r = (mkt.get("result") or "").lower()
                             if r in ("yes", "no"):
                                 settled_result = r; break
                     except: pass
