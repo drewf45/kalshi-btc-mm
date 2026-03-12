@@ -63,6 +63,7 @@ CONFIRM_CHECKS     = 4       # ticks required at start of watch window
 CONFIRM_STEP       = 30      # reduce by 1 every 30s → min 1 at T=90s
 SAFETY_NET_SECS    = 30      # fallback: buy best side at T=10s if no position yet
 POLL_SECS          = 1.0     # orderbook poll interval (same as Kalshi)
+DRY_RUN            = os.getenv('PM_DRY_RUN', 'false').lower() == 'true'
 MAX_RISK_PCT       = 0.20    # 20% of balance per trade
 MAX_USDC           = 10.0    # hard cap per trade
 MIN_ORDER_SHARES   = 5       # Polymarket minimum order size
@@ -326,6 +327,9 @@ def place_order(client: ClobClient, token_id: str, price: float, size: float, si
             size=size,
             side="BUY",
         )
+        if DRY_RUN:
+            log.warning(f"[DRY-RUN] Would place {side_str.upper()}@{price:.2f} x{size:.2f} — skipping real order")
+            return True
         resp = client.create_and_post_order(order_args)
         log.warning(f"[ORDER] {side_str.upper()}@{price:.2f} x{size:.2f} → {resp}")
         return True
