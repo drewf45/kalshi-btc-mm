@@ -284,9 +284,25 @@ def parse_best_yes_no(ob: Any) -> Tuple[Optional[int], Optional[int], Optional[i
                 asks.append(p)
         return min(asks) if asks else None
 
-    ob_data = ob.get("orderbook", ob)
-    yes_bids = ob_data.get("yes", [])
-    no_bids  = ob_data.get("no",  [])
+    # Support both old format (orderbook.yes/no, int cents)
+    # and new format (orderbook_fp.yes_dollars/no_dollars, float 0.xx)
+    if "orderbook_fp" in ob:
+        fp = ob["orderbook_fp"]
+        def fp_to_cents(levels):
+            result = []
+            for lv in (levels or []):
+                try:
+                    p = round(float(lv[0]) * 100)
+                    if 1 <= p <= 99:
+                        result.append([p, lv[1]])
+                except: pass
+            return result
+        yes_bids = fp_to_cents(fp.get("yes_dollars", []))
+        no_bids  = fp_to_cents(fp.get("no_dollars",  []))
+    else:
+        ob_data  = ob.get("orderbook", ob)
+        yes_bids = ob_data.get("yes", [])
+        no_bids  = ob_data.get("no",  [])
 
     yes_bid = best_bid(yes_bids)
     no_bid  = best_bid(no_bids)
