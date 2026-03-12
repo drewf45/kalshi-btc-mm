@@ -763,36 +763,22 @@ def main() -> None:
         init_ask   = (yes_ask if side == "yes" else no_ask)
         buy_price  = min((init_ask + 1) if init_ask is not None else init_bid, 99)
 
-        # ── ENTRY GATE ─────────────────────────────────────
-        from scoring_v11 import v11_score, compute_contracts_kalshi, score_to_tier, MIN_SCORE
-        # Hard cap: never enter above 96¢ — no counterparty at 97-99¢ near close
+        # ── ENTRY GATE — Simple: 85-96¢ + confirms → enter ──
+        # Hard cap at 96¢: no counterparty liquidity at 97-99¢
         if buy_price > 96:
-            log.info(f"[SKIP] {st.market} {side.upper()}@{buy_price}¢ > 96¢ cap — no liquidity")
-            st.certainty_counter = 0
-            st.certainty_side    = None
-            st.watch_active      = False
-            time.sleep(POLL_SECONDS)
-            continue
-        v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
-        tier = score_to_tier(v11)
-        safety_net_auto = False
-        if v11 < MIN_SCORE:
-            log.info(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} — skip")
+            log.info(f"[SKIP] {st.market} {side.upper()}@{buy_price}¢ > 96¢ cap — reset")
             st.certainty_counter = 0
             st.certainty_side    = None
             st.watch_active      = False
             time.sleep(POLL_SECONDS)
             continue
 
-        order_qty = compute_contracts_kalshi(v11, buy_price, st.live_balance_usd, _session_start_balance)
-        if order_qty == 0:
-            log.info(f"[SKIP] V11 size=0 — skip")
-            time.sleep(POLL_SECONDS)
-            continue
+        # Size: 20% of live balance
+        order_qty = max(1, int((st.live_balance_usd * MAX_RISK_PCT) / (buy_price / 100)))
 
         # Minimum trade gate ($1 cost)
         if order_qty * buy_price / 100 < 1.00:
-            log.info(f"[SKIP] Proposed cost < $1.00 — skip")
+            log.info(f"[SKIP] Cost < $1.00 — skip")
             time.sleep(POLL_SECONDS)
             continue
 
