@@ -890,7 +890,11 @@ def main() -> None:
                 log.warning(f"[RETRY] #{attempt} {current_side.upper()}@{new_price}¢ qty={remaining} ${cost:.2f} t={deadline-time.time():.0f}s left")
                 try:
                     oid = place_order(client, st.market, current_side, new_price, remaining, close_ts)
-                    if oid and not oid.startswith("BLOCKED") and not oid.startswith("DRY") and not oid.startswith("ERROR"):
+                    if oid == "DRY_RUN":
+                        total_filled = remaining  # treat dry run as instant fill
+                        last_price   = new_price
+                        break
+                    elif oid and not oid.startswith("BLOCKED") and not oid.startswith("ERROR"):
                         resting_oid = oid
                         last_price  = new_price
                         st.order_id = oid
