@@ -764,7 +764,7 @@ def main() -> None:
         # ── V11 SCORING GATE ─────────────────────────────────
         from scoring_v11 import v11_score, compute_contracts_kalshi, score_to_tier, MIN_SCORE
         # Safety net at T=10s with price ≥ 90¢: automatic entry — market has decided
-        safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 90)
+        safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 60)
         v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
         tier = score_to_tier(v11)
         if not safety_net_auto and v11 < MIN_SCORE:
