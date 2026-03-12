@@ -91,7 +91,7 @@ def required_confirms(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
     reduction = int(elapsed / CONFIRM_STEP)
     return max(1, CONFIRM_CHECKS - reduction)
-SAFETY_NET_SECONDS   = 30      # Fallback: buy best side at T=10s if no position yet
+SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
 META_REFRESH_SECONDS = 10.0    # Active market refresh interval
 MAX_RISK_PCT         = 0.20    # 20% of live balance per trade (hard cap)
@@ -763,14 +763,21 @@ def main() -> None:
 
         # ── V11 SCORING GATE ─────────────────────────────────
         from scoring_v11 import v11_score, compute_contracts_kalshi, score_to_tier, MIN_SCORE
+        # Safety net at T=10s with price ≥ 90¢: automatic entry — market has decided
+        safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 90)
         v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
         tier = score_to_tier(v11)
-        if v11 < MIN_SCORE:
+        if not safety_net_auto and v11 < MIN_SCORE:
             log.warning(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} < {MIN_SCORE} — skip")
             TRADED_TICKERS.add(st.market)
             st.traded_this_market = True
             time.sleep(POLL_SECONDS)
             continue
+        if safety_net_auto and v11 < MIN_SCORE:
+            # Force MEDIUM sizing for auto safety net
+            v11 = 0.30
+            tier = 'MEDIUM'
+            log.warning(f"[SAFETY-AUTO] {st.market} {side.upper()}@{buy_price}¢ ≥90¢ at T=10s — auto entry")
 
         order_qty = compute_contracts_kalshi(v11, buy_price, st.live_balance_usd, _session_start_balance)
         if order_qty == 0:
