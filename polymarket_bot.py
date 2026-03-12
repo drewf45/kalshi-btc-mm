@@ -406,24 +406,15 @@ def main():
             time.sleep(10)
             continue
 
-        # ── INNER POLL LOOP — Kalshi-identical logic ─────────────
+        # ── INNER POLL LOOP — stays on this market, no re-fetch ────
         certainty_side    = None
         certainty_counter = 0
 
         while True:
-            now_utc = datetime.now(timezone.utc)
-            candidate2 = find_next_market(now_utc)
-            if not candidate2:
-                log.info(f"[WINDOW-DONE] {q[:40]}")
-                TRADED_WINDOWS.add(window_key)
-                break
-            c2_key = f"{ASSET}_{candidate2['end_dt'].strftime('%Y%m%d_%H%M')}"
-            if c2_key != window_key:
-                log.info(f"[WINDOW-DONE] {q[:40]} — new window")
-                TRADED_WINDOWS.add(window_key)
-                break
-            secs = candidate2["secs"]
+            # Use original end_dt — no re-fetch, no key mismatch
+            secs = (end_dt - datetime.now(timezone.utc)).total_seconds()
             if secs <= 0:
+                log.info(f"[WINDOW-DONE] {q[:40]}")
                 TRADED_WINDOWS.add(window_key)
                 break
 
