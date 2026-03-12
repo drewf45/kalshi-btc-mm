@@ -446,9 +446,10 @@ def main():
             time.sleep(5)
             continue
         if safety_net_auto and v11 < MIN_SCORE:
-            v11 = 0.30
-            tier = 'MEDIUM'
-            log.warning(f"[SAFETY-AUTO] {q[:45]} {side.upper()}@{price:.2f} ≥0.90 at T=10s — auto entry")
+            # Certain win at T=10s — size at HIGH (20% max)
+            v11 = 0.60
+            tier = 'HIGH'
+            log.warning(f"[SAFETY-AUTO] {q[:45]} {side.upper()}@{price:.2f} at T=10s — sizing HIGH")
 
         balance = get_usdc_balance(client)
         if balance < 0.50:

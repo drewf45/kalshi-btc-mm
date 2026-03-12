@@ -774,10 +774,10 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
         if safety_net_auto and v11 < MIN_SCORE:
-            # Force MEDIUM sizing for auto safety net
-            v11 = 0.30
-            tier = 'MEDIUM'
-            log.warning(f"[SAFETY-AUTO] {st.market} {side.upper()}@{buy_price}¢ ≥90¢ at T=10s — auto entry")
+            # Certain win at T=10s — size at HIGH (20% max)
+            v11 = 0.60
+            tier = 'HIGH'
+            log.warning(f"[SAFETY-AUTO] {st.market} {side.upper()}@{buy_price}¢ at T=10s — sizing HIGH")
 
         order_qty = compute_contracts_kalshi(v11, buy_price, st.live_balance_usd, _session_start_balance)
         if order_qty == 0:
