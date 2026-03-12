@@ -439,7 +439,7 @@ def main():
         from scoring_v11 import v11_score, compute_shares_polymarket, score_to_tier, MIN_SCORE
         v11 = v11_score(ASSET, side, int(price * 100), secs, _btc_1h_pct)
         tier = score_to_tier(v11)
-        safety_net_auto = (secs <= SAFETY_NET_SECS and price >= 0.60)
+        safety_net_auto = (secs <= SAFETY_NET_SECS and price >= 0.90)
         if not safety_net_auto and v11 < MIN_SCORE:
             log.warning(f"[V11-SKIP] {q[:45]} {side.upper()}@{price:.2f} score={v11:.3f} — skip")
             TRADED_WINDOWS.add(window_key)
