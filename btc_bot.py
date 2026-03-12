@@ -771,9 +771,11 @@ def main() -> None:
         v11 = v11_score(BOT_ID, side, buy_price, secs_to_close, _btc_1h_pct)
         tier = score_to_tier(v11)
         if not safety_net_auto and v11 < MIN_SCORE:
-            log.warning(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} < {MIN_SCORE} — skip")
-            TRADED_TICKERS.add(st.market)
-            st.traded_this_market = True
+            log.info(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} — waiting for safety net")
+            # Do NOT mark as traded — safety net at T=10s still gets a shot
+            st.certainty_counter = 0
+            st.certainty_side    = None
+            st.watch_active      = False
             time.sleep(POLL_SECONDS)
             continue
         if safety_net_auto and v11 < MIN_SCORE:

@@ -770,9 +770,11 @@ def main() -> None:
         # Safety net at T=10s with price ≥ 90¢: automatic entry
         safety_net_auto = (secs_to_close <= SAFETY_NET_SECONDS and buy_price >= 75)
         if not safety_net_auto and v11 < MIN_SCORE:
-            log.warning(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} < {MIN_SCORE} — skip")
-            TRADED_TICKERS.add(st.market)
-            st.traded_this_market = True
+            log.info(f"[V11-SKIP] {st.market} {side.upper()}@{buy_price}¢ score={v11:.3f} — waiting for safety net")
+            # Do NOT mark as traded — safety net at T=10s still gets a shot
+            st.certainty_counter = 0
+            st.certainty_side    = None
+            st.watch_active      = False
             time.sleep(POLL_SECONDS)
             continue
 
