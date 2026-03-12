@@ -941,6 +941,12 @@ def main() -> None:
             )
             # Sim P&L outcome tracking for DRY_RUN
             if DRY_RUN:
+                # Wait until market closes before polling for settlement
+                if close_ts:
+                    wait_secs = max(0, close_ts - time.time() + 5)
+                    if wait_secs > 0:
+                        log.info(f"[SIM-WAIT] {st.market} — waiting {wait_secs:.0f}s for close")
+                        time.sleep(wait_secs)
                 settled_result = None
                 for _ in range(60):
                     time.sleep(1)
