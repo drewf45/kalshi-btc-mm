@@ -61,7 +61,7 @@ CONFIRM_THRESHOLD  = 0.85    # ask >= 90¢ to consider "certain" (Kalshi: bid >=
 WATCH_WINDOW       = 180     # start watching 180s before close
 CONFIRM_CHECKS     = 4       # ticks required at start of watch window
 CONFIRM_STEP       = 30      # reduce by 1 every 30s → min 1 at T=90s
-SAFETY_NET_SECS    = 10      # fallback: buy best side at T=10s if no position yet
+SAFETY_NET_SECS    = 30      # fallback: buy best side at T=10s if no position yet
 POLL_SECS          = 1.0     # orderbook poll interval (same as Kalshi)
 MAX_RISK_PCT       = 0.20    # 20% of balance per trade
 MAX_USDC           = 10.0    # hard cap per trade

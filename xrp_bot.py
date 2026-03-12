@@ -91,7 +91,7 @@ def required_confirms(secs_to_close: float) -> int:
     elapsed = max(0, WATCH_WINDOW_SECONDS - secs_to_close)
     reduction = int(elapsed / CONFIRM_STEP)
     return max(1, CONFIRM_CHECKS - reduction)
-SAFETY_NET_SECONDS   = 10      # Fallback: buy best side at T=10s if no position yet
+SAFETY_NET_SECONDS   = 30      # Fallback: buy best side at T=10s if no position yet
 POLL_SECONDS         = 1.0     # Orderbook poll interval
 META_REFRESH_SECONDS = 10.0    # Active market refresh interval
 MAX_RISK_PCT         = 0.20    # 20% of live balance per trade (hard cap)
