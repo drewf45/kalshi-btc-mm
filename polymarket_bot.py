@@ -435,8 +435,8 @@ def main():
         # Find next market
         candidate = find_next_market(now_utc)
         if not candidate:
-            log.info(f"[SCAN] No open {ASSET} windows (next scan in 15s)")
-            time.sleep(15)
+            log.info(f"[SCAN] No open {ASSET} windows (next scan in 30s)")
+            time.sleep(30)
             continue
 
         m      = candidate["market"]

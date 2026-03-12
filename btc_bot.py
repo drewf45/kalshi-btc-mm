@@ -612,7 +612,8 @@ def main() -> None:
 
         # ── Refresh active market ───────────────────────────
         now = time.time()
-        if now - last_meta > META_REFRESH_SECONDS or not st.market:
+        idle_refresh = META_REFRESH_SECONDS if (secs_to_close is None or secs_to_close < 90) else 30.0
+        if now - last_meta > idle_refresh or not st.market:
             try:
                 ev, ticker, mobj = refresh_market()
                 if ticker != st.market:
