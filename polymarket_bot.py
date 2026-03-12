@@ -57,7 +57,7 @@ if not PRIVATE_KEY or not FUNDER:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS must be set as env vars")
 
 # ── THRESHOLDS — matches Kalshi V5 btc_bot.py exactly ────────
-CONFIRM_THRESHOLD  = 0.85    # ask >= 90¢ to consider "certain" (Kalshi: bid >= 90¢)
+CONFIRM_THRESHOLD  = 0.62    # ask >= 90¢ to consider "certain" (Kalshi: bid >= 90¢)
 WATCH_WINDOW       = 180     # start watching 180s before close
 CONFIRM_CHECKS     = 4       # ticks required at start of watch window
 CONFIRM_STEP       = 30      # reduce by 1 every 30s → min 1 at T=90s
@@ -439,34 +439,14 @@ def main():
             time.sleep(POLL_SECS)
             continue
 
-        # V11 scoring gate
-        from scoring_v11 import v11_score, compute_shares_polymarket, score_to_tier, MIN_SCORE
-        v11 = v11_score(ASSET, side, int(price * 100), secs, _btc_1h_pct)
-        tier = score_to_tier(v11)
-        safety_net_auto = (secs <= SAFETY_NET_SECS and 0.75 <= price <= 0.96)
-        if not safety_net_auto and v11 < MIN_SCORE:
-            log.info(f"[V11-SKIP] {q[:45]} {side.upper()}@{price:.2f} score={v11:.3f} — waiting for safety net")
-            # Do NOT mark as traded — safety net at T=10s still gets a shot
-            time.sleep(3)
-            continue
-        if safety_net_auto and v11 < MIN_SCORE:
-            # Certain win at T=10s — size at HIGH (20% max)
-            v11 = 0.60
-            tier = 'HIGH'
-            log.warning(f"[SAFETY-AUTO] {q[:45]} {side.upper()}@{price:.2f} at T=10s — sizing HIGH")
-
+        # Simple sizing: 20% of balance
         balance = get_usdc_balance(client)
         if balance < 0.50:
-            log.warning(f"[LOW-BAL] CLOB ${balance:.2f} — using ${ASSUMED_BALANCE:.2f}")
             balance = ASSUMED_BALANCE
 
-        size = compute_shares_polymarket(v11, price, balance, _session_start_balance)
-        if size == 0:
-            log.warning(f"[V11-SKIP] size=0 — skip")
-            TRADED_WINDOWS.add(window_key)
-            continue
-        # hard cap
-        size = min(size, MAX_USDC / price)
+        usdc_risk = balance * MAX_RISK_PCT
+        size = round(usdc_risk / price, 2)
+        size = max(0.01, min(size, MAX_USDC / price))
         usdc_cost = size * price
 
         log.warning(f"[ENTER] {ASSET} {side.upper()}@{price:.2f} x{size:.2f} (${usdc_cost:.2f}) V11={v11:.3f} tier={tier} bal=${balance:.2f} t={secs:.0f}s")
