@@ -21,9 +21,9 @@ from py_clob_client.clob_types import OrderArgs
 try:
     from web3 import Web3 as _Web3
     _POLYGON_RPCS   = [
+        "https://polygon-mainnet.g.alchemy.com/v2/pwbVz5BdGt673DWi0Jf5V",  # primary — Alchemy
         "https://polygon.drpc.org",
         "https://polygon-rpc.com",
-        "https://rpc-mainnet.matic.network",
         "https://rpc.ankr.com/polygon",
     ]
     _POLYGON_RPC    = _POLYGON_RPCS[0]
