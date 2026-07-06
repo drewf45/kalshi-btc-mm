@@ -7,7 +7,7 @@ with N and Wilson bounds.
 Statistical gates:
 - Tradeable-at-size: Wilson 95% lower bound > breakeven + friction
 - Band lock: Wilson upper bound < breakeven at N >= 200
-- Project kill: all bands locked → thesis is dead
+- Project kill: all bands locked -> thesis is dead
 """
 
 import math
@@ -22,7 +22,6 @@ log = logging.getLogger("k_worker.scoreboard")
 COST_BANDS = [
     (95, 95), (96, 96), (97, 97), (98, 98), (99, 99),
 ]
-FEE_FRICTION_PCT = 0.01  # estimated 1% friction from fees/slippage
 
 
 def wilson_bounds(wins: int, n: int, z: float = 1.96) -> tuple:
@@ -39,57 +38,65 @@ def wilson_bounds(wins: int, n: int, z: float = 1.96) -> tuple:
 def build_scoreboard() -> str:
     """Build the daily scoreboard string."""
     lines = []
-    lines.append("═══ K-WORKER SCOREBOARD ═══")
+    lines.append("=== K-WORKER SCOREBOARD ===")
     lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M ET')}")
 
-    # Overall daily stats
     daily = store.daily_stats("live-traded")
-    lines.append(f"\n📊 Today: {daily['n']} trades, "
+    lines.append(f"\nToday: {daily['n']} trades, "
                  f"W/L={daily['wins']}/{daily['losses']}, "
                  f"net=${daily['net_pnl']:.2f}, fees=${daily['total_fees']:.2f}")
 
-    # Per-band breakdown
-    lines.append("\n╔═══════╦═════╦═══════╦══════════╦═══════════╦═══════════╗")
-    lines.append("║ Band  ║  N  ║ Win%  ║ BE%      ║ Wilson LB ║ Margin    ║")
-    lines.append("╠═══════╬═════╬═══════╬══════════╬═══════════╬═══════════╣")
+    lines.append("\n Band  |  N  | Win%  | BE%      | Wilson LB | Margin")
+    lines.append("-------|-----|-------|----------|-----------|----------")
 
     all_locked = True
     for lo, hi in COST_BANDS:
         stats = store.query_band_stats(lo, hi, "live-traded")
         n = stats["n"]
         wp = stats["win_pct"]
-        be = lo / 100.0  # breakeven = cost
+        be = lo / 100.0
         w_lo, w_hi = wilson_bounds(stats["wins"], n)
-        margin = wp - be - FEE_FRICTION_PCT if n > 0 else 0.0
-        wilson_margin = w_lo - be - FEE_FRICTION_PCT if n > 0 else 0.0
+
+        friction = store.query_band_friction(lo, hi, "live-traded")
+
+        if friction is not None:
+            friction_str = f"{friction:.1%}"
+            wilson_margin = w_lo - be - friction if n > 0 else 0.0
+            be_display = f"{be:.1%}+{friction_str}"
+        else:
+            friction_str = "unmeasured"
+            wilson_margin = w_lo - be if n > 0 else 0.0
+            be_display = f"{be:.1%}+?"
 
         status = ""
         if n == 0:
-            status = "⏳"
+            status = "waiting"
             all_locked = False
-        elif w_lo > be + FEE_FRICTION_PCT:
-            status = "✅ CLEAR"
+        elif friction is None:
+            status = "unmeasured friction"
+            all_locked = False
+        elif w_lo > be + friction:
+            status = "CLEAR"
             all_locked = False
         elif n >= 200 and w_hi < be:
-            status = "🔒 LOCKED"
+            status = "LOCKED"
         else:
-            status = "📊 MEASURING"
+            status = "MEASURING"
             all_locked = False
 
         lines.append(
-            f"║ {lo}-{hi}¢ ║ {n:3d} ║ {wp:5.1%} ║ {be:6.1%}+1% ║ {w_lo:7.1%}   ║ {wilson_margin:+7.1%} {status} ║"
+            f" {lo}-{hi}c | {n:3d} | {wp:5.1%} | {be_display:>8s} | {w_lo:7.1%}   | {wilson_margin:+7.1%} {status}"
         )
 
-    lines.append("╚═══════╩═════╩═══════╩══════════╩═══════════╩═══════════╝")
+    lines.append("")
 
     if all_locked and any(store.query_band_stats(lo, hi, "live-traded")["n"] >= 200
                           for lo, hi in COST_BANDS):
-        lines.append("\n🪦 PROJECT KILL: All bands locked. Thesis is dead.")
+        lines.append("PROJECT KILL: All bands locked. Thesis is dead.")
 
-    # Shadow report
     shadow = store.daily_stats("live-observed")
     if shadow["n"] > 0:
-        lines.append(f"\n👁 Shadow: {shadow['n']} observed, "
+        lines.append(f"Shadow: {shadow['n']} observed, "
                      f"would-be net=${shadow['net_pnl']:.2f}")
 
     return "\n".join(lines)

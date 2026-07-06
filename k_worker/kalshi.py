@@ -58,7 +58,7 @@ class KalshiClient:
             msg,
             asy_padding.PSS(
                 mgf=asy_padding.MGF1(hashes.SHA256()),
-                salt_length=asy_padding.PSS.MAX_LENGTH,
+                salt_length=asy_padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA256(),
         )
@@ -72,18 +72,30 @@ class KalshiClient:
                 params: Optional[Dict] = None,
                 json_body: Optional[Dict] = None,
                 timeout: float = 10.0) -> Any:
+        import random
         if not path.startswith("/"):
             path = "/" + path
         url = f"{self.api_base}{self.api_prefix}{path}"
         url_with_q = url + "?" + urlencode(params) if params else url
-        headers = self._sign_headers(method, url)
-        headers["Accept"] = "application/json"
-        if json_body is not None:
-            headers["Content-Type"] = "application/json"
-        resp = self.session.request(
-            method=method.upper(), url=url_with_q,
-            headers=headers, json=json_body, timeout=timeout,
-        )
+
+        max_retries = 3
+        base_delay = 0.5
+        for attempt in range(max_retries + 1):
+            headers = self._sign_headers(method, url)
+            headers["Accept"] = "application/json"
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+            resp = self.session.request(
+                method=method.upper(), url=url_with_q,
+                headers=headers, json=json_body, timeout=timeout,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                    log.warning(f"[API] HTTP {resp.status_code} {path} — retry {attempt+1}/{max_retries} in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+            break
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code} {path}: {resp.text or ''}")
         return resp.json() if resp.content else None
@@ -93,9 +105,9 @@ def build_client() -> KalshiClient:
     """Build a KalshiClient from env vars."""
     kalshi_env = os.environ.get("KALSHI_ENV", "demo").lower()
     if kalshi_env == "live":
-        api_base = os.environ.get("KALSHI_API_BASE", "https://api.elections.kalshi.com")
+        api_base = os.environ.get("KALSHI_API_BASE", "https://external-api.kalshi.com")
     else:
-        api_base = os.environ.get("KALSHI_API_BASE", "https://demo-api.kalshi.co")
+        api_base = os.environ.get("KALSHI_API_BASE", "https://external-api.demo.kalshi.co")
     api_prefix = os.environ.get("KALSHI_API_PREFIX", "/trade-api/v2")
     key_id = os.environ.get("KALSHI_API_KEY_ID", "")
     pem_b64 = os.environ.get("KALSHI_PRIVATE_KEY_PEM_BASE64", "")

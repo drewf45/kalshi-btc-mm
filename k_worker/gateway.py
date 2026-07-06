@@ -12,6 +12,7 @@ Walls (Tier 0, non-negotiable):
 - Per-hour exposure cap $3.00
 """
 
+import json
 import time
 import logging
 from typing import Optional, Tuple
@@ -28,6 +29,32 @@ MIN_BALANCE_USD = 5.00
 
 _traded_tickers: set = set()
 _hourly_exposure: list = []  # list of (timestamp, dollars_at_risk)
+
+
+def _load_persisted_state() -> None:
+    """Load traded tickers and hourly exposure from store at boot."""
+    raw = store.get_state("traded_tickers")
+    if raw:
+        try:
+            _traded_tickers.update(json.loads(raw))
+        except Exception:
+            pass
+    raw = store.get_state("hourly_exposure")
+    if raw:
+        try:
+            _hourly_exposure.extend(json.loads(raw))
+        except Exception:
+            pass
+
+
+def _save_traded_tickers() -> None:
+    store.set_state("traded_tickers", json.dumps(list(_traded_tickers)))
+
+
+def _save_hourly_exposure() -> None:
+    cutoff = time.time() - 3600
+    _hourly_exposure[:] = [(ts, d) for ts, d in _hourly_exposure if ts >= cutoff]
+    store.set_state("hourly_exposure", json.dumps(_hourly_exposure))
 
 
 @dataclass
@@ -190,6 +217,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
     pos = kalshi.position_for_market(client, ticker)
     if abs(pos) > 0:
         _traded_tickers.add(ticker)
+        _save_traded_tickers()
         log.warning(f"[GATEWAY] Exchange position check: already hold {pos}ct on {ticker}")
         row_id = store.insert_row(store.SurfaceRow(
             market_ticker=ticker,
@@ -213,10 +241,30 @@ def submit(client: kalshi.KalshiClient, ticker: str,
 
     if rest_price is None or rest_price < COST_BAND_LO:
         log.warning(f"[GATEWAY] Rest price gone: {rest_price}")
-        return None, None
+        row_id = store.insert_row(store.SurfaceRow(
+            market_ticker=ticker,
+            decision_ts=time.time(),
+            action="SKIP",
+            seconds_to_expiry=secs_to_expiry,
+            yes_quote_cents=eval_result.yes_quote_cents,
+            side=eval_result.side,
+            cost_per_contract_cents=eval_result.cost_cents,
+            breakeven_pct=eval_result.breakeven_pct,
+            yes_ask_cents=book.yes_ask,
+            no_ask_cents=book.no_ask,
+            skip_reason="REST_PRICE_GONE",
+            env="live-observed",
+        ))
+        return None, row_id
 
     # Expiration: T-10s
     expiry_ts = close_ts - 10
+
+    spread = None
+    if eval_result.side == "yes" and book.yes_bid is not None and book.yes_ask is not None:
+        spread = book.yes_ask - book.yes_bid
+    elif eval_result.side == "no" and book.no_bid is not None and book.no_ask is not None:
+        spread = book.no_ask - book.no_bid
 
     # Log the ENTER row
     depth = book.yes_bid_qty if eval_result.side == "yes" else book.no_bid_qty
@@ -230,6 +278,9 @@ def submit(client: kalshi.KalshiClient, ticker: str,
         cost_per_contract_cents=eval_result.cost_cents,
         breakeven_pct=eval_result.breakeven_pct,
         book_depth_at_touch=depth,
+        yes_ask_cents=book.yes_ask,
+        no_ask_cents=book.no_ask,
+        spread_cents=spread,
         why_tag=eval_result.why_tag,
         order_type="maker",
         contracts=1,
@@ -244,8 +295,10 @@ def submit(client: kalshi.KalshiClient, ticker: str,
             rest_price, count=1, expiration_ts=expiry_ts,
         )
         _traded_tickers.add(ticker)
+        _save_traded_tickers()
         cost_usd = eval_result.cost_cents / 100.0
         _hourly_exposure.append((time.time(), cost_usd))
+        _save_hourly_exposure()
         log.warning(
             f"[GATEWAY] ORDER PLACED {ticker} {eval_result.side.upper()} "
             f"cost={eval_result.cost_cents}¢ rest@{rest_price}¢ "
@@ -258,9 +311,32 @@ def submit(client: kalshi.KalshiClient, ticker: str,
         return None, row_id
 
 
+def reprice(client: kalshi.KalshiClient, ticker: str,
+            eval_result: EvalResult, old_order_id: str,
+            new_book: kalshi.Book, close_ts: int) -> Tuple[Optional[str], Optional[int]]:
+    """The ONLY legal reprice path. Re-checks balance and band; accounts exposure delta."""
+    new_side, new_cost, new_yq = _favorite_side(new_book)
+    if new_side != eval_result.side or new_cost is None:
+        return None, None
+    if not (COST_BAND_LO <= new_cost <= COST_BAND_HI):
+        return None, None
+    cash, _ = kalshi.get_balance(client)
+    if cash is None or cash < new_cost / 100.0:
+        return None, None
+    kalshi.cancel_order(client, old_order_id)
+    rest_price = new_book.yes_bid if eval_result.side == "yes" else new_book.no_bid
+    if rest_price is None or rest_price < COST_BAND_LO:
+        return None, None
+    oid = kalshi.place_order_maker(client, ticker, eval_result.side, rest_price,
+                                   count=1, expiration_ts=close_ts - 10)
+    log.warning(f"[GATEWAY] REPRICE {ticker} → {new_cost}c oid={oid}")
+    return oid, new_cost
+
+
 def mark_traded(ticker: str) -> None:
     """Mark a ticker as traded (used when detecting existing positions)."""
     _traded_tickers.add(ticker)
+    _save_traded_tickers()
 
 
 def is_traded(ticker: str) -> bool:
@@ -269,5 +345,4 @@ def is_traded(ticker: str) -> bool:
 
 def reset_for_new_market() -> None:
     """Called on market roll — prune old hourly exposure entries."""
-    cutoff = time.time() - 3600
-    _hourly_exposure[:] = [(ts, d) for ts, d in _hourly_exposure if ts >= cutoff]
+    _save_hourly_exposure()

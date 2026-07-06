@@ -1,7 +1,21 @@
 services:
   - type: worker
-    name: kalshi-btc-mm
+    name: kalshi-k-worker
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python -m k_worker
+    disk:
+      name: k-worker-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: K_WORKER_DB
+        value: /var/data/k_worker_surface.db
+
+  - type: worker
+    name: kalshi-k-watcher
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m k_worker.watcher

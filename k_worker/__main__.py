@@ -5,7 +5,7 @@ Boot sequence:
 2. notify — init Telegram
 3. store — init SQLite
 4. kalshi — build client, read balance
-5. Main loop: discover market → engine cycle → repeat
+5. Main loop: discover market -> engine cycle -> repeat
 6. Scoreboard on schedule (every 4 hours)
 """
 
@@ -41,11 +41,16 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
 
     # 1. Environment check
-    log.info("[MAIN] ═══ K-WORKER BOOT ═══")
+    log.info("[MAIN] === K-WORKER BOOT ===")
     vals = envcheck.check_env()
     is_live = vals["_is_live"]
-    mode = "LIVE" if is_live else "DEMO"
-    log.warning(f"[MAIN] Mode: {mode}")
+    worker_mode = vals["_mode"]
+    env_label = "LIVE" if is_live else "DEMO"
+    mode_label = worker_mode.upper()
+    log.warning(f"[MAIN] Env: {env_label} | Mode: {mode_label}")
+
+    if worker_mode == "observe":
+        engine.set_observe_mode(True)
 
     # 2. Telegram
     try:
@@ -59,7 +64,10 @@ def main():
     # 3. Store
     store.init_db()
 
-    # 4. Kalshi client
+    # 4. Load persisted gateway state
+    gateway._load_persisted_state()
+
+    # 5. Kalshi client
     client = kalshi.build_client()
     cash, pv = kalshi.get_balance(client)
     if cash is None:
@@ -70,29 +78,29 @@ def main():
 
     notify.send(
         f"<b>K-WORKER STARTED</b>\n"
-        f"Mode: {mode}\n"
+        f"Env: {env_label} | Mode: {mode_label}\n"
         f"Balance: ${total:.2f} (cash=${cash:.2f})\n"
-        f"Engine: KXBTC15M · flat 1ct · fav 95-99c · maker-only"
+        f"Engine: KXBTC15M | flat 1ct | fav 95-99c | maker-only"
     )
 
-    discipline.check_drawdown(cash)
+    if worker_mode == "trade":
+        discipline.check_drawdown(cash)
 
     envcheck.check_clock_skew()
 
     last_scoreboard = 0
     last_ticker = None
 
-    # 5. Main loop
+    # 6. Main loop
     while _running:
         try:
             engine.heartbeat()
 
-            if discipline.is_halted():
+            if worker_mode == "trade" and discipline.is_halted():
                 log.warning(f"[MAIN] Engine halted: {discipline.halt_reason()}")
                 time.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            # Discover current market
             try:
                 event_ticker, ticker, market_obj = kalshi.discover_market(client)
             except Exception as e:
@@ -109,39 +117,34 @@ def main():
             now = time.time()
             secs_to_expiry = close_ts - now
 
-            # Skip if already expired
             if secs_to_expiry < 10:
                 time.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            # New market detected
             if ticker != last_ticker:
                 log.info(f"[MAIN] Market: {ticker} closes in {secs_to_expiry:.0f}s")
                 gateway.reset_for_new_market()
                 last_ticker = ticker
 
-            # Skip if already traded this ticker
-            if gateway.is_traded(ticker):
+            if worker_mode == "trade" and gateway.is_traded(ticker):
                 time.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            # Check for existing positions
-            try:
-                pos = kalshi.position_for_market(client, ticker)
-                if abs(pos) > 0:
-                    gateway.mark_traded(ticker)
-                    log.info(f"[MAIN] Already holding position on {ticker}")
-                    time.sleep(LOOP_SLEEP_SEC)
-                    continue
-            except Exception:
-                pass
+            if worker_mode == "trade":
+                try:
+                    pos = kalshi.position_for_market(client, ticker)
+                    if abs(pos) > 0:
+                        gateway.mark_traded(ticker)
+                        log.info(f"[MAIN] Already holding position on {ticker}")
+                        time.sleep(LOOP_SLEEP_SEC)
+                        continue
+                except Exception:
+                    pass
 
-            # Run engine cycle
             outcome = engine.run_market_cycle(client, ticker, close_ts, market_obj)
             if outcome:
                 log.info(f"[MAIN] Cycle result for {ticker}: {outcome}")
 
-            # Scoreboard
             if time.time() - last_scoreboard > SCOREBOARD_INTERVAL_SEC:
                 try:
                     scoreboard.send_scoreboard()
@@ -156,7 +159,6 @@ def main():
 
         time.sleep(LOOP_SLEEP_SEC)
 
-    # Shutdown
     log.warning("[MAIN] Shutting down...")
     try:
         scoreboard.send_scoreboard()

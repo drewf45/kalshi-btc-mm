@@ -40,6 +40,9 @@ def init_db() -> None:
             cost_per_contract_cents INTEGER,
             breakeven_pct           REAL,
             book_depth_at_touch     INTEGER,
+            yes_ask_cents           INTEGER,
+            no_ask_cents            INTEGER,
+            spread_cents            INTEGER,
             feed_lag_ms             REAL,
             action                  TEXT NOT NULL,
             skip_reason             TEXT,
@@ -67,6 +70,12 @@ def init_db() -> None:
     _conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_surface_env ON surface(env)
     """)
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     _conn.commit()
     log.info(f"[STORE] Initialized: {DB_PATH}")
 
@@ -82,6 +91,9 @@ class SurfaceRow:
     cost_per_contract_cents: Optional[int] = None
     breakeven_pct: Optional[float] = None
     book_depth_at_touch: Optional[int] = None
+    yes_ask_cents: Optional[int] = None
+    no_ask_cents: Optional[int] = None
+    spread_cents: Optional[int] = None
     feed_lag_ms: Optional[float] = None
     skip_reason: Optional[str] = None
     why_tag: Optional[str] = None
@@ -172,6 +184,47 @@ def query_band_stats(cost_band_lo: int, cost_band_hi: int,
         "win_pct": wins / n if n > 0 else 0.0,
         "net_pnl": sum(r[1] or 0 for r in rows),
     }
+
+
+def query_band_friction(cost_band_lo: int, cost_band_hi: int,
+                        env: str = "live-traded") -> Optional[float]:
+    """Compute measured friction for a cost band from filled rows.
+    friction = (sum_fees + sum_abs_slippage) / sum_cost.
+    Returns None if no fills exist for the band."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT SUM(COALESCE(fee_cents,0)),
+                      SUM(ABS(COALESCE(slippage_cents,0))),
+                      SUM(COALESCE(cost_per_contract_cents,0))
+               FROM surface
+               WHERE env=? AND action='ENTER'
+               AND cost_per_contract_cents >= ? AND cost_per_contract_cents <= ?
+               AND fill_cost_cents IS NOT NULL""",
+            (env, cost_band_lo, cost_band_hi),
+        ).fetchone()
+    if row is None or row[2] is None or row[2] == 0:
+        return None
+    total_fees = row[0] or 0
+    total_slip = row[1] or 0
+    total_cost = row[2]
+    return (total_fees + total_slip) / total_cost
+
+
+def get_state(key: str) -> Optional[str]:
+    """Read a value from the state table."""
+    with _lock:
+        row = _conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_state(key: str, value: str) -> None:
+    """Write a value to the state table (upsert)."""
+    with _lock:
+        _conn.execute(
+            "INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=?",
+            (key, value, value),
+        )
+        _conn.commit()
 
 
 def daily_stats(env: str = "live-traded") -> dict:
