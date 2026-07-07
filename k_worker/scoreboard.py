@@ -41,7 +41,7 @@ def build_scoreboard() -> str:
     """Build the daily scoreboard string."""
     lines = []
     lines.append("=== Kal SCOREBOARD ===")
-    lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M ET')}")
+    lines.append(f"Time: {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
 
     daily = store.daily_stats("live-traded")
     lines.append(f"\nToday: {daily['n']} trades, "

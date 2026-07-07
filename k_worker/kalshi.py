@@ -353,6 +353,94 @@ def probe_fills_route(client: KalshiClient) -> str:
     raise RuntimeError("FATAL: No working fills route — engine cannot see fills")
 
 
+_fill_parse_warned = False
+
+
+def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
+    """Parse a Kalshi fill into (cost_cents, fee_cents, count) for our_side.
+
+    Kalshi fills carry yes_price/no_price. We map to cost for our held side.
+    Returns (None, fee, count) if price is unparseable — caller uses fallback.
+    Logs the raw fill dict once on first parse failure (self-diagnosing).
+    """
+    global _fill_parse_warned
+    from decimal import Decimal
+
+    cost_cents = None
+    fee_cents = 0
+    count = 1
+
+    for ck in ("count", "quantity", "qty"):
+        raw = fill.get(ck)
+        if raw is not None:
+            try:
+                count = int(raw)
+            except (ValueError, TypeError):
+                pass
+            break
+
+    if our_side == "yes":
+        raw = fill.get("yes_price")
+        if raw is not None:
+            try:
+                val = Decimal(str(raw))
+                cost_cents = float(val * 100) if val < 1 else float(val)
+            except Exception:
+                pass
+        if cost_cents is None:
+            raw = fill.get("no_price")
+            if raw is not None:
+                try:
+                    val = Decimal(str(raw))
+                    no_c = float(val * 100) if val < 1 else float(val)
+                    cost_cents = 100 - no_c
+                except Exception:
+                    pass
+    else:
+        raw = fill.get("no_price")
+        if raw is not None:
+            try:
+                val = Decimal(str(raw))
+                cost_cents = float(val * 100) if val < 1 else float(val)
+            except Exception:
+                pass
+        if cost_cents is None:
+            raw = fill.get("yes_price")
+            if raw is not None:
+                try:
+                    val = Decimal(str(raw))
+                    yes_c = float(val * 100) if val < 1 else float(val)
+                    cost_cents = 100 - yes_c
+                except Exception:
+                    pass
+
+    if cost_cents is None:
+        raw = fill.get("price")
+        if raw is not None:
+            try:
+                val = Decimal(str(raw))
+                yes_c = float(val * 100) if val < 1 else float(val)
+                cost_cents = yes_c if our_side == "yes" else (100 - yes_c)
+            except Exception:
+                pass
+
+    if cost_cents is None and not _fill_parse_warned:
+        log.warning(f"[FILLS] Unparsed fill record (raw): {fill}")
+        _fill_parse_warned = True
+
+    for fee_key in ("fee", "taker_fee", "maker_fee"):
+        raw = fill.get(fee_key)
+        if raw is not None:
+            try:
+                val = Decimal(str(raw))
+                fee_cents = int(val * 100) if val < 1 else int(val)
+            except Exception:
+                pass
+            break
+
+    return cost_cents, fee_cents, count
+
+
 _resting_shape_logged = False
 _fills_shape_logged = False
 
@@ -559,9 +647,9 @@ def extract_boundaries(market_obj: Dict) -> Tuple[Optional[float], Optional[floa
 # ── Census (Part 4.2) ──────────────────────────────────────────
 
 def get_todays_settled_tickers(client: KalshiClient) -> List[str]:
-    """Get all KXBTC15M tickers that closed/settled today (for census)."""
-    import datetime as dt
-    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    """Get all KXBTC15M tickers that closed/settled today (ET day boundary)."""
+    now_et = datetime.now(NY)
+    today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     try:
         resp = client.request("GET", "/markets",
                               params={"series_ticker": SERIES_TICKER, "limit": 200})

@@ -41,10 +41,46 @@ def _set_float(key: str, value: float) -> None:
     store.set_state(key, f"{value:.6f}")
 
 
+_was_genesis = False
+
+
 def init_book() -> None:
+    global _was_genesis
     if store.get_state("treasury_engine_book") is None:
+        _was_genesis = True
         _set_float("treasury_engine_book", SEED)
         log.info(f"[TREASURY] Initialized engine book at seed=${SEED:.2f}")
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class TreasurySnapshot:
+    book: float
+    accrued_tax: float
+    accrued_fee: float
+
+
+def snapshot() -> TreasurySnapshot:
+    """Current treasury state as a snapshot (book + accruals)."""
+    t = get_totals()
+    return TreasurySnapshot(
+        book=t["engine_book"],
+        accrued_tax=t["accrued_tax"],
+        accrued_fee=t["accrued_fee"],
+    )
+
+
+def is_genesis() -> bool:
+    """True if treasury was freshly seeded this boot (no prior state)."""
+    return _was_genesis
+
+
+def set_book(value: float) -> None:
+    """Set the engine book directly (used by boot reconcile)."""
+    _set_float("treasury_engine_book", value)
+    log.warning(f"[TREASURY] Book set to ${value:.2f}")
 
 
 def get_totals() -> Dict[str, float]:

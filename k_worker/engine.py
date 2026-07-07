@@ -549,36 +549,7 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
     fee_cents = 0
 
     if fill_records:
-        fr = fill_records[0]
-        for key in ("yes_price", "price"):
-            raw = fr.get(key)
-            if raw is None:
-                continue
-            try:
-                val = Decimal(str(raw))
-                yes_cents = float(val * 100) if val < 1 else float(val)
-                fill_cost = yes_cents if eval_result.side == "yes" else (100 - yes_cents)
-                break
-            except Exception:
-                continue
-
-        if fill_cost is None and fr.get("no_price") is not None:
-            try:
-                val = Decimal(str(fr["no_price"]))
-                no_cents = float(val * 100) if val < 1 else float(val)
-                fill_cost = no_cents if eval_result.side == "no" else (100 - no_cents)
-            except Exception:
-                pass
-
-        for fee_key in ("fee", "taker_fee", "maker_fee"):
-            raw = fr.get(fee_key)
-            if raw is not None:
-                try:
-                    val = Decimal(str(raw))
-                    fee_cents = int(val * 100) if val < 1 else int(val)
-                except Exception:
-                    pass
-                break
+        fill_cost, fee_cents, _ = kalshi.parse_fill(fill_records[0], eval_result.side)
 
     if fill_cost is None:
         fill_cost = eval_result.cost_exact or eval_result.cost_cents

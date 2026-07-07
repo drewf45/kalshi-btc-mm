@@ -144,37 +144,15 @@ def _reconcile_fills(client: kalshi.KalshiClient) -> int:
             fill_by_oid.setdefault(oid, []).append(f)
 
     nofill_rows = store.get_nofill_enter_rows(limit=200)
-    for row_id, ticker, order_id, cost_cents, fee_cents in nofill_rows:
+    for row_id, ticker, order_id, cost_cents, fee_cents, side in nofill_rows:
         if order_id and order_id in fill_by_oid:
             log.warning(f"[RECONCILE] Found broker fill for no_fill row {row_id} "
                         f"ticker={ticker} oid={order_id} — upgrading")
             store.clear_resolution(row_id)
-            from decimal import Decimal
             fills = fill_by_oid[order_id]
-            fr = fills[0]
-            fill_cost = None
-            for key in ("yes_price", "price"):
-                raw = fr.get(key)
-                if raw is None:
-                    continue
-                try:
-                    val = Decimal(str(raw))
-                    fill_cost = float(val * 100) if val < 1 else float(val)
-                    break
-                except Exception:
-                    continue
+            fill_cost, fc, _ = kalshi.parse_fill(fills[0], side or "yes")
             if fill_cost is None:
                 fill_cost = cost_cents or 0
-            fc = 0
-            for fee_key in ("fee", "taker_fee", "maker_fee"):
-                raw = fr.get(fee_key)
-                if raw is not None:
-                    try:
-                        val = Decimal(str(raw))
-                        fc = int(val * 100) if val < 1 else int(val)
-                    except Exception:
-                        pass
-                    break
             store.update_fill(row_id, fill_cost, time.time(), 0, fc)
             store.update_why_tag(row_id, "RECONCILED_FROM_BROKER")
             upgraded += 1
@@ -230,6 +208,46 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
     )
 
 
+BOOT_RECONCILE_TOL = 0.05
+
+
+def boot_reconcile(client: kalshi.KalshiClient) -> None:
+    """Drew's law 2026-07-07: never trust stored treasury across a deploy
+    boundary. Pull live broker truth and reconcile BEFORE the first cycle."""
+    live_bal, _ = kalshi.get_balance(client)
+    if live_bal is None:
+        raise RuntimeError("FATAL: boot reconcile cannot read balance — refusing to trade on unknown money")
+
+    t = treasury.snapshot()
+    expected = t.book + t.accrued_tax + t.accrued_fee
+    delta = round(live_bal - expected, 2)
+    fresh = treasury.is_genesis() and store.count_rows_total() == 0
+
+    if fresh:
+        treasury.set_book(live_bal)
+        store.record_epoch(t.book, live_bal, delta, "fresh_store_init")
+        notify.send(f"🔧 BOOT RECONCILE: fresh store — book initialized from live balance ${live_bal:.2f} (EPOCH)")
+    elif abs(delta) <= BOOT_RECONCILE_TOL:
+        notify.send(f"🔧 BOOT RECONCILE OK: bal ${live_bal:.2f} ≈ expected ${expected:.2f} (Δ ${delta:+.2f})")
+    else:
+        new_book = round(live_bal - t.accrued_tax - t.accrued_fee, 2)
+        treasury.set_book(new_book)
+        store.record_epoch(t.book, new_book, delta, "boot_rebaseline")
+        notify.send(
+            f"🔧 BOOT RECONCILE: book ${t.book:.2f} → ${new_book:.2f} "
+            f"(Δ ${delta:+.2f}) — re-baselined to live balance; accruals preserved (EPOCH)"
+        )
+
+    try:
+        for p in kalshi.get_positions(client):
+            tk = p.get("ticker") or p.get("market_ticker")
+            if tk and not store.has_row_for_ticker(tk):
+                store.insert_orphan_row(tk, p)
+                notify.alert(f"ORPHAN POSITION at boot: {tk} — row created; sweep will settle it")
+    except Exception as e:
+        notify.alert(f"Boot position scan failed: {e} — positions unverified this boot")
+
+
 def main():
     global _running
     signal.signal(signal.SIGINT, _shutdown)
@@ -282,6 +300,9 @@ def main():
     # 5b. Fills route probe — FATAL if no working route
     fills_route = kalshi.probe_fills_route(client)
     notify.send(f"Fills route probe: {fills_route} ✓")
+
+    # 5c. Boot reconcile — Drew's law: never trust stored treasury across deploys
+    boot_reconcile(client)
 
     if engine.HEARTBEAT_PING_URL:
         log.info(f"[MAIN] Dead-man ping configured: {engine.HEARTBEAT_PING_URL[:40]}...")
@@ -375,8 +396,16 @@ def main():
                         log.info(f"[MAIN] Already holding position on {ticker}")
                         time.sleep(LOOP_SLEEP_SEC)
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"[MAIN] Position check failed for {ticker}: {e}")
+                    store.insert_row(store.SurfaceRow(
+                        market_ticker=ticker, decision_ts=time.time(), action="SKIP",
+                        skip_reason=f"POSCHECK_FAILED:{e}", why_tag="SKIP_POSCHECK_FAILED",
+                        env="live-observed",
+                    ))
+                    notify.alert(f"Position check failed for {ticker}: {e} — skipping cycle")
+                    time.sleep(LOOP_SLEEP_SEC)
+                    continue
 
             outcome = engine.run_market_cycle(client, ticker, close_ts, market_obj)
             if outcome:

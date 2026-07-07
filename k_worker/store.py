@@ -97,6 +97,17 @@ def init_db() -> None:
             label      TEXT NOT NULL
         )
     """)
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS epochs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts         REAL NOT NULL,
+            old_book   REAL,
+            new_book   REAL,
+            delta      REAL,
+            reason     TEXT,
+            boot_id    TEXT
+        )
+    """)
     for col, typ in [
         ("spot_price", "REAL"), ("boundary_lo", "REAL"), ("boundary_hi", "REAL"),
         ("distance", "REAL"), ("distance_pct", "REAL"), ("lane", "TEXT"),
@@ -430,10 +441,17 @@ def set_state(key: str, value: str) -> None:
         _conn.commit()
 
 
+def et_midnight_ts() -> float:
+    """Today's midnight in America/New_York as a Unix timestamp."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    return now_et.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
 def daily_stats(env: str = "live-traded") -> dict:
     """Today's stats."""
-    import datetime as dt
-    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    today_start = et_midnight_ts()
     with _lock:
         rows = _conn.execute(
             """SELECT resolution, pnl_net, fee_cents FROM surface
@@ -489,8 +507,7 @@ def upsert_market_ledger(ticker: str, settled_ts: float, result: str,
 
 def query_caution_ledger() -> dict:
     """Daily caution ledger from market_ledger."""
-    import datetime as dt
-    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    today_start = et_midnight_ts()
     with _lock:
         rows = _conn.execute(
             """SELECT outcome_class, realized_cents, best_available_cents,
@@ -593,8 +610,7 @@ def query_context_stats() -> dict:
 
 def query_h8_probe_daily() -> dict:
     """Today's H8 probe stats for budget/kill checks."""
-    import datetime as dt
-    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    today_start = et_midnight_ts()
     with _lock:
         rows = _conn.execute(
             """SELECT resolution, cost_per_contract_cents FROM surface
@@ -620,11 +636,11 @@ def update_order_id(row_id: int, order_id: str) -> None:
 
 def get_nofill_enter_rows(limit: int = 200) -> list:
     """Return ENTER rows with resolution='no_fill' for reconciliation.
-    Returns list of (id, market_ticker, order_id, cost_per_contract_cents, fee_cents)."""
+    Returns list of (id, market_ticker, order_id, cost_per_contract_cents, fee_cents, side)."""
     with _lock:
         rows = _conn.execute(
             """SELECT id, market_ticker, order_id, cost_per_contract_cents,
-                      COALESCE(fee_cents, 0)
+                      COALESCE(fee_cents, 0), side
                FROM surface
                WHERE action='ENTER' AND resolution='no_fill'
                AND order_id IS NOT NULL
@@ -646,8 +662,7 @@ def clear_resolution(row_id: int) -> None:
 
 def count_fills_today(env: str = "live-traded") -> int:
     """Count ENTER rows that have a fill (fill_cost_cents IS NOT NULL) today."""
-    import datetime as dt
-    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    today_start = et_midnight_ts()
     with _lock:
         row = _conn.execute(
             """SELECT COUNT(*) FROM surface
@@ -736,8 +751,7 @@ def query_median_depth() -> Optional[int]:
 
 def get_covered_tickers_today() -> set:
     """Return set of KXBTC15M tickers with at least one surface row today."""
-    import datetime as dt
-    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    today_start = et_midnight_ts()
     with _lock:
         rows = _conn.execute(
             """SELECT DISTINCT market_ticker FROM surface
@@ -760,3 +774,66 @@ def query_h8_probe_lifetime() -> dict:
     wins = row[0] if row else 0
     losses = row[1] if row else 0
     return {"wins": wins, "losses": losses}
+
+
+# ── Boot reconcile helpers (Part A) ───────────────────────────
+
+def count_rows_total() -> int:
+    """Total surface rows (used to detect fresh/wiped store)."""
+    with _lock:
+        row = _conn.execute("SELECT COUNT(*) FROM surface").fetchone()
+    return row[0] if row else 0
+
+
+def has_row_for_ticker(ticker: str) -> bool:
+    """Check if any surface row exists for a ticker."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM surface WHERE market_ticker=? LIMIT 1",
+            (ticker,),
+        ).fetchone()
+    return row is not None
+
+
+def insert_orphan_row(ticker: str, position_data: dict) -> int:
+    """Insert a surface row for an orphan position found at boot."""
+    side = None
+    for k in ("yes_position", "position", "net_position"):
+        v = position_data.get(k)
+        if v is not None:
+            try:
+                qty = int(v)
+                if qty > 0:
+                    side = "yes"
+                elif qty < 0:
+                    side = "no"
+                break
+            except (ValueError, TypeError):
+                pass
+    if side is None and position_data.get("no_position"):
+        try:
+            if int(position_data["no_position"]) > 0:
+                side = "no"
+        except (ValueError, TypeError):
+            pass
+    return insert_row(SurfaceRow(
+        market_ticker=ticker,
+        decision_ts=time.time(),
+        action="ENTER",
+        side=side,
+        why_tag="ORPHAN_POSITION_BOOT",
+        env="live-traded",
+    ))
+
+
+def record_epoch(old_book: float, new_book: float, delta: float,
+                 reason: str) -> None:
+    """Record a treasury epoch transition."""
+    boot_id = f"boot-{int(time.time())}"
+    with _lock:
+        _conn.execute(
+            """INSERT INTO epochs (ts, old_book, new_book, delta, reason, boot_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (time.time(), old_book, new_book, delta, reason, boot_id),
+        )
+        _conn.commit()
