@@ -131,7 +131,9 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
 
 
 def _reconcile_fills(client: kalshi.KalshiClient) -> int:
-    """Pull broker fills, diff against store, upgrade missed no_fill rows."""
+    """Pull broker fills, diff against store, upgrade unconfirmed ENTER rows.
+    Covers no_fill, cancelled_external, blind_standdown — any label assigned
+    without a broker-confirmed zero-fill."""
     upgraded = 0
     try:
         broker_fills = kalshi.get_all_recent_fills(client, limit=200)
@@ -145,10 +147,11 @@ def _reconcile_fills(client: kalshi.KalshiClient) -> int:
         if oid:
             fill_by_oid.setdefault(oid, []).append(f)
 
-    nofill_rows = store.get_nofill_enter_rows(limit=200)
-    for row_id, ticker, order_id, cost_cents, fee_cents, side in nofill_rows:
+    unconfirmed = store.get_unconfirmed_enter_rows(limit=200)
+    for row_id, ticker, order_id, cost_cents, fee_cents, side in unconfirmed:
         if order_id and order_id in fill_by_oid:
-            log.warning(f"[RECONCILE] Found broker fill for no_fill row {row_id} "
+            old_res = "unconfirmed"
+            log.warning(f"[RECONCILE] Found broker fill for row {row_id} "
                         f"ticker={ticker} oid={order_id} — upgrading")
             store.clear_resolution(row_id)
             fills = fill_by_oid[order_id]
@@ -158,10 +161,10 @@ def _reconcile_fills(client: kalshi.KalshiClient) -> int:
             store.update_fill(row_id, fill_cost, time.time(), 0, fc)
             store.update_why_tag(row_id, "RECONCILED_FROM_BROKER")
             upgraded += 1
-            notify.send(f"🔧 RECONCILE: upgraded row {row_id} ({ticker}) from no_fill → filled")
+            notify.send(f"🔧 RECONCILE: upgraded row {row_id} ({ticker}) → filled")
 
     if upgraded:
-        log.warning(f"[RECONCILE] Upgraded {upgraded} rows from no_fill → filled")
+        log.warning(f"[RECONCILE] Upgraded {upgraded} rows → filled")
     return upgraded
 
 
@@ -397,6 +400,7 @@ def main():
     # 3. Store
     store.init_db()
     store.dedup_historical_skips()
+    store.recompute_missing_pnl()
 
     # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()

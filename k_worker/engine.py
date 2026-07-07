@@ -491,10 +491,24 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                                 eval_result, close_ts)
 
         if state == "gone":
-            label = "no_fill" if secs_left <= 20 else "cancelled_external"
-            store.update_settlement(row_id, label, 0.0, time.time())
-            log.warning(f"[ENGINE] Order {order_id} {label} (T-{secs_left:.0f}s)")
-            return {"outcome": label}
+            if secs_left <= 20:
+                store.update_settlement(row_id, "no_fill", 0.0, time.time())
+                log.warning(f"[ENGINE] Order {order_id} no_fill (T-{secs_left:.0f}s)")
+                return {"outcome": "no_fill"}
+            # Cancel may have raced a fill — recheck fills before labeling
+            try:
+                recheck = kalshi.get_fills(client, ticker)
+                recheck_mine = [f for f in recheck
+                                if str(f.get("order_id")) == str(order_id)]
+                if recheck_mine:
+                    log.warning(f"[ENGINE] Cancel-race: fills found after gone on {ticker}")
+                    return _handle_fill(client, ticker, recheck_mine, row_id,
+                                        eval_result, close_ts)
+            except Exception as e:
+                log.warning(f"[ENGINE] Cancel-race fills recheck failed: {e}")
+            store.update_settlement(row_id, "cancelled_external", 0.0, time.time())
+            log.warning(f"[ENGINE] Order {order_id} cancelled_external (T-{secs_left:.0f}s)")
+            return {"outcome": "cancelled_external"}
 
         # state == "resting" — check partial fill
         raw = status_result.get("raw") or {}

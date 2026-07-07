@@ -530,18 +530,19 @@ def query_caution_ledger() -> dict:
 
 
 def check_conflicting_resolutions() -> list:
-    """Find tickers with conflicting resolutions in the same cell. Returns list of ticker strings."""
+    """Find tickers with conflicting resolutions in the same cell+side.
+    Side-flips (same ticker, different sides) are expected, not corruption."""
     with _lock:
         rows = _conn.execute(
-            """SELECT market_ticker, CAST(cost_per_contract_cents AS INTEGER) as band
+            """SELECT market_ticker, CAST(cost_per_contract_cents AS INTEGER) as band, side
                FROM surface
                WHERE resolution IN ('win','loss','obs_win','obs_loss')
                AND side IS NOT NULL
-               GROUP BY market_ticker, band
+               GROUP BY market_ticker, band, side
                HAVING COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN 1
                                           WHEN resolution IN ('loss','obs_loss') THEN 2 END) > 1"""
         ).fetchall()
-    return [f"{r[0]}@{r[1]}c" for r in rows]
+    return [f"{r[0]}@{r[1]}c/{r[2]}" for r in rows]
 
 
 # ── H8 stats (Fix 4) ───────────────────────────────────────────
@@ -635,14 +636,22 @@ def update_order_id(row_id: int, order_id: str) -> None:
 
 
 def get_nofill_enter_rows(limit: int = 200) -> list:
-    """Return ENTER rows with resolution='no_fill' for reconciliation.
+    """Legacy alias — use get_unconfirmed_enter_rows."""
+    return get_unconfirmed_enter_rows(limit)
+
+
+def get_unconfirmed_enter_rows(limit: int = 200) -> list:
+    """Return ENTER rows whose resolution was assigned without a broker-confirmed fill.
+    Covers no_fill, cancelled_external, blind_standdown — the reconciler checks
+    broker fills for all of these since cancels can race fills.
     Returns list of (id, market_ticker, order_id, cost_per_contract_cents, fee_cents, side)."""
     with _lock:
         rows = _conn.execute(
             """SELECT id, market_ticker, order_id, cost_per_contract_cents,
                       COALESCE(fee_cents, 0), side
                FROM surface
-               WHERE action='ENTER' AND resolution='no_fill'
+               WHERE action='ENTER'
+               AND resolution IN ('no_fill', 'cancelled_external', 'blind_standdown')
                AND order_id IS NOT NULL
                ORDER BY id DESC LIMIT ?""",
             (limit,),
@@ -839,3 +848,27 @@ def record_epoch(old_book: float, new_book: float, delta: float,
             (time.time(), old_book, new_book, delta, reason, boot_id),
         )
         _conn.commit()
+
+
+def recompute_missing_pnl() -> int:
+    """One-time boot fix: recompute pnl_net for resolved ENTER rows where it's 0 or NULL.
+    Derives pnl from fill_cost (or cost_per_contract), fee, and resolution."""
+    with _lock:
+        cur = _conn.execute("""
+            UPDATE surface SET pnl_net = CASE
+                WHEN resolution = 'win' THEN
+                    (100.0 - COALESCE(fill_cost_cents, cost_per_contract_cents, 0)
+                           - COALESCE(fee_cents, 0)) / 100.0
+                WHEN resolution = 'loss' THEN
+                    -(COALESCE(fill_cost_cents, cost_per_contract_cents, 0)
+                      + COALESCE(fee_cents, 0)) / 100.0
+            END
+            WHERE resolution IN ('win', 'loss')
+            AND action = 'ENTER'
+            AND (pnl_net IS NULL OR pnl_net = 0)
+        """)
+        updated = cur.rowcount
+        if updated:
+            _conn.commit()
+            log.warning(f"[STORE] Recomputed pnl_net for {updated} resolved rows")
+    return updated
