@@ -34,7 +34,8 @@ H8_COST_HI = Decimal("94.00")
 H8_PROBE_BUDGET_PER_DAY = 2.00
 H8_MIN_DISTANCE_PCT = 0.0015
 H8_MAX_SECS = 60
-HOURLY_EXPOSURE_CAP_USD = 3.00
+# 4 windows/hour × max 99¢ cost = $3.96; cap must not structurally ban the 4th window
+HOURLY_EXPOSURE_CAP_USD = 4.00
 MIN_BALANCE_USD = 5.00
 
 _traded_tickers: set = set()
