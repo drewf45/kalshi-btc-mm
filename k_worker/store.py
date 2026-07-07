@@ -102,6 +102,7 @@ def init_db() -> None:
         ("distance", "REAL"), ("distance_pct", "REAL"), ("lane", "TEXT"),
         ("session_tag", "TEXT"), ("vol_regime", "TEXT"), ("winner_clip_cents", "REAL"),
         ("order_id", "TEXT"),
+        ("reprice_count", "INTEGER"),
     ]:
         try:
             _conn.execute(f"ALTER TABLE surface ADD COLUMN {col} {typ}")
@@ -655,6 +656,95 @@ def count_fills_today(env: str = "live-traded") -> int:
             (env, today_start),
         ).fetchone()
     return row[0] if row else 0
+
+
+def update_reprice(row_id: int, new_cost: float, new_order_id: str,
+                   reprice_count: int) -> None:
+    """Update surface row after a reprice — new cost basis, new order_id, reprice count."""
+    with _lock:
+        _conn.execute(
+            """UPDATE surface SET cost_per_contract_cents=?, order_id=?,
+               reprice_count=? WHERE id=?""",
+            (new_cost, new_order_id, reprice_count, row_id),
+        )
+        _conn.commit()
+
+
+def update_why_tag(row_id: int, why_tag: str, skip_reason: str = None) -> None:
+    """Update why_tag (and optionally skip_reason) on a surface row."""
+    with _lock:
+        if skip_reason is not None:
+            _conn.execute(
+                "UPDATE surface SET why_tag=?, skip_reason=? WHERE id=?",
+                (why_tag, skip_reason, row_id),
+            )
+        else:
+            _conn.execute(
+                "UPDATE surface SET why_tag=? WHERE id=?",
+                (why_tag, row_id),
+            )
+        _conn.commit()
+
+
+def query_clip_by_time_band() -> list:
+    """Win rate + avg clip (pnl) per T_BAND for the scoreboard."""
+    T_BANDS = [(180, 120), (120, 60), (60, 10)]
+    results = []
+    with _lock:
+        for hi, lo in T_BANDS:
+            row = _conn.execute(
+                """SELECT
+                    COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN market_ticker END),
+                    COUNT(DISTINCT CASE WHEN resolution IN ('loss','obs_loss') THEN market_ticker END),
+                    AVG(CASE WHEN resolution IN ('win','loss') THEN pnl_net END)
+                   FROM surface
+                   WHERE seconds_to_expiry >= ? AND seconds_to_expiry < ?
+                   AND resolution IN ('win','loss','obs_win','obs_loss')
+                   AND side IS NOT NULL
+                   AND COALESCE(lane,'main')='main'""",
+                (lo, hi),
+            ).fetchone()
+            wins = row[0] if row else 0
+            losses = row[1] if row else 0
+            n = wins + losses
+            avg_clip = row[2] if row else 0
+            results.append({
+                "band": f"T-{hi}-{lo}",
+                "n": n, "wins": wins, "losses": losses,
+                "win_pct": wins / n if n > 0 else 0,
+                "avg_clip": float(avg_clip or 0),
+            })
+    return results
+
+
+def query_median_depth() -> Optional[int]:
+    """Median book_depth_at_touch for ENTER rows (capacity gauge)."""
+    with _lock:
+        rows = _conn.execute(
+            """SELECT book_depth_at_touch FROM surface
+               WHERE action='ENTER' AND book_depth_at_touch IS NOT NULL
+               ORDER BY book_depth_at_touch"""
+        ).fetchall()
+    if not rows:
+        return None
+    depths = [r[0] for r in rows]
+    mid = len(depths) // 2
+    if len(depths) % 2 == 0:
+        return (depths[mid - 1] + depths[mid]) // 2
+    return depths[mid]
+
+
+def get_covered_tickers_today() -> set:
+    """Return set of KXBTC15M tickers with at least one surface row today."""
+    import datetime as dt
+    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    with _lock:
+        rows = _conn.execute(
+            """SELECT DISTINCT market_ticker FROM surface
+               WHERE market_ticker LIKE 'KXBTC15M%' AND decision_ts >= ?""",
+            (today_start,),
+        ).fetchall()
+    return {r[0] for r in rows}
 
 
 def query_h8_probe_lifetime() -> dict:

@@ -10,7 +10,7 @@ Walls (Tier 0, non-negotiable):
 - Never both sides of one ticker
 - Maker (post_only) only — no taker path exists
 - Live balance re-read inside submit
-- Per-hour exposure cap $3.00 (main lane)
+- Per-hour exposure cap $4.00 (main lane, 4 windows/hr × 99¢ max)
 - H8 probe budget $2.00/day
 """
 

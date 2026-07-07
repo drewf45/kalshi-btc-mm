@@ -29,6 +29,7 @@ LOOP_SLEEP_SEC = 30
 SCOREBOARD_INTERVAL_SEC = int(float(os.environ.get("SCOREBOARD_EVERY_HOURS", "4")) * 3600)
 BACKFILL_INTERVAL_SEC = 300
 RECONCILE_INTERVAL_SEC = 300
+CENSUS_INTERVAL_SEC = 3600
 HOURLY_BALANCE_SEC = 3600
 _running = True
 
@@ -175,12 +176,41 @@ def _reconcile_fills(client: kalshi.KalshiClient) -> int:
                         pass
                     break
             store.update_fill(row_id, fill_cost, time.time(), 0, fc)
+            store.update_why_tag(row_id, "RECONCILED_FROM_BROKER")
             upgraded += 1
             notify.send(f"🔧 RECONCILE: upgraded row {row_id} ({ticker}) from no_fill → filled")
 
     if upgraded:
         log.warning(f"[RECONCILE] Upgraded {upgraded} rows from no_fill → filled")
     return upgraded
+
+
+def _run_census(client: kalshi.KalshiClient) -> None:
+    """Census: pull today's settled KXBTC15M from exchange, diff against surface."""
+    try:
+        settled = kalshi.get_todays_settled_tickers(client)
+    except Exception as e:
+        log.warning(f"[CENSUS] Exchange query failed: {e}")
+        return
+    if not settled:
+        return
+    covered = store.get_covered_tickers_today()
+    missed = [t for t in settled if t not in covered]
+    for ticker in missed:
+        store.insert_row(store.SurfaceRow(
+            market_ticker=ticker, decision_ts=time.time(), action="SKIP",
+            skip_reason="UNSEEN_BY_ENGINE", why_tag="MISSED_UNSEEN",
+            env="live-observed",
+        ))
+    total = len(settled)
+    n_covered = total - len(missed)
+    store.set_state("census_total", str(total))
+    store.set_state("census_covered", str(n_covered))
+    if missed:
+        log.warning(f"[CENSUS] Coverage {n_covered}/{total} — missed: {missed[:5]}")
+        notify.alert(f"Census: {len(missed)} missed windows — coverage {n_covered}/{total}")
+    else:
+        log.info(f"[CENSUS] Coverage {n_covered}/{total} ✓")
 
 
 def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
@@ -190,11 +220,12 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
         return
     total = cash + (pv or 0)
     daily = store.daily_stats("live-traded")
+    broker_fills = store.count_fills_today("live-traded")
     treas = treasury.format_hourly()
     treasury.check_invariant(total)
     notify.send(
         f"Balance: ${total:.2f} | positions ${pv or 0:.2f} | "
-        f"today: {daily['n']} fills, net ${daily['net_pnl']:.2f}\n"
+        f"today: {broker_fills} fills, {daily['n']} settled, net ${daily['net_pnl']:.2f}\n"
         f"{treas}"
     )
 
@@ -248,6 +279,10 @@ def main():
 
     envcheck.check_clock_skew()
 
+    # 5b. Fills route probe — FATAL if no working route
+    fills_route = kalshi.probe_fills_route(client)
+    notify.send(f"Fills route probe: {fills_route} ✓")
+
     if engine.HEARTBEAT_PING_URL:
         log.info(f"[MAIN] Dead-man ping configured: {engine.HEARTBEAT_PING_URL[:40]}...")
     else:
@@ -256,6 +291,7 @@ def main():
     last_scoreboard = 0
     last_backfill = 0
     last_reconcile = 0
+    last_census = 0
     last_hourly = 0
     last_ticker = None
 
@@ -285,6 +321,14 @@ def main():
                 except Exception as e:
                     log.warning(f"[MAIN] Reconcile error: {e}")
                 last_reconcile = now
+
+            # Census (Part 4.2) — every hour
+            if now - last_census > CENSUS_INTERVAL_SEC:
+                try:
+                    _run_census(client)
+                except Exception as e:
+                    log.warning(f"[MAIN] Census error: {e}")
+                last_census = now
 
             # Hourly balance Telegram (T2)
             if now - last_hourly > HOURLY_BALANCE_SEC:

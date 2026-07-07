@@ -177,7 +177,14 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     secs_to_expiry = close_ts - now
 
     if discipline.is_halted():
-        log.warning(f"[ENGINE] Halted — skipping {ticker} ({discipline.halt_reason()})")
+        reason = discipline.halt_reason()
+        store.insert_row(store.SurfaceRow(
+            market_ticker=ticker, decision_ts=time.time(), action="SKIP",
+            seconds_to_expiry=secs_to_expiry,
+            skip_reason=f"HALTED:{reason}", why_tag=f"SKIP_HALTED_{reason}",
+            env="live-observed",
+        ))
+        log.warning(f"[ENGINE] Halted — skipping {ticker} ({reason})")
         _send_market_line(f"⏭ {_time_et()} SKIP_HALTED | Bal ?")
         return "halted"
 
@@ -196,6 +203,12 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     secs_to_expiry = close_ts - now
 
     if secs_to_expiry < CANCEL_BEFORE_EXPIRY_SEC:
+        store.insert_row(store.SurfaceRow(
+            market_ticker=ticker, decision_ts=time.time(), action="SKIP",
+            seconds_to_expiry=secs_to_expiry,
+            skip_reason="EXPIRED_BEFORE_EVAL", why_tag="MISSED_EXPIRED",
+            env="live-observed",
+        ))
         log.info(f"[ENGINE] {ticker} too close to expiry ({secs_to_expiry:.0f}s)")
         return "expired"
 
@@ -203,6 +216,12 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     book = kalshi.fetch_orderbook(client, ticker)
     cash, pv = kalshi.get_balance(client)
     if cash is None:
+        store.insert_row(store.SurfaceRow(
+            market_ticker=ticker, decision_ts=time.time(), action="SKIP",
+            seconds_to_expiry=secs_to_expiry,
+            skip_reason="BALANCE_UNREADABLE", why_tag="SKIP_BALANCE_UNREADABLE",
+            env="live-observed",
+        ))
         log.warning(f"[ENGINE] Cannot read balance — skipping {ticker}")
         _send_market_line(f"⏭ {_time_et()} SKIP_BALANCE (unreadable) | Bal ?")
         return "no_balance"
@@ -395,6 +414,8 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         _send_market_line(f"{prefix}⏭ {ts} CANCELLED {tag} | {bal}")
     elif outcome == "reprice_failed":
         _send_market_line(f"{prefix}⏭ {ts} REPRICE_FAIL {tag} | {bal}")
+    elif outcome == "blind_standdown":
+        _send_market_line(f"{prefix}⚠ {ts} BLIND_STANDDOWN {tag} | {bal}")
 
     heartbeat()
     return outcome
@@ -449,9 +470,17 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
         except kalshi.OrderStatusUnavailable as e:
             blind_consecutive += 1
             log.warning(f"[ENGINE] OrderStatusUnavailable #{blind_consecutive} on {ticker}: {e}")
-            if blind_consecutive >= 3:
+            if blind_consecutive == 3 or (blind_consecutive > 3 and blind_consecutive % 10 == 0):
                 notify.alert(f"BLIND: cannot verify order state on {ticker} "
-                             f"({blind_consecutive} consecutive failures)")
+                             f"(#{blind_consecutive}: {e})")
+            if blind_consecutive >= 12:
+                try:
+                    kalshi.cancel_order(client, order_id)
+                except Exception as ce:
+                    notify.alert(f"BLIND_UNCANCELED: failed to cancel {order_id} on {ticker}: {ce}")
+                store.update_why_tag(row_id, "BLIND_STANDDOWN", str(e)[:200])
+                store.update_settlement(row_id, "blind_standdown", 0.0, time.time())
+                return {"outcome": "blind_standdown"}
             time.sleep(POLL_INTERVAL_SEC)
             continue
 
@@ -505,7 +534,8 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                     order_id = new_oid
                     cost_cents = new_cost_out
                     reprices += 1
-                    log.info(f"[ENGINE] REPRICE #{reprices} {ticker} → {cost_cents}c")
+                    store.update_reprice(row_id, new_cost_out, new_oid, reprices)
+                    log.info(f"[ENGINE] REPRICE #{reprices} {ticker} → {cost_cents}c oid={new_oid}")
 
         time.sleep(POLL_INTERVAL_SEC)
 

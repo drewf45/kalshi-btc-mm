@@ -334,6 +334,25 @@ def cancel_all_for_market(client: KalshiClient, ticker: str) -> int:
     return cancelled
 
 
+_FILLS_ROUTE_PRIMARY = "/portfolio/events/fills"
+_FILLS_ROUTE_FALLBACK = "/portfolio/fills"
+_fills_route: str = _FILLS_ROUTE_FALLBACK
+
+
+def probe_fills_route(client: KalshiClient) -> str:
+    """Probe fills route at boot — FATAL if neither candidate works."""
+    global _fills_route
+    for route in [_FILLS_ROUTE_PRIMARY, _FILLS_ROUTE_FALLBACK]:
+        try:
+            client.request("GET", route, params={"limit": 1})
+            _fills_route = route
+            log.warning(f"[FILLS] Route probe: {route} ✓")
+            return route
+        except Exception as e:
+            log.warning(f"[FILLS] Route probe: {route} ✗ ({e})")
+    raise RuntimeError("FATAL: No working fills route — engine cannot see fills")
+
+
 _resting_shape_logged = False
 _fills_shape_logged = False
 
@@ -346,7 +365,7 @@ def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
 
     # 1. Fills first — immutable broker truth
     try:
-        fr = client.request("GET", "/portfolio/fills",
+        fr = client.request("GET", _fills_route,
                             params={"ticker": ticker, "limit": 100})
     except Exception as e:
         raise OrderStatusUnavailable(f"fills endpoint failed for {ticker}: {e}") from e
@@ -448,7 +467,7 @@ def get_settlement_result(client: KalshiClient, ticker: str) -> Optional[str]:
 def get_fills(client: KalshiClient, ticker: str) -> List[Dict]:
     """Get fills for a specific ticker.
     Raises on API failure — caller must handle (empty list is indistinguishable from failure)."""
-    resp = client.request("GET", "/portfolio/fills",
+    resp = client.request("GET", _fills_route,
                           params={"ticker": ticker, "limit": 100})
     if isinstance(resp, dict):
         return resp.get("fills", [])
@@ -458,7 +477,7 @@ def get_fills(client: KalshiClient, ticker: str) -> List[Dict]:
 def get_all_recent_fills(client: KalshiClient, limit: int = 200) -> List[Dict]:
     """Get recent fills across all tickers for reconciliation.
     Raises on API failure."""
-    resp = client.request("GET", "/portfolio/fills",
+    resp = client.request("GET", _fills_route,
                           params={"limit": limit})
     if isinstance(resp, dict):
         return resp.get("fills", [])
@@ -535,3 +554,28 @@ def extract_boundaries(market_obj: Dict) -> Tuple[Optional[float], Optional[floa
                 except (KeyError, ValueError, TypeError):
                     pass
     return lo, hi
+
+
+# ── Census (Part 4.2) ──────────────────────────────────────────
+
+def get_todays_settled_tickers(client: KalshiClient) -> List[str]:
+    """Get all KXBTC15M tickers that closed/settled today (for census)."""
+    import datetime as dt
+    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    try:
+        resp = client.request("GET", "/markets",
+                              params={"series_ticker": SERIES_TICKER, "limit": 200})
+    except Exception as e:
+        log.warning(f"[CENSUS] Failed to fetch markets: {e}")
+        return []
+    mkts = resp.get("markets", []) if isinstance(resp, dict) else []
+    tickers = []
+    for m in mkts:
+        ticker = m.get("ticker") or m.get("market_ticker", "")
+        status = (m.get("status") or "").lower()
+        if status not in ("settled", "finalized", "closed"):
+            continue
+        close_ts = resolve_close_ts(m, ticker)
+        if close_ts is not None and close_ts >= today_start:
+            tickers.append(ticker)
+    return tickers

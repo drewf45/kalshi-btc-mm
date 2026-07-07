@@ -133,6 +133,25 @@ def build_scoreboard() -> str:
             )
         lines.append("")
 
+    # --- CLIP BY TIME BAND (H10/Yogi-Berra) ---
+    clip_bands = store.query_clip_by_time_band()
+    if any(c["n"] > 0 for c in clip_bands):
+        lines.append(" CLIP BY TIME BAND")
+        lines.append(" Band      |  N  | Win%  | Avg Clip")
+        lines.append("-----------|-----|-------|----------")
+        for c in clip_bands:
+            if c["n"] > 0:
+                lines.append(
+                    f" {c['band']:<10s}| {c['n']:3d} | {c['win_pct']:5.1%} | ${c['avg_clip']:+.3f}"
+                )
+        lines.append("")
+
+    # --- MEDIAN DEPTH AT TOUCH ---
+    med_depth = store.query_median_depth()
+    if med_depth is not None:
+        lines.append(f" Median depth at touch: {med_depth} contracts")
+        lines.append("")
+
     # --- CAUTION LEDGER (Fix 5) ---
     caution = store.query_caution_ledger()
     if caution["n"] > 0:
@@ -186,6 +205,13 @@ def build_scoreboard() -> str:
     conflicts = store.check_conflicting_resolutions()
     if conflicts:
         lines.append(f" ALERT: Conflicting resolutions: {', '.join(conflicts[:5])}")
+        lines.append("")
+
+    # --- CENSUS COVERAGE ---
+    census_total = store.get_state("census_total")
+    census_covered = store.get_state("census_covered")
+    if census_total and census_covered:
+        lines.append(f" Coverage: {census_covered}/{census_total} windows")
         lines.append("")
 
     # --- Daily shadow summary ---
