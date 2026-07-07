@@ -301,7 +301,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
 
     # Place the order
     try:
-        order_id = kalshi.place_order_maker(
+        order_id, order_resp = kalshi.place_order_maker(
             client, ticker, eval_result.side,
             rest_price, count=1, expiration_ts=expiry_ts,
         )
@@ -316,10 +316,19 @@ def submit(client: kalshi.KalshiClient, ticker: str,
             f"why={eval_result.why_tag} oid={order_id}"
         )
         return order_id, row_id, None
+    except RuntimeError as e:
+        err = str(e)
+        if "HTTP 4" in err and "HTTP 429" not in err:
+            log.error(f"[GATEWAY] Order REJECTED (definitive): {e}")
+            store.update_settlement(row_id, "order_rejected", 0.0, time.time())
+            return None, row_id, "SKIP_ORDER_REJECTED"
+        log.error(f"[GATEWAY] Order AMBIGUOUS failure: {e}")
+        store.update_settlement(row_id, "order_ambiguous", 0.0, time.time())
+        return None, row_id, "SKIP_ORDER_AMBIGUOUS"
     except Exception as e:
-        log.error(f"[GATEWAY] Order failed: {e}")
-        store.update_settlement(row_id, "order_failed", 0.0, time.time())
-        return None, row_id, "SKIP_ORDER_FAILED"
+        log.error(f"[GATEWAY] Order AMBIGUOUS failure: {e}")
+        store.update_settlement(row_id, "order_ambiguous", 0.0, time.time())
+        return None, row_id, "SKIP_ORDER_AMBIGUOUS"
 
 
 def reprice(client: kalshi.KalshiClient, ticker: str,
@@ -338,8 +347,8 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
     rest_price = new_book.yes_bid if eval_result.side == "yes" else new_book.no_bid
     if rest_price is None or rest_price < COST_BAND_LO:
         return None, None
-    oid = kalshi.place_order_maker(client, ticker, eval_result.side, rest_price,
-                                   count=1, expiration_ts=close_ts - 10)
+    oid, _ = kalshi.place_order_maker(client, ticker, eval_result.side, rest_price,
+                                      count=1, expiration_ts=close_ts - 10)
     log.warning(f"[GATEWAY] REPRICE {ticker} → {new_cost}c oid={oid}")
     return oid, new_cost
 

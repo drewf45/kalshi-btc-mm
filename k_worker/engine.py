@@ -24,9 +24,11 @@ ENTRY_WINDOW_SEC = 180
 CANCEL_BEFORE_EXPIRY_SEC = 10
 POLL_INTERVAL_SEC = 5
 MAX_REPRICES_LOW_BAND = 1
+MAX_SUBMIT_ATTEMPTS = 2
 TELEGRAM_PER_MARKET = os.environ.get("TELEGRAM_PER_MARKET", "1").strip() == "1"
 
 _observe_mode = False
+_submit_attempts: Dict[str, int] = {}
 
 
 def set_observe_mode(enabled: bool) -> None:
@@ -201,12 +203,48 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         )
         return "observe"
 
-    # Phase 3: Submit via gateway
+    # Phase 3: Submit via gateway (with retry discipline)
+    attempt = _submit_attempts.get(ticker, 0) + 1
+    _submit_attempts[ticker] = attempt
+
+    if attempt > MAX_SUBMIT_ATTEMPTS:
+        log.warning(f"[ENGINE] Max submit attempts ({MAX_SUBMIT_ATTEMPTS}) exhausted for {ticker}")
+        _send_market_line(
+            f"⏭ {_time_et()} SKIP_MAX_ATTEMPTS (fav {eval_result.side.upper()} "
+            f"{eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {_bal_from(cash, pv)}"
+        )
+        return "max_attempts"
+
     order_id, row_id, skip_why = gateway.submit(
         client, ticker, eval_result, close_ts, secs_to_expiry, book,
     )
 
     if order_id is None:
+        if skip_why == "SKIP_ORDER_AMBIGUOUS":
+            time.sleep(2)
+            pos = kalshi.position_for_market(client, ticker)
+            if abs(pos) > 0:
+                log.warning(f"[ENGINE] Ambiguous submit but exchange shows position — treating as filled")
+                gateway.mark_traded(ticker)
+                bal = _bal_str(client)
+                _send_market_line(
+                    f"⚠ {_time_et()} AMBIGUOUS_BUT_FILLED {eval_result.why_tag} | {bal}"
+                )
+                return "ambiguous_filled"
+            if attempt < MAX_SUBMIT_ATTEMPTS:
+                log.warning(f"[ENGINE] Ambiguous failure, no position — will retry next cycle")
+                _submit_attempts[ticker] = attempt
+                return "retry_pending"
+
+        if skip_why == "SKIP_ORDER_REJECTED" and attempt < MAX_SUBMIT_ATTEMPTS:
+            retry_tag = f"{eval_result.why_tag}_RETRY1"
+            log.warning(f"[ENGINE] Definitive reject, attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} — will retry")
+            _send_market_line(
+                f"⏭ {_time_et()} {retry_tag} (fav {eval_result.side.upper()} "
+                f"{eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {_bal_from(cash, pv)}"
+            )
+            return "retry_pending"
+
         log.info(f"[ENGINE] Submit failed for {ticker}")
         tag = skip_why or "SKIP_SUBMIT_FAILED"
         side_str = eval_result.side.upper() if eval_result.side else "?"
@@ -329,26 +367,48 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
                  eval_result: gateway.EvalResult,
                  close_ts: int) -> Dict:
     """Handle a filled order. Returns dict with outcome, fill_cost, fee_cents, pnl."""
-    raw_yes = order.get("yes_price")
-    raw_no = order.get("no_price")
-    avg = order.get("avg_price")
-    if eval_result.side == "yes":
-        fill_cost = int(avg if avg is not None else (raw_yes if raw_yes is not None else eval_result.cost_cents))
-    else:
-        if raw_no is not None:
-            fill_cost = int(raw_no)
-        elif avg is not None:
-            fill_cost = int(avg)
-        elif raw_yes is not None:
-            fill_cost = 100 - int(raw_yes)
+    from decimal import Decimal
+
+    fill_cost = None
+    fee_cents = 0
+
+    # V2 fields: average_fill_price (YES-side dollar string), average_fee_paid (dollar string)
+    v2_avg = order.get("average_fill_price")
+    v2_fee = order.get("average_fee_paid")
+
+    if v2_avg is not None:
+        yes_cents = int(Decimal(str(v2_avg)) * 100)
+        if eval_result.side == "yes":
+            fill_cost = yes_cents
         else:
-            fill_cost = eval_result.cost_cents
+            fill_cost = 100 - yes_cents
+
+    if fill_cost is None:
+        raw_yes = order.get("yes_price")
+        raw_no = order.get("no_price")
+        avg = order.get("avg_price")
+        if eval_result.side == "yes":
+            fill_cost = int(avg if avg is not None else (raw_yes if raw_yes is not None else eval_result.cost_cents))
+        else:
+            if raw_no is not None:
+                fill_cost = int(raw_no)
+            elif avg is not None:
+                fill_cost = int(avg)
+            elif raw_yes is not None:
+                fill_cost = 100 - int(raw_yes)
+            else:
+                fill_cost = eval_result.cost_cents
+
+    if v2_fee is not None:
+        fee_cents = int(Decimal(str(v2_fee)) * 100)
+    else:
+        fee_cents = order.get("taker_fee", 0) + order.get("maker_fee", 0)
+
     if not (gateway.COST_BAND_LO <= fill_cost <= gateway.COST_BAND_HI):
         log.error(f"[ENGINE] PHRASING-LAW ASSERT: fill_cost={fill_cost}c outside 95-99 for {ticker} "
-                  f"(avg={avg} yes={raw_yes} no={raw_no} side={eval_result.side}) — using eval cost, flagging row")
+                  f"(order keys={list(order.keys())} side={eval_result.side}) — using eval cost, flagging row")
         notify.alert(f"Phrasing-law assert on fill {ticker}: {fill_cost}c — check order payload")
         fill_cost = eval_result.cost_cents
-    fee_cents = order.get("taker_fee", 0) + order.get("maker_fee", 0)
 
     slippage = fill_cost - eval_result.cost_cents if eval_result.cost_cents else 0
 

@@ -1,6 +1,7 @@
 """Chunk 1 — Telegram notifications."""
 
 import os
+import time
 import logging
 import threading
 import requests
@@ -10,6 +11,8 @@ log = logging.getLogger("k_worker.notify")
 _BOT_TOKEN = ""
 _CHAT_ID = ""
 _SESSION = requests.Session()
+_pending_queue: list = []
+_queue_lock = threading.Lock()
 
 
 def init():
@@ -41,24 +44,56 @@ def send(text: str, parse_mode: str = "HTML") -> None:
     threading.Thread(target=_send_sync, args=(text, parse_mode), daemon=True).start()
 
 
+def _do_send(text: str, parse_mode: str) -> bool:
+    """Attempt one send. Returns True on success."""
+    resp = _SESSION.post(
+        f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": _CHAT_ID,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        },
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        log.warning(f"[TELEGRAM] Send failed: HTTP {resp.status_code} {resp.text[:200]}")
+        return False
+    return True
+
+
 def _send_sync(text: str, parse_mode: str) -> None:
-    try:
-        resp = _SESSION.post(
-            f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": _CHAT_ID,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log.warning(f"[TELEGRAM] Send failed: HTTP {resp.status_code} {resp.text[:200]}")
-    except Exception as e:
-        log.warning(f"[TELEGRAM] Send error: {e}")
+    queued = []
+    with _queue_lock:
+        if _pending_queue:
+            queued = list(_pending_queue)
+            _pending_queue.clear()
+
+    all_msgs = queued + [(text, parse_mode)]
+
+    for msg_text, msg_pm in all_msgs:
+        try:
+            if not _do_send(msg_text, msg_pm):
+                with _queue_lock:
+                    _pending_queue.append((msg_text, msg_pm))
+        except (ConnectionError, ConnectionResetError, requests.ConnectionError,
+                requests.Timeout, OSError) as e:
+            log.warning(f"[TELEGRAM] Connection error, retrying in 2s: {e}")
+            time.sleep(2)
+            try:
+                if not _do_send(msg_text, msg_pm):
+                    with _queue_lock:
+                        _pending_queue.append((msg_text, msg_pm))
+            except Exception as e2:
+                log.warning(f"[TELEGRAM] Retry failed, queuing: {e2}")
+                with _queue_lock:
+                    _pending_queue.append((msg_text, msg_pm))
+        except Exception as e:
+            log.warning(f"[TELEGRAM] Send error, queuing: {e}")
+            with _queue_lock:
+                _pending_queue.append((msg_text, msg_pm))
 
 
 def alert(text: str) -> None:
     """Send an ALERT-prefixed message."""
-    send(f"🚨 <b>ALERT</b>\n{text}")
+    send(f"\U0001f6a8 <b>ALERT</b>\n{text}")

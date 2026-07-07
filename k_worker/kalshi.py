@@ -293,10 +293,18 @@ def position_for_market(client: KalshiClient, ticker: str) -> int:
 # ── Orders ───────────────────────────────────────────────────────
 
 def get_open_orders(client: KalshiClient) -> List[Dict]:
-    resp = client.request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
-    if isinstance(resp, dict):
-        return resp.get("orders", [])
-    return resp if isinstance(resp, list) else []
+    try:
+        resp = client.request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
+        if isinstance(resp, dict):
+            return resp.get("orders", [])
+        return resp if isinstance(resp, list) else []
+    except RuntimeError as e:
+        if "HTTP 410" in str(e) or "HTTP 404" in str(e):
+            resp = client.request("GET", "/portfolio/events/orders", params={"status": "resting", "limit": 200})
+            if isinstance(resp, dict):
+                return resp.get("orders", [])
+            return resp if isinstance(resp, list) else []
+        raise
 
 
 def cancel_order(client: KalshiClient, order_id: str) -> str:
@@ -304,7 +312,16 @@ def cancel_order(client: KalshiClient, order_id: str) -> str:
         client.request("DELETE", f"/portfolio/orders/{order_id}")
         return "canceled"
     except RuntimeError as e:
-        if "HTTP 404" in str(e):
+        err = str(e)
+        if "HTTP 410" in err:
+            try:
+                client.request("DELETE", f"/portfolio/events/orders/{order_id}")
+                return "canceled"
+            except RuntimeError as e2:
+                if "HTTP 404" in str(e2):
+                    return "not_found"
+                raise
+        if "HTTP 404" in err:
             return "not_found"
         raise
 
@@ -331,6 +348,16 @@ def get_order(client: KalshiClient, order_id: str) -> Optional[Dict]:
     try:
         resp = client.request("GET", f"/portfolio/orders/{order_id}")
         return resp.get("order", resp) if isinstance(resp, dict) else None
+    except RuntimeError as e:
+        if "HTTP 410" in str(e):
+            try:
+                resp = client.request("GET", f"/portfolio/events/orders/{order_id}")
+                return resp.get("order", resp) if isinstance(resp, dict) else None
+            except Exception as e2:
+                log.warning(f"[ORDER] get V2 {order_id}: {e2}")
+                return None
+        log.warning(f"[ORDER] get {order_id}: {e}")
+        return None
     except Exception as e:
         log.warning(f"[ORDER] get {order_id}: {e}")
         return None
@@ -338,35 +365,40 @@ def get_order(client: KalshiClient, order_id: str) -> Optional[Dict]:
 
 def place_order_maker(client: KalshiClient, ticker: str, side: str,
                       price_cents: int, count: int = 1,
-                      expiration_ts: Optional[int] = None) -> str:
-    """Place a post_only (maker) limit order. Returns order_id or raises.
+                      expiration_ts: Optional[int] = None) -> Tuple[str, Dict]:
+    """Place a post_only (maker) limit order via V2. Returns (order_id, response).
 
+    side: 'yes'/'no' (engine convention). price_cents: COST of the held side.
+    V2 quotes the YES leg only: buy NO == ask YES at (100 - cost).
     The ONLY order placement function in the engine — no taker path exists.
     """
+    if side == "yes":
+        v2_side = "bid"
+        v2_price = f"{price_cents / 100:.2f}"
+    else:
+        v2_side = "ask"
+        v2_price = f"{(100 - price_cents) / 100:.2f}"
+
     body: Dict[str, Any] = {
         "ticker": ticker,
-        "action": "buy",
-        "side": side,
-        "type": "limit",
-        "count": max(1, int(count)),
-        "client_order_id": f"{ENGINE_ID}-{uuid.uuid4().hex[:12]}",
-        "post_only": True,
+        "client_order_id": str(uuid.uuid4()),
+        "side": v2_side,
+        "count": str(max(1, int(count))),
+        "price": v2_price,
         "time_in_force": "good_till_canceled",
+        "post_only": True,
+        "self_trade_prevention_type": "taker_at_cross",
     }
-    if side == "yes":
-        body["yes_price"] = int(price_cents)
-    else:
-        body["no_price"] = int(price_cents)
     if expiration_ts is not None and expiration_ts > int(time.time()):
-        body["expiration_ts"] = expiration_ts
+        body["expiration_time"] = int(expiration_ts)
 
-    resp = client.request("POST", "/portfolio/orders", json_body=body)
+    resp = client.request("POST", "/portfolio/events/orders", json_body=body)
+    log.info(f"[ORDER-V2] resp: {resp}")
     if isinstance(resp, dict):
-        order = resp.get("order", resp)
-        oid = order.get("order_id") or resp.get("order_id")
+        oid = resp.get("order_id")
         if oid:
-            return str(oid)
-    raise RuntimeError(f"Unexpected order response: {resp}")
+            return str(oid), resp
+    raise RuntimeError(f"Unexpected V2 order response: {resp}")
 
 
 # ── Settlement ───────────────────────────────────────────────────
