@@ -10,6 +10,8 @@ import os
 import time
 import logging
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, Dict
 
 import requests as _requests
@@ -22,6 +24,7 @@ ENTRY_WINDOW_SEC = 180
 CANCEL_BEFORE_EXPIRY_SEC = 10
 POLL_INTERVAL_SEC = 5
 MAX_REPRICES_LOW_BAND = 1
+TELEGRAM_PER_MARKET = os.environ.get("TELEGRAM_PER_MARKET", "1").strip() == "1"
 
 _observe_mode = False
 
@@ -61,6 +64,32 @@ def get_heartbeat_ts() -> float:
     return _heartbeat_ts
 
 
+# ── T3: per-market Telegram ─────────────────────────────────────
+
+def _time_et() -> str:
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M")
+
+
+def _bal_str(client: kalshi.KalshiClient) -> str:
+    cash, pv = kalshi.get_balance(client)
+    if cash is None:
+        return "Bal ?"
+    return f"Bal ${(cash + (pv or 0)):.2f}"
+
+
+def _bal_from(cash, pv=0) -> str:
+    if cash is None:
+        return "Bal ?"
+    return f"Bal ${(cash + (pv or 0)):.2f}"
+
+
+def _send_market_line(text: str) -> None:
+    if TELEGRAM_PER_MARKET:
+        notify.send(text)
+
+
+# ── Main cycle ──────────────────────────────────────────────────
+
 def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
                      close_ts: int, market_obj: Dict) -> Optional[str]:
     """Run one full market cycle for a ticker. Returns outcome string or None.
@@ -78,6 +107,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
 
     if discipline.is_halted():
         log.warning(f"[ENGINE] Halted — skipping {ticker} ({discipline.halt_reason()})")
+        _send_market_line(f"⏭ {_time_et()} SKIP_HALTED | Bal ?")
         return "halted"
 
     # Phase 1: Wait for entry window
@@ -100,9 +130,10 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
 
     # Phase 2: Fetch book and evaluate
     book = kalshi.fetch_orderbook(client, ticker)
-    cash, _ = kalshi.get_balance(client)
+    cash, pv = kalshi.get_balance(client)
     if cash is None:
         log.warning(f"[ENGINE] Cannot read balance — skipping {ticker}")
+        _send_market_line(f"⏭ {_time_et()} SKIP_BALANCE (unreadable) | Bal ?")
         return "no_balance"
 
     if not _observe_mode:
@@ -119,7 +150,6 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         spread = book.no_ask - book.no_bid
 
     if not eval_result.allowed:
-        env = "live-observed"
         store.insert_row(store.SurfaceRow(
             market_ticker=ticker,
             decision_ts=time.time(),
@@ -133,9 +163,15 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
             no_ask_cents=book.no_ask,
             spread_cents=spread,
             skip_reason=eval_result.reject_code,
-            env=env,
+            why_tag=eval_result.why_tag,
+            env="live-observed",
         ))
         log.info(f"[ENGINE] SKIP {ticker}: {eval_result.reject_code} — {eval_result.reject_reason}")
+        side_str = eval_result.side.upper() if eval_result.side else "?"
+        cost_str = f"{eval_result.cost_cents}¢" if eval_result.cost_cents is not None else "?¢"
+        tag = eval_result.why_tag or eval_result.reject_code
+        bal = _bal_from(cash, pv)
+        _send_market_line(f"⏭ {_time_et()} {tag} (fav {side_str} {cost_str} @T-{int(secs_to_expiry)}) | {bal}")
         return f"skip:{eval_result.reject_code}"
 
     # Observe mode: log what would be an ENTER but never submit
@@ -157,20 +193,56 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
             env="live-observed",
         ))
         log.info(f"[ENGINE] OBSERVE {ticker}: would ENTER {eval_result.side} @ {eval_result.cost_cents}c")
+        side_str = eval_result.side.upper() if eval_result.side else "?"
+        bal = _bal_from(cash, pv)
+        _send_market_line(
+            f"\U0001f441 {_time_et()} OBSERVE {eval_result.why_tag} "
+            f"(fav {side_str} {eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {bal}"
+        )
         return "observe"
 
     # Phase 3: Submit via gateway
-    order_id, row_id = gateway.submit(
+    order_id, row_id, skip_why = gateway.submit(
         client, ticker, eval_result, close_ts, secs_to_expiry, book,
     )
 
     if order_id is None:
         log.info(f"[ENGINE] Submit failed for {ticker}")
+        tag = skip_why or "SKIP_SUBMIT_FAILED"
+        side_str = eval_result.side.upper() if eval_result.side else "?"
+        bal = _bal_str(client)
+        _send_market_line(
+            f"⏭ {_time_et()} {tag} (fav {side_str} {eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {bal}"
+        )
         return "submit_failed"
 
-    # Phase 4: Monitor fill
-    outcome = _monitor_order(client, ticker, order_id, row_id, eval_result,
-                             close_ts, book)
+    # Phase 4: Monitor fill -> settlement
+    result = _monitor_order(client, ticker, order_id, row_id, eval_result,
+                            close_ts, book)
+
+    outcome = result["outcome"]
+    bal = _bal_str(client)
+    ts = _time_et()
+    tag = eval_result.why_tag
+
+    if outcome == "no_fill":
+        _send_market_line(f"\U0001f7e1 {ts} NO_FILL {tag} rested {eval_result.cost_cents}¢, uncrossed | {bal}")
+    elif outcome in ("win", "loss"):
+        emoji = "✅" if outcome == "win" else "❌"
+        label = "WIN" if outcome == "win" else "LOSS"
+        fc = result.get("fill_cost", eval_result.cost_cents)
+        fee = result.get("fee_cents", 0)
+        pnl = result.get("pnl", 0.0)
+        _send_market_line(f"{emoji} {ts} FILL {tag} @{fc}¢ fee {fee}¢ → {label} ${pnl:+.2f} | {bal}")
+    elif outcome == "timeout":
+        fc = result.get("fill_cost", eval_result.cost_cents)
+        fee = result.get("fee_cents", 0)
+        _send_market_line(f"\U0001f7e1 {ts} FILL {tag} @{fc}¢ fee {fee}¢ → TIMEOUT | {bal}")
+    elif outcome == "cancelled_external":
+        _send_market_line(f"⏭ {ts} CANCELLED {tag} | {bal}")
+    elif outcome == "reprice_failed":
+        _send_market_line(f"⏭ {ts} REPRICE_FAIL {tag} | {bal}")
+
     heartbeat()
     return outcome
 
@@ -187,8 +259,8 @@ def _wait_with_heartbeat(seconds: float):
 def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                    order_id: str, row_id: int,
                    eval_result: gateway.EvalResult,
-                   close_ts: int, original_book: kalshi.Book) -> str:
-    """Monitor an open order: wait for fill, handle repricing, cancel at T-10s."""
+                   close_ts: int, original_book: kalshi.Book) -> Dict:
+    """Monitor an open order. Returns dict with outcome and fill details."""
     reprices = 0
     cost_cents = eval_result.cost_cents
     is_99_band = cost_cents == 99
@@ -203,7 +275,7 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             kalshi.cancel_all_for_market(client, ticker)
             store.update_settlement(row_id, "no_fill", 0.0, time.time())
             log.info(f"[ENGINE] NO_FILL {ticker} — cancelled at T-{CANCEL_BEFORE_EXPIRY_SEC}s")
-            return "no_fill"
+            return {"outcome": "no_fill"}
 
         order = kalshi.get_order(client, order_id)
         if order is None:
@@ -222,7 +294,7 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             else:
                 store.update_settlement(row_id, "cancelled_external", 0.0, time.time())
                 log.warning(f"[ENGINE] Order {order_id} cancelled externally")
-                return "cancelled_external"
+                return {"outcome": "cancelled_external"}
 
         if not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
             new_book = kalshi.fetch_orderbook(client, ticker)
@@ -238,7 +310,7 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                 except Exception as e:
                     log.warning(f"[ENGINE] Reprice failed: {e}")
                     store.update_settlement(row_id, "reprice_failed", 0.0, time.time())
-                    return "reprice_failed"
+                    return {"outcome": "reprice_failed"}
                 if new_oid is not None:
                     order_id = new_oid
                     cost_cents = new_cost_out
@@ -252,8 +324,8 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
 def _handle_fill(client: kalshi.KalshiClient, ticker: str,
                  order: Dict, row_id: int,
                  eval_result: gateway.EvalResult,
-                 close_ts: int) -> str:
-    """Handle a filled order: record fill, wait for settlement."""
+                 close_ts: int) -> Dict:
+    """Handle a filled order. Returns dict with outcome, fill_cost, fee_cents, pnl."""
     raw_yes = order.get("yes_price")
     raw_no = order.get("no_price")
     avg = order.get("avg_price")
@@ -280,14 +352,6 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
     store.update_fill(row_id, fill_cost, time.time(), slippage, fee_cents)
     log.info(f"[ENGINE] FILLED {ticker} {eval_result.side} @ {fill_cost}c fee={fee_cents}c")
 
-    bal_cash, bal_pv = kalshi.get_balance(client)
-    bal_line = f"Balance: ${(bal_cash or 0) + (bal_pv or 0):.2f}" if bal_cash is not None else "Balance: unknown"
-    notify.send(
-        f"<b>FILL</b> {ticker}\n"
-        f"{eval_result.side.upper()} @ {fill_cost}c | fee={fee_cents}c\n"
-        f"{bal_line}"
-    )
-
     # Post-fill drift check (10s after fill)
     time.sleep(min(10, max(0, close_ts - time.time() - 5)))
     heartbeat()
@@ -304,15 +368,18 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
         pass
 
     # Wait for settlement
-    return _wait_for_settlement(client, ticker, row_id, eval_result, fill_cost,
-                                fee_cents, close_ts)
+    settle = _wait_for_settlement(client, ticker, row_id, eval_result, fill_cost,
+                                   fee_cents, close_ts)
+    settle["fill_cost"] = fill_cost
+    settle["fee_cents"] = fee_cents
+    return settle
 
 
 def _wait_for_settlement(client: kalshi.KalshiClient, ticker: str,
                          row_id: int, eval_result: gateway.EvalResult,
                          fill_cost: int, fee_cents: int,
-                         close_ts: int) -> str:
-    """Wait for market settlement after fill."""
+                         close_ts: int) -> Dict:
+    """Wait for market settlement after fill. Returns dict with outcome and pnl."""
     # Wait until after close
     wait_until = close_ts + 30
     while time.time() < wait_until:
@@ -341,17 +408,10 @@ def _wait_for_settlement(client: kalshi.KalshiClient, ticker: str,
                 f"[ENGINE] SETTLED {ticker} → {result.upper()} "
                 f"{'WIN' if won else 'LOSS'} pnl=${pnl:+.2f}"
             )
-            bal_cash, bal_pv = kalshi.get_balance(client)
-            bal_line = f"Balance: ${(bal_cash or 0) + (bal_pv or 0):.2f}" if bal_cash is not None else "Balance: unknown"
-            notify.send(
-                f"<b>{'WIN' if won else 'LOSS'}</b> {ticker}\n"
-                f"Result: {result.upper()} | PnL: ${pnl:+.2f}\n"
-                f"{bal_line}"
-            )
-            return resolution
+            return {"outcome": resolution, "pnl": pnl}
 
         time.sleep(15)
 
     log.warning(f"[ENGINE] Settlement timeout for {ticker}")
     store.update_settlement(row_id, "timeout", 0.0, time.time())
-    return "timeout"
+    return {"outcome": "timeout", "pnl": 0.0}

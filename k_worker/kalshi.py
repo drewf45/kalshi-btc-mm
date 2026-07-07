@@ -219,10 +219,13 @@ _ob_shape_logged = False
 def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:
     """Fetch and parse orderbook for a ticker.
 
-    Correct endpoint: GET /markets/{ticker}/orderbook
-    Response: {"orderbook": {"yes": [[price, qty], ...], "no": [[price, qty], ...]}}
-    Each side carries BIDS ONLY (reciprocal pricing).
+    Endpoint: GET /markets/{ticker}/orderbook
+    Fixed-point response: {"orderbook_fp": {"yes_dollars": [["0.97","5.00"], ...],
+                                             "no_dollars": [...]}}
+    Each side carries BIDS ONLY; arrays sorted ASCENDING (highest bid LAST).
+    Strings support subpenny prices and fractional counts.
     """
+    from decimal import Decimal
     global _ob_shape_logged
     try:
         resp = client.request("GET", f"/markets/{ticker}/orderbook")
@@ -237,26 +240,26 @@ def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:
         log.info(f"[OB] shape: {list(resp.keys())}")
         _ob_shape_logged = True
 
-    ob = resp.get("orderbook") or {}
-    yes_levels = ob.get("yes") or []
-    no_levels = ob.get("no") or []
+    ob = resp.get("orderbook_fp") or {}
 
-    def _best_bid(levels):
+    def best(levels):
         if not levels:
-            return None, 0
-        best = max(levels, key=lambda l: l[0])
-        return int(best[0]), int(best[1]) if len(best) >= 2 else 0
+            return None, None
+        price_str, count_str = levels[-1]
+        d = Decimal(price_str) * 100
+        cents = int(d)
+        if d != cents:
+            log.info(f"[OB] subpenny bid {price_str} on {ticker} — floored to {cents}c")
+        return cents, int(Decimal(count_str))
 
-    yes_bid, yes_bid_qty = _best_bid(yes_levels) if yes_levels else (None, 0)
-    no_bid, no_bid_qty = _best_bid(no_levels) if no_levels else (None, 0)
-
-    yes_ask = (100 - no_bid) if no_bid is not None else None
-    no_ask = (100 - yes_bid) if yes_bid is not None else None
+    yes_bid, yes_bid_qty = best(ob.get("yes_dollars") or [])
+    no_bid, no_bid_qty = best(ob.get("no_dollars") or [])
 
     return Book(
-        yes_bid=yes_bid, yes_ask=yes_ask,
-        no_bid=no_bid, no_ask=no_ask,
-        yes_bid_qty=yes_bid_qty, no_bid_qty=no_bid_qty,
+        yes_bid=yes_bid, yes_bid_qty=yes_bid_qty or 0,
+        no_bid=no_bid, no_bid_qty=no_bid_qty or 0,
+        yes_ask=(100 - no_bid) if no_bid is not None else None,
+        no_ask=(100 - yes_bid) if yes_bid is not None else None,
     )
 
 
