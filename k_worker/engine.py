@@ -302,6 +302,7 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                    eval_result: gateway.EvalResult,
                    close_ts: int, original_book: kalshi.Book) -> Dict:
     """Monitor an open order. Returns dict with outcome and fill details."""
+    from decimal import Decimal
     reprices = 0
     cost_cents = eval_result.cost_cents
     is_99_band = cost_cents == 99
@@ -323,19 +324,28 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             time.sleep(POLL_INTERVAL_SEC)
             continue
 
+        fill_ct = Decimal(order.get("fill_count", "0") or "0")
+        rem_ct = Decimal(order.get("remaining_count", "0") or "0")
         status = (order.get("status") or "").lower()
 
-        if status in ("executed", "filled"):
+        if fill_ct > 0 and rem_ct == 0:
             return _handle_fill(client, ticker, order, row_id, eval_result, close_ts)
 
-        if status in ("canceled", "cancelled"):
+        if status in ("canceled", "cancelled", "expired"):
             if pending_reprice:
                 log.info(f"[ENGINE] Order {order_id} cancelled_by_reprice")
                 pending_reprice = False
             else:
-                store.update_settlement(row_id, "cancelled_external", 0.0, time.time())
-                log.warning(f"[ENGINE] Order {order_id} cancelled externally")
+                label = "expired_order" if status == "expired" else "cancelled_external"
+                store.update_settlement(row_id, label, 0.0, time.time())
+                log.warning(f"[ENGINE] Order {order_id} {label}")
                 return {"outcome": "cancelled_external"}
+
+        if fill_ct > 0 and rem_ct > 0:
+            notify.alert(f"Partial fill at 1ct?! {order}")
+
+        if status in ("executed", "filled"):
+            return _handle_fill(client, ticker, order, row_id, eval_result, close_ts)
 
         if not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
             new_book = kalshi.fetch_orderbook(client, ticker)

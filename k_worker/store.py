@@ -207,6 +207,20 @@ def get_unresolved_rows(ticker: str) -> list:
     return rows
 
 
+def approx_close_ts(ticker: str) -> float:
+    """Approximate close timestamp for a ticker from its most recent surface row."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT decision_ts, seconds_to_expiry FROM surface
+               WHERE market_ticker=? AND seconds_to_expiry IS NOT NULL
+               ORDER BY id DESC LIMIT 1""",
+            (ticker,),
+        ).fetchone()
+    if row and row[0] and row[1]:
+        return row[0] + row[1]
+    return 0.0
+
+
 def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
     """Combined stats from live-traded AND live-observed rows (obs_win/obs_loss count)."""
     traded = query_band_stats(cost_band_lo, cost_band_hi, "live-traded")

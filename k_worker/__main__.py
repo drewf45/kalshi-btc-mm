@@ -38,15 +38,25 @@ def _shutdown(sig, frame):
     _running = False
 
 
+STALE_TICKER_SEC = 86400  # 24 hours
+
+
 def _backfill_settlements(client: kalshi.KalshiClient) -> int:
     """S1: Backfill settlement results for unresolved rows with closed markets.
     Fills get win/loss, SKIPs with a recorded side get obs_win/obs_loss.
     Returns count of rows updated."""
     updated = 0
+    now = time.time()
     tickers = store.unresolved_tickers()
     for ticker in tickers:
         result = kalshi.get_settlement_result(client, ticker)
         if result is None:
+            close_ts = store.approx_close_ts(ticker)
+            if close_ts > 0 and (now - close_ts) > STALE_TICKER_SEC:
+                log.warning(f"[BACKFILL] {ticker} beyond live tier — marking stale")
+                for row_id, action, side, cost_cents, fee_cents in store.get_unresolved_rows(ticker):
+                    store.update_settlement(row_id, "obs_stale", 0.0, now)
+                    updated += 1
             continue
         rows = store.get_unresolved_rows(ticker)
         for row_id, action, side, cost_cents, fee_cents in rows:
