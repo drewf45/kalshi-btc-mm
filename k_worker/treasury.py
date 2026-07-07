@@ -83,6 +83,19 @@ def set_book(value: float) -> None:
     log.warning(f"[TREASURY] Book set to ${value:.2f}")
 
 
+def rebuild_accruals(tax: float, fee: float) -> None:
+    """Redistribute from book to accruals without changing total system value.
+    Used on fresh-store boots where book = live_bal (already includes all P&L).
+    Subtracts tax+fee from book, sets accruals — total unchanged."""
+    _set_float("treasury_accrued_tax", tax)
+    _set_float("treasury_accrued_fee", fee)
+    book = _get_float("treasury_engine_book", SEED)
+    new_book = book - tax - fee
+    _set_float("treasury_engine_book", new_book)
+    log.warning(f"[TREASURY] Rebuild accruals: tax=${tax:.3f} fee=${fee:.3f} "
+                f"book ${book:.2f} → ${new_book:.2f} (total unchanged)")
+
+
 def get_totals() -> Dict[str, float]:
     return {
         "engine_book": _get_float("treasury_engine_book", SEED),

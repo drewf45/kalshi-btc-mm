@@ -15,6 +15,8 @@ import os
 import time
 import signal
 import logging
+from datetime import datetime
+from typing import Optional
 
 from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard, treasury
 
@@ -213,6 +215,121 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
 BOOT_RECONCILE_TOL = 0.05
 
 
+def _fill_timestamp(fill: dict) -> Optional[float]:
+    """Extract Unix timestamp from a Kalshi fill record."""
+    for k in ("created_time", "trade_time", "updated_time"):
+        v = fill.get(k)
+        if isinstance(v, str) and v:
+            try:
+                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                return dt.timestamp()
+            except Exception:
+                pass
+    for k in ("created_ts", "ts", "trade_ts"):
+        v = fill.get(k)
+        if v is not None:
+            try:
+                val = float(v)
+                return val / 1000 if val > 10_000_000_000 else val
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _fill_side(fills: list) -> str:
+    """Determine our side from fill records. bid->yes, ask->no."""
+    for f in fills:
+        s = str(f.get("side", "")).lower()
+        if s in ("yes", "no"):
+            return s
+        if s == "bid":
+            return "yes"
+        if s == "ask":
+            return "no"
+    return "yes"
+
+
+def rebuild_today(client: kalshi.KalshiClient) -> int:
+    """Rebuild today's surface from broker fills on a fresh-store boot.
+    Replays settled wins through accrual math (without waterfall — book already
+    includes the P&L). Returns count of tickers rebuilt."""
+    try:
+        fills = kalshi.get_all_recent_fills(client, limit=200)
+    except Exception as e:
+        log.warning(f"[REBUILD] Failed to fetch broker fills: {e}")
+        notify.alert(f"REBUILD: broker fills fetch failed: {e}")
+        return 0
+
+    today_start = store.et_midnight_ts()
+    today_fills = [f for f in fills if (_fill_timestamp(f) or 0) >= today_start]
+
+    if not today_fills:
+        log.info("[REBUILD] No broker fills today — nothing to rebuild")
+        return 0
+
+    by_ticker: dict = {}
+    for f in today_fills:
+        tk = f.get("ticker") or f.get("market_ticker", "")
+        if tk:
+            by_ticker.setdefault(tk, []).append(f)
+
+    rebuilt = 0
+    total_tax = 0.0
+    total_fee = 0.0
+
+    for ticker, fill_records in by_ticker.items():
+        if not ticker.startswith("KXBTC15M"):
+            continue
+        if store.has_row_for_ticker(ticker):
+            continue
+
+        side = _fill_side(fill_records)
+        cost_cents, fee_cents, count = kalshi.parse_fills(fill_records, side)
+
+        fill_ts = _fill_timestamp(fill_records[0]) or time.time()
+
+        row_id = store.insert_row(store.SurfaceRow(
+            market_ticker=ticker,
+            decision_ts=fill_ts,
+            action="ENTER",
+            side=side,
+            cost_per_contract_cents=int(cost_cents) if cost_cents is not None else None,
+            fill_cost_cents=int(cost_cents) if cost_cents is not None else None,
+            fill_ts=fill_ts,
+            fee_cents=fee_cents,
+            contracts=count,
+            why_tag="REBUILT_FROM_BROKER",
+            env="live-traded",
+        ))
+
+        result = kalshi.get_settlement_result(client, ticker)
+        if result is not None and side and cost_cents is not None:
+            won = (result == side)
+            if won:
+                pnl = (100 - cost_cents - fee_cents) / 100.0
+                tax = pnl * treasury.TAX_RATE
+                fee_amt = pnl * treasury.OPERATOR_FEE
+                total_tax += tax
+                total_fee += fee_amt
+                store.update_settlement(row_id, "win", pnl, time.time())
+                discipline.record_win()
+            else:
+                pnl = -(cost_cents + fee_cents) / 100.0
+                store.update_settlement(row_id, "loss", pnl, time.time())
+                discipline.record_loss()
+
+        rebuilt += 1
+
+    if total_tax > 0 or total_fee > 0:
+        treasury.rebuild_accruals(total_tax, total_fee)
+
+    log.warning(f"[REBUILD] {rebuilt} tickers rebuilt from broker fills "
+                f"(accrued: tax=${total_tax:.3f} fee=${total_fee:.3f})")
+    notify.send(f"🔧 REBUILD: {rebuilt} tickers rebuilt from broker fills "
+                f"(tax ${total_tax:.3f}, fee ${total_fee:.3f})")
+    return rebuilt
+
+
 def boot_reconcile(client: kalshi.KalshiClient) -> None:
     """Drew's law 2026-07-07: never trust stored treasury across a deploy
     boundary. Pull live broker truth and reconcile BEFORE the first cycle."""
@@ -229,6 +346,7 @@ def boot_reconcile(client: kalshi.KalshiClient) -> None:
         treasury.set_book(live_bal)
         store.record_epoch(t.book, live_bal, delta, "fresh_store_init")
         notify.send(f"🔧 BOOT RECONCILE: fresh store — book initialized from live balance ${live_bal:.2f} (EPOCH)")
+        rebuild_today(client)
     elif abs(delta) <= BOOT_RECONCILE_TOL:
         notify.send(f"🔧 BOOT RECONCILE OK: bal ${live_bal:.2f} ≈ expected ${expected:.2f} (Δ ${delta:+.2f})")
     else:
