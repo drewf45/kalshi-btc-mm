@@ -222,18 +222,22 @@ def approx_close_ts(ticker: str) -> float:
 
 
 def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
-    """Combined stats from live-traded AND live-observed rows (obs_win/obs_loss count)."""
+    """Combined stats from live-traded AND live-observed rows.
+    Uses COUNT(DISTINCT market_ticker) for obs to prevent multi-row inflation."""
     traded = query_band_stats(cost_band_lo, cost_band_hi, "live-traded")
     with _lock:
-        obs_rows = _conn.execute(
-            """SELECT resolution FROM surface
+        row = _conn.execute(
+            """SELECT
+                COUNT(DISTINCT CASE WHEN resolution='obs_win' THEN market_ticker END),
+                COUNT(DISTINCT CASE WHEN resolution='obs_loss' THEN market_ticker END)
+               FROM surface
                WHERE env='live-observed'
                AND cost_per_contract_cents >= ? AND cost_per_contract_cents <= ?
                AND resolution IN ('obs_win', 'obs_loss')""",
             (cost_band_lo, cost_band_hi),
-        ).fetchall()
-    obs_wins = sum(1 for r in obs_rows if r[0] == "obs_win")
-    obs_losses = sum(1 for r in obs_rows if r[0] == "obs_loss")
+        ).fetchone()
+    obs_wins = row[0] if row else 0
+    obs_losses = row[1] if row else 0
     obs_n = obs_wins + obs_losses
     return {
         "traded": traded,
@@ -244,6 +248,58 @@ def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
         "combined_n": traded["n"] + obs_n,
         "combined_wins": traded["wins"] + obs_wins,
     }
+
+
+def dedup_historical_skips() -> int:
+    """Mark pre-fix duplicate SKIP rows as obs_dup (append-only — not deleted).
+    For each (market_ticker, cost_per_contract_cents), keep the LAST row,
+    set all earlier duplicates' resolution to obs_dup."""
+    with _lock:
+        dupes_resolved = _conn.execute(
+            """SELECT market_ticker, cost_per_contract_cents, MAX(id) as keep_id
+               FROM surface
+               WHERE env='live-observed' AND action='SKIP'
+               AND resolution IN ('obs_win', 'obs_loss')
+               GROUP BY market_ticker, cost_per_contract_cents
+               HAVING COUNT(*) > 1"""
+        ).fetchall()
+
+        updated = 0
+        for ticker, cost, keep_id in dupes_resolved:
+            cur = _conn.execute(
+                """UPDATE surface SET resolution='obs_dup'
+                   WHERE market_ticker=? AND cost_per_contract_cents=?
+                   AND env='live-observed' AND action='SKIP'
+                   AND resolution IN ('obs_win', 'obs_loss')
+                   AND id != ?""",
+                (ticker, cost, keep_id),
+            )
+            updated += cur.rowcount
+
+        dupes_null = _conn.execute(
+            """SELECT market_ticker, cost_per_contract_cents, MAX(id) as keep_id
+               FROM surface
+               WHERE env='live-observed' AND action='SKIP'
+               AND resolution IS NULL
+               GROUP BY market_ticker, cost_per_contract_cents
+               HAVING COUNT(*) > 1"""
+        ).fetchall()
+
+        for ticker, cost, keep_id in dupes_null:
+            cur = _conn.execute(
+                """UPDATE surface SET resolution='obs_dup'
+                   WHERE market_ticker=? AND cost_per_contract_cents=?
+                   AND env='live-observed' AND action='SKIP'
+                   AND resolution IS NULL
+                   AND id != ?""",
+                (ticker, cost, keep_id),
+            )
+            updated += cur.rowcount
+
+        if updated:
+            _conn.commit()
+            log.info(f"[STORE] Dedup: marked {updated} historical duplicate rows as obs_dup")
+    return updated
 
 
 def query_drift_stats() -> dict:

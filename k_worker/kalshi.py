@@ -292,13 +292,6 @@ def position_for_market(client: KalshiClient, ticker: str) -> int:
 
 # ── Orders ───────────────────────────────────────────────────────
 
-def get_open_orders(client: KalshiClient) -> List[Dict]:
-    resp = client.request("GET", "/portfolio/events/orders", params={"status": "resting", "limit": 200})
-    if isinstance(resp, dict):
-        return resp.get("orders", [])
-    return resp if isinstance(resp, list) else []
-
-
 def cancel_order(client: KalshiClient, order_id: str) -> str:
     try:
         client.request("DELETE", f"/portfolio/events/orders/{order_id}")
@@ -313,35 +306,61 @@ def cancel_all_for_market(client: KalshiClient, ticker: str) -> int:
     """Cancel all resting orders for a ticker. Returns count cancelled."""
     cancelled = 0
     try:
-        for o in get_open_orders(client):
-            if str(o.get("ticker", "")) == str(ticker):
-                oid = o.get("order_id") or o.get("id")
-                if oid:
-                    try:
-                        cancel_order(client, str(oid))
-                        cancelled += 1
-                    except Exception:
-                        pass
+        resp = client.request("GET", "/portfolio/events/orders",
+                              params={"ticker": ticker, "status": "resting", "limit": 200})
+        for o in (resp or {}).get("orders", []):
+            oid = o.get("order_id") or o.get("id")
+            if oid:
+                try:
+                    cancel_order(client, str(oid))
+                    cancelled += 1
+                except Exception:
+                    pass
     except Exception:
         pass
     return cancelled
 
 
-_order_shape_logged = False
+_resting_shape_logged = False
+_fills_shape_logged = False
 
 
-def get_order(client: KalshiClient, order_id: str) -> Optional[Dict]:
-    global _order_shape_logged
+def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
+    """Status via LIST + FILLS — no GET-by-id (route does not exist).
+    Returns {state: 'resting'|'filled'|'gone', raw: order_dict|fills_list|None}."""
+    global _resting_shape_logged, _fills_shape_logged
+
     try:
-        resp = client.request("GET", f"/portfolio/events/orders/{order_id}")
-        order = resp.get("order", resp) if isinstance(resp, dict) else None
-        if order and not _order_shape_logged:
-            log.info(f"[ORDER-V2] get shape: {order}")
-            _order_shape_logged = True
-        return order
+        resp = client.request("GET", "/portfolio/events/orders",
+                              params={"ticker": ticker, "status": "resting", "limit": 200})
     except Exception as e:
-        log.warning(f"[ORDER] get {order_id}: {e}")
-        return None
+        log.warning(f"[ORDER] list resting {ticker}: {e}")
+        return {"state": "resting", "raw": None}
+
+    orders = (resp or {}).get("orders") or []
+    if orders and not _resting_shape_logged:
+        log.info(f"[ORDER-V2] resting shape: {orders[0]}")
+        _resting_shape_logged = True
+    for o in orders:
+        if o.get("order_id") == order_id:
+            return {"state": "resting", "raw": o}
+
+    try:
+        fr = client.request("GET", "/portfolio/fills",
+                            params={"ticker": ticker, "limit": 100})
+    except Exception as e:
+        log.warning(f"[FILLS] {ticker}: {e}")
+        return {"state": "gone", "raw": None}
+
+    fills = (fr or {}).get("fills") or []
+    if fills and not _fills_shape_logged:
+        log.info(f"[FILLS-V2] shape: {fills[0]}")
+        _fills_shape_logged = True
+    mine = [f for f in fills if f.get("order_id") == order_id]
+    if mine:
+        return {"state": "filled", "raw": mine}
+
+    return {"state": "gone", "raw": None}
 
 
 def place_order_maker(client: KalshiClient, ticker: str, side: str,

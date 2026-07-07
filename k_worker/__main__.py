@@ -129,6 +129,7 @@ def main():
 
     # 3. Store
     store.init_db()
+    store.dedup_historical_skips()
 
     # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()

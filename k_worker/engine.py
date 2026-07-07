@@ -29,6 +29,7 @@ TELEGRAM_PER_MARKET = os.environ.get("TELEGRAM_PER_MARKET", "1").strip() == "1"
 
 _observe_mode = False
 _submit_attempts: Dict[str, int] = {}
+_skip_logged: set = set()
 
 
 def set_observe_mode(enabled: bool) -> None:
@@ -152,22 +153,24 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         spread = book.no_ask - book.no_bid
 
     if not eval_result.allowed:
-        store.insert_row(store.SurfaceRow(
-            market_ticker=ticker,
-            decision_ts=time.time(),
-            action="SKIP",
-            seconds_to_expiry=secs_to_expiry,
-            yes_quote_cents=eval_result.yes_quote_cents,
-            side=eval_result.side,
-            cost_per_contract_cents=eval_result.cost_cents,
-            breakeven_pct=eval_result.breakeven_pct,
-            yes_ask_cents=book.yes_ask,
-            no_ask_cents=book.no_ask,
-            spread_cents=spread,
-            skip_reason=eval_result.reject_code,
-            why_tag=eval_result.why_tag,
-            env="live-observed",
-        ))
+        if ticker not in _skip_logged:
+            store.insert_row(store.SurfaceRow(
+                market_ticker=ticker,
+                decision_ts=time.time(),
+                action="SKIP",
+                seconds_to_expiry=secs_to_expiry,
+                yes_quote_cents=eval_result.yes_quote_cents,
+                side=eval_result.side,
+                cost_per_contract_cents=eval_result.cost_cents,
+                breakeven_pct=eval_result.breakeven_pct,
+                yes_ask_cents=book.yes_ask,
+                no_ask_cents=book.no_ask,
+                spread_cents=spread,
+                skip_reason=eval_result.reject_code,
+                why_tag=eval_result.why_tag,
+                env="live-observed",
+            ))
+            _skip_logged.add(ticker)
         log.info(f"[ENGINE] SKIP {ticker}: {eval_result.reject_code} — {eval_result.reject_reason}")
         side_str = eval_result.side.upper() if eval_result.side else "?"
         cost_str = f"{eval_result.cost_cents}¢" if eval_result.cost_cents is not None else "?¢"
@@ -178,22 +181,24 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
 
     # Observe mode: log what would be an ENTER but never submit
     if _observe_mode:
-        store.insert_row(store.SurfaceRow(
-            market_ticker=ticker,
-            decision_ts=time.time(),
-            action="SKIP",
-            seconds_to_expiry=secs_to_expiry,
-            yes_quote_cents=eval_result.yes_quote_cents,
-            side=eval_result.side,
-            cost_per_contract_cents=eval_result.cost_cents,
-            breakeven_pct=eval_result.breakeven_pct,
-            yes_ask_cents=book.yes_ask,
-            no_ask_cents=book.no_ask,
-            spread_cents=spread,
-            skip_reason="OBSERVE_MODE",
-            why_tag=eval_result.why_tag,
-            env="live-observed",
-        ))
+        if ticker not in _skip_logged:
+            store.insert_row(store.SurfaceRow(
+                market_ticker=ticker,
+                decision_ts=time.time(),
+                action="SKIP",
+                seconds_to_expiry=secs_to_expiry,
+                yes_quote_cents=eval_result.yes_quote_cents,
+                side=eval_result.side,
+                cost_per_contract_cents=eval_result.cost_cents,
+                breakeven_pct=eval_result.breakeven_pct,
+                yes_ask_cents=book.yes_ask,
+                no_ask_cents=book.no_ask,
+                spread_cents=spread,
+                skip_reason="OBSERVE_MODE",
+                why_tag=eval_result.why_tag,
+                env="live-observed",
+            ))
+            _skip_logged.add(ticker)
         log.info(f"[ENGINE] OBSERVE {ticker}: would ENTER {eval_result.side} @ {eval_result.cost_cents}c")
         side_str = eval_result.side.upper() if eval_result.side else "?"
         bal = _bal_from(cash, pv)
@@ -301,12 +306,11 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                    order_id: str, row_id: int,
                    eval_result: gateway.EvalResult,
                    close_ts: int, original_book: kalshi.Book) -> Dict:
-    """Monitor an open order. Returns dict with outcome and fill details."""
+    """Monitor an open order via LIST + FILLS. Returns dict with outcome and fill details."""
     from decimal import Decimal
     reprices = 0
     cost_cents = eval_result.cost_cents
     is_99_band = cost_cents == 99
-    pending_reprice = False
 
     while True:
         heartbeat()
@@ -319,41 +323,32 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             log.info(f"[ENGINE] NO_FILL {ticker} — cancelled at T-{CANCEL_BEFORE_EXPIRY_SEC}s")
             return {"outcome": "no_fill"}
 
-        order = kalshi.get_order(client, order_id)
-        if order is None:
-            time.sleep(POLL_INTERVAL_SEC)
-            continue
+        status_result = kalshi.order_status(client, ticker, order_id)
+        state = status_result["state"]
 
-        fill_ct = Decimal(order.get("fill_count", "0") or "0")
-        rem_ct = Decimal(order.get("remaining_count", "0") or "0")
-        status = (order.get("status") or "").lower()
+        if state == "filled":
+            return _handle_fill(client, ticker, status_result["raw"], row_id,
+                                eval_result, close_ts)
 
-        if fill_ct > 0 and rem_ct == 0:
-            return _handle_fill(client, ticker, order, row_id, eval_result, close_ts)
+        if state == "gone":
+            label = "no_fill" if secs_left <= 20 else "cancelled_external"
+            store.update_settlement(row_id, label, 0.0, time.time())
+            log.warning(f"[ENGINE] Order {order_id} {label} (T-{secs_left:.0f}s)")
+            return {"outcome": label}
 
-        if status in ("canceled", "cancelled", "expired"):
-            if pending_reprice:
-                log.info(f"[ENGINE] Order {order_id} cancelled_by_reprice")
-                pending_reprice = False
-            else:
-                label = "expired_order" if status == "expired" else "cancelled_external"
-                store.update_settlement(row_id, label, 0.0, time.time())
-                log.warning(f"[ENGINE] Order {order_id} {label}")
-                return {"outcome": "cancelled_external"}
+        # state == "resting" — check for partial fill edge case
+        raw = status_result.get("raw") or {}
+        fc_str = raw.get("fill_count", "0") or "0"
+        if Decimal(fc_str) > 0:
+            notify.alert(f"Partial fill at 1ct?! fill_count={fc_str} on resting order {raw}")
 
-        if fill_ct > 0 and rem_ct > 0:
-            notify.alert(f"Partial fill at 1ct?! {order}")
-
-        if status in ("executed", "filled"):
-            return _handle_fill(client, ticker, order, row_id, eval_result, close_ts)
-
+        # Reprice check (not in 99c band, max 1 reprice)
         if not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
             new_book = kalshi.fetch_orderbook(client, ticker)
             new_side, new_cost, _ = gateway._favorite_side(new_book)
             if (new_side == eval_result.side and new_cost is not None
                     and new_cost != cost_cents
                     and gateway.COST_BAND_LO <= new_cost <= gateway.COST_BAND_HI):
-                pending_reprice = True
                 try:
                     new_oid, new_cost_out = gateway.reprice(
                         client, ticker, eval_result, order_id, new_book, close_ts,
@@ -367,57 +362,61 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                     cost_cents = new_cost_out
                     reprices += 1
                     log.info(f"[ENGINE] REPRICE #{reprices} {ticker} → {cost_cents}c")
-                pending_reprice = False
 
         time.sleep(POLL_INTERVAL_SEC)
 
 
 def _handle_fill(client: kalshi.KalshiClient, ticker: str,
-                 order: Dict, row_id: int,
+                 fill_records: list, row_id: int,
                  eval_result: gateway.EvalResult,
                  close_ts: int) -> Dict:
-    """Handle a filled order. Returns dict with outcome, fill_cost, fee_cents, pnl."""
+    """Handle a filled order. fill_records: list of fill dicts from /portfolio/fills."""
     from decimal import Decimal
 
     fill_cost = None
     fee_cents = 0
 
-    # V2 fields: average_fill_price (YES-side dollar string), average_fee_paid (dollar string)
-    v2_avg = order.get("average_fill_price")
-    v2_fee = order.get("average_fee_paid")
+    if fill_records:
+        fr = fill_records[0]
+        for key in ("yes_price", "price"):
+            raw = fr.get(key)
+            if raw is None:
+                continue
+            try:
+                val = Decimal(str(raw))
+                yes_cents = int(val * 100) if val < 1 else int(val)
+                fill_cost = yes_cents if eval_result.side == "yes" else (100 - yes_cents)
+                break
+            except Exception:
+                continue
 
-    if v2_avg is not None:
-        yes_cents = int(Decimal(str(v2_avg)) * 100)
-        if eval_result.side == "yes":
-            fill_cost = yes_cents
-        else:
-            fill_cost = 100 - yes_cents
+        if fill_cost is None and fr.get("no_price") is not None:
+            try:
+                val = Decimal(str(fr["no_price"]))
+                no_cents = int(val * 100) if val < 1 else int(val)
+                fill_cost = no_cents if eval_result.side == "no" else (100 - no_cents)
+            except Exception:
+                pass
+
+        for fee_key in ("fee", "taker_fee", "maker_fee"):
+            raw = fr.get(fee_key)
+            if raw is not None:
+                try:
+                    val = Decimal(str(raw))
+                    fee_cents = int(val * 100) if val < 1 else int(val)
+                except Exception:
+                    pass
+                break
 
     if fill_cost is None:
-        raw_yes = order.get("yes_price")
-        raw_no = order.get("no_price")
-        avg = order.get("avg_price")
-        if eval_result.side == "yes":
-            fill_cost = int(avg if avg is not None else (raw_yes if raw_yes is not None else eval_result.cost_cents))
-        else:
-            if raw_no is not None:
-                fill_cost = int(raw_no)
-            elif avg is not None:
-                fill_cost = int(avg)
-            elif raw_yes is not None:
-                fill_cost = 100 - int(raw_yes)
-            else:
-                fill_cost = eval_result.cost_cents
-
-    if v2_fee is not None:
-        fee_cents = int(Decimal(str(v2_fee)) * 100)
-    else:
-        fee_cents = order.get("taker_fee", 0) + order.get("maker_fee", 0)
+        fill_cost = eval_result.cost_cents
+        notify.alert(f"Fill on {ticker} — price missing from fill records, using eval cost {fill_cost}c")
 
     if not (gateway.COST_BAND_LO <= fill_cost <= gateway.COST_BAND_HI):
         log.error(f"[ENGINE] PHRASING-LAW ASSERT: fill_cost={fill_cost}c outside 95-99 for {ticker} "
-                  f"(order keys={list(order.keys())} side={eval_result.side}) — using eval cost, flagging row")
-        notify.alert(f"Phrasing-law assert on fill {ticker}: {fill_cost}c — check order payload")
+                  f"(fill keys={list(fill_records[0].keys()) if fill_records else []} "
+                  f"side={eval_result.side}) — using eval cost, flagging row")
+        notify.alert(f"Phrasing-law assert on fill {ticker}: {fill_cost}c — check fill records")
         fill_cost = eval_result.cost_cents
 
     slippage = fill_cost - eval_result.cost_cents if eval_result.cost_cents else 0
