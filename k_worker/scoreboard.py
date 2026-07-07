@@ -17,7 +17,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 
-from . import store, notify
+from . import store, notify, treasury
 
 log = logging.getLogger("k_worker.scoreboard")
 
@@ -131,6 +131,10 @@ def build_scoreboard() -> str:
             for bucket, count in drift["loss_buckets"].items():
                 lines.append(f"   T-{bucket}s: {count} losses")
             lines.append("")
+
+    # --- TREASURY ---
+    lines.append(treasury.format_scoreboard())
+    lines.append("")
 
     # --- Daily shadow summary ---
     shadow = store.daily_stats("live-observed")

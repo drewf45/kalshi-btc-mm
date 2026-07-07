@@ -16,7 +16,7 @@ import time
 import signal
 import logging
 
-from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard
+from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard, treasury
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,10 +56,12 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
                     pnl = (100 - (cost_cents or 0) - (fee_cents or 0)) / 100.0
                     res = "win"
                     discipline.record_win()
+                    treasury.waterfall(pnl)
                 else:
                     pnl = -((cost_cents or 0) + (fee_cents or 0)) / 100.0
                     res = "loss"
                     discipline.record_loss()
+                    treasury.record_loss(pnl)
             else:
                 if side is None:
                     continue
@@ -80,9 +82,12 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
         return
     total = cash + (pv or 0)
     daily = store.daily_stats("live-traded")
+    treas = treasury.format_hourly()
+    treasury.check_invariant(total)
     notify.send(
         f"Balance: ${total:.2f} | positions ${pv or 0:.2f} | "
-        f"today: {daily['n']} fills, net ${daily['net_pnl']:.2f}"
+        f"today: {daily['n']} fills, net ${daily['net_pnl']:.2f}\n"
+        f"{treas}"
     )
 
 
@@ -115,8 +120,9 @@ def main():
     # 3. Store
     store.init_db()
 
-    # 4. Load persisted gateway state
+    # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()
+    treasury.init_book()
 
     # 5. Kalshi client
     client = kalshi.build_client()

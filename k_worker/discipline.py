@@ -68,13 +68,15 @@ def record_win() -> None:
 
 
 def check_drawdown(balance_usd: float) -> None:
-    """Check drawdown rail. Halt if balance < floor."""
-    if balance_usd < DRAWDOWN_FLOOR_USD:
-        reason = f"balance=${balance_usd:.2f} < floor=${DRAWDOWN_FLOOR_USD:.2f}"
+    """Check drawdown rail against tradeable balance (excludes accruals)."""
+    from . import treasury
+    tradeable = treasury.tradeable_balance(balance_usd)
+    if tradeable < DRAWDOWN_FLOOR_USD:
+        reason = f"tradeable=${tradeable:.2f} < floor=${DRAWDOWN_FLOOR_USD:.2f} (cash=${balance_usd:.2f})"
         _set_halted(reason)
         msg = (
-            f"DRAWDOWN HALT: balance=${balance_usd:.2f} < "
-            f"floor=${DRAWDOWN_FLOOR_USD:.2f}.\n"
+            f"DRAWDOWN HALT: tradeable=${tradeable:.2f} < "
+            f"floor=${DRAWDOWN_FLOOR_USD:.2f} (cash=${balance_usd:.2f}).\n"
             f"Engine halted. Run `python -m k_worker.reset` to resume."
         )
         log.error(f"[DISCIPLINE] {msg}")

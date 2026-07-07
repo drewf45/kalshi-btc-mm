@@ -16,7 +16,7 @@ from typing import Optional, Tuple, Dict
 
 import requests as _requests
 
-from . import kalshi, store, gateway, discipline, notify
+from . import kalshi, store, gateway, discipline, notify, treasury
 
 log = logging.getLogger("k_worker.engine")
 
@@ -233,7 +233,10 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         fc = result.get("fill_cost", eval_result.cost_cents)
         fee = result.get("fee_cents", 0)
         pnl = result.get("pnl", 0.0)
-        _send_market_line(f"{emoji} {ts} FILL {tag} @{fc}¢ fee {fee}¢ → {label} ${pnl:+.2f} | {bal}")
+        line = f"{emoji} {ts} FILL {tag} @{fc}¢ fee {fee}¢ → {label} ${pnl:+.2f} | {bal}"
+        if result.get("treasury_line"):
+            line += f"\n{result['treasury_line']}"
+        _send_market_line(line)
     elif outcome == "timeout":
         fc = result.get("fill_cost", eval_result.cost_cents)
         fee = result.get("fee_cents", 0)
@@ -398,17 +401,23 @@ def _wait_for_settlement(client: kalshi.KalshiClient, ticker: str,
                 pnl = (payout_cents - fill_cost - fee_cents) / 100.0
                 resolution = "win"
                 discipline.record_win()
+                split = treasury.waterfall(pnl)
             else:
                 pnl = -(fill_cost + fee_cents) / 100.0
                 resolution = "loss"
                 discipline.record_loss()
+                treasury.record_loss(pnl)
+                split = None
 
             store.update_settlement(row_id, resolution, pnl, time.time())
             log.warning(
                 f"[ENGINE] SETTLED {ticker} → {result.upper()} "
                 f"{'WIN' if won else 'LOSS'} pnl=${pnl:+.2f}"
             )
-            return {"outcome": resolution, "pnl": pnl}
+            ret = {"outcome": resolution, "pnl": pnl}
+            if split:
+                ret["treasury_line"] = split["treasury_line"]
+            return ret
 
         time.sleep(15)
 
