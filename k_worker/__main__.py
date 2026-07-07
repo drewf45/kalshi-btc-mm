@@ -28,6 +28,7 @@ log = logging.getLogger("k_worker")
 LOOP_SLEEP_SEC = 30
 SCOREBOARD_INTERVAL_SEC = int(float(os.environ.get("SCOREBOARD_EVERY_HOURS", "4")) * 3600)
 BACKFILL_INTERVAL_SEC = 300
+RECONCILE_INTERVAL_SEC = 300
 HOURLY_BALANCE_SEC = 3600
 _running = True
 
@@ -126,6 +127,62 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
     return updated
 
 
+def _reconcile_fills(client: kalshi.KalshiClient) -> int:
+    """Pull broker fills, diff against store, upgrade missed no_fill rows."""
+    upgraded = 0
+    try:
+        broker_fills = kalshi.get_all_recent_fills(client, limit=200)
+    except Exception as e:
+        log.warning(f"[RECONCILE] Failed to fetch broker fills: {e}")
+        return 0
+
+    fill_by_oid = {}
+    for f in broker_fills:
+        oid = str(f.get("order_id", ""))
+        if oid:
+            fill_by_oid.setdefault(oid, []).append(f)
+
+    nofill_rows = store.get_nofill_enter_rows(limit=200)
+    for row_id, ticker, order_id, cost_cents, fee_cents in nofill_rows:
+        if order_id and order_id in fill_by_oid:
+            log.warning(f"[RECONCILE] Found broker fill for no_fill row {row_id} "
+                        f"ticker={ticker} oid={order_id} — upgrading")
+            store.clear_resolution(row_id)
+            from decimal import Decimal
+            fills = fill_by_oid[order_id]
+            fr = fills[0]
+            fill_cost = None
+            for key in ("yes_price", "price"):
+                raw = fr.get(key)
+                if raw is None:
+                    continue
+                try:
+                    val = Decimal(str(raw))
+                    fill_cost = float(val * 100) if val < 1 else float(val)
+                    break
+                except Exception:
+                    continue
+            if fill_cost is None:
+                fill_cost = cost_cents or 0
+            fc = 0
+            for fee_key in ("fee", "taker_fee", "maker_fee"):
+                raw = fr.get(fee_key)
+                if raw is not None:
+                    try:
+                        val = Decimal(str(raw))
+                        fc = int(val * 100) if val < 1 else int(val)
+                    except Exception:
+                        pass
+                    break
+            store.update_fill(row_id, fill_cost, time.time(), 0, fc)
+            upgraded += 1
+            notify.send(f"🔧 RECONCILE: upgraded row {row_id} ({ticker}) from no_fill → filled")
+
+    if upgraded:
+        log.warning(f"[RECONCILE] Upgraded {upgraded} rows from no_fill → filled")
+    return upgraded
+
+
 def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
     """T2: Send hourly balance status to Telegram."""
     cash, pv = kalshi.get_balance(client)
@@ -198,6 +255,7 @@ def main():
 
     last_scoreboard = 0
     last_backfill = 0
+    last_reconcile = 0
     last_hourly = 0
     last_ticker = None
 
@@ -219,6 +277,14 @@ def main():
                 except Exception as e:
                     log.warning(f"[MAIN] Backfill error: {e}")
                 last_backfill = now
+
+            # Broker-fills reconciler (WO-C) — every ~5 min
+            if now - last_reconcile > RECONCILE_INTERVAL_SEC:
+                try:
+                    _reconcile_fills(client)
+                except Exception as e:
+                    log.warning(f"[MAIN] Reconcile error: {e}")
+                last_reconcile = now
 
             # Hourly balance Telegram (T2)
             if now - last_hourly > HOURLY_BALANCE_SEC:

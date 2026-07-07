@@ -7,6 +7,7 @@ Rates env-tunable; Drew amends by ruling in the daily log.
 """
 
 import os
+import time
 import logging
 from typing import Dict, Optional
 
@@ -106,9 +107,16 @@ def record_loss(pnl: float) -> None:
     log.info(f"[TREASURY] LOSS: book ${pnl:+.3f} → ${new_book:.2f}")
 
 
+_last_invariant_alert_ts: float = 0.0
+_last_invariant_drift: float = 0.0
+_INVARIANT_THROTTLE_SEC = 1800
+
+
 def check_invariant(total_balance: float) -> Optional[str]:
     """Verify total_balance ~ engine_book + accrued_tax + accrued_fee.
-    Returns None if OK, drift description string if drift > $0.05."""
+    Returns None if OK, drift description string if drift > $0.05.
+    Alert hygiene: first occurrence, then only on change > $0.10 or every 30 min."""
+    global _last_invariant_alert_ts, _last_invariant_drift
     t = get_totals()
     expected = t["engine_book"] + t["accrued_tax"] + t["accrued_fee"]
     drift = abs(total_balance - expected)
@@ -118,7 +126,17 @@ def check_invariant(total_balance: float) -> Optional[str]:
                f"tax=${t['accrued_tax']:.2f} + fee=${t['accrued_fee']:.2f}) "
                f"drift=${drift:.2f}")
         log.error(f"[TREASURY] {msg}")
-        notify.alert(f"Treasury: {msg}")
+        now = time.time()
+        drift_change = abs(drift - _last_invariant_drift)
+        should_alert = (
+            _last_invariant_alert_ts == 0.0
+            or drift_change > 0.10
+            or (now - _last_invariant_alert_ts) >= _INVARIANT_THROTTLE_SEC
+        )
+        if should_alert:
+            notify.alert(f"Treasury: {msg}")
+            _last_invariant_alert_ts = now
+            _last_invariant_drift = drift
         return msg
     return None
 

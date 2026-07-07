@@ -34,6 +34,12 @@ SERIES_TICKER = "KXBTC15M"
 ENGINE_ID = "k_worker"
 
 
+class OrderStatusUnavailable(Exception):
+    """Raised when order status cannot be determined (API failure).
+    Callers must handle — never guess state."""
+    pass
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -307,21 +313,24 @@ def cancel_order(client: KalshiClient, order_id: str) -> str:
 
 
 def cancel_all_for_market(client: KalshiClient, ticker: str) -> int:
-    """Cancel all resting orders for a ticker. Returns count cancelled."""
+    """Cancel all resting orders for a ticker.
+    Returns count cancelled, or -1 if cancellation state is unknown."""
     cancelled = 0
     try:
         resp = client.request("GET", "/portfolio/events/orders",
                               params={"ticker": ticker, "status": "resting", "limit": 200})
-        for o in (resp or {}).get("orders", []):
-            oid = o.get("order_id") or o.get("id")
-            if oid:
-                try:
-                    cancel_order(client, str(oid))
-                    cancelled += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    except Exception as e:
+        log.error(f"[CANCEL] Failed to list orders for {ticker}: {e}")
+        return -1
+    for o in (resp or {}).get("orders", []):
+        oid = o.get("order_id") or o.get("id")
+        if oid:
+            try:
+                cancel_order(client, str(oid))
+                cancelled += 1
+            except Exception as e:
+                log.error(f"[CANCEL] Failed to cancel order {oid} on {ticker}: {e}")
+                return -1
     return cancelled
 
 
@@ -330,39 +339,45 @@ _fills_shape_logged = False
 
 
 def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
-    """Status via LIST + FILLS — no GET-by-id (route does not exist).
-    Returns {state: 'resting'|'filled'|'gone', raw: order_dict|fills_list|None}."""
+    """Fills are immutable broker truth — check them FIRST.
+    Returns {state: 'resting'|'filled'|'gone', raw: ...}.
+    Raises OrderStatusUnavailable on API failure (caller must handle; never guess)."""
     global _resting_shape_logged, _fills_shape_logged
 
+    # 1. Fills first — immutable broker truth
+    try:
+        fr = client.request("GET", "/portfolio/fills",
+                            params={"ticker": ticker, "limit": 100})
+    except Exception as e:
+        raise OrderStatusUnavailable(f"fills endpoint failed for {ticker}: {e}") from e
+
+    fills = (fr or {}).get("fills") or []
+    if fills and not _fills_shape_logged:
+        log.info(f"[FILLS-V2] shape: {fills[0]}")
+        _fills_shape_logged = True
+    mine = [f for f in fills if str(f.get("order_id")) == str(order_id)]
+    if mine:
+        return {"state": "filled", "raw": mine}
+
+    # 2. Orders list — read the order's OWN status field, not just list membership
     try:
         resp = client.request("GET", "/portfolio/events/orders",
-                              params={"ticker": ticker, "status": "resting", "limit": 200})
+                              params={"ticker": ticker, "limit": 200})
     except Exception as e:
-        log.warning(f"[ORDER] list resting {ticker}: {e}")
-        return {"state": "resting", "raw": None}
+        raise OrderStatusUnavailable(f"orders list failed for {ticker}: {e}") from e
 
     orders = (resp or {}).get("orders") or []
     if orders and not _resting_shape_logged:
         log.info(f"[ORDER-V2] resting shape: {orders[0]}")
         _resting_shape_logged = True
     for o in orders:
-        if o.get("order_id") == order_id:
-            return {"state": "resting", "raw": o}
-
-    try:
-        fr = client.request("GET", "/portfolio/fills",
-                            params={"ticker": ticker, "limit": 100})
-    except Exception as e:
-        log.warning(f"[FILLS] {ticker}: {e}")
-        return {"state": "gone", "raw": None}
-
-    fills = (fr or {}).get("fills") or []
-    if fills and not _fills_shape_logged:
-        log.info(f"[FILLS-V2] shape: {fills[0]}")
-        _fills_shape_logged = True
-    mine = [f for f in fills if f.get("order_id") == order_id]
-    if mine:
-        return {"state": "filled", "raw": mine}
+        if str(o.get("order_id") or o.get("id")) == str(order_id):
+            st = str(o.get("status", "")).lower()
+            if st in ("resting", "open", "pending"):
+                return {"state": "resting", "raw": o}
+            if st in ("executed", "filled"):
+                return {"state": "resting", "raw": o}
+            return {"state": "gone", "raw": o}
 
     return {"state": "gone", "raw": None}
 
@@ -431,16 +446,23 @@ def get_settlement_result(client: KalshiClient, ticker: str) -> Optional[str]:
 
 
 def get_fills(client: KalshiClient, ticker: str) -> List[Dict]:
-    """Get fills for a specific ticker."""
-    try:
-        resp = client.request("GET", "/portfolio/fills",
-                              params={"ticker": ticker, "limit": 100})
-        if isinstance(resp, dict):
-            return resp.get("fills", [])
-        return resp if isinstance(resp, list) else []
-    except Exception as e:
-        log.warning(f"[FILLS] {ticker}: {e}")
-        return []
+    """Get fills for a specific ticker.
+    Raises on API failure — caller must handle (empty list is indistinguishable from failure)."""
+    resp = client.request("GET", "/portfolio/fills",
+                          params={"ticker": ticker, "limit": 100})
+    if isinstance(resp, dict):
+        return resp.get("fills", [])
+    return resp if isinstance(resp, list) else []
+
+
+def get_all_recent_fills(client: KalshiClient, limit: int = 200) -> List[Dict]:
+    """Get recent fills across all tickers for reconciliation.
+    Raises on API failure."""
+    resp = client.request("GET", "/portfolio/fills",
+                          params={"limit": limit})
+    if isinstance(resp, dict):
+        return resp.get("fills", [])
+    return resp if isinstance(resp, list) else []
 
 
 # ── BTC Spot (Fix 4) ───────────────────────────────────────────

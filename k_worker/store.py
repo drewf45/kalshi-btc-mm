@@ -101,6 +101,7 @@ def init_db() -> None:
         ("spot_price", "REAL"), ("boundary_lo", "REAL"), ("boundary_hi", "REAL"),
         ("distance", "REAL"), ("distance_pct", "REAL"), ("lane", "TEXT"),
         ("session_tag", "TEXT"), ("vol_regime", "TEXT"), ("winner_clip_cents", "REAL"),
+        ("order_id", "TEXT"),
     ]:
         try:
             _conn.execute(f"ALTER TABLE surface ADD COLUMN {col} {typ}")
@@ -604,6 +605,56 @@ def query_h8_probe_daily() -> dict:
     wins = sum(1 for r in rows if r[0] == "win")
     losses = sum(1 for r in rows if r[0] == "loss")
     return {"at_risk": at_risk, "wins": wins, "losses": losses, "n": len(rows)}
+
+
+def update_order_id(row_id: int, order_id: str) -> None:
+    """Store the exchange order_id on a surface row after placement."""
+    with _lock:
+        _conn.execute(
+            "UPDATE surface SET order_id=? WHERE id=?",
+            (order_id, row_id),
+        )
+        _conn.commit()
+
+
+def get_nofill_enter_rows(limit: int = 200) -> list:
+    """Return ENTER rows with resolution='no_fill' for reconciliation.
+    Returns list of (id, market_ticker, order_id, cost_per_contract_cents, fee_cents)."""
+    with _lock:
+        rows = _conn.execute(
+            """SELECT id, market_ticker, order_id, cost_per_contract_cents,
+                      COALESCE(fee_cents, 0)
+               FROM surface
+               WHERE action='ENTER' AND resolution='no_fill'
+               AND order_id IS NOT NULL
+               ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return rows
+
+
+def clear_resolution(row_id: int) -> None:
+    """Clear resolution so a row can be re-settled (used by reconciler)."""
+    with _lock:
+        _conn.execute(
+            "UPDATE surface SET resolution=NULL, pnl_net=NULL, settled_ts=NULL WHERE id=?",
+            (row_id,),
+        )
+        _conn.commit()
+
+
+def count_fills_today(env: str = "live-traded") -> int:
+    """Count ENTER rows that have a fill (fill_cost_cents IS NOT NULL) today."""
+    import datetime as dt
+    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    with _lock:
+        row = _conn.execute(
+            """SELECT COUNT(*) FROM surface
+               WHERE env=? AND action='ENTER' AND decision_ts >= ?
+               AND fill_cost_cents IS NOT NULL""",
+            (env, today_start),
+        ).fetchone()
+    return row[0] if row else 0
 
 
 def query_h8_probe_lifetime() -> dict:

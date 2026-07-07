@@ -413,24 +413,48 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                    order_id: str, row_id: int,
                    eval_result: gateway.EvalResult,
                    close_ts: int, original_book: kalshi.Book) -> Dict:
-    """Monitor an open order via LIST + FILLS."""
+    """Monitor an open order — fills-first, blind-frozen, final-check."""
     reprices = 0
     cost_cents = eval_result.cost_cents
     cost_exact = eval_result.cost_exact or cost_cents
     is_99_band = cost_cents == 99
+    blind_consecutive = 0
 
     while True:
         heartbeat()
         now = time.time()
         secs_left = close_ts - now
 
+        # T-10 cancel branch — final fills check before NO_FILL stamp
         if secs_left <= CANCEL_BEFORE_EXPIRY_SEC:
-            kalshi.cancel_all_for_market(client, ticker)
+            cancel_result = kalshi.cancel_all_for_market(client, ticker)
+            try:
+                final_fills = kalshi.get_fills(client, ticker)
+                mine = [f for f in final_fills
+                        if str(f.get("order_id")) == str(order_id)]
+                if mine:
+                    log.warning(f"[ENGINE] Final fills check caught fill on {ticker}")
+                    return _handle_fill(client, ticker, mine, row_id,
+                                        eval_result, close_ts)
+            except Exception as e:
+                log.warning(f"[ENGINE] Final fills check failed: {e}")
             store.update_settlement(row_id, "no_fill", 0.0, time.time())
             log.info(f"[ENGINE] NO_FILL {ticker} — cancelled at T-{CANCEL_BEFORE_EXPIRY_SEC}s")
             return {"outcome": "no_fill"}
 
-        status_result = kalshi.order_status(client, ticker, order_id)
+        # Poll order status — blind-frozen on failure
+        try:
+            status_result = kalshi.order_status(client, ticker, order_id)
+            blind_consecutive = 0
+        except kalshi.OrderStatusUnavailable as e:
+            blind_consecutive += 1
+            log.warning(f"[ENGINE] OrderStatusUnavailable #{blind_consecutive} on {ticker}: {e}")
+            if blind_consecutive >= 3:
+                notify.alert(f"BLIND: cannot verify order state on {ticker} "
+                             f"({blind_consecutive} consecutive failures)")
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
         state = status_result["state"]
 
         if state == "filled":
@@ -449,8 +473,21 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
         if Decimal(fc_str) > 0:
             notify.alert(f"Partial fill at 1ct?! fill_count={fc_str} on resting order {raw}")
 
-        # Reprice check (main lane only, not in 99c band, max 1 reprice)
+        # Reprice gate: check fills before cancel+replace (prevents double-entry B5)
         if eval_result.lane == "main" and not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
+            try:
+                pre_fills = kalshi.get_fills(client, ticker)
+                pre_mine = [f for f in pre_fills
+                            if str(f.get("order_id")) == str(order_id)]
+                if pre_mine:
+                    log.warning(f"[ENGINE] Reprice gate caught fill on {ticker} — skipping reprice")
+                    return _handle_fill(client, ticker, pre_mine, row_id,
+                                        eval_result, close_ts)
+            except Exception as e:
+                log.warning(f"[ENGINE] Reprice gate fills check failed: {e} — skipping reprice")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
             new_book = kalshi.fetch_orderbook(client, ticker)
             new_side, new_cost_d, _, _ = gateway._favorite_side(new_book)
             if (new_side == eval_result.side and new_cost_d is not None

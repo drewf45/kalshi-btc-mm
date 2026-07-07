@@ -427,6 +427,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
             rest_price_int, count=1, expiration_ts=expiry_ts,
             v2_price_str=rest_fp,
         )
+        store.update_order_id(row_id, order_id)
         _traded_tickers.add(ticker)
         _save_traded_tickers()
         if eval_result.lane == "main":
