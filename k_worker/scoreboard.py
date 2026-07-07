@@ -40,7 +40,7 @@ def wilson_bounds(wins: int, n: int, z: float = 1.96) -> tuple:
 def build_scoreboard() -> str:
     """Build the daily scoreboard string."""
     lines = []
-    lines.append("=== K-WORKER SCOREBOARD ===")
+    lines.append("=== Kal SCOREBOARD ===")
     lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M ET')}")
 
     daily = store.daily_stats("live-traded")
@@ -98,7 +98,7 @@ def build_scoreboard() -> str:
                           for lo, hi in COST_BANDS):
         lines.append("PROJECT KILL: All bands locked. Thesis is dead.")
 
-    # --- S1: SHADOW bands (live-observed with obs_win/obs_loss) ---
+    # --- S1: SHADOW bands ---
     has_shadow = False
     shadow_lines = []
     shadow_lines.append(" SHADOW (observed)")
@@ -119,9 +119,55 @@ def build_scoreboard() -> str:
         lines.extend(shadow_lines)
         lines.append("")
 
+    # --- H8 GRID (Fix 4) ---
+    h8_cells = store.query_h8_grid()
+    if h8_cells:
+        lines.append(" H8 GRID (decided-but-unconverged)")
+        lines.append(" Cost     | Dist  | Time     |  N  | Win%  | BE%  | WLB")
+        lines.append("----------|-------|----------|-----|-------|------|------")
+        for c in h8_cells:
+            w_lo, _ = wilson_bounds(c["wins"], c["n"])
+            lines.append(
+                f" {c['cost']:>8s} | {c['dist']:>5s} | {c['time']:>8s} | "
+                f"{c['n']:3d} | {c['win_pct']:5.1%} | {c['be']:.0%} | {w_lo:5.1%}"
+            )
+        lines.append("")
+
+    # --- CAUTION LEDGER (Fix 5) ---
+    caution = store.query_caution_ledger()
+    if caution["n"] > 0:
+        lines.append(" CAUTION LEDGER (today)")
+        lines.append(f"  Captured:       ${caution['captured']:.2f}")
+        lines.append(f"  Cost of caution: ${caution['cost_of_caution']:.2f}")
+        lines.append(f"  Caution savings: ${caution['caution_savings']:.2f}")
+        lines.append(f"  Net caution:     ${caution['net_caution']:+.2f}")
+        lines.append(f"  Took loss:       ${caution['took_loss']:.2f}")
+        lines.append("")
+
+    # --- CONTEXT TABLE (Fix 5) ---
+    ctx = store.query_context_stats()
+    if ctx["sessions"]:
+        lines.append(" CONTEXT: Sessions")
+        lines.append(" Session     |  N  | Win%  | Net PnL")
+        lines.append("-------------|-----|-------|--------")
+        for tag in ["ASIA", "LONDON_OPEN", "EU", "NY_PRE", "NY_OPEN", "NY", "NY_CLOSE", "EVENING"]:
+            s = ctx["sessions"].get(tag)
+            if s and s["n"] > 0:
+                lines.append(f" {tag:<12s}| {s['n']:3d} | {s['win_pct']:5.1%} | ${s['net_pnl']:+.2f}")
+        lines.append("")
+    if ctx["vol_regimes"]:
+        lines.append(" CONTEXT: Vol Regime")
+        lines.append(" Regime |  N  | Win%  | Net PnL")
+        lines.append("--------|-----|-------|--------")
+        for tag in ["LOW", "MED", "HIGH", "UNKNOWN"]:
+            s = ctx["vol_regimes"].get(tag)
+            if s and s["n"] > 0:
+                lines.append(f" {tag:<7s}| {s['n']:3d} | {s['win_pct']:5.1%} | ${s['net_pnl']:+.2f}")
+        lines.append("")
+
     # --- S4: Weekly drift review (Sunday only) ---
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() == 6:  # Sunday
+    if now_et.weekday() == 6:
         drift = store.query_drift_stats()
         if drift["win_count"] + drift["loss_count"] > 0:
             lines.append(" WEEKLY DRIFT REVIEW")
@@ -135,6 +181,12 @@ def build_scoreboard() -> str:
     # --- TREASURY ---
     lines.append(treasury.format_scoreboard())
     lines.append("")
+
+    # --- Conflicting resolution check ---
+    conflicts = store.check_conflicting_resolutions()
+    if conflicts:
+        lines.append(f" ALERT: Conflicting resolutions: {', '.join(conflicts[:5])}")
+        lines.append("")
 
     # --- Daily shadow summary ---
     shadow = store.daily_stats("live-observed")

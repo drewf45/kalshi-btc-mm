@@ -44,6 +44,7 @@ STALE_TICKER_SEC = 86400  # 24 hours
 def _backfill_settlements(client: kalshi.KalshiClient) -> int:
     """S1: Backfill settlement results for unresolved rows with closed markets.
     Fills get win/loss, SKIPs with a recorded side get obs_win/obs_loss.
+    Computes winner_clip_cents and populates market_ledger per ticker.
     Returns count of rows updated."""
     updated = 0
     now = time.time()
@@ -59,7 +60,22 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
                     updated += 1
             continue
         rows = store.get_unresolved_rows(ticker)
+        realized_cents = 0.0
+        best_available_cents = 0.0
+        regret_avoided = 0.0
+        has_fill = False
         for row_id, action, side, cost_cents, fee_cents in rows:
+            # Winner clip: if favorite == winner -> clip = 100-cost; else -> -cost
+            clip = None
+            if side is not None and cost_cents is not None:
+                if result == side:
+                    clip = 100.0 - float(cost_cents)
+                else:
+                    clip = -float(cost_cents)
+                store.update_winner_clip(row_id, clip)
+                if clip > 0 and clip > best_available_cents:
+                    best_available_cents = clip
+
             if action == "ENTER":
                 won = (result == side) if side else False
                 if won:
@@ -67,19 +83,44 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
                     res = "win"
                     discipline.record_win()
                     treasury.waterfall(pnl)
+                    realized_cents = 100.0 - float(cost_cents or 0) - float(fee_cents or 0)
                 else:
                     pnl = -((cost_cents or 0) + (fee_cents or 0)) / 100.0
                     res = "loss"
                     discipline.record_loss()
                     treasury.record_loss(pnl)
+                    realized_cents = -(float(cost_cents or 0) + float(fee_cents or 0))
+                has_fill = True
             else:
                 if side is None:
                     continue
                 won = (result == side)
                 res = "obs_win" if won else "obs_loss"
                 pnl = 0.0
+                if clip is not None and clip < 0:
+                    regret_avoided += abs(clip)
             store.update_settlement(row_id, res, pnl, time.time())
             updated += 1
+
+        # Market ledger
+        regret_missed = max(0, best_available_cents - max(0, realized_cents))
+        if has_fill:
+            if realized_cents > 0:
+                outcome_class = "CAPTURED"
+            else:
+                outcome_class = "TOOK_LOSS"
+        elif best_available_cents > 0:
+            outcome_class = "MISSED_CLIP"
+        elif regret_avoided > 0:
+            outcome_class = "DODGED_LOSS"
+        else:
+            outcome_class = "UNOBSERVED"
+        store.upsert_market_ledger(
+            ticker, time.time(), result, realized_cents,
+            best_available_cents, regret_missed, regret_avoided,
+            outcome_class,
+        )
+
     if updated:
         log.info(f"[BACKFILL] Updated {updated} rows across {len(tickers)} tickers")
     return updated

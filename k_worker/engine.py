@@ -4,6 +4,7 @@ Final 180s window. Rest post-only limit at favorite's touch for 95-99c.
 No repricing in 99c band. Max one reprice in 95-98c.
 No chase, no scorer, no probability model — cost IS the signal.
 Unfilled at T-10s -> cancel, log SKIP NO_FILL.
+H8 probe lane: cost 80-94c, distance_pct >= 0.15%, secs <= 60.
 """
 
 import os
@@ -12,6 +13,7 @@ import logging
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from decimal import Decimal
 from typing import Optional, Tuple, Dict
 
 import requests as _requests
@@ -27,9 +29,13 @@ MAX_REPRICES_LOW_BAND = 1
 MAX_SUBMIT_ATTEMPTS = 2
 TELEGRAM_PER_MARKET = os.environ.get("TELEGRAM_PER_MARKET", "1").strip() == "1"
 
+T_BANDS = [(180, 120), (120, 60), (60, 10)]
+
 _observe_mode = False
 _submit_attempts: Dict[str, int] = {}
-_skip_logged: set = set()
+_skip_logged: set = set()  # cell keys: (ticker, cost_band, time_band_tuple)
+
+_spot_history: list = []  # (timestamp, price) for vol_regime
 
 
 def set_observe_mode(enabled: bool) -> None:
@@ -67,6 +73,75 @@ def get_heartbeat_ts() -> float:
     return _heartbeat_ts
 
 
+# ── Context tags (Fix 5) ──────────────────────────────────────
+
+SESSION_WINDOWS = [
+    ("ASIA",        20, 0,  2, 29),
+    ("LONDON_OPEN",  2, 30, 4, 0),
+    ("EU",           4, 0,  8, 0),
+    ("NY_PRE",       8, 0,  9, 29),
+    ("NY_OPEN",      9, 30, 10, 30),
+    ("NY",          10, 30, 15, 29),
+    ("NY_CLOSE",    15, 30, 16, 30),
+    ("EVENING",     16, 30, 20, 0),
+]
+
+
+def _current_session() -> str:
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    t = now_et.hour * 60 + now_et.minute
+    for name, sh, sm, eh, em in SESSION_WINDOWS:
+        start = sh * 60 + sm
+        end = eh * 60 + em
+        if start <= end:
+            if start <= t < end:
+                return name
+        else:
+            if t >= start or t < end:
+                return name
+    return "UNKNOWN"
+
+
+def _record_spot(price: float) -> None:
+    now = time.time()
+    _spot_history.append((now, price))
+    cutoff = now - 1200
+    _spot_history[:] = [(t, p) for t, p in _spot_history if t >= cutoff]
+
+
+def _vol_regime() -> str:
+    """|delta_spot| over prior 15m in bps -> LOW/MED/HIGH."""
+    if len(_spot_history) < 2:
+        return "UNKNOWN"
+    now = time.time()
+    target = now - 900
+    oldest = min(_spot_history, key=lambda x: abs(x[0] - target))
+    newest = _spot_history[-1]
+    if oldest[1] == 0:
+        return "UNKNOWN"
+    delta_bps = abs(newest[1] - oldest[1]) / oldest[1] * 10000
+    if delta_bps < 8:
+        return "LOW"
+    elif delta_bps <= 25:
+        return "MED"
+    return "HIGH"
+
+
+# ── Cell-key throttle (Fix 2) ─────────────────────────────────
+
+def _time_band(secs_to_expiry: float) -> Optional[Tuple[int, int]]:
+    for hi, lo in T_BANDS:
+        if lo <= secs_to_expiry < hi:
+            return (hi, lo)
+    return None
+
+
+def _cell_key(ticker: str, cost_exact: Optional[float], secs_to_expiry: float) -> tuple:
+    cost_band = int(cost_exact) if cost_exact is not None else None
+    tb = _time_band(secs_to_expiry)
+    return (ticker, cost_band, tb)
+
+
 # ── T3: per-market Telegram ─────────────────────────────────────
 
 def _time_et() -> str:
@@ -95,14 +170,7 @@ def _send_market_line(text: str) -> None:
 
 def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
                      close_ts: int, market_obj: Dict) -> Optional[str]:
-    """Run one full market cycle for a ticker. Returns outcome string or None.
-
-    Phases:
-    1. Wait until entry window (T-180s)
-    2. Evaluate via gateway
-    3. If allowed, submit and monitor fill
-    4. Track settlement
-    """
+    """Run one full market cycle for a ticker."""
     heartbeat()
 
     now = time.time()
@@ -131,7 +199,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         log.info(f"[ENGINE] {ticker} too close to expiry ({secs_to_expiry:.0f}s)")
         return "expired"
 
-    # Phase 2: Fetch book and evaluate
+    # Phase 2: Fetch book, spot, boundaries, evaluate
     book = kalshi.fetch_orderbook(client, ticker)
     cash, pv = kalshi.get_balance(client)
     if cash is None:
@@ -144,7 +212,18 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         if discipline.is_halted():
             return "halted"
 
-    eval_result = gateway.evaluate(ticker, book, secs_to_expiry, cash)
+    # Fix 4: Spot + boundaries
+    spot = kalshi.get_btc_spot()
+    if spot is not None:
+        _record_spot(spot)
+    boundary_lo, boundary_hi = kalshi.extract_boundaries(market_obj)
+
+    session_tag = _current_session()
+    vol_regime = _vol_regime()
+
+    eval_result = gateway.evaluate(ticker, book, secs_to_expiry, cash,
+                                    spot=spot, boundary_lo=boundary_lo,
+                                    boundary_hi=boundary_hi)
 
     spread = None
     if eval_result.side == "yes" and book.yes_bid is not None and book.yes_ask is not None:
@@ -153,7 +232,8 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         spread = book.no_ask - book.no_bid
 
     if not eval_result.allowed:
-        if ticker not in _skip_logged:
+        ck = _cell_key(ticker, eval_result.cost_exact, secs_to_expiry)
+        if ck not in _skip_logged:
             store.insert_row(store.SurfaceRow(
                 market_ticker=ticker,
                 decision_ts=time.time(),
@@ -161,27 +241,37 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
                 seconds_to_expiry=secs_to_expiry,
                 yes_quote_cents=eval_result.yes_quote_cents,
                 side=eval_result.side,
-                cost_per_contract_cents=eval_result.cost_cents,
+                cost_per_contract_cents=eval_result.cost_exact or eval_result.cost_cents,
                 breakeven_pct=eval_result.breakeven_pct,
                 yes_ask_cents=book.yes_ask,
                 no_ask_cents=book.no_ask,
                 spread_cents=spread,
                 skip_reason=eval_result.reject_code,
                 why_tag=eval_result.why_tag,
+                lane=eval_result.lane,
+                spot_price=spot,
+                boundary_lo=boundary_lo,
+                boundary_hi=boundary_hi,
+                distance=eval_result.distance,
+                distance_pct=eval_result.distance_pct,
+                session_tag=session_tag,
+                vol_regime=vol_regime,
                 env="live-observed",
             ))
-            _skip_logged.add(ticker)
+            _skip_logged.add(ck)
         log.info(f"[ENGINE] SKIP {ticker}: {eval_result.reject_code} — {eval_result.reject_reason}")
         side_str = eval_result.side.upper() if eval_result.side else "?"
-        cost_str = f"{eval_result.cost_cents}¢" if eval_result.cost_cents is not None else "?¢"
+        cost_str = f"{eval_result.cost_exact or eval_result.cost_cents}¢" if eval_result.cost_exact or eval_result.cost_cents else "?¢"
         tag = eval_result.why_tag or eval_result.reject_code
         bal = _bal_from(cash, pv)
-        _send_market_line(f"⏭ {_time_et()} {tag} (fav {side_str} {cost_str} @T-{int(secs_to_expiry)}) | {bal}")
+        prefix = "\U0001f9ea " if eval_result.lane == "h8_probe" else "⏭ "
+        _send_market_line(f"{prefix}{_time_et()} {tag} (fav {side_str} {cost_str} @T-{int(secs_to_expiry)}) | {bal}")
         return f"skip:{eval_result.reject_code}"
 
-    # Observe mode: log what would be an ENTER but never submit
+    # Observe mode: log what would be an ENTER
     if _observe_mode:
-        if ticker not in _skip_logged:
+        ck = _cell_key(ticker, eval_result.cost_exact, secs_to_expiry)
+        if ck not in _skip_logged:
             store.insert_row(store.SurfaceRow(
                 market_ticker=ticker,
                 decision_ts=time.time(),
@@ -189,26 +279,35 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
                 seconds_to_expiry=secs_to_expiry,
                 yes_quote_cents=eval_result.yes_quote_cents,
                 side=eval_result.side,
-                cost_per_contract_cents=eval_result.cost_cents,
+                cost_per_contract_cents=eval_result.cost_exact or eval_result.cost_cents,
                 breakeven_pct=eval_result.breakeven_pct,
                 yes_ask_cents=book.yes_ask,
                 no_ask_cents=book.no_ask,
                 spread_cents=spread,
                 skip_reason="OBSERVE_MODE",
                 why_tag=eval_result.why_tag,
+                lane=eval_result.lane,
+                spot_price=spot,
+                boundary_lo=boundary_lo,
+                boundary_hi=boundary_hi,
+                distance=eval_result.distance,
+                distance_pct=eval_result.distance_pct,
+                session_tag=session_tag,
+                vol_regime=vol_regime,
                 env="live-observed",
             ))
-            _skip_logged.add(ticker)
-        log.info(f"[ENGINE] OBSERVE {ticker}: would ENTER {eval_result.side} @ {eval_result.cost_cents}c")
+            _skip_logged.add(ck)
+        log.info(f"[ENGINE] OBSERVE {ticker}: would ENTER {eval_result.side} @ {eval_result.cost_exact}c")
         side_str = eval_result.side.upper() if eval_result.side else "?"
         bal = _bal_from(cash, pv)
+        prefix = "\U0001f9ea " if eval_result.lane == "h8_probe" else "\U0001f441 "
         _send_market_line(
-            f"\U0001f441 {_time_et()} OBSERVE {eval_result.why_tag} "
-            f"(fav {side_str} {eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {bal}"
+            f"{prefix}{_time_et()} OBSERVE {eval_result.why_tag} "
+            f"(fav {side_str} {eval_result.cost_exact}¢ @T-{int(secs_to_expiry)}) | {bal}"
         )
         return "observe"
 
-    # Phase 3: Submit via gateway (with retry discipline)
+    # Phase 3: Submit via gateway
     attempt = _submit_attempts.get(ticker, 0) + 1
     _submit_attempts[ticker] = attempt
 
@@ -216,7 +315,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         log.warning(f"[ENGINE] Max submit attempts ({MAX_SUBMIT_ATTEMPTS}) exhausted for {ticker}")
         _send_market_line(
             f"⏭ {_time_et()} SKIP_MAX_ATTEMPTS (fav {eval_result.side.upper()} "
-            f"{eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {_bal_from(cash, pv)}"
+            f"{eval_result.cost_exact}¢ @T-{int(secs_to_expiry)}) | {_bal_from(cash, pv)}"
         )
         return "max_attempts"
 
@@ -246,7 +345,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
             log.warning(f"[ENGINE] Definitive reject, attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} — will retry")
             _send_market_line(
                 f"⏭ {_time_et()} {retry_tag} (fav {eval_result.side.upper()} "
-                f"{eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {_bal_from(cash, pv)}"
+                f"{eval_result.cost_exact}¢ @T-{int(secs_to_expiry)}) | {_bal_from(cash, pv)}"
             )
             return "retry_pending"
 
@@ -255,9 +354,16 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         side_str = eval_result.side.upper() if eval_result.side else "?"
         bal = _bal_str(client)
         _send_market_line(
-            f"⏭ {_time_et()} {tag} (fav {side_str} {eval_result.cost_cents}¢ @T-{int(secs_to_expiry)}) | {bal}"
+            f"⏭ {_time_et()} {tag} (fav {side_str} {eval_result.cost_exact}¢ @T-{int(secs_to_expiry)}) | {bal}"
         )
         return "submit_failed"
+
+    # Update session/vol on the ENTER row
+    store._conn.execute(
+        "UPDATE surface SET session_tag=?, vol_regime=? WHERE id=?",
+        (session_tag, vol_regime, row_id),
+    )
+    store._conn.commit()
 
     # Phase 4: Monitor fill -> settlement
     result = _monitor_order(client, ticker, order_id, row_id, eval_result,
@@ -267,27 +373,28 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     bal = _bal_str(client)
     ts = _time_et()
     tag = eval_result.why_tag
+    prefix = "\U0001f9ea " if eval_result.lane == "h8_probe" else ""
 
     if outcome == "no_fill":
-        _send_market_line(f"\U0001f7e1 {ts} NO_FILL {tag} rested {eval_result.cost_cents}¢, uncrossed | {bal}")
+        _send_market_line(f"{prefix}\U0001f7e1 {ts} NO_FILL {tag} rested {eval_result.cost_exact}¢, uncrossed | {bal}")
     elif outcome in ("win", "loss"):
         emoji = "✅" if outcome == "win" else "❌"
         label = "WIN" if outcome == "win" else "LOSS"
         fc = result.get("fill_cost", eval_result.cost_cents)
         fee = result.get("fee_cents", 0)
         pnl = result.get("pnl", 0.0)
-        line = f"{emoji} {ts} FILL {tag} @{fc}¢ fee {fee}¢ → {label} ${pnl:+.2f} | {bal}"
+        line = f"{prefix}{emoji} {ts} FILL {tag} @{fc}¢ fee {fee}¢ → {label} ${pnl:+.2f} | {bal}"
         if result.get("treasury_line"):
             line += f"\n{result['treasury_line']}"
         _send_market_line(line)
     elif outcome == "timeout":
         fc = result.get("fill_cost", eval_result.cost_cents)
         fee = result.get("fee_cents", 0)
-        _send_market_line(f"\U0001f7e1 {ts} FILL {tag} @{fc}¢ fee {fee}¢ → TIMEOUT | {bal}")
+        _send_market_line(f"{prefix}\U0001f7e1 {ts} FILL {tag} @{fc}¢ fee {fee}¢ → TIMEOUT | {bal}")
     elif outcome == "cancelled_external":
-        _send_market_line(f"⏭ {ts} CANCELLED {tag} | {bal}")
+        _send_market_line(f"{prefix}⏭ {ts} CANCELLED {tag} | {bal}")
     elif outcome == "reprice_failed":
-        _send_market_line(f"⏭ {ts} REPRICE_FAIL {tag} | {bal}")
+        _send_market_line(f"{prefix}⏭ {ts} REPRICE_FAIL {tag} | {bal}")
 
     heartbeat()
     return outcome
@@ -306,10 +413,10 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                    order_id: str, row_id: int,
                    eval_result: gateway.EvalResult,
                    close_ts: int, original_book: kalshi.Book) -> Dict:
-    """Monitor an open order via LIST + FILLS. Returns dict with outcome and fill details."""
-    from decimal import Decimal
+    """Monitor an open order via LIST + FILLS."""
     reprices = 0
     cost_cents = eval_result.cost_cents
+    cost_exact = eval_result.cost_exact or cost_cents
     is_99_band = cost_cents == 99
 
     while True:
@@ -336,19 +443,19 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             log.warning(f"[ENGINE] Order {order_id} {label} (T-{secs_left:.0f}s)")
             return {"outcome": label}
 
-        # state == "resting" — check for partial fill edge case
+        # state == "resting" — check partial fill
         raw = status_result.get("raw") or {}
         fc_str = raw.get("fill_count", "0") or "0"
         if Decimal(fc_str) > 0:
             notify.alert(f"Partial fill at 1ct?! fill_count={fc_str} on resting order {raw}")
 
-        # Reprice check (not in 99c band, max 1 reprice)
-        if not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
+        # Reprice check (main lane only, not in 99c band, max 1 reprice)
+        if eval_result.lane == "main" and not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
             new_book = kalshi.fetch_orderbook(client, ticker)
-            new_side, new_cost, _ = gateway._favorite_side(new_book)
-            if (new_side == eval_result.side and new_cost is not None
-                    and new_cost != cost_cents
-                    and gateway.COST_BAND_LO <= new_cost <= gateway.COST_BAND_HI):
+            new_side, new_cost_d, _, _ = gateway._favorite_side(new_book)
+            if (new_side == eval_result.side and new_cost_d is not None
+                    and int(new_cost_d) != cost_cents
+                    and gateway.COST_BAND_LO <= new_cost_d <= gateway.COST_BAND_HI):
                 try:
                     new_oid, new_cost_out = gateway.reprice(
                         client, ticker, eval_result, order_id, new_book, close_ts,
@@ -370,9 +477,7 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
                  fill_records: list, row_id: int,
                  eval_result: gateway.EvalResult,
                  close_ts: int) -> Dict:
-    """Handle a filled order. fill_records: list of fill dicts from /portfolio/fills."""
-    from decimal import Decimal
-
+    """Handle a filled order."""
     fill_cost = None
     fee_cents = 0
 
@@ -384,7 +489,7 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
                 continue
             try:
                 val = Decimal(str(raw))
-                yes_cents = int(val * 100) if val < 1 else int(val)
+                yes_cents = float(val * 100) if val < 1 else float(val)
                 fill_cost = yes_cents if eval_result.side == "yes" else (100 - yes_cents)
                 break
             except Exception:
@@ -393,7 +498,7 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
         if fill_cost is None and fr.get("no_price") is not None:
             try:
                 val = Decimal(str(fr["no_price"]))
-                no_cents = int(val * 100) if val < 1 else int(val)
+                no_cents = float(val * 100) if val < 1 else float(val)
                 fill_cost = no_cents if eval_result.side == "no" else (100 - no_cents)
             except Exception:
                 pass
@@ -409,17 +514,22 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
                 break
 
     if fill_cost is None:
-        fill_cost = eval_result.cost_cents
+        fill_cost = eval_result.cost_exact or eval_result.cost_cents
         notify.alert(f"Fill on {ticker} — price missing from fill records, using eval cost {fill_cost}c")
 
-    if not (gateway.COST_BAND_LO <= fill_cost <= gateway.COST_BAND_HI):
-        log.error(f"[ENGINE] PHRASING-LAW ASSERT: fill_cost={fill_cost}c outside 95-99 for {ticker} "
-                  f"(fill keys={list(fill_records[0].keys()) if fill_records else []} "
-                  f"side={eval_result.side}) — using eval cost, flagging row")
-        notify.alert(f"Phrasing-law assert on fill {ticker}: {fill_cost}c — check fill records")
-        fill_cost = eval_result.cost_cents
+    # Widened fill assert: Decimal 95.00-99.00 for main, 80.00-94.00 for H8
+    fill_d = Decimal(str(fill_cost))
+    if eval_result.lane == "h8_probe":
+        valid = gateway.H8_COST_LO <= fill_d <= gateway.H8_COST_HI
+    else:
+        valid = gateway.COST_BAND_LO <= fill_d <= gateway.COST_BAND_HI
+    if not valid:
+        log.error(f"[ENGINE] PHRASING-LAW ASSERT: fill_cost={fill_cost}c outside band for {ticker} "
+                  f"lane={eval_result.lane} side={eval_result.side}")
+        notify.alert(f"Phrasing-law assert on fill {ticker}: {fill_cost}c lane={eval_result.lane}")
+        fill_cost = eval_result.cost_exact or eval_result.cost_cents
 
-    slippage = fill_cost - eval_result.cost_cents if eval_result.cost_cents else 0
+    slippage = fill_cost - (eval_result.cost_exact or eval_result.cost_cents)
 
     store.update_fill(row_id, fill_cost, time.time(), slippage, fee_cents)
     log.info(f"[ENGINE] FILLED {ticker} {eval_result.side} @ {fill_cost}c fee={fee_cents}c")
@@ -439,7 +549,6 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
     except Exception:
         pass
 
-    # Wait for settlement
     settle = _wait_for_settlement(client, ticker, row_id, eval_result, fill_cost,
                                    fee_cents, close_ts)
     settle["fill_cost"] = fill_cost
@@ -449,16 +558,14 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
 
 def _wait_for_settlement(client: kalshi.KalshiClient, ticker: str,
                          row_id: int, eval_result: gateway.EvalResult,
-                         fill_cost: int, fee_cents: int,
+                         fill_cost: float, fee_cents: int,
                          close_ts: int) -> Dict:
-    """Wait for market settlement after fill. Returns dict with outcome and pnl."""
-    # Wait until after close
+    """Wait for market settlement after fill."""
     wait_until = close_ts + 30
     while time.time() < wait_until:
         heartbeat()
         time.sleep(min(15, max(1, wait_until - time.time())))
 
-    # Poll for settlement (up to 5 minutes)
     deadline = time.time() + 300
     while time.time() < deadline:
         heartbeat()

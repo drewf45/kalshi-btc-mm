@@ -211,6 +211,8 @@ class Book:
     no_ask: Optional[int] = None
     yes_bid_qty: int = 0
     no_bid_qty: int = 0
+    yes_bid_fp: Optional[str] = None
+    no_bid_fp: Optional[str] = None
 
 
 _ob_shape_logged = False
@@ -244,22 +246,24 @@ def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:
 
     def best(levels):
         if not levels:
-            return None, None
+            return None, None, None
         price_str, count_str = levels[-1]
         d = Decimal(price_str) * 100
         cents = int(d)
         if d != cents:
             log.info(f"[OB] subpenny bid {price_str} on {ticker} — floored to {cents}c")
-        return cents, int(Decimal(count_str))
+        return cents, int(Decimal(count_str)), price_str
 
-    yes_bid, yes_bid_qty = best(ob.get("yes_dollars") or [])
-    no_bid, no_bid_qty = best(ob.get("no_dollars") or [])
+    yes_bid, yes_bid_qty, yes_fp = best(ob.get("yes_dollars") or [])
+    no_bid, no_bid_qty, no_fp = best(ob.get("no_dollars") or [])
 
     return Book(
         yes_bid=yes_bid, yes_bid_qty=yes_bid_qty or 0,
         no_bid=no_bid, no_bid_qty=no_bid_qty or 0,
         yes_ask=(100 - no_bid) if no_bid is not None else None,
         no_ask=(100 - yes_bid) if yes_bid is not None else None,
+        yes_bid_fp=yes_fp,
+        no_bid_fp=no_fp,
     )
 
 
@@ -365,14 +369,25 @@ def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
 
 def place_order_maker(client: KalshiClient, ticker: str, side: str,
                       price_cents: int, count: int = 1,
-                      expiration_ts: Optional[int] = None) -> Tuple[str, Dict]:
+                      expiration_ts: Optional[int] = None,
+                      v2_price_str: Optional[str] = None) -> Tuple[str, Dict]:
     """Place a post_only (maker) limit order via V2. Returns (order_id, response).
 
     side: 'yes'/'no' (engine convention). price_cents: COST of the held side.
+    v2_price_str: exact fixed-point dollar string from orderbook_fp — used when
+    available so orders rest at the true touch (subpenny precision).
     V2 quotes the YES leg only: buy NO == ask YES at (100 - cost).
     The ONLY order placement function in the engine — no taker path exists.
     """
-    if side == "yes":
+    from decimal import Decimal
+    if v2_price_str is not None:
+        if side == "yes":
+            v2_side = "bid"
+            v2_price = v2_price_str
+        else:
+            v2_side = "ask"
+            v2_price = str(Decimal("1") - Decimal(v2_price_str))
+    elif side == "yes":
         v2_side = "bid"
         v2_price = f"{price_cents / 100:.2f}"
     else:
@@ -426,3 +441,75 @@ def get_fills(client: KalshiClient, ticker: str) -> List[Dict]:
     except Exception as e:
         log.warning(f"[FILLS] {ticker}: {e}")
         return []
+
+
+# ── BTC Spot (Fix 4) ───────────────────────────────────────────
+
+_spot_cache: Dict[str, Any] = {"price": None, "ts": 0.0}
+
+
+def get_btc_spot() -> Optional[float]:
+    """BTC spot from Coinbase public ticker, cached <=5s. Feed failure -> None."""
+    now = time.time()
+    if _spot_cache["price"] is not None and (now - _spot_cache["ts"]) < 5:
+        return _spot_cache["price"]
+    try:
+        resp = requests.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5,
+        )
+        resp.raise_for_status()
+        price = float(resp.json()["data"]["amount"])
+        _spot_cache["price"] = price
+        _spot_cache["ts"] = now
+        return price
+    except Exception as e:
+        log.warning(f"[SPOT] Coinbase fetch failed: {e}")
+        return _spot_cache["price"]
+
+
+# ── Boundary extraction (Fix 4) ────────────────────────────────
+
+_boundary_keys_logged = False
+
+
+def extract_boundaries(market_obj: Dict) -> Tuple[Optional[float], Optional[float]]:
+    """Extract lo/hi price boundaries from market object. Never parse tickers."""
+    global _boundary_keys_logged
+    if not _boundary_keys_logged:
+        log.info(f"[BOUNDARY] Market keys: {sorted(market_obj.keys())}")
+        _boundary_keys_logged = True
+
+    lo, hi = None, None
+    for k in ("floor_strike", "custom_strike_floor", "strike_low", "range_low"):
+        v = market_obj.get(k)
+        if v is not None:
+            try:
+                lo = float(v)
+                break
+            except (ValueError, TypeError):
+                pass
+    for k in ("cap_strike", "custom_strike_cap", "strike_high", "range_high"):
+        v = market_obj.get(k)
+        if v is not None:
+            try:
+                hi = float(v)
+                break
+            except (ValueError, TypeError):
+                pass
+    cs = market_obj.get("custom_strike")
+    if isinstance(cs, dict):
+        if lo is None:
+            for ck in ("floor", "low", "min"):
+                try:
+                    lo = float(cs[ck])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    pass
+        if hi is None:
+            for ck in ("cap", "high", "max"):
+                try:
+                    hi = float(cs[ck])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    pass
+    return lo, hi

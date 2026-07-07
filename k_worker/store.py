@@ -76,6 +76,36 @@ def init_db() -> None:
             value TEXT
         )
     """)
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_ledger (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_ticker   TEXT NOT NULL UNIQUE,
+            settled_ts      REAL,
+            result          TEXT,
+            realized_cents  REAL DEFAULT 0,
+            best_available_cents REAL DEFAULT 0,
+            regret_missed   REAL DEFAULT 0,
+            regret_avoided  REAL DEFAULT 0,
+            outcome_class   TEXT
+        )
+    """)
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS context_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            date_start TEXT,
+            date_end   TEXT,
+            label      TEXT NOT NULL
+        )
+    """)
+    for col, typ in [
+        ("spot_price", "REAL"), ("boundary_lo", "REAL"), ("boundary_hi", "REAL"),
+        ("distance", "REAL"), ("distance_pct", "REAL"), ("lane", "TEXT"),
+        ("session_tag", "TEXT"), ("vol_regime", "TEXT"), ("winner_clip_cents", "REAL"),
+    ]:
+        try:
+            _conn.execute(f"ALTER TABLE surface ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     _conn.commit()
     log.info(f"[STORE] Initialized: {DB_PATH}")
 
@@ -109,6 +139,15 @@ class SurfaceRow:
     pnl_net: Optional[float] = None
     settled_ts: Optional[float] = None
     env: str = "live-observed"
+    spot_price: Optional[float] = None
+    boundary_lo: Optional[float] = None
+    boundary_hi: Optional[float] = None
+    distance: Optional[float] = None
+    distance_pct: Optional[float] = None
+    lane: Optional[str] = None
+    session_tag: Optional[str] = None
+    vol_regime: Optional[str] = None
+    winner_clip_cents: Optional[float] = None
 
 
 def insert_row(row: SurfaceRow) -> int:
@@ -164,25 +203,33 @@ def update_settlement(row_id: int, resolution: str, pnl_net: float,
 
 
 def query_band_stats(cost_band_lo: int, cost_band_hi: int,
-                     env: str = "live-traded") -> dict:
-    """Query win stats for a cost band. Returns {n, wins, losses, win_pct}."""
+                     env: str = "live-traded", lane: str = "main") -> dict:
+    """Query win stats for a cost band using COUNT(DISTINCT market_ticker).
+    Excludes obs_stale, obs_dup, and side=NULL rows."""
     with _lock:
-        rows = _conn.execute(
-            """SELECT resolution, pnl_net FROM surface
+        row = _conn.execute(
+            """SELECT
+                COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN market_ticker END),
+                COUNT(DISTINCT CASE WHEN resolution IN ('loss','obs_loss') THEN market_ticker END),
+                SUM(CASE WHEN resolution IN ('win','loss') THEN COALESCE(pnl_net,0) ELSE 0 END)
+               FROM surface
                WHERE env=? AND action='ENTER'
-               AND cost_per_contract_cents >= ? AND cost_per_contract_cents <= ?
-               AND resolution IS NOT NULL""",
-            (env, cost_band_lo, cost_band_hi),
-        ).fetchall()
-    wins = sum(1 for r in rows if r[0] == "win")
-    losses = sum(1 for r in rows if r[0] == "loss")
+               AND CAST(cost_per_contract_cents AS INTEGER) >= ?
+               AND CAST(cost_per_contract_cents AS INTEGER) <= ?
+               AND resolution IN ('win','loss','obs_win','obs_loss')
+               AND side IS NOT NULL
+               AND COALESCE(lane,'main')=?""",
+            (env, cost_band_lo, cost_band_hi, lane),
+        ).fetchone()
+    wins = row[0] if row else 0
+    losses = row[1] if row else 0
     n = wins + losses
     return {
         "n": n,
         "wins": wins,
         "losses": losses,
         "win_pct": wins / n if n > 0 else 0.0,
-        "net_pnl": sum(r[1] or 0 for r in rows),
+        "net_pnl": float(row[2] or 0) if row else 0.0,
     }
 
 
@@ -223,7 +270,7 @@ def approx_close_ts(ticker: str) -> float:
 
 def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
     """Combined stats from live-traded AND live-observed rows.
-    Uses COUNT(DISTINCT market_ticker) for obs to prevent multi-row inflation."""
+    Uses COUNT(DISTINCT market_ticker). Excludes obs_stale, obs_dup, side=NULL."""
     traded = query_band_stats(cost_band_lo, cost_band_hi, "live-traded")
     with _lock:
         row = _conn.execute(
@@ -232,8 +279,11 @@ def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
                 COUNT(DISTINCT CASE WHEN resolution='obs_loss' THEN market_ticker END)
                FROM surface
                WHERE env='live-observed'
-               AND cost_per_contract_cents >= ? AND cost_per_contract_cents <= ?
-               AND resolution IN ('obs_win', 'obs_loss')""",
+               AND CAST(cost_per_contract_cents AS INTEGER) >= ?
+               AND CAST(cost_per_contract_cents AS INTEGER) <= ?
+               AND resolution IN ('obs_win', 'obs_loss')
+               AND side IS NOT NULL
+               AND COALESCE(lane,'main')='main'""",
             (cost_band_lo, cost_band_hi),
         ).fetchone()
     obs_wins = row[0] if row else 0
@@ -348,7 +398,8 @@ def query_band_friction(cost_band_lo: int, cost_band_hi: int,
                       SUM(COALESCE(cost_per_contract_cents,0))
                FROM surface
                WHERE env=? AND action='ENTER'
-               AND cost_per_contract_cents >= ? AND cost_per_contract_cents <= ?
+               AND CAST(cost_per_contract_cents AS INTEGER) >= ?
+               AND CAST(cost_per_contract_cents AS INTEGER) <= ?
                AND fill_cost_cents IS NOT NULL""",
             (env, cost_band_lo, cost_band_hi),
         ).fetchone()
@@ -399,3 +450,172 @@ def daily_stats(env: str = "live-traded") -> dict:
         "net_pnl": sum(r[1] or 0 for r in rows),
         "total_fees": sum((r[2] or 0) for r in rows) / 100.0,
     }
+
+
+# ── Winner clip + market ledger (Fix 5) ────────────────────────
+
+def update_winner_clip(row_id: int, clip_cents: float) -> None:
+    with _lock:
+        _conn.execute(
+            "UPDATE surface SET winner_clip_cents=? WHERE id=?",
+            (clip_cents, row_id),
+        )
+        _conn.commit()
+
+
+def upsert_market_ledger(ticker: str, settled_ts: float, result: str,
+                         realized_cents: float, best_available_cents: float,
+                         regret_missed: float, regret_avoided: float,
+                         outcome_class: str) -> None:
+    with _lock:
+        _conn.execute(
+            """INSERT INTO market_ledger
+               (market_ticker, settled_ts, result, realized_cents,
+                best_available_cents, regret_missed, regret_avoided, outcome_class)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(market_ticker) DO UPDATE SET
+                settled_ts=?, result=?, realized_cents=?,
+                best_available_cents=?, regret_missed=?, regret_avoided=?,
+                outcome_class=?""",
+            (ticker, settled_ts, result, realized_cents, best_available_cents,
+             regret_missed, regret_avoided, outcome_class,
+             settled_ts, result, realized_cents, best_available_cents,
+             regret_missed, regret_avoided, outcome_class),
+        )
+        _conn.commit()
+
+
+def query_caution_ledger() -> dict:
+    """Daily caution ledger from market_ledger."""
+    import datetime as dt
+    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    with _lock:
+        rows = _conn.execute(
+            """SELECT outcome_class, realized_cents, best_available_cents,
+                      regret_missed, regret_avoided
+               FROM market_ledger WHERE settled_ts >= ?""",
+            (today_start,),
+        ).fetchall()
+    captured = sum(r[1] for r in rows if r[0] == "CAPTURED") / 100.0
+    missed = sum(r[3] for r in rows if r[0] == "MISSED_CLIP") / 100.0
+    savings = sum(r[4] for r in rows if r[0] == "DODGED_LOSS") / 100.0
+    took_loss = sum(abs(r[1]) for r in rows if r[0] == "TOOK_LOSS") / 100.0
+    return {
+        "captured": captured,
+        "cost_of_caution": missed,
+        "caution_savings": savings,
+        "took_loss": took_loss,
+        "net_caution": savings - missed,
+        "n": len(rows),
+    }
+
+
+def check_conflicting_resolutions() -> list:
+    """Find tickers with conflicting resolutions in the same cell. Returns list of ticker strings."""
+    with _lock:
+        rows = _conn.execute(
+            """SELECT market_ticker, CAST(cost_per_contract_cents AS INTEGER) as band
+               FROM surface
+               WHERE resolution IN ('win','loss','obs_win','obs_loss')
+               AND side IS NOT NULL
+               GROUP BY market_ticker, band
+               HAVING COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN 1
+                                          WHEN resolution IN ('loss','obs_loss') THEN 2 END) > 1"""
+        ).fetchall()
+    return [f"{r[0]}@{r[1]}c" for r in rows]
+
+
+# ── H8 stats (Fix 4) ───────────────────────────────────────────
+
+def query_h8_grid() -> list:
+    """H8 grid: cells (cost_bucket x distance_bucket x time_band)."""
+    COST_BUCKETS = [(65, 79), (80, 89), (90, 94)]
+    DIST_BUCKETS = [("close", 0, 0.0005), ("mid", 0.0005, 0.0015), ("far", 0.0015, 1.0)]
+    TIME_BUCKETS = [(180, 120), (120, 60), (60, 10)]
+    cells = []
+    with _lock:
+        for clo, chi in COST_BUCKETS:
+            for dlabel, dlo, dhi in DIST_BUCKETS:
+                for thi, tlo in TIME_BUCKETS:
+                    row = _conn.execute(
+                        """SELECT
+                            COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN market_ticker END),
+                            COUNT(DISTINCT CASE WHEN resolution IN ('loss','obs_loss') THEN market_ticker END)
+                           FROM surface
+                           WHERE CAST(cost_per_contract_cents AS INTEGER) >= ?
+                           AND CAST(cost_per_contract_cents AS INTEGER) <= ?
+                           AND distance_pct >= ? AND distance_pct < ?
+                           AND seconds_to_expiry >= ? AND seconds_to_expiry < ?
+                           AND resolution IN ('win','loss','obs_win','obs_loss')
+                           AND side IS NOT NULL
+                           AND COALESCE(lane,'main') IN ('main','h8_probe')""",
+                        (clo, chi, dlo, dhi, tlo, thi),
+                    ).fetchone()
+                    w = row[0] if row else 0
+                    l = row[1] if row else 0
+                    n = w + l
+                    if n > 0:
+                        cells.append({
+                            "cost": f"{clo}-{chi}", "dist": dlabel,
+                            "time": f"{thi}-{tlo}", "n": n, "wins": w,
+                            "win_pct": w / n, "be": clo / 100.0,
+                        })
+    return cells
+
+
+def query_context_stats() -> dict:
+    """Win% and margin per session_tag and vol_regime."""
+    result = {"sessions": {}, "vol_regimes": {}}
+    with _lock:
+        for tag_col, dest in [("session_tag", "sessions"), ("vol_regime", "vol_regimes")]:
+            rows = _conn.execute(
+                f"""SELECT {tag_col},
+                    COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN market_ticker END),
+                    COUNT(DISTINCT CASE WHEN resolution IN ('loss','obs_loss') THEN market_ticker END),
+                    SUM(CASE WHEN resolution IN ('win','loss') THEN COALESCE(pnl_net,0) ELSE 0 END)
+                   FROM surface
+                   WHERE {tag_col} IS NOT NULL
+                   AND resolution IN ('win','loss','obs_win','obs_loss')
+                   AND side IS NOT NULL
+                   GROUP BY {tag_col}"""
+            ).fetchall()
+            for tag, w, l, pnl in rows:
+                n = w + l
+                result[dest][tag] = {
+                    "n": n, "wins": w, "losses": l,
+                    "win_pct": w / n if n > 0 else 0.0,
+                    "net_pnl": float(pnl or 0),
+                }
+    return result
+
+
+def query_h8_probe_daily() -> dict:
+    """Today's H8 probe stats for budget/kill checks."""
+    import datetime as dt
+    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    with _lock:
+        rows = _conn.execute(
+            """SELECT resolution, cost_per_contract_cents FROM surface
+               WHERE lane='h8_probe' AND decision_ts >= ?
+               AND action='ENTER'""",
+            (today_start,),
+        ).fetchall()
+    at_risk = sum(r[1] or 0 for r in rows) / 100.0
+    wins = sum(1 for r in rows if r[0] == "win")
+    losses = sum(1 for r in rows if r[0] == "loss")
+    return {"at_risk": at_risk, "wins": wins, "losses": losses, "n": len(rows)}
+
+
+def query_h8_probe_lifetime() -> dict:
+    """Lifetime H8 probe stats for probe kill check."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT
+                COUNT(CASE WHEN resolution='win' THEN 1 END),
+                COUNT(CASE WHEN resolution='loss' THEN 1 END)
+               FROM surface WHERE lane='h8_probe' AND action='ENTER'
+               AND resolution IN ('win','loss')"""
+        ).fetchone()
+    wins = row[0] if row else 0
+    losses = row[1] if row else 0
+    return {"wins": wins, "losses": losses}
