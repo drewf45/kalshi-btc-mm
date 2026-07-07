@@ -186,6 +186,86 @@ def query_band_stats(cost_band_lo: int, cost_band_hi: int,
     }
 
 
+def unresolved_tickers() -> list:
+    """Return distinct tickers with at least one unresolved row."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT DISTINCT market_ticker FROM surface WHERE resolution IS NULL"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_unresolved_rows(ticker: str) -> list:
+    """Return unresolved rows for a ticker: (id, action, side, cost_cents, fee_cents)."""
+    with _lock:
+        rows = _conn.execute(
+            """SELECT id, action, side, cost_per_contract_cents,
+                      COALESCE(fee_cents, 0)
+               FROM surface WHERE market_ticker=? AND resolution IS NULL""",
+            (ticker,),
+        ).fetchall()
+    return rows
+
+
+def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
+    """Combined stats from live-traded AND live-observed rows (obs_win/obs_loss count)."""
+    traded = query_band_stats(cost_band_lo, cost_band_hi, "live-traded")
+    with _lock:
+        obs_rows = _conn.execute(
+            """SELECT resolution FROM surface
+               WHERE env='live-observed'
+               AND cost_per_contract_cents >= ? AND cost_per_contract_cents <= ?
+               AND resolution IN ('obs_win', 'obs_loss')""",
+            (cost_band_lo, cost_band_hi),
+        ).fetchall()
+    obs_wins = sum(1 for r in obs_rows if r[0] == "obs_win")
+    obs_losses = sum(1 for r in obs_rows if r[0] == "obs_loss")
+    obs_n = obs_wins + obs_losses
+    return {
+        "traded": traded,
+        "obs_n": obs_n,
+        "obs_wins": obs_wins,
+        "obs_losses": obs_losses,
+        "obs_win_pct": obs_wins / obs_n if obs_n > 0 else 0.0,
+        "combined_n": traded["n"] + obs_n,
+        "combined_wins": traded["wins"] + obs_wins,
+    }
+
+
+def query_drift_stats() -> dict:
+    """S4: Drift and time-bucket stats for the weekly review."""
+    with _lock:
+        rows = _conn.execute(
+            """SELECT resolution, post_fill_drift_cents, seconds_to_expiry
+               FROM surface
+               WHERE env='live-traded' AND action='ENTER'
+               AND resolution IN ('win', 'loss')
+               AND post_fill_drift_cents IS NOT NULL"""
+        ).fetchall()
+    win_drifts = [r[1] for r in rows if r[0] == "win"]
+    loss_drifts = [r[1] for r in rows if r[0] == "loss"]
+
+    buckets = {"180-120": 0, "120-60": 0, "60-10": 0}
+    for r in rows:
+        if r[0] != "loss":
+            continue
+        tte = r[2] or 0
+        if tte >= 120:
+            buckets["180-120"] += 1
+        elif tte >= 60:
+            buckets["120-60"] += 1
+        else:
+            buckets["60-10"] += 1
+
+    return {
+        "win_mean_drift": sum(win_drifts) / len(win_drifts) if win_drifts else 0.0,
+        "loss_mean_drift": sum(loss_drifts) / len(loss_drifts) if loss_drifts else 0.0,
+        "win_count": len(win_drifts),
+        "loss_count": len(loss_drifts),
+        "loss_buckets": buckets,
+    }
+
+
 def query_band_friction(cost_band_lo: int, cost_band_hi: int,
                         env: str = "live-traded") -> Optional[float]:
     """Compute measured friction for a cost band from filled rows.

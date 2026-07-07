@@ -6,11 +6,12 @@ Boot sequence:
 3. store — init SQLite
 4. kalshi — build client, read balance
 5. Main loop: discover market -> engine cycle -> repeat
-6. Scoreboard on schedule (every 4 hours)
+6. Scoreboard on schedule (configurable via SCOREBOARD_EVERY_HOURS)
+7. Settlement backfill every ~5 min
+8. Hourly balance Telegram message
 """
 
 import os
-import sys
 import time
 import signal
 import logging
@@ -25,7 +26,9 @@ logging.basicConfig(
 log = logging.getLogger("k_worker")
 
 LOOP_SLEEP_SEC = 30
-SCOREBOARD_INTERVAL_SEC = 4 * 3600
+SCOREBOARD_INTERVAL_SEC = int(float(os.environ.get("SCOREBOARD_EVERY_HOURS", "4")) * 3600)
+BACKFILL_INTERVAL_SEC = 300
+HOURLY_BALANCE_SEC = 3600
 _running = True
 
 
@@ -33,6 +36,54 @@ def _shutdown(sig, frame):
     global _running
     log.warning(f"[MAIN] Received signal {sig} — shutting down")
     _running = False
+
+
+def _backfill_settlements(client: kalshi.KalshiClient) -> int:
+    """S1: Backfill settlement results for unresolved rows with closed markets.
+    Fills get win/loss, SKIPs with a recorded side get obs_win/obs_loss.
+    Returns count of rows updated."""
+    updated = 0
+    tickers = store.unresolved_tickers()
+    for ticker in tickers:
+        result = kalshi.get_settlement_result(client, ticker)
+        if result is None:
+            continue
+        rows = store.get_unresolved_rows(ticker)
+        for row_id, action, side, cost_cents, fee_cents in rows:
+            if action == "ENTER":
+                won = (result == side) if side else False
+                if won:
+                    pnl = (100 - (cost_cents or 0) - (fee_cents or 0)) / 100.0
+                    res = "win"
+                    discipline.record_win()
+                else:
+                    pnl = -((cost_cents or 0) + (fee_cents or 0)) / 100.0
+                    res = "loss"
+                    discipline.record_loss()
+            else:
+                if side is None:
+                    continue
+                won = (result == side)
+                res = "obs_win" if won else "obs_loss"
+                pnl = 0.0
+            store.update_settlement(row_id, res, pnl, time.time())
+            updated += 1
+    if updated:
+        log.info(f"[BACKFILL] Updated {updated} rows across {len(tickers)} tickers")
+    return updated
+
+
+def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
+    """T2: Send hourly balance status to Telegram."""
+    cash, pv = kalshi.get_balance(client)
+    if cash is None:
+        return
+    total = cash + (pv or 0)
+    daily = store.daily_stats("live-traded")
+    notify.send(
+        f"Balance: ${total:.2f} | positions ${pv or 0:.2f} | "
+        f"today: {daily['n']} fills, net ${daily['net_pnl']:.2f}"
+    )
 
 
 def main():
@@ -75,32 +126,51 @@ def main():
 
     total = cash + (pv or 0)
     log.warning(f"[MAIN] Balance: cash=${cash:.2f} positions=${pv or 0:.2f} total=${total:.2f}")
-
-    notify.send(
-        f"<b>K-WORKER STARTED</b>\n"
-        f"Env: {env_label} | Mode: {mode_label}\n"
-        f"Balance: ${total:.2f} (cash=${cash:.2f})\n"
-        f"Engine: KXBTC15M | flat 1ct | fav 95-99c | maker-only"
-    )
+    log.warning(f"[MAIN] Engine: KXBTC15M | flat 1ct | fav 95-99c | maker-only")
 
     if worker_mode == "trade":
         discipline.check_drawdown(cash)
 
     envcheck.check_clock_skew()
 
+    if engine.HEARTBEAT_PING_URL:
+        log.info(f"[MAIN] Dead-man ping configured: {engine.HEARTBEAT_PING_URL[:40]}...")
+    else:
+        log.info("[MAIN] No HEARTBEAT_PING_URL — dead-man ping disabled")
+
     last_scoreboard = 0
+    last_backfill = 0
+    last_hourly = 0
     last_ticker = None
 
     # 6. Main loop
     while _running:
         try:
             engine.heartbeat()
+            now = time.time()
 
             if worker_mode == "trade" and discipline.is_halted():
                 log.warning(f"[MAIN] Engine halted: {discipline.halt_reason()}")
                 time.sleep(LOOP_SLEEP_SEC)
                 continue
 
+            # Settlement backfill (S1) — every ~5 min
+            if now - last_backfill > BACKFILL_INTERVAL_SEC:
+                try:
+                    _backfill_settlements(client)
+                except Exception as e:
+                    log.warning(f"[MAIN] Backfill error: {e}")
+                last_backfill = now
+
+            # Hourly balance Telegram (T2)
+            if now - last_hourly > HOURLY_BALANCE_SEC:
+                try:
+                    _send_hourly_balance(client)
+                except Exception as e:
+                    log.warning(f"[MAIN] Hourly balance error: {e}")
+                last_hourly = now
+
+            # Discover current market
             try:
                 event_ticker, ticker, market_obj = kalshi.discover_market(client)
             except Exception as e:
@@ -114,7 +184,6 @@ def main():
                 time.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            now = time.time()
             secs_to_expiry = close_ts - now
 
             if secs_to_expiry < 10:
@@ -145,6 +214,7 @@ def main():
             if outcome:
                 log.info(f"[MAIN] Cycle result for {ticker}: {outcome}")
 
+            # Scoreboard
             if time.time() - last_scoreboard > SCOREBOARD_INTERVAL_SEC:
                 try:
                     scoreboard.send_scoreboard()

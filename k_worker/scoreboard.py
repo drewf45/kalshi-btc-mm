@@ -13,6 +13,8 @@ Statistical gates:
 import math
 import time
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 
 from . import store, notify
@@ -46,7 +48,9 @@ def build_scoreboard() -> str:
                  f"W/L={daily['wins']}/{daily['losses']}, "
                  f"net=${daily['net_pnl']:.2f}, fees=${daily['total_fees']:.2f}")
 
-    lines.append("\n Band  |  N  | Win%  | BE%      | Wilson LB | Margin")
+    # --- TRADED bands ---
+    lines.append("\n TRADED")
+    lines.append(" Band  |  N  | Win%  | BE%      | Wilson LB | Margin")
     lines.append("-------|-----|-------|----------|-----------|----------")
 
     all_locked = True
@@ -94,6 +98,41 @@ def build_scoreboard() -> str:
                           for lo, hi in COST_BANDS):
         lines.append("PROJECT KILL: All bands locked. Thesis is dead.")
 
+    # --- S1: SHADOW bands (live-observed with obs_win/obs_loss) ---
+    has_shadow = False
+    shadow_lines = []
+    shadow_lines.append(" SHADOW (observed)")
+    shadow_lines.append(" Band  |  N  | Win%  | Wilson LB")
+    shadow_lines.append("-------|-----|-------|----------")
+    for lo, hi in COST_BANDS:
+        combined = store.query_band_stats_combined(lo, hi)
+        obs_n = combined["obs_n"]
+        if obs_n > 0:
+            has_shadow = True
+        obs_wp = combined["obs_win_pct"]
+        obs_w_lo, _ = wilson_bounds(combined["obs_wins"], obs_n)
+        shadow_lines.append(
+            f" {lo}-{hi}c | {obs_n:3d} | {obs_wp:5.1%} | {obs_w_lo:7.1%}"
+        )
+    shadow_lines.append(f" Combined N per band used for trade-at-size gate")
+    if has_shadow:
+        lines.extend(shadow_lines)
+        lines.append("")
+
+    # --- S4: Weekly drift review (Sunday only) ---
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() == 6:  # Sunday
+        drift = store.query_drift_stats()
+        if drift["win_count"] + drift["loss_count"] > 0:
+            lines.append(" WEEKLY DRIFT REVIEW")
+            lines.append(f" Winners: mean drift={drift['win_mean_drift']:+.1f}c (N={drift['win_count']})")
+            lines.append(f" Losers:  mean drift={drift['loss_mean_drift']:+.1f}c (N={drift['loss_count']})")
+            lines.append(f" Loss by time bucket:")
+            for bucket, count in drift["loss_buckets"].items():
+                lines.append(f"   T-{bucket}s: {count} losses")
+            lines.append("")
+
+    # --- Daily shadow summary ---
     shadow = store.daily_stats("live-observed")
     if shadow["n"] > 0:
         lines.append(f"Shadow: {shadow['n']} observed, "

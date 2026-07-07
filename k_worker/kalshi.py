@@ -213,81 +213,51 @@ class Book:
     no_bid_qty: int = 0
 
 
-def parse_orderbook(ob: Any) -> Book:
-    """Parse orderbook response into Book with best bid/ask and depth at touch."""
-    if not isinstance(ob, dict):
+_ob_shape_logged = False
+
+
+def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:
+    """Fetch and parse orderbook for a ticker.
+
+    Correct endpoint: GET /markets/{ticker}/orderbook
+    Response: {"orderbook": {"yes": [[price, qty], ...], "no": [[price, qty], ...]}}
+    Each side carries BIDS ONLY (reciprocal pricing).
+    """
+    global _ob_shape_logged
+    try:
+        resp = client.request("GET", f"/markets/{ticker}/orderbook")
+    except Exception as e:
+        log.warning(f"[OB] {ticker}: {e}")
         return Book()
 
-    ob_data = ob.get("orderbook", ob)
-    yes_levels = ob_data.get("yes", [])
-    no_levels = ob_data.get("no", [])
+    if not isinstance(resp, dict):
+        return Book()
 
-    def _best_bid_with_qty(levels):
-        if not isinstance(levels, list) or not levels:
+    if not _ob_shape_logged:
+        log.info(f"[OB] shape: {list(resp.keys())}")
+        _ob_shape_logged = True
+
+    ob = resp.get("orderbook") or {}
+    yes_levels = ob.get("yes") or []
+    no_levels = ob.get("no") or []
+
+    def _best_bid(levels):
+        if not levels:
             return None, 0
-        best_p, best_q = None, 0
-        for lv in levels:
-            p, q = None, 0
-            if isinstance(lv, (list, tuple)) and len(lv) >= 1:
-                try:
-                    p = int(lv[0])
-                    q = int(lv[1]) if len(lv) >= 2 else 0
-                except (ValueError, TypeError):
-                    continue
-            elif isinstance(lv, dict):
-                try:
-                    p = int(lv.get("price", lv.get("p", 0)))
-                    q = int(lv.get("quantity", lv.get("q", 0)))
-                except (ValueError, TypeError):
-                    continue
-            if p is not None and 1 <= p <= 99:
-                if best_p is None or p > best_p:
-                    best_p, best_q = p, q
-        return best_p, best_q
+        best = max(levels, key=lambda l: l[0])
+        return int(best[0]), int(best[1]) if len(best) >= 2 else 0
 
-    def _best_ask(levels):
-        if not isinstance(levels, list) or not levels:
-            return None
-        asks = []
-        for lv in levels:
-            p = None
-            if isinstance(lv, (list, tuple)) and len(lv) >= 1:
-                try:
-                    p = int(lv[0])
-                except (ValueError, TypeError):
-                    continue
-            elif isinstance(lv, dict):
-                try:
-                    p = int(lv.get("price", lv.get("p", 0)))
-                except (ValueError, TypeError):
-                    continue
-            if p is not None and 1 <= p <= 99:
-                asks.append(p)
-        return min(asks) if asks else None
+    yes_bid, yes_bid_qty = _best_bid(yes_levels) if yes_levels else (None, 0)
+    no_bid, no_bid_qty = _best_bid(no_levels) if no_levels else (None, 0)
 
-    yes_bid, yes_bid_qty = _best_bid_with_qty(yes_levels)
-    no_bid, no_bid_qty = _best_bid_with_qty(no_levels)
-
-    _no_ask_raw = _best_ask(no_levels)
-    _yes_ask_raw = _best_ask(yes_levels)
-    yes_ask = (100 - _no_ask_raw) if _no_ask_raw is not None else None
-    no_ask = (100 - _yes_ask_raw) if _yes_ask_raw is not None else None
+    yes_ask = (100 - no_bid) if no_bid is not None else None
+    no_ask = (100 - yes_bid) if yes_bid is not None else None
 
     return Book(
         yes_bid=yes_bid, yes_ask=yes_ask,
         no_bid=no_bid, no_ask=no_ask,
         yes_bid_qty=yes_bid_qty, no_bid_qty=no_bid_qty,
     )
-
-
-def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:
-    """Fetch and parse orderbook for a ticker."""
-    try:
-        ob = client.request("GET", f"/orderbook/v2/{ticker}")
-        return parse_orderbook(ob)
-    except Exception as e:
-        log.warning(f"[OB] {ticker}: {e}")
-        return Book()
 
 
 # ── Positions ────────────────────────────────────────────────────

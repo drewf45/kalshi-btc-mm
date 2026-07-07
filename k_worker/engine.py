@@ -6,9 +6,13 @@ No chase, no scorer, no probability model — cost IS the signal.
 Unfilled at T-10s -> cancel, log SKIP NO_FILL.
 """
 
+import os
 import time
 import logging
+import threading
 from typing import Optional, Tuple, Dict
+
+import requests as _requests
 
 from . import kalshi, store, gateway, discipline, notify
 
@@ -27,17 +31,30 @@ def set_observe_mode(enabled: bool) -> None:
     _observe_mode = enabled
 
 HEARTBEAT_FILE = "/tmp/k_worker_heartbeat"
+HEARTBEAT_PING_URL = os.environ.get("HEARTBEAT_PING_URL", "").strip()
+_PING_THROTTLE_SEC = 60
 _heartbeat_ts: float = 0.0
+_last_ping_ts: float = 0.0
 
 
 def heartbeat():
-    global _heartbeat_ts
+    global _heartbeat_ts, _last_ping_ts
     _heartbeat_ts = time.time()
     try:
         with open(HEARTBEAT_FILE, "w") as f:
             f.write(str(_heartbeat_ts))
     except Exception:
         pass
+    if HEARTBEAT_PING_URL and (_heartbeat_ts - _last_ping_ts) >= _PING_THROTTLE_SEC:
+        _last_ping_ts = _heartbeat_ts
+        threading.Thread(target=_ping, daemon=True).start()
+
+
+def _ping():
+    try:
+        _requests.post(HEARTBEAT_PING_URL, timeout=2)
+    except Exception as e:
+        log.warning(f"[HEARTBEAT] Ping failed: {e}")
 
 
 def get_heartbeat_ts() -> float:
@@ -263,9 +280,12 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
     store.update_fill(row_id, fill_cost, time.time(), slippage, fee_cents)
     log.info(f"[ENGINE] FILLED {ticker} {eval_result.side} @ {fill_cost}c fee={fee_cents}c")
 
+    bal_cash, bal_pv = kalshi.get_balance(client)
+    bal_line = f"Balance: ${(bal_cash or 0) + (bal_pv or 0):.2f}" if bal_cash is not None else "Balance: unknown"
     notify.send(
         f"<b>FILL</b> {ticker}\n"
-        f"{eval_result.side.upper()} @ {fill_cost}c | fee={fee_cents}c"
+        f"{eval_result.side.upper()} @ {fill_cost}c | fee={fee_cents}c\n"
+        f"{bal_line}"
     )
 
     # Post-fill drift check (10s after fill)
@@ -317,14 +337,16 @@ def _wait_for_settlement(client: kalshi.KalshiClient, ticker: str,
                 discipline.record_loss()
 
             store.update_settlement(row_id, resolution, pnl, time.time())
-            emoji = "+" if won else "-"
             log.warning(
                 f"[ENGINE] SETTLED {ticker} → {result.upper()} "
                 f"{'WIN' if won else 'LOSS'} pnl=${pnl:+.2f}"
             )
+            bal_cash, bal_pv = kalshi.get_balance(client)
+            bal_line = f"Balance: ${(bal_cash or 0) + (bal_pv or 0):.2f}" if bal_cash is not None else "Balance: unknown"
             notify.send(
                 f"<b>{'WIN' if won else 'LOSS'}</b> {ticker}\n"
-                f"Result: {result.upper()} | PnL: ${pnl:+.2f}"
+                f"Result: {result.upper()} | PnL: ${pnl:+.2f}\n"
+                f"{bal_line}"
             )
             return resolution
 

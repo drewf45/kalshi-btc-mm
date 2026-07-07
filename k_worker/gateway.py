@@ -304,6 +304,15 @@ def submit(client: kalshi.KalshiClient, ticker: str,
             f"cost={eval_result.cost_cents}¢ rest@{rest_price}¢ "
             f"why={eval_result.why_tag} oid={order_id}"
         )
+        # T2: trade confirmation with balance
+        from . import notify
+        bal_cash, bal_pv = kalshi.get_balance(client)
+        bal_line = f"Balance: ${(bal_cash or 0) + (bal_pv or 0):.2f}" if bal_cash is not None else "Balance: unknown"
+        notify.send(
+            f"<b>ORDER PLACED</b> {ticker}\n"
+            f"{eval_result.side.upper()} {eval_result.cost_cents}c | why={eval_result.why_tag}\n"
+            f"{bal_line}"
+        )
         return order_id, row_id
     except Exception as e:
         log.error(f"[GATEWAY] Order failed: {e}")
