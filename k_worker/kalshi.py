@@ -302,13 +302,38 @@ def position_for_market(client: KalshiClient, ticker: str) -> int:
 
 # ── Orders ───────────────────────────────────────────────────────
 
+_ORDERS_ROUTE_CANDIDATES = ["/portfolio/orders", "/portfolio/events/orders"]
+_orders_route: str = "/portfolio/orders"
+
+
+def probe_orders_route(client: KalshiClient) -> str:
+    """Probe orders-list route at boot — FATAL if neither candidate works."""
+    global _orders_route
+    for route in _ORDERS_ROUTE_CANDIDATES:
+        try:
+            client.request("GET", route, params={"limit": 1})
+            _orders_route = route
+            log.warning(f"[ORDERS] Route probe: {route} ✓")
+            return route
+        except Exception as e:
+            log.warning(f"[ORDERS] Route probe: {route} ✗ ({e})")
+    raise RuntimeError("FATAL: no orders-list route responded")
+
+
 def cancel_order(client: KalshiClient, order_id: str) -> str:
     try:
         client.request("DELETE", f"/portfolio/events/orders/{order_id}")
         return "canceled"
     except RuntimeError as e:
         if "HTTP 404" in str(e):
-            return "not_found"
+            try:
+                client.request("DELETE", f"{_orders_route}/{order_id}")
+                log.warning(f"[CANCEL] Fallback route {_orders_route}/{order_id} succeeded (migration)")
+                return "canceled"
+            except RuntimeError as e2:
+                if "HTTP 404" in str(e2):
+                    return "not_found"
+                raise
         raise
 
 
@@ -317,7 +342,7 @@ def cancel_all_for_market(client: KalshiClient, ticker: str) -> int:
     Returns count cancelled, or -1 if cancellation state is unknown."""
     cancelled = 0
     try:
-        resp = client.request("GET", "/portfolio/events/orders",
+        resp = client.request("GET", _orders_route,
                               params={"ticker": ticker, "status": "resting", "limit": 200})
     except Exception as e:
         log.error(f"[CANCEL] Failed to list orders for {ticker}: {e}")
@@ -360,18 +385,51 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
     """Parse a Kalshi fill into (cost_cents, fee_cents, count) for our_side.
 
     Kalshi fills carry yes_price/no_price. We map to cost for our held side.
+    Unwraps one level if nested under 'fill'/'order'. Tries extended key
+    candidates (yes_price_cents, price_cents, yes_price_dollars).
     Returns (None, fee, count) if price is unparseable — caller uses fallback.
     Logs the raw fill dict once on first parse failure (self-diagnosing).
     """
     global _fill_parse_warned
     from decimal import Decimal
 
+    inner = fill
+    for wrap_key in ("fill", "order"):
+        if isinstance(fill.get(wrap_key), dict):
+            inner = fill[wrap_key]
+            break
+    dicts = [inner, fill] if inner is not fill else [fill]
+
+    def _get(key):
+        for d in dicts:
+            v = d.get(key)
+            if v is not None:
+                return v
+        return None
+
+    def _to_cents(raw):
+        if raw is None:
+            return None
+        try:
+            val = Decimal(str(raw))
+            return float(val * 100) if val < 1 else float(val)
+        except Exception:
+            return None
+
+    def _raw_cents(raw):
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
     cost_cents = None
     fee_cents = 0
     count = 1
 
     for ck in ("count", "quantity", "qty"):
-        raw = fill.get(ck)
+        raw = _get(ck)
         if raw is not None:
             try:
                 count = int(raw)
@@ -379,57 +437,59 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
                 pass
             break
 
+    YES_DOLLAR_KEYS = ("yes_price", "yes_price_dollars")
+    NO_DOLLAR_KEYS = ("no_price", "no_price_dollars")
+
     if our_side == "yes":
-        raw = fill.get("yes_price")
-        if raw is not None:
-            try:
-                val = Decimal(str(raw))
-                cost_cents = float(val * 100) if val < 1 else float(val)
-            except Exception:
-                pass
+        for k in YES_DOLLAR_KEYS:
+            cost_cents = _to_cents(_get(k))
+            if cost_cents is not None:
+                break
         if cost_cents is None:
-            raw = fill.get("no_price")
-            if raw is not None:
-                try:
-                    val = Decimal(str(raw))
-                    no_c = float(val * 100) if val < 1 else float(val)
+            cost_cents = _raw_cents(_get("yes_price_cents"))
+        if cost_cents is None:
+            for k in NO_DOLLAR_KEYS:
+                no_c = _to_cents(_get(k))
+                if no_c is not None:
                     cost_cents = 100 - no_c
-                except Exception:
-                    pass
-    else:
-        raw = fill.get("no_price")
-        if raw is not None:
-            try:
-                val = Decimal(str(raw))
-                cost_cents = float(val * 100) if val < 1 else float(val)
-            except Exception:
-                pass
+                    break
         if cost_cents is None:
-            raw = fill.get("yes_price")
-            if raw is not None:
-                try:
-                    val = Decimal(str(raw))
-                    yes_c = float(val * 100) if val < 1 else float(val)
+            no_c = _raw_cents(_get("no_price_cents"))
+            if no_c is not None:
+                cost_cents = 100 - no_c
+    else:
+        for k in NO_DOLLAR_KEYS:
+            cost_cents = _to_cents(_get(k))
+            if cost_cents is not None:
+                break
+        if cost_cents is None:
+            cost_cents = _raw_cents(_get("no_price_cents"))
+        if cost_cents is None:
+            for k in YES_DOLLAR_KEYS:
+                yes_c = _to_cents(_get(k))
+                if yes_c is not None:
                     cost_cents = 100 - yes_c
-                except Exception:
-                    pass
+                    break
+        if cost_cents is None:
+            yes_c = _raw_cents(_get("yes_price_cents"))
+            if yes_c is not None:
+                cost_cents = 100 - yes_c
 
     if cost_cents is None:
-        raw = fill.get("price")
-        if raw is not None:
-            try:
-                val = Decimal(str(raw))
-                yes_c = float(val * 100) if val < 1 else float(val)
-                cost_cents = yes_c if our_side == "yes" else (100 - yes_c)
-            except Exception:
-                pass
+        val = _to_cents(_get("price"))
+        if val is not None:
+            cost_cents = val if our_side == "yes" else (100 - val)
+    if cost_cents is None:
+        pc = _raw_cents(_get("price_cents"))
+        if pc is not None:
+            cost_cents = pc if our_side == "yes" else (100 - pc)
 
     if cost_cents is None and not _fill_parse_warned:
         log.warning(f"[FILLS] Unparsed fill record (raw): {fill}")
         _fill_parse_warned = True
 
     for fee_key in ("fee", "taker_fee", "maker_fee"):
-        raw = fill.get(fee_key)
+        raw = _get(fee_key)
         if raw is not None:
             try:
                 val = Decimal(str(raw))
@@ -439,6 +499,30 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
             break
 
     return cost_cents, fee_cents, count
+
+
+def parse_fills(fill_records: list, our_side: str) -> Tuple[Optional[float], int, int]:
+    """Parse multiple fill records into (avg_cost_cents, total_fee_cents, total_count).
+    Computes count-weighted average cost across records for partial fills."""
+    if not fill_records:
+        return None, 0, 0
+
+    weighted_cost = 0.0
+    parsed_count = 0
+    total_fee = 0
+    total_count = 0
+
+    for fr in fill_records:
+        cost, fee, cnt = parse_fill(fr, our_side)
+        total_fee += fee
+        total_count += cnt
+        if cost is not None:
+            weighted_cost += cost * cnt
+            parsed_count += cnt
+
+    if parsed_count > 0:
+        return weighted_cost / parsed_count, total_fee, total_count
+    return None, total_fee, total_count
 
 
 _resting_shape_logged = False
@@ -468,7 +552,7 @@ def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
 
     # 2. Orders list — read the order's OWN status field, not just list membership
     try:
-        resp = client.request("GET", "/portfolio/events/orders",
+        resp = client.request("GET", _orders_route,
                               params={"ticker": ticker, "limit": 200})
     except Exception as e:
         raise OrderStatusUnavailable(f"orders list failed for {ticker}: {e}") from e

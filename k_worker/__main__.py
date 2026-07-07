@@ -150,7 +150,7 @@ def _reconcile_fills(client: kalshi.KalshiClient) -> int:
                         f"ticker={ticker} oid={order_id} — upgrading")
             store.clear_resolution(row_id)
             fills = fill_by_oid[order_id]
-            fill_cost, fc, _ = kalshi.parse_fill(fills[0], side or "yes")
+            fill_cost, fc, _ = kalshi.parse_fills(fills, side or "yes")
             if fill_cost is None:
                 fill_cost = cost_cents or 0
             store.update_fill(row_id, fill_cost, time.time(), 0, fc)
@@ -181,14 +181,16 @@ def _run_census(client: kalshi.KalshiClient) -> None:
             env="live-observed",
         ))
     total = len(settled)
-    n_covered = total - len(missed)
+    seen_live = len(covered)
+    explained_missed = len(missed)
     store.set_state("census_total", str(total))
-    store.set_state("census_covered", str(n_covered))
+    store.set_state("census_covered", str(seen_live))
+    store.set_state("census_missed", str(explained_missed))
     if missed:
-        log.warning(f"[CENSUS] Coverage {n_covered}/{total} — missed: {missed[:5]}")
-        notify.alert(f"Census: {len(missed)} missed windows — coverage {n_covered}/{total}")
+        log.warning(f"[CENSUS] {seen_live} seen-live / {explained_missed} explained-missed / {total} total — missed: {missed[:5]}")
+        notify.alert(f"Census: {explained_missed} missed windows — {seen_live}/{total} seen-live")
     else:
-        log.info(f"[CENSUS] Coverage {n_covered}/{total} ✓")
+        log.info(f"[CENSUS] {seen_live}/{total} seen-live ✓")
 
 
 def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
@@ -297,9 +299,10 @@ def main():
 
     envcheck.check_clock_skew()
 
-    # 5b. Fills route probe — FATAL if no working route
+    # 5b. Route probes — FATAL if no working route
     fills_route = kalshi.probe_fills_route(client)
-    notify.send(f"Fills route probe: {fills_route} ✓")
+    orders_route = kalshi.probe_orders_route(client)
+    notify.send(f"Route probes: fills {fills_route} ✓ | orders {orders_route} ✓")
 
     # 5c. Boot reconcile — Drew's law: never trust stored treasury across deploys
     boot_reconcile(client)

@@ -750,12 +750,14 @@ def query_median_depth() -> Optional[int]:
 
 
 def get_covered_tickers_today() -> set:
-    """Return set of KXBTC15M tickers with at least one surface row today."""
+    """Return set of KXBTC15M tickers seen live today.
+    Excludes MISSED_UNSEEN rows (census markers don't count as coverage)."""
     today_start = et_midnight_ts()
     with _lock:
         rows = _conn.execute(
             """SELECT DISTINCT market_ticker FROM surface
-               WHERE market_ticker LIKE 'KXBTC15M%' AND decision_ts >= ?""",
+               WHERE market_ticker LIKE 'KXBTC15M%' AND decision_ts >= ?
+               AND COALESCE(why_tag, '') != 'MISSED_UNSEEN'""",
             (today_start,),
         ).fetchall()
     return {r[0] for r in rows}

@@ -549,7 +549,7 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
     fee_cents = 0
 
     if fill_records:
-        fill_cost, fee_cents, _ = kalshi.parse_fill(fill_records[0], eval_result.side)
+        fill_cost, fee_cents, _ = kalshi.parse_fills(fill_records, eval_result.side)
 
     if fill_cost is None:
         fill_cost = eval_result.cost_exact or eval_result.cost_cents

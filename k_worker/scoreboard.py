@@ -210,8 +210,12 @@ def build_scoreboard() -> str:
     # --- CENSUS COVERAGE ---
     census_total = store.get_state("census_total")
     census_covered = store.get_state("census_covered")
+    census_missed = store.get_state("census_missed")
     if census_total and census_covered:
-        lines.append(f" Coverage: {census_covered}/{census_total} windows")
+        cov_line = f" Coverage: {census_covered} seen-live / {census_total} total"
+        if census_missed and int(census_missed) > 0:
+            cov_line += f" ({census_missed} explained-missed)"
+        lines.append(cov_line)
         lines.append("")
 
     # --- Daily shadow summary ---
