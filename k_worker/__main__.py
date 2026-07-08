@@ -401,6 +401,7 @@ def main():
     store.init_db()
     store.dedup_historical_skips()
     store.recompute_missing_pnl()
+    store.migrate_lanes()
 
     # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()

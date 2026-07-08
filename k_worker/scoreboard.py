@@ -17,11 +17,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 
-from . import store, notify, treasury
+from . import store, notify, treasury, gateway
 
 log = logging.getLogger("k_worker.scoreboard")
 
-COST_BANDS = [
+F_COST_BANDS = [
     (95, 95), (96, 96), (97, 97), (98, 98), (99, 99),
 ]
 
@@ -37,6 +37,22 @@ def wilson_bounds(wins: int, n: int, z: float = 1.96) -> tuple:
     return max(0.0, centre - spread), min(1.0, centre + spread)
 
 
+def _lane_daily(lane: str) -> dict:
+    """Today's W/L for a specific lane."""
+    today_start = store.et_midnight_ts()
+    with store._lock:
+        rows = store._conn.execute(
+            """SELECT resolution, pnl_net FROM surface
+               WHERE lane=? AND action='ENTER' AND decision_ts >= ?
+               AND resolution IN ('win', 'loss')""",
+            (lane, today_start),
+        ).fetchall()
+    wins = sum(1 for r in rows if r[0] == "win")
+    losses = sum(1 for r in rows if r[0] == "loss")
+    pnl = sum(r[1] or 0 for r in rows)
+    return {"wins": wins, "losses": losses, "n": wins + losses, "pnl": pnl}
+
+
 def build_scoreboard() -> str:
     """Build the daily scoreboard string."""
     lines = []
@@ -48,14 +64,17 @@ def build_scoreboard() -> str:
                  f"W/L={daily['wins']}/{daily['losses']}, "
                  f"net=${daily['net_pnl']:.2f}, fees=${daily['total_fees']:.2f}")
 
-    # --- TRADED bands ---
-    lines.append("\n TRADED")
+    # === LANE F (LIVE) ===
+    f_daily = _lane_daily("F")
+    kill_f = store.query_lane_losses_recent("F", 3600)
+    lines.append(f"\n LANE F (LIVE) W/L={f_daily['wins']}/{f_daily['losses']} "
+                 f"net=${f_daily['pnl']:.2f} | kill {kill_f}/3")
     lines.append(" Band  |  N  | Win%  | BE%      | Wilson LB | Margin")
     lines.append("-------|-----|-------|----------|-----------|----------")
 
     all_locked = True
-    for lo, hi in COST_BANDS:
-        stats = store.query_band_stats(lo, hi, "live-traded")
+    for lo, hi in F_COST_BANDS:
+        stats = store.query_band_stats(lo, hi, "live-traded", "F")
         n = stats["n"]
         wp = stats["win_pct"]
         be = lo / 100.0
@@ -94,17 +113,40 @@ def build_scoreboard() -> str:
 
     lines.append("")
 
-    if all_locked and any(store.query_band_stats(lo, hi, "live-traded")["n"] >= 200
-                          for lo, hi in COST_BANDS):
-        lines.append("PROJECT KILL: All bands locked. Thesis is dead.")
+    if all_locked and any(store.query_band_stats(lo, hi, "live-traded", "F")["n"] >= 200
+                          for lo, hi in F_COST_BANDS):
+        lines.append("PROJECT KILL: All F bands locked. Thesis is dead.")
 
-    # --- S1: SHADOW bands ---
+    # === LANE H8 (LIVE) ===
+    h8_daily = _lane_daily("H8")
+    kill_h8 = store.query_lane_losses_recent("H8", 3600)
+    h8_cells = store.query_h8_grid()
+    if h8_cells or h8_daily["n"] > 0:
+        lines.append(f" LANE H8 (LIVE) W/L={h8_daily['wins']}/{h8_daily['losses']} "
+                     f"net=${h8_daily['pnl']:.2f} | kill {kill_h8}/3 | "
+                     f"budget ${store.query_h8_probe_daily()['at_risk']:.2f}/"
+                     f"${gateway.LANES['H8']['daily_budget']:.2f}")
+        if h8_cells:
+            lines.append(" Cost     | Dist  | Time     |  N  | Win%  | BE%  | WLB")
+            lines.append("----------|-------|----------|-----|-------|------|------")
+            for c in h8_cells:
+                w_lo, _ = wilson_bounds(c["wins"], c["n"])
+                lines.append(
+                    f" {c['cost']:>8s} | {c['dist']:>5s} | {c['time']:>8s} | "
+                    f"{c['n']:3d} | {c['win_pct']:5.1%} | {c['be']:.0%} | {w_lo:5.1%}"
+                )
+        lines.append("")
+
+    # === LANE MM (SHADOW) — placeholder ===
+    # === LANE D (SHADOW) — placeholder ===
+
+    # --- F SHADOW (observed) ---
     has_shadow = False
     shadow_lines = []
-    shadow_lines.append(" SHADOW (observed)")
+    shadow_lines.append(" F SHADOW (observed)")
     shadow_lines.append(" Band  |  N  | Win%  | Wilson LB")
     shadow_lines.append("-------|-----|-------|----------")
-    for lo, hi in COST_BANDS:
+    for lo, hi in F_COST_BANDS:
         combined = store.query_band_stats_combined(lo, hi)
         obs_n = combined["obs_n"]
         if obs_n > 0:
@@ -117,20 +159,6 @@ def build_scoreboard() -> str:
     shadow_lines.append(f" Combined N per band used for trade-at-size gate")
     if has_shadow:
         lines.extend(shadow_lines)
-        lines.append("")
-
-    # --- H8 GRID (Fix 4) ---
-    h8_cells = store.query_h8_grid()
-    if h8_cells:
-        lines.append(" H8 GRID (decided-but-unconverged)")
-        lines.append(" Cost     | Dist  | Time     |  N  | Win%  | BE%  | WLB")
-        lines.append("----------|-------|----------|-----|-------|------|------")
-        for c in h8_cells:
-            w_lo, _ = wilson_bounds(c["wins"], c["n"])
-            lines.append(
-                f" {c['cost']:>8s} | {c['dist']:>5s} | {c['time']:>8s} | "
-                f"{c['n']:3d} | {c['win_pct']:5.1%} | {c['be']:.0%} | {w_lo:5.1%}"
-            )
         lines.append("")
 
     # --- CLIP BY TIME BAND (H10/Yogi-Berra) ---
@@ -152,7 +180,7 @@ def build_scoreboard() -> str:
         lines.append(f" Median depth at touch: {med_depth} contracts")
         lines.append("")
 
-    # --- CAUTION LEDGER (Fix 5) ---
+    # --- CAUTION LEDGER ---
     caution = store.query_caution_ledger()
     if caution["n"] > 0:
         lines.append(" CAUTION LEDGER (today)")
@@ -163,7 +191,7 @@ def build_scoreboard() -> str:
         lines.append(f"  Took loss:       ${caution['took_loss']:.2f}")
         lines.append("")
 
-    # --- CONTEXT TABLE (Fix 5) ---
+    # --- CONTEXT TABLE ---
     ctx = store.query_context_stats()
     if ctx["sessions"]:
         lines.append(" CONTEXT: Sessions")

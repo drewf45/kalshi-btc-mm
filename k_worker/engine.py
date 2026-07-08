@@ -23,13 +23,20 @@ from . import kalshi, store, gateway, discipline, notify, treasury
 log = logging.getLogger("k_worker.engine")
 
 ENTRY_WINDOW_SEC = 180
+WATCH_WINDOW_SEC = 900
 CANCEL_BEFORE_EXPIRY_SEC = 10
 POLL_INTERVAL_SEC = 5
 MAX_REPRICES_LOW_BAND = 1
 MAX_SUBMIT_ATTEMPTS = 2
 TELEGRAM_PER_MARKET = os.environ.get("TELEGRAM_PER_MARKET", "1").strip() == "1"
 
-T_BANDS = [(180, 120), (120, 60), (60, 10)]
+T_BANDS = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
+
+CONFIRM_LADDER = [
+    {"lo_sec": 600, "hi_sec": 900, "floor_cents": 99, "confirms": 9},
+    {"lo_sec": 300, "hi_sec": 600, "floor_cents": 98, "confirms": 6},
+    {"lo_sec": 180, "hi_sec": 300, "floor_cents": 97, "confirms": 3},
+]
 
 _observe_mode = False
 _submit_attempts: Dict[str, int] = {}
@@ -188,14 +195,15 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         _send_market_line(f"⏭ {_time_et()} SKIP_HALTED | Bal ?")
         return "halted"
 
-    # Phase 1: Wait for entry window
+    # Phase 1: Watch-confirm ladder (T-900 to T-180) then final window (T-180)
+    watch_start = close_ts - WATCH_WINDOW_SEC
     entry_time = close_ts - ENTRY_WINDOW_SEC
-    if now < entry_time:
-        wait = entry_time - now
+    if now < watch_start:
+        wait = watch_start - now
         if wait > 300:
-            log.info(f"[ENGINE] {ticker} closes in {secs_to_expiry:.0f}s, entry window in {wait:.0f}s — too far out")
+            log.info(f"[ENGINE] {ticker} closes in {secs_to_expiry:.0f}s, watch window in {wait:.0f}s — too far out")
             return "too_early"
-        log.info(f"[ENGINE] Waiting {wait:.0f}s for entry window on {ticker}")
+        log.info(f"[ENGINE] Waiting {wait:.0f}s for watch window on {ticker}")
         _wait_with_heartbeat(wait)
 
     heartbeat()
@@ -212,43 +220,65 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         log.info(f"[ENGINE] {ticker} too close to expiry ({secs_to_expiry:.0f}s)")
         return "expired"
 
-    # Phase 2: Fetch book, spot, boundaries, evaluate
-    book = kalshi.fetch_orderbook(client, ticker)
-    cash, pv = kalshi.get_balance(client)
-    if cash is None:
-        store.insert_row(store.SurfaceRow(
-            market_ticker=ticker, decision_ts=time.time(), action="SKIP",
-            seconds_to_expiry=secs_to_expiry,
-            skip_reason="BALANCE_UNREADABLE", why_tag="SKIP_BALANCE_UNREADABLE",
-            env="live-observed",
-        ))
-        log.warning(f"[ENGINE] Cannot read balance — skipping {ticker}")
-        _send_market_line(f"⏭ {_time_et()} SKIP_BALANCE (unreadable) | Bal ?")
-        return "no_balance"
+    # Watch-confirm ladder: try each tier before the final window
+    ladder_result = None
+    if secs_to_expiry > ENTRY_WINDOW_SEC:
+        ladder_result = _run_watch_ladder(client, ticker, close_ts, market_obj)
+        if ladder_result is not None:
+            # Ladder passed — proceed directly to submit with this eval
+            eval_result, book, cash, pv, spot, session_tag, vol_regime = ladder_result
+            spread = _compute_spread(eval_result, book)
+            boundary_lo = eval_result.boundary_lo
+            boundary_hi = eval_result.boundary_hi
+        else:
+            # No tier passed — fall through to final window
+            heartbeat()
+            now = time.time()
+            secs_to_expiry = close_ts - now
+            if secs_to_expiry < CANCEL_BEFORE_EXPIRY_SEC:
+                return "expired"
 
-    if not _observe_mode:
-        discipline.check_drawdown(cash)
-        if discipline.is_halted():
-            return "halted"
+    if ladder_result is None:
+        # Phase 2: Final window — existing single-evaluation behavior
+        if now < entry_time:
+            wait = entry_time - now
+            if wait > 0:
+                _wait_with_heartbeat(wait)
+            heartbeat()
+            now = time.time()
+            secs_to_expiry = close_ts - now
 
-    # Fix 4: Spot + boundaries
-    spot = kalshi.get_btc_spot()
-    if spot is not None:
-        _record_spot(spot)
-    boundary_lo, boundary_hi = kalshi.extract_boundaries(market_obj)
+        book = kalshi.fetch_orderbook(client, ticker)
+        cash, pv = kalshi.get_balance(client)
+        if cash is None:
+            store.insert_row(store.SurfaceRow(
+                market_ticker=ticker, decision_ts=time.time(), action="SKIP",
+                seconds_to_expiry=secs_to_expiry,
+                skip_reason="BALANCE_UNREADABLE", why_tag="SKIP_BALANCE_UNREADABLE",
+                env="live-observed",
+            ))
+            log.warning(f"[ENGINE] Cannot read balance — skipping {ticker}")
+            _send_market_line(f"⏭ {_time_et()} SKIP_BALANCE (unreadable) | Bal ?")
+            return "no_balance"
 
-    session_tag = _current_session()
-    vol_regime = _vol_regime()
+        if not _observe_mode:
+            discipline.check_drawdown(cash)
+            if discipline.is_halted():
+                return "halted"
 
-    eval_result = gateway.evaluate(ticker, book, secs_to_expiry, cash,
-                                    spot=spot, boundary_lo=boundary_lo,
-                                    boundary_hi=boundary_hi)
+        spot = kalshi.get_btc_spot()
+        if spot is not None:
+            _record_spot(spot)
+        boundary_lo, boundary_hi = kalshi.extract_boundaries(market_obj)
 
-    spread = None
-    if eval_result.side == "yes" and book.yes_bid is not None and book.yes_ask is not None:
-        spread = book.yes_ask - book.yes_bid
-    elif eval_result.side == "no" and book.no_bid is not None and book.no_ask is not None:
-        spread = book.no_ask - book.no_bid
+        session_tag = _current_session()
+        vol_regime = _vol_regime()
+
+        eval_result = gateway.evaluate(ticker, book, secs_to_expiry, cash,
+                                        spot=spot, boundary_lo=boundary_lo,
+                                        boundary_hi=boundary_hi)
+
+        spread = _compute_spread(eval_result, book)
 
     if not eval_result.allowed:
         ck = _cell_key(ticker, eval_result.cost_exact, secs_to_expiry)
@@ -283,7 +313,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         cost_str = f"{eval_result.cost_exact or eval_result.cost_cents}¢" if eval_result.cost_exact or eval_result.cost_cents else "?¢"
         tag = eval_result.why_tag or eval_result.reject_code
         bal = _bal_from(cash, pv)
-        prefix = "\U0001f9ea " if eval_result.lane == "h8_probe" else "⏭ "
+        prefix = "\U0001f9ea " if eval_result.lane == "H8" else "⏭ "
         _send_market_line(f"{prefix}{_time_et()} {tag} (fav {side_str} {cost_str} @T-{int(secs_to_expiry)}) | {bal}")
         return f"skip:{eval_result.reject_code}"
 
@@ -319,7 +349,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         log.info(f"[ENGINE] OBSERVE {ticker}: would ENTER {eval_result.side} @ {eval_result.cost_exact}c")
         side_str = eval_result.side.upper() if eval_result.side else "?"
         bal = _bal_from(cash, pv)
-        prefix = "\U0001f9ea " if eval_result.lane == "h8_probe" else "\U0001f441 "
+        prefix = "\U0001f9ea " if eval_result.lane == "H8" else "\U0001f441 "
         _send_market_line(
             f"{prefix}{_time_et()} OBSERVE {eval_result.why_tag} "
             f"(fav {side_str} {eval_result.cost_exact}¢ @T-{int(secs_to_expiry)}) | {bal}"
@@ -392,7 +422,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     bal = _bal_str(client)
     ts = _time_et()
     tag = eval_result.why_tag
-    prefix = "\U0001f9ea " if eval_result.lane == "h8_probe" else ""
+    prefix = "\U0001f9ea " if eval_result.lane == "H8" else ""
 
     if outcome == "no_fill":
         _send_market_line(f"{prefix}\U0001f7e1 {ts} NO_FILL {tag} rested {eval_result.cost_exact}¢, uncrossed | {bal}")
@@ -419,6 +449,132 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
 
     heartbeat()
     return outcome
+
+
+def _compute_spread(eval_result: gateway.EvalResult, book: kalshi.Book) -> Optional[int]:
+    if eval_result.side == "yes" and book.yes_bid is not None and book.yes_ask is not None:
+        return book.yes_ask - book.yes_bid
+    elif eval_result.side == "no" and book.no_bid is not None and book.no_ask is not None:
+        return book.no_ask - book.no_bid
+    return None
+
+
+def _run_watch_ladder(client: kalshi.KalshiClient, ticker: str,
+                      close_ts: int, market_obj: Dict) -> Optional[tuple]:
+    """Watch-confirm ladder (T-900 to T-180). Returns (eval_result, book, cash, pv,
+    spot, session_tag, vol_regime) when a tier passes, or None if all tiers expire.
+    R2: rejects if the counterparty side stays empty throughout a tier."""
+    confirm_count = 0
+    watch_side = None
+    last_tier_idx = -1
+    no_counterparty_ticks = 0
+
+    while True:
+        heartbeat()
+        now = time.time()
+        secs_left = close_ts - now
+
+        if secs_left <= ENTRY_WINDOW_SEC:
+            return None
+        if secs_left < CANCEL_BEFORE_EXPIRY_SEC:
+            return None
+
+        # Determine current tier
+        tier_idx = None
+        tier = None
+        for i, t in enumerate(CONFIRM_LADDER):
+            if t["lo_sec"] <= secs_left < t["hi_sec"]:
+                tier_idx = i
+                tier = t
+                break
+
+        if tier is None:
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        # Reset on tier change
+        if tier_idx != last_tier_idx:
+            confirm_count = 0
+            watch_side = None
+            no_counterparty_ticks = 0
+            last_tier_idx = tier_idx
+
+        book = kalshi.fetch_orderbook(client, ticker)
+        side, cost_d, yes_quote, fp_str = gateway._favorite_side(book)
+
+        if side is None or cost_d is None:
+            confirm_count = 0
+            watch_side = None
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        # R2: Counterparty liquidity check
+        has_counterparty = True
+        if side == "yes" and book.no_bid is None:
+            has_counterparty = False
+        elif side == "no" and book.yes_bid is None:
+            has_counterparty = False
+        if not has_counterparty:
+            no_counterparty_ticks += 1
+            confirm_count = 0
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        cost_int = int(cost_d)
+
+        # Dropout: side flip resets counter
+        if side != watch_side:
+            confirm_count = 0
+            watch_side = side
+
+        # Dropout: below tier floor resets counter
+        if cost_int < tier["floor_cents"]:
+            confirm_count = 0
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        # Must also be in the main band (95-99)
+        if not (gateway.COST_BAND_LO_INT <= cost_int <= gateway.COST_BAND_HI_INT):
+            confirm_count = 0
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        confirm_count += 1
+
+        if confirm_count >= tier["confirms"]:
+            # Tier passed — run full evaluate
+            cash, pv = kalshi.get_balance(client)
+            if cash is None:
+                log.warning(f"[ENGINE] Watch ladder: balance unreadable at confirm")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            if not _observe_mode:
+                discipline.check_drawdown(cash)
+                if discipline.is_halted():
+                    return None
+
+            spot = kalshi.get_btc_spot()
+            if spot is not None:
+                _record_spot(spot)
+            boundary_lo, boundary_hi = kalshi.extract_boundaries(market_obj)
+
+            eval_result = gateway.evaluate(ticker, book, secs_left, cash,
+                                            spot=spot, boundary_lo=boundary_lo,
+                                            boundary_hi=boundary_hi)
+
+            if eval_result.allowed:
+                # Enrich why_tag with confirmation count
+                eval_result.why_tag = (f"{eval_result.why_tag}"
+                                       f"_confirms_{confirm_count}/{tier['confirms']}")
+                session_tag = _current_session()
+                vol_regime = _vol_regime()
+                log.warning(f"[ENGINE] Watch ladder tier {tier_idx} passed: "
+                            f"{ticker} {side} {cost_int}c "
+                            f"confirms {confirm_count}/{tier['confirms']}")
+                return (eval_result, book, cash, pv, spot, session_tag, vol_regime)
+
+        time.sleep(POLL_INTERVAL_SEC)
 
 
 def _wait_with_heartbeat(seconds: float):
@@ -517,7 +673,7 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             notify.alert(f"Partial fill at 1ct?! fill_count={fc_str} on resting order {raw}")
 
         # Reprice gate: check fills before cancel+replace (prevents double-entry B5)
-        if eval_result.lane == "main" and not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
+        if eval_result.lane == "F" and not is_99_band and reprices < MAX_REPRICES_LOW_BAND:
             try:
                 pre_fills = kalshi.get_fills(client, ticker)
                 pre_mine = [f for f in pre_fills
@@ -571,7 +727,7 @@ def _handle_fill(client: kalshi.KalshiClient, ticker: str,
 
     # Widened fill assert: Decimal 95.00-99.00 for main, 80.00-94.00 for H8
     fill_d = Decimal(str(fill_cost))
-    if eval_result.lane == "h8_probe":
+    if eval_result.lane == "H8":
         valid = gateway.H8_COST_LO <= fill_d <= gateway.H8_COST_HI
     else:
         valid = gateway.COST_BAND_LO <= fill_d <= gateway.COST_BAND_HI

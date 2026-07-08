@@ -157,7 +157,7 @@ class SurfaceRow:
     boundary_hi: Optional[float] = None
     distance: Optional[float] = None
     distance_pct: Optional[float] = None
-    lane: Optional[str] = None
+    lane: str = "F"
     session_tag: Optional[str] = None
     vol_regime: Optional[str] = None
     winner_clip_cents: Optional[float] = None
@@ -216,7 +216,7 @@ def update_settlement(row_id: int, resolution: str, pnl_net: float,
 
 
 def query_band_stats(cost_band_lo: int, cost_band_hi: int,
-                     env: str = "live-traded", lane: str = "main") -> dict:
+                     env: str = "live-traded", lane: str = "F") -> dict:
     """Query win stats for a cost band using COUNT(DISTINCT market_ticker).
     Excludes obs_stale, obs_dup, and side=NULL rows."""
     with _lock:
@@ -231,7 +231,7 @@ def query_band_stats(cost_band_lo: int, cost_band_hi: int,
                AND CAST(cost_per_contract_cents AS INTEGER) <= ?
                AND resolution IN ('win','loss','obs_win','obs_loss')
                AND side IS NOT NULL
-               AND COALESCE(lane,'main')=?""",
+               AND COALESCE(lane,'F')=?""",
             (env, cost_band_lo, cost_band_hi, lane),
         ).fetchone()
     wins = row[0] if row else 0
@@ -296,7 +296,7 @@ def query_band_stats_combined(cost_band_lo: int, cost_band_hi: int) -> dict:
                AND CAST(cost_per_contract_cents AS INTEGER) <= ?
                AND resolution IN ('obs_win', 'obs_loss')
                AND side IS NOT NULL
-               AND COALESCE(lane,'main')='main'""",
+               AND COALESCE(lane,'F')='F'""",
             (cost_band_lo, cost_band_hi),
         ).fetchone()
     obs_wins = row[0] if row else 0
@@ -568,7 +568,7 @@ def query_h8_grid() -> list:
                            AND seconds_to_expiry >= ? AND seconds_to_expiry < ?
                            AND resolution IN ('win','loss','obs_win','obs_loss')
                            AND side IS NOT NULL
-                           AND COALESCE(lane,'main') IN ('main','h8_probe')""",
+                           AND COALESCE(lane,'F') IN ('F','H8')""",
                         (clo, chi, dlo, dhi, tlo, thi),
                     ).fetchone()
                     w = row[0] if row else 0
@@ -615,7 +615,7 @@ def query_h8_probe_daily() -> dict:
     with _lock:
         rows = _conn.execute(
             """SELECT resolution, cost_per_contract_cents FROM surface
-               WHERE lane='h8_probe' AND decision_ts >= ?
+               WHERE lane='H8' AND decision_ts >= ?
                AND action='ENTER'""",
             (today_start,),
         ).fetchall()
@@ -712,7 +712,7 @@ def update_why_tag(row_id: int, why_tag: str, skip_reason: str = None) -> None:
 
 def query_clip_by_time_band() -> list:
     """Win rate + avg clip (pnl) per T_BAND for the scoreboard."""
-    T_BANDS = [(180, 120), (120, 60), (60, 10)]
+    T_BANDS = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
     results = []
     with _lock:
         for hi, lo in T_BANDS:
@@ -725,7 +725,7 @@ def query_clip_by_time_band() -> list:
                    WHERE seconds_to_expiry >= ? AND seconds_to_expiry < ?
                    AND resolution IN ('win','loss','obs_win','obs_loss')
                    AND side IS NOT NULL
-                   AND COALESCE(lane,'main')='main'""",
+                   AND COALESCE(lane,'F')='F'""",
                 (lo, hi),
             ).fetchone()
             wins = row[0] if row else 0
@@ -779,7 +779,7 @@ def query_h8_probe_lifetime() -> dict:
             """SELECT
                 COUNT(CASE WHEN resolution='win' THEN 1 END),
                 COUNT(CASE WHEN resolution='loss' THEN 1 END)
-               FROM surface WHERE lane='h8_probe' AND action='ENTER'
+               FROM surface WHERE lane='H8' AND action='ENTER'
                AND resolution IN ('win','loss')"""
         ).fetchone()
     wins = row[0] if row else 0
@@ -872,3 +872,30 @@ def recompute_missing_pnl() -> int:
             _conn.commit()
             log.warning(f"[STORE] Recomputed pnl_net for {updated} resolved rows")
     return updated
+
+
+def migrate_lanes() -> None:
+    """Migrate lane column: 'main'->'F', 'h8_probe'->'H8', NULL->'F'."""
+    with _lock:
+        c1 = _conn.execute(
+            "UPDATE surface SET lane='F' WHERE lane IS NULL OR lane='main'"
+        ).rowcount
+        c2 = _conn.execute(
+            "UPDATE surface SET lane='H8' WHERE lane IN ('h8_probe', 'h8')"
+        ).rowcount
+        if c1 + c2 > 0:
+            _conn.commit()
+            log.info(f"[STORE] Lane migration: {c1} rows → F, {c2} rows → H8")
+
+
+def query_lane_losses_recent(lane: str, window_sec: int = 3600) -> int:
+    """Count losses for a specific lane in the recent time window."""
+    cutoff = time.time() - window_sec
+    with _lock:
+        row = _conn.execute(
+            """SELECT COUNT(*) FROM surface
+               WHERE lane=? AND action='ENTER' AND resolution='loss'
+               AND settled_ts IS NOT NULL AND settled_ts >= ?""",
+            (lane, cutoff),
+        ).fetchone()
+    return row[0] if row else 0

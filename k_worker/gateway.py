@@ -2,24 +2,21 @@
 
 Walls (Tier 0, non-negotiable):
 - KXBTC15M tickers only
-- Favorite side by cost: 95.00-99.00¢ cost band only (Decimal)
-- 80.00-94.00¢ H8 probe lane (bounded, separate budget)
-- Below 80¢ REJECT (shadow only)
-- Flat 1 contract
-- One entry per ticker ever, verified against exchange position state
-- Never both sides of one ticker
+- Favorite side by cost per lane band
+- Flat 1 contract (live lanes)
+- One entry per lane per ticker (lane-scoped single entry)
+- Cross-lane cap: ≤3 contracts per market across all lanes
+- Never both sides of one ticker (except MM atomic pair, which is shadow)
 - Maker (post_only) only — no taker path exists
 - Live balance re-read inside submit
-- Per-hour exposure cap $4.00 (main lane, 4 windows/hr × 99¢ max)
-- H8 probe budget $2.00/day
+- Per-lane budgets and 3-loss/60min kill rules
 """
 
 import json
 import time
 import logging
 from decimal import Decimal
-from typing import Optional, Tuple
-from dataclasses import dataclass, field
+from typing import Optional, Tuple, Dict
 
 from . import kalshi, store
 
@@ -31,14 +28,39 @@ COST_BAND_LO_INT = 95
 COST_BAND_HI_INT = 99
 H8_COST_LO = Decimal("80.00")
 H8_COST_HI = Decimal("94.00")
-H8_PROBE_BUDGET_PER_DAY = 2.00
-H8_MIN_DISTANCE_PCT = 0.0015
-H8_MAX_SECS = 60
-# 4 windows/hour × max 99¢ cost = $3.96; cap must not structurally ban the 4th window
 HOURLY_EXPOSURE_CAP_USD = 4.00
 MIN_BALANCE_USD = 5.00
+CROSS_LANE_CAP = 3
 
-_traded_tickers: set = set()
+LANES: Dict[str, dict] = {
+    "F": {
+        "band_lo": Decimal("95.00"), "band_hi": Decimal("99.00"),
+        "hourly_cap": 4.00, "daily_budget": None,
+        "kill_losses": 3, "kill_window_sec": 3600,
+        "mode": "LIVE",
+    },
+    "H8": {
+        "band_lo": Decimal("80.00"), "band_hi": Decimal("94.00"),
+        "hourly_cap": None, "daily_budget": 2.00,
+        "min_distance_pct": 0.0015, "max_secs": 60,
+        "kill_losses": 3, "kill_window_sec": 3600,
+        "mode": "LIVE",
+    },
+    "MM": {
+        "band_lo": None, "band_hi": None,
+        "hourly_cap": None, "daily_budget": None,
+        "kill_losses": 3, "kill_window_sec": 3600,
+        "mode": "SHADOW",
+    },
+    "D": {
+        "band_lo": Decimal("60.00"), "band_hi": Decimal("80.00"),
+        "hourly_cap": None, "daily_budget": None,
+        "kill_losses": 3, "kill_window_sec": 3600,
+        "mode": "SHADOW",
+    },
+}
+
+_traded_tickers: set = set()  # set of (lane, ticker) tuples
 _hourly_exposure: list = []  # list of (timestamp, dollars_at_risk)
 
 
@@ -47,7 +69,12 @@ def _load_persisted_state() -> None:
     raw = store.get_state("traded_tickers")
     if raw:
         try:
-            _traded_tickers.update(json.loads(raw))
+            data = json.loads(raw)
+            for item in data:
+                if isinstance(item, str):
+                    _traded_tickers.add(("F", item))
+                elif isinstance(item, list) and len(item) == 2:
+                    _traded_tickers.add((item[0], item[1]))
         except Exception:
             pass
     raw = store.get_state("hourly_exposure")
@@ -59,7 +86,7 @@ def _load_persisted_state() -> None:
 
 
 def _save_traded_tickers() -> None:
-    store.set_state("traded_tickers", json.dumps(list(_traded_tickers)))
+    store.set_state("traded_tickers", json.dumps([list(t) for t in _traded_tickers]))
 
 
 def _save_hourly_exposure() -> None:
@@ -80,7 +107,7 @@ class EvalResult:
     why_tag: Optional[str] = None
     reject_code: Optional[str] = None
     reject_reason: Optional[str] = None
-    lane: str = "main"
+    lane: str = "F"
     spot_price: Optional[float] = None
     boundary_lo: Optional[float] = None
     boundary_hi: Optional[float] = None
@@ -165,7 +192,7 @@ def evaluate(ticker: str, book: kalshi.Book, secs_to_expiry: float,
         return _evaluate_h8_probe(base, cost_d, secs_to_expiry, cash_usd,
                                   ticker, spot, dist_pct)
 
-    # Wall 2: Main lane cost band 95.00-99.00¢
+    # Wall 2: Lane F cost band 95.00-99.00¢
     if cost_d < COST_BAND_LO:
         base.reject_code = "OUT_OF_BAND_COST"
         base.reject_reason = f"cost={cost_float}¢ < {COST_BAND_LO}¢ (shadow only)"
@@ -177,11 +204,28 @@ def evaluate(ticker: str, book: kalshi.Book, secs_to_expiry: float,
         base.why_tag = f"SKIP_OOB_{cost_float}c_T-{int(secs_to_expiry)}"
         return base
 
-    # Wall 3: One entry per ticker
-    if ticker in _traded_tickers:
+    # Wall 3: Lane-scoped single entry
+    if ("F", ticker) in _traded_tickers:
         base.reject_code = "SECOND_ENTRY"
-        base.reject_reason = f"Already traded {ticker}"
+        base.reject_reason = f"Already traded {ticker} in lane F"
         base.why_tag = "SKIP_SECOND_ENTRY"
+        return base
+
+    # Wall 3b: Cross-lane cap
+    cross_count = sum(1 for l, t in _traded_tickers if t == ticker)
+    if cross_count >= CROSS_LANE_CAP:
+        base.reject_code = "REJECT_CROSS_LANE_CAP"
+        base.reject_reason = f"{cross_count} lanes already trading {ticker} (cap={CROSS_LANE_CAP})"
+        base.why_tag = "SKIP_CROSS_LANE_CAP"
+        return base
+
+    # Wall 3c: Per-lane kill rule (3 losses/60min)
+    lane_cfg = LANES["F"]
+    recent_losses = store.query_lane_losses_recent("F", lane_cfg["kill_window_sec"])
+    if recent_losses >= lane_cfg["kill_losses"]:
+        base.reject_code = "LANE_KILLED"
+        base.reject_reason = f"Lane F: {recent_losses} losses in {lane_cfg['kill_window_sec']}s"
+        base.why_tag = "SKIP_LANE_KILLED_F"
         return base
 
     # Wall 4: Insufficient balance
@@ -221,25 +265,25 @@ def _evaluate_h8_probe(base: EvalResult, cost_d: Decimal, secs_to_expiry: float,
                         cash_usd: float, ticker: str,
                         spot: Optional[float], dist_pct: Optional[float]) -> EvalResult:
     """Evaluate H8 probe lane qualification."""
-    base.lane = "h8_probe"
+    base.lane = "H8"
     cost_float = float(cost_d)
+    h8_cfg = LANES["H8"]
 
-    # All four conditions required
     if spot is None:
         base.reject_code = "H8_NO_SPOT"
         base.reject_reason = "Spot price unavailable"
         base.why_tag = "SKIP_H8_UNQUALIFIED"
         return base
 
-    if dist_pct is None or dist_pct < H8_MIN_DISTANCE_PCT:
+    if dist_pct is None or dist_pct < h8_cfg["min_distance_pct"]:
         base.reject_code = "H8_DISTANCE"
-        base.reject_reason = f"distance_pct={dist_pct or 0:.4%} < {H8_MIN_DISTANCE_PCT:.2%}"
+        base.reject_reason = f"distance_pct={dist_pct or 0:.4%} < {h8_cfg['min_distance_pct']:.2%}"
         base.why_tag = "SKIP_H8_UNQUALIFIED"
         return base
 
-    if secs_to_expiry > H8_MAX_SECS:
+    if secs_to_expiry > h8_cfg["max_secs"]:
         base.reject_code = "H8_TIME"
-        base.reject_reason = f"secs_to_expiry={secs_to_expiry:.0f} > {H8_MAX_SECS}"
+        base.reject_reason = f"secs_to_expiry={secs_to_expiry:.0f} > {h8_cfg['max_secs']}"
         base.why_tag = "SKIP_H8_UNQUALIFIED"
         return base
 
@@ -251,19 +295,36 @@ def _evaluate_h8_probe(base: EvalResult, cost_d: Decimal, secs_to_expiry: float,
         base.why_tag = "SKIP_H8_KILLED"
         return base
 
+    # Per-lane kill rule
+    recent_losses = store.query_lane_losses_recent("H8", h8_cfg["kill_window_sec"])
+    if recent_losses >= h8_cfg["kill_losses"]:
+        base.reject_code = "LANE_KILLED"
+        base.reject_reason = f"Lane H8: {recent_losses} losses in {h8_cfg['kill_window_sec']}s"
+        base.why_tag = "SKIP_LANE_KILLED_H8"
+        return base
+
     # Budget wall
     daily = store.query_h8_probe_daily()
     cost_usd = cost_float / 100.0
-    if daily["at_risk"] + cost_usd > H8_PROBE_BUDGET_PER_DAY:
+    if daily["at_risk"] + cost_usd > h8_cfg["daily_budget"]:
         base.reject_code = "H8_BUDGET"
-        base.reject_reason = f"probe budget ${daily['at_risk']:.2f} + ${cost_usd:.2f} > ${H8_PROBE_BUDGET_PER_DAY:.2f}"
+        base.reject_reason = f"probe budget ${daily['at_risk']:.2f} + ${cost_usd:.2f} > ${h8_cfg['daily_budget']:.2f}"
         base.why_tag = "SKIP_H8_BUDGET"
         return base
 
-    if ticker in _traded_tickers:
+    # Lane-scoped single entry
+    if ("H8", ticker) in _traded_tickers:
         base.reject_code = "SECOND_ENTRY"
-        base.reject_reason = f"Already traded {ticker}"
+        base.reject_reason = f"Already traded {ticker} in lane H8"
         base.why_tag = "SKIP_SECOND_ENTRY"
+        return base
+
+    # Cross-lane cap
+    cross_count = sum(1 for l, t in _traded_tickers if t == ticker)
+    if cross_count >= CROSS_LANE_CAP:
+        base.reject_code = "REJECT_CROSS_LANE_CAP"
+        base.reject_reason = f"{cross_count} lanes already trading {ticker}"
+        base.why_tag = "SKIP_CROSS_LANE_CAP"
         return base
 
     if cash_usd < cost_usd or cash_usd < MIN_BALANCE_USD:
@@ -312,7 +373,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
     # Verify no existing position on exchange
     pos = kalshi.position_for_market(client, ticker)
     if abs(pos) > 0:
-        _traded_tickers.add(ticker)
+        _traded_tickers.add((eval_result.lane, ticker))
         _save_traded_tickers()
         log.warning(f"[GATEWAY] Exchange position check: already hold {pos}ct on {ticker}")
         row_id = store.insert_row(store.SurfaceRow(
@@ -364,9 +425,9 @@ def submit(client: kalshi.KalshiClient, ticker: str,
         rest_cost_d = Decimal(rest_fp) * 100
     else:
         rest_cost_d = Decimal(rest_price_int)
-    if eval_result.lane == "main":
+    if eval_result.lane == "F":
         if not (COST_BAND_LO <= rest_cost_d <= COST_BAND_HI):
-            log.warning(f"[GATEWAY] Rest price {rest_cost_d}¢ outside main band")
+            log.warning(f"[GATEWAY] Rest price {rest_cost_d}¢ outside F band")
             row_id = store.insert_row(store.SurfaceRow(
                 market_ticker=ticker, decision_ts=time.time(), action="SKIP",
                 seconds_to_expiry=secs_to_expiry, side=eval_result.side,
@@ -375,7 +436,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
                 lane=eval_result.lane, env="live-observed",
             ))
             return None, row_id, "SKIP_REST_PRICE_OOB"
-    elif eval_result.lane == "h8_probe":
+    elif eval_result.lane == "H8":
         if not (H8_COST_LO <= rest_cost_d <= H8_COST_HI):
             log.warning(f"[GATEWAY] Rest price {rest_cost_d}¢ outside H8 band")
             row_id = store.insert_row(store.SurfaceRow(
@@ -429,9 +490,9 @@ def submit(client: kalshi.KalshiClient, ticker: str,
             v2_price_str=rest_fp,
         )
         store.update_order_id(row_id, order_id)
-        _traded_tickers.add(ticker)
+        _traded_tickers.add((eval_result.lane, ticker))
         _save_traded_tickers()
-        if eval_result.lane == "main":
+        if eval_result.lane == "F":
             _hourly_exposure.append((time.time(), cost_usd))
             _save_hourly_exposure()
         log.warning(
@@ -491,14 +552,15 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
     return oid, int(new_cost_d)
 
 
-def mark_traded(ticker: str) -> None:
-    """Mark a ticker as traded (used when detecting existing positions)."""
-    _traded_tickers.add(ticker)
+def mark_traded(ticker: str, lane: str = "F") -> None:
+    """Mark a ticker as traded in a lane."""
+    _traded_tickers.add((lane, ticker))
     _save_traded_tickers()
 
 
 def is_traded(ticker: str) -> bool:
-    return ticker in _traded_tickers
+    """True if ticker has been traded by any lane."""
+    return any(t == ticker for _, t in _traded_tickers)
 
 
 def reset_for_new_market() -> None:
