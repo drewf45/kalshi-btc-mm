@@ -240,7 +240,8 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
             return "no_balance"
 
         if not _observe_mode:
-            discipline.check_drawdown(cash)
+            tradeable = treasury.tradeable_balance(cash)
+            discipline.check_drawdown(tradeable)
             if discipline.is_halted():
                 return "halted"
 
@@ -529,7 +530,8 @@ def _run_watch_ladder(client: kalshi.KalshiClient, ticker: str,
                 continue
 
             if not _observe_mode:
-                discipline.check_drawdown(cash)
+                tradeable = treasury.tradeable_balance(cash)
+                discipline.check_drawdown(tradeable)
                 if discipline.is_halted():
                     return None
 

@@ -19,7 +19,7 @@ from decimal import Decimal
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass, field
 
-from . import kalshi, store, delta_table_loader
+from . import kalshi, store, delta_table_loader, treasury
 
 log = logging.getLogger("k_worker.gateway")
 
@@ -229,17 +229,20 @@ def evaluate(ticker: str, book: kalshi.Book, secs_to_expiry: float,
         base.why_tag = "SKIP_LANE_KILLED_F"
         return base
 
-    # Wall 4: Insufficient balance
+    # Wall 4: Insufficient tradeable capital
     cost_usd = cost_float / 100.0
-    if cash_usd < cost_usd:
+    tradeable = treasury.tradeable_balance(cash_usd)
+    if tradeable < cost_usd:
         base.reject_code = "INSUFFICIENT_BALANCE"
-        base.reject_reason = f"cash=${cash_usd:.2f} < cost=${cost_usd:.2f}"
+        base.reject_reason = (f"tradeable=${tradeable:.2f} < cost=${cost_usd:.2f} "
+                              f"(bal ${cash_usd:.2f} − owed ${treasury.accrued_total():.2f})")
         base.why_tag = "SKIP_BALANCE"
         return base
 
-    if cash_usd < MIN_BALANCE_USD:
+    if tradeable < MIN_BALANCE_USD:
         base.reject_code = "INSUFFICIENT_BALANCE"
-        base.reject_reason = f"cash=${cash_usd:.2f} < floor=${MIN_BALANCE_USD:.2f}"
+        base.reject_reason = (f"tradeable=${tradeable:.2f} < floor=${MIN_BALANCE_USD:.2f} "
+                              f"(bal ${cash_usd:.2f} − owed ${treasury.accrued_total():.2f})")
         base.why_tag = "SKIP_BALANCE"
         return base
 
@@ -328,9 +331,11 @@ def _evaluate_h8_probe(base: EvalResult, cost_d: Decimal, secs_to_expiry: float,
         base.why_tag = "SKIP_CROSS_LANE_CAP"
         return base
 
-    if cash_usd < cost_usd or cash_usd < MIN_BALANCE_USD:
+    tradeable = treasury.tradeable_balance(cash_usd)
+    if tradeable < cost_usd or tradeable < MIN_BALANCE_USD:
         base.reject_code = "INSUFFICIENT_BALANCE"
-        base.reject_reason = f"cash=${cash_usd:.2f}"
+        base.reject_reason = (f"tradeable=${tradeable:.2f} "
+                              f"(bal ${cash_usd:.2f} − owed ${treasury.accrued_total():.2f})")
         base.why_tag = "SKIP_BALANCE"
         return base
 
@@ -361,11 +366,13 @@ def submit(client: kalshi.KalshiClient, ticker: str,
     if not eval_result.allowed:
         raise ValueError("Cannot submit a rejected evaluation")
 
-    # Re-read balance inside submit
+    # Re-read balance inside submit — tradeable, not raw
     cash, _ = kalshi.get_balance(client)
     cost_usd = (eval_result.cost_exact or eval_result.cost_cents) / 100.0
-    if cash is None or cash < cost_usd:
-        log.warning(f"[GATEWAY] Balance re-check failed: cash=${cash}")
+    tradeable = treasury.tradeable_balance(cash) if cash is not None else None
+    if cash is None or tradeable is None or tradeable < cost_usd:
+        log.warning(f"[GATEWAY] Balance re-check failed: tradeable=${tradeable} "
+                    f"(bal ${cash} − owed ${treasury.accrued_total():.2f})")
         row_id = store.insert_row(store.SurfaceRow(
             market_ticker=ticker,
             decision_ts=time.time(),
@@ -539,7 +546,8 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
         return None, None
     cash, _ = kalshi.get_balance(client)
     new_cost_float = float(new_cost_d)
-    if cash is None or cash < new_cost_float / 100.0:
+    tradeable = treasury.tradeable_balance(cash) if cash is not None else None
+    if cash is None or tradeable is None or tradeable < new_cost_float / 100.0:
         return None, None
     kalshi.cancel_order(client, old_order_id)
     if eval_result.side == "yes":

@@ -9,15 +9,18 @@ Rates env-tunable; Drew amends by ruling in the daily log.
 import os
 import time
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 
 from . import store, notify
 
 log = logging.getLogger("k_worker.treasury")
 
+NY = ZoneInfo("America/New_York")
+
 TAX_RATE = float(os.environ.get("TREASURY_TAX_RATE", "0.30"))
 OPERATOR_FEE = float(os.environ.get("TREASURY_OPERATOR_FEE", "0.05"))
-PAYOUT_MIN = float(os.environ.get("TREASURY_PAYOUT_MIN", "5.00"))
 SEED = float(os.environ.get("TREASURY_SEED", "12.38"))
 
 FLOOR_MILESTONES = [
@@ -25,6 +28,8 @@ FLOOR_MILESTONES = [
     (35.0, 25.0),
     (20.0, 15.0),
 ]
+
+OPERATING_FLOOR = 5.00
 
 
 def _get_float(key: str, default: float = 0.0) -> float:
@@ -106,10 +111,18 @@ def get_totals() -> Dict[str, float]:
     }
 
 
-def tradeable_balance(cash: float) -> float:
-    """Cash minus accrued tax and fee — what the engine may trade with."""
+def accrued_total() -> float:
+    """Total owed to Drew (tax + fee)."""
     t = get_totals()
-    return cash - t["accrued_tax"] - t["accrued_fee"]
+    return t["accrued_tax"] + t["accrued_fee"]
+
+
+def tradeable_balance(cash: float) -> float:
+    """Tradeable capital = cash minus what's owed to Drew.
+    Belt-and-suspenders: if invariant is drifting, trade on the smaller claim."""
+    t = get_totals()
+    after_owed = cash - t["accrued_tax"] - t["accrued_fee"]
+    return min(after_owed, t["engine_book"])
 
 
 def waterfall(pnl: float) -> Dict:
@@ -129,10 +142,6 @@ def waterfall(pnl: float) -> Dict:
 
     log.info(f"[TREASURY] WIN split: tax +${tax:.3f} fee +${fee:.3f} book +${remainder:.3f} "
              f"→ book=${new_book:.2f} accrued_tax=${new_tax:.3f} accrued_fee=${new_fee:.3f}")
-
-    total_accrued = new_tax + new_fee
-    if total_accrued >= PAYOUT_MIN:
-        _send_payout_alert(new_tax, new_fee, new_book)
 
     return {
         "tax": tax,
@@ -156,6 +165,55 @@ def record_loss(pnl: float) -> None:
     log.info(f"[TREASURY] LOSS: book ${pnl:+.3f} → ${new_book:.2f}")
 
 
+# ── Payout detection ──────────────────────────────────────────────
+
+_payout_detected_ts: float = 0.0
+_payout_detected_amount: float = 0.0
+_PAYOUT_MATCH_TOL = 0.10
+_PAYOUT_RENOTIFY_SEC = 86400
+
+
+def is_payout_match(drop: float) -> bool:
+    """True if this balance drop matches accrued (Drew withdrew his cut)."""
+    owed = accrued_total()
+    if owed < 0.01:
+        return False
+    return abs(drop - owed) <= _PAYOUT_MATCH_TOL
+
+
+def record_payout_detected(drop: float) -> None:
+    """Suppress the drift alert and post a PAYOUT DETECTED message."""
+    global _payout_detected_ts, _payout_detected_amount
+    _payout_detected_ts = time.time()
+    _payout_detected_amount = drop
+    owed = accrued_total()
+    notify.send(
+        f"\U0001f4b8 PAYOUT DETECTED? balance -${drop:.2f} matches owed ${owed:.2f} "
+        f"— confirm with: python -m k_worker.treasury_paid {drop:.2f}"
+    )
+    log.warning(f"[TREASURY] Payout detected: drop=${drop:.2f} owed=${owed:.2f}")
+
+
+def has_unconfirmed_payout() -> bool:
+    return _payout_detected_ts > 0.0
+
+
+def check_unconfirmed_payout() -> None:
+    """Re-alert if a detected payout goes unconfirmed for >24h."""
+    global _payout_detected_ts
+    if _payout_detected_ts == 0.0:
+        return
+    elapsed = time.time() - _payout_detected_ts
+    if elapsed >= _PAYOUT_RENOTIFY_SEC:
+        notify.alert(
+            f"UNCONFIRMED PAYOUT: ${_payout_detected_amount:.2f} detected "
+            f"{elapsed / 3600:.0f}h ago — confirm or investigate"
+        )
+        _payout_detected_ts = time.time()
+
+
+# ── Invariant check ───────────────────────────────────────────────
+
 _last_invariant_alert_ts: float = 0.0
 _last_invariant_drift: float = 0.0
 _INVARIANT_THROTTLE_SEC = 1800
@@ -164,30 +222,42 @@ _INVARIANT_THROTTLE_SEC = 1800
 def check_invariant(total_balance: float) -> Optional[str]:
     """Verify total_balance ~ engine_book + accrued_tax + accrued_fee.
     Returns None if OK, drift description string if drift > $0.05.
+    Payout-matching drops are suppressed (posted as PAYOUT DETECTED instead).
     Alert hygiene: first occurrence, then only on change > $0.10 or every 30 min."""
     global _last_invariant_alert_ts, _last_invariant_drift
     t = get_totals()
     expected = t["engine_book"] + t["accrued_tax"] + t["accrued_fee"]
-    drift = abs(total_balance - expected)
-    if drift > 0.05:
-        msg = (f"INVARIANT DRIFT: balance=${total_balance:.2f} vs "
-               f"expected=${expected:.2f} (book=${t['engine_book']:.2f} + "
-               f"tax=${t['accrued_tax']:.2f} + fee=${t['accrued_fee']:.2f}) "
-               f"drift=${drift:.2f}")
-        log.error(f"[TREASURY] {msg}")
-        now = time.time()
-        drift_change = abs(drift - _last_invariant_drift)
-        should_alert = (
-            _last_invariant_alert_ts == 0.0
-            or drift_change > 0.10
-            or (now - _last_invariant_alert_ts) >= _INVARIANT_THROTTLE_SEC
-        )
-        if should_alert:
-            notify.alert(f"Treasury: {msg}")
-            _last_invariant_alert_ts = now
-            _last_invariant_drift = drift
-        return msg
-    return None
+    drift = total_balance - expected
+    abs_drift = abs(drift)
+
+    if abs_drift <= 0.05:
+        return None
+
+    # Payout detection: balance dropped by ~accrued (Drew withdrew)
+    if drift < 0 and is_payout_match(abs(drift)):
+        record_payout_detected(abs(drift))
+        return None
+
+    # Check unconfirmed payouts (re-alert after 24h)
+    check_unconfirmed_payout()
+
+    msg = (f"INVARIANT DRIFT: balance=${total_balance:.2f} vs "
+           f"expected=${expected:.2f} (book=${t['engine_book']:.2f} + "
+           f"tax=${t['accrued_tax']:.2f} + fee=${t['accrued_fee']:.2f}) "
+           f"drift=${drift:+.2f}")
+    log.error(f"[TREASURY] {msg}")
+    now = time.time()
+    drift_change = abs(abs_drift - _last_invariant_drift)
+    should_alert = (
+        _last_invariant_alert_ts == 0.0
+        or drift_change > 0.10
+        or (now - _last_invariant_alert_ts) >= _INVARIANT_THROTTLE_SEC
+    )
+    if should_alert:
+        notify.alert(f"Treasury: {msg}")
+        _last_invariant_alert_ts = now
+        _last_invariant_drift = abs_drift
+    return msg
 
 
 def _floor_for_book(book: float) -> Optional[float]:
@@ -197,25 +267,30 @@ def _floor_for_book(book: float) -> Optional[float]:
     return None
 
 
-def _send_payout_alert(accrued_tax: float, accrued_fee: float, book: float) -> None:
-    total = accrued_tax + accrued_fee
-    lines = [
-        f"💰 TREASURY PAYOUT DUE: withdraw ${total:.2f}",
-        f"  savings ${accrued_tax:.2f} (tax) + fee ${accrued_fee:.2f}",
-    ]
-    floor = _floor_for_book(book)
-    if floor is not None and book > floor:
-        excess = book - floor
-        lines.append(f"  scrape: book ${book:.2f} > floor ${floor:.2f} → excess ${excess:.2f}")
-    lines.append("Run `python -m k_worker.treasury_paid` after withdrawal.")
-    notify.alert("\n".join(lines))
+# ── Payout confirmation ──────────────────────────────────────────
 
-
-def mark_paid() -> None:
-    """Move accrued to paid (after manual withdrawal)."""
+def mark_paid(amount: Optional[float] = None) -> None:
+    """Move accrued to paid (after manual withdrawal confirmation).
+    Writes an epochs row, resets accrued, recomputes book so invariant goes green."""
+    global _payout_detected_ts, _payout_detected_amount
     t = get_totals()
+    owed = t["accrued_tax"] + t["accrued_fee"]
+
+    if amount is not None and abs(amount - owed) > _PAYOUT_MATCH_TOL:
+        log.warning(f"[TREASURY] mark_paid amount=${amount:.2f} vs owed=${owed:.2f} "
+                    f"— mismatch > ${_PAYOUT_MATCH_TOL}, proceeding anyway")
+
+    paid_amount = amount if amount is not None else owed
+
     new_paid_tax = t["paid_tax"] + t["accrued_tax"]
     new_paid_fee = t["paid_fee"] + t["accrued_fee"]
+
+    # Adjust book downward by the paid amount (money left the account)
+    new_book = t["engine_book"]
+    book_adjustment = paid_amount - owed
+    if abs(book_adjustment) > 0.001:
+        new_book = t["engine_book"] + book_adjustment
+        _set_float("treasury_engine_book", new_book)
 
     log.warning(f"[TREASURY] PAYOUT: tax ${t['accrued_tax']:.2f} → paid (lifetime ${new_paid_tax:.2f}), "
                 f"fee ${t['accrued_fee']:.2f} → paid (lifetime ${new_paid_fee:.2f})")
@@ -225,17 +300,70 @@ def mark_paid() -> None:
     _set_float("treasury_accrued_tax", 0.0)
     _set_float("treasury_accrued_fee", 0.0)
 
+    store.record_epoch(t["engine_book"], new_book,
+                       -paid_amount, "PAYOUT")
+
+    _payout_detected_ts = 0.0
+    _payout_detected_amount = 0.0
+
     notify.send(
-        f"💰 TREASURY PAID: tax ${t['accrued_tax']:.2f} + fee ${t['accrued_fee']:.2f} "
-        f"= ${t['accrued_tax'] + t['accrued_fee']:.2f}\n"
+        f"\U0001f4b8 TREASURY PAID: tax ${t['accrued_tax']:.2f} + fee ${t['accrued_fee']:.2f} "
+        f"= ${owed:.2f} (withdrawn ${paid_amount:.2f})\n"
         f"Lifetime: tax ${new_paid_tax:.2f} · fee ${new_paid_fee:.2f}"
     )
 
 
-def format_hourly() -> str:
+# ── Daily payout notice (08:00 ET) ────────────────────────────────
+
+def is_payout_notice_time() -> bool:
+    """True during the 08:00-08:05 ET window."""
+    now = datetime.now(NY)
+    return now.hour == 8 and now.minute < 5
+
+
+def send_payout_notice(live_balance: float) -> None:
+    """Post the daily payout notice at 08:00 ET."""
     t = get_totals()
     owed = t["accrued_tax"] + t["accrued_fee"]
-    return f"book ${t['engine_book']:.2f} | owed-to-Drew ${owed:.2f}"
+    if owed < 0.01:
+        return
+
+    tradeable_after = tradeable_balance(live_balance) - owed
+    if tradeable_after < OPERATING_FLOOR:
+        safe_amount = max(0, tradeable_balance(live_balance) - OPERATING_FLOOR)
+        if safe_amount < 0.01:
+            notify.send(
+                f"\U0001f4b8 PAYOUT NOTICE — you are owed ${owed:.2f} "
+                f"(tax ${t['accrued_tax']:.3f} + fee ${t['accrued_fee']:.3f}). "
+                f"Floor protection: tradeable ${tradeable_balance(live_balance):.2f} "
+                f"< floor ${OPERATING_FLOOR:.2f} after payout — hold until book grows."
+            )
+        else:
+            notify.send(
+                f"\U0001f4b8 PAYOUT NOTICE — you are owed ${owed:.2f} "
+                f"(tax ${t['accrued_tax']:.3f} + fee ${t['accrued_fee']:.3f}). "
+                f"Floor protection: safe partial ${safe_amount:.2f} of ${owed:.2f}. "
+                f"Withdraw ${safe_amount:.2f} on Kalshi, then confirm: "
+                f"python -m k_worker.treasury_paid {safe_amount:.2f}"
+            )
+    else:
+        notify.send(
+            f"\U0001f4b8 PAYOUT NOTICE — you are owed ${owed:.2f} "
+            f"(tax ${t['accrued_tax']:.3f} + fee ${t['accrued_fee']:.3f}). "
+            f"Withdraw ${owed:.2f} on Kalshi, then confirm: "
+            f"python -m k_worker.treasury_paid {owed:.2f}"
+        )
+
+
+# ── Display formatters ────────────────────────────────────────────
+
+def format_hourly(cash: float = 0.0, pv: float = 0.0) -> str:
+    t = get_totals()
+    owed = t["accrued_tax"] + t["accrued_fee"]
+    trd = tradeable_balance(cash) if cash > 0 else t["engine_book"]
+    account = cash + pv
+    return (f"Tradeable ${trd:.2f} | owed-to-Drew ${owed:.2f} | "
+            f"account ${account:.2f} | positions ${pv:.2f}")
 
 
 def format_scoreboard() -> str:

@@ -206,10 +206,9 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
     total = cash + (pv or 0)
     daily = store.daily_stats("live-traded")
     broker_fills = store.count_fills_today("live-traded")
-    treas = treasury.format_hourly()
+    treas = treasury.format_hourly(cash, pv or 0)
     treasury.check_invariant(total)
     notify.send(
-        f"Balance: ${total:.2f} | positions ${pv or 0:.2f} | "
         f"today: {broker_fills} fills, {daily['n']} settled, net ${daily['net_pnl']:.2f}\n"
         f"{treas}"
     )
@@ -352,6 +351,13 @@ def boot_reconcile(client: kalshi.KalshiClient) -> None:
         rebuild_today(client)
     elif abs(delta) <= BOOT_RECONCILE_TOL:
         notify.send(f"🔧 BOOT RECONCILE OK: bal ${live_bal:.2f} ≈ expected ${expected:.2f} (Δ ${delta:+.2f})")
+    elif delta < 0 and treasury.is_payout_match(abs(delta)):
+        # Drop matches accrued — Drew's withdrawal, NOT drift. Never re-baseline it away.
+        treasury.record_payout_detected(abs(delta))
+        notify.send(
+            f"🔧 BOOT RECONCILE: bal ${live_bal:.2f} vs expected ${expected:.2f} "
+            f"(Δ ${delta:+.2f}) — matches owed, suppressed as pending payout"
+        )
     else:
         new_book = round(live_bal - t.accrued_tax - t.accrued_fee, 2)
         treasury.set_book(new_book)
@@ -423,7 +429,7 @@ def main():
     log.warning(f"[MAIN] Engine: KXBTC15M | flat 1ct | fav 95-99c | maker-only")
 
     if worker_mode == "trade":
-        discipline.check_drawdown(cash)
+        discipline.check_drawdown(treasury.tradeable_balance(cash))
 
     envcheck.check_clock_skew()
 
@@ -446,6 +452,7 @@ def main():
     last_census = 0
     last_hourly = 0
     last_review_pack = 0
+    last_payout_notice = 0
     last_ticker = None
 
     # 6. Main loop
@@ -490,6 +497,16 @@ def main():
                 except Exception as e:
                     log.warning(f"[MAIN] Hourly balance error: {e}")
                 last_hourly = now
+
+            # Daily Payout Notice (08:00 ET)
+            if treasury.is_payout_notice_time() and now - last_payout_notice > 3600:
+                try:
+                    pn_cash, pn_pv = kalshi.get_balance(client)
+                    if pn_cash is not None:
+                        treasury.send_payout_notice(pn_cash + (pn_pv or 0))
+                    last_payout_notice = now
+                except Exception as e:
+                    log.warning(f"[MAIN] Payout notice error: {e}")
 
             # Daily Review Pack (09:00 ET)
             if review_pack.is_review_time() and now - last_review_pack > 3600:

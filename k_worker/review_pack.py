@@ -142,12 +142,16 @@ def build_review_pack() -> str:
     # 8. TREASURY
     t = treasury.get_totals()
     owed = t["accrued_tax"] + t["accrued_fee"]
+    trd = treasury.tradeable_balance(t["engine_book"] + owed)
     today_metrics["treasury_book"] = t["engine_book"]
     today_metrics["treasury_owed"] = owed
+    today_metrics["treasury_tradeable"] = trd
     book_delta = _delta_str(t["engine_book"], yesterday.get("treasury_book"))
     owed_delta = _delta_str(owed, yesterday.get("treasury_owed"))
-    lines.append(f"8. TREASURY: book ${t['engine_book']:.2f}{book_delta} | "
-                 f"owed-to-Drew ${owed:.2f}{owed_delta}")
+    paid_lifetime = t["paid_tax"] + t["paid_fee"]
+    lines.append(f"8. TREASURY: tradeable ${trd:.2f} | owed ${owed:.2f}{owed_delta} | "
+                 f"book ${t['engine_book']:.2f}{book_delta} | "
+                 f"lifetime collected ${paid_lifetime:.2f}")
 
     # 9. NEW ALERT TYPES
     new_alerts = _query_new_alert_types()
