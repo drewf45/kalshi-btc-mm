@@ -550,7 +550,24 @@ def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
     if mine:
         return {"state": "filled", "raw": mine}
 
-    # 2. Orders list — read the order's OWN status field, not just list membership
+    # 2. Per-order GET — single-object reads index sooner than list
+    try:
+        o = client.request("GET", f"{_orders_route}/{order_id}")
+        if o:
+            order_obj = o.get("order") or o
+            if not _resting_shape_logged:
+                log.info(f"[ORDER-V2] per-order shape: {order_obj}")
+                _resting_shape_logged = True
+            st = str(order_obj.get("status", "")).lower()
+            if st in ("resting", "open", "pending"):
+                return {"state": "resting", "raw": order_obj}
+            if st in ("executed", "filled"):
+                return {"state": "resting", "raw": order_obj}
+            return {"state": "gone", "raw": order_obj}
+    except Exception:
+        pass  # fall through to list endpoint
+
+    # 3. Orders list — fallback if per-order GET fails (404, 5xx, etc.)
     try:
         resp = client.request("GET", _orders_route,
                               params={"ticker": ticker, "limit": 200})
@@ -558,9 +575,6 @@ def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
         raise OrderStatusUnavailable(f"orders list failed for {ticker}: {e}") from e
 
     orders = (resp or {}).get("orders") or []
-    if orders and not _resting_shape_logged:
-        log.info(f"[ORDER-V2] resting shape: {orders[0]}")
-        _resting_shape_logged = True
     for o in orders:
         if str(o.get("order_id") or o.get("id")) == str(order_id):
             st = str(o.get("status", "")).lower()

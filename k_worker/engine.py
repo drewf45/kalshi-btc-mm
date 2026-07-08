@@ -393,8 +393,9 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     store._conn.commit()
 
     # Phase 4: Monitor fill -> settlement
+    order_placed_ts = time.time()
     result = _monitor_order(client, ticker, order_id, row_id, eval_result,
-                            close_ts, book)
+                            close_ts, book, order_placed_ts=order_placed_ts)
 
     outcome = result["outcome"]
     bal = _bal_str(client)
@@ -586,13 +587,16 @@ def _wait_with_heartbeat(seconds: float):
 def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                    order_id: str, row_id: int,
                    eval_result: gateway.EvalResult,
-                   close_ts: int, original_book: kalshi.Book) -> Dict:
+                   close_ts: int, original_book: kalshi.Book,
+                   order_placed_ts: float = 0.0) -> Dict:
     """Monitor an open order — fills-first, blind-frozen, final-check."""
     reprices = 0
     cost_cents = eval_result.cost_cents
     cost_exact = eval_result.cost_exact or cost_cents
     is_99_band = cost_cents == 99
     blind_consecutive = 0
+    gone_first_seen_ts: float = 0.0
+    gone_consecutive: int = 0
 
     while True:
         heartbeat()
@@ -648,7 +652,33 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
                 store.update_settlement(row_id, "no_fill", 0.0, time.time())
                 log.warning(f"[ENGINE] Order {order_id} no_fill (T-{secs_left:.0f}s)")
                 return {"outcome": "no_fill"}
-            # Cancel may have raced a fill — recheck fills before labeling
+
+            # Grace window: never emit "gone" within 10s of placement
+            age = now - order_placed_ts if order_placed_ts else float("inf")
+            if age < 10.0:
+                log.info(f"[ENGINE] Grace window: order {order_id} age={age:.1f}s < 10s — resting_pending")
+                gone_first_seen_ts = 0.0
+                gone_consecutive = 0
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # Debounce: require TWO consecutive "gone" reads ≥5s apart
+            if gone_consecutive == 0:
+                gone_first_seen_ts = now
+                gone_consecutive = 1
+                log.info(f"[ENGINE] Gone debounce 1/2 on {order_id} — will recheck")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+            else:
+                gone_consecutive += 1
+                elapsed = now - gone_first_seen_ts
+                if elapsed < 5.0:
+                    log.info(f"[ENGINE] Gone debounce {gone_consecutive}/2 on {order_id} — "
+                             f"elapsed={elapsed:.1f}s < 5s, waiting")
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+            # Confirmed gone after debounce — recheck fills before labeling
             try:
                 recheck = kalshi.get_fills(client, ticker)
                 recheck_mine = [f for f in recheck
@@ -660,10 +690,13 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
             except Exception as e:
                 log.warning(f"[ENGINE] Cancel-race fills recheck failed: {e}")
             store.update_settlement(row_id, "cancelled_external", 0.0, time.time())
-            log.warning(f"[ENGINE] Order {order_id} cancelled_external (T-{secs_left:.0f}s)")
+            log.warning(f"[ENGINE] Order {order_id} cancelled_external (T-{secs_left:.0f}s, "
+                         f"debounce={gone_consecutive} reads over {now - gone_first_seen_ts:.1f}s)")
             return {"outcome": "cancelled_external"}
 
-        # state == "resting" — check partial fill
+        # state == "resting" — reset gone debounce, check partial fill
+        gone_first_seen_ts = 0.0
+        gone_consecutive = 0
         raw = status_result.get("raw") or {}
         fc_str = raw.get("fill_count", "0") or "0"
         if Decimal(fc_str) > 0:

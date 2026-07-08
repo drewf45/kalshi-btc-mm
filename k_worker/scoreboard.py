@@ -259,6 +259,7 @@ def build_scoreboard() -> str:
 
 def send_scoreboard() -> None:
     """Build and send scoreboard to Telegram."""
+    import html
     text = build_scoreboard()
     log.info(f"[SCOREBOARD]\n{text}")
-    notify.send(f"<pre>{text}</pre>")
+    notify.send(f"<pre>{html.escape(text)}</pre>")

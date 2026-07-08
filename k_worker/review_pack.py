@@ -246,9 +246,10 @@ def _query_new_alert_types() -> list:
 
 def send_review_pack() -> None:
     """Build and send the Daily Review Pack to Telegram."""
+    import html
     text = build_review_pack()
     log.info(f"[REVIEW_PACK]\n{text}")
-    notify.send(f"<pre>{text}</pre>")
+    notify.send(f"<pre>{html.escape(text)}</pre>")
 
 
 def is_review_time() -> bool:

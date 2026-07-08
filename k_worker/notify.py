@@ -1,5 +1,6 @@
 """Chunk 1 — Telegram notifications."""
 
+import html
 import os
 import time
 import logging
@@ -45,7 +46,7 @@ def send(text: str, parse_mode: str = "HTML") -> None:
 
 
 def _do_send(text: str, parse_mode: str) -> bool:
-    """Attempt one send. Returns True on success."""
+    """Attempt one send. On 400, resend as plain text with [FMT-FALLBACK] prefix."""
     resp = _SESSION.post(
         f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
         json={
@@ -56,10 +57,25 @@ def _do_send(text: str, parse_mode: str) -> bool:
         },
         timeout=10,
     )
-    if resp.status_code != 200:
-        log.warning(f"[TELEGRAM] Send failed: HTTP {resp.status_code} {resp.text[:200]}")
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 400:
+        log.warning(f"[TELEGRAM] 400 parse error, resending as plain text: {resp.text[:200]}")
+        fallback = _SESSION.post(
+            f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": _CHAT_ID,
+                "text": f"[FMT-FALLBACK]\n{text}",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        if fallback.status_code == 200:
+            return True
+        log.warning(f"[TELEGRAM] Fallback also failed: HTTP {fallback.status_code}")
         return False
-    return True
+    log.warning(f"[TELEGRAM] Send failed: HTTP {resp.status_code} {resp.text[:200]}")
+    return False
 
 
 def _send_sync(text: str, parse_mode: str) -> None:
@@ -96,4 +112,4 @@ def _send_sync(text: str, parse_mode: str) -> None:
 
 def alert(text: str) -> None:
     """Send an ALERT-prefixed message."""
-    send(f"\U0001f6a8 <b>ALERT</b>\n{text}")
+    send(f"\U0001f6a8 <b>ALERT</b>\n{html.escape(text)}")
