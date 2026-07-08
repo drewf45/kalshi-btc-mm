@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 venv/
-__pycache__/
-*.pyc
+delta_table.csv
+candles_manifest.json
+btc_candles_raw.json

@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Dict
 import requests as _requests
 
 from . import kalshi, store, gateway, discipline, notify, treasury, delta_table_loader
+from .sessions import SESSION_WINDOWS, session_tag as _session_tag_fn
 
 log = logging.getLogger("k_worker.engine")
 
@@ -82,31 +83,8 @@ def get_heartbeat_ts() -> float:
 
 # ── Context tags (Fix 5) ──────────────────────────────────────
 
-SESSION_WINDOWS = [
-    ("ASIA",        20, 0,  2, 29),
-    ("LONDON_OPEN",  2, 30, 4, 0),
-    ("EU",           4, 0,  8, 0),
-    ("NY_PRE",       8, 0,  9, 29),
-    ("NY_OPEN",      9, 30, 10, 30),
-    ("NY",          10, 30, 15, 29),
-    ("NY_CLOSE",    15, 30, 16, 30),
-    ("EVENING",     16, 30, 20, 0),
-]
-
-
 def _current_session() -> str:
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    t = now_et.hour * 60 + now_et.minute
-    for name, sh, sm, eh, em in SESSION_WINDOWS:
-        start = sh * 60 + sm
-        end = eh * 60 + em
-        if start <= end:
-            if start <= t < end:
-                return name
-        else:
-            if t >= start or t < end:
-                return name
-    return "UNKNOWN"
+    return _session_tag_fn(time.time())
 
 
 def _record_spot(price: float) -> None:
@@ -570,13 +548,13 @@ def _run_watch_ladder(client: kalshi.KalshiClient, ticker: str,
                     tv = delta_table_loader.f_top_rung_verdict(dist_usd, secs_left)
                     if tv["qualified"] is False:
                         log.info(f"[ENGINE] Top-rung guard: table says no — "
-                                 f"d=${dist_usd:.0f} p_cross={tv['p_cross']:.6f}")
+                                 f"d=${dist_usd:.0f} wub={tv['wilson_ub']:.6f}")
                         store.insert_row(store.SurfaceRow(
                             market_ticker=ticker, decision_ts=time.time(),
                             action="SKIP", seconds_to_expiry=secs_left,
                             cost_per_contract_cents=cost_int,
                             skip_reason="TABLE_UNQUALIFIED",
-                            why_tag=f"SKIP_TABLE_UNQUALIFIED_d{tv['distance_grid']}_p{tv['p_cross']:.4f}",
+                            why_tag=f"SKIP_TABLE_UNQUALIFIED_d{tv['distance_grid']}_wub{tv['wilson_ub']:.4f}",
                             env="live-observed",
                         ))
                         confirm_count = 0

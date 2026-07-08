@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard, treasury, delta_table_loader
+from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard, treasury, delta_table_loader, delta_table_builder, review_pack
 
 logging.basicConfig(
     level=logging.INFO,
@@ -403,9 +403,10 @@ def main():
     store.recompute_missing_pnl()
     store.migrate_lanes()
 
-    # 3b. Delta table
+    # 3b. Delta table — self-provisioning (R5)
     if not delta_table_loader.load():
         delta_table_loader.alert_if_absent()
+        delta_table_builder.start_background_build()
 
     # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()
@@ -444,6 +445,7 @@ def main():
     last_reconcile = 0
     last_census = 0
     last_hourly = 0
+    last_review_pack = 0
     last_ticker = None
 
     # 6. Main loop
@@ -488,6 +490,14 @@ def main():
                 except Exception as e:
                     log.warning(f"[MAIN] Hourly balance error: {e}")
                 last_hourly = now
+
+            # Daily Review Pack (09:00 ET)
+            if review_pack.is_review_time() and now - last_review_pack > 3600:
+                try:
+                    review_pack.send_review_pack()
+                    last_review_pack = now
+                except Exception as e:
+                    log.warning(f"[MAIN] Review pack error: {e}")
 
             # Discover current market
             try:
