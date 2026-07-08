@@ -236,13 +236,15 @@ def build_scoreboard() -> str:
         lines.append("")
 
     # --- CENSUS COVERAGE ---
-    census_total = store.get_state("census_total")
     census_covered = store.get_state("census_covered")
     census_missed = store.get_state("census_missed")
-    if census_total and census_covered:
-        cov_line = f" Coverage: {census_covered} seen-live / {census_total} total"
-        if census_missed and int(census_missed) > 0:
-            cov_line += f" ({census_missed} explained-missed)"
+    if census_covered:
+        seen = int(census_covered)
+        missed = int(census_missed) if census_missed else 0
+        total = seen + missed
+        cov_line = f" Coverage: {seen} seen-live / {total} total"
+        if missed > 0:
+            cov_line += f" ({missed} explained-missed)"
         lines.append(cov_line)
         lines.append("")
 

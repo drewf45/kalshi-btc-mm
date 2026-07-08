@@ -1,0 +1,20 @@
+{
+  "source": "Synthetic GBM (annual_vol=0.55, seed=42) \u2014 re-run with --source coinbase before deploy",
+  "date_range": "2026-01-09 to 2026-07-07",
+  "days_covered": 180.0,
+  "candle_count": 259200,
+  "granularity_sec": 60,
+  "distance_grid": "$50-$2000 step $5",
+  "time_grid_sec": [
+    10,
+    30,
+    60,
+    120,
+    180,
+    300,
+    600,
+    900
+  ],
+  "csv_sha256": "d19e0d8e54bd25e8997a90e09af2fd6fb174ff6ccff709205f89923b50e3c256",
+  "built_at": "2026-07-08T13:59:08Z"
+}

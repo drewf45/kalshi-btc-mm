@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard, treasury
+from . import envcheck, notify, kalshi, store, gateway, discipline, engine, scoreboard, treasury, delta_table_loader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -402,6 +402,10 @@ def main():
     store.dedup_historical_skips()
     store.recompute_missing_pnl()
     store.migrate_lanes()
+
+    # 3b. Delta table
+    if not delta_table_loader.load():
+        delta_table_loader.alert_if_absent()
 
     # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()

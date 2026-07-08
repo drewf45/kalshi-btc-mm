@@ -18,7 +18,7 @@ from typing import Optional, Tuple, Dict
 
 import requests as _requests
 
-from . import kalshi, store, gateway, discipline, notify, treasury
+from . import kalshi, store, gateway, discipline, notify, treasury, delta_table_loader
 
 log = logging.getLogger("k_worker.engine")
 
@@ -564,6 +564,25 @@ def _run_watch_ladder(client: kalshi.KalshiClient, ticker: str,
                                             boundary_hi=boundary_hi)
 
             if eval_result.allowed:
+                # Top-rung guard (tier 0 = T-900-600 only)
+                if tier_idx == 0 and delta_table_loader.is_loaded():
+                    dist_usd = abs(eval_result.distance) if eval_result.distance is not None else 0
+                    tv = delta_table_loader.f_top_rung_verdict(dist_usd, secs_left)
+                    if tv["qualified"] is False:
+                        log.info(f"[ENGINE] Top-rung guard: table says no — "
+                                 f"d=${dist_usd:.0f} p_cross={tv['p_cross']:.6f}")
+                        store.insert_row(store.SurfaceRow(
+                            market_ticker=ticker, decision_ts=time.time(),
+                            action="SKIP", seconds_to_expiry=secs_left,
+                            cost_per_contract_cents=cost_int,
+                            skip_reason="TABLE_UNQUALIFIED",
+                            why_tag=f"SKIP_TABLE_UNQUALIFIED_d{tv['distance_grid']}_p{tv['p_cross']:.4f}",
+                            env="live-observed",
+                        ))
+                        confirm_count = 0
+                        time.sleep(POLL_INTERVAL_SEC)
+                        continue
+
                 # Enrich why_tag with confirmation count
                 eval_result.why_tag = (f"{eval_result.why_tag}"
                                        f"_confirms_{confirm_count}/{tier['confirms']}")

@@ -19,7 +19,7 @@ from decimal import Decimal
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass, field
 
-from . import kalshi, store
+from . import kalshi, store, delta_table_loader
 
 log = logging.getLogger("k_worker.gateway")
 
@@ -339,6 +339,17 @@ def _evaluate_h8_probe(base: EvalResult, cost_d: Decimal, secs_to_expiry: float,
     base.why_tag = f"H8PROBE_{cost_float}c_D{dp:.2f}_T-{int(secs_to_expiry)}"
     base.reject_code = None
     base.reject_reason = None
+
+    # Dual-gate: log table verdict alongside static gate (static authoritative)
+    if spot is not None and base.boundary_lo is not None and base.boundary_hi is not None:
+        dist_usd = abs(base.distance) if base.distance is not None else 0
+        tv = delta_table_loader.h8_table_verdict(dist_usd, secs_to_expiry)
+        tag_suffix = f"|TBL_d{tv['distance_grid']}_p{tv['p_cross']:.4f}" if tv['p_cross'] is not None else "|TBL_ABSENT"
+        if tv['wilson_ub'] is not None:
+            tag_suffix += f"_wub{tv['wilson_ub']:.4f}"
+            tag_suffix += "_PASS" if tv['qualified'] else "_FAIL"
+        base.why_tag += tag_suffix
+
     return base
 
 
