@@ -3,7 +3,7 @@ services:
     name: kalshi-k-worker
     runtime: python
     plan: starter
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python -c "import k_worker.__main__"
     startCommand: python -m k_worker
     disk:
       name: k-worker-data
@@ -17,5 +17,5 @@ services:
     name: kalshi-k-watcher
     runtime: python
     plan: starter
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python -c "import k_worker.__main__"
     startCommand: python -m k_worker.watcher

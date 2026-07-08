@@ -17,6 +17,7 @@ import time
 import logging
 from decimal import Decimal
 from typing import Optional, Tuple, Dict
+from dataclasses import dataclass, field
 
 from . import kalshi, store
 
