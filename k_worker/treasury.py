@@ -9,6 +9,7 @@ Rates env-tunable; Drew amends by ruling in the daily log.
 import os
 import time
 import logging
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional
@@ -167,6 +168,7 @@ def record_loss(pnl: float) -> None:
 
 # ── Payout detection ──────────────────────────────────────────────
 
+_payout_lock = threading.Lock()
 _payout_detected_ts: float = 0.0
 _payout_detected_amount: float = 0.0
 _PAYOUT_MATCH_TOL = 0.10
@@ -184,32 +186,52 @@ def is_payout_match(drop: float) -> bool:
 def record_payout_detected(drop: float) -> None:
     """Suppress the drift alert and post a PAYOUT DETECTED message."""
     global _payout_detected_ts, _payout_detected_amount
-    _payout_detected_ts = time.time()
-    _payout_detected_amount = drop
+    with _payout_lock:
+        _payout_detected_ts = time.time()
+        _payout_detected_amount = drop
     owed = accrued_total()
     notify.send(
-        f"\U0001f4b8 PAYOUT DETECTED? balance -${drop:.2f} matches owed ${owed:.2f} "
-        f"— confirm with: python -m k_worker.treasury_paid {drop:.2f}"
+        f"\U0001f4b8 PAYOUT DETECTED? balance -${drop:.2f} matches owed ${owed:.2f}\n"
+        f"Reply <b>yes</b> to confirm, <b>no</b> to dismiss, or <code>/paid {drop:.2f}</code>"
     )
     log.warning(f"[TREASURY] Payout detected: drop=${drop:.2f} owed=${owed:.2f}")
 
 
 def has_unconfirmed_payout() -> bool:
-    return _payout_detected_ts > 0.0
+    with _payout_lock:
+        return _payout_detected_ts > 0.0
+
+
+def get_payout_detected_amount() -> float:
+    with _payout_lock:
+        return _payout_detected_amount
+
+
+def dismiss_payout_detection() -> None:
+    """Clear a pending payout detection without confirming (drift alerting resumes)."""
+    global _payout_detected_ts, _payout_detected_amount
+    with _payout_lock:
+        _payout_detected_ts = 0.0
+        _payout_detected_amount = 0.0
+    log.warning("[TREASURY] Payout detection dismissed by operator")
 
 
 def check_unconfirmed_payout() -> None:
     """Re-alert if a detected payout goes unconfirmed for >24h."""
     global _payout_detected_ts
-    if _payout_detected_ts == 0.0:
-        return
-    elapsed = time.time() - _payout_detected_ts
+    with _payout_lock:
+        if _payout_detected_ts == 0.0:
+            return
+        elapsed = time.time() - _payout_detected_ts
+        amount = _payout_detected_amount
     if elapsed >= _PAYOUT_RENOTIFY_SEC:
         notify.alert(
-            f"UNCONFIRMED PAYOUT: ${_payout_detected_amount:.2f} detected "
-            f"{elapsed / 3600:.0f}h ago — confirm or investigate"
+            f"UNCONFIRMED PAYOUT: ${amount:.2f} detected "
+            f"{elapsed / 3600:.0f}h ago — confirm or investigate\n"
+            f"Reply yes to confirm, no to dismiss, or /paid {amount:.2f}"
         )
-        _payout_detected_ts = time.time()
+        with _payout_lock:
+            _payout_detected_ts = time.time()
 
 
 # ── Invariant check ───────────────────────────────────────────────
@@ -303,8 +325,9 @@ def mark_paid(amount: Optional[float] = None) -> None:
     store.record_epoch(t["engine_book"], new_book,
                        -paid_amount, "PAYOUT")
 
-    _payout_detected_ts = 0.0
-    _payout_detected_amount = 0.0
+    with _payout_lock:
+        _payout_detected_ts = 0.0
+        _payout_detected_amount = 0.0
 
     notify.send(
         f"\U0001f4b8 TREASURY PAID: tax ${t['accrued_tax']:.2f} + fee ${t['accrued_fee']:.2f} "
@@ -343,15 +366,15 @@ def send_payout_notice(live_balance: float) -> None:
                 f"\U0001f4b8 PAYOUT NOTICE — you are owed ${owed:.2f} "
                 f"(tax ${t['accrued_tax']:.3f} + fee ${t['accrued_fee']:.3f}). "
                 f"Floor protection: safe partial ${safe_amount:.2f} of ${owed:.2f}. "
-                f"Withdraw ${safe_amount:.2f} on Kalshi, then confirm: "
-                f"python -m k_worker.treasury_paid {safe_amount:.2f}"
+                f"Withdraw ${safe_amount:.2f} on Kalshi, then reply "
+                f"<code>/paid {safe_amount:.2f}</code>"
             )
     else:
         notify.send(
             f"\U0001f4b8 PAYOUT NOTICE — you are owed ${owed:.2f} "
             f"(tax ${t['accrued_tax']:.3f} + fee ${t['accrued_fee']:.3f}). "
-            f"Withdraw ${owed:.2f} on Kalshi, then confirm: "
-            f"python -m k_worker.treasury_paid {owed:.2f}"
+            f"Withdraw ${owed:.2f} on Kalshi, then reply "
+            f"<code>/paid {owed:.2f}</code>"
         )
 
 

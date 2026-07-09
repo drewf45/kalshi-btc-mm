@@ -116,19 +116,21 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
                         updated += 1
                         continue
 
+                # WO-J: prefer fill_cost_cents over decision cost for pnl
+                eff_cost = fill_cost_cents if fill_cost_cents is not None else (cost_cents or 0)
                 won = (result == side) if side else False
                 if won:
-                    pnl = ((100 - (cost_cents or 0)) * n_ct - (fee_cents or 0)) / 100.0
+                    pnl = ((100 - eff_cost) * n_ct - (fee_cents or 0)) / 100.0
                     res = "win"
                     discipline.record_win()
                     treasury.waterfall(pnl)
-                    realized_cents = (100.0 - float(cost_cents or 0)) * n_ct - float(fee_cents or 0)
+                    realized_cents = (100.0 - float(eff_cost)) * n_ct - float(fee_cents or 0)
                 else:
-                    pnl = -((cost_cents or 0) * n_ct + (fee_cents or 0)) / 100.0
+                    pnl = -(eff_cost * n_ct + (fee_cents or 0)) / 100.0
                     res = "loss"
                     discipline.record_loss()
                     treasury.record_loss(pnl)
-                    realized_cents = -(float(cost_cents or 0) * n_ct + float(fee_cents or 0))
+                    realized_cents = -(float(eff_cost) * n_ct + float(fee_cents or 0))
                 has_fill = True
             else:
                 if side is None:
@@ -475,6 +477,13 @@ def main():
     store.recompute_missing_pnl()
     store.migrate_lanes()
 
+    # 3a. WO-I: one-shot ladder timestamp repair (heals stale secs_to_expiry)
+    if store.get_state("repair_ts_done") != "1":
+        from . import repair_ts
+        n = repair_ts.repair(dry_run=False)
+        store.set_state("repair_ts_done", "1")
+        notify.send(f"\U0001f527 TS REPAIR: {n} ladder rows re-stamped from why_tags (one-shot)")
+
     # 3b. Delta table — self-provisioning (R5)
     if not delta_table_loader.load():
         delta_table_loader.alert_if_absent()
@@ -516,6 +525,9 @@ def main():
 
     # Boot reconcile — Drew's law: never trust stored treasury across deploys
     boot_reconcile(client)
+
+    # 5d. Telegram inbound listener (WO-H)
+    notify.start_listener(client)
 
     if engine.HEARTBEAT_PING_URL:
         log.info(f"[MAIN] Dead-man ping configured: {engine.HEARTBEAT_PING_URL[:40]}...")
@@ -634,9 +646,13 @@ def main():
                 try:
                     pos = kalshi.position_for_market(client, ticker)
                     if abs(pos) > 0:
-                        gateway.mark_traded(ticker, "F")
-                        gateway.mark_traded(ticker, "H8")
-                        log.info(f"[MAIN] Already holding position on {ticker}")
+                        known_lane = store.lookup_lane(ticker) or "F"
+                        gateway.mark_traded(ticker, known_lane)
+                        if known_lane == "F":
+                            gateway.mark_traded(ticker, "H8")
+                        else:
+                            gateway.mark_traded(ticker, "F")
+                        log.info(f"[MAIN] Already holding position on {ticker} (lane={known_lane})")
                         time.sleep(LOOP_SLEEP_SEC)
                         continue
                 except Exception as e:

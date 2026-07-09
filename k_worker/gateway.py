@@ -620,7 +620,8 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
     cash, _ = kalshi.get_balance(client)
     new_cost_float = float(new_cost_d)
     tradeable = treasury.tradeable_balance(cash) if cash is not None else None
-    if cash is None or tradeable is None or tradeable < new_cost_float / 100.0:
+    n_ct = max(1, eval_result.contracts)
+    if cash is None or tradeable is None or tradeable < new_cost_float / 100.0 * n_ct:
         return None, None
     if eval_result.side == "yes":
         rest_price = new_book.yes_bid

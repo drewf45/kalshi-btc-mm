@@ -918,6 +918,18 @@ def insert_orphan_row(ticker: str, position_data: dict) -> int:
     ))
 
 
+def lookup_lane(ticker: str) -> Optional[str]:
+    """Return the lane from the most recent ENTER row for this ticker, or None."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT lane FROM surface
+               WHERE market_ticker=? AND action='ENTER'
+               ORDER BY id DESC LIMIT 1""",
+            (ticker,),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def record_epoch(old_book: float, new_book: float, delta: float,
                  reason: str) -> None:
     """Record a treasury epoch transition."""

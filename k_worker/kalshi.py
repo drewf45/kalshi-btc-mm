@@ -257,7 +257,7 @@ def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:
         d = Decimal(price_str) * 100
         cents = int(d)
         if d != cents:
-            log.info(f"[OB] subpenny bid {price_str} on {ticker} — floored to {cents}c")
+            log.debug(f"[OB] subpenny bid {price_str} on {ticker} — floored to {cents}c")
         return cents, int(Decimal(count_str)), price_str
 
     yes_bid, yes_bid_qty, yes_fp = best(ob.get("yes_dollars") or [])
