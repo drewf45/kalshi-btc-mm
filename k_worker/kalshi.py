@@ -636,11 +636,25 @@ def amend_order(client: KalshiClient, order_id: str, ticker: str, side: str,
     if client_order_id:
         body["client_order_id"] = str(client_order_id)
 
-    try:
-        resp = client.request(
-            "POST", f"/portfolio/events/orders/{order_id}/amend", json_body=body)
-    except Exception as e:
-        log.warning(f"[AMEND] amend failed for {order_id}: {e}")
+    # Tape 0709: this API base 404s on /portfolio/events/* GETs — try the
+    # events amend path first, fall back to the probed legacy route.
+    resp = None
+    for route in (f"/portfolio/events/orders/{order_id}/amend",
+                  f"{_orders_route}/{order_id}/amend"):
+        try:
+            resp = client.request("POST", route, json_body=body)
+            break
+        except RuntimeError as e:
+            if "HTTP 404" in str(e):
+                log.warning(f"[AMEND] {route} 404 — trying fallback")
+                continue
+            log.warning(f"[AMEND] amend failed for {order_id}: {e}")
+            return None, {}
+        except Exception as e:
+            log.warning(f"[AMEND] amend failed for {order_id}: {e}")
+            return None, {}
+    if resp is None:
+        log.warning(f"[AMEND] no amend route responded for {order_id}")
         return None, {}
     log.info(f"[AMEND] resp: {resp}")
     if isinstance(resp, dict):

@@ -364,9 +364,13 @@ def rebuild_today(client: kalshi.KalshiClient) -> int:
 def boot_reconcile(client: kalshi.KalshiClient) -> None:
     """Drew's law 2026-07-07: never trust stored treasury across a deploy
     boundary. Pull live broker truth and reconcile BEFORE the first cycle."""
-    live_bal, _ = kalshi.get_balance(client)
-    if live_bal is None:
+    cash_b, pv_b = kalshi.get_balance(client)
+    if cash_b is None:
         raise RuntimeError("FATAL: boot reconcile cannot read balance — refusing to trade on unknown money")
+    # Tape 0709: reconcile on cash+positions — check_invariant compares
+    # against total; baselining on cash-only guaranteed a drift alert equal
+    # to any open position's value at boot (+$0.99 observed).
+    live_bal = cash_b + (pv_b or 0)
 
     t = treasury.snapshot()
     expected = t.book + t.accrued_tax + t.accrued_fee
