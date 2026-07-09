@@ -163,14 +163,16 @@ def build_scoreboard() -> str:
 
     # --- CLIP BY TIME BAND (H10/Yogi-Berra) ---
     clip_bands = store.query_clip_by_time_band()
-    if any(c["n"] > 0 for c in clip_bands):
+    if any(c["traded_n"] > 0 for c in clip_bands):
         lines.append(" CLIP BY TIME BAND")
-        lines.append(" Band      |  N  | Win%  | Avg Clip")
-        lines.append("-----------|-----|-------|----------")
+        lines.append(" Band      |  N  | Win%  | Clip   | Obs")
+        lines.append("-----------|-----|-------|--------|-----")
         for c in clip_bands:
-            if c["n"] > 0:
+            if c["traded_n"] > 0 or c["obs_n"] > 0:
+                wp = c["traded_win_pct"] if c["traded_n"] > 0 else 0
                 lines.append(
-                    f" {c['band']:<10s}| {c['n']:3d} | {c['win_pct']:5.1%} | ${c['avg_clip']:+.3f}"
+                    f" {c['band']:<10s}| {c['traded_n']:3d} | {wp:5.1%} "
+                    f"| ${c['traded_clip']:+.3f} | {c['obs_n']}"
                 )
         lines.append("")
 

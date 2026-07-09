@@ -638,7 +638,8 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
     if not (COST_BAND_LO <= rest_cost_d <= COST_BAND_HI):
         return None, None
     oid, _ = kalshi.amend_order(client, old_order_id, ticker, eval_result.side,
-                                rest_price, count=1, v2_price_str=rest_fp)
+                                rest_price, count=max(1, eval_result.contracts),
+                                v2_price_str=rest_fp)
     if oid is None:
         # Amend failed — order may be filled or externally gone. Place
         # NOTHING; monitor loop resolves via fills-first status.

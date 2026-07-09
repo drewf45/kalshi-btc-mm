@@ -205,6 +205,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         if ladder_result is not None:
             # Ladder passed — proceed directly to submit with this eval
             eval_result, book, cash, pv, spot, session_tag, vol_regime = ladder_result
+            secs_to_expiry = close_ts - time.time()
             spread = _compute_spread(eval_result, book)
             boundary_lo = eval_result.boundary_lo
             boundary_hi = eval_result.boundary_hi
@@ -359,7 +360,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
             pos = kalshi.position_for_market(client, ticker)
             if abs(pos) > 0:
                 log.warning(f"[ENGINE] Ambiguous submit but exchange shows position — treating as filled")
-                gateway.mark_traded(ticker)
+                gateway.mark_traded(ticker, eval_result.lane)
                 bal = _bal_str(client)
                 _send_market_line(
                     f"⚠ {_time_et()} AMBIGUOUS_BUT_FILLED {eval_result.why_tag} | {bal}"
@@ -388,12 +389,7 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
         )
         return "submit_failed"
 
-    # Update session/vol on the ENTER row
-    store._conn.execute(
-        "UPDATE surface SET session_tag=?, vol_regime=? WHERE id=?",
-        (session_tag, vol_regime, row_id),
-    )
-    store._conn.commit()
+    store.update_session_vol(row_id, session_tag, vol_regime)
 
     # P9 (0708): queue position at placement — instruments no-fill cause.
     try:

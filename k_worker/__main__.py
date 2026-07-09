@@ -60,16 +60,32 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
             close_ts = store.approx_close_ts(ticker)
             if close_ts > 0 and (now - close_ts) > STALE_TICKER_SEC:
                 log.warning(f"[BACKFILL] {ticker} beyond live tier — marking stale")
-                for row_id, action, side, cost_cents, fee_cents, contracts in store.get_unresolved_rows(ticker):
+                for row_id, action, side, cost_cents, fee_cents, contracts, _fc, _oid in store.get_unresolved_rows(ticker):
                     store.update_settlement(row_id, "obs_stale", 0.0, now)
                     updated += 1
             continue
         rows = store.get_unresolved_rows(ticker)
+
+        # WO-E: fetch broker fills once per ticker if any ENTER rows lack fill confirmation
+        broker_fills_by_oid = None
+        unfilled_enters = [r for r in rows if r[1] == "ENTER" and r[6] is None]
+        if unfilled_enters:
+            try:
+                bfills = kalshi.get_fills(client, ticker)
+                broker_fills_by_oid = {}
+                for f in bfills:
+                    oid = str(f.get("order_id", ""))
+                    if oid:
+                        broker_fills_by_oid.setdefault(oid, []).append(f)
+            except Exception as e:
+                log.warning(f"[BACKFILL] Broker fills fetch failed for {ticker}: {e}")
+                broker_fills_by_oid = {}
+
         realized_cents = 0.0
         best_available_cents = 0.0
         regret_avoided = 0.0
         has_fill = False
-        for row_id, action, side, cost_cents, fee_cents, contracts in rows:
+        for row_id, action, side, cost_cents, fee_cents, contracts, fill_cost_cents, order_id in rows:
             n_ct = max(1, contracts or 1)
             # Winner clip: if favorite == winner -> clip = 100-cost; else -> -cost
             clip = None
@@ -83,6 +99,23 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
                     best_available_cents = clip
 
             if action == "ENTER":
+                # WO-E: only waterfall if fill is confirmed; verify unfilled against broker
+                if fill_cost_cents is None:
+                    upgraded = False
+                    if order_id and broker_fills_by_oid and order_id in broker_fills_by_oid:
+                        fc, fee_c, ct = kalshi.parse_fills(broker_fills_by_oid[order_id], side or "yes")
+                        if fc is not None:
+                            store.update_fill(row_id, fc, time.time(), 0, fee_c)
+                            cost_cents = int(fc)
+                            fee_cents = fee_c
+                            n_ct = max(1, ct or 1)
+                            upgraded = True
+                            log.warning(f"[BACKFILL] Upgraded unfilled ENTER {ticker} row {row_id} from broker")
+                    if not upgraded:
+                        store.update_settlement(row_id, "no_fill", 0.0, time.time())
+                        updated += 1
+                        continue
+
                 won = (result == side) if side else False
                 if won:
                     pnl = ((100 - (cost_cents or 0)) * n_ct - (fee_cents or 0)) / 100.0
@@ -337,7 +370,7 @@ def rebuild_today(client: kalshi.KalshiClient) -> int:
         if result is not None and side and cost_cents is not None:
             won = (result == side)
             if won:
-                pnl = (100 - cost_cents - fee_cents) / 100.0
+                pnl = ((100 - cost_cents) * count - fee_cents) / 100.0
                 tax = pnl * treasury.TAX_RATE
                 fee_amt = pnl * treasury.OPERATOR_FEE
                 total_tax += tax
@@ -345,7 +378,7 @@ def rebuild_today(client: kalshi.KalshiClient) -> int:
                 store.update_settlement(row_id, "win", pnl, time.time())
                 discipline.record_win()
             else:
-                pnl = -(cost_cents + fee_cents) / 100.0
+                pnl = -(cost_cents * count + fee_cents) / 100.0
                 store.update_settlement(row_id, "loss", pnl, time.time())
                 discipline.record_loss()
 
@@ -563,7 +596,7 @@ def main():
             # Daily Review Pack (09:00 ET)
             if review_pack.is_review_time() and now - last_review_pack > 3600:
                 try:
-                    review_pack.send_review_pack()
+                    review_pack.send_review_pack(client)
                     last_review_pack = now
                 except Exception as e:
                     log.warning(f"[MAIN] Review pack error: {e}")
@@ -601,7 +634,8 @@ def main():
                 try:
                     pos = kalshi.position_for_market(client, ticker)
                     if abs(pos) > 0:
-                        gateway.mark_traded(ticker)
+                        gateway.mark_traded(ticker, "F")
+                        gateway.mark_traded(ticker, "H8")
                         log.info(f"[MAIN] Already holding position on {ticker}")
                         time.sleep(LOOP_SLEEP_SEC)
                         continue

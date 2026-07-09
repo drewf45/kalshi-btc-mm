@@ -262,13 +262,15 @@ def unresolved_tickers() -> list:
 
 
 def get_unresolved_rows(ticker: str) -> list:
-    """Return unresolved rows for a ticker: (id, action, side, cost_cents, fee_cents).
+    """Return unresolved rows: (id, action, side, cost_cents, fee_cents, contracts,
+    fill_cost_cents, order_id).
     Includes resolution='timeout' (P1 0708) — filled, settlement lagged, never
     resolved. pnl was stamped 0.0 so re-settling waterfalls exactly once."""
     with _lock:
         rows = _conn.execute(
             """SELECT id, action, side, cost_per_contract_cents,
-                      COALESCE(fee_cents, 0), COALESCE(contracts, 1)
+                      COALESCE(fee_cents, 0), COALESCE(contracts, 1),
+                      fill_cost_cents, order_id
                FROM surface WHERE market_ticker=?
                AND (resolution IS NULL OR resolution='timeout')""",
             (ticker,),
@@ -736,33 +738,86 @@ def update_why_tag(row_id: int, why_tag: str, skip_reason: str = None) -> None:
         _conn.commit()
 
 
+def update_session_vol(row_id: int, session_tag: str, vol_regime: str) -> None:
+    """Update session_tag and vol_regime on a surface row."""
+    with _lock:
+        _conn.execute(
+            "UPDATE surface SET session_tag=?, vol_regime=? WHERE id=?",
+            (session_tag, vol_regime, row_id),
+        )
+        _conn.commit()
+
+
 def query_clip_by_time_band() -> list:
-    """Win rate + avg clip (pnl) per T_BAND for the scoreboard."""
+    """Win rate + avg clip per T_BAND. Separates live-traded from observed;
+    clip comes from traded rows only (same population as traded_n)."""
     T_BANDS = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
+    today_start = et_midnight_ts()
     results = []
     with _lock:
         for hi, lo in T_BANDS:
-            row = _conn.execute(
+            traded = _conn.execute(
                 """SELECT
-                    COUNT(DISTINCT CASE WHEN resolution IN ('win','obs_win') THEN market_ticker END),
-                    COUNT(DISTINCT CASE WHEN resolution IN ('loss','obs_loss') THEN market_ticker END),
-                    AVG(CASE WHEN resolution IN ('win','loss') THEN pnl_net END)
+                    COUNT(CASE WHEN resolution='win' THEN 1 END),
+                    COUNT(CASE WHEN resolution='loss' THEN 1 END),
+                    AVG(pnl_net)
                    FROM surface
-                   WHERE seconds_to_expiry >= ? AND seconds_to_expiry < ?
-                   AND resolution IN ('win','loss','obs_win','obs_loss')
+                   WHERE env='live-traded' AND action='ENTER'
+                   AND seconds_to_expiry >= ? AND seconds_to_expiry < ?
+                   AND resolution IN ('win','loss')
                    AND side IS NOT NULL
                    AND COALESCE(lane,'F')='F'""",
                 (lo, hi),
             ).fetchone()
-            wins = row[0] if row else 0
-            losses = row[1] if row else 0
-            n = wins + losses
-            avg_clip = row[2] if row else 0
+            t_wins = traded[0] if traded else 0
+            t_losses = traded[1] if traded else 0
+            t_clip = traded[2] if traded else 0
+
+            obs = _conn.execute(
+                """SELECT
+                    COUNT(DISTINCT CASE WHEN resolution='obs_win' THEN market_ticker END),
+                    COUNT(DISTINCT CASE WHEN resolution='obs_loss' THEN market_ticker END)
+                   FROM surface
+                   WHERE env='live-observed'
+                   AND seconds_to_expiry >= ? AND seconds_to_expiry < ?
+                   AND resolution IN ('obs_win','obs_loss')
+                   AND side IS NOT NULL
+                   AND COALESCE(lane,'F')='F'""",
+                (lo, hi),
+            ).fetchone()
+            obs_n = (obs[0] or 0) + (obs[1] or 0) if obs else 0
+
+            today = _conn.execute(
+                """SELECT
+                    COUNT(CASE WHEN resolution='win' THEN 1 END),
+                    COUNT(CASE WHEN resolution='loss' THEN 1 END),
+                    AVG(pnl_net)
+                   FROM surface
+                   WHERE env='live-traded' AND action='ENTER'
+                   AND seconds_to_expiry >= ? AND seconds_to_expiry < ?
+                   AND resolution IN ('win','loss')
+                   AND side IS NOT NULL
+                   AND COALESCE(lane,'F')='F'
+                   AND decision_ts >= ?""",
+                (lo, hi, today_start),
+            ).fetchone()
+            td_wins = today[0] if today else 0
+            td_losses = today[1] if today else 0
+            td_clip = today[2] if today else 0
+
+            traded_n = t_wins + t_losses
+            today_n = td_wins + td_losses
             results.append({
                 "band": f"T-{hi}-{lo}",
-                "n": n, "wins": wins, "losses": losses,
-                "win_pct": wins / n if n > 0 else 0,
-                "avg_clip": float(avg_clip or 0),
+                "traded_n": traded_n,
+                "traded_wins": t_wins,
+                "traded_losses": t_losses,
+                "traded_win_pct": t_wins / traded_n if traded_n > 0 else 0,
+                "traded_clip": float(t_clip or 0),
+                "obs_n": obs_n,
+                "today_n": today_n,
+                "today_wins": td_wins,
+                "today_clip": float(td_clip or 0),
             })
     return results
 

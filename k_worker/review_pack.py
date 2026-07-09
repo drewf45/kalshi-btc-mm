@@ -53,8 +53,8 @@ def _pct_delta_str(current: float, yesterday: float) -> str:
     return f" ({d:+.1f}pp vs yday)"
 
 
-def build_review_pack() -> str:
-    """Build the Daily Review Pack string."""
+def build_review_pack(cash: float = 0.0, pv: float = 0.0) -> str:
+    """Build the Daily Review Pack string. Pass live cash+pv for §8 invariant check."""
     now_et = datetime.now(NY)
     date_str = now_et.strftime("%Y-%m-%d")
     day_n = _day_number()
@@ -83,16 +83,18 @@ def build_review_pack() -> str:
     lines.append(f"2. NO-FILL RATE: {nf_pct:.1f}% ({nofill['nofill']}/{nofill['attempts']}) "
                  f"[baseline 22%]{_pct_delta_str(nf_pct, yesterday.get('nofill_pct'))}")
 
-    # 3. CLIP BY TIME BAND
+    # 3. CLIP BY TIME BAND (traded/obs separated)
     lines.append("3. CLIP BY TIME BAND:")
     clip_bands = store.query_clip_by_time_band()
     for c in clip_bands:
         band_key = f"clip_{c['band']}"
-        today_metrics[band_key] = c["avg_clip"]
-        delta = _delta_str(c["avg_clip"], yesterday.get(band_key), "+.3f")
+        today_metrics[band_key] = c["traded_clip"]
+        delta = _delta_str(c["traded_clip"], yesterday.get(band_key), "+.3f")
         flag = " ← early-band" if c["band"] == "T-900-600" else ""
-        if c["n"] > 0:
-            lines.append(f"   {c['band']}: n={c['n']} clip=${c['avg_clip']:+.3f}{delta}{flag}")
+        if c["traded_n"] > 0 or c["obs_n"] > 0:
+            today_part = f" (today {c['today_n']})" if c["today_n"] > 0 else ""
+            lines.append(f"   {c['band']}: traded n={c['traded_n']} clip=${c['traded_clip']:+.3f} "
+                         f"| obs n={c['obs_n']}{today_part}{delta}{flag}")
         else:
             lines.append(f"   {c['band']}: n=0{flag}")
 
@@ -125,10 +127,12 @@ def build_review_pack() -> str:
     else:
         lines.append("5. CAUTION LEDGER: no data today")
 
-    # 6. H8 DUAL-GATE
+    # 6. H8 DUAL-GATE (qualified = TBL-tagged; unqualified = all other H8)
     h8_stats = _query_h8_dual_gate()
     if h8_stats["total"] > 0:
-        lines.append(f"6. H8 DUAL-GATE: {h8_stats['agree']}/{h8_stats['total']} agreements")
+        lines.append(f"6. H8 DUAL-GATE: qualified {h8_stats['qualified']} "
+                     f"(dual-gate agree {h8_stats['agree']}/{h8_stats['qualified']}) "
+                     f"| unqualified {h8_stats['unqualified']}")
         if h8_stats["disagreements"]:
             for dis in h8_stats["disagreements"][:5]:
                 lines.append(f"   {dis}")
@@ -139,19 +143,25 @@ def build_review_pack() -> str:
     ts = delta_table_loader.table_status()
     lines.append(f"7. TABLE STATUS: {ts['detail']}")
 
-    # 8. TREASURY
+    # 8. TREASURY (live balance when available; identity-free tradeable)
     t = treasury.get_totals()
     owed = t["accrued_tax"] + t["accrued_fee"]
-    trd = treasury.tradeable_balance(t["engine_book"] + owed)
+    trd = treasury.tradeable_balance(cash) if cash > 0 else t["engine_book"]
     today_metrics["treasury_book"] = t["engine_book"]
     today_metrics["treasury_owed"] = owed
     today_metrics["treasury_tradeable"] = trd
     book_delta = _delta_str(t["engine_book"], yesterday.get("treasury_book"))
     owed_delta = _delta_str(owed, yesterday.get("treasury_owed"))
     paid_lifetime = t["paid_tax"] + t["paid_fee"]
+    inv_flag = ""
+    if cash > 0:
+        live_bal = cash + pv
+        expected = t["engine_book"] + owed
+        drift = abs(live_bal - expected)
+        inv_flag = f" ⚠ DRIFT ${drift:.2f}" if drift > 0.05 else " ✓"
     lines.append(f"8. TREASURY: tradeable ${trd:.2f} | owed ${owed:.2f}{owed_delta} | "
                  f"book ${t['engine_book']:.2f}{book_delta} | "
-                 f"lifetime collected ${paid_lifetime:.2f}")
+                 f"lifetime collected ${paid_lifetime:.2f}{inv_flag}")
 
     # 9. NEW ALERT TYPES
     new_alerts = _query_new_alert_types()
@@ -202,27 +212,39 @@ def _query_nofill_rate() -> dict:
 
 
 def _query_h8_dual_gate() -> dict:
-    """Scan today's H8 why_tags for dual-gate agreement/disagreement."""
+    """Scan today's H8 rows: qualified (TBL-tagged) vs unqualified (all other H8)."""
     today_start = store.et_midnight_ts()
     with store._lock:
-        rows = store._conn.execute(
+        qualified_rows = store._conn.execute(
             """SELECT why_tag, resolution FROM surface
                WHERE lane='H8' AND decision_ts >= ?
                AND why_tag LIKE '%TBL_%'""",
             (today_start,),
         ).fetchall()
+        all_h8 = store._conn.execute(
+            """SELECT COUNT(*) FROM surface
+               WHERE lane='H8' AND decision_ts >= ?""",
+            (today_start,),
+        ).fetchone()
+    total_h8 = all_h8[0] if all_h8 else 0
+    qualified = len(qualified_rows)
+    unqualified = total_h8 - qualified
     agree = 0
-    total = 0
     disagreements = []
-    for tag, resolution in rows:
-        total += 1
+    for tag, resolution in qualified_rows:
         if "|TBL_" in tag:
             if "_PASS" in tag:
                 agree += 1
             elif "_FAIL" in tag:
                 outcome = resolution or "pending"
                 disagreements.append(f"DISAGREE: {tag[:60]}... → {outcome}")
-    return {"agree": agree, "total": total, "disagreements": disagreements}
+    return {
+        "agree": agree,
+        "qualified": qualified,
+        "unqualified": unqualified,
+        "total": total_h8,
+        "disagreements": disagreements,
+    }
 
 
 def _query_new_alert_types() -> list:
@@ -248,10 +270,16 @@ def _query_new_alert_types() -> list:
     return sorted(new)[:10]
 
 
-def send_review_pack() -> None:
+def send_review_pack(client=None) -> None:
     """Build and send the Daily Review Pack to Telegram."""
     import html
-    text = build_review_pack()
+    cash, pv = 0.0, 0.0
+    if client is not None:
+        from . import kalshi
+        c, p = kalshi.get_balance(client)
+        if c is not None:
+            cash, pv = c, p or 0.0
+    text = build_review_pack(cash=cash, pv=pv)
     log.info(f"[REVIEW_PACK]\n{text}")
     notify.send(f"<pre>{html.escape(text)}</pre>")
 
