@@ -12,6 +12,8 @@ Boot sequence:
 """
 
 import os
+import sys
+import fcntl
 import time
 import signal
 import logging
@@ -44,6 +46,36 @@ def _shutdown(sig, frame):
 
 
 STALE_TICKER_SEC = 86400  # 24 hours
+LOCK_FILE = os.environ.get("K_WORKER_LOCK", "/var/data/k_worker.lock")
+_lock_fd = None
+
+
+def _acquire_instance_lock() -> None:
+    """HF-2: acquire exclusive flock — prevents two engines from running
+    against one Kalshi account + one DB simultaneously."""
+    global _lock_fd
+    lock_dir = os.path.dirname(LOCK_FILE)
+    if lock_dir and not os.path.isdir(lock_dir):
+        os.makedirs(lock_dir, exist_ok=True)
+    _lock_fd = open(LOCK_FILE, "w")
+    deadline = time.time() + 120
+    alerted = False
+    while True:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_fd.write(str(os.getpid()))
+            _lock_fd.flush()
+            log.info("[MAIN] Instance lock acquired")
+            return
+        except (IOError, OSError):
+            if not alerted:
+                log.warning("[MAIN] Waiting for previous instance to release lock...")
+                notify.send("⏳ Waiting for previous instance to exit")
+                alerted = True
+            if time.time() >= deadline:
+                notify.alert("ENGINE_OVERLAP: another instance holds the lock — refusing to start")
+                raise RuntimeError("FATAL: ENGINE_OVERLAP — another instance holds the lock after 120s")
+            time.sleep(10)
 
 
 def _backfill_settlements(client: kalshi.KalshiClient) -> int:
@@ -473,16 +505,24 @@ def main():
 
     # 3. Store
     store.init_db()
+
+    # HF-2: single-instance guard — acquire exclusive lock before any writes
+    _acquire_instance_lock()
+
     store.dedup_historical_skips()
     store.recompute_missing_pnl()
     store.migrate_lanes()
 
     # 3a. WO-I: one-shot ladder timestamp repair (heals stale secs_to_expiry)
     if store.get_state("repair_ts_done") != "1":
-        from . import repair_ts
-        n = repair_ts.repair(dry_run=False)
-        store.set_state("repair_ts_done", "1")
-        notify.send(f"\U0001f527 TS REPAIR: {n} ladder rows re-stamped from why_tags (one-shot)")
+        try:
+            from . import repair_ts
+            n = repair_ts.repair(dry_run=False)
+            store.set_state("repair_ts_done", "1")
+            notify.send(f"\U0001f527 TS REPAIR: {n} ladder rows re-stamped from why_tags (one-shot)")
+        except Exception as e:
+            log.error(f"[MAIN] TS REPAIR failed (deferred to next boot): {e}")
+            notify.send(f"⚠ TS REPAIR deferred: {e} — will retry next boot")
 
     # 3b. Delta table — self-provisioning (R5)
     if not delta_table_loader.load():

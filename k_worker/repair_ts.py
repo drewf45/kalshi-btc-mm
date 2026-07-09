@@ -1,4 +1,4 @@
-"""WO-A repair: fix stale seconds_to_expiry on ladder-pass rows.
+r"""WO-A repair: fix stale seconds_to_expiry on ladder-pass rows.
 
 The watch ladder computed secs_to_expiry before waiting; the surface row
 recorded the pre-wait value instead of the true decision-time value.
@@ -17,7 +17,8 @@ log = logging.getLogger("k_worker.repair_ts")
 
 
 def repair(dry_run: bool = False) -> int:
-    store.init_db()
+    if store._conn is None:
+        store.init_db()
 
     with store._lock:
         rows = store._conn.execute(
@@ -27,7 +28,7 @@ def repair(dry_run: bool = False) -> int:
                AND seconds_to_expiry IS NOT NULL"""
         ).fetchall()
 
-    repaired = 0
+    updates = []
     for row_id, why_tag, stored_tte in rows:
         m = re.search(r'_T-(\d+)', why_tag)
         if not m:
@@ -35,21 +36,21 @@ def repair(dry_run: bool = False) -> int:
         true_tte = int(m.group(1))
         diff = abs(stored_tte - true_tte)
         if diff > 5:
+            new_tag = f"{why_tag}|TS_REPAIRED"
             if dry_run:
-                print(f"  WOULD REPAIR id={row_id}: stored={stored_tte:.0f} → "
-                      f"{true_tte} (Δ{diff:.0f}s) tag={why_tag[:60]}")
-            else:
-                new_tag = f"{why_tag}|TS_REPAIRED"
-                with store._lock:
-                    store._conn.execute(
-                        "UPDATE surface SET seconds_to_expiry=?, why_tag=? WHERE id=?",
-                        (true_tte, new_tag, row_id),
-                    )
-                    store._conn.commit()
-                print(f"  REPAIRED id={row_id}: {stored_tte:.0f} → "
-                      f"{true_tte} (Δ{diff:.0f}s)")
-            repaired += 1
+                print(f"  WOULD REPAIR id={row_id}: stored={stored_tte:.0f} -> "
+                      f"{true_tte} (d{diff:.0f}s) tag={why_tag[:60]}")
+            updates.append((true_tte, new_tag, row_id))
 
+    if updates and not dry_run:
+        with store._lock:
+            store._conn.executemany(
+                "UPDATE surface SET seconds_to_expiry=?, why_tag=? WHERE id=?",
+                updates,
+            )
+            store._conn.commit()
+
+    repaired = len(updates)
     print(f"{'Would repair' if dry_run else 'Repaired'} "
           f"{repaired}/{len(rows)} ladder rows")
     return repaired

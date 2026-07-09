@@ -29,6 +29,7 @@ def init_db() -> None:
     global _conn
     _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     _conn.execute("PRAGMA journal_mode=WAL")
+    _conn.execute("PRAGMA busy_timeout=15000")
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS surface (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
