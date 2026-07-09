@@ -472,7 +472,16 @@ def main():
     orders_route = kalshi.probe_orders_route(client)
     notify.send(f"Route probes: fills {fills_route} ✓ | orders {orders_route} ✓")
 
-    # 5c. Boot reconcile — Drew's law: never trust stored treasury across deploys
+    # 5c. Settle-before-baseline (tape 0709): resolve any pending settlements
+    # FIRST so the reconcile baseline doesn't absorb a payout that the
+    # backfill then waterfalls again (observed +$0.02 double-count when a
+    # position settled during redeploy).
+    try:
+        _backfill_settlements(client)
+    except Exception as e:
+        log.warning(f"[MAIN] Pre-reconcile backfill error: {e}")
+
+    # Boot reconcile — Drew's law: never trust stored treasury across deploys
     boot_reconcile(client)
 
     if engine.HEARTBEAT_PING_URL:
