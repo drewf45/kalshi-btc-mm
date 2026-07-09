@@ -431,12 +431,13 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
     fee_cents = 0
     count = 1
 
-    for ck in ("count", "quantity", "qty"):
+    # Tape 0709: live fills carry count_fp ('1.00') — parse via Decimal.
+    for ck in ("count", "count_fp", "quantity", "qty"):
         raw = _get(ck)
         if raw is not None:
             try:
-                count = int(raw)
-            except (ValueError, TypeError):
+                count = int(Decimal(str(raw)))
+            except Exception:
                 pass
             break
 
@@ -491,7 +492,8 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
         log.warning(f"[FILLS] Unparsed fill record (raw): {fill}")
         _fill_parse_warned = True
 
-    for fee_key in ("fee", "taker_fee", "maker_fee"):
+    # Tape 0709: live fills carry fee_cost ('0.000000', dollars).
+    for fee_key in ("fee", "fee_cost", "taker_fee", "maker_fee"):
         raw = _get(fee_key)
         if raw is not None:
             try:
