@@ -240,8 +240,10 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
             return "no_balance"
 
         if not _observe_mode:
-            tradeable = treasury.tradeable_balance(cash)
-            discipline.check_drawdown(tradeable)
+            # P2 (0708): pass RAW cash — check_drawdown applies
+            # tradeable_balance internally; passing tradeable deducted
+            # owed-to-Drew twice and tripped the rail early.
+            discipline.check_drawdown(cash)
             if discipline.is_halted():
                 return "halted"
 
@@ -393,12 +395,28 @@ def run_market_cycle(client: kalshi.KalshiClient, ticker: str,
     )
     store._conn.commit()
 
+    # P9 (0708): queue position at placement — instruments no-fill cause.
+    try:
+        qp = kalshi.get_order_queue_position(client, order_id)
+        if qp is not None:
+            store.update_queue_pos(row_id, "queue_pos_entry", qp)
+            log.info(f"[ENGINE] Queue position at entry: {qp} ({ticker})")
+    except Exception:
+        pass
+
     # Phase 4: Monitor fill -> settlement
     order_placed_ts = time.time()
     result = _monitor_order(client, ticker, order_id, row_id, eval_result,
                             close_ts, book, order_placed_ts=order_placed_ts)
 
     outcome = result["outcome"]
+
+    # P5 (0708): confirmed zero-fill releases lane-F hourly exposure.
+    # blind_standdown deliberately NOT released (could be filled).
+    if eval_result.lane == "F" and outcome in ("no_fill", "cancelled_external"):
+        n_ct = max(1, getattr(eval_result, "contracts", 1))
+        gateway.release_exposure((eval_result.cost_exact or eval_result.cost_cents) / 100.0 * n_ct)
+
     bal = _bal_str(client)
     ts = _time_et()
     tag = eval_result.why_tag
@@ -530,8 +548,8 @@ def _run_watch_ladder(client: kalshi.KalshiClient, ticker: str,
                 continue
 
             if not _observe_mode:
-                tradeable = treasury.tradeable_balance(cash)
-                discipline.check_drawdown(tradeable)
+                # P2 (0708): raw cash — see run_market_cycle note.
+                discipline.check_drawdown(cash)
                 if discipline.is_halted():
                     return None
 
@@ -545,24 +563,31 @@ def _run_watch_ladder(client: kalshi.KalshiClient, ticker: str,
                                             boundary_hi=boundary_hi)
 
             if eval_result.allowed:
-                # Top-rung guard (tier 0 = T-900-600 only)
+                # Top-rung guard (tier 0 = T-900-600 only) — P3 (0708):
+                # upper-tail gate vs cost-implied breakeven; low-tail entries
+                # trade and get TAGGED (ruling #3: tape decides adverse-selection).
                 if tier_idx == 0 and delta_table_loader.is_loaded():
                     dist_usd = abs(eval_result.distance) if eval_result.distance is not None else 0
-                    tv = delta_table_loader.f_top_rung_verdict(dist_usd, secs_left)
+                    tv = delta_table_loader.f_top_rung_verdict(
+                        dist_usd, secs_left,
+                        cost_cents=eval_result.cost_exact or eval_result.cost_cents)
                     if tv["qualified"] is False:
-                        log.info(f"[ENGINE] Top-rung guard: table says no — "
-                                 f"d=${dist_usd:.0f} wub={tv['wilson_ub']:.6f}")
+                        log.info(f"[ENGINE] Top-rung guard: crossing risk over gate — "
+                                 f"d=${dist_usd:.0f} wub={tv['wilson_ub']:.6f} "
+                                 f"be={tv['breakeven_p']:.2%}")
                         store.insert_row(store.SurfaceRow(
                             market_ticker=ticker, decision_ts=time.time(),
                             action="SKIP", seconds_to_expiry=secs_left,
                             cost_per_contract_cents=cost_int,
-                            skip_reason="TABLE_UNQUALIFIED",
-                            why_tag=f"SKIP_TABLE_UNQUALIFIED_d{tv['distance_grid']}_wub{tv['wilson_ub']:.4f}",
+                            skip_reason="TABLE_RISK_OVER_GATE",
+                            why_tag=f"SKIP_TABLE_RISK_d{tv['distance_grid']}_wub{tv['wilson_ub']:.4f}",
                             env="live-observed",
                         ))
                         confirm_count = 0
                         time.sleep(POLL_INTERVAL_SEC)
                         continue
+                    if tv.get("low_tail"):
+                        eval_result.why_tag = f"{eval_result.why_tag}_LOWTAIL"
 
                 # Enrich why_tag with confirmation count
                 eval_result.why_tag = (f"{eval_result.why_tag}"
@@ -599,6 +624,7 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
     blind_consecutive = 0
     gone_first_seen_ts: float = 0.0
     gone_consecutive: int = 0
+    queue_t60_logged = False
 
     while True:
         heartbeat()
@@ -699,9 +725,19 @@ def _monitor_order(client: kalshi.KalshiClient, ticker: str,
         # state == "resting" — reset gone debounce, check partial fill
         gone_first_seen_ts = 0.0
         gone_consecutive = 0
+
+        # P9 (0708): one queue-position sample inside the final minute.
+        if not queue_t60_logged and secs_left <= 60:
+            queue_t60_logged = True
+            try:
+                qp = kalshi.get_order_queue_position(client, order_id)
+                if qp is not None:
+                    store.update_queue_pos(row_id, "queue_pos_t60", qp)
+            except Exception:
+                pass
         raw = status_result.get("raw") or {}
         fc_str = raw.get("fill_count", "0") or "0"
-        if Decimal(fc_str) > 0:
+        if Decimal(fc_str) > 0 and getattr(eval_result, "contracts", 1) == 1:
             notify.alert(f"Partial fill at 1ct?! fill_count={fc_str} on resting order {raw}")
 
         # Reprice gate: check fills before cancel+replace (prevents double-entry B5)
@@ -812,14 +848,15 @@ def _wait_for_settlement(client: kalshi.KalshiClient, ticker: str,
         result = kalshi.get_settlement_result(client, ticker)
         if result is not None:
             won = (result == eval_result.side)
+            n_ct = max(1, getattr(eval_result, "contracts", 1))
             if won:
-                payout_cents = 100
-                pnl = (payout_cents - fill_cost - fee_cents) / 100.0
+                # P16 (0708): per-contract clip x contracts, fee is total.
+                pnl = ((100 - fill_cost) * n_ct - fee_cents) / 100.0
                 resolution = "win"
                 discipline.record_win()
                 split = treasury.waterfall(pnl)
             else:
-                pnl = -(fill_cost + fee_cents) / 100.0
+                pnl = -(fill_cost * n_ct + fee_cents) / 100.0
                 resolution = "loss"
                 discipline.record_loss()
                 treasury.record_loss(pnl)

@@ -232,23 +232,42 @@ def h8_table_verdict(distance_usd: float, secs_remaining: float,
     }
 
 
-def f_top_rung_verdict(distance_usd: float, secs_remaining: float,
-                       session: str = "ALL") -> dict:
-    """F top-rung guard: table verdict for the T-900-600 rung.
+F_TOPRUNG_HAIRCUT = float(os.environ.get("F_TOPRUNG_HAIRCUT", "0.5"))
+LOW_TAIL_UB = 0.001
 
-    Gates on wilson_ub (R2): if wilson_ub for P(cross) is negligible
-    (boundary too far), the early entry is underwater -> SKIP.
-    "Table says no" = wilson_ub of P(cross) <= 0.001.
+
+def f_top_rung_verdict(distance_usd: float, secs_remaining: float,
+                       cost_cents: float,
+                       session: str = "ALL") -> dict:
+    """F top-rung guard (T-900-600) — P3 (0708), Drew's ruling banked.
+
+    Guard two-tail rule (doctrine 0708): a probability gate must state BOTH
+    tails. The UPPER tail is the trade-killing one — at cost c cents, the
+    breakeven crossing probability is (100 - c)/100; any cell whose wilson_ub
+    exceeds a haircut of that breakeven is negative-EV and MUST skip.
+      qualified = wilson_ub <= breakeven_p * F_TOPRUNG_HAIRCUT
+    (haircut 0.5 default per safest-price doctrine; env-tunable.)
+
+    The old low-tail skip (wilson_ub <= 0.001 -> skip) is REMOVED per
+    capital-gate ruling #3 — the adverse-selection theory was UNPROVEN.
+    Low-tail cells now trade and are TAGGED (low_tail=True) so the tape
+    can prove or kill the theory from settlements.
 
     Returns dict:
       qualified: bool or None (None = table absent, static gate decides)
       p_cross, wilson_ub: float or None
       distance_grid: int
+      low_tail: bool (tag-only, never a skip)
+      breakeven_p: float
       reason: str
     """
+    breakeven_p = max(0.0, (100.0 - float(cost_cents)) / 100.0)
+    gate = breakeven_p * F_TOPRUNG_HAIRCUT
+
     if not _LOADED:
         return {"qualified": None, "p_cross": None, "wilson_ub": None,
-                "distance_grid": 0, "reason": "TABLE_ABSENT"}
+                "distance_grid": 0, "low_tail": False,
+                "breakeven_p": breakeven_p, "reason": "TABLE_ABSENT"}
 
     cell = _lookup(distance_usd, secs_remaining, session)
     d = _round_distance_down(distance_usd)
@@ -257,17 +276,22 @@ def f_top_rung_verdict(distance_usd: float, secs_remaining: float,
 
     if cell is None:
         return {"qualified": None, "p_cross": None, "wilson_ub": None,
-                "distance_grid": d, "reason": "CELL_MISSING"}
+                "distance_grid": d, "low_tail": False,
+                "breakeven_p": breakeven_p, "reason": "CELL_MISSING"}
 
-    # Qualified = crossing probability is NOT negligible = boundary close enough
-    qualified = cell["wilson_ub"] > 0.001
+    wub = cell["wilson_ub"]
+    qualified = wub <= gate
+    low_tail = wub <= LOW_TAIL_UB
 
     return {
         "qualified": qualified,
         "p_cross": cell["p_cross"],
-        "wilson_ub": cell["wilson_ub"],
+        "wilson_ub": wub,
         "distance_grid": d,
-        "reason": "PASS" if qualified else f"wilson_ub={cell['wilson_ub']:.6f}<=0.001",
+        "low_tail": low_tail,
+        "breakeven_p": breakeven_p,
+        "reason": ("PASS" if qualified
+                   else f"wilson_ub={wub:.4f}>gate={gate:.4f}(be={breakeven_p:.2f}*hc={F_TOPRUNG_HAIRCUT})"),
     }
 
 

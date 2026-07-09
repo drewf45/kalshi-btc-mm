@@ -302,8 +302,11 @@ def position_for_market(client: KalshiClient, ticker: str) -> int:
 
 # ── Orders ───────────────────────────────────────────────────────
 
-_ORDERS_ROUTE_CANDIDATES = ["/portfolio/orders", "/portfolio/events/orders"]
-_orders_route: str = "/portfolio/orders"
+# P7 (0708): V2 events route FIRST — legacy /portfolio/orders* is slated
+# for deprecation no earlier than 2026-05-21 with rate-limit costs rising
+# from 2026-05-14 (Kalshi API changelog). Legacy kept as fallback only.
+_ORDERS_ROUTE_CANDIDATES = ["/portfolio/events/orders", "/portfolio/orders"]
+_orders_route: str = "/portfolio/events/orders"
 
 
 def probe_orders_route(client: KalshiClient) -> str:
@@ -587,6 +590,65 @@ def order_status(client: KalshiClient, ticker: str, order_id: str) -> Dict:
     return {"state": "gone", "raw": None}
 
 
+def amend_order(client: KalshiClient, order_id: str, ticker: str, side: str,
+                price_cents: int, count: int = 1,
+                v2_price_str: Optional[str] = None) -> Tuple[Optional[str], Dict]:
+    """P4 (0708): atomic reprice via Amend Order V2 —
+    POST /portfolio/events/orders/{order_id}/amend.
+    Replaces the cancel+place path, which had a fill-race double-entry window
+    (cancel returning not_found on a just-filled order was ignored and a new
+    order was placed anyway). Amend cannot double-enter by construction.
+
+    side: engine 'yes'/'no'. V2 quotes the YES leg: yes->bid at price,
+    no->ask at (1 - price). Returns (new_order_id, response) or (None, {})
+    on failure — caller treats failure as safe (order state unchanged or
+    gone; monitor loop's fills-first status will resolve it).
+    """
+    from decimal import Decimal
+    if v2_price_str is not None:
+        if side == "yes":
+            v2_side, v2_price = "bid", v2_price_str
+        else:
+            v2_side, v2_price = "ask", str(Decimal("1") - Decimal(v2_price_str))
+    elif side == "yes":
+        v2_side, v2_price = "bid", f"{price_cents / 100:.2f}"
+    else:
+        v2_side, v2_price = "ask", f"{(100 - price_cents) / 100:.2f}"
+
+    # Recover the original client_order_id from the per-order GET (amend
+    # request shape wants both original and updated client_order_id).
+    client_order_id = None
+    try:
+        o = client.request("GET", f"{_orders_route}/{order_id}")
+        if o:
+            obj = o.get("order") or o
+            client_order_id = obj.get("client_order_id")
+    except Exception as e:
+        log.warning(f"[AMEND] per-order GET failed for {order_id}: {e}")
+
+    body: Dict[str, Any] = {
+        "ticker": ticker,
+        "side": v2_side,
+        "price": v2_price,
+        "count": str(max(1, int(count))),
+        "updated_client_order_id": str(uuid.uuid4()),
+    }
+    if client_order_id:
+        body["client_order_id"] = str(client_order_id)
+
+    try:
+        resp = client.request(
+            "POST", f"/portfolio/events/orders/{order_id}/amend", json_body=body)
+    except Exception as e:
+        log.warning(f"[AMEND] amend failed for {order_id}: {e}")
+        return None, {}
+    log.info(f"[AMEND] resp: {resp}")
+    if isinstance(resp, dict):
+        new_oid = resp.get("order_id") or order_id
+        return str(new_oid), resp
+    return None, {}
+
+
 def place_order_maker(client: KalshiClient, ticker: str, side: str,
                       price_cents: int, count: int = 1,
                       expiration_ts: Optional[int] = None,
@@ -673,10 +735,16 @@ def get_all_recent_fills(client: KalshiClient, limit: int = 200) -> List[Dict]:
 # ── BTC Spot (Fix 4) ───────────────────────────────────────────
 
 _spot_cache: Dict[str, Any] = {"price": None, "ts": 0.0}
+SPOT_MAX_STALE_SEC = 30.0
 
 
 def get_btc_spot() -> Optional[float]:
-    """BTC spot from Coinbase public ticker, cached <=5s. Feed failure -> None."""
+    """BTC spot from Coinbase public ticker, cached <=5s.
+    P6 (0708): on fetch failure the cache is only served if it is younger
+    than SPOT_MAX_STALE_SEC — an unbounded stale fallback was silently
+    feeding hour-old prices into H8 distance and the top-rung guard.
+    Older than the bound -> None; consumers already fail safe on None
+    (H8_NO_SPOT skip, guard skipped). Fail-loud doctrine."""
     now = time.time()
     if _spot_cache["price"] is not None and (now - _spot_cache["ts"]) < 5:
         return _spot_cache["price"]
@@ -690,8 +758,12 @@ def get_btc_spot() -> Optional[float]:
         _spot_cache["ts"] = now
         return price
     except Exception as e:
-        log.warning(f"[SPOT] Coinbase fetch failed: {e}")
-        return _spot_cache["price"]
+        age = now - _spot_cache["ts"]
+        if _spot_cache["price"] is not None and age < SPOT_MAX_STALE_SEC:
+            log.warning(f"[SPOT] Coinbase fetch failed: {e} — serving cache age {age:.0f}s")
+            return _spot_cache["price"]
+        log.warning(f"[SPOT] Coinbase fetch failed: {e} — cache stale ({age:.0f}s) -> BLIND (None)")
+        return None
 
 
 # ── Boundary extraction (Fix 4) ────────────────────────────────
@@ -740,6 +812,70 @@ def extract_boundaries(market_obj: Dict) -> Tuple[Optional[float], Optional[floa
                 except (KeyError, ValueError, TypeError):
                     pass
     return lo, hi
+
+
+# ── Fee-change tripwire (P8, 0708) ─────────────────────────────
+
+_FEE_ROUTE_CANDIDATES = ["/exchange/series_fee_changes", "/series/fee_changes"]
+_fee_route_dead = False
+
+
+def get_series_fee_changes(client: KalshiClient,
+                           series_ticker: str = SERIES_TICKER) -> Optional[list]:
+    """P8 (0708): the thesis is sized in single cents — a maker-fee change on
+    KXBTC15M kills the 98-99c rungs. Kalshi publishes Get Series Fee Changes;
+    exact route probed from candidates (schema drift tolerated, fail-loud
+    once). Returns list of change records touching the series, [] if none,
+    None if the endpoint is unreachable (caller alerts once, non-fatal)."""
+    global _fee_route_dead
+    if _fee_route_dead:
+        return None
+    last_err = None
+    for route in _FEE_ROUTE_CANDIDATES:
+        try:
+            resp = client.request("GET", route,
+                                  params={"series_ticker": series_ticker, "limit": 50})
+            if isinstance(resp, dict):
+                for k in ("fee_changes", "series_fee_changes", "changes"):
+                    if isinstance(resp.get(k), list):
+                        return [c for c in resp[k]
+                                if series_ticker in str(c.get("series_ticker", c))]
+                return []
+            return []
+        except Exception as e:
+            last_err = e
+            continue
+    log.warning(f"[FEES] No fee-changes route responded ({last_err}) — tripwire disabled this boot")
+    _fee_route_dead = True
+    return None
+
+
+# ── Queue position (P9, 0708) ──────────────────────────────────
+
+def get_order_queue_position(client: KalshiClient, order_id: str) -> Optional[int]:
+    """P9 (0708): read our resting order's queue position. Primary source is
+    the queue_position field on the per-order GET; dedicated endpoint as
+    fallback. Instruments the 22% no-fill baseline — distinguishes 'deep in
+    queue' from 'book never traded', and gates the queue-jump knob (P12)
+    on measurement instead of guesswork. Returns None on any failure."""
+    try:
+        o = client.request("GET", f"{_orders_route}/{order_id}")
+        if o:
+            obj = o.get("order") or o
+            qp = obj.get("queue_position")
+            if qp is not None:
+                return int(qp)
+    except Exception:
+        pass
+    try:
+        r = client.request("GET", f"{_orders_route}/{order_id}/queue_position")
+        if isinstance(r, dict):
+            qp = r.get("queue_position")
+            if qp is not None:
+                return int(qp)
+    except Exception:
+        pass
+    return None
 
 
 # ── Census (Part 4.2) ──────────────────────────────────────────

@@ -33,6 +33,7 @@ BACKFILL_INTERVAL_SEC = 300
 RECONCILE_INTERVAL_SEC = 300
 CENSUS_INTERVAL_SEC = 3600
 HOURLY_BALANCE_SEC = 3600
+FEE_CHECK_INTERVAL_SEC = 21600  # P8 (0708): fee tripwire every 6h
 _running = True
 
 
@@ -59,7 +60,7 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
             close_ts = store.approx_close_ts(ticker)
             if close_ts > 0 and (now - close_ts) > STALE_TICKER_SEC:
                 log.warning(f"[BACKFILL] {ticker} beyond live tier — marking stale")
-                for row_id, action, side, cost_cents, fee_cents in store.get_unresolved_rows(ticker):
+                for row_id, action, side, cost_cents, fee_cents, contracts in store.get_unresolved_rows(ticker):
                     store.update_settlement(row_id, "obs_stale", 0.0, now)
                     updated += 1
             continue
@@ -68,7 +69,8 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
         best_available_cents = 0.0
         regret_avoided = 0.0
         has_fill = False
-        for row_id, action, side, cost_cents, fee_cents in rows:
+        for row_id, action, side, cost_cents, fee_cents, contracts in rows:
+            n_ct = max(1, contracts or 1)
             # Winner clip: if favorite == winner -> clip = 100-cost; else -> -cost
             clip = None
             if side is not None and cost_cents is not None:
@@ -83,17 +85,17 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
             if action == "ENTER":
                 won = (result == side) if side else False
                 if won:
-                    pnl = (100 - (cost_cents or 0) - (fee_cents or 0)) / 100.0
+                    pnl = ((100 - (cost_cents or 0)) * n_ct - (fee_cents or 0)) / 100.0
                     res = "win"
                     discipline.record_win()
                     treasury.waterfall(pnl)
-                    realized_cents = 100.0 - float(cost_cents or 0) - float(fee_cents or 0)
+                    realized_cents = (100.0 - float(cost_cents or 0)) * n_ct - float(fee_cents or 0)
                 else:
-                    pnl = -((cost_cents or 0) + (fee_cents or 0)) / 100.0
+                    pnl = -((cost_cents or 0) * n_ct + (fee_cents or 0)) / 100.0
                     res = "loss"
                     discipline.record_loss()
                     treasury.record_loss(pnl)
-                    realized_cents = -(float(cost_cents or 0) + float(fee_cents or 0))
+                    realized_cents = -(float(cost_cents or 0) * n_ct + float(fee_cents or 0))
                 has_fill = True
             else:
                 if side is None:
@@ -212,6 +214,33 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
         f"today: {broker_fills} fills, {daily['n']} settled, net ${daily['net_pnl']:.2f}\n"
         f"{treas}"
     )
+
+
+def _check_fee_tripwire(client: kalshi.KalshiClient) -> None:
+    """P8 (0708): thesis-critical invariant — zero/low maker fees on
+    KXBTC15M. Any fee-change record touching the series -> ALERT + HALT
+    (capital-gate ruling: alert and stand down; operator resets after
+    review). Endpoint unreachable -> alert once, non-fatal."""
+    changes = kalshi.get_series_fee_changes(client)
+    if changes is None:
+        if store.get_state("fee_route_alerted") != "1":
+            store.set_state("fee_route_alerted", "1")
+            notify.alert("FEE TRIPWIRE: fee-changes endpoint unreachable — "
+                         "tripwire inactive; verify maker fees manually")
+        return
+    if not changes:
+        return
+    seen = store.get_state("fee_changes_seen") or ""
+    new_records = [c for c in changes if str(c) not in seen]
+    if not new_records:
+        return
+    store.set_state("fee_changes_seen", seen + "|".join(str(c) for c in new_records))
+    msg = (f"FEE CHANGE on {kalshi.SERIES_TICKER}: {new_records[:3]} — "
+           f"engine halted pending review (thesis is sized in single cents). "
+           f"Resume: python -m k_worker.reset")
+    log.error(f"[FEES] {msg}")
+    notify.alert(msg)
+    store.set_state("halted", "FEE_CHANGE_DETECTED")
 
 
 BOOT_RECONCILE_TOL = 0.05
@@ -429,7 +458,8 @@ def main():
     log.warning(f"[MAIN] Engine: KXBTC15M | flat 1ct | fav 95-99c | maker-only")
 
     if worker_mode == "trade":
-        discipline.check_drawdown(treasury.tradeable_balance(cash))
+        # P2 (0708): raw cash — check_drawdown applies tradeable internally.
+        discipline.check_drawdown(cash)
 
     envcheck.check_clock_skew()
 
@@ -451,6 +481,7 @@ def main():
     last_reconcile = 0
     last_census = 0
     last_hourly = 0
+    last_fee_check = 0
     last_review_pack = 0
     last_payout_notice = 0
     last_ticker = None
@@ -497,6 +528,14 @@ def main():
                 except Exception as e:
                     log.warning(f"[MAIN] Hourly balance error: {e}")
                 last_hourly = now
+
+            # Fee tripwire (P8) — every 6h
+            if now - last_fee_check > FEE_CHECK_INTERVAL_SEC:
+                try:
+                    _check_fee_tripwire(client)
+                except Exception as e:
+                    log.warning(f"[MAIN] Fee tripwire error: {e}")
+                last_fee_check = now
 
             # Daily Payout Notice (08:00 ET)
             if treasury.is_payout_notice_time() and now - last_payout_notice > 3600:

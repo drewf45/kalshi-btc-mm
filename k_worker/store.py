@@ -114,6 +114,8 @@ def init_db() -> None:
         ("session_tag", "TEXT"), ("vol_regime", "TEXT"), ("winner_clip_cents", "REAL"),
         ("order_id", "TEXT"),
         ("reprice_count", "INTEGER"),
+        ("queue_pos_entry", "INTEGER"),
+        ("queue_pos_t60", "INTEGER"),
     ]:
         try:
             _conn.execute(f"ALTER TABLE surface ADD COLUMN {col} {typ}")
@@ -247,21 +249,28 @@ def query_band_stats(cost_band_lo: int, cost_band_hi: int,
 
 
 def unresolved_tickers() -> list:
-    """Return distinct tickers with at least one unresolved row."""
+    """Return distinct tickers with at least one unresolved row.
+    P1 (0708): 'timeout' rows are filled positions whose settlement lagged the
+    5-min engine poll — they MUST re-enter the sweep or they become ghost
+    trades (no waterfall, no Wilson N). Terminal-label completeness law."""
     with _lock:
         rows = _conn.execute(
-            "SELECT DISTINCT market_ticker FROM surface WHERE resolution IS NULL"
+            "SELECT DISTINCT market_ticker FROM surface "
+            "WHERE resolution IS NULL OR resolution='timeout'"
         ).fetchall()
     return [r[0] for r in rows]
 
 
 def get_unresolved_rows(ticker: str) -> list:
-    """Return unresolved rows for a ticker: (id, action, side, cost_cents, fee_cents)."""
+    """Return unresolved rows for a ticker: (id, action, side, cost_cents, fee_cents).
+    Includes resolution='timeout' (P1 0708) — filled, settlement lagged, never
+    resolved. pnl was stamped 0.0 so re-settling waterfalls exactly once."""
     with _lock:
         rows = _conn.execute(
             """SELECT id, action, side, cost_per_contract_cents,
-                      COALESCE(fee_cents, 0)
-               FROM surface WHERE market_ticker=? AND resolution IS NULL""",
+                      COALESCE(fee_cents, 0), COALESCE(contracts, 1)
+               FROM surface WHERE market_ticker=?
+               AND (resolution IS NULL OR resolution='timeout')""",
             (ticker,),
         ).fetchall()
     return rows
@@ -610,7 +619,13 @@ def query_context_stats() -> dict:
 
 
 def query_h8_probe_daily() -> dict:
-    """Today's H8 probe stats for budget/kill checks."""
+    """Today's H8 probe stats for budget/kill checks.
+    P5 (0708): confirmed zero-fills (no_fill / cancelled_external /
+    order_rejected) release their budget — a $2/day budget was burning
+    half a day's probes on trades that never existed. blind_standdown
+    stays counted (could be filled — safest-price doctrine); if the
+    reconciler later upgrades a released row to filled, its resolution
+    changes and it counts again."""
     today_start = et_midnight_ts()
     with _lock:
         rows = _conn.execute(
@@ -619,7 +634,8 @@ def query_h8_probe_daily() -> dict:
                AND action='ENTER'""",
             (today_start,),
         ).fetchall()
-    at_risk = sum(r[1] or 0 for r in rows) / 100.0
+    _ZERO_FILL = ("no_fill", "cancelled_external", "order_rejected")
+    at_risk = sum((r[1] or 0) for r in rows if r[0] not in _ZERO_FILL) / 100.0
     wins = sum(1 for r in rows if r[0] == "win")
     losses = sum(1 for r in rows if r[0] == "loss")
     return {"at_risk": at_risk, "wins": wins, "losses": losses, "n": len(rows)}
@@ -691,6 +707,16 @@ def update_reprice(row_id: int, new_cost: float, new_order_id: str,
                reprice_count=? WHERE id=?""",
             (new_cost, new_order_id, reprice_count, row_id),
         )
+        _conn.commit()
+
+
+def update_queue_pos(row_id: int, field: str, value: int) -> None:
+    """P9 (0708): stamp queue position on a surface row.
+    field must be 'queue_pos_entry' or 'queue_pos_t60'."""
+    if field not in ("queue_pos_entry", "queue_pos_t60"):
+        raise ValueError(f"bad queue field {field}")
+    with _lock:
+        _conn.execute(f"UPDATE surface SET {field}=? WHERE id=?", (value, row_id))
         _conn.commit()
 
 
@@ -857,10 +883,12 @@ def recompute_missing_pnl() -> int:
         cur = _conn.execute("""
             UPDATE surface SET pnl_net = CASE
                 WHEN resolution = 'win' THEN
-                    (100.0 - COALESCE(fill_cost_cents, cost_per_contract_cents, 0)
-                           - COALESCE(fee_cents, 0)) / 100.0
+                    ((100.0 - COALESCE(fill_cost_cents, cost_per_contract_cents, 0))
+                       * COALESCE(contracts, 1)
+                     - COALESCE(fee_cents, 0)) / 100.0
                 WHEN resolution = 'loss' THEN
                     -(COALESCE(fill_cost_cents, cost_per_contract_cents, 0)
+                        * COALESCE(contracts, 1)
                       + COALESCE(fee_cents, 0)) / 100.0
             END
             WHERE resolution IN ('win', 'loss')

@@ -12,6 +12,7 @@ Walls (Tier 0, non-negotiable):
 - Per-lane budgets and 3-loss/60min kill rules
 """
 
+import os
 import json
 import time
 import logging
@@ -32,6 +33,44 @@ H8_COST_HI = Decimal("94.00")
 HOURLY_EXPOSURE_CAP_USD = 4.00
 MIN_BALANCE_USD = 5.00
 CROSS_LANE_CAP = 3
+
+# P16 (0708) — sizing lever, capital-gate ruling #5: built and waiting.
+# F_CONTRACTS > 1 is HONORED ONLY when the exact cost band is Wilson-CLEAR
+# (measured friction, Wilson LB > breakeven + friction) on live-traded data.
+# Otherwise the gateway clamps to 1. H8 is always flat 1.
+import math as _math
+F_CONTRACTS = max(1, min(5, int(os.environ.get("F_CONTRACTS", "1"))))
+
+
+def _wilson_lb(wins: int, n: int, z: float = 1.96) -> float:
+    if n == 0:
+        return 0.0
+    p = wins / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    spread = z * _math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
+    return max(0.0, centre - spread)
+
+
+def f_size_for_band(cost_int: int) -> int:
+    """P16: contracts for a lane-F entry at this cost band.
+    Returns F_CONTRACTS only if the band is CLEAR; else 1."""
+    if F_CONTRACTS <= 1:
+        return 1
+    stats = store.query_band_stats(cost_int, cost_int, "live-traded", "F")
+    n = stats["n"]
+    if n == 0:
+        return 1
+    friction = store.query_band_friction(cost_int, cost_int, "live-traded")
+    if friction is None:
+        return 1
+    be = cost_int / 100.0
+    w_lo = _wilson_lb(stats["wins"], n)
+    if w_lo > be + friction:
+        log.warning(f"[GATEWAY] Band {cost_int}c CLEAR (N={n} LB={w_lo:.1%} "
+                    f"be+fr={be + friction:.1%}) — sizing {F_CONTRACTS} contracts")
+        return F_CONTRACTS
+    return 1
 
 LANES: Dict[str, dict] = {
     "F": {
@@ -114,6 +153,7 @@ class EvalResult:
     boundary_hi: Optional[float] = None
     distance: Optional[float] = None
     distance_pct: Optional[float] = None
+    contracts: int = 1  # P16 (0708): set by submit; >1 only when band is Wilson-CLEAR
 
 
 def _favorite_side(book: kalshi.Book) -> Tuple[Optional[str], Optional[Decimal], Optional[int], Optional[str]]:
@@ -139,9 +179,21 @@ def _favorite_side(book: kalshi.Book) -> Tuple[Optional[str], Optional[Decimal],
 
 
 def _hourly_exposure_usd() -> float:
-    """Sum of dollars at risk in the last hour."""
+    """Sum of dollars at risk in the last hour.
+    P5 (0708): releases append negative entries; clamp at 0 so a release
+    outliving its expired placement can't go negative."""
     cutoff = time.time() - 3600
-    return sum(d for ts, d in _hourly_exposure if ts >= cutoff)
+    return max(0.0, sum(d for ts, d in _hourly_exposure if ts >= cutoff))
+
+
+def release_exposure(cost_usd: float) -> None:
+    """P5 (0708): refund hourly exposure for a broker-confirmed zero-fill
+    (no_fill / cancelled_external). Appends a negative entry so the audit
+    trail keeps both the placement and the release."""
+    _hourly_exposure.append((time.time(), -abs(cost_usd)))
+    _save_hourly_exposure()
+    log.info(f"[GATEWAY] Exposure released: -${abs(cost_usd):.2f} "
+             f"(hourly now ${_hourly_exposure_usd():.2f})")
 
 
 def evaluate(ticker: str, book: kalshi.Book, secs_to_expiry: float,
@@ -366,9 +418,15 @@ def submit(client: kalshi.KalshiClient, ticker: str,
     if not eval_result.allowed:
         raise ValueError("Cannot submit a rejected evaluation")
 
-    # Re-read balance inside submit — tradeable, not raw
+    # P16 (0708): size decision — Wilson-CLEAR bands may take F_CONTRACTS.
+    count = 1
+    if eval_result.lane == "F":
+        count = f_size_for_band(eval_result.cost_cents)
+    eval_result.contracts = count
+
+    # Re-read balance inside submit — tradeable, not raw; at SIZE.
     cash, _ = kalshi.get_balance(client)
-    cost_usd = (eval_result.cost_exact or eval_result.cost_cents) / 100.0
+    cost_usd = (eval_result.cost_exact or eval_result.cost_cents) / 100.0 * count
     tradeable = treasury.tradeable_balance(cash) if cash is not None else None
     if cash is None or tradeable is None or tradeable < cost_usd:
         log.warning(f"[GATEWAY] Balance re-check failed: tradeable=${tradeable} "
@@ -467,6 +525,14 @@ def submit(client: kalshi.KalshiClient, ticker: str,
             ))
             return None, row_id, "SKIP_REST_PRICE_OOB"
 
+    # P16: hourly-cap re-check at size (evaluate checked 1-lot only).
+    if eval_result.lane == "F" and count > 1:
+        if _hourly_exposure_usd() + cost_usd > HOURLY_EXPOSURE_CAP_USD:
+            log.warning(f"[GATEWAY] Sized entry exceeds hourly cap — clamping to 1")
+            count = 1
+            eval_result.contracts = 1
+            cost_usd = (eval_result.cost_exact or eval_result.cost_cents) / 100.0
+
     expiry_ts = close_ts - 10
 
     spread = None
@@ -491,7 +557,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
         spread_cents=spread,
         why_tag=eval_result.why_tag,
         order_type="maker",
-        contracts=1,
+        contracts=count,
         dollars_at_risk=cost_usd,
         lane=eval_result.lane,
         spot_price=eval_result.spot_price,
@@ -505,7 +571,7 @@ def submit(client: kalshi.KalshiClient, ticker: str,
     try:
         order_id, order_resp = kalshi.place_order_maker(
             client, ticker, eval_result.side,
-            rest_price_int, count=1, expiration_ts=expiry_ts,
+            rest_price_int, count=count, expiration_ts=expiry_ts,
             v2_price_str=rest_fp,
         )
         store.update_order_id(row_id, order_id)
@@ -538,7 +604,14 @@ def submit(client: kalshi.KalshiClient, ticker: str,
 def reprice(client: kalshi.KalshiClient, ticker: str,
             eval_result: EvalResult, old_order_id: str,
             new_book: kalshi.Book, close_ts: int) -> Tuple[Optional[str], Optional[int]]:
-    """The ONLY legal reprice path. Re-checks balance and band; accounts exposure delta."""
+    """The ONLY legal reprice path — P4 (0708): atomic Amend Order V2.
+
+    The old cancel+place sequence had a double-entry window: a fill landing
+    between the fills pre-check and the cancel made cancel return not_found,
+    which was IGNORED, and a second order was placed. Amend mutates the
+    resting order in one exchange call — if the order is already filled/gone
+    the amend fails and we place NOTHING; the monitor loop's fills-first
+    status check resolves the truth. Re-checks balance and band as before."""
     new_side, new_cost_d, new_yq, new_fp = _favorite_side(new_book)
     if new_side != eval_result.side or new_cost_d is None:
         return None, None
@@ -549,7 +622,6 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
     tradeable = treasury.tradeable_balance(cash) if cash is not None else None
     if cash is None or tradeable is None or tradeable < new_cost_float / 100.0:
         return None, None
-    kalshi.cancel_order(client, old_order_id)
     if eval_result.side == "yes":
         rest_price = new_book.yes_bid
         rest_fp = new_book.yes_bid_fp
@@ -565,10 +637,14 @@ def reprice(client: kalshi.KalshiClient, ticker: str,
         rest_cost_d = Decimal(rest_price)
     if not (COST_BAND_LO <= rest_cost_d <= COST_BAND_HI):
         return None, None
-    oid, _ = kalshi.place_order_maker(client, ticker, eval_result.side, rest_price,
-                                       count=1, expiration_ts=close_ts - 10,
-                                       v2_price_str=rest_fp)
-    log.warning(f"[GATEWAY] REPRICE {ticker} → {new_cost_float}c rest@{rest_fp or rest_price} oid={oid}")
+    oid, _ = kalshi.amend_order(client, old_order_id, ticker, eval_result.side,
+                                rest_price, count=1, v2_price_str=rest_fp)
+    if oid is None:
+        # Amend failed — order may be filled or externally gone. Place
+        # NOTHING; monitor loop resolves via fills-first status.
+        log.warning(f"[GATEWAY] REPRICE amend failed on {old_order_id} — no replacement placed")
+        return None, None
+    log.warning(f"[GATEWAY] REPRICE(amend) {ticker} → {new_cost_float}c rest@{rest_fp or rest_price} oid={oid}")
     return oid, int(new_cost_d)
 
 
