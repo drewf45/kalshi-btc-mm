@@ -749,10 +749,12 @@ def update_session_vol(row_id: int, session_tag: str, vol_regime: str) -> None:
         _conn.commit()
 
 
+T_BANDS = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
+
+
 def query_clip_by_time_band() -> list:
     """Win rate + avg clip per T_BAND. Separates live-traded from observed;
     clip comes from traded rows only (same population as traded_n)."""
-    T_BANDS = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
     today_start = et_midnight_ts()
     results = []
     with _lock:
@@ -788,7 +790,7 @@ def query_clip_by_time_band() -> list:
             ).fetchone()
             obs_n = (obs[0] or 0) + (obs[1] or 0) if obs else 0
 
-            today = _conn.execute(
+            today_traded = _conn.execute(
                 """SELECT
                     COUNT(CASE WHEN resolution='win' THEN 1 END),
                     COUNT(CASE WHEN resolution='loss' THEN 1 END),
@@ -802,9 +804,24 @@ def query_clip_by_time_band() -> list:
                    AND decision_ts >= ?""",
                 (lo, hi, today_start),
             ).fetchone()
-            td_wins = today[0] if today else 0
-            td_losses = today[1] if today else 0
-            td_clip = today[2] if today else 0
+            td_wins = today_traded[0] if today_traded else 0
+            td_losses = today_traded[1] if today_traded else 0
+            td_clip = today_traded[2] if today_traded else 0
+
+            today_obs = _conn.execute(
+                """SELECT
+                    COUNT(DISTINCT CASE WHEN resolution='obs_win' THEN market_ticker END),
+                    COUNT(DISTINCT CASE WHEN resolution='obs_loss' THEN market_ticker END)
+                   FROM surface
+                   WHERE env='live-observed'
+                   AND seconds_to_expiry >= ? AND seconds_to_expiry < ?
+                   AND resolution IN ('obs_win','obs_loss')
+                   AND side IS NOT NULL
+                   AND COALESCE(lane,'F')='F'
+                   AND decision_ts >= ?""",
+                (lo, hi, today_start),
+            ).fetchone()
+            today_obs_n = (today_obs[0] or 0) + (today_obs[1] or 0) if today_obs else 0
 
             traded_n = t_wins + t_losses
             today_n = td_wins + td_losses
@@ -819,6 +836,7 @@ def query_clip_by_time_band() -> list:
                 "today_n": today_n,
                 "today_wins": td_wins,
                 "today_clip": float(td_clip or 0),
+                "today_obs_n": today_obs_n,
             })
     return results
 

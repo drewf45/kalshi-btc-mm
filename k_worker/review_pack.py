@@ -17,7 +17,6 @@ log = logging.getLogger("k_worker.review_pack")
 
 NY = ZoneInfo("America/New_York")
 EPOCH = datetime(2026, 7, 4, tzinfo=NY)
-T_BANDS_DISPLAY = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
 
 
 def _day_number() -> int:
@@ -71,6 +70,7 @@ def build_review_pack(cash: float = 0.0, pv: float = 0.0) -> str:
 
     # Defaults for VERDICT cross-references (updated by sections if they succeed)
     pct, total, nf_pct, clip_bands = 0.0, 0, 0.0, []
+    data_mismatches = []
 
     # 1. COVERAGE
     try:
@@ -108,10 +108,20 @@ def build_review_pack(cash: float = 0.0, pv: float = 0.0) -> str:
             today_metrics[band_key] = c["traded_clip"]
             delta = _delta_str(c["traded_clip"], yesterday.get(band_key), "+.3f")
             flag = " ← early-band" if c["band"] == "T-900-600" else ""
-            if c["traded_n"] > 0 or c["obs_n"] > 0:
-                today_part = f" (today {c['today_n']})" if c["today_n"] > 0 else ""
-                lines.append(f"   {c['band']}: traded n={c['traded_n']} clip=${c['traded_clip']:+.3f} "
-                             f"| obs n={c['obs_n']}{today_part}{delta}{flag}")
+            # WO-v3 integrity: today count can never exceed lifetime (same population)
+            traded_mismatch = c["today_n"] > c["traded_n"]
+            obs_mismatch = c["today_obs_n"] > c["obs_n"]
+            if traded_mismatch or obs_mismatch:
+                lines.append(f"   {c['band']}: DATA MISMATCH "
+                             f"(traded: lifetime={c['traded_n']} today={c['today_n']}) "
+                             f"(obs: lifetime={c['obs_n']} today={c['today_obs_n']})")
+                data_mismatches.append(f"CLIP_MISMATCH_{c['band']}")
+            elif c["traded_n"] > 0 or c["obs_n"] > 0:
+                td_part = f" (today {c['today_n']})" if c["today_n"] > 0 else ""
+                obs_td = f" (today {c['today_obs_n']})" if c["today_obs_n"] > 0 else ""
+                lines.append(f"   {c['band']}: traded n={c['traded_n']}{td_part} "
+                             f"clip=${c['traded_clip']:+.3f} "
+                             f"| obs n={c['obs_n']}{obs_td}{delta}{flag}")
             else:
                 lines.append(f"   {c['band']}: n=0{flag}")
     except Exception as e:
@@ -147,8 +157,9 @@ def build_review_pack(cash: float = 0.0, pv: float = 0.0) -> str:
         caution = store.query_caution_ledger()
         if caution["n"] > 0:
             lines.append(f"5. CAUTION LEDGER: captured ${caution['captured']:.2f} / "
-                         f"cost ${caution['cost_of_caution']:.2f} / "
-                         f"net ${caution['net_caution']:+.2f}")
+                         f"missed ${caution['cost_of_caution']:.2f} / "
+                         f"dodged ${caution['caution_savings']:.2f} / "
+                         f"net (dodged−missed) ${caution['net_caution']:+.2f}")
         else:
             lines.append("5. CAUTION LEDGER: no data today")
     except Exception as e:
@@ -206,8 +217,9 @@ def build_review_pack(cash: float = 0.0, pv: float = 0.0) -> str:
     # 9. NEW ALERT TYPES
     try:
         new_alerts = _query_new_alert_types()
-        if new_alerts:
-            lines.append(f"9. NEW ALERT TYPES SINCE LAST PACK: {', '.join(new_alerts)}")
+        all_alerts = sorted(set(new_alerts + data_mismatches))
+        if all_alerts:
+            lines.append(f"9. NEW ALERT TYPES SINCE LAST PACK: {', '.join(all_alerts)}")
         else:
             lines.append("9. NEW ALERT TYPES SINCE LAST PACK: none")
     except Exception as e:
@@ -224,6 +236,8 @@ def build_review_pack(cash: float = 0.0, pv: float = 0.0) -> str:
         clip_early = next((c for c in clip_bands if c["band"] == "T-900-600"), None)
         if clip_early and clip_early["traded_n"] > 0 and clip_early["traded_clip"] < 0:
             issues.append(f"early-band clip ${clip_early['traded_clip']:+.3f}")
+        if data_mismatches:
+            issues.append(f"{len(data_mismatches)} DATA MISMATCH band(s)")
         if issues:
             lines.append(f"VERDICT: ⚠ {', '.join(issues)}")
         else:

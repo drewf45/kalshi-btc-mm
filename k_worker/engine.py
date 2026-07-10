@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Dict
 import requests as _requests
 
 from . import kalshi, store, gateway, discipline, notify, treasury, delta_table_loader
+from .store import T_BANDS
 from .sessions import SESSION_WINDOWS, session_tag as _session_tag_fn
 
 log = logging.getLogger("k_worker.engine")
@@ -30,8 +31,6 @@ POLL_INTERVAL_SEC = 5
 MAX_REPRICES_LOW_BAND = 1
 MAX_SUBMIT_ATTEMPTS = 2
 TELEGRAM_PER_MARKET = os.environ.get("TELEGRAM_PER_MARKET", "1").strip() == "1"
-
-T_BANDS = [(900, 600), (600, 300), (300, 180), (180, 120), (120, 60), (60, 10)]
 
 CONFIRM_LADDER = [
     {"lo_sec": 600, "hi_sec": 900, "floor_cents": 99, "confirms": 9},
