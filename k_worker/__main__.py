@@ -569,6 +569,9 @@ def main():
     # 5d. Telegram inbound listener (WO-H)
     notify.start_listener(client)
 
+    # WO-3: boot recovery — send late review pack if booted after 09:10 and none sent today
+    review_pack.boot_recovery(client)
+
     if engine.HEARTBEAT_PING_URL:
         log.info(f"[MAIN] Dead-man ping configured: {engine.HEARTBEAT_PING_URL[:40]}...")
     else:
@@ -582,6 +585,8 @@ def main():
     last_fee_check = 0
     last_review_pack = 0
     last_payout_notice = 0
+    last_pack_watchdog = 0
+    last_payout_watchdog = 0
     last_ticker = None
 
     # 6. Main loop
@@ -643,7 +648,8 @@ def main():
                         treasury.send_payout_notice(pn_cash + (pn_pv or 0))
                     last_payout_notice = now
                 except Exception as e:
-                    log.warning(f"[MAIN] Payout notice error: {e}")
+                    log.exception("[MAIN] Payout notice error")
+                    notify.send(f"PAYOUT NOTICE FAILED: {e}")
 
             # Daily Review Pack (09:00 ET)
             if review_pack.is_review_time() and now - last_review_pack > 3600:
@@ -651,7 +657,24 @@ def main():
                     review_pack.send_review_pack(client)
                     last_review_pack = now
                 except Exception as e:
-                    log.warning(f"[MAIN] Review pack error: {e}")
+                    log.exception("[MAIN] Review pack error")
+                    notify.send(f"REVIEW PACK FAILED: {e}")
+
+            # Payout notice watchdog (WO-3) — 08:10 ET
+            if review_pack.is_payout_watchdog_time() and now - last_payout_watchdog > 3600:
+                try:
+                    review_pack.check_payout_watchdog()
+                except Exception as e:
+                    log.warning(f"[MAIN] Payout watchdog error: {e}")
+                last_payout_watchdog = now
+
+            # Pack watchdog (WO-3) — 09:10 ET
+            if review_pack.is_pack_watchdog_time() and now - last_pack_watchdog > 3600:
+                try:
+                    review_pack.check_pack_watchdog(client)
+                except Exception as e:
+                    log.warning(f"[MAIN] Pack watchdog error: {e}")
+                last_pack_watchdog = now
 
             # Discover current market
             try:

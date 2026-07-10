@@ -346,6 +346,7 @@ def is_payout_notice_time() -> bool:
 
 def send_payout_notice(live_balance: float) -> None:
     """Post the daily payout notice at 08:00 ET."""
+    store.set_state("payout_notice_sent_date", datetime.now(NY).strftime("%Y-%m-%d"))
     t = get_totals()
     owed = t["accrued_tax"] + t["accrued_fee"]
     if owed < 0.01:
