@@ -255,6 +255,7 @@ def main():
         f"  approved ({len(approved_list)}): {approved_names}",
         f"  blacklist: {bl_count} series | "
         f"drafted: {len(drafted_list)}",
+        f"  draft prefixes: {', '.join(registry.DRAFT_PREFIXES)}",
         f"  halt: {'ACTIVE' if halt_state == '1' else 'clear'} | "
         f"live_halt: {'ACTIVE' if live_halt_state == '1' else 'clear'}",
     ]

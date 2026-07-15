@@ -7,6 +7,7 @@ env var at boot (no Telegram commands). variable_kind defaults to running_max.
 Fee registry: cached fee multipliers from the API, with change alerting.
 """
 
+import os
 import time
 import logging
 from typing import Optional, List, Dict
@@ -24,6 +25,30 @@ CRYPTO_BLACKLIST = {
 }
 
 _user_blacklist: set = set()
+
+DRAFT_PREFIXES = [p.strip().upper()
+                  for p in os.environ.get("DW_DRAFT_PREFIXES", "KXHIGH,KXLOW").split(",")
+                  if p.strip()]
+
+CITY_STATIONS = {
+    "NY":   ("KNYC", "America/New_York"),
+    "CHI":  ("KMDW", "America/Chicago"),
+    "AUS":  ("KAUS", "America/Chicago"),
+    "DEN":  ("KDEN", "America/Denver"),
+    "LAX":  ("KLAX", "America/Los_Angeles"),
+    "MIA":  ("KMIA", "America/New_York"),
+    "PHIL": ("KPHL", "America/New_York"),
+}
+
+
+def _station_for(series: str):
+    """Map a prefixed weather series to (station, tz); UNKNOWN if city unmapped."""
+    for prefix in DRAFT_PREFIXES:
+        if series.startswith(prefix):
+            city = series[len(prefix):]
+            if city in CITY_STATIONS:
+                return CITY_STATIONS[city]
+    return ("UNKNOWN", "America/New_York")
 
 
 def load_blacklist() -> None:
@@ -54,30 +79,39 @@ def remove_blacklist(series: str) -> None:
 
 
 def auto_draft(market: dict) -> Optional[str]:
-    """Auto-draft a registry entry from a market object if it looks like weather.
+    """Draft a registry entry. Detection order: ticker prefix -> category -> title.
     Returns series_ticker if drafted, else None."""
     series = _series_of(market)
     if not series or is_blacklisted(series):
         return None
-    existing = dstore.get_registry(series)
-    if existing:
+    if dstore.get_registry(series):
         return None
-    title = (market.get("title") or market.get("subtitle") or "").lower()
-    settle_source = ""
-    station = ""
-    units = "F"
-    rounding = "0.5"
-    tz = "America/New_York"
-    if any(w in title for w in ["temperature", "high temp", "low temp",
-                                 "degrees", "°f", "weather"]):
-        settle_source = "NWS"
-        rules_url = market.get("rules_url", "")
-        notes = f"auto-drafted from market {market.get('ticker', '')}"
-        dstore.draft_registry(series, settle_source, station, tz, units,
-                              rounding, rules_url, notes)
-        log.info(f"[REGISTRY] Auto-drafted {series} (weather)")
-        return series
-    return None
+
+    matched = None
+    if any(series.startswith(p) for p in DRAFT_PREFIXES):
+        matched = "prefix"
+    else:
+        cat = (market.get("category") or "").lower()
+        if "climate" in cat or "weather" in cat:
+            matched = "category"
+        else:
+            title = (market.get("title") or market.get("subtitle") or "").lower()
+            if any(w in title for w in ["temperature", "high temp", "low temp",
+                                         "degrees", "°f", "weather"]):
+                matched = "title"
+    if not matched:
+        return None
+
+    station, tz = _station_for(series)
+    variable_kind = "running_min" if series.startswith("KXLOW") else "running_max"
+    notes = (f"auto-drafted via {matched} from {market.get('ticker', '')} "
+             f"kind={variable_kind}")
+    dstore.draft_registry(series, "NWS", station, tz, "F", "0.5",
+                          market.get("rules_url", ""), notes,
+                          variable_kind=variable_kind)
+    log.info(f"[REGISTRY] Drafted {series} via {matched} station={station} "
+             f"kind={variable_kind}")
+    return series
 
 
 def pull_fee_schedule(client) -> List[dict]:

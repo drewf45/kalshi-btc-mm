@@ -25,6 +25,11 @@ def init_db() -> None:
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.execute("PRAGMA busy_timeout=15000")
     _conn.executescript(_SCHEMA)
+    try:
+        _conn.execute("ALTER TABLE series_registry ADD COLUMN "
+                      "variable_kind TEXT DEFAULT 'running_max'")
+    except sqlite3.OperationalError:
+        pass
     _conn.commit()
     log.info(f"[DSTORE] Initialized {DB_PATH}")
 
@@ -68,7 +73,8 @@ CREATE TABLE IF NOT EXISTS series_registry (
     rounding TEXT,
     rules_url TEXT,
     version INTEGER DEFAULT 1,
-    notes TEXT
+    notes TEXT,
+    variable_kind TEXT DEFAULT 'running_max'
 );
 CREATE TABLE IF NOT EXISTS fee_registry (
     series_ticker TEXT PRIMARY KEY,
@@ -292,13 +298,13 @@ def get_registry(series: str) -> Optional[dict]:
         return None
     cols = ["series_ticker", "drafted_ts", "approved_ts", "approved_by",
             "settle_source", "station_or_ref", "tz", "units", "rounding",
-            "rules_url", "version", "notes"]
+            "rules_url", "version", "notes", "variable_kind"]
     return dict(zip(cols, row))
 
 
 def draft_registry(series: str, settle_source: str, station: str,
                    tz: str, units: str, rounding: str, rules_url: str = "",
-                   notes: str = "") -> None:
+                   notes: str = "", variable_kind: str = "running_max") -> None:
     with _lock:
         existing = _conn.execute(
             "SELECT version FROM series_registry WHERE series_ticker=?",
@@ -308,10 +314,10 @@ def draft_registry(series: str, settle_source: str, station: str,
             """INSERT OR REPLACE INTO series_registry
                (series_ticker, drafted_ts, approved_ts, approved_by,
                 settle_source, station_or_ref, tz, units, rounding,
-                rules_url, version, notes)
-               VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rules_url, version, notes, variable_kind)
+               VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (series, time.time(), settle_source, station, tz, units,
-             rounding, rules_url, version, notes))
+             rounding, rules_url, version, notes, variable_kind))
         _conn.commit()
 
 
@@ -339,7 +345,7 @@ def list_registry(approved_only: bool = False) -> List[dict]:
             rows = _conn.execute("SELECT * FROM series_registry").fetchall()
     cols = ["series_ticker", "drafted_ts", "approved_ts", "approved_by",
             "settle_source", "station_or_ref", "tz", "units", "rounding",
-            "rules_url", "version", "notes"]
+            "rules_url", "version", "notes", "variable_kind"]
     return [dict(zip(cols, r)) for r in rows]
 
 

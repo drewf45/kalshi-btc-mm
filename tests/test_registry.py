@@ -131,6 +131,28 @@ class TestEnvBlacklist:
         os.environ.pop("DW_BLACKLIST_EXTRA", None)
 
 
+class TestAutoDraftPrefix:
+    def test_prefix_draft_kxhigh(self):
+        m = {"ticker": "KXHIGHNY-26JUL15-B84.5", "event_ticker": "KXHIGHNY-26JUL15"}
+        assert registry.auto_draft(m) == "KXHIGHNY"
+        row = dstore.get_registry("KXHIGHNY")
+        assert row["station_or_ref"] == "KNYC" and row["tz"] == "America/New_York"
+        assert row["variable_kind"] == "running_max"
+
+    def test_kxlow_drafts_running_min(self):
+        m = {"ticker": "KXLOWCHI-26JUL15-B65", "event_ticker": "KXLOWCHI-26JUL15"}
+        registry.auto_draft(m)
+        assert dstore.get_registry("KXLOWCHI")["variable_kind"] == "running_min"
+
+    def test_unknown_city_drafts_but_cannot_approve(self, monkeypatch):
+        m = {"ticker": "KXHIGHXX-26JUL15-B80", "event_ticker": "KXHIGHXX-26JUL15"}
+        registry.auto_draft(m)
+        assert dstore.get_registry("KXHIGHXX")["station_or_ref"] == "UNKNOWN"
+        monkeypatch.setenv("DW_APPROVED_SERIES", "KXHIGHXX")
+        assert tg.apply_env_approvals() == []
+        assert not dstore.get_registry("KXHIGHXX")["approved_ts"]
+
+
 class TestEnvClearHalt:
     def test_clears_active_halt(self):
         dstore.set_state("halt_promotion", "1")

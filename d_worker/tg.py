@@ -34,6 +34,15 @@ def apply_env_approvals() -> list:
             log.info(f"[BOOT] DW_APPROVED_SERIES: {series} already approved "
                      f"(v{reg.get('version')})")
             continue
+        station = (reg.get("station_or_ref") or "").strip()
+        if not station or station == "UNKNOWN":
+            log.error(f"[BOOT] DW_APPROVED_SERIES: REFUSED {series} — "
+                      f"station UNKNOWN; correct the registry row first")
+            from k_worker import notify
+            notify.alert(f"🅳 🚨 APPROVAL REFUSED: {series} — station UNKNOWN. "
+                         f"Verify the contract's settlement station, update the "
+                         f"registry, then re-approve.")
+            continue
         dstore.approve_registry(series, "env")
         log.info(f"[BOOT] DW_APPROVED_SERIES: APPROVED {series} v{reg.get('version')}")
         approved.append(series)
