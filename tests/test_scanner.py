@@ -19,10 +19,14 @@ def _setup_db(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _reset_governor():
+def _reset_scanner_state():
     scanner._governor = None
+    scanner._sweep_counter = 0
+    scanner._dead_series.clear()
     yield
     scanner._governor = None
+    scanner._sweep_counter = 0
+    scanner._dead_series.clear()
 
 
 def _make_market(ticker, series="KXTEST", close_time="2026-07-15T00:00:00Z"):
@@ -103,9 +107,10 @@ class TestPagination:
 class TestPerMarketIsolation:
     @patch("k_worker.notify")
     @patch("d_worker.scanner._classify_market")
+    @patch("d_worker.scanner._fetch_targeted", return_value=[])
     @patch("d_worker.scanner._fetch_all_markets")
-    def test_one_error_does_not_crash_sweep(self, mock_fetch, mock_classify,
-                                             mock_notify):
+    def test_one_error_does_not_crash_sweep(self, mock_fetch, mock_targeted,
+                                             mock_classify, mock_notify):
         markets = [_make_market("OK-1"), _make_market("BAD-1"),
                     _make_market("OK-2")]
         mock_fetch.return_value = markets
@@ -165,8 +170,10 @@ class TestObsCache:
 
     @patch("k_worker.notify")
     @patch("d_worker.scanner._classify_market")
+    @patch("d_worker.scanner._fetch_targeted", return_value=[])
     @patch("d_worker.scanner._fetch_all_markets")
-    def test_skip_aggregation(self, mock_fetch, mock_classify, mock_notify):
+    def test_skip_aggregation(self, mock_fetch, mock_targeted,
+                               mock_classify, mock_notify):
         """Non-approved SKIPs aggregate; ERR rows stay individual."""
         markets = [_make_market(f"T{i}", series="KXUNAPPROVED") for i in range(5)]
         mock_fetch.return_value = markets
@@ -208,3 +215,27 @@ class TestResolveCloseTs:
 
     def test_no_time_returns_none(self):
         assert scanner._resolve_close_ts({}) is None
+
+
+class TestTargetedSweep:
+    def test_target_list_includes_bootstrap_grid(self):
+        lst = scanner._target_series_list()
+        assert "KXHIGHNY" in lst and "KXLOWCHI" in lst
+
+    def test_dead_series_skipped_for_a_day(self):
+        scanner._dead_series["KXHIGHXX"] = time.time()
+        assert "KXHIGHXX" not in scanner._target_series_list()
+
+    @patch("d_worker.scanner.kalshi")
+    def test_fetch_all_markets_no_cap(self, mock_kalshi):
+        pages = []
+        for p in range(60):
+            pages.append({
+                "markets": [_make_market(f"T{p*200+i}") for i in range(200)],
+                "cursor": f"page{p+2}" if p < 59 else "",
+            })
+        client = MagicMock()
+        client.request = MagicMock(side_effect=pages)
+        gov = scanner.TokenBucket(6000)
+        ms = scanner._fetch_all_markets(client, gov)
+        assert len(ms) == 12000

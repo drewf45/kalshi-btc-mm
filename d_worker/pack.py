@@ -76,6 +76,15 @@ def build_pack() -> str:
     total_seeds = sum(c.get("seeds", 0) for c in day_cycles)
     total_skips = sum(c.get("skips", 0) for c in day_cycles)
     total_errs = sum(c.get("errs", 0) for c in day_cycles)
+    targeted_total = 0
+    discovery_total = 0
+    for c in day_cycles:
+        notes = c.get("notes") or ""
+        for part in notes.split():
+            if part.startswith("T:") and part[2:].isdigit():
+                targeted_total += int(part[2:])
+            elif part.startswith("D:") and part[2:].isdigit():
+                discovery_total += int(part[2:])
     top_skips = dstore.top_skip_reasons(midnight, 2)
     top_str = ""
     if top_skips:
@@ -85,7 +94,8 @@ def build_pack() -> str:
             pct = count / total_v * 100 if total_v > 0 else 0
             parts.append(f"{reason} {pct:.0f}%")
         top_str = " | top: " + ", ".join(parts)
-    lines.append(f"1. SCAN: {total_mkts} mkts in {len(day_cycles)} sweeps | "
+    lines.append(f"1. SCAN: {total_mkts} mkts in {len(day_cycles)} sweeps "
+                 f"(targeted {targeted_total} | discovery {discovery_total}) | "
                  f"SEED {total_seeds} / SKIP {total_skips} / ERR {total_errs}{top_str}")
 
     # §2 SEEDS
