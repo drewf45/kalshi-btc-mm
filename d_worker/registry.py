@@ -12,6 +12,7 @@ import logging
 from typing import Optional, List, Dict
 
 from . import dstore
+from . import series_of as _series_of
 
 log = logging.getLogger("d_worker.registry")
 
@@ -55,7 +56,7 @@ def remove_blacklist(series: str) -> None:
 def auto_draft(market: dict) -> Optional[str]:
     """Auto-draft a registry entry from a market object if it looks like weather.
     Returns series_ticker if drafted, else None."""
-    series = market.get("series_ticker", "")
+    series = _series_of(market)
     if not series or is_blacklisted(series):
         return None
     existing = dstore.get_registry(series)
@@ -92,7 +93,7 @@ def pull_fee_schedule(client) -> List[dict]:
 def update_fee_from_market(market: dict) -> Optional[dict]:
     """Extract fee multipliers from a market object and upsert.
     Returns old values if changed (for alerting)."""
-    series = market.get("series_ticker", "")
+    series = _series_of(market)
     if not series:
         return None
     maker = market.get("maker_fee_rate") or market.get("fee_rate_maker")

@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from k_worker import kalshi, notify
 
-from . import dstore, scanner, shadow, pack, tg, registry
+from . import dstore, scanner, shadow, pack, tg, registry, watchdog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -169,6 +169,21 @@ def _settlement_loop(client: kalshi.KalshiClient) -> None:
             time.sleep(min(30, end - time.time()))
 
 
+def _watchdog_loop(client: kalshi.KalshiClient) -> None:
+    """Continuous watchdog cycle — re-verify every open position."""
+    governor = scanner._get_governor()
+    while _running:
+        try:
+            stats = watchdog.watch_cycle(client, governor=governor)
+            if stats["broken"] > 0 or stats["settle_lag"] > 0:
+                log.warning(f"[WATCHDOG] Cycle: {stats}")
+        except Exception as e:
+            log.error(f"[WATCHDOG] Error: {e}", exc_info=True)
+        end = time.time() + watchdog.WATCH_INTERVAL_SEC
+        while _running and time.time() < end:
+            time.sleep(min(30, end - time.time()))
+
+
 def _pack_loop() -> None:
     """Hourly pack to Telegram + DB, every hour."""
     while _running:
@@ -225,9 +240,10 @@ def main():
 
     approved_names = ", ".join(r["series_ticker"] for r in approved_list) or "none"
     boot_lines = [
-        f"🅳 BOOT — KAL-D scanner started",
+        f"🅳 BOOT — KAL-D scanner + watchdog started",
         f"  scan: {scanner.SCAN_REQ_PER_MIN} req/min, "
         f"{scanner.SCAN_CYCLE_TARGET_SEC}s target",
+        f"  watchdog: {watchdog.WATCH_INTERVAL_SEC}s cycle",
         f"  sim: ${scanner.SIM_CAPITAL_USD:.2f} cap, "
         f"batch sizes {scanner.SHADOW_BATCH_SIZES}",
         f"  approved ({len(approved_list)}): {approved_names}",
@@ -246,6 +262,7 @@ def main():
     threads = [
         SupervisedThread("dw-scanner", _scanner_loop, (client,)),
         SupervisedThread("dw-settle", _settlement_loop, (client,)),
+        SupervisedThread("dw-watchdog", _watchdog_loop, (client,)),
         SupervisedThread("dw-pack", _pack_loop),
     ]
     for t in threads:

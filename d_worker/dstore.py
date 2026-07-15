@@ -126,6 +126,13 @@ CREATE TABLE IF NOT EXISTS verdict_skip_agg (
     verdict TEXT NOT NULL,
     count INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watch_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seed_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    status TEXT NOT NULL,
+    evidence_json TEXT
+);
 CREATE TABLE IF NOT EXISTS dstate (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -475,6 +482,35 @@ def invariant_break_seeds() -> List[dict]:
             "classifier_correct", "maker_filled_est",
             "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days"]
     return [dict(zip(cols, r)) for r in rows]
+
+
+# ── Watch rows ──────────────────────────────────────────────────
+
+def insert_watch_row(seed_id: int, status: str,
+                     evidence_json: str = None) -> int:
+    with _lock:
+        cur = _conn.execute(
+            """INSERT INTO watch_rows (seed_id, ts, status, evidence_json)
+               VALUES (?, ?, ?, ?)""",
+            (seed_id, time.time(), status, evidence_json))
+        _conn.commit()
+        return cur.lastrowid
+
+
+def watch_stats_since(ts: float) -> dict:
+    with _lock:
+        row = _conn.execute(
+            """SELECT
+                COUNT(*),
+                SUM(CASE WHEN status='EVIDENCE_HELD' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='EVIDENCE_BROKEN' THEN 1 ELSE 0 END)
+               FROM watch_rows WHERE ts >= ?""",
+            (ts,)).fetchone()
+    return {
+        "total": row[0] or 0,
+        "held": row[1] or 0,
+        "broken": row[2] or 0,
+    }
 
 
 # ── Stats rollup ─────────────────────────────────────────────────

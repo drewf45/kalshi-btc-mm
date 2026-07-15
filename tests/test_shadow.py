@@ -29,9 +29,14 @@ class TestSettleNet:
         net = shadow._settle_net(correct=True, price=50, fee=0)
         assert net == 50.0
 
-    def test_loss_returns_negative_price(self):
+    def test_loss_returns_negative_price_plus_fee(self):
         net = shadow._settle_net(correct=False, price=97, fee=2)
-        assert net == -97.0
+        assert net == -99.0
+
+    def test_loss_99_cent_mult1(self):
+        """1-lot @ 99¢, mult=1 loss → -(99+1) = -100¢."""
+        net = shadow._settle_net(correct=False, price=99, fee=1)
+        assert net == -100.0
 
     def test_zero_price_returns_zero(self):
         net = shadow._settle_net(correct=True, price=0, fee=0)

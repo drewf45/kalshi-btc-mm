@@ -13,6 +13,7 @@ from typing import Optional, List, Dict
 from k_worker import kalshi
 
 from . import dstore, classify, registry, feeds, shadow, feemath
+from . import series_of
 from .feeds import Observation
 
 log = logging.getLogger("d_worker.scanner")
@@ -183,7 +184,7 @@ def sweep(client: kalshi.KalshiClient) -> int:
 
     for market in markets:
         ticker = market.get("ticker", "")
-        series = market.get("series_ticker", "")
+        series = series_of(market)
         close_ts = _resolve_close_ts(market) or 0
 
         if registry.is_blacklisted(series):
@@ -245,7 +246,7 @@ def _classify_market(client: kalshi.KalshiClient, market: dict,
                      governor: TokenBucket, close_ts: float) -> classify.VerdictRow:
     """Classify a single market with feeds + book fetch."""
     ticker = market.get("ticker", "")
-    series = market.get("series_ticker", "")
+    series = series_of(market)
 
     registry.auto_draft(market)
     fee_change = registry.update_fee_from_market(market)

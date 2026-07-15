@@ -90,8 +90,14 @@ def build_pack() -> str:
     # §2 SEEDS
     sim_used = dstore.sim_capital_used()
     sim_cap = float(os.environ.get("DW_SIM_CAPITAL_USD", "10.00"))
+    watch = dstore.watch_stats_since(midnight)
+    watch_str = ""
+    if seed_stats["open"] > 0:
+        watch_str = f" | watch ✓ {watch['held']}/{watch['total']}"
+        if watch["broken"] > 0:
+            watch_str = f" | watch ⚠ {watch['broken']} BROKEN"
     lines.append(f"2. SEEDS: {seed_stats['new']} new | {seed_stats['open']} open | "
-                 f"sim ${sim_used:.2f}/${sim_cap:.2f}")
+                 f"sim ${sim_used:.2f}/${sim_cap:.2f}{watch_str}")
 
     # §3 SETTLED
     lt_settled = seed_stats["lifetime_settled"]
@@ -135,10 +141,15 @@ def build_pack() -> str:
     feed_status = _feed_health()
     last_cycle = day_cycles[0] if day_cycles else None
     sweep_sec = 0
-    if last_cycle and last_cycle.get("finished_ts") and last_cycle.get("started_ts"):
-        sweep_sec = last_cycle["finished_ts"] - last_cycle["started_ts"]
-    lines.append(f"7. HEALTH: api {gov.total_consumed}/min (cap {gov.rate}) | "
-                 f"{feed_status} | sweep {sweep_sec:.0f}s")
+    last_reqs = 0
+    if last_cycle:
+        if last_cycle.get("finished_ts") and last_cycle.get("started_ts"):
+            sweep_sec = last_cycle["finished_ts"] - last_cycle["started_ts"]
+        last_reqs = last_cycle.get("req_count", 0) or 0
+    rpm = last_reqs / (sweep_sec / 60) if sweep_sec > 0 else 0
+    lines.append(f"7. HEALTH: api {last_reqs} reqs/{sweep_sec:.0f}s "
+                 f"({rpm:.0f}/min, cap {gov.rate}) | "
+                 f"{feed_status}")
 
     # §8 ALERTS
     _reset_hour()
@@ -190,6 +201,10 @@ def _get_alerts() -> list:
     alerts = []
     if halt == "1":
         alerts.append("halt_promotion active (invariant break)")
+    midnight = dstore.et_midnight_ts()
+    watch = dstore.watch_stats_since(midnight)
+    if watch["broken"] > 0:
+        alerts.append(f"{watch['broken']} EVIDENCE_BROKEN watch event(s)")
     breaks = dstore.invariant_break_seeds()
     if breaks:
         alerts.append(f"{len(breaks)} invariant break(s)")

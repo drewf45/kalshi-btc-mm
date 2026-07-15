@@ -119,13 +119,14 @@ def record_seed(verdict: classify.VerdictRow, book, market: dict) -> Optional[in
 
 
 def _settle_net(correct: bool, price: int, fee: int) -> float:
-    """Compute true net clip (after fees) for one side at settlement."""
+    """Compute true net clip (after fees) for one side at settlement.
+    Entry fee is paid win or lose."""
     if price <= 0:
         return 0.0
     if correct:
         return float((100 - price) - fee)
     else:
-        return float(-price)
+        return float(-(price + fee))
 
 
 def _extract_1lot_fees(sizes_json_str: str) -> tuple:

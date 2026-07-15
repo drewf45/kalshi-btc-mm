@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict
 
 from . import feemath
+from . import series_of as _series_of
 from .feeds import Observation
 
 log = logging.getLogger("d_worker.classify")
@@ -83,7 +84,7 @@ def run(market: dict, registry_row: Optional[dict],
         state: dict) -> VerdictRow:
     """Classify a market. Returns a VerdictRow."""
     ticker = market.get("ticker", "")
-    series = market.get("series_ticker", "")
+    series = _series_of(market)
     close_ts = state.get("close_ts", 0)
 
     if not registry_row:
@@ -198,7 +199,7 @@ def _classify_d1_wx(market: dict, ticker: str, series: str, close_ts: float,
 def _check_d2(market: dict, registry_row: dict) -> Optional[VerdictRow]:
     """D2: deadline-passed. Only from machine-readable timestamps."""
     ticker = market.get("ticker", "")
-    series = market.get("series_ticker", "")
+    series = _series_of(market)
     notes = (registry_row.get("notes") or "").lower()
     if "no-revival" not in notes:
         return None
