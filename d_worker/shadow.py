@@ -2,6 +2,10 @@
 
 Telegram messages: SEED placed (🌱) and SETTLED (✅/🚨) only.
 Invariant break sets halt_promotion; cleared via DW_CLEAR_HALT=1 at next boot.
+
+Settlement nets subtract seed-time order fees (from sizes_json) so the
+values written to net_clip_taker/maker_cents and consumed by the GATE MARCH
+rollup are true net, never gross.
 """
 
 import json
@@ -114,8 +118,31 @@ def record_seed(verdict: classify.VerdictRow, book, market: dict) -> Optional[in
     return seed_id
 
 
-def settle_seeds(client: kalshi.KalshiClient) -> int:
-    """Poll and settle unsettled seeds. Returns count settled."""
+def _settle_net(correct: bool, price: int, fee: int) -> float:
+    """Compute true net clip (after fees) for one side at settlement."""
+    if price <= 0:
+        return 0.0
+    if correct:
+        return float((100 - price) - fee)
+    else:
+        return float(-price)
+
+
+def _extract_1lot_fees(sizes_json_str: str) -> tuple:
+    """Extract 1-lot taker and maker fees from seed-time sizes_json.
+    Returns (taker_fee, maker_fee)."""
+    try:
+        sizes = json.loads(sizes_json_str) if sizes_json_str else {}
+    except (json.JSONDecodeError, TypeError):
+        sizes = {}
+    lot1 = sizes.get("1", {})
+    return (lot1.get("taker_fee", 0), lot1.get("maker_fee", 0))
+
+
+def settle_seeds(client: kalshi.KalshiClient,
+                 governor=None) -> int:
+    """Poll and settle unsettled seeds. Returns count settled.
+    If governor is provided, settlement API calls consume tokens."""
     seeds = dstore.get_unsettled_seeds()
     settled = 0
     now = time.time()
@@ -123,6 +150,8 @@ def settle_seeds(client: kalshi.KalshiClient) -> int:
         if seed["close_ts"] and now < seed["close_ts"] + 60:
             continue
         ticker = seed["market_ticker"]
+        if governor:
+            governor.consume(1)
         try:
             result = kalshi.get_settlement_result(client, ticker)
         except Exception as e:
@@ -134,14 +163,11 @@ def settle_seeds(client: kalshi.KalshiClient) -> int:
         correct = (result == side)
         taker_price = seed["taker_price_cents"] or 0
         maker_price = seed["maker_price_cents"] or 0
-        net_taker = 0.0
-        net_maker = 0.0
-        if correct:
-            net_taker = float(100 - taker_price) if taker_price > 0 else 0
-            net_maker = float(100 - maker_price) if maker_price > 0 else 0
-        else:
-            net_taker = -float(taker_price)
-            net_maker = -float(maker_price)
+
+        taker_fee, maker_fee = _extract_1lot_fees(seed.get("sizes_json", ""))
+        net_taker = _settle_net(correct, taker_price, taker_fee)
+        net_maker = _settle_net(correct, maker_price, maker_fee)
+
         lockup_days = 0.0
         if seed["ts"] and seed["close_ts"]:
             lockup_days = (taker_price * (now - seed["ts"]) / 86400.0) / 100.0
@@ -153,11 +179,12 @@ def settle_seeds(client: kalshi.KalshiClient) -> int:
         settled += 1
 
         status = "✓" if correct else "✗ WRONG"
-        maker_note = " (filled est)" if maker_filled else ""
+        maker_label = "UNINSTRUMENTED" if maker_filled is None else (
+            "filled est" if maker_filled else "not filled")
         notify.send(
             f"🅳 {'✅' if correct else '🚨'} SETTLED — {ticker} | "
             f"classifier {status} | net taker {net_taker:+.1f}¢, "
-            f"maker est {net_maker:+.1f}¢{maker_note} | "
+            f"maker {net_maker:+.1f}¢ ({maker_label}) | "
             f"lockup {lockup_days:.1f}¢-days")
 
         if not correct:
@@ -171,9 +198,9 @@ def settle_seeds(client: kalshi.KalshiClient) -> int:
     return settled
 
 
-def _check_maker_fill(seed: dict) -> bool:
-    """Estimate if the maker touch traded through."""
-    return False
+def _check_maker_fill(seed: dict) -> Optional[bool]:
+    """Estimate if the maker touch traded through. Returns None (uninstrumented)."""
+    return None
 
 
 def nightly_rollup() -> None:
@@ -181,7 +208,6 @@ def nightly_rollup() -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-    seeds = dstore.get_unsettled_seeds()
     all_settled = [s for s in _all_settled_seeds() if s.get("settled_ts")]
 
     by_class: dict = {}

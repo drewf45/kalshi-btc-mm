@@ -1,14 +1,12 @@
-"""Pack builder — hourly to DB, daily to Telegram, flood budget for events.
+"""Pack builder — hourly to Telegram + DB, flood budget for events.
 
-Message policy: Telegram receives ONLY boot, seed, settle, failure, and
-one daily pack (09:00 ET). Hourly packs are built every hour and stored
-in the packs table for database review. Daily pack is suppressed if the
-day had zero seeds, zero settlements, zero alerts, and scan health is green.
+Message policy: hourly pack SENT to Telegram every hour, always.
+Events (seed/settle/failure) sent individually within flood budget.
+No daily pack — the hourly cadence replaces it.
 """
 
 import os
 import json
-import html
 import time
 import logging
 from datetime import datetime
@@ -22,7 +20,6 @@ log = logging.getLogger("d_worker.pack")
 
 NY = ZoneInfo("America/New_York")
 MSG_BUDGET_PER_HOUR = int(os.environ.get("DW_MSG_BUDGET_PER_HOUR", "20"))
-DAILY_PACK_HOUR = 9
 
 _msg_count_this_hour: int = 0
 _msg_hour: int = -1
@@ -51,25 +48,9 @@ def send_event(text: str) -> None:
     notify.send(text)
 
 
-def is_hourly_pack_time() -> bool:
+def hourly_pack_sent_this_hour() -> bool:
     now = datetime.now(NY)
-    return now.minute == 0
-
-
-def hourly_pack_stored_this_hour() -> bool:
-    now = datetime.now(NY)
-    key = f"pack_stored_{now.strftime('%Y%m%d_%H')}"
-    return dstore.get_state(key) == "1"
-
-
-def is_daily_pack_time() -> bool:
-    now = datetime.now(NY)
-    return now.hour == DAILY_PACK_HOUR and now.minute < 5
-
-
-def daily_pack_sent_today() -> bool:
-    now = datetime.now(NY)
-    key = f"daily_pack_sent_{now.strftime('%Y%m%d')}"
+    key = f"pack_sent_{now.strftime('%Y%m%d_%H')}"
     return dstore.get_state(key) == "1"
 
 
@@ -85,7 +66,7 @@ def build_pack() -> str:
                 and not alerts)
     mode = "quiet" if is_quiet else "active"
 
-    lines = [f"🅳 === KAL-D DAILY — {date_str} ({mode}) ==="]
+    lines = [f"🅳 === KAL-D HOURLY — {date_str} {now.strftime('%H:%M')} ET ({mode}) ==="]
 
     # §1 SCAN
     cycles = dstore.latest_cycles(100)
@@ -137,7 +118,7 @@ def build_pack() -> str:
     # §5 FILLS
     fill_stats = dstore.seed_fill_stats_since(midnight)
     lines.append(f"5. FILLS: taker-viable {fill_stats['taker_viable']}/{fill_stats['total']} | "
-                 f"maker-est-filled {fill_stats['maker_filled']}/{fill_stats['total']}")
+                 f"maker UNINSTRUMENTED")
 
     # §6 REGISTRY
     all_reg = dstore.list_registry()
@@ -171,9 +152,9 @@ def build_pack() -> str:
     return "\n".join(lines)
 
 
-def store_hourly_pack() -> None:
-    """Build the hourly pack and store it in kal_d.db. No Telegram send."""
-    if hourly_pack_stored_this_hour():
+def send_hourly_pack() -> None:
+    """Build the hourly pack, store to DB, and send to Telegram."""
+    if hourly_pack_sent_this_hour():
         return
     text = build_pack()
     now = datetime.now(NY)
@@ -186,40 +167,9 @@ def store_hourly_pack() -> None:
         "settled_today": seed_stats["today_settled"],
     }
     dstore.insert_pack(hour_key, text, json.dumps(stats))
-    dstore.set_state(f"pack_stored_{hour_key}", "1")
-    log.info(f"[PACK] Hourly pack stored: {hour_key}")
-
-
-def send_daily_pack() -> None:
-    """Send the daily pack to Telegram at 09:00 ET, if there's anything to report."""
-    if daily_pack_sent_today():
-        return
-    now = datetime.now(NY)
-    midnight = dstore.et_midnight_ts()
-    seed_stats = dstore.seed_stats_since(midnight)
-    alerts = _get_alerts()
-    health_ok = _scan_health_ok()
-
-    if (seed_stats["new"] == 0 and seed_stats["today_settled"] == 0
-            and not alerts and health_ok):
-        log.info("[PACK] Daily pack suppressed — fully quiet day")
-        dstore.set_state(f"daily_pack_sent_{now.strftime('%Y%m%d')}", "1")
-        return
-
-    text = build_pack()
-    log.info(f"[PACK] Daily pack:\n{text}")
-    notify.send(f"<pre>{html.escape(text)}</pre>")
-    dstore.set_state(f"daily_pack_sent_{now.strftime('%Y%m%d')}", "1")
-
-
-def _scan_health_ok() -> bool:
-    midnight = dstore.et_midnight_ts()
-    cycles = dstore.latest_cycles(100)
-    day_cycles = [c for c in cycles if c["started_ts"] >= midnight]
-    if not day_cycles:
-        return True
-    total_errs = sum(c.get("errs", 0) for c in day_cycles)
-    return total_errs == 0
+    notify.send(text)
+    dstore.set_state(f"pack_sent_{hour_key}", "1")
+    log.info(f"[PACK] Hourly pack sent: {hour_key}")
 
 
 def _feed_health() -> str:

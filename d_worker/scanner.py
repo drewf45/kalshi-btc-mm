@@ -76,6 +76,7 @@ def _get_governor() -> TokenBucket:
 
 
 _running_values: Dict[tuple, float] = {}
+_obs_cache: Dict[str, Optional[Observation]] = {}
 
 
 def _running_value_key(station: str, tz_name: str = "America/New_York") -> tuple:
@@ -155,6 +156,8 @@ def _resolve_close_ts(market: dict) -> Optional[float]:
 
 def sweep(client: kalshi.KalshiClient) -> int:
     """Run one full platform sweep. Returns cycle_id."""
+    global _obs_cache
+    _obs_cache = {}
     governor = _get_governor()
     cycle_id = dstore.start_cycle(governor.rate)
     started = time.time()
@@ -175,25 +178,32 @@ def sweep(client: kalshi.KalshiClient) -> int:
     markets.sort(key=lambda m: _resolve_close_ts(m) or float("inf"))
 
     verdict_rows = []
+    skip_agg: Dict[tuple, int] = {}
+    approved_series = {r["series_ticker"] for r in dstore.list_registry(approved_only=True)}
+
     for market in markets:
         ticker = market.get("ticker", "")
         series = market.get("series_ticker", "")
         close_ts = _resolve_close_ts(market) or 0
 
         if registry.is_blacklisted(series):
-            verdict_rows.append((
-                cycle_id, time.time(), ticker, series, close_ts,
-                "NONE", "SKIP_SERIES_BLACKLIST", None, None, None, None))
+            agg_key = (series, "SKIP_SERIES_BLACKLIST")
+            skip_agg[agg_key] = skip_agg.get(agg_key, 0) + 1
             skips_count += 1
             continue
 
         try:
             result = _classify_market(client, market, governor, close_ts)
-            verdict_rows.append((
-                cycle_id, time.time(), ticker, series, close_ts,
-                result.dclass, result.verdict, result.side,
-                _json_or_none(result.evidence),
-                result.fee_maker, result.fee_taker))
+
+            if result.verdict == "SEED" or result.verdict == "ERR" or series in approved_series:
+                verdict_rows.append((
+                    cycle_id, time.time(), ticker, series, close_ts,
+                    result.dclass, result.verdict, result.side,
+                    _json_or_none(result.evidence),
+                    result.fee_maker, result.fee_taker))
+            elif result.verdict.startswith("SKIP"):
+                agg_key = (series, result.verdict)
+                skip_agg[agg_key] = skip_agg.get(agg_key, 0) + 1
 
             if result.verdict == "SEED":
                 seeds_count += 1
@@ -211,6 +221,8 @@ def sweep(client: kalshi.KalshiClient) -> int:
             errs_count += 1
 
     dstore.insert_verdicts_batch(verdict_rows)
+    if skip_agg:
+        dstore.insert_skip_aggregates(cycle_id, skip_agg)
 
     elapsed = time.time() - started
     req_used = governor.total_consumed - req_start
@@ -248,7 +260,11 @@ def _classify_market(client: kalshi.KalshiClient, market: dict,
     obs2 = None
     station = (reg_row or {}).get("station_or_ref", "")
     if station and reg_row and reg_row.get("settle_source") in ("NWS", "NWS_STATION", "WEATHER"):
-        obs = feeds.observe_nws(station)
+        if station in _obs_cache:
+            obs = _obs_cache[station]
+        else:
+            obs = feeds.observe_nws(station)
+            _obs_cache[station] = obs
         station_tz = (reg_row or {}).get("tz", "America/New_York")
         if obs:
             _update_running_value(station, obs.value, station_tz)

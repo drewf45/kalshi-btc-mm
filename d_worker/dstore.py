@@ -118,10 +118,20 @@ CREATE TABLE IF NOT EXISTS packs (
     rendered_text TEXT NOT NULL,
     stats_json TEXT
 );
+CREATE TABLE IF NOT EXISTS verdict_skip_agg (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    series_ticker TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    count INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dstate (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_verdicts_ticker_ts ON verdicts (market_ticker, ts);
+CREATE INDEX IF NOT EXISTS idx_skip_agg_cycle ON verdict_skip_agg (cycle_id);
 """
 
 
@@ -195,6 +205,22 @@ def insert_verdicts_batch(rows: List[tuple]) -> None:
         _conn.commit()
 
 
+def insert_skip_aggregates(cycle_id: int, skip_agg: dict) -> None:
+    """Insert aggregated skip counts. skip_agg: {(series, verdict): count}."""
+    if not skip_agg:
+        return
+    now = time.time()
+    rows = [(cycle_id, now, series, verdict, count)
+            for (series, verdict), count in skip_agg.items()]
+    with _lock:
+        _conn.executemany(
+            """INSERT INTO verdict_skip_agg
+               (cycle_id, ts, series_ticker, verdict, count)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows)
+        _conn.commit()
+
+
 def count_verdicts_since(ts: float, verdict: str = None) -> int:
     with _lock:
         if verdict:
@@ -218,10 +244,14 @@ def verdict_counts_since(ts: float) -> Dict[str, int]:
 def top_skip_reasons(ts: float, limit: int = 5) -> List[tuple]:
     with _lock:
         rows = _conn.execute(
-            """SELECT verdict, COUNT(*) as c FROM verdicts
-               WHERE ts >= ? AND verdict LIKE 'SKIP_%'
-               GROUP BY verdict ORDER BY c DESC LIMIT ?""",
-            (ts, limit)).fetchall()
+            """SELECT verdict, SUM(cnt) as c FROM (
+                 SELECT verdict, COUNT(*) as cnt FROM verdicts
+                   WHERE ts >= ? AND verdict LIKE 'SKIP_%' GROUP BY verdict
+                 UNION ALL
+                 SELECT verdict, SUM(count) as cnt FROM verdict_skip_agg
+                   WHERE ts >= ? AND verdict LIKE 'SKIP_%' GROUP BY verdict
+               ) GROUP BY verdict ORDER BY c DESC LIMIT ?""",
+            (ts, ts, limit)).fetchall()
     return rows
 
 
@@ -358,9 +388,10 @@ def get_unsettled_seeds() -> List[dict]:
 
 
 def settle_seed(seed_id: int, result: str, classifier_correct: bool,
-                maker_filled_est: bool,
+                maker_filled_est,
                 net_clip_taker: float, net_clip_maker: float,
                 lockup_days: float) -> None:
+    maker_val = None if maker_filled_est is None else (1 if maker_filled_est else 0)
     with _lock:
         _conn.execute(
             """UPDATE shadow_seeds SET settled_ts=?, result=?,
@@ -369,7 +400,7 @@ def settle_seed(seed_id: int, result: str, classifier_correct: bool,
                lockup_capital_days=? WHERE id=?""",
             (time.time(), result,
              1 if classifier_correct else 0,
-             1 if maker_filled_est else 0,
+             maker_val,
              net_clip_taker, net_clip_maker, lockup_days, seed_id))
         _conn.commit()
 

@@ -4,8 +4,8 @@ Boot: envcheck → instance lock → dstore init → env-var approvals/blacklist
 Telegram BOOT message → threads: scanner loop, settlement poller, pack scheduler →
 supervise (any thread death = alert + restart, 3 strikes = FATAL).
 
-Message policy: Telegram receives ONLY boot, seed, settle, failure, and one daily
-pack (09:00 ET). Hourly packs are stored in kal_d.db for database review.
+Message policy: Telegram receives boot, seed, settle, failure, and hourly pack
+(every hour, always). Events within flood budget.
 """
 
 import os
@@ -145,9 +145,10 @@ def _scanner_loop(client: kalshi.KalshiClient) -> None:
 def _settlement_loop(client: kalshi.KalshiClient) -> None:
     """Periodic settlement polling + nightly rollup."""
     last_rollup_day = ""
+    governor = scanner._get_governor()
     while _running:
         try:
-            settled = shadow.settle_seeds(client)
+            settled = shadow.settle_seeds(client, governor=governor)
             if settled:
                 log.info(f"[SETTLE] Settled {settled} seeds")
         except Exception as e:
@@ -169,14 +170,12 @@ def _settlement_loop(client: kalshi.KalshiClient) -> None:
 
 
 def _pack_loop() -> None:
-    """Hourly pack to DB, daily pack to Telegram at 09:00 ET."""
+    """Hourly pack to Telegram + DB, every hour."""
     while _running:
         try:
             now = datetime.now(NY)
-            if now.minute == 0 and not pack.hourly_pack_stored_this_hour():
-                pack.store_hourly_pack()
-            if pack.is_daily_pack_time() and not pack.daily_pack_sent_today():
-                pack.send_daily_pack()
+            if now.minute == 0 and not pack.hourly_pack_sent_this_hour():
+                pack.send_hourly_pack()
         except Exception as e:
             log.error(f"[PACK] Error: {e}", exc_info=True)
         time.sleep(30)

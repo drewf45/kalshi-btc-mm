@@ -157,6 +157,44 @@ class TestRunningValueKeying:
         scanner._running_values.clear()
 
 
+class TestObsCache:
+    def test_cache_cleared_each_sweep(self):
+        scanner._obs_cache["KNYC"] = "stale"
+        scanner._obs_cache = {}
+        assert "KNYC" not in scanner._obs_cache
+
+    @patch("k_worker.notify")
+    @patch("d_worker.scanner._classify_market")
+    @patch("d_worker.scanner._fetch_all_markets")
+    def test_skip_aggregation(self, mock_fetch, mock_classify, mock_notify):
+        """Non-approved SKIPs aggregate; ERR rows stay individual."""
+        markets = [_make_market(f"T{i}", series="KXUNAPPROVED") for i in range(5)]
+        mock_fetch.return_value = markets
+
+        from d_worker.classify import VerdictRow
+        skip_verdict = VerdictRow(
+            market_ticker="", series_ticker="KXUNAPPROVED", close_ts=0,
+            dclass="NONE", verdict="SKIP_NO_REGISTRY", side=None,
+            evidence=None, fee_maker=None, fee_taker=None)
+        mock_classify.return_value = skip_verdict
+        scanner._governor = scanner.TokenBucket(100)
+
+        with patch("d_worker.scanner.registry") as mock_reg:
+            mock_reg.is_blacklisted.return_value = False
+            client = MagicMock()
+            scanner.sweep(client)
+
+        with dstore._lock:
+            verdicts = dstore._conn.execute(
+                "SELECT COUNT(*) FROM verdicts WHERE verdict='SKIP_NO_REGISTRY'"
+            ).fetchone()[0]
+            agg = dstore._conn.execute(
+                "SELECT SUM(count) FROM verdict_skip_agg WHERE verdict='SKIP_NO_REGISTRY'"
+            ).fetchone()[0]
+        assert verdicts == 0
+        assert agg == 5
+
+
 class TestResolveCloseTs:
     def test_iso_string(self):
         ts = scanner._resolve_close_ts(
