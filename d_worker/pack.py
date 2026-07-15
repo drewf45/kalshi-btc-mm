@@ -66,7 +66,8 @@ def build_pack() -> str:
                 and not alerts)
     mode = "quiet" if is_quiet else "active"
 
-    lines = [f"🅳 === KAL-D HOURLY — {date_str} {now.strftime('%H:%M')} ET ({mode}) ==="]
+    rung = int(dstore.get_state("current_rung") or "0")
+    lines = [f"🅳 === KAL-D HOURLY R{rung} — {date_str} {now.strftime('%H:%M')} ET ({mode}) ==="]
 
     # §1 SCAN
     cycles = dstore.latest_cycles(100)
@@ -88,8 +89,10 @@ def build_pack() -> str:
                  f"SEED {total_seeds} / SKIP {total_skips} / ERR {total_errs}{top_str}")
 
     # §2 SEEDS
-    sim_used = dstore.sim_capital_used()
-    sim_cap = float(os.environ.get("DW_SIM_CAPITAL_USD", "10.00"))
+    ledger = dstore.budget_ledger_summary()
+    from . import budget as _budget
+    book_cap = _budget._book_cap_usd()
+    denials = dstore.budget_denial_count_since(midnight)
     watch = dstore.watch_stats_since(midnight)
     watch_str = ""
     if seed_stats["open"] > 0:
@@ -97,7 +100,8 @@ def build_pack() -> str:
         if watch["broken"] > 0:
             watch_str = f" | watch ⚠ {watch['broken']} BROKEN"
     lines.append(f"2. SEEDS: {seed_stats['new']} new | {seed_stats['open']} open | "
-                 f"sim ${sim_used:.2f}/${sim_cap:.2f}{watch_str}")
+                 f"at-risk ${ledger['at_risk_usd']:.2f}/${book_cap:.2f} | "
+                 f"denied {denials}{watch_str}")
 
     # §3 SETTLED
     lt_settled = seed_stats["lifetime_settled"]
@@ -198,9 +202,13 @@ def _feed_health() -> str:
 
 def _get_alerts() -> list:
     halt = dstore.get_state("halt_promotion")
+    live_halt = dstore.get_state("live_halt")
     alerts = []
     if halt == "1":
         alerts.append("halt_promotion active (invariant break)")
+    if live_halt == "1":
+        reason = dstore.get_state("live_halt_reason") or "unknown"
+        alerts.append(f"live_halt active ({reason})")
     midnight = dstore.et_midnight_ts()
     watch = dstore.watch_stats_since(midnight)
     if watch["broken"] > 0:

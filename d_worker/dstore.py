@@ -126,6 +126,26 @@ CREATE TABLE IF NOT EXISTS verdict_skip_agg (
     verdict TEXT NOT NULL,
     count INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS budget_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    market_ticker TEXT NOT NULL,
+    cost_cents INTEGER NOT NULL,
+    dclass TEXT,
+    status TEXT NOT NULL,
+    reason TEXT,
+    updated_ts REAL
+);
+CREATE TABLE IF NOT EXISTS order_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    reservation_id INTEGER,
+    market_ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price_cents INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    order_id_or_error TEXT
+);
 CREATE TABLE IF NOT EXISTS watch_rows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     seed_id INTEGER NOT NULL,
@@ -511,6 +531,91 @@ def watch_stats_since(ts: float) -> dict:
         "held": row[1] or 0,
         "broken": row[2] or 0,
     }
+
+
+# ── Budget ledger ──────────────────────────────────────────────
+
+def insert_budget_decision(ticker: str, cost_cents: int, dclass: str,
+                           status: str, reason: str) -> int:
+    with _lock:
+        cur = _conn.execute(
+            """INSERT INTO budget_decisions
+               (ts, market_ticker, cost_cents, dclass, status, reason)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (time.time(), ticker, cost_cents, dclass, status, reason))
+        _conn.commit()
+        return cur.lastrowid
+
+
+def update_budget_decision(decision_id: int, new_status: str) -> bool:
+    with _lock:
+        cur = _conn.execute(
+            "UPDATE budget_decisions SET status=?, updated_ts=? WHERE id=?",
+            (new_status, time.time(), decision_id))
+        _conn.commit()
+        return cur.rowcount > 0
+
+
+def budget_ledger_summary() -> dict:
+    with _lock:
+        at_risk = _conn.execute(
+            "SELECT COALESCE(SUM(cost_cents), 0) FROM budget_decisions "
+            "WHERE status='AT_RISK'").fetchone()[0]
+        reserved = _conn.execute(
+            "SELECT COALESCE(SUM(cost_cents), 0) FROM budget_decisions "
+            "WHERE status='RESERVED'").fetchone()[0]
+        lockup_row = _conn.execute(
+            """SELECT COALESCE(SUM(
+                cost_cents * (? - ts) / 86400.0 / 100.0
+               ), 0) FROM budget_decisions
+               WHERE status IN ('AT_RISK', 'RESERVED')""",
+            (time.time(),)).fetchone()
+    return {
+        "at_risk_usd": (at_risk or 0) / 100.0,
+        "reserved_usd": (reserved or 0) / 100.0,
+        "lockup_days": lockup_row[0] or 0.0,
+    }
+
+
+def budget_class_exposure(dclass: str) -> float:
+    with _lock:
+        row = _conn.execute(
+            "SELECT COALESCE(SUM(cost_cents), 0) FROM budget_decisions "
+            "WHERE dclass=? AND status IN ('AT_RISK', 'RESERVED')",
+            (dclass,)).fetchone()
+    return (row[0] or 0) / 100.0
+
+
+def budget_market_lots(ticker: str) -> int:
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) FROM budget_decisions "
+            "WHERE market_ticker=? AND status IN ('AT_RISK', 'RESERVED')",
+            (ticker,)).fetchone()
+    return row[0] or 0
+
+
+def budget_denial_count_since(ts: float) -> int:
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) FROM budget_decisions WHERE ts >= ? AND status='DENIED'",
+            (ts,)).fetchone()
+    return row[0] or 0
+
+
+def insert_order_row(reservation_id: int, ticker: str, side: str,
+                     price_cents: int, status: str,
+                     order_id_or_error: str = "") -> int:
+    with _lock:
+        cur = _conn.execute(
+            """INSERT INTO order_rows
+               (ts, reservation_id, market_ticker, side, price_cents,
+                status, order_id_or_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), reservation_id, ticker, side, price_cents,
+             status, order_id_or_error))
+        _conn.commit()
+        return cur.lastrowid
 
 
 # ── Stats rollup ─────────────────────────────────────────────────

@@ -12,7 +12,7 @@ from typing import Optional, List, Dict
 
 from k_worker import kalshi
 
-from . import dstore, classify, registry, feeds, shadow, feemath
+from . import dstore, classify, registry, feeds, shadow, feemath, budget
 from . import series_of
 from .feeds import Observation
 
@@ -298,13 +298,17 @@ def _classify_market(client: kalshi.KalshiClient, market: dict,
 
 def _handle_seed(client: kalshi.KalshiClient, verdict: classify.VerdictRow,
                  market: dict, governor: TokenBucket) -> None:
-    """Record a shadow seed from a SEED verdict."""
-    halt = dstore.get_state("halt_promotion")
-    if halt == "1":
-        log.warning(f"[SCANNER] SEED suppressed (halt_promotion): {verdict.market_ticker}")
+    """Record a shadow seed, gated by the inside body's budget ledger."""
+    ticker = verdict.market_ticker
+    close_ts = verdict.close_ts or 0
+    tts = max(0, close_ts - time.time())
+
+    taker_price = (verdict.evidence or {}).get("taker_price", 99)
+    res = budget.reserve(ticker, taker_price, verdict.dclass, tts, verdict.side)
+    if not res.granted:
+        log.info(f"[SCANNER] SEED denied by inside body: {ticker} — {res.reason}")
         return
 
-    ticker = verdict.market_ticker
     book = None
     governor.consume(1)
     try:
@@ -312,7 +316,13 @@ def _handle_seed(client: kalshi.KalshiClient, verdict: classify.VerdictRow,
     except Exception:
         pass
 
-    shadow.record_seed(verdict, book, market)
+    seed_id = shadow.record_seed(verdict, book, market)
+    if seed_id is None:
+        budget.release(res.reservation_id, "SEED_DUPLICATE")
+        return
+
+    if res.reservation_id:
+        dstore.set_state(f"seed_reservation_{seed_id}", str(res.reservation_id))
 
 
 def _json_or_none(d: Optional[dict]) -> Optional[str]:

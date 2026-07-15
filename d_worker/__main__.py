@@ -1,11 +1,10 @@
-"""KAL-D main entry point.
+"""KAL-D main entry point — two-body architecture.
 
-Boot: envcheck → instance lock → dstore init → env-var approvals/blacklist/halt →
-Telegram BOOT message → threads: scanner loop, settlement poller, pack scheduler →
-supervise (any thread death = alert + restart, 3 strikes = FATAL).
+Outside body (scanner): sweep → classify → reserve → seed → next.
+Inside body (watchdog): re-verify evidence → budget gate → abandon on break.
 
-Message policy: Telegram receives boot, seed, settle, failure, and hourly pack
-(every hour, always). Events within flood budget.
+Boot: envcheck → dstore init → instance lock → budget init → env-var config →
+Telegram BOOT → threads (scanner, settle, watchdog, pack) → supervisor.
 """
 
 import os
@@ -20,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from k_worker import kalshi, notify
 
-from . import dstore, scanner, shadow, pack, tg, registry, watchdog
+from . import dstore, scanner, shadow, pack, tg, registry, watchdog, budget, gateway
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,11 +218,14 @@ def main():
     # 4. Instance lock
     _acquire_lock()
 
-    # 5. Registry init + env-var approvals
+    # 5. Registry init + env-var approvals + budget + rung
     registry.load_blacklist()
+    budget.init_budget()
     newly_approved = tg.apply_env_approvals()
     newly_blacklisted = tg.apply_env_blacklist()
     halt_cleared = tg.apply_env_clear_halt()
+    rung_set = tg.apply_env_rung()
+    live_halt_cleared = tg.apply_env_clear_live_halt()
 
     # 6. Kalshi client
     client = kalshi.build_client()
@@ -238,24 +240,32 @@ def main():
     bl_count = len(registry.CRYPTO_BLACKLIST) + len(registry._user_blacklist)
     halt_state = dstore.get_state("halt_promotion")
 
+    rung = gateway.current_rung()
+    live_halt_state = dstore.get_state("live_halt")
+    book_cap = budget._book_cap_usd()
+
     approved_names = ", ".join(r["series_ticker"] for r in approved_list) or "none"
     boot_lines = [
-        f"🅳 BOOT — KAL-D scanner + watchdog started",
+        f"🅳 BOOT — KAL-D R{rung} scanner + watchdog",
+        f"  rung: {rung} ({'LIVE' if gateway.is_live_enabled() else 'SHADOW'}) | "
+        f"book cap: ${book_cap:.2f}",
         f"  scan: {scanner.SCAN_REQ_PER_MIN} req/min, "
         f"{scanner.SCAN_CYCLE_TARGET_SEC}s target",
         f"  watchdog: {watchdog.WATCH_INTERVAL_SEC}s cycle",
-        f"  sim: ${scanner.SIM_CAPITAL_USD:.2f} cap, "
-        f"batch sizes {scanner.SHADOW_BATCH_SIZES}",
         f"  approved ({len(approved_list)}): {approved_names}",
         f"  blacklist: {bl_count} series | "
         f"drafted: {len(drafted_list)}",
         f"  halt: {'ACTIVE' if halt_state == '1' else 'clear'} | "
-        f"min net clip: {scanner.MIN_NET_CLIP_CENTS}¢/ct",
+        f"live_halt: {'ACTIVE' if live_halt_state == '1' else 'clear'}",
     ]
     if newly_approved:
         boot_lines.append(f"  env-approved this boot: {', '.join(newly_approved)}")
     if halt_cleared:
         boot_lines.append(f"  halt_promotion cleared via DW_CLEAR_HALT")
+    if rung_set:
+        boot_lines.append(f"  rung set to {rung} via DW_RUNG")
+    if live_halt_cleared:
+        boot_lines.append(f"  live_halt cleared via DW_CLEAR_LIVE_HALT")
     notify.send("\n".join(boot_lines))
 
     # 8. Launch threads (no tg poller — env-var driven)

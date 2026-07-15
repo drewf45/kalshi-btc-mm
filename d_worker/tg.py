@@ -1,10 +1,11 @@
-"""Env-var-driven approval + blacklist + halt-clear for KAL-D.
+"""Env-var-driven configuration for KAL-D.
 
-No Telegram polling — k_worker owns the bot token exclusively.
-Configuration via env vars, applied once at boot:
+Applied once at boot:
   DW_APPROVED_SERIES: comma-separated series tickers to approve
   DW_BLACKLIST_EXTRA: comma-separated series tickers to blacklist
   DW_CLEAR_HALT: set to "1" to clear halt_promotion on this boot
+  DW_CLEAR_LIVE_HALT: set to "1" to clear live_halt on this boot
+  DW_RUNG: set current go-live rung (0-3, Drew-only)
 """
 
 import os
@@ -68,4 +69,39 @@ def apply_env_clear_halt() -> bool:
     dstore.set_state("halt_promotion", "0")
     log.warning("[BOOT] DW_CLEAR_HALT=1 — halt_promotion cleared. "
                 "Remove DW_CLEAR_HALT from env to avoid silent re-clears.")
+    return True
+
+
+def apply_env_rung() -> bool:
+    """Set current go-live rung from DW_RUNG. Returns True if set."""
+    raw = os.environ.get("DW_RUNG", "").strip()
+    if not raw:
+        return False
+    try:
+        rung = int(raw)
+    except ValueError:
+        log.warning(f"[BOOT] DW_RUNG={raw!r} not a valid integer — ignored")
+        return False
+    if rung < 0 or rung > 3:
+        log.warning(f"[BOOT] DW_RUNG={rung} out of range [0,3] — ignored")
+        return False
+    current = int(dstore.get_state("current_rung") or "0")
+    if rung != current:
+        dstore.set_state("current_rung", str(rung))
+        log.warning(f"[BOOT] DW_RUNG={rung} — rung changed from {current} to {rung}")
+    return True
+
+
+def apply_env_clear_live_halt() -> bool:
+    """If DW_CLEAR_LIVE_HALT=1, clear live_halt. Returns True if cleared."""
+    raw = os.environ.get("DW_CLEAR_LIVE_HALT", "").strip()
+    if raw != "1":
+        return False
+    halt = dstore.get_state("live_halt")
+    if halt != "1":
+        log.info("[BOOT] DW_CLEAR_LIVE_HALT=1 but no live_halt active — ignored")
+        return False
+    dstore.set_state("live_halt", "0")
+    dstore.set_state("live_halt_reason", "")
+    log.warning("[BOOT] DW_CLEAR_LIVE_HALT=1 — live_halt cleared.")
     return True
