@@ -134,6 +134,29 @@ class TestPerMarketIsolation:
         assert cycle["markets_seen"] == 3
 
 
+class TestRunningValueKeying:
+    def test_different_tz_different_key(self):
+        """Stations in different timezones get different keys even at the same moment."""
+        k1 = scanner._running_value_key("KNYC", "America/New_York")
+        k2 = scanner._running_value_key("KLAX", "America/Los_Angeles")
+        assert k1[0] != k2[0]
+        assert isinstance(k1, tuple) and len(k1) == 2
+
+    def test_same_station_same_key(self):
+        k1 = scanner._running_value_key("KNYC", "America/New_York")
+        k2 = scanner._running_value_key("KNYC", "America/New_York")
+        assert k1 == k2
+
+    def test_update_uses_local_date(self):
+        """Running value update keys by station-local date, not NY."""
+        scanner._running_values.clear()
+        val = scanner._update_running_value("KLAX", 95.0, "America/Los_Angeles")
+        assert val == 95.0
+        key = scanner._running_value_key("KLAX", "America/Los_Angeles")
+        assert scanner._running_values[key] == 95.0
+        scanner._running_values.clear()
+
+
 class TestResolveCloseTs:
     def test_iso_string(self):
         ts = scanner._resolve_close_ts(

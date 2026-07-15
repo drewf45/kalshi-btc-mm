@@ -168,15 +168,16 @@ def _classify_d1_wx(market: dict, ticker: str, series: str, close_ts: float,
 
     decided = False
     side = None
+    var_kind = (registry_row.get("variable_kind") or "running_max").lower()
 
-    if direction == "above":
+    if direction == "above" and var_kind == "running_max":
         threshold = strike + rounding
         if running_val >= threshold:
             decided = True
             side = "yes"
             evidence["threshold"] = threshold
             evidence["crossed"] = True
-    elif direction == "below":
+    elif direction == "below" and var_kind == "running_min":
         threshold = strike - rounding
         if running_val <= threshold:
             decided = True

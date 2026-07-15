@@ -5,12 +5,15 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import os
+
 import requests
 
 log = logging.getLogger("d_worker.feeds")
 
+_NWS_CONTACT = os.environ.get("DW_NWS_CONTACT", "kal-d-worker")
 _SESSION = requests.Session()
-_SESSION.headers["User-Agent"] = "(kal-d-worker, drewfagaly@gmail.com)"
+_SESSION.headers["User-Agent"] = f"(kal-d-worker, {_NWS_CONTACT})"
 
 NWS_BASE = "https://api.weather.gov"
 OMETEO_BASE = "https://api.open-meteo.com/v1/forecast"
@@ -76,6 +79,7 @@ def observe_open_meteo(lat: float, lon: float,
             "latitude": lat, "longitude": lon,
             "current": field,
             "temperature_unit": "fahrenheit",
+            "timezone": "UTC",
         }
         resp = _SESSION.get(OMETEO_BASE, params=params, timeout=10)
         if resp.status_code != 200:
@@ -89,9 +93,12 @@ def observe_open_meteo(lat: float, lon: float,
         ts_str = current.get("time", "")
         obs_ts = time.time()
         if ts_str:
-            from datetime import datetime
+            from datetime import datetime, timezone
             try:
-                obs_ts = datetime.fromisoformat(ts_str).timestamp()
+                dt = datetime.fromisoformat(ts_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                obs_ts = dt.timestamp()
             except Exception:
                 pass
         return Observation(value=float(val), ts=obs_ts,

@@ -115,6 +115,25 @@ class TestD1WXCrossing:
                 _state(running_value=80))
         assert v.verdict == "SKIP_NOT_DECIDED"
 
+    def test_below_market_running_max_undecidable(self):
+        """A 'below' market with running_max variable cannot be decided early.
+        Running max under the strike does NOT mean it stays under — afternoon can cross."""
+        m = _market(subtitle="Will the high temperature stay under 84.5°F?")
+        v = run(m, _registry(), _obs(80), None, _fee(), _book(),
+                _state(running_value=80))
+        assert v.verdict == "SKIP_NOT_DECIDED"
+
+    def test_below_market_running_min_decidable(self):
+        """A 'below' market with running_min variable CAN be decided when crossed."""
+        m = _market(subtitle="Will the low temperature stay under 40°F?",
+                    floor_strike=40.0)
+        reg = _registry()
+        reg["variable_kind"] = "running_min"
+        v = run(m, reg, _obs(38.0), None, _fee(), _book(),
+                _state(running_value=38.0))
+        assert v.verdict == "SEED"
+        assert v.side == "yes"
+
 
 class TestUnapprovedSeries:
     def test_unapproved_returns_skip(self):

@@ -75,20 +75,30 @@ def _get_governor() -> TokenBucket:
     return _governor
 
 
-_running_values: Dict[str, float] = {}
-_running_values_date: str = ""
+_running_values: Dict[tuple, float] = {}
 
 
-def _update_running_value(station: str, value: float) -> float:
-    """Track daily running max for a station. Resets on date change."""
-    global _running_values_date
+def _running_value_key(station: str, tz_name: str = "America/New_York") -> tuple:
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-    if today != _running_values_date:
-        _running_values.clear()
-        _running_values_date = today
-    key = station
+    try:
+        local_tz = ZoneInfo(tz_name)
+    except Exception:
+        local_tz = ZoneInfo("America/New_York")
+    return (station, datetime.now(local_tz).strftime("%Y-%m-%d"))
+
+
+def _update_running_value(station: str, value: float,
+                          tz_name: str = "America/New_York") -> float:
+    """Track daily running max for a station. Resets on station-local date change."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        local_tz = ZoneInfo(tz_name)
+    except Exception:
+        local_tz = ZoneInfo("America/New_York")
+    local_date = datetime.now(local_tz).strftime("%Y-%m-%d")
+    key = (station, local_date)
     current = _running_values.get(key)
     if current is None or value > current:
         _running_values[key] = value
@@ -239,8 +249,9 @@ def _classify_market(client: kalshi.KalshiClient, market: dict,
     station = (reg_row or {}).get("station_or_ref", "")
     if station and reg_row and reg_row.get("settle_source") in ("NWS", "NWS_STATION", "WEATHER"):
         obs = feeds.observe_nws(station)
+        station_tz = (reg_row or {}).get("tz", "America/New_York")
         if obs:
-            _update_running_value(station, obs.value)
+            _update_running_value(station, obs.value, station_tz)
 
     stale = feeds.staleness(obs, FEED_STALENESS_SEC)
 
@@ -252,11 +263,13 @@ def _classify_market(client: kalshi.KalshiClient, market: dict,
         except Exception as e:
             log.warning(f"[SCANNER] Book fetch failed for {ticker}: {e}")
 
+    station_tz = (reg_row or {}).get("tz", "America/New_York")
+    running_key = _running_value_key(station, station_tz)
     state = {
         "close_ts": close_ts,
         "staleness_sec": stale,
         "max_staleness": FEED_STALENESS_SEC,
-        "running_value": _running_values.get(station, obs.value if obs else 0),
+        "running_value": _running_values.get(running_key, obs.value if obs else 0),
         "min_net_clip_cents": MIN_NET_CLIP_CENTS,
         "batch_sizes": SHADOW_BATCH_SIZES,
         "sim_capital_remaining": SIM_CAPITAL_USD - dstore.sim_capital_used(),
