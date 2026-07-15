@@ -1,4 +1,4 @@
-"""Pack tests: 8-section format ≤30 lines, flood budget overflow."""
+"""Pack tests: 8-section format ≤30 lines, flood budget, daily vs hourly split."""
 
 import os
 import pytest
@@ -26,7 +26,7 @@ def _reset_pack():
     yield
 
 
-def _seed_cycle(started_offset=-60, markets=50, seeds=2, skips=45, errs=1):
+def _seed_cycle(markets=50, seeds=2, skips=45, errs=1):
     cid = dstore.start_cycle(30)
     dstore.finish_cycle(cid, markets, seeds, skips, errs, 5, "test")
     return cid
@@ -61,6 +61,12 @@ class TestBuildPack:
         assert "quiet" in text.lower()
 
     @patch("d_worker.pack.notify")
+    def test_daily_header(self, mock_notify):
+        _seed_cycle()
+        text = pack.build_pack()
+        assert "DAILY" in text
+
+    @patch("d_worker.pack.notify")
     def test_alerts_section_halt(self, mock_notify):
         dstore.set_state("halt_promotion", "1")
         _seed_cycle()
@@ -86,15 +92,44 @@ class TestFloodBudget:
         pack.MSG_BUDGET_PER_HOUR = 20
 
 
-class TestPackTiming:
-    def test_pack_sent_this_hour(self):
-        assert not pack.pack_sent_this_hour()
-        pack.mark_pack_sent()
-        assert pack.pack_sent_this_hour()
+class TestHourlyStorage:
+    @patch("d_worker.pack.notify")
+    def test_store_hourly_writes_to_db(self, mock_notify):
+        _seed_cycle()
+        pack.store_hourly_pack()
+        packs = dstore.latest_packs(1)
+        assert len(packs) == 1
+        assert "🅳" in packs[0]["rendered_text"]
+        assert mock_notify.send.call_count == 0
 
     @patch("d_worker.pack.notify")
-    def test_send_pack_idempotent(self, mock_notify):
+    def test_store_hourly_idempotent(self, mock_notify):
         _seed_cycle()
-        pack.send_pack()
-        pack.send_pack()
+        pack.store_hourly_pack()
+        pack.store_hourly_pack()
+        packs = dstore.latest_packs(10)
+        assert len(packs) == 1
+
+
+class TestDailyPack:
+    @patch("d_worker.pack.notify")
+    def test_daily_sends_when_activity(self, mock_notify):
+        _seed_cycle(seeds=3)
+        dstore.insert_seed(1, "KXTEST-1", "D1_WX", "yes", "{}", 97, True,
+                           96, "{}", time.time() + 3600)
+        pack.send_daily_pack()
+        assert mock_notify.send.call_count == 1
+
+    @patch("d_worker.pack.notify")
+    def test_daily_suppressed_when_fully_quiet(self, mock_notify):
+        pack.send_daily_pack()
+        assert mock_notify.send.call_count == 0
+
+    @patch("d_worker.pack.notify")
+    def test_daily_idempotent(self, mock_notify):
+        _seed_cycle(seeds=1)
+        dstore.insert_seed(1, "KXTEST-1", "D1_WX", "yes", "{}", 97, True,
+                           96, "{}", time.time() + 3600)
+        pack.send_daily_pack()
+        pack.send_daily_pack()
         assert mock_notify.send.call_count == 1

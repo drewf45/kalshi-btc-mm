@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS class_stats_daily (
     fills_taker_viable INTEGER DEFAULT 0,
     PRIMARY KEY (date, dclass)
 );
+CREATE TABLE IF NOT EXISTS packs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hour_key TEXT NOT NULL,
+    ts REAL NOT NULL,
+    rendered_text TEXT NOT NULL,
+    stats_json TEXT
+);
 CREATE TABLE IF NOT EXISTS dstate (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -483,3 +490,23 @@ def et_midnight_ts() -> float:
     now = datetime.now(NY)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.timestamp()
+
+
+# ── Packs ───────────────────────────────────────────────────────
+
+def insert_pack(hour_key: str, rendered_text: str, stats_json: str = "") -> int:
+    with _lock:
+        cur = _conn.execute(
+            "INSERT INTO packs (hour_key, ts, rendered_text, stats_json) VALUES (?, ?, ?, ?)",
+            (hour_key, time.time(), rendered_text, stats_json))
+        _conn.commit()
+        return cur.lastrowid
+
+
+def latest_packs(n: int = 24) -> List[dict]:
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM packs ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+    cols = ["id", "hour_key", "ts", "rendered_text", "stats_json"]
+    return [dict(zip(cols, r)) for r in rows]

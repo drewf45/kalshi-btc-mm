@@ -1,9 +1,9 @@
-"""Registry tests: approve flow, version bump, fee-change alert."""
+"""Registry tests: approve flow, version bump, fee-change alert, env-var approval."""
 
 import os
 import pytest
 import tempfile
-from d_worker import dstore, registry
+from d_worker import dstore, registry, tg
 
 
 @pytest.fixture(autouse=True)
@@ -82,3 +82,70 @@ class TestBlacklist:
         assert registry.is_blacklisted("KXTEST")
         registry.remove_blacklist("KXTEST")
         assert not registry.is_blacklisted("KXTEST")
+
+
+class TestEnvApproval:
+    def test_env_approves_drafted_series(self):
+        dstore.draft_registry("KXHIGHNY", "NWS", "KNYC", "America/New_York",
+                              "F", "0.5")
+        os.environ["DW_APPROVED_SERIES"] = "KXHIGHNY"
+        approved = tg.apply_env_approvals()
+        assert "KXHIGHNY" in approved
+        reg = dstore.get_registry("KXHIGHNY")
+        assert reg["approved_ts"] is not None
+        assert reg["approved_by"] == "env"
+        os.environ.pop("DW_APPROVED_SERIES", None)
+
+    def test_env_skips_already_approved(self):
+        dstore.draft_registry("KXHIGHNY", "NWS", "KNYC", "America/New_York",
+                              "F", "0.5")
+        dstore.approve_registry("KXHIGHNY", "drew")
+        os.environ["DW_APPROVED_SERIES"] = "KXHIGHNY"
+        approved = tg.apply_env_approvals()
+        assert approved == []
+        os.environ.pop("DW_APPROVED_SERIES", None)
+
+    def test_env_skips_undrafted(self):
+        os.environ["DW_APPROVED_SERIES"] = "KXNOPE"
+        approved = tg.apply_env_approvals()
+        assert approved == []
+        os.environ.pop("DW_APPROVED_SERIES", None)
+
+    def test_env_empty_is_noop(self):
+        os.environ["DW_APPROVED_SERIES"] = ""
+        approved = tg.apply_env_approvals()
+        assert approved == []
+        os.environ.pop("DW_APPROVED_SERIES", None)
+
+
+class TestEnvBlacklist:
+    def test_env_blacklist(self):
+        os.environ["DW_BLACKLIST_EXTRA"] = "KXFOO,KXBAR"
+        added = tg.apply_env_blacklist()
+        assert "KXFOO" in added
+        assert "KXBAR" in added
+        assert registry.is_blacklisted("KXFOO")
+        assert registry.is_blacklisted("KXBAR")
+        registry.remove_blacklist("KXFOO")
+        registry.remove_blacklist("KXBAR")
+        os.environ.pop("DW_BLACKLIST_EXTRA", None)
+
+
+class TestEnvClearHalt:
+    def test_clears_active_halt(self):
+        dstore.set_state("halt_promotion", "1")
+        os.environ["DW_CLEAR_HALT"] = "1"
+        assert tg.apply_env_clear_halt()
+        assert dstore.get_state("halt_promotion") == "0"
+        os.environ.pop("DW_CLEAR_HALT", None)
+
+    def test_ignores_no_halt(self):
+        os.environ["DW_CLEAR_HALT"] = "1"
+        assert not tg.apply_env_clear_halt()
+        os.environ.pop("DW_CLEAR_HALT", None)
+
+    def test_noop_without_env(self):
+        dstore.set_state("halt_promotion", "1")
+        os.environ.pop("DW_CLEAR_HALT", None)
+        assert not tg.apply_env_clear_halt()
+        assert dstore.get_state("halt_promotion") == "1"

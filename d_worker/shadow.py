@@ -1,4 +1,8 @@
-"""Shadow seed lifecycle: book snapshot, dual fill model, settle."""
+"""Shadow seed lifecycle: book snapshot, dual fill model, settle.
+
+Telegram messages: SEED placed (🌱) and SETTLED (✅/🚨) only.
+Invariant break sets halt_promotion; cleared via DW_CLEAR_HALT=1 at next boot.
+"""
 
 import json
 import math
@@ -159,10 +163,9 @@ def settle_seeds(client: kalshi.KalshiClient) -> int:
         if not correct:
             dstore.set_state("halt_promotion", "1")
             notify.alert(
-                f"🅳 INVARIANT BREAK: {ticker} classified {side} "
+                f"🅳 🚨 INVARIANT BREAK: {ticker} classified {side} "
                 f"but settled {result}. halt_promotion set. "
-                f"Action: review evidence, then /dclear to resume. "
-                f"Evidence: {json.dumps(seed.get('book_json', '{}')[:200])}")
+                f"Action: review evidence, set DW_CLEAR_HALT=1 and restart to resume.")
             log.error(f"[SHADOW] INVARIANT BREAK: {ticker} {side} → {result}")
 
     return settled

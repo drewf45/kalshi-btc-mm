@@ -1,6 +1,9 @@
 """Settlement-source registry + fee-multiplier registry.
 
-Settlement registry: human-approved mapping from series → truth source.
+Settlement registry: mapping from series → truth source + variable_kind.
+Approval flow: series auto-drafted on first scan; approved via DW_APPROVED_SERIES
+env var at boot (no Telegram commands). variable_kind defaults to running_max.
+
 Fee registry: cached fee multipliers from the API, with change alerting.
 """
 

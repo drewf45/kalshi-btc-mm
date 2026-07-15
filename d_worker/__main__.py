@@ -1,9 +1,11 @@
 """KAL-D main entry point.
 
-Boot: envcheck (FATAL loud) → instance lock kal_d.lock → dstore init →
-fee registry pull → Telegram BOOT message → threads:
-scanner loop, settlement poller, pack scheduler, tg poller →
+Boot: envcheck → instance lock → dstore init → env-var approvals/blacklist/halt →
+Telegram BOOT message → threads: scanner loop, settlement poller, pack scheduler →
 supervise (any thread death = alert + restart, 3 strikes = FATAL).
+
+Message policy: Telegram receives ONLY boot, seed, settle, failure, and one daily
+pack (09:00 ET). Hourly packs are stored in kal_d.db for database review.
 """
 
 import os
@@ -32,6 +34,7 @@ NY = ZoneInfo("America/New_York")
 REQUIRED_ENV = [
     "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PEM_BASE64", "KALSHI_ENV",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+    "DW_NWS_CONTACT",
 ]
 
 LOCK_FILE = os.environ.get("DW_LOCK_FILE", "/var/data/kal_d.lock")
@@ -80,7 +83,6 @@ def _acquire_lock() -> None:
         except (IOError, OSError):
             if not alerted:
                 log.warning("[MAIN] Waiting for previous d_worker instance...")
-                notify.send("🅳 ⏳ Waiting for previous d_worker to exit")
                 alerted = True
             if time.time() >= deadline:
                 notify.alert("🅳 OVERLAP: another d_worker holds the lock")
@@ -167,19 +169,17 @@ def _settlement_loop(client: kalshi.KalshiClient) -> None:
 
 
 def _pack_loop() -> None:
-    """Hourly pack scheduler."""
+    """Hourly pack to DB, daily pack to Telegram at 09:00 ET."""
     while _running:
         try:
-            if pack.is_pack_time() and not pack.pack_sent_this_hour():
-                pack.send_pack()
+            now = datetime.now(NY)
+            if now.minute == 0 and not pack.hourly_pack_stored_this_hour():
+                pack.store_hourly_pack()
+            if pack.is_daily_pack_time() and not pack.daily_pack_sent_today():
+                pack.send_daily_pack()
         except Exception as e:
             log.error(f"[PACK] Error: {e}", exc_info=True)
         time.sleep(30)
-
-
-def _tg_loop() -> None:
-    """Telegram inbound command poller."""
-    tg.poll_loop()
 
 
 def main():
@@ -205,8 +205,11 @@ def main():
     # 4. Instance lock
     _acquire_lock()
 
-    # 5. Registry init
+    # 5. Registry init + env-var approvals
     registry.load_blacklist()
+    newly_approved = tg.apply_env_approvals()
+    newly_blacklisted = tg.apply_env_blacklist()
+    halt_cleared = tg.apply_env_clear_halt()
 
     # 6. Kalshi client
     client = kalshi.build_client()
@@ -214,28 +217,38 @@ def main():
     if cash is None:
         raise RuntimeError("FATAL: cannot read Kalshi balance")
 
-    # 7. Boot message
-    bl_count = len(registry.CRYPTO_BLACKLIST) + len(registry._user_blacklist)
+    # 7. Boot message — config echo
     all_reg = dstore.list_registry()
-    approved = sum(1 for r in all_reg if r.get("approved_ts"))
-    notify.send(
-        f"🅳 BOOT — KAL-D scanner started\n"
-        f"  scan: {scanner.SCAN_REQ_PER_MIN} req/min, "
-        f"{scanner.SCAN_CYCLE_TARGET_SEC}s target\n"
-        f"  sim: ${scanner.SIM_CAPITAL_USD:.2f} cap, "
-        f"batch sizes {scanner.SHADOW_BATCH_SIZES}\n"
-        f"  blacklist: {bl_count} series | "
-        f"registry: {approved} approved / {len(all_reg) - approved} drafted\n"
-        f"  min net clip: {scanner.MIN_NET_CLIP_CENTS}¢/ct")
+    approved_list = [r for r in all_reg if r.get("approved_ts")]
+    drafted_list = [r for r in all_reg if not r.get("approved_ts")]
+    bl_count = len(registry.CRYPTO_BLACKLIST) + len(registry._user_blacklist)
+    halt_state = dstore.get_state("halt_promotion")
 
-    # 8. Launch threads
+    approved_names = ", ".join(r["series_ticker"] for r in approved_list) or "none"
+    boot_lines = [
+        f"🅳 BOOT — KAL-D scanner started",
+        f"  scan: {scanner.SCAN_REQ_PER_MIN} req/min, "
+        f"{scanner.SCAN_CYCLE_TARGET_SEC}s target",
+        f"  sim: ${scanner.SIM_CAPITAL_USD:.2f} cap, "
+        f"batch sizes {scanner.SHADOW_BATCH_SIZES}",
+        f"  approved ({len(approved_list)}): {approved_names}",
+        f"  blacklist: {bl_count} series | "
+        f"drafted: {len(drafted_list)}",
+        f"  halt: {'ACTIVE' if halt_state == '1' else 'clear'} | "
+        f"min net clip: {scanner.MIN_NET_CLIP_CENTS}¢/ct",
+    ]
+    if newly_approved:
+        boot_lines.append(f"  env-approved this boot: {', '.join(newly_approved)}")
+    if halt_cleared:
+        boot_lines.append(f"  halt_promotion cleared via DW_CLEAR_HALT")
+    notify.send("\n".join(boot_lines))
+
+    # 8. Launch threads (no tg poller — env-var driven)
     threads = [
         SupervisedThread("dw-scanner", _scanner_loop, (client,)),
         SupervisedThread("dw-settle", _settlement_loop, (client,)),
         SupervisedThread("dw-pack", _pack_loop),
-        SupervisedThread("dw-tg", _tg_loop),
     ]
-    tg.init()
     for t in threads:
         t.start()
     log.info("[MAIN] All threads launched")
@@ -252,7 +265,7 @@ def main():
                 break
 
     log.warning("[MAIN] Shutting down...")
-    notify.send("🅳 <b>KAL-D STOPPED</b>")
+    notify.send("🅳 KAL-D STOPPED")
     log.warning("[MAIN] Done.")
 
 
