@@ -27,9 +27,22 @@ MIN_NET_CLIP_CENTS = float(os.environ.get("DW_MIN_NET_CLIP_CENTS", "1.0"))
 SHADOW_BATCH_SIZES = [int(x) for x in
                       os.environ.get("DW_SHADOW_BATCH_SIZES", "1,5,10").split(",")]
 DISCOVERY_EVERY_N = int(os.environ.get("DW_DISCOVERY_EVERY_N", "6"))
+DISCOVERY_PAGES_PER_SWEEP = int(os.environ.get("DW_DISCOVERY_PAGES", "100"))
 
 _sweep_counter = 0
 _dead_series: dict = {}
+
+_SLIM_FIELDS = (
+    "ticker", "event_ticker", "series_ticker", "title", "subtitle", "category",
+    "rules_url", "close_time", "expected_expiration_time", "expiration_time",
+    "status", "floor_strike", "cap_strike", "strike_type",
+    "maker_fee_rate", "taker_fee_rate", "fee_rate_maker", "fee_rate_taker",
+    "fee_schedule", "position_limit", "tick_size",
+)
+
+
+def _slim(m: dict) -> dict:
+    return {k: m[k] for k in _SLIM_FIELDS if k in m}
 
 
 class TokenBucket:
@@ -111,13 +124,14 @@ def _update_running_value(station: str, value: float,
     return _running_values[key]
 
 
-def _fetch_all_markets(client: kalshi.KalshiClient,
-                       governor: TokenBucket) -> List[dict]:
-    """Paginate GET /markets to get all open/active markets."""
-    all_markets = []
-    cursor = None
-    page = 0
-    while True:
+def _stream_discovery(client, governor, cycle_id, approved_series,
+                      counters, verdict_rows, skip_agg, seen_tickers) -> int:
+    """Crawl up to DISCOVERY_PAGES_PER_SWEEP pages from the persisted cursor,
+    classifying page-by-page. Returns markets processed. Memory: O(one page)."""
+    cursor = dstore.get_state("discovery_cursor") or None
+    pages = 0
+    processed = 0
+    while pages < DISCOVERY_PAGES_PER_SWEEP:
         governor.consume(1)
         params = {"limit": 200, "status": "open"}
         if cursor:
@@ -128,18 +142,23 @@ def _fetch_all_markets(client: kalshi.KalshiClient,
             if "429" in str(e):
                 governor.halve()
                 from k_worker import notify
-                notify.send("🅳 ⚠ SCANNER: 429 rate limit — budget halved")
+                notify.send("🅳 ⚠ SCANNER: 429 on discovery — budget halved")
                 break
             raise
         if not isinstance(resp, dict):
             break
-        markets = resp.get("markets", [])
-        all_markets.extend(markets)
+        page_markets = [_slim(m) for m in resp.get("markets", [])
+                        if m.get("ticker") not in seen_tickers]
+        _process_batch(client, governor, page_markets, cycle_id,
+                       approved_series, counters, verdict_rows, skip_agg)
+        processed += len(page_markets)
+        pages += 1
         cursor = resp.get("cursor")
-        page += 1
-        if not cursor or not markets:
+        if not cursor or not resp.get("markets"):
+            cursor = None
             break
-    return all_markets
+    dstore.set_state("discovery_cursor", cursor or "")
+    return processed
 
 
 def _target_series_list() -> list:
@@ -182,6 +201,46 @@ def _fetch_targeted(client: kalshi.KalshiClient,
     return out
 
 
+def _process_batch(client, governor, markets, cycle_id, approved_series,
+                   counters, verdict_rows, skip_agg):
+    """Classify a batch of markets, mutating counters/rows/agg in place."""
+    for market in markets:
+        ticker = market.get("ticker", "")
+        series = series_of(market)
+        close_ts = _resolve_close_ts(market) or 0
+
+        if registry.is_blacklisted(series):
+            key = (series, "SKIP_SERIES_BLACKLIST")
+            skip_agg[key] = skip_agg.get(key, 0) + 1
+            counters["skips"] += 1
+            continue
+        try:
+            result = _classify_market(client, market, governor, close_ts)
+            if result.verdict in ("SEED", "ERR") or series in approved_series:
+                verdict_rows.append((
+                    cycle_id, time.time(), ticker, series, close_ts,
+                    result.dclass, result.verdict, result.side,
+                    _json_or_none(result.evidence),
+                    result.fee_maker, result.fee_taker))
+            elif result.verdict.startswith("SKIP"):
+                key = (series, result.verdict)
+                skip_agg[key] = skip_agg.get(key, 0) + 1
+            if result.verdict == "SEED":
+                counters["seeds"] += 1
+                _handle_seed(client, result, market, governor)
+            elif result.verdict.startswith("SKIP"):
+                counters["skips"] += 1
+            elif result.verdict == "ERR":
+                counters["errs"] += 1
+        except Exception as e:
+            log.warning(f"[SCANNER] Error classifying {ticker}: {e}")
+            verdict_rows.append((
+                cycle_id, time.time(), ticker, series, close_ts,
+                "NONE", "ERR", None,
+                _json_or_none({"error": str(e)}), None, None))
+            counters["errs"] += 1
+
+
 def _resolve_close_ts(market: dict) -> Optional[float]:
     """Extract close timestamp from a market object."""
     for field in ("close_time", "expected_expiration_time", "expiration_time"):
@@ -213,67 +272,40 @@ def sweep(client: kalshi.KalshiClient) -> int:
 
     global _sweep_counter
     _sweep_counter += 1
-    discovery_ran = (_sweep_counter % DISCOVERY_EVERY_N == 1)
-
-    try:
-        markets = _fetch_targeted(client, governor)
-        targeted_n = len(markets)
-        discovery_n = 0
-        if discovery_ran:
-            disc = _fetch_all_markets(client, governor)
-            seen = {m.get("ticker") for m in markets}
-            disc = [m for m in disc if m.get("ticker") not in seen]
-            discovery_n = len(disc)
-            markets.extend(disc)
-    except Exception as e:
-        log.error(f"[SCANNER] Market fetch failed: {e}")
-        dstore.finish_cycle(cycle_id, 0, 0, 0, 1, 0, f"fetch_failed: {e}")
-        return cycle_id
-
-    markets.sort(key=lambda m: _resolve_close_ts(m) or float("inf"))
 
     verdict_rows = []
     skip_agg: Dict[tuple, int] = {}
-    approved_series = {r["series_ticker"] for r in dstore.list_registry(approved_only=True)}
+    counters = {"seeds": 0, "skips": 0, "errs": 0}
+    approved_series = {r["series_ticker"]
+                       for r in dstore.list_registry(approved_only=True)}
 
-    for market in markets:
-        ticker = market.get("ticker", "")
-        series = series_of(market)
-        close_ts = _resolve_close_ts(market) or 0
+    # PHASE T — targeted weather, fetched AND classified first
+    try:
+        targeted = [_slim(m) for m in _fetch_targeted(client, governor)]
+    except Exception as e:
+        log.error(f"[SCANNER] Targeted fetch failed: {e}")
+        dstore.finish_cycle(cycle_id, 0, 0, 0, 1, 0, f"fetch_failed: {e}")
+        return cycle_id
+    targeted.sort(key=lambda m: _resolve_close_ts(m) or float("inf"))
+    targeted_n = len(targeted)
+    seen_tickers = {m.get("ticker") for m in targeted}
+    _process_batch(client, governor, targeted, cycle_id, approved_series,
+                   counters, verdict_rows, skip_agg)
 
-        if registry.is_blacklisted(series):
-            agg_key = (series, "SKIP_SERIES_BLACKLIST")
-            skip_agg[agg_key] = skip_agg.get(agg_key, 0) + 1
-            skips_count += 1
-            continue
+    # PHASE D — streaming, resumable, bounded (every sweep)
+    discovery_n = 0
+    try:
+        discovery_n = _stream_discovery(client, governor, cycle_id,
+                                        approved_series, counters,
+                                        verdict_rows, skip_agg, seen_tickers)
+    except Exception as e:
+        log.error(f"[SCANNER] Discovery failed: {e}")
+        counters["errs"] += 1
 
-        try:
-            result = _classify_market(client, market, governor, close_ts)
-
-            if result.verdict == "SEED" or result.verdict == "ERR" or series in approved_series:
-                verdict_rows.append((
-                    cycle_id, time.time(), ticker, series, close_ts,
-                    result.dclass, result.verdict, result.side,
-                    _json_or_none(result.evidence),
-                    result.fee_maker, result.fee_taker))
-            elif result.verdict.startswith("SKIP"):
-                agg_key = (series, result.verdict)
-                skip_agg[agg_key] = skip_agg.get(agg_key, 0) + 1
-
-            if result.verdict == "SEED":
-                seeds_count += 1
-                _handle_seed(client, result, market, governor)
-            elif result.verdict.startswith("SKIP"):
-                skips_count += 1
-            elif result.verdict == "ERR":
-                errs_count += 1
-        except Exception as e:
-            log.warning(f"[SCANNER] Error classifying {ticker}: {e}")
-            verdict_rows.append((
-                cycle_id, time.time(), ticker, series, close_ts,
-                "NONE", "ERR", None,
-                _json_or_none({"error": str(e)}), None, None))
-            errs_count += 1
+    seeds_count = counters["seeds"]
+    skips_count = counters["skips"]
+    errs_count = counters["errs"]
+    markets_seen = targeted_n + discovery_n
 
     dstore.insert_verdicts_batch(verdict_rows)
     if skip_agg:
@@ -281,16 +313,18 @@ def sweep(client: kalshi.KalshiClient) -> int:
 
     elapsed = time.time() - started
     req_used = governor.total_consumed - req_start
-    notes = f"T:{targeted_n} D:{discovery_n} elapsed={elapsed:.0f}s"
+    cursor_state = "resume" if (dstore.get_state("discovery_cursor") or "") else "done"
+    notes = (f"T:{targeted_n} D:{discovery_n} cursor={cursor_state} "
+             f"elapsed={elapsed:.0f}s")
     if elapsed > SCAN_CYCLE_TARGET_SEC * 2:
         notes += " SLOW"
         log.warning(f"[SCANNER] Sweep took {elapsed:.0f}s (target {SCAN_CYCLE_TARGET_SEC}s)")
         notify.send(f"🅳 ⚠ SCANNER: sweep took {elapsed:.0f}s "
                      f"(target {SCAN_CYCLE_TARGET_SEC}s)")
 
-    dstore.finish_cycle(cycle_id, len(markets), seeds_count, skips_count,
+    dstore.finish_cycle(cycle_id, markets_seen, seeds_count, skips_count,
                         errs_count, req_used, notes)
-    log.info(f"[SCANNER] Sweep done: {len(markets)} mkts, "
+    log.info(f"[SCANNER] Sweep done: {markets_seen} mkts, "
              f"{seeds_count} seeds, {skips_count} skips, {errs_count} errs, "
              f"{req_used} reqs in {elapsed:.0f}s")
     return cycle_id

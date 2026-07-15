@@ -161,8 +161,11 @@ def build_pack() -> str:
             sweep_sec = last_cycle["finished_ts"] - last_cycle["started_ts"]
         last_reqs = last_cycle.get("req_count", 0) or 0
     rpm = last_reqs / (sweep_sec / 60) if sweep_sec > 0 else 0
+    import resource
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     lines.append(f"7. HEALTH: api {last_reqs} reqs/{sweep_sec:.0f}s sweep "
-                 f"(burst ok; cap {gov.rate}/min avg) | {feed_status}")
+                 f"(burst ok; cap {gov.rate}/min avg) | {feed_status} "
+                 f"| mem {rss_mb:.0f}MB")
 
     # §8 ALERTS
     _reset_hour()

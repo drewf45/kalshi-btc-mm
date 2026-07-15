@@ -1,4 +1,4 @@
-"""Scanner tests: pagination, per-market error isolation, 429 handling."""
+"""Scanner tests: streaming discovery, per-market error isolation, 429 handling."""
 
 import os
 import pytest
@@ -66,9 +66,14 @@ class TestTokenBucket:
         assert tb.rate == 5
 
 
-class TestPagination:
-    @patch("d_worker.scanner.kalshi")
-    def test_three_page_fetch(self, mock_kalshi):
+class TestStreamDiscovery:
+    @patch("d_worker.scanner._classify_market")
+    def test_three_page_crawl(self, mock_classify):
+        from d_worker.classify import VerdictRow
+        mock_classify.return_value = VerdictRow(
+            market_ticker="", series_ticker="KXTEST", close_ts=0,
+            dclass="NONE", verdict="SKIP_NO_REGISTRY", side=None,
+            evidence=None, fee_maker=None, fee_taker=None)
         pages = [
             {"markets": [_make_market(f"T{i}") for i in range(200)],
              "cursor": "page2"},
@@ -79,41 +84,91 @@ class TestPagination:
         ]
         client = MagicMock()
         client.request = MagicMock(side_effect=pages)
-        gov = scanner.TokenBucket(100)
-        result = scanner._fetch_all_markets(client, gov)
-        assert len(result) == 450
+        gov = scanner.TokenBucket(1000)
+        cycle_id = dstore.start_cycle(30)
+        counters = {"seeds": 0, "skips": 0, "errs": 0}
+        n = scanner._stream_discovery(client, gov, cycle_id, set(),
+                                       counters, [], {}, set())
+        assert n == 450
         assert client.request.call_count == 3
 
-    @patch("d_worker.scanner.kalshi")
-    def test_429_halves_and_stops(self, mock_kalshi):
+    def test_429_halves_and_stops(self):
         client = MagicMock()
         client.request = MagicMock(
             side_effect=RuntimeError("HTTP 429 Too Many Requests"))
         gov = scanner.TokenBucket(60)
+        cycle_id = dstore.start_cycle(30)
+        counters = {"seeds": 0, "skips": 0, "errs": 0}
         with patch("k_worker.notify"):
-            result = scanner._fetch_all_markets(client, gov)
-        assert result == []
+            n = scanner._stream_discovery(client, gov, cycle_id, set(),
+                                           counters, [], {}, set())
+        assert n == 0
         assert gov.rate == 30
 
-    @patch("d_worker.scanner.kalshi")
-    def test_empty_first_page(self, mock_kalshi):
+    @patch("d_worker.scanner._classify_market")
+    def test_empty_first_page(self, mock_classify):
         client = MagicMock()
         client.request = MagicMock(return_value={"markets": [], "cursor": ""})
         gov = scanner.TokenBucket(100)
-        result = scanner._fetch_all_markets(client, gov)
-        assert result == []
+        cycle_id = dstore.start_cycle(30)
+        counters = {"seeds": 0, "skips": 0, "errs": 0}
+        n = scanner._stream_discovery(client, gov, cycle_id, set(),
+                                       counters, [], {}, set())
+        assert n == 0
+
+    @patch("d_worker.scanner._classify_market")
+    def test_cursor_persists_and_resumes(self, mock_classify):
+        from d_worker.classify import VerdictRow
+        mock_classify.return_value = VerdictRow(
+            market_ticker="", series_ticker="KXTEST", close_ts=0,
+            dclass="NONE", verdict="SKIP_NO_REGISTRY", side=None,
+            evidence=None, fee_maker=None, fee_taker=None)
+        client = MagicMock()
+        client.request = MagicMock(return_value={
+            "markets": [_make_market("T1")], "cursor": "next_page"})
+        gov = scanner.TokenBucket(100)
+        cycle_id = dstore.start_cycle(30)
+        counters = {"seeds": 0, "skips": 0, "errs": 0}
+
+        old_pages = scanner.DISCOVERY_PAGES_PER_SWEEP
+        scanner.DISCOVERY_PAGES_PER_SWEEP = 1
+        try:
+            scanner._stream_discovery(client, gov, cycle_id, set(),
+                                       counters, [], {}, set())
+        finally:
+            scanner.DISCOVERY_PAGES_PER_SWEEP = old_pages
+
+        assert dstore.get_state("discovery_cursor") == "next_page"
+
+    @patch("d_worker.scanner._classify_market")
+    def test_cursor_clears_at_end(self, mock_classify):
+        from d_worker.classify import VerdictRow
+        mock_classify.return_value = VerdictRow(
+            market_ticker="", series_ticker="KXTEST", close_ts=0,
+            dclass="NONE", verdict="SKIP_NO_REGISTRY", side=None,
+            evidence=None, fee_maker=None, fee_taker=None)
+        client = MagicMock()
+        client.request = MagicMock(return_value={
+            "markets": [_make_market("T1")], "cursor": ""})
+        gov = scanner.TokenBucket(100)
+        cycle_id = dstore.start_cycle(30)
+        counters = {"seeds": 0, "skips": 0, "errs": 0}
+        dstore.set_state("discovery_cursor", "old_cursor")
+        scanner._stream_discovery(client, gov, cycle_id, set(),
+                                   counters, [], {}, set())
+        assert dstore.get_state("discovery_cursor") == ""
 
 
 class TestPerMarketIsolation:
     @patch("k_worker.notify")
     @patch("d_worker.scanner._classify_market")
-    @patch("d_worker.scanner._fetch_targeted", return_value=[])
-    @patch("d_worker.scanner._fetch_all_markets")
-    def test_one_error_does_not_crash_sweep(self, mock_fetch, mock_targeted,
+    @patch("d_worker.scanner._stream_discovery", return_value=0)
+    @patch("d_worker.scanner._fetch_targeted")
+    def test_one_error_does_not_crash_sweep(self, mock_targeted, mock_disc,
                                              mock_classify, mock_notify):
         markets = [_make_market("OK-1"), _make_market("BAD-1"),
                     _make_market("OK-2")]
-        mock_fetch.return_value = markets
+        mock_targeted.return_value = markets
 
         from d_worker.classify import VerdictRow
         good_verdict = VerdictRow(
@@ -170,13 +225,13 @@ class TestObsCache:
 
     @patch("k_worker.notify")
     @patch("d_worker.scanner._classify_market")
-    @patch("d_worker.scanner._fetch_targeted", return_value=[])
-    @patch("d_worker.scanner._fetch_all_markets")
-    def test_skip_aggregation(self, mock_fetch, mock_targeted,
+    @patch("d_worker.scanner._stream_discovery", return_value=0)
+    @patch("d_worker.scanner._fetch_targeted")
+    def test_skip_aggregation(self, mock_targeted, mock_disc,
                                mock_classify, mock_notify):
         """Non-approved SKIPs aggregate; ERR rows stay individual."""
         markets = [_make_market(f"T{i}", series="KXUNAPPROVED") for i in range(5)]
-        mock_fetch.return_value = markets
+        mock_targeted.return_value = markets
 
         from d_worker.classify import VerdictRow
         skip_verdict = VerdictRow(
@@ -226,16 +281,17 @@ class TestTargetedSweep:
         scanner._dead_series["KXHIGHXX"] = time.time()
         assert "KXHIGHXX" not in scanner._target_series_list()
 
-    @patch("d_worker.scanner.kalshi")
-    def test_fetch_all_markets_no_cap(self, mock_kalshi):
-        pages = []
-        for p in range(60):
-            pages.append({
-                "markets": [_make_market(f"T{p*200+i}") for i in range(200)],
-                "cursor": f"page{p+2}" if p < 59 else "",
-            })
-        client = MagicMock()
-        client.request = MagicMock(side_effect=pages)
-        gov = scanner.TokenBucket(6000)
-        ms = scanner._fetch_all_markets(client, gov)
-        assert len(ms) == 12000
+
+class TestSlim:
+    def test_slim_keeps_classification_fields(self):
+        m = {"ticker": "T-1", "event_ticker": "T", "floor_strike": 84.5,
+             "close_time": "2026-07-15T21:00:00Z", "junk": "x" * 10000}
+        s = scanner._slim(m)
+        assert "junk" not in s
+        assert s["floor_strike"] == 84.5
+        assert s["ticker"] == "T-1"
+
+    def test_slim_handles_missing_fields(self):
+        m = {"ticker": "T-1"}
+        s = scanner._slim(m)
+        assert s == {"ticker": "T-1"}
