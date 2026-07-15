@@ -14,7 +14,7 @@ from typing import Optional, Dict, List
 
 from k_worker import kalshi, notify
 
-from . import dstore, feeds, registry
+from . import dstore, feeds, registry, gateway, budget
 
 log = logging.getLogger("d_worker.watchdog")
 
@@ -62,6 +62,13 @@ def watch_cycle(client: kalshi.KalshiClient, governor=None) -> dict:
                 f"🅳 🚨 EVIDENCE BROKEN — {ticker} {side} | "
                 f"abandon bid {bid_price}¢ | re-pull shows break")
             log.error(f"[WATCHDOG] EVIDENCE BROKEN: {ticker} {side}")
+
+            if seed.get("is_live"):
+                res_key = dstore.get_state(f"seed_reservation_{seed['id']}")
+                res_id = int(res_key) if res_key else 0
+                if res_id:
+                    gateway.abandon_ship(client, ticker, side, res_id, governor)
+                budget.deny_all(f"EVIDENCE_BROKEN on live seed {ticker}")
 
     return stats
 

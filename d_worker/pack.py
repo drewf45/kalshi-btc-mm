@@ -109,18 +109,25 @@ def build_pack() -> str:
         watch_str = f" | watch ✓ {watch['held']}/{watch['total']}"
         if watch["broken"] > 0:
             watch_str = f" | watch ⚠ {watch['broken']} BROKEN"
+    live_str = ""
+    if seed_stats.get("live_open", 0) > 0:
+        live_str = f" | LIVE {seed_stats['live_open']}"
     lines.append(f"2. SEEDS: {seed_stats['new']} new | {seed_stats['open']} open | "
                  f"at-risk ${ledger['at_risk_usd']:.2f}/${book_cap:.2f} | "
-                 f"denied {denials}{watch_str}")
+                 f"denied {denials}{watch_str}{live_str}")
 
     # §3 SETTLED
     lt_settled = seed_stats["lifetime_settled"]
     lt_correct = seed_stats["lifetime_correct"]
     lt_pct = lt_correct / lt_settled * 100 if lt_settled > 0 else 0
     inv_label = "INVARIANT" if lt_pct == 100 or lt_settled == 0 else "⚠ BROKEN"
+    live_settled_str = ""
+    if seed_stats.get("live_settled", 0) > 0:
+        pnl = seed_stats.get("live_pnl_cents", 0)
+        live_settled_str = f" | LIVE {seed_stats['live_settled']} settled P&L {pnl:+.1f}¢"
     lines.append(f"3. SETTLED: {seed_stats['today_settled']} today | "
                  f"classifier {lt_correct}/{lt_settled} ✓ "
-                 f"(lifetime {lt_pct:.1f}% — {inv_label})")
+                 f"(lifetime {lt_pct:.1f}% — {inv_label}){live_settled_str}")
 
     # §4 CLASSES
     daily_stats = dstore.get_daily_stats()

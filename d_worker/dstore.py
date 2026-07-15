@@ -30,6 +30,17 @@ def init_db() -> None:
                       "variable_kind TEXT DEFAULT 'running_max'")
     except sqlite3.OperationalError:
         pass
+    for col, typ in [
+        ("is_live", "INTEGER DEFAULT 0"),
+        ("live_order_id", "TEXT"),
+        ("live_fill_price", "INTEGER"),
+        ("live_entry_fee", "INTEGER"),
+        ("live_pnl_cents", "REAL"),
+    ]:
+        try:
+            _conn.execute(f"ALTER TABLE shadow_seeds ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     _conn.commit()
     log.info(f"[DSTORE] Initialized {DB_PATH}")
 
@@ -104,7 +115,12 @@ CREATE TABLE IF NOT EXISTS shadow_seeds (
     maker_filled_est INTEGER,
     net_clip_taker_cents REAL,
     net_clip_maker_cents REAL,
-    lockup_capital_days REAL
+    lockup_capital_days REAL,
+    is_live INTEGER DEFAULT 0,
+    live_order_id TEXT,
+    live_fill_price INTEGER,
+    live_entry_fee INTEGER,
+    live_pnl_cents REAL
 );
 CREATE TABLE IF NOT EXISTS class_stats_daily (
     date TEXT,
@@ -416,8 +432,28 @@ def get_unsettled_seeds() -> List[dict]:
             "book_json", "taker_price_cents", "taker_viable", "maker_price_cents",
             "sizes_json", "close_ts", "settled_ts", "result",
             "classifier_correct", "maker_filled_est",
-            "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days"]
+            "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days",
+            "is_live", "live_order_id", "live_fill_price", "live_entry_fee",
+            "live_pnl_cents"]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def mark_seed_live(seed_id: int, order_id: str,
+                   fill_price: int, fee_paid: int) -> None:
+    with _lock:
+        _conn.execute(
+            """UPDATE shadow_seeds SET is_live=1, live_order_id=?,
+               live_fill_price=?, live_entry_fee=? WHERE id=?""",
+            (order_id, fill_price, fee_paid, seed_id))
+        _conn.commit()
+
+
+def set_seed_live_pnl(seed_id: int, pnl_cents: float) -> None:
+    with _lock:
+        _conn.execute(
+            "UPDATE shadow_seeds SET live_pnl_cents=? WHERE id=?",
+            (pnl_cents, seed_id))
+        _conn.commit()
 
 
 def settle_seed(seed_id: int, result: str, classifier_correct: bool,
@@ -460,6 +496,13 @@ def seed_stats_since(ts: float) -> dict:
         today_settled = _conn.execute(
             "SELECT COUNT(*), SUM(CASE WHEN classifier_correct=1 THEN 1 ELSE 0 END) "
             "FROM shadow_seeds WHERE settled_ts >= ?", (ts,)).fetchone()
+        live_open = _conn.execute(
+            "SELECT COUNT(*) FROM shadow_seeds WHERE is_live=1 AND settled_ts IS NULL"
+        ).fetchone()
+        live_settled = _conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(live_pnl_cents), 0) "
+            "FROM shadow_seeds WHERE is_live=1 AND settled_ts IS NOT NULL"
+        ).fetchone()
     return {
         "new": new[0],
         "open": open_seeds[0],
@@ -467,6 +510,9 @@ def seed_stats_since(ts: float) -> dict:
         "lifetime_correct": settled[1] or 0,
         "today_settled": today_settled[0] or 0,
         "today_correct": today_settled[1] or 0,
+        "live_open": live_open[0] or 0,
+        "live_settled": live_settled[0] or 0,
+        "live_pnl_cents": live_settled[1] or 0.0,
     }
 
 
@@ -506,7 +552,9 @@ def invariant_break_seeds() -> List[dict]:
             "book_json", "taker_price_cents", "taker_viable", "maker_price_cents",
             "sizes_json", "close_ts", "settled_ts", "result",
             "classifier_correct", "maker_filled_est",
-            "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days"]
+            "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days",
+            "is_live", "live_order_id", "live_fill_price", "live_entry_fee",
+            "live_pnl_cents"]
     return [dict(zip(cols, r)) for r in rows]
 
 

@@ -282,6 +282,104 @@ class TestTargetedSweep:
         assert "KXHIGHXX" not in scanner._target_series_list()
 
 
+class TestHandleSeedLive:
+    @patch("d_worker.scanner.shadow")
+    @patch("d_worker.scanner.budget")
+    @patch("d_worker.scanner.gateway")
+    @patch("d_worker.scanner.kalshi")
+    def test_99_cent_never_goes_live(self, mock_kalshi, mock_gateway,
+                                      mock_budget, mock_shadow):
+        """99¢ 1-lot fails fee inequality — gateway.submit not called."""
+        from d_worker.classify import VerdictRow
+        from d_worker.budget import ReserveResult
+
+        mock_gateway.is_live_enabled.return_value = True
+        mock_budget.reserve.return_value = ReserveResult(True, "granted", 42)
+        mock_shadow.record_seed.return_value = 1
+        mock_kalshi.fetch_orderbook.return_value = None
+
+        verdict = VerdictRow(
+            market_ticker="KXTEST-B99", series_ticker="KXTEST",
+            close_ts=time.time()+3600,
+            dclass="D1_WX", verdict="SEED", side="yes",
+            evidence={"taker_price": 99}, fee_maker=1.0, fee_taker=1.0)
+
+        client = MagicMock()
+        governor = MagicMock()
+        scanner._handle_seed(client, verdict, {"ticker": "KXTEST-B99"}, governor)
+
+        mock_gateway.submit.assert_not_called()
+
+    @patch("d_worker.scanner.shadow")
+    @patch("d_worker.scanner.budget")
+    @patch("d_worker.scanner.gateway")
+    @patch("d_worker.scanner.kalshi")
+    def test_97_cent_goes_live_at_rung_2(self, mock_kalshi, mock_gateway,
+                                          mock_budget, mock_shadow):
+        """97¢ passes fee inequality → gateway.submit → seed marked live."""
+        from d_worker.classify import VerdictRow
+        from d_worker.budget import ReserveResult
+        from d_worker.gateway import OrderResult
+
+        vid = dstore.insert_verdict(0, "KXTEST-B97", "KXTEST", time.time()+3600,
+                                     "D1_WX", "SEED", "yes", {}, 1.0, 1.0)
+        seed_id = dstore.insert_seed(vid, "KXTEST-B97", "D1_WX", "yes", "{}",
+                                      97, True, 96, "{}", time.time()+3600)
+
+        mock_gateway.is_live_enabled.return_value = True
+        mock_budget.reserve.return_value = ReserveResult(True, "granted", 42)
+        mock_shadow.record_seed.return_value = seed_id
+        mock_kalshi.fetch_orderbook.return_value = None
+        mock_gateway.submit.return_value = OrderResult("PLACED", order_id="ord-123")
+
+        verdict = VerdictRow(
+            market_ticker="KXTEST-B97", series_ticker="KXTEST",
+            close_ts=time.time()+3600,
+            dclass="D1_WX", verdict="SEED", side="yes",
+            evidence={"taker_price": 97}, fee_maker=1.0, fee_taker=1.0)
+
+        client = MagicMock()
+        governor = MagicMock()
+        scanner._handle_seed(client, verdict, {"ticker": "KXTEST-B97"}, governor)
+
+        mock_gateway.submit.assert_called_once()
+        with dstore._lock:
+            row = dstore._conn.execute(
+                "SELECT is_live, live_order_id, live_fill_price, live_entry_fee "
+                "FROM shadow_seeds WHERE id=?", (seed_id,)).fetchone()
+        assert row[0] == 1
+        assert row[1] == "ord-123"
+        assert row[2] == 97
+        assert row[3] == 1
+
+    @patch("d_worker.scanner.shadow")
+    @patch("d_worker.scanner.budget")
+    @patch("d_worker.scanner.gateway")
+    @patch("d_worker.scanner.kalshi")
+    def test_no_live_at_rung_0(self, mock_kalshi, mock_gateway,
+                                mock_budget, mock_shadow):
+        """Rung 0 → gateway.submit not called even for good price."""
+        from d_worker.classify import VerdictRow
+        from d_worker.budget import ReserveResult
+
+        mock_gateway.is_live_enabled.return_value = False
+        mock_budget.reserve.return_value = ReserveResult(True, "granted", 42)
+        mock_shadow.record_seed.return_value = 1
+        mock_kalshi.fetch_orderbook.return_value = None
+
+        verdict = VerdictRow(
+            market_ticker="KXTEST-B97", series_ticker="KXTEST",
+            close_ts=time.time()+3600,
+            dclass="D1_WX", verdict="SEED", side="yes",
+            evidence={"taker_price": 97}, fee_maker=1.0, fee_taker=1.0)
+
+        client = MagicMock()
+        governor = MagicMock()
+        scanner._handle_seed(client, verdict, {"ticker": "KXTEST-B97"}, governor)
+
+        mock_gateway.submit.assert_not_called()
+
+
 class TestSlim:
     def test_slim_keeps_classification_fields(self):
         m = {"ticker": "T-1", "event_ticker": "T", "floor_strike": 84.5,

@@ -12,7 +12,7 @@ from typing import Optional, List, Dict
 
 from k_worker import kalshi
 
-from . import dstore, classify, registry, feeds, shadow, feemath, budget
+from . import dstore, classify, registry, feeds, shadow, feemath, budget, gateway
 from . import series_of
 from .feeds import Observation
 
@@ -411,6 +411,18 @@ def _handle_seed(client: kalshi.KalshiClient, verdict: classify.VerdictRow,
 
     if res.reservation_id:
         dstore.set_state(f"seed_reservation_{seed_id}", str(res.reservation_id))
+
+    if gateway.is_live_enabled() and seed_id and res.reservation_id:
+        taker_m = feemath.taker_mult(verdict.fee_taker or 1.0)
+        ok, _ = feemath.entry_ok(taker_price, taker_m, 1, MIN_NET_CLIP_CENTS)
+        if ok:
+            order_result = gateway.submit(
+                client, ticker, verdict.side, taker_price,
+                res.reservation_id, governor)
+            if order_result.status == "PLACED":
+                fee_cents = feemath.order_fee_cents(taker_m, 1, taker_price)
+                dstore.mark_seed_live(
+                    seed_id, order_result.order_id, taker_price, fee_cents)
 
 
 def _json_or_none(d: Optional[dict]) -> Optional[str]:

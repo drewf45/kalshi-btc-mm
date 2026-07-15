@@ -16,7 +16,7 @@ from typing import Optional, List
 
 from k_worker import kalshi, notify
 
-from . import dstore, feemath, classify
+from . import dstore, feemath, classify, budget
 
 log = logging.getLogger("d_worker.shadow")
 
@@ -177,6 +177,18 @@ def settle_seeds(client: kalshi.KalshiClient,
 
         dstore.settle_seed(seed["id"], result, correct, maker_filled,
                            net_taker, net_maker, lockup_days)
+
+        if seed.get("is_live"):
+            live_price = seed.get("live_fill_price") or taker_price
+            live_fee = seed.get("live_entry_fee") or 0
+            live_pnl = _settle_net(correct, live_price, live_fee)
+            dstore.set_seed_live_pnl(seed["id"], live_pnl)
+
+        res_key = dstore.get_state(f"seed_reservation_{seed['id']}")
+        if res_key:
+            budget.release(int(res_key),
+                           "SETTLED" if correct else "SETTLED_WRONG")
+
         settled += 1
 
         status = "✓" if correct else "✗ WRONG"
@@ -236,5 +248,7 @@ def _all_settled_seeds() -> List[dict]:
             "book_json", "taker_price_cents", "taker_viable", "maker_price_cents",
             "sizes_json", "close_ts", "settled_ts", "result",
             "classifier_correct", "maker_filled_est",
-            "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days"]
+            "net_clip_taker_cents", "net_clip_maker_cents", "lockup_capital_days",
+            "is_live", "live_order_id", "live_fill_price", "live_entry_fee",
+            "live_pnl_cents"]
     return [dict(zip(cols, r)) for r in rows]

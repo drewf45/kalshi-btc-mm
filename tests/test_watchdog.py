@@ -127,3 +127,64 @@ class TestWatchRows:
         gov = MagicMock()
         watchdog.watch_cycle(client, governor=gov)
         gov.consume.assert_called_once_with(1)
+
+
+class TestLiveAbandon:
+    @patch("d_worker.watchdog.budget")
+    @patch("d_worker.watchdog.gateway")
+    @patch("d_worker.watchdog.notify")
+    @patch("d_worker.watchdog.feeds")
+    @patch("d_worker.watchdog.kalshi")
+    def test_broken_live_seed_abandons_and_halts(self, mock_kalshi, mock_feeds,
+                                                   mock_notify, mock_gateway,
+                                                   mock_budget):
+        sid, vid = _insert_open_seed()
+        dstore.mark_seed_live(sid, "ord-live", 97, 1)
+        dstore.set_state(f"seed_reservation_{sid}", "42")
+
+        dstore.draft_registry("KXTEST", "NWS", "KNYC", "America/New_York",
+                              "F", "0.5")
+        dstore.approve_registry("KXTEST", "test")
+
+        obs = Observation(value=95.0, ts=time.time(), source="NWS", raw={})
+        mock_feeds.observe_nws.return_value = obs
+        mock_feeds.staleness.return_value = 10
+        mock_kalshi.fetch_orderbook.return_value = MagicMock(yes_bid=45, no_bid=55)
+
+        client = MagicMock()
+        stats = watchdog.watch_cycle(client)
+        assert stats["broken"] == 1
+
+        mock_gateway.abandon_ship.assert_called_once()
+        args = mock_gateway.abandon_ship.call_args
+        assert args[0][1] == "KXTEST-26JUL15-B97"
+        assert args[0][3] == 42
+
+        mock_budget.deny_all.assert_called_once()
+        assert "EVIDENCE_BROKEN" in mock_budget.deny_all.call_args[0][0]
+
+    @patch("d_worker.watchdog.budget")
+    @patch("d_worker.watchdog.gateway")
+    @patch("d_worker.watchdog.notify")
+    @patch("d_worker.watchdog.feeds")
+    @patch("d_worker.watchdog.kalshi")
+    def test_shadow_broken_no_abandon(self, mock_kalshi, mock_feeds,
+                                       mock_notify, mock_gateway, mock_budget):
+        """Shadow-only broken seed does NOT trigger abandon or live_halt."""
+        sid, vid = _insert_open_seed()
+
+        dstore.draft_registry("KXTEST", "NWS", "KNYC", "America/New_York",
+                              "F", "0.5")
+        dstore.approve_registry("KXTEST", "test")
+
+        obs = Observation(value=95.0, ts=time.time(), source="NWS", raw={})
+        mock_feeds.observe_nws.return_value = obs
+        mock_feeds.staleness.return_value = 10
+        mock_kalshi.fetch_orderbook.return_value = MagicMock(yes_bid=45, no_bid=55)
+
+        client = MagicMock()
+        stats = watchdog.watch_cycle(client)
+        assert stats["broken"] == 1
+
+        mock_gateway.abandon_ship.assert_not_called()
+        mock_budget.deny_all.assert_not_called()

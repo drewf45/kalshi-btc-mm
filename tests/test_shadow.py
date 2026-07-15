@@ -136,3 +136,86 @@ class TestSettleSeeds:
         gov = MagicMock()
         shadow.settle_seeds(client, governor=gov)
         gov.consume.assert_called_once_with(1)
+
+
+class TestBudgetRelease:
+    @patch("d_worker.shadow.budget")
+    @patch("d_worker.shadow.kalshi")
+    @patch("d_worker.shadow.notify")
+    def test_settlement_releases_reservation(self, mock_notify, mock_kalshi,
+                                               mock_budget):
+        past = time.time() - 300
+        vid = dstore.insert_verdict(0, "KXTEST-REL", "KXTEST", past,
+                                     "D1_WX", "SEED", "yes", {}, 1.0, 1.0)
+        sid = dstore.insert_seed(vid, "KXTEST-REL", "D1_WX", "yes", "{}",
+                                  97, True, 96, "{}", past)
+        dstore.set_state(f"seed_reservation_{sid}", "42")
+
+        mock_kalshi.get_settlement_result.return_value = "yes"
+        client = MagicMock()
+        shadow.settle_seeds(client)
+
+        mock_budget.release.assert_called_once_with(42, "SETTLED")
+
+    @patch("d_worker.shadow.budget")
+    @patch("d_worker.shadow.kalshi")
+    @patch("d_worker.shadow.notify")
+    def test_wrong_settlement_releases_with_wrong_tag(self, mock_notify,
+                                                        mock_kalshi, mock_budget):
+        past = time.time() - 300
+        vid = dstore.insert_verdict(0, "KXTEST-WRG", "KXTEST", past,
+                                     "D1_WX", "SEED", "yes", {}, 1.0, 1.0)
+        sid = dstore.insert_seed(vid, "KXTEST-WRG", "D1_WX", "yes", "{}",
+                                  97, True, 96, "{}", past)
+        dstore.set_state(f"seed_reservation_{sid}", "42")
+
+        mock_kalshi.get_settlement_result.return_value = "no"
+        client = MagicMock()
+        shadow.settle_seeds(client)
+
+        mock_budget.release.assert_called_once_with(42, "SETTLED_WRONG")
+
+
+class TestLivePnl:
+    @patch("d_worker.shadow.budget")
+    @patch("d_worker.shadow.kalshi")
+    @patch("d_worker.shadow.notify")
+    def test_live_pnl_computed_on_settle(self, mock_notify, mock_kalshi,
+                                          mock_budget):
+        past = time.time() - 300
+        vid = dstore.insert_verdict(0, "KXTEST-LPNL", "KXTEST", past,
+                                     "D1_WX", "SEED", "yes", {}, 1.0, 1.0)
+        sid = dstore.insert_seed(vid, "KXTEST-LPNL", "D1_WX", "yes", "{}",
+                                  97, True, 96, "{}", past)
+        dstore.mark_seed_live(sid, "ord-live", 97, 1)
+
+        mock_kalshi.get_settlement_result.return_value = "yes"
+        client = MagicMock()
+        shadow.settle_seeds(client)
+
+        with dstore._lock:
+            pnl = dstore._conn.execute(
+                "SELECT live_pnl_cents FROM shadow_seeds WHERE id=?", (sid,)
+            ).fetchone()[0]
+        assert pnl == 2.0  # correct at 97¢, fee 1¢: (100-97) - 1 = 2
+
+    @patch("d_worker.shadow.budget")
+    @patch("d_worker.shadow.kalshi")
+    @patch("d_worker.shadow.notify")
+    def test_live_pnl_loss(self, mock_notify, mock_kalshi, mock_budget):
+        past = time.time() - 300
+        vid = dstore.insert_verdict(0, "KXTEST-LLOSS", "KXTEST", past,
+                                     "D1_WX", "SEED", "yes", {}, 1.0, 1.0)
+        sid = dstore.insert_seed(vid, "KXTEST-LLOSS", "D1_WX", "yes", "{}",
+                                  97, True, 96, "{}", past)
+        dstore.mark_seed_live(sid, "ord-live", 97, 1)
+
+        mock_kalshi.get_settlement_result.return_value = "no"
+        client = MagicMock()
+        shadow.settle_seeds(client)
+
+        with dstore._lock:
+            pnl = dstore._conn.execute(
+                "SELECT live_pnl_cents FROM shadow_seeds WHERE id=?", (sid,)
+            ).fetchone()[0]
+        assert pnl == -98.0  # wrong at 97¢, fee 1¢: -(97+1) = -98
