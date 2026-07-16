@@ -56,5 +56,21 @@ class TestFlipComplementMath(unittest.TestCase):
             fm.exit_args("maybe", 50)
 
 
+class TestModeSwitch(unittest.TestCase):
+    """F-2: this branch flips by default; KW_MODE=OFF is the one-variable kill switch."""
+
+    def test_default_enabled(self):
+        self.assertTrue(fm.mode_enabled(None))      # unset -> runs
+        self.assertTrue(fm.mode_enabled(""))        # empty  -> runs
+        self.assertTrue(fm.mode_enabled("FLIP"))
+        self.assertTrue(fm.mode_enabled("flip"))
+        self.assertTrue(fm.mode_enabled("anything"))
+
+    def test_off_kill_switch(self):
+        self.assertFalse(fm.mode_enabled("OFF"))
+        self.assertFalse(fm.mode_enabled("off"))
+        self.assertFalse(fm.mode_enabled("  Off  "))
+
+
 if __name__ == "__main__":
     unittest.main()

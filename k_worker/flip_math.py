@@ -12,7 +12,7 @@ without importing the (cryptography-bound) client.
     exit   held NO  @q          ('yes', 100-q)  (buy YES@100-q)         bid  100-q
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def entry_args(leg_side: str, price_cents: int) -> Tuple[str, int]:
@@ -42,3 +42,9 @@ def v2_of(side: str, price_cents: int) -> Tuple[str, int]:
 def bundle_cost(yes_bid: int, no_bid: int) -> int:
     """Combined cost of joining both best bids — the FLIP entry bundle (≤ FLIP_LINE)."""
     return int(yes_bid) + int(no_bid)
+
+
+def mode_enabled(raw: Optional[str]) -> bool:
+    """F-2: this branch's k_worker flips BY DEFAULT (no env needed). KW_MODE=OFF is the
+    one-variable kill switch (engine up, flip quiet). Anything else (incl. unset) runs."""
+    return (raw or "FLIP").strip().upper() != "OFF"

@@ -6,9 +6,10 @@ scratch build is archived under `flipdesk_reference/` as doctrine + test referen
 ships nothing.
 
 ## What it is
-`KW_MODE=FLIP` makes `engine.run_market_cycle` dispatch to `k_worker/flip_mode.py`
-instead of the directional lanes (which stay intact and **dormant**). It is **off by
-default** — with `KW_MODE` unset the engine behaves exactly as before.
+On this branch `engine.run_market_cycle` dispatches to `k_worker/flip_mode.py` instead of
+the directional lanes (which stay intact and **dormant**). Flip is **on by default** —
+`KW_MODE` unset ⇒ FLIP. `KW_MODE=OFF` is the one-variable **kill switch**: the engine
+stays up and the flip lane goes quiet.
 
 Per window:
 1. **Arm at the open** — `discover_market` returns the active window; arm while
@@ -16,13 +17,16 @@ Per window:
 2. **Quote both sides** — join the best YES bid and best NO bid (subpenny `v2_price_str`),
    two `place_order_maker` calls, each `expiration_ts = close_ts − 90`. WALL: combined
    ≤ `FLIP_LINE` (99¢).
-3. **Flip** — on both fills, post exits at entry+`FLIP_X` (4¢) via the complement rule
-   (`k_worker/flip_math.py`, pinned): exit held YES@q → buy NO@100−q; exit held NO@q →
-   buy YES@100−q. Kalshi nets complements to flat. A lone leg is keepable only ≤
-   `FLIP_LONE_MAX` (49¢).
-4. **T-90 sweep** — cancel unfilled exits, re-join at the current touch; an intact bundle
-   rides its guaranteed floor, a lone leg (≤49¢) rides settlement as the accepted 1-lot
-   residual. **No taker path is added.**
+3. **Netted / flip** — if **both** legs fill the bundle NETS FLAT and the exchange banks
+   the `+(100−cost)¢` floor at the second fill (F-1): nothing to flip — the mode books it
+   and stops (broker-truth checks net = 0). A **lone** leg is flipped at entry+`FLIP_X`
+   (4¢) via the complement rule (`k_worker/flip_math.py`, pinned): exit held YES@q → buy
+   NO@100−q; exit held NO@q → buy YES@100−q. A lone leg is keepable only ≤ `FLIP_LONE_MAX`
+   (49¢).
+4. **T-90 sweep** — cancel an unfilled lone exit, re-join at the current touch (rejoin
+   `expiration_ts = close_ts − 2`, F-3, so it lives to the bell). An intact bundle rides
+   its guaranteed floor; a lone leg (≤49¢) rides settlement as the accepted 1-lot residual.
+   **No taker path is added.**
 5. **Discipline** — one entry phase per window (`gateway.mark_traded`); two consecutive
    stopped windows (`−FLIP_STOP_CENTS`) pause the engine (reuses `discipline` halt).
 
@@ -36,8 +40,9 @@ table self-provisioning, notify, review pack, discipline halt. The engine diff i
 lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `flip_math.py`.
 
 ## Env
-`KW_MODE=FLIP` · `FLIP_ENTRY_SEC=120` · `FLIP_LINE=99` · `FLIP_LONE_MAX=49` · `FLIP_X=4` ·
-`FLIP_FLAT_AT=90` · `FLIP_STOP_CENTS=25` · `FLIP_PAUSE_AFTER_STOPS=2` (all overridable).
+`KW_MODE` (unset/anything ⇒ FLIP; `OFF` ⇒ kill switch) · `FLIP_ENTRY_SEC=120` ·
+`FLIP_LINE=99` · `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` · `FLIP_STOP_CENTS=25` ·
+`FLIP_PAUSE_AFTER_STOPS=2` (all overridable).
 
 ## Before live — required validation (I could not do these here)
 - The offline sandbox has a broken `cryptography` binding, so `flip_mode` and every

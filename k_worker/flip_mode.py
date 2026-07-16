@@ -1,7 +1,8 @@
 """k_worker/flip_mode.py — WO-LANE-FLIP: the flip doctrine as a MODE in the proven engine.
 
-Enabled ONLY when env KW_MODE=FLIP (default OFF — the engine's directional lanes are
-untouched and dormant unless opted in). Reuses the proven organs verbatim:
+On this branch the engine flips BY DEFAULT (F-2: KW_MODE unset ⇒ FLIP); KW_MODE=OFF is
+the one-variable kill switch (engine up, directional lanes dormant, flip quiet). Reuses
+the proven organs verbatim:
 place_order_maker (the four flip intents via flip_math), fetch_orderbook, get_fills/
 parse_fill, cancel_all_for_market, discipline halt, notify, and store — so fills flow
 into the SAME reconcile / settlement / treasury machinery the engine already runs.
@@ -23,8 +24,8 @@ from . import flip_math
 
 NY = ZoneInfo("America/New_York")
 
-KW_MODE = os.environ.get("KW_MODE", "").strip().upper()
-ENABLED = KW_MODE == "FLIP"
+KW_MODE = os.environ.get("KW_MODE", "FLIP").strip().upper()   # F-2: FLIP is the default
+ENABLED = flip_math.mode_enabled(os.environ.get("KW_MODE"))   # KW_MODE=OFF is the kill switch
 
 FLIP_WINDOW_SEC = int(os.environ.get("FLIP_WINDOW_SEC", "900"))
 FLIP_ENTRY_SEC = int(os.environ.get("FLIP_ENTRY_SEC", "120"))
@@ -154,6 +155,7 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
                     _record_enter(ticker, close_ts, hs, fp)
                     notify.send(f"🌱 W{tag} — filled {hs.upper()}@{fp}")
         if len(fills) < 2:
+            engine.heartbeat()             # F-4: prove liveness through the blocking phase
             time.sleep(FLIP_POLL_SEC)
 
     # cancel any unfilled entry bids
@@ -163,6 +165,36 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     if not fills:
         notify.send(f"⏭ W{tag} — no fill ≤ line | SAT")
         return "flip_sat_nofill"
+
+    # F-1: DOUBLE FILL — both legs filled ⇒ the position NETS FLAT and the exchange banks
+    # the +100¢ floor at the second fill. There is nothing to flip: post no exit orders,
+    # and skip the exit monitor + T-90 sweep entirely.
+    if len(fills) == 2:
+        y, n = fills["yes"], fills["no"]
+        netcost = y + n
+        notify.send(f"💰 W{tag} — both filled {y}+{n}={netcost} → netted "
+                    f"+{100 - netcost}¢ (exchange floor) | DONE")
+        # broker-truth: a netted bundle MUST read flat (net 0). Alert loudly if not.
+        try:
+            net = kalshi.position_for_market(client, ticker)
+            if net != 0:
+                notify.alert(f"⚠ W{tag} netted-flat check FAILED — broker net {net} ≠ 0 "
+                             f"(raw {kalshi.get_positions(client)})")
+        except Exception as e:
+            notify.send(f"⚠ W{tag} net check error: {e}")
+        # marker row so the engine's reconcile/treasury see the banked floor
+        try:
+            store.insert_row(store.SurfaceRow(
+                market_ticker=ticker, decision_ts=time.time(), action="ENTER",
+                side="net", cost_per_contract_cents=int(netcost),
+                fill_cost_cents=int(netcost), fill_ts=time.time(), contracts=1,
+                order_type="maker", why_tag="FLIP_NETTED", lane="F", env="live",
+                seconds_to_expiry=close_ts - time.time(),
+            ))
+        except Exception as e:
+            notify.send(f"⚠ W{tag} netted marker-row failed: {e}")
+        _bump_stop_streak(False)
+        return "flip_done_netted"
 
     # lone-leg keepability (WALL): a lone leg above the max means the line was misjudged
     if len(fills) == 1:
@@ -191,15 +223,18 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
                 del exit_oids[hs]
                 notify.send(f"🌱 W{tag} — flipped {hs.upper()} → {flipped[hs]}")
         if exit_oids:
+            engine.heartbeat()             # F-4: liveness through the exit monitor
             time.sleep(FLIP_POLL_SEC)
 
     # T-90 SWEEP — cancel any unfilled exit and re-post the complement at the CURRENT
-    # touch (maker join, still T-90 expiry). If it fills → flat; if not, an intact bundle
-    # rides its floor and a lone leg rides settlement (both resolved by the engine's
-    # settlement backfill). No taker is added.
+    # touch (maker join). If it fills → flat; if not, an intact bundle rides its floor and
+    # a lone leg rides settlement (both resolved by the engine's settlement backfill). No
+    # taker is added.
     if exit_oids:
+        engine.heartbeat()                 # F-4: liveness across the sweep
         kalshi.cancel_all_for_market(client, ticker)
         book2 = kalshi.fetch_orderbook(client, ticker)
+        rejoin_exp = int(close_ts - 2)     # F-3: rejoin must live to the bell, not die at T-90
         for hs in list(exit_oids):
             comp = "no" if hs == "yes" else "yes"
             comp_bid = book2.no_bid if comp == "no" else book2.yes_bid
@@ -207,7 +242,7 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
             if comp_bid is not None:
                 try:
                     kalshi.place_order_maker(client, ticker, comp, comp_bid, 1,
-                                             expiration_ts=exp, v2_price_str=comp_fp)
+                                             expiration_ts=rejoin_exp, v2_price_str=comp_fp)
                     notify.send(f"🔁 W{tag} — T-90 rejoin {hs.upper()} exit @touch")
                 except Exception as e:
                     notify.send(f"⚠ W{tag} T-90 rejoin failed: {e}")
