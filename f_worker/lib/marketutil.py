@@ -1,0 +1,208 @@
+# f_worker/lib/marketutil.py
+# Crypto-free market helpers borrowed from bot.py. Split out of kalshi.py on purpose:
+# the testable core (fgateway walls, manager, pricebrain, tests) needs orderbook
+# parsing, payload building and close-ts math WITHOUT dragging in the cryptography
+# stack that KalshiClient requires. Nothing here imports cryptography.
+
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+NY = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
+MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(x)))
+
+
+# ---- close_ts resolution (borrowed verbatim from bot.py) ----
+def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optional[int]:
+    if not ticker:
+        return None
+    try:
+        parts = str(ticker).split("-")
+        if len(parts) < 2:
+            return None
+        dt_chunk = parts[1]
+        day = int(dt_chunk[0:2])
+        mon = MONTHS[dt_chunk[2:5].upper()]
+        year = 2000 + int(dt_chunk[5:7])
+        hh = int(dt_chunk[7:9])
+        mm = int(dt_chunk[9:11])
+        start_local = datetime(year, mon, day, hh, mm, tzinfo=NY)
+        close_utc = (start_local + timedelta(minutes=int(interval_minutes))).astimezone(UTC)
+        return int(close_utc.timestamp())
+    except Exception:
+        return None
+
+
+def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
+    if not isinstance(market_obj, dict):
+        market_obj = {}
+    for k in ("close_ts", "closeTs", "close_time_ts", "closeTimeTs", "close_timestamp",
+              "closeTimestamp", "close_time", "closeTime", "expiration_ts", "expirationTs"):
+        v = market_obj.get(k)
+        if isinstance(v, (int, float)):
+            vv = int(v)
+            return vv // 1000 if vv > 10_000_000_000 else vv
+    for k in ("close_time", "closeTime", "close_datetime", "closeDateTime",
+              "expiration_time", "expirationTime"):
+        v = market_obj.get(k)
+        if isinstance(v, str):
+            ts = _parse_iso_to_epoch_s(v)
+            if ts is not None:
+                return ts
+    return infer_close_ts_from_ticker(ticker, interval_minutes=15)
+
+
+def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
+    now_ts = int(time.time())
+
+    def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
+        v = obj.get(key)
+        if v is None:
+            return None
+        try:
+            vv = int(v)
+            return vv // 1000 if vv > 10_000_000_000 else vv
+        except Exception:
+            return None
+
+    active, future = [], []
+    for m in markets:
+        status = str(m.get("status", "")).lower()
+        if status and status != "open":
+            continue
+        ot = get_ts(m, "open_time") or get_ts(m, "open_ts") or get_ts(m, "open_timestamp")
+        ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
+        if ot is not None and ct is not None and ot <= now_ts < ct:
+            active.append((ct, m))
+        elif ct is not None and ct > now_ts:
+            future.append((ct, m))
+
+    if active:
+        active.sort(key=lambda x: x[0]); chosen = active[0][1]
+    elif future:
+        future.sort(key=lambda x: x[0]); chosen = future[0][1]
+    elif markets:
+        chosen = markets[0]
+    else:
+        raise RuntimeError("No markets available to pick from.")
+
+    market_ticker = chosen.get("ticker") or chosen.get("market_ticker")
+    event_ticker = chosen.get("event_ticker") or (chosen.get("event") or {}).get("ticker")
+    if not market_ticker or not event_ticker:
+        raise RuntimeError(f"Could not determine event/market ticker from: {chosen}")
+    return str(event_ticker), str(market_ticker), chosen
+
+
+def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    lo = hi = None
+    for lo_key in ("floor_strike", "lower_strike", "strike_lower", "floor"):
+        if lo_key in market_obj:
+            try:
+                lo = float(market_obj[lo_key]); break
+            except Exception:
+                lo = None
+    for hi_key in ("cap_strike", "upper_strike", "strike_upper", "cap"):
+        if hi_key in market_obj:
+            try:
+                hi = float(market_obj[hi_key]); break
+            except Exception:
+                hi = None
+    return lo, hi
+
+
+# ---- orderbook parsing (borrowed verbatim from bot.py) ----
+def _best_from_levels(levels: Any, want: str) -> Optional[int]:
+    if not isinstance(levels, list) or not levels:
+        return None
+    best: Optional[int] = None
+    for lv in levels:
+        p = None
+        if isinstance(lv, (list, tuple)) and len(lv) >= 1:
+            try:
+                p = int(lv[0])
+            except Exception:
+                p = None
+        elif isinstance(lv, dict):
+            for k in ("price", "yes_price", "p"):
+                if k in lv:
+                    try:
+                        p = int(lv[k]); break
+                    except Exception:
+                        p = None
+        if p is None:
+            continue
+        best = p if best is None else (max(best, p) if want == "bid" else min(best, p))
+    if best is None:
+        return None
+    return clamp_int(best, 1, 99)
+
+
+def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    if not isinstance(ob, dict):
+        return None, None, None, None
+    root = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
+    yes_bid = yes_ask = no_bid = no_ask = None
+    if isinstance(root, dict) and isinstance(root.get("yes"), dict):
+        y = root.get("yes", {}); n = root.get("no", {})
+        yes_bid = _best_from_levels(y.get("bids", y.get("buy")), "bid")
+        yes_ask = _best_from_levels(y.get("asks", y.get("sell")), "ask")
+        if isinstance(n, dict):
+            no_bid = _best_from_levels(n.get("bids", n.get("buy")), "bid")
+            no_ask = _best_from_levels(n.get("asks", n.get("sell")), "ask")
+    if isinstance(root, dict) and (isinstance(root.get("yes"), list) or isinstance(root.get("no"), list)):
+        if yes_bid is None and isinstance(root.get("yes"), list):
+            yes_bid = _best_from_levels(root.get("yes"), "bid")
+        if no_bid is None and isinstance(root.get("no"), list):
+            no_bid = _best_from_levels(root.get("no"), "bid")
+    if yes_ask is None and no_bid is not None:
+        yes_ask = clamp_int(100 - no_bid, 1, 99)
+    if no_ask is None and yes_bid is not None:
+        no_ask = clamp_int(100 - yes_bid, 1, 99)
+    if yes_bid is None and no_ask is not None:
+        yes_bid = clamp_int(100 - no_ask, 1, 99)
+    if no_bid is None and yes_ask is not None:
+        no_bid = clamp_int(100 - yes_ask, 1, 99)
+    if yes_bid is not None and yes_ask is not None and yes_ask <= yes_bid:
+        yes_ask = None
+    if no_bid is not None and no_ask is not None and no_ask <= no_bid:
+        no_ask = None
+    return yes_bid, yes_ask, no_bid, no_ask
+
+
+def build_order_payload(market_ticker: str, action: str, side: str, price_cents: int,
+                        count: int, post_only: bool, order_type: str = "limit") -> Dict[str, Any]:
+    """Borrowed from bot.py:build_order_payload; adds market-order type for T-90 flat."""
+    body: Dict[str, Any] = {
+        "ticker": market_ticker,
+        "action": action,
+        "side": side,
+        "type": order_type,
+        "count": int(count),
+    }
+    if order_type == "limit":
+        if side == "yes":
+            body["yes_price"] = int(price_cents)
+        else:
+            body["no_price"] = int(price_cents)
+        if post_only:
+            body["post_only"] = True
+    return body

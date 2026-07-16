@@ -1,0 +1,15 @@
+{
+  "sigma_low": 6.0,
+  "sigma_high": 18.0,
+  "sigma_floor": 7.24,
+  "sigma_ceil": 10.61,
+  "max_build_cost": 99,
+  "min_flip_headroom": 2,
+  "max_leg_spread": 6,
+  "flip_rate": {
+    "low": 0.25,
+    "mid": 0.5,
+    "high": 0.0
+  },
+  "_provenance": "seeded by tools/crossing_study.py (Deliverable 0)"
+}

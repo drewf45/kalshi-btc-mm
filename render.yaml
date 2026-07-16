@@ -3,5 +3,8 @@ services:
     name: kalshi-btc-mm
     runtime: python
     plan: starter
+    # FLIPDESK: one package, one job, no other option on the box.
+    # Point this Render service's branch at the flipdesk build branch and the desk
+    # runs live from boot. The retired weather desk (d_worker) does not run here.
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python -m f_worker
