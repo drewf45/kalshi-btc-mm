@@ -74,6 +74,7 @@ class Config:
     pause_after_stops: int = 2    # DW_PAUSE_AFTER_STOPS (W7: two consecutive stops => halt)
     lots: int = 1                 # DW_LOTS (ladder-owned; boot rung is 1)
     req_per_min: int = 30         # DW_REQ_PER_MIN (api budget)
+    stuck_gauge_n: int = 4        # DW_STUCK_GAUGE_N (same gate refusal N windows => alert)
 
     # --- Discovery / loop timing ---
     # DW_ENTRY_START_LEAD_SEC: begin seeking this many secs before close. NOTE the
@@ -144,6 +145,7 @@ def load_config() -> Config:
     c.pause_after_stops = env_int("DW_PAUSE_AFTER_STOPS", c.pause_after_stops)
     c.lots = env_int("DW_LOTS", c.lots)
     c.req_per_min = env_int("DW_REQ_PER_MIN", c.req_per_min)
+    c.stuck_gauge_n = env_int("DW_STUCK_GAUGE_N", c.stuck_gauge_n)
 
     c.entry_start_lead_sec = env_int("DW_ENTRY_START_LEAD_SEC", c.entry_start_lead_sec)
     c.poll_seconds = env_float("POLL_SECONDS", c.poll_seconds)

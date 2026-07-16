@@ -19,7 +19,7 @@ import requests
 
 from .config import Config
 from .lib import spot as spotlib
-from .lib.marketutil import parse_best_yes_no
+from .lib.marketutil import parse_best_yes_no, raw_book_sample
 
 
 # Boot-default gate constants. Deliverable 0 replaces these via flipdesk_gate.json.
@@ -79,7 +79,7 @@ class PriceBrain:
     def spot(self) -> Optional[float]:
         return spotlib.fetch_btc_spot_usd(self.session)
 
-    def sigma(self, now: Optional[float] = None) -> float:
+    def sigma(self, now: Optional[float] = None) -> Optional[float]:
         return self._sigma.get(self.session, now=now)
 
     def vol_regime(self, sigma: float) -> str:
@@ -93,17 +93,24 @@ class PriceBrain:
     def gate_window(self, orderbook: Dict[str, Any], sigma: Optional[float] = None) -> GateDecision:
         """Decide whether this 15M window is worth one shot. Pure given its inputs, so
         it is unit-testable with a synthetic book."""
+        ob_keys, sample = raw_book_sample(orderbook)   # raw material to falsify the parser
         if sigma is None:
             sigma = self.sigma()
         if sigma is None:
             # BLIND: the spot/sigma feed is down. Fail CLOSED with its own reason — never
-            # round(None) into a crash, never trade on a feed we can't see.
+            # round(None) into a crash, never trade on a feed we can't see. Now REACHABLE
+            # (SigmaCache no longer fabricates a default).
             return GateDecision(False, "BLIND: spot/sigma feed unavailable", regime="blind",
-                                evidence={"sigma": None, "feed": "coinbase", "fresh": False})
+                                evidence={"sigma": None, "feed": "coinbase", "fresh": False,
+                                          "ob_keys": ob_keys, "sample": sample})
         regime = self.vol_regime(sigma)
         yb, ya, nb, na = parse_best_yes_no(orderbook)
-        ev: Dict[str, Any] = {"sigma": round(sigma, 3), "regime": regime,
-                              "yes_bid": yb, "yes_ask": ya, "no_bid": nb, "no_ask": na}
+        ev: Dict[str, Any] = {"sigma": round(sigma, 3),
+                              "sigma_raw": self._sigma.last_raw,
+                              "clamped": self._sigma.last_clamped,
+                              "regime": regime,
+                              "yes_bid": yb, "yes_ask": ya, "no_bid": nb, "no_ask": na,
+                              "ob_keys": ob_keys, "sample": sample}
 
         # vol regime gate
         if sigma < self.gate["sigma_floor"]:

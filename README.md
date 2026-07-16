@@ -121,11 +121,22 @@ without its reason + evidence attached:
 - Every desk-loop IO error (discovery, fills poll, book fetch) writes a tagged
   `STAGE_ERR` evidence row and pages a `⚠` line (rate-limited to once per window;
   desk-level stages throttle by time), instead of a silent `except: return`.
+- **Evidence must be able to convict the instrument.** Gate rows carry the raw response's
+  top-level keys and one sample level (`ob_keys: ["orderbook_fp"]`, `sample: ["0.4700","120"]`)
+  plus `sigma_raw`/`clamped`, so `yes_bid: None` can be told apart from "I couldn't read
+  the book." Every response shape the desk consumes has a pinned fixture built from the
+  **live tape** (`tests/test_orderbook_fp.py`) — the fixture *is* the contract.
+- **Stuck-gauge tripwire:** the same gate refusal reason `DW_STUCK_GAUGE_N` (4) windows
+  running pages "sensor suspect, not market fact." A market can be boring; a reading that
+  never varies is broken.
+- **Sensors never fabricate.** `SigmaCache` returns `None` on a dead/never-fetched feed
+  (so the fail-closed BLIND gate is *reachable*, not dead code behind a fictional default),
+  and tags clamped readings so a floor-hugging σ is never mistaken for a measurement.
 
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 71 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 85 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

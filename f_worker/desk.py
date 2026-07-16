@@ -122,6 +122,8 @@ class Desk:
         # IDLE -> gate
         ob = self._safe_ob(win.market_ticker)
         gate = self.pb.gate_window(ob)
+        self._check_stuck_gauge(gate)
+
         if not gate.ok:
             # gate REFUSED — carry the reason + evidence (σ/regime/BLIND) onto the tape
             win.regime = gate.regime
@@ -202,6 +204,17 @@ class Desk:
         except Exception as e:
             self._stage_err(self._cur_win, "book_fetch", e)
             return {}
+
+    def _check_stuck_gauge(self, gate: Any) -> int:
+        """STUCK-GAUGE TRIPWIRE (F2.4): a refusal reason repeating N windows is a sensor
+        suspect, not a market fact — a market can be boring, but a reading that never
+        varies is broken. A healthy pass reason repeating is fine; only refusals trip it.
+        Returns the trailing streak."""
+        streak = self.ledger.record_gate_reason(gate.reason)
+        if not gate.ok and streak >= self.cfg.stuck_gauge_n and self.notifier:
+            self.notifier.alert(f"gate reason repeating {streak}x — sensor suspect, not "
+                                f"market fact: '{gate.reason}'")
+        return streak
 
     def _announce_fill(self, win: "W.Window", side: str, px: int) -> None:
         """A resting entry bid filled — inventory just came into existence. Announce it

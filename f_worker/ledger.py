@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS fee_fingerprint (
     detail      TEXT,
     ts          REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS gate_reasons (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    reason  TEXT NOT NULL,
+    ts      REAL NOT NULL
+);
 """
 
 # Columns added after the first schema shipped. Applied idempotently at open so an
@@ -246,6 +251,25 @@ class Ledger:
             row = self._conn.execute(
                 "SELECT fingerprint FROM fee_fingerprint ORDER BY id DESC LIMIT 1").fetchone()
             return row["fingerprint"] if row else None
+
+    # ---------------- stuck-gauge tripwire (F2.4) ----------------
+    def record_gate_reason(self, reason: str) -> int:
+        """Append a window's gate reason and return the trailing CONSECUTIVE count of the
+        same reason. A gauge that repeats is a gauge that's stuck — a market can be
+        boring, but a sensor reading that never changes is broken."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO gate_reasons(reason, ts) VALUES (?,?)", (reason, self._clock()))
+            self._conn.commit()
+            rows = self._conn.execute(
+                "SELECT reason FROM gate_reasons ORDER BY id DESC LIMIT 200").fetchall()
+        streak = 0
+        for r in rows:
+            if r["reason"] == reason:
+                streak += 1
+            else:
+                break
+        return streak
 
     def realized_flip_stats(self, since_ts: float) -> Dict[str, Any]:
         """Lived flip performance over a trailing window (F1.5): entered windows and how

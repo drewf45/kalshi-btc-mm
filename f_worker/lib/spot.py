@@ -64,21 +64,36 @@ def norm_cdf(x: float) -> float:
 
 
 class SigmaCache:
-    """Cached sigma with floor/ceil clamps (borrowed cadence from bot.py:get_sigma_cached)."""
+    """Cached realized sigma — HONEST edition (F2.2).
 
-    def __init__(self, floor: float = 6.0, ceil: float = 40.0, refresh_sec: float = 5.0,
-                 default: float = 12.0):
+    NO fabricated default: a never-fetched or feed-dead sigma is None, so the BLIND
+    gate becomes reachable instead of dead code hiding behind a fictional 12.0. Clamps
+    are TAGGED: `last_raw` keeps the pre-clamp measurement and `last_clamped` flags when
+    the floor/ceil moved it, so a floor-hugging σ=5.0 can never again be mistaken for a
+    real reading."""
+
+    def __init__(self, floor: float = 6.0, ceil: float = 40.0, refresh_sec: float = 5.0):
         self.floor = floor
         self.ceil = ceil
         self.refresh_sec = refresh_sec
-        self._val = default
-        self._ts = 0.0
+        self._val: Optional[float] = None
+        self._ts: Optional[float] = None
+        self.last_raw: Optional[float] = None
+        self.last_clamped: bool = False
 
-    def get(self, session: requests.Session, now: Optional[float] = None) -> float:
+    def get(self, session: requests.Session, now: Optional[float] = None) -> Optional[float]:
         now = time.time() if now is None else now
-        if (now - self._ts) < self.refresh_sec:
-            return float(self._val)
+        if self._ts is not None and (now - self._ts) < self.refresh_sec:
+            return self._val
         rs = realized_sigma_usd_per_sqrt_sec(session)
-        self._val = float(self._val) if (rs is None or rs <= 0) else float(max(self.floor, min(self.ceil, rs)))
+        self.last_raw = rs
+        if rs is None or rs <= 0:
+            # feed death or garbage — do NOT fabricate. None => BLIND.
+            self._val = None
+            self.last_clamped = False
+        else:
+            clamped = float(max(self.floor, min(self.ceil, rs)))
+            self.last_clamped = clamped != rs
+            self._val = clamped
         self._ts = now
-        return float(self._val)
+        return self._val

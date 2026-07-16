@@ -138,7 +138,33 @@ def market_bounds_usd(market_obj: Dict[str, Any]) -> Tuple[Optional[float], Opti
     return lo, hi
 
 
-# ---- orderbook parsing (borrowed verbatim from bot.py) ----
+# ---- orderbook parsing ----
+# The LIVE Kalshi API returns the book under the envelope key `orderbook_fp` (fixed-
+# point) with prices as dollar STRINGS ("0.4700" == 47c); the legacy shape used
+# `orderbook` with integer cents. The old parser (borrowed from the pre-fp bot.py
+# fossil) only unwrapped `orderbook` and only read numeric levels, so it returned
+# (None,None,None,None) against the real shape — gating every window against a blank
+# book. We now unwrap both envelopes and read dollar-strings AND cents alike.
+def _price_to_cents(v: Any) -> Optional[int]:
+    """Coerce a level price to integer cents. Handles fp dollar-strings ("0.4700"->47),
+    cent-strings ("47"->47), and numeric cents/dollars."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return int(round(v * 100)) if 0.0 < v <= 1.0 else int(round(v))
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return int(round(float(s) * 100)) if "." in s else int(s)
+        except ValueError:
+            return None
+    return None
+
+
 def _best_from_levels(levels: Any, want: str) -> Optional[int]:
     if not isinstance(levels, list) or not levels:
         return None
@@ -146,17 +172,11 @@ def _best_from_levels(levels: Any, want: str) -> Optional[int]:
     for lv in levels:
         p = None
         if isinstance(lv, (list, tuple)) and len(lv) >= 1:
-            try:
-                p = int(lv[0])
-            except Exception:
-                p = None
+            p = _price_to_cents(lv[0])
         elif isinstance(lv, dict):
             for k in ("price", "yes_price", "p"):
                 if k in lv:
-                    try:
-                        p = int(lv[k]); break
-                    except Exception:
-                        p = None
+                    p = _price_to_cents(lv[k]); break
         if p is None:
             continue
         best = p if best is None else (max(best, p) if want == "bid" else min(best, p))
@@ -165,10 +185,39 @@ def _best_from_levels(levels: Any, want: str) -> Optional[int]:
     return clamp_int(best, 1, 99)
 
 
+def _unwrap_book(ob: Dict[str, Any]) -> Any:
+    """Return the yes/no container, unwrapping either the fp or legacy envelope."""
+    for key in ("orderbook_fp", "orderbook"):
+        if isinstance(ob.get(key), dict):
+            return ob.get(key)
+    return ob
+
+
+def raw_book_sample(ob: Dict[str, Any]) -> Tuple[List[str], Any]:
+    """Evidence helper (F2.3): the raw response's top-level keys and one sample level,
+    so a gate row can falsify the parser itself ('is the book empty, or did I fail to
+    read it?')."""
+    if not isinstance(ob, dict):
+        return [], None
+    keys = list(ob.keys())
+    root = _unwrap_book(ob)
+    if isinstance(root, dict):
+        for side in ("yes", "no"):
+            sub = root.get(side)
+            if isinstance(sub, list) and sub:
+                return keys, sub[0]
+            if isinstance(sub, dict):
+                for lk in ("bids", "asks", "buy", "sell"):
+                    lv = sub.get(lk)
+                    if isinstance(lv, list) and lv:
+                        return keys, lv[0]
+    return keys, None
+
+
 def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
     if not isinstance(ob, dict):
         return None, None, None, None
-    root = ob.get("orderbook") if isinstance(ob.get("orderbook"), dict) else ob
+    root = _unwrap_book(ob)
     yes_bid = yes_ask = no_bid = no_ask = None
     if isinstance(root, dict) and isinstance(root.get("yes"), dict):
         y = root.get("yes", {}); n = root.get("no", {})
