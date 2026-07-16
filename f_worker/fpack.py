@@ -56,6 +56,12 @@ def render_pack(ledger: Ledger, cfg: Config, client: Any = None,
         except Exception as e:
             lines.append(f"⚠️ reconcile: broker read failed ({e})")
 
+    # lived flip performance over a trailing week — the synthetic priors get replaced by
+    # what the tape actually did (F1.5)
+    lived = ledger.realized_flip_stats((now or _now()) - 7 * 86400)
+    lines.append(f"lived flip rate (7d): {lived['bundle']}/{lived['entered']} entered "
+                 f"= {lived['flip_rate']:.0%}")
+
     lines.append(f"size ladder: rung {rung} ({lots} lot/side)")
     lines.append(f"halt: {'SET — ' + hreason if halted else 'clear'}")
     lines.append(f"api budget: {cfg.req_per_min}/min cap")
@@ -63,6 +69,10 @@ def render_pack(ledger: Ledger, cfg: Config, client: Any = None,
     if rss is not None:
         lines.append(f"mem: {rss} MB RSS")
     return "\n".join(lines[:30])
+
+
+def _now() -> float:
+    return time.time()
 
 
 class PackScheduler(threading.Thread):

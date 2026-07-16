@@ -25,7 +25,7 @@ def _fill_price(fill: Dict[str, Any], side: str) -> Optional[int]:
 
 class Desk:
     def __init__(self, client: Any, gateway: Any, manager: Any, pricebrain: Any,
-                 ledger: Any, config: Config, notifier: Any = None):
+                 ledger: Any, config: Config, notifier: Any = None, settler: Any = None):
         self.client = client
         self.gw = gateway
         self.mgr = manager
@@ -33,11 +33,16 @@ class Desk:
         self.ledger = ledger
         self.cfg = config
         self.notifier = notifier
+        self.settler = settler
         self._last_window_id: Optional[str] = None
+        self._cur_market: Optional[str] = None
         self._stop = False
 
     def stop(self) -> None:
         self._stop = True
+
+    def current_market(self) -> Optional[str]:
+        return self._cur_market
 
     # ---- fill polling (match our order ids on the fills tape) ----
     def _poll_fills(self, win: "W.Window", order_ids: Dict[str, Optional[str]],
@@ -95,7 +100,9 @@ class Desk:
             self.mgr._book(win)
             return
         # SEEKING
-        win.transition(W.SEEKING, {"gate": gate.reason, "yes": gate.yes_price, "no": gate.no_price})
+        win.regime = gate.regime
+        win.transition(W.SEEKING, {"gate": gate.reason, "yes": gate.yes_price,
+                                   "no": gate.no_price, "regime": gate.regime})
         self.mgr.post_entry(win, gate, self._seconds_to_close(win))
 
         # entry phase
@@ -121,6 +128,7 @@ class Desk:
                 # T-90 flat wall (W4)
                 if win.mode == "bundle" and len(win.held_legs()) == 2:
                     self.mgr.ride_floor(win)
+                    self._settle_floor(win)
                 else:
                     self.mgr.flat_out(win, self._marks(win))
                 break
@@ -134,6 +142,17 @@ class Desk:
                 if s2c is not None and s2c <= self.cfg.flat_at_t + 20:
                     self.mgr.salvage_walk(win, self._best_bid(win.open_sides()[0]) if win.open_sides() else None, s2c)
             time.sleep(self.cfg.poll_seconds)
+
+    def _settle_floor(self, win: "W.Window") -> None:
+        """After a floor ride, reconcile against broker truth (F1.2)."""
+        if self.settler is None:
+            return
+        try:
+            from .manager import compute_window_pnl
+            booked = compute_window_pnl(win, self.cfg)["net_cents"]
+            self.settler.verify_floor(win, booked)
+        except Exception as e:
+            print(f"[desk] settlement check failed: {e}", flush=True)
 
     def _marks(self, win: "W.Window") -> Dict[str, int]:
         ob = self._safe_ob(win.market_ticker)

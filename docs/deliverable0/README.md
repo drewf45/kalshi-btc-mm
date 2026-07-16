@@ -11,8 +11,12 @@ source. Re-run against real candle data before trusting the numbers or seeding t
 # real 1-minute BTC candles from a CSV (columns: time, open, high, low, close)
 python tools/crossing_study.py --csv path/to/btc_1m.csv --out docs/deliverable0
 
-# or pull recent candles live from Coinbase
+# pull recent candles live from Coinbase (~300 minutes)
 python tools/crossing_study.py --coinbase --out docs/deliverable0
+
+# the REAL study: paginate 180 days of 1-minute candles (F1.5). Writes a manifest with
+# coverage % and gap count; warns and refuses to seed the gate if coverage < 90%.
+python tools/crossing_study.py --coinbase --days 180 --out docs/deliverable0
 ```
 
 The generated `flipdesk_gate.json` is what pricebrain loads at boot to seed the D4 gate

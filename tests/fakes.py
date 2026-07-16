@@ -10,10 +10,16 @@ class FakeClient:
     that a wall blocked BEFORE anything reached the exchange."""
 
     def __init__(self, avail: float = 1000.0, total: float = 1000.0,
-                 orderbook: Optional[Dict[str, Any]] = None):
+                 orderbook: Optional[Dict[str, Any]] = None,
+                 positions: Optional[List[Dict[str, Any]]] = None,
+                 open_orders: Optional[List[Dict[str, Any]]] = None,
+                 market: Optional[Dict[str, Any]] = None):
         self.avail = avail
         self.total = total
         self.orderbook = orderbook or {}
+        self.positions = positions or []
+        self.open_orders = open_orders or []
+        self.market = market or {}
         self.fills: List[Dict[str, Any]] = []
         self.placed: List[Dict[str, Any]] = []
         self.canceled: List[str] = []
@@ -41,6 +47,15 @@ class FakeClient:
 
     def get_fills(self, market_ticker: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
         return list(self.fills)
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        return list(self.positions)
+
+    def get_open_orders(self, market_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+        return list(self.open_orders)
+
+    def get_market(self, market_ticker: str) -> Dict[str, Any]:
+        return dict(self.market)
 
     def discover_market(self, series_ticker: str):
         return None

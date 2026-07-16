@@ -191,13 +191,13 @@ class Manager:
         for leg in win.held_legs():
             if best_bid is None:
                 continue
-            net_if_cross = feemath.net_after_taker_exit(leg.entry_price, best_bid, leg.count)
             # recover when crossing now beats holding a leg that likely won't flip
             if best_bid >= leg.entry_price or seconds_to_close is None or seconds_to_close <= self.cfg.flat_at_t + 15:
                 oid, fee = self.gw.salvage_cross(win.window_id, win.market_ticker, leg.side,
                                                  leg.entry_price, best_bid, win.mode == "lone")
                 leg.order_id = oid
-                self.ledger.record_fill(win.window_id, leg.side, best_bid, leg.count)
+                self.ledger.record_fill(win.window_id, leg.side, best_bid, leg.count,
+                                        fee_cents=fee, is_taker=True)
                 win.resolve_leg(leg.side, best_bid, SALVAGE)
         if win.state == W.HOLDING and not win.held_legs():
             win.transition(W.DONE, {"resolution": "salvaged"})
@@ -210,19 +210,23 @@ class Manager:
         win.transition(W.DONE, {"resolution": "bundle rode floor to settlement"})
         self._book(win)
 
-    # ---- EXITING: T-90 flat wall (W4) ----
-    def flat_out(self, win: "W.Window", marks: Optional[Dict[str, int]] = None) -> None:
+    # ---- EXITING: T-90 flat wall (W4) — also the orphan-recovery flatten path (F1.1) ----
+    def flat_out(self, win: "W.Window", marks: Optional[Dict[str, int]] = None,
+                 reason: str = "T-90 flat wall") -> None:
         marks = marks or {}
-        if win.state == W.HOLDING:
-            win.transition(W.EXITING, {"reason": "T-90 flat wall"})
+        # HOLDING->EXITING is the normal edge; SEEKING->EXITING carries a recovered orphan.
+        if win.state in (W.HOLDING, W.SEEKING):
+            win.transition(W.EXITING, {"reason": reason})
         for leg in win.held_legs():
             mark = marks.get(leg.side)
+            fee = feemath.fee_cents(mark, leg.count) if mark is not None else 0
             oid = self.gw.market_out(win.window_id, win.market_ticker, leg.side,
                                      win.mode == "lone", entry_price=leg.entry_price, mark_price=mark)
             leg.order_id = oid
             win.resolve_leg(leg.side, mark if mark is not None else 0, MARKET_OUT)
-            self.ledger.record_fill(win.window_id, leg.side, mark if mark is not None else 0, leg.count)
-        win.transition(W.DONE, {"resolution": "flat at T-90"})
+            self.ledger.record_fill(win.window_id, leg.side, mark if mark is not None else 0,
+                                    leg.count, fee_cents=fee, is_taker=True)
+        win.transition(W.DONE, {"resolution": reason})
         self._book(win)
 
     # ---- book one window_pnl row + emit the one-line story ----
@@ -230,6 +234,7 @@ class Manager:
         pnl = compute_window_pnl(win, self.cfg)
         self.ledger.record_pnl(win.window_id, pnl["kind"], pnl["gross_cents"], pnl["fees_cents"],
                                pnl["net_cents"], pnl["stopped"], win.rung,
+                               regime=getattr(win, "regime", None),
                                detail={"legs": [vars(l) for l in win.legs]})
         story = window_story(win, pnl)
         if self.notifier is not None:

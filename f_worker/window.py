@@ -68,6 +68,7 @@ class Window:
 
     state: str = IDLE
     mode: Optional[str] = None            # "bundle" | "lone" | None
+    regime: Optional[str] = None          # vol regime at gate time (for lived stats)
     legs: List[Leg] = field(default_factory=list)
 
     # entry order handles (for cancel-at-phase-end)

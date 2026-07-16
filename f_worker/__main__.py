@@ -18,6 +18,9 @@ from .fgateway import FGateway
 from .pricebrain import PriceBrain
 from .manager import Manager
 from .desk import Desk
+from .reconcile import Reconciler
+from .settlement import Settler
+from .feewatch import FeeTripwire, FeeTripwireThread
 from .fpack import PackScheduler, render_pack
 
 
@@ -98,7 +101,20 @@ def main() -> None:
     gateway = FGateway(client, ledger, cfg, notifier)
     pricebrain = PriceBrain(cfg)
     manager = Manager(gateway, ledger, pricebrain, cfg, notifier)
-    desk = Desk(client, gateway, manager, pricebrain, ledger, cfg, notifier)
+    settler = Settler(client, ledger, cfg, notifier)
+    desk = Desk(client, gateway, manager, pricebrain, ledger, cfg, notifier, settler=settler)
+
+    # F1.1 — boot reconcile / orphan sweep BEFORE any new risk is taken. This line
+    # reaches Drew's phone before the first window (acceptance).
+    Reconciler(client, gateway, manager, ledger, cfg, notifier).boot_reconcile()
+
+    # F1.3 — capture the series fee fingerprint as the boot baseline, then watch it.
+    tripwire = FeeTripwire(client, ledger, cfg, notifier)
+    disc = client.discover_market(cfg.series_ticker)
+    if disc:
+        tripwire.capture(disc[1])
+    feewatch = FeeTripwireThread(tripwire, desk.current_market)
+    feewatch.start()
 
     pack = PackScheduler(ledger, cfg, notifier, client)
     pack.start()

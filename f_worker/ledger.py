@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS fills (
     side       TEXT,
     price_cents INTEGER,
     count      INTEGER,
+    fee_cents  INTEGER DEFAULT 0,
+    is_taker   INTEGER DEFAULT 0,
     ts         REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS window_pnl (
@@ -76,6 +78,8 @@ CREATE TABLE IF NOT EXISTS window_pnl (
     net_cents  INTEGER NOT NULL,
     stopped    INTEGER NOT NULL,
     rung       INTEGER,
+    regime     TEXT,
+    settled    INTEGER DEFAULT 0,
     detail     TEXT,
     ts         REAL NOT NULL
 );
@@ -92,7 +96,32 @@ CREATE TABLE IF NOT EXISTS halt (
     reason    TEXT,
     ts        REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settlements (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id     TEXT NOT NULL,
+    result        TEXT,
+    booked_net    INTEGER,
+    broker_net    INTEGER,
+    mismatch      INTEGER DEFAULT 0,
+    detail        TEXT,
+    ts            REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fee_fingerprint (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    detail      TEXT,
+    ts          REAL NOT NULL
+);
 """
+
+# Columns added after the first schema shipped. Applied idempotently at open so an
+# existing flipdesk.db on the box forward-migrates instead of erroring.
+_MIGRATIONS = [
+    ("fills", "fee_cents", "INTEGER DEFAULT 0"),
+    ("fills", "is_taker", "INTEGER DEFAULT 0"),
+    ("window_pnl", "regime", "TEXT"),
+    ("window_pnl", "settled", "INTEGER DEFAULT 0"),
+]
 
 
 class Ledger:
@@ -104,6 +133,7 @@ class Ledger:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
             # Seed rung 1 / halt-clear once, if empty (these seeds are appends).
             if self._conn.execute("SELECT COUNT(*) c FROM size_ladder").fetchone()["c"] == 0:
@@ -115,6 +145,16 @@ class Ledger:
                     "INSERT INTO halt(flip_halt, reason, ts) VALUES (0,'boot',?)",
                     (self._clock(),))
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent forward-migration for dbs created by an earlier schema."""
+        for table, col, decl in _MIGRATIONS:
+            cols = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                try:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError:
+                    pass
 
     def close(self) -> None:
         with self._lock:
@@ -159,24 +199,68 @@ class Ledger:
                  json.dumps(detail or {}, default=str), self._clock()))
             self._conn.commit()
 
-    def record_fill(self, window_id: str, side: str, price_cents: int, count: int) -> None:
+    def record_fill(self, window_id: str, side: str, price_cents: int, count: int,
+                    fee_cents: int = 0, is_taker: bool = False) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO fills(window_id, side, price_cents, count, ts) VALUES (?,?,?,?,?)",
-                (window_id, side, price_cents, count, self._clock()))
+                "INSERT INTO fills(window_id, side, price_cents, count, fee_cents, is_taker, ts) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (window_id, side, price_cents, count, int(fee_cents),
+                 1 if is_taker else 0, self._clock()))
             self._conn.commit()
 
     # ---------------- window P&L ----------------
     def record_pnl(self, window_id: str, kind: str, gross_cents: int, fees_cents: int,
-                   net_cents: int, stopped: bool, rung: int,
+                   net_cents: int, stopped: bool, rung: int, regime: Optional[str] = None,
                    detail: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO window_pnl(window_id, kind, gross_cents, fees_cents, net_cents, "
-                "stopped, rung, detail, ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                "stopped, rung, regime, settled, detail, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (window_id, kind, int(gross_cents), int(fees_cents), int(net_cents),
-                 1 if stopped else 0, int(rung), json.dumps(detail or {}, default=str), self._clock()))
+                 1 if stopped else 0, int(rung), regime, 0,
+                 json.dumps(detail or {}, default=str), self._clock()))
             self._conn.commit()
+
+    def mark_settled(self, window_id: str, result: str, booked_net: int, broker_net: int,
+                     mismatch: bool, detail: Optional[Dict[str, Any]] = None) -> None:
+        """Append a broker-truth settlement record (F1.2). Append-only: the model P&L row
+        is left intact; this is the reconciliation beside it."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settlements(window_id, result, booked_net, broker_net, mismatch, "
+                "detail, ts) VALUES (?,?,?,?,?,?,?)",
+                (window_id, result, int(booked_net), int(broker_net), 1 if mismatch else 0,
+                 json.dumps(detail or {}, default=str), self._clock()))
+            self._conn.commit()
+
+    def record_fee_fingerprint(self, fingerprint: str, detail: Optional[Dict[str, Any]] = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO fee_fingerprint(fingerprint, detail, ts) VALUES (?,?,?)",
+                (fingerprint, json.dumps(detail or {}, default=str), self._clock()))
+            self._conn.commit()
+
+    def last_fee_fingerprint(self) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fingerprint FROM fee_fingerprint ORDER BY id DESC LIMIT 1").fetchone()
+            return row["fingerprint"] if row else None
+
+    def realized_flip_stats(self, since_ts: float) -> Dict[str, Any]:
+        """Lived flip performance over a trailing window (F1.5): entered windows and how
+        they resolved, plus the both-legs-flip rate. Replaces the synthetic priors with
+        what the tape actually did."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*) c FROM window_pnl WHERE ts>=? GROUP BY kind",
+                (since_ts,)).fetchall()
+        counts = {r["kind"]: r["c"] for r in rows}
+        entered = sum(v for k, v in counts.items() if k != "sat_out")
+        bundle = counts.get("bundle", 0)
+        flip_rate = round(bundle / entered, 3) if entered else 0.0
+        return {"entered": entered, "bundle": bundle, "sat_out": counts.get("sat_out", 0),
+                "flip_rate": flip_rate, "by_kind": counts}
 
     def day_net_cents(self, since_ts: float) -> int:
         with self._lock:

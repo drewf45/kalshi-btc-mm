@@ -74,6 +74,63 @@ def load_coinbase(minutes: int = 300) -> List[Tuple[float, float]]:
     return rows[-minutes:]
 
 
+def load_coinbase_paginated(days: int, granularity: int = 60,
+                            sleep_s: float = 0.34) -> Tuple[List[Tuple[float, float]], Dict]:
+    """Paginated multi-day fetch (F1.5 — ported doctrine from the old delta_table_builder).
+
+    Coinbase caps candles at ~300 per request, so a real 180-day/1-minute study needs
+    ~860 chunked requests walked backward with start/end. We dedupe by timestamp, sleep
+    between calls to respect the rate limit, and emit a manifest+validator (requests,
+    candles, coverage, gaps) so partial/holey pulls are visible instead of silent.
+    """
+    import time as _time
+    from datetime import datetime, timezone
+    import requests
+
+    def _iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    now = _time.time()
+    start = now - days * 86400
+    chunk = granularity * 300
+    rows: Dict[int, float] = {}
+    manifest = {"days": days, "granularity": granularity, "requests": 0,
+                "empty_requests": 0, "errors": 0}
+    t = start
+    while t < now:
+        e = min(now, t + chunk)
+        try:
+            r = requests.get("https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                             params={"granularity": granularity, "start": _iso(t), "end": _iso(e)},
+                             timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                manifest["empty_requests"] += 1
+            for c in data:
+                rows[int(c[0])] = float(c[4])
+        except Exception as ex:
+            manifest["errors"] += 1
+            print(f"[study] chunk {_iso(t)} failed: {ex}", file=sys.stderr)
+        manifest["requests"] += 1
+        t = e
+        _time.sleep(sleep_s)
+
+    out = sorted(rows.items())
+    manifest["candles"] = len(out)
+    expected = days * 1440
+    manifest["expected_candles"] = expected
+    manifest["coverage_pct"] = round(100.0 * len(out) / expected, 2) if expected else 0.0
+    # gap validator: count missing-minute runs
+    gaps = 0
+    ts_sorted = [t for t, _ in out]
+    for i in range(1, len(ts_sorted)):
+        if ts_sorted[i] - ts_sorted[i - 1] > granularity * 1.5:
+            gaps += 1
+    manifest["gaps"] = gaps
+    return [(float(t), c) for t, c in out], manifest
+
+
 def gen_synthetic(minutes: int, sigma_per_min: float = 120.0, seed: int = 7,
                   start: float = 100_000.0) -> List[Tuple[float, float]]:
     """Deterministic GBM-ish walk (no Math.random needed): a fixed LCG so CI is stable."""
@@ -236,15 +293,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     src.add_argument("--csv", help="candle CSV: time,open,high,low,close")
     src.add_argument("--coinbase", action="store_true", help="pull recent 1m candles live")
     src.add_argument("--synthetic", type=int, metavar="MINUTES", help="generate N minutes of demo candles")
+    ap.add_argument("--days", type=int, default=0,
+                    help="with --coinbase: paginate this many days back (e.g. 180)")
     ap.add_argument("--out", default=".", help="output directory")
     ap.add_argument("--sigma-low", type=float, default=6.0)
     ap.add_argument("--sigma-high", type=float, default=18.0)
     args = ap.parse_args(argv)
 
+    manifest = None
     if args.csv:
         rows, source = load_csv(args.csv), f"csv:{os.path.basename(args.csv)}"
     elif args.coinbase:
-        rows, source = load_coinbase(), "coinbase:1m"
+        if args.days and args.days > 0:
+            rows, manifest = load_coinbase_paginated(args.days)
+            source = f"coinbase:{args.days}d:1m"
+        else:
+            rows, source = load_coinbase(), "coinbase:1m"
     else:
         rows, source = gen_synthetic(args.synthetic), f"synthetic:{args.synthetic}m"
 
@@ -259,6 +323,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     write_summary(windows, gate, os.path.join(args.out, "crossing_study_summary.md"), source)
     with open(os.path.join(args.out, "flipdesk_gate.json"), "w") as f:
         json.dump(gate, f, indent=2)
+    if manifest is not None:
+        with open(os.path.join(args.out, "crossing_study_manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"fetch manifest: {manifest['candles']}/{manifest['expected_candles']} candles "
+              f"({manifest['coverage_pct']}%), {manifest['gaps']} gaps, "
+              f"{manifest['requests']} requests, {manifest['errors']} errors")
+        if manifest["coverage_pct"] < 90.0:
+            print("WARNING: coverage < 90% — the study is holey; do not seed the gate from it",
+                  file=sys.stderr)
 
     print(f"analyzed {len(windows)} windows -> {args.out}/crossing_study.csv, "
           f"crossing_study_summary.md, flipdesk_gate.json")

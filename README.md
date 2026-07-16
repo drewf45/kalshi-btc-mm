@@ -46,6 +46,9 @@ f_worker/
   desk.py         the window loop: discover → run one window → book → next
   notify.py       Telegram (🅵 prefix); inbound is ONLY /fhalt + /fstatus
   fpack.py        hourly pack (broker-truth beside ledger-truth) + boot echo
+  reconcile.py    F1.1 boot reconcile / orphan sweep (cancel resting, flatten held)
+  settlement.py   F1.2 settlement broker-truth (poll result, reconcile, alert)
+  feewatch.py     F1.3 fee tripwire (fingerprint the schedule; change -> halt + alert)
   lib/            borrowed-from-bot.py parts:
     kalshi.py       the ONLY module that imports cryptography (signed client)
     marketutil.py   crypto-free: orderbook parse, payload build, close-ts, discovery
@@ -85,10 +88,30 @@ FATAL-checked: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM_BASE64`. Soft:
 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` (absent ⇒ notify is a logged no-op). `DRY_RUN=1`
 records intent but never submits.
 
+## Between-windows hardening (Work Order F1)
+
+The walls guard the desk while it trades; F1 guards it while it crashes, restarts,
+settles, and learns:
+
+- **F1.1 Boot reconcile / orphan sweep** (`reconcile.py`) — before the desk takes any new
+  risk, it cancels every resting order on the series and flattens any held leg the broker
+  reports (a crash/deploy orphan) through the manager's normal exit path, paging
+  `🅵 🚨 ORPHAN RECOVERED`. The reconcile line reaches the phone before the first window.
+- **F1.2 Settlement broker-truth** (`settlement.py`) — a floor ride is reconciled against
+  the market's actual result; a void/refund is a mismatch that alerts instead of drifting
+  the ledger silently. A `settlements` row is appended beside the model P&L.
+- **F1.3 Fee tripwire** (`feewatch.py`) — the series fee schedule is fingerprinted at boot
+  and re-checked every 6h; any change trips `flip_halt` + alert. The economics die loudly.
+- **F1.5 Real crossing study** — `tools/crossing_study.py --coinbase --days 180` paginates
+  Coinbase's 300-candle cap into a multi-day pull with a manifest+validator (coverage %,
+  gaps). The pack prints the **lived** 7-day flip rate so tape supersedes synthetic priors.
+- **F1.6** — the hourly pack carries rung, halt, day-net beside account, mem, and the lived
+  flip rate; every fill records its broker fee + taker flag.
+
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 41 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 54 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

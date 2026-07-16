@@ -143,6 +143,14 @@ class KalshiClient:
         resp = self.request("GET", f"/markets/{market_ticker}/orderbook", params={"depth": depth})
         return resp if isinstance(resp, dict) else {}
 
+    def get_market(self, market_ticker: str) -> Dict[str, Any]:
+        """Single market object — carries status/result (for settlement broker-truth) and
+        the fee params (for the fee tripwire)."""
+        resp = self.request("GET", f"/markets/{market_ticker}")
+        if isinstance(resp, dict):
+            return resp.get("market") if isinstance(resp.get("market"), dict) else resp
+        return {}
+
     def list_markets(self, series_ticker: str, status: str = "open", limit: int = 200) -> List[Dict[str, Any]]:
         resp = self.request("GET", "/markets",
                             params={"series_ticker": series_ticker, "status": status, "limit": limit})
