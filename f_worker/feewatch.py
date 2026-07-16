@@ -54,7 +54,11 @@ class FeeTripwire:
         baseline = self.ledger.last_fee_fingerprint()
         try:
             mkt = self.client.get_market(market_ticker)
-        except Exception:
+        except Exception as e:
+            # couldn't read the schedule this cycle — say so; do NOT infer "unchanged".
+            print(f"[feewatch] check fetch failed ({e}); will retry next cycle", flush=True)
+            if self.notifier:
+                self.notifier.alert(f"fee tripwire could not read {market_ticker} fees: {e}")
             return False
         fp = fee_fingerprint(mkt)
         if baseline is None:

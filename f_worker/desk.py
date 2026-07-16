@@ -36,6 +36,8 @@ class Desk:
         self.settler = settler
         self._last_window_id: Optional[str] = None
         self._cur_market: Optional[str] = None
+        self._cur_win: Optional["W.Window"] = None
+        self._err_seen: Dict[tuple, float] = {}
         self._stop = False
 
     def stop(self) -> None:
@@ -44,13 +46,35 @@ class Desk:
     def current_market(self) -> Optional[str]:
         return self._cur_market
 
+    # ---- loud-tape law: no error reaches the loop without a tagged row + a phone line ----
+    def _stage_err(self, win: Optional["W.Window"], stage: str, e: Exception,
+                   throttle: float = float("inf")) -> None:
+        """Record a STAGE_ERR evidence row and page Drew. Per-window stages report once
+        (window_id keys are unique); desk-level stages (discovery) throttle by time so a
+        dead feed pages periodically, not every second."""
+        wid = win.window_id if win else "-"
+        key = (wid, stage)
+        now = time.time()
+        last = self._err_seen.get(key)
+        if last is not None and (now - last) < throttle:
+            return
+        self._err_seen[key] = now
+        try:
+            self.ledger.record_transition(wid, None, "STAGE_ERR", {"stage": stage, "error": str(e)})
+        except Exception:
+            pass
+        if self.notifier:
+            wtag = f"W{win.tag()}" if win else "desk"
+            self.notifier.send(f"⚠ {wtag} — {stage} error: {e}")
+
     # ---- fill polling (match our order ids on the fills tape) ----
     def _poll_fills(self, win: "W.Window", order_ids: Dict[str, Optional[str]],
                     action: str) -> Dict[str, int]:
         found: Dict[str, int] = {}
         try:
             fills = self.client.get_fills(win.market_ticker)
-        except Exception:
+        except Exception as e:
+            self._stage_err(self._cur_win, "fills_poll", e)
             return found
         want = {v: s for s, v in order_ids.items() if v}
         for f in fills:
@@ -74,7 +98,8 @@ class Desk:
     def _best_bid(self, side: str) -> Optional[int]:
         try:
             ob = self.client.get_orderbook(self._cur_market)
-        except Exception:
+        except Exception as e:
+            self._stage_err(self._cur_win, "book_fetch", e)
             return None
         yb, ya, nb, na = parse_best_yes_no(ob)
         return yb if side == "yes" else nb
@@ -82,6 +107,7 @@ class Desk:
     # ---- run exactly one window to a terminal state ----
     def run_window(self, win: "W.Window") -> None:
         self._cur_market = win.market_ticker
+        self._cur_win = win
         self.ledger.record_window(win.window_id, win.market_ticker, win.event_ticker,
                                   win.open_ts, win.close_ts, win.rung)
 
@@ -96,6 +122,10 @@ class Desk:
         ob = self._safe_ob(win.market_ticker)
         gate = self.pb.gate_window(ob)
         if not gate.ok:
+            # gate REFUSED — carry the reason + evidence (σ/regime/BLIND) onto the tape
+            win.regime = gate.regime
+            win.sat_reason = gate.reason
+            win.sat_evidence = dict(gate.evidence or {})
             win.transition(W.SAT_OUT, {"gate": gate.reason, "evidence": gate.evidence})
             self.mgr._book(win)
             return
@@ -112,7 +142,9 @@ class Desk:
             fills.update(self._poll_fills(win, {"yes": win.yes_entry_oid, "no": win.no_entry_oid}, "buy"))
             if len(fills) < 2:
                 time.sleep(self.cfg.poll_seconds)
-        self.mgr.settle_entry_phase(win, fills, self._seconds_to_close(win))
+        # one final touch snapshot so a no-fill sat-out shows where the market was
+        touch = self._touch(win.market_ticker) if len(fills) < 2 else None
+        self.mgr.settle_entry_phase(win, fills, self._seconds_to_close(win), touch=touch)
         if win.is_terminal:
             return
 
@@ -162,8 +194,15 @@ class Desk:
     def _safe_ob(self, market_ticker: str) -> Dict[str, Any]:
         try:
             return self.client.get_orderbook(market_ticker)
-        except Exception:
+        except Exception as e:
+            self._stage_err(self._cur_win, "book_fetch", e)
             return {}
+
+    def _touch(self, market_ticker: str) -> Dict[str, Any]:
+        """Final best-bid snapshot at entry-phase end: where the market was while our
+        bids sat, so a no-fill sat-out can prove the touch (loud-tape law)."""
+        yb, ya, nb, na = parse_best_yes_no(self._safe_ob(market_ticker))
+        return {"yes_bid": yb, "no_bid": nb}
 
     # ---- the outer forever-loop ----
     def loop_once(self) -> Optional[str]:
@@ -173,7 +212,11 @@ class Desk:
             self.notifier and self.notifier.send(f"desk idle — flip_halt set ({reason}); "
                                                  f"clear with DW_CLEAR_HALT=1 boot")
             return None
-        disc = self.client.discover_market(self.cfg.series_ticker)
+        try:
+            disc = self.client.discover_market(self.cfg.series_ticker)
+        except Exception as e:
+            self._stage_err(None, "discovery", e, throttle=60.0)
+            return None
         if not disc:
             return None
         event_ticker, market_ticker, mkt, close_ts = disc

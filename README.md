@@ -108,10 +108,24 @@ settles, and learns:
 - **F1.6** — the hourly pack carries rung, halt, day-net beside account, mem, and the lived
   flip rate; every fill records its broker fee + taker flag.
 
+## Loud tape (Drew's law)
+
+Everything fails or tags *why*, loudly — no decision, skip, or error reaches the tape
+without its reason + evidence attached:
+
+- A `SAT_OUT` line says **which** kind it was, because they are different findings:
+  `SAT_OUT (gate: vol too calm to cross a strike | σ=4.1 low)` (gate refused — tune the
+  gate) vs `SAT_OUT (posted 49/48, 0 fills in 60s | touch 51/50)` (bids posted, nobody
+  filled — a thesis finding) vs `SAT_OUT (gate: BLIND: spot/sigma feed unavailable)`
+  (the feed is down — fail closed, never a crash, never a trade).
+- Every desk-loop IO error (discovery, fills poll, book fetch) writes a tagged
+  `STAGE_ERR` evidence row and pages a `⚠` line (rate-limited to once per window;
+  desk-level stages throttle by time), instead of a silent `except: return`.
+
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 54 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 61 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

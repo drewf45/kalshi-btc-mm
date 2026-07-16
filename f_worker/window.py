@@ -74,6 +74,13 @@ class Window:
     # entry order handles (for cancel-at-phase-end)
     yes_entry_oid: Optional[str] = None
     no_entry_oid: Optional[str] = None
+    posted_yes: Optional[int] = None      # entry bid prices we posted (for sat-out tape)
+    posted_no: Optional[int] = None
+
+    # why a SAT_OUT happened, with evidence (the tape must always say which — gate
+    # refusal vs bids-posted-no-fill vs blind feed)
+    sat_reason: Optional[str] = None
+    sat_evidence: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         self._ledger = None  # injected via bind_ledger
@@ -98,6 +105,16 @@ class Window:
     @property
     def is_terminal(self) -> bool:
         return self.state in TERMINAL
+
+    def tag(self) -> str:
+        """HH:MM (NY) window label for tape lines, or ?? when close_ts is unknown."""
+        if not self.close_ts:
+            return "??:??"
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromtimestamp(int(self.close_ts), tz=timezone.utc).astimezone(
+            ZoneInfo("America/New_York"))
+        return dt.strftime("%H:%M")
 
     # ---- inventory helpers ----
     def add_fill(self, side: str, price: int, count: int, order_id: Optional[str] = None) -> None:

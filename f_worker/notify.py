@@ -73,7 +73,10 @@ class Notifier:
                 elif text.startswith("/fstatus"):
                     self.send(on_status())
                 # every other command is silently dropped — the phone cannot excite risk
-        except Exception:
+        except Exception as e:
+            # the pager can't page about its own poll failure; be loud on stdout so a
+            # dead command channel is visible in the logs, then retry next tick.
+            print(f"[notify:poll_error] {e}", flush=True)
             return
 
     def listen_loop(self, on_halt: Callable[[], None], on_status: Callable[[], str],

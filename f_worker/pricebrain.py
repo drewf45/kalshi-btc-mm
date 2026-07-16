@@ -92,6 +92,11 @@ class PriceBrain:
         it is unit-testable with a synthetic book."""
         if sigma is None:
             sigma = self.sigma()
+        if sigma is None:
+            # BLIND: the spot/sigma feed is down. Fail CLOSED with its own reason — never
+            # round(None) into a crash, never trade on a feed we can't see.
+            return GateDecision(False, "BLIND: spot/sigma feed unavailable", regime="blind",
+                                evidence={"sigma": None, "feed": "coinbase", "fresh": False})
         regime = self.vol_regime(sigma)
         yb, ya, nb, na = parse_best_yes_no(orderbook)
         ev: Dict[str, Any] = {"sigma": round(sigma, 3), "regime": regime,

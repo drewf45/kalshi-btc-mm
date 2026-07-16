@@ -30,8 +30,11 @@ def compute_window_pnl(win: "W.Window", cfg: Config) -> Dict[str, Any]:
     taker fee (W8, exact roundup); flip and floor legs are fee-free (maker / settlement)."""
     legs = win.legs
     if not legs:
+        # a sat-out is a first-class finding — it carries WHY (gate refusal vs bids
+        # posted with no fill vs blind feed) and its evidence onto the tape.
         return {"kind": KIND_SAT_OUT, "gross_cents": 0, "fees_cents": 0,
-                "net_cents": 0, "stopped": False}
+                "net_cents": 0, "stopped": False,
+                "reason": win.sat_reason or "?", "evidence": win.sat_evidence or {}}
 
     gross = 0
     fees = 0
@@ -83,7 +86,20 @@ def window_story(win: "W.Window", pnl: Dict[str, Any]) -> str:
     net = pnl["net_cents"]
     sign = "+" if net >= 0 else ""
     if kind == KIND_SAT_OUT:
-        return f"⏭ W{tag} — SAT_OUT (no fill ≤ line) | DONE"
+        ev = pnl.get("evidence") or {}
+        if "posted_yes" in ev:
+            # bids POSTED, nobody filled — a thesis finding; show where the touch was
+            t = ev.get("touch") or {}
+            secs = ev.get("entry_window_sec", "?")
+            return (f"⏭ W{tag} — SAT_OUT (posted {ev.get('posted_yes')}/{ev.get('posted_no')}, "
+                    f"0 fills in {secs}s | touch {t.get('yes_bid', '?')}/{t.get('no_bid', '?')}) "
+                    f"| DONE")
+        # gate REFUSED (nothing posted) — a gate-tuning finding; show σ/regime
+        r = pnl.get("reason", "?")
+        sig = ev.get("sigma")
+        reg = ev.get("regime", "?")
+        detail = f" | σ={sig} {reg}" if sig is not None else ""
+        return f"⏭ W{tag} — SAT_OUT (gate: {r}{detail}) | DONE"
     if kind == KIND_FLOOR:
         cost = sum(l.entry_price * l.count for l in win.legs)
         return f"🔁 W{tag} — bundle {_bundle_str(win)}={cost} | rode floor → {sign}{net}¢ | DONE"
@@ -126,14 +142,18 @@ class Manager:
 
     # ---- SEEKING: post the one entry phase ----
     def post_entry(self, win: "W.Window", gate: Any, seconds_to_close: Optional[int]) -> None:
+        win.posted_yes, win.posted_no = gate.yes_price, gate.no_price
         yoid, noid = self.gw.post_entry_pair(win.window_id, win.market_ticker,
                                              gate.yes_price, gate.no_price, seconds_to_close)
         win.yes_entry_oid, win.no_entry_oid = yoid, noid
 
     def settle_entry_phase(self, win: "W.Window", fills: Dict[str, int],
-                           seconds_to_close: Optional[int]) -> None:
+                           seconds_to_close: Optional[int],
+                           touch: Optional[Dict[str, Any]] = None) -> None:
         """fills: {side: fill_price} for legs that filled during the entry phase.
-        Cancels any unfilled entry order, then routes per the One-Shot Law."""
+        `touch` is a final best-bid snapshot (yes_bid/no_bid) taken at phase end so a
+        no-fill sat-out can show WHERE the market was while our bids sat. Cancels any
+        unfilled entry order, then routes per the One-Shot Law."""
         # cancel unfilled resting entry bids
         if "yes" not in fills and win.yes_entry_oid:
             self.gw.cancel(win.yes_entry_oid)
@@ -158,7 +178,10 @@ class Manager:
                 win.transition(W.EXITING, {"reason": "lone leg > single_leg_max",
                                            "side": side, "price": price})
         else:
-            win.transition(W.SAT_OUT, {"reason": "no fill in entry phase"})
+            win.sat_reason = "posted, no fill in entry phase"
+            win.sat_evidence = {"posted_yes": win.posted_yes, "posted_no": win.posted_no,
+                                "touch": touch or {}, "entry_window_sec": self.cfg.entry_window_sec}
+            win.transition(W.SAT_OUT, {"reason": win.sat_reason, "evidence": win.sat_evidence})
             self._book(win)
 
     # ---- HOLDING: post flip asks for every still-held leg ----
@@ -235,7 +258,8 @@ class Manager:
         self.ledger.record_pnl(win.window_id, pnl["kind"], pnl["gross_cents"], pnl["fees_cents"],
                                pnl["net_cents"], pnl["stopped"], win.rung,
                                regime=getattr(win, "regime", None),
-                               detail={"legs": [vars(l) for l in win.legs]})
+                               detail={"legs": [vars(l) for l in win.legs],
+                                       "reason": pnl.get("reason"), "evidence": pnl.get("evidence")})
         story = window_story(win, pnl)
         if self.notifier is not None:
             self.notifier.send(story)
