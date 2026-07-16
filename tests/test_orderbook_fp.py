@@ -52,6 +52,29 @@ class TestFpParse(unittest.TestCase):
         self.assertEqual(keys, ["orderbook_fp"])
         self.assertEqual(sample, ["0.4700", "120"])
 
+    # THE LAST KEY: the real fp containers are yes_dollars / no_dollars (official docs).
+    def test_official_docs_fixture(self):
+        ob = {"orderbook_fp": {"yes_dollars": [["0.1500", "100.00"]],
+                               "no_dollars":  [["0.1500", "100.00"]]}}
+        yb, ya, nb, na = parse_best_yes_no(ob)
+        self.assertEqual((yb, nb), (15, 15))
+        self.assertEqual((ya, na), (85, 85))
+
+    def test_ascending_highest_bid_last(self):
+        # arrays are sorted ASCENDING (highest bid last); max() must still win
+        ob = {"orderbook_fp": {"yes_dollars": [["0.4400", "50"], ["0.4700", "120"]],
+                               "no_dollars":  [["0.4500", "60"], ["0.4800", "90"]]}}
+        yb, ya, nb, na = parse_best_yes_no(ob)
+        self.assertEqual(yb, 47)
+        self.assertEqual(nb, 48)
+        self.assertEqual(ya, 52)   # 100 - no_bid(48)
+        self.assertEqual(na, 53)   # 100 - yes_bid(47)
+
+    def test_dollars_sample_for_evidence(self):
+        ob = {"orderbook_fp": {"yes_dollars": [["0.1500", "100.00"]], "no_dollars": []}}
+        keys, sample = raw_book_sample(ob)
+        self.assertEqual(sample, ["0.1500", "100.00"])
+
 
 class TestSigmaHonesty(unittest.TestCase):
     def setUp(self):

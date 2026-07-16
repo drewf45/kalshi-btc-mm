@@ -252,7 +252,7 @@ def raw_book_sample(ob: Dict[str, Any]) -> Tuple[List[str], Any]:
     keys = list(ob.keys())
     root = _unwrap_book(ob)
     if isinstance(root, dict):
-        for side in ("yes", "no"):
+        for side in ("yes_dollars", "no_dollars", "yes", "no"):
             sub = root.get(side)
             if isinstance(sub, list) and sub:
                 return keys, sub[0]
@@ -268,19 +268,25 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
     if not isinstance(ob, dict):
         return None, None, None, None
     root = _unwrap_book(ob)
+    # THE LAST KEY: per Kalshi's official Get-Market-Orderbook docs the fp inner containers
+    # are `yes_dollars` / `no_dollars` (lists of [price_str, count_str] pairs), NOT
+    # `yes` / `no`. F2 unwrapped the envelope but read the wrong keys — the whole "book
+    # missing a side" saga was this. The book is BIDS ONLY, sorted ASCENDING (highest bid
+    # last); _best_from_levels' max() handles the ordering, and the complement logic below
+    # turns a YES bid at p into the NO ask at 100-p.
+    y_c = root.get("yes_dollars", root.get("yes")) if isinstance(root, dict) else None
+    n_c = root.get("no_dollars", root.get("no")) if isinstance(root, dict) else None
     yes_bid = yes_ask = no_bid = no_ask = None
-    if isinstance(root, dict) and isinstance(root.get("yes"), dict):
-        y = root.get("yes", {}); n = root.get("no", {})
-        yes_bid = _best_from_levels(y.get("bids", y.get("buy")), "bid")
-        yes_ask = _best_from_levels(y.get("asks", y.get("sell")), "ask")
-        if isinstance(n, dict):
-            no_bid = _best_from_levels(n.get("bids", n.get("buy")), "bid")
-            no_ask = _best_from_levels(n.get("asks", n.get("sell")), "ask")
-    if isinstance(root, dict) and (isinstance(root.get("yes"), list) or isinstance(root.get("no"), list)):
-        if yes_bid is None and isinstance(root.get("yes"), list):
-            yes_bid = _best_from_levels(root.get("yes"), "bid")
-        if no_bid is None and isinstance(root.get("no"), list):
-            no_bid = _best_from_levels(root.get("no"), "bid")
+    if isinstance(y_c, dict):
+        yes_bid = _best_from_levels(y_c.get("bids", y_c.get("buy")), "bid")
+        yes_ask = _best_from_levels(y_c.get("asks", y_c.get("sell")), "ask")
+    if isinstance(n_c, dict):
+        no_bid = _best_from_levels(n_c.get("bids", n_c.get("buy")), "bid")
+        no_ask = _best_from_levels(n_c.get("asks", n_c.get("sell")), "ask")
+    if yes_bid is None and isinstance(y_c, list):
+        yes_bid = _best_from_levels(y_c, "bid")
+    if no_bid is None and isinstance(n_c, list):
+        no_bid = _best_from_levels(n_c, "bid")
     if yes_ask is None and no_bid is not None:
         yes_ask = clamp_int(100 - no_bid, 1, 99)
     if no_ask is None and yes_bid is not None:
