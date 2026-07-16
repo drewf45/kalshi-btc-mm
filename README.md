@@ -40,7 +40,7 @@ f_worker/
   pricebrain.py   spot/vol-regime feed + delta-table gate loader + the D4 window gate
   ledger.py       flipdesk.db — APPEND-ONLY: windows, events, orders, fills, pnl,
                   size_ladder, halt
-  fgateway.py     THE ONLY order path — walls W1..W8, one place calls place_order
+  fgateway.py     THE ONLY order path — walls W1..W8, one place calls create_order (V2 events route)
   window.py       the state machine: IDLE→SEEKING→HOLDING→EXITING→DONE (+SAT_OUT)
   manager.py      flip asks, salvage walk, T-90 flat, knee accounting (window P&L)
   desk.py         the window loop: discover → run one window → book → next
@@ -87,6 +87,24 @@ order path (W5).
 FATAL-checked: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM_BASE64`. Soft:
 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` (absent ⇒ notify is a logged no-op). `DRY_RUN=1`
 records intent but never submits.
+
+## The order grammar (WO-F4 — ported from the proven engine)
+
+The single order path builds the **V2 events grammar** that placed hundreds of live fills
+in `k_worker` — not the pre-V2 body f_worker shipped with (which the live exchange would
+reject). `lib/order_v2.py` is the crypto-free, unit-tested translation:
+
+- Place always `POST`s `/portfolio/events/orders`; orders/fills routes are probed at boot
+  (FATAL if neither responds); cancel is the events route with a legacy 404-fallback.
+- Every intent collapses to **bid/ask on the YES leg only**, price a **dollar string**,
+  count a **string**: buy YES→bid p; buy NO→ask (100−p); sell YES→ask q; sell NO→bid (100−q).
+  Entries can rest at the exact `orderbook_fp` subpenny touch (`v2_price_str`).
+- Body carries `client_order_id`, `time_in_force`, `post_only`, `self_trade_prevention_type`,
+  and **W4b** `expiration_time = close_ts − flat_at_t` so an order dies with its window at
+  the exchange (the orphan sweep becomes the second line of defense).
+- Maker = `post_only:true` (entries/flips); **taker** = `post_only:false` (salvage/flat) is
+  the one path no code of ours has run — same body; prove it in demo/1-lot probe before
+  trusting it. Fills are read back with the proven `parse_fill` (YES↔NO complement, fp strings).
 
 ## Discovery: the computed bell
 
@@ -150,7 +168,7 @@ without its reason + evidence attached:
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 99 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 112 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

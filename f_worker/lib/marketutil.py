@@ -302,6 +302,99 @@ def parse_best_yes_no(ob: Dict[str, Any]) -> Tuple[Optional[int], Optional[int],
     return yes_bid, yes_ask, no_bid, no_ask
 
 
+def parse_fill(fill: Dict[str, Any], our_side: str) -> Tuple[Optional[float], int, int]:
+    """Parse a Kalshi V2 fill into (price_cents, fee_cents, count) in OUR-side terms —
+    ported from k_worker/kalshi.py:parse_fill (the proven engine's fill reader). For a
+    BUY fill this is our entry cost; for a SELL fill it is our exit proceeds. Handles the
+    fp shapes seen on the live tape (yes_price/no_price as dollar strings, count_fp,
+    fee_cost) and complements NO<->YES (a value < 1 is dollars). Returns (None, fee,
+    count) when price is unparseable so the caller can fall back."""
+    from decimal import Decimal
+    inner = fill
+    for wrap_key in ("fill", "order"):
+        if isinstance(fill.get(wrap_key), dict):
+            inner = fill[wrap_key]
+            break
+    dicts = [inner, fill] if inner is not fill else [fill]
+
+    def _get(key):
+        for d in dicts:
+            v = d.get(key)
+            if v is not None:
+                return v
+        return None
+
+    def _to_cents(raw):
+        if raw is None:
+            return None
+        try:
+            val = Decimal(str(raw))
+            return float(val * 100) if val < 1 else float(val)
+        except Exception:
+            return None
+
+    def _raw_cents(raw):
+        try:
+            return float(raw) if raw is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    count = 1
+    for ck in ("count", "count_fp", "quantity", "qty"):
+        raw = _get(ck)
+        if raw is not None:
+            try:
+                count = int(Decimal(str(raw)))
+            except Exception:
+                pass
+            break
+
+    yk, nk = ("yes_price", "yes_price_dollars"), ("no_price", "no_price_dollars")
+    price = None
+    if our_side == "yes":
+        for k in yk:
+            price = _to_cents(_get(k))
+            if price is not None:
+                break
+        if price is None:
+            price = _raw_cents(_get("yes_price_cents"))
+        if price is None:
+            for k in nk:
+                v = _to_cents(_get(k))
+                if v is not None:
+                    price = 100 - v
+                    break
+    else:
+        for k in nk:
+            price = _to_cents(_get(k))
+            if price is not None:
+                break
+        if price is None:
+            price = _raw_cents(_get("no_price_cents"))
+        if price is None:
+            for k in yk:
+                v = _to_cents(_get(k))
+                if v is not None:
+                    price = 100 - v
+                    break
+    if price is None:
+        v = _to_cents(_get("price"))
+        if v is not None:
+            price = v if our_side == "yes" else (100 - v)
+
+    fee_cents = 0
+    for fk in ("fee", "fee_cost", "taker_fee", "maker_fee"):
+        raw = _get(fk)
+        if raw is not None:
+            try:
+                val = Decimal(str(raw))
+                fee_cents = int(val * 100) if val < 1 else int(val)
+            except Exception:
+                pass
+            break
+    return price, fee_cents, count
+
+
 def build_order_payload(market_ticker: str, action: str, side: str, price_cents: int,
                         count: int, post_only: bool, order_type: str = "limit") -> Dict[str, Any]:
     """Borrowed from bot.py:build_order_payload; adds market-order type for T-90 flat."""

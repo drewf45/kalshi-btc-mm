@@ -16,33 +16,69 @@ PREFIX = "🅵 "
 
 
 class Notifier:
-    def __init__(self, token: str, chat_id: str):
+    # lost-letters: a Telegram send that fails is QUEUED, not dropped, and flushed ahead
+    # of the next send (ported from k_worker/notify.py:_send_sync). Retries once on a
+    # connection error before queuing. Capped so a long outage can't grow unbounded.
+    _QUEUE_CAP = 100
+
+    def __init__(self, token: str, chat_id: str, sleep: Optional[Callable[[float], None]] = None):
         self.token = token or ""
         self.chat_id = chat_id or ""
         self.session = requests.Session()
         self._enabled = bool(self.token and self.chat_id)
         self._offset = 0
+        self._pending: List[str] = []
+        self._qlock = threading.Lock()
+        self._sleep = sleep or time.sleep
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    def send(self, text: str) -> bool:
-        """Send one line, prefixed. No-op (returns False) if Telegram not configured."""
-        line = text if text.startswith(PREFIX) else PREFIX + text
-        if not self._enabled:
-            print(f"[notify:disabled] {line}", flush=True)
-            return False
+    def _do_send(self, line: str) -> bool:
         try:
             r = self.session.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": self.chat_id, "text": line, "disable_web_page_preview": True},
-                timeout=10.0,
-            )
+                timeout=10.0)
             return r.status_code < 400
+        except (ConnectionError, requests.ConnectionError, requests.Timeout, OSError) as e:
+            print(f"[notify:conn] {e}; retry in 2s", flush=True)
+            self._sleep(2)
+            try:
+                r = self.session.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": line, "disable_web_page_preview": True},
+                    timeout=10.0)
+                return r.status_code < 400
+            except Exception as e2:
+                print(f"[notify:retry-failed] {e2}", flush=True)
+                return False
         except Exception as e:
-            print(f"[notify:error] {e}: {line}", flush=True)
+            print(f"[notify:error] {e}", flush=True)
             return False
+
+    def send(self, text: str) -> bool:
+        """Send one line, prefixed. Flushes any queued (lost) letters first; a failed send
+        is re-queued (dead-letter), never silently dropped. No-op if not configured."""
+        line = text if text.startswith(PREFIX) else PREFIX + text
+        if not self._enabled:
+            print(f"[notify:disabled] {line}", flush=True)
+            return False
+        with self._qlock:
+            batch = self._pending + [line]
+            self._pending = []
+        ok = False
+        for msg in batch:
+            if self._do_send(msg):
+                ok = True
+            else:
+                with self._qlock:
+                    self._pending.append(msg)
+                    if len(self._pending) > self._QUEUE_CAP:   # drop oldest, loudly
+                        dropped = self._pending.pop(0)
+                        print(f"[notify:dropped] queue full, dropped: {dropped}", flush=True)
+        return ok
 
     def alert(self, text: str) -> bool:
         """Alerts-only channel (§5): halt, two-stop, wall-violation BUG, reconcile, FATAL."""

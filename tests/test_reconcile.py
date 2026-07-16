@@ -45,10 +45,10 @@ class TestReconcile(unittest.TestCase):
                                      "no": {"bids": [[52, 5]], "asks": [[54, 5]]}}})
         summary = rec.boot_reconcile()
         self.assertEqual(summary["orphans"], 1)
-        # a market-out order was placed to flatten the held YES leg
+        # a crossing (taker) order was placed to flatten the held YES leg: sell YES -> ASK
         self.assertEqual(len(client.placed), 1)
-        self.assertEqual(client.placed[0]["side"], "yes")
-        self.assertEqual(client.placed[0]["type"], "market")
+        self.assertEqual(client.placed[0]["side"], "ask")       # V2: sell yes == ask yes
+        self.assertFalse(client.placed[0]["post_only"])         # taker
         # the recovery is booked and Drew was paged
         self.assertEqual(led.state_counts(0).get(KIND_SALVAGE), 1)
         self.assertTrue(any("ORPHAN RECOVERED" in a for a in notif.alerts))
@@ -66,7 +66,7 @@ class TestReconcile(unittest.TestCase):
             orderbook={"orderbook": {"yes": {"bids": [[50, 5]], "asks": [[52, 5]]},
                                      "no": {"bids": [[46, 5]], "asks": [[48, 5]]}}})
         rec.boot_reconcile()
-        self.assertEqual(client.placed[0]["side"], "no")
+        self.assertEqual(client.placed[0]["side"], "bid")       # V2: sell no == bid yes
 
 
 if __name__ == "__main__":

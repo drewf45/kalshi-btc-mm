@@ -145,10 +145,17 @@ class Manager:
         self.notifier = notifier
 
     # ---- SEEKING: post the one entry phase ----
+    def _expiry(self, win: "W.Window") -> Optional[int]:
+        """W4b: orders die with their window at the exchange — at T-flat_at_t."""
+        return (win.close_ts - self.cfg.flat_at_t) if win.close_ts else None
+
     def post_entry(self, win: "W.Window", gate: Any, seconds_to_close: Optional[int]) -> None:
         win.posted_yes, win.posted_no = gate.yes_price, gate.no_price
-        yoid, noid = self.gw.post_entry_pair(win.window_id, win.market_ticker,
-                                             gate.yes_price, gate.no_price, seconds_to_close)
+        yoid, noid = self.gw.post_entry_pair(
+            win.window_id, win.market_ticker, gate.yes_price, gate.no_price, seconds_to_close,
+            expiration_ts=self._expiry(win),
+            yes_price_str=getattr(gate, "yes_price_str", None),
+            no_price_str=getattr(gate, "no_price_str", None))
         win.yes_entry_oid, win.no_entry_oid = yoid, noid
 
     def settle_entry_phase(self, win: "W.Window", fills: Dict[str, int],
@@ -194,7 +201,8 @@ class Manager:
         for leg in win.held_legs():
             ask = self.pb.flip_ask_price(leg.side, leg.entry_price)
             oid = self.gw.post_flip_ask(win.window_id, win.market_ticker, leg.side,
-                                        leg.entry_price, ask, is_lone, seconds_to_close)
+                                        leg.entry_price, ask, is_lone, seconds_to_close,
+                                        expiration_ts=self._expiry(win))
             leg.order_id = oid
 
     def on_flip_fill(self, win: "W.Window", side: str, exit_price: int) -> None:

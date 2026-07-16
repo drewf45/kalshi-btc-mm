@@ -32,10 +32,10 @@ class FakeClient:
         self.balance_calls += 1
         return self.avail, self.total
 
-    def place_order(self, payload: Dict[str, Any]) -> str:
+    def create_order(self, body: Dict[str, Any]) -> str:
         self._oid += 1
         oid = f"OID-{self._oid}"
-        rec = dict(payload)
+        rec = dict(body)
         rec["order_id"] = oid
         self.placed.append(rec)
         return oid

@@ -33,6 +33,9 @@ class KalshiClient:
         pem_bytes = base64.b64decode(private_key_pem_b64)
         self.private_key = serialization.load_pem_private_key(pem_bytes, password=None)
         self.session = requests.Session()
+        # routes (V2 first, legacy fallback). Overwritten by probe_*_route() at boot.
+        self._orders_route = "/portfolio/events/orders"
+        self._fills_route = "/portfolio/fills"
 
     def _sign_headers(self, method: str, full_url: str) -> Dict[str, str]:
         ts = str(now_ms())
@@ -91,45 +94,69 @@ class KalshiClient:
                     pass
         return av, tot
 
-    # ---- orders / cancels / amends ----
-    def place_order(self, payload: Dict[str, Any]) -> str:
-        resp = self.request("POST", "/portfolio/orders", json_body=payload)
+    # ---- orders / cancels (V2 events grammar; ported from k_worker/kalshi.py) ----
+    # place ALWAYS posts to the V2 events route (proven). The list/cancel routes are
+    # probed at boot; legacy /portfolio/orders is a deprecation fallback only.
+    def create_order(self, body: Dict[str, Any]) -> str:
+        """Submit a V2 order body (built by lib.order_v2). Returns the order_id."""
+        resp = self.request("POST", "/portfolio/events/orders", json_body=body)
         if isinstance(resp, dict):
-            if isinstance(resp.get("order"), dict) and resp["order"].get("order_id"):
-                return str(resp["order"]["order_id"])
             if resp.get("order_id"):
                 return str(resp["order_id"])
-        raise RuntimeError(f"Unexpected create order response: {resp}")
+            if isinstance(resp.get("order"), dict) and resp["order"].get("order_id"):
+                return str(resp["order"]["order_id"])
+        raise RuntimeError(f"Unexpected V2 order response: {resp}")
+
+    def probe_orders_route(self) -> str:
+        """Probe the orders-list route at boot; FATAL if neither candidate works."""
+        for route in ("/portfolio/events/orders", "/portfolio/orders"):
+            try:
+                self.request("GET", route, params={"limit": 1})
+                self._orders_route = route
+                print(f"[ORDERS] route probe {route} ok", flush=True)
+                return route
+            except Exception as e:
+                print(f"[ORDERS] route probe {route} failed ({e})", flush=True)
+        raise RuntimeError("FATAL: no orders-list route responded")
+
+    def probe_fills_route(self) -> str:
+        for route in ("/portfolio/events/fills", "/portfolio/fills"):
+            try:
+                self.request("GET", route, params={"limit": 1})
+                self._fills_route = route
+                print(f"[FILLS] route probe {route} ok", flush=True)
+                return route
+            except Exception as e:
+                print(f"[FILLS] route probe {route} failed ({e})", flush=True)
+        raise RuntimeError("FATAL: no fills route responded")
 
     def cancel_order(self, order_id: str) -> str:
         try:
-            self.request("DELETE", f"/portfolio/orders/{order_id}")
+            self.request("DELETE", f"/portfolio/events/orders/{order_id}")
             return "canceled"
         except RuntimeError as e:
-            if ("HTTP 404" in str(e)) or ("not_found" in str(e)):
-                return "not_found"
+            if "HTTP 404" in str(e):
+                try:
+                    self.request("DELETE", f"{self._orders_route}/{order_id}")
+                    return "canceled"
+                except RuntimeError as e2:
+                    if "HTTP 404" in str(e2):
+                        return "not_found"
+                    raise
             raise
-
-    def amend_order(self, order_id: str, new_price_cents: int, side: str, count: int) -> str:
-        body: Dict[str, Any] = {"count": int(count)}
-        body["yes_price" if side == "yes" else "no_price"] = int(new_price_cents)
-        resp = self.request("POST", f"/portfolio/orders/{order_id}/amend", json_body=body)
-        if isinstance(resp, dict) and isinstance(resp.get("order"), dict):
-            return str(resp["order"].get("order_id", order_id))
-        return order_id
 
     def get_open_orders(self, market_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"status": "resting", "limit": 200}
         if market_ticker:
             params["ticker"] = market_ticker
-        resp = self.request("GET", "/portfolio/orders", params=params)
+        resp = self.request("GET", self._orders_route, params=params)
         return resp.get("orders", []) if isinstance(resp, dict) else (resp or [])
 
     def get_fills(self, market_ticker: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"limit": limit}
         if market_ticker:
             params["ticker"] = market_ticker
-        resp = self.request("GET", "/portfolio/fills", params=params)
+        resp = self.request("GET", self._fills_route, params=params)
         return resp.get("fills", []) if isinstance(resp, dict) else (resp or [])
 
     def get_positions(self) -> List[Dict[str, Any]]:

@@ -12,16 +12,8 @@ from typing import Any, Dict, Optional
 
 from . import window as W
 from .config import Config
-from .lib.marketutil import (parse_best_yes_no, current_window_ticker, next_window_ticker,
-                             throttled_print)
-
-
-def _fill_price(fill: Dict[str, Any], side: str) -> Optional[int]:
-    for k in (("yes_price",) if side == "yes" else ("no_price",)) + ("price",):
-        v = fill.get(k)
-        if isinstance(v, (int, float)):
-            return int(v)
-    return None
+from .lib.marketutil import (parse_best_yes_no, parse_fill, current_window_ticker,
+                             next_window_ticker, throttled_print)
 
 
 class TokenBucket:
@@ -100,9 +92,12 @@ class Desk:
             wtag = f"W{win.tag()}" if win else "desk"
             self.notifier.send(f"⚠ {wtag} — {stage} error: {e}{rate}")
 
-    # ---- fill polling (match our order ids on the fills tape) ----
+    # ---- fill polling (match OUR order ids on the V2 fills tape) ----
     def _poll_fills(self, win: "W.Window", order_ids: Dict[str, Optional[str]],
-                    action: str) -> Dict[str, int]:
+                    action: str = "") -> Dict[str, int]:
+        """Match fills to our order_ids (robust across V2, where fills carry no plain
+        buy/sell action) and read the price in OUR-side cents via the proven parse_fill.
+        For entry fills that's cost; for flip fills it's the exit proceeds."""
         found: Dict[str, int] = {}
         try:
             fills = self.client.get_fills(win.market_ticker)
@@ -111,16 +106,12 @@ class Desk:
             return found
         want = {v: s for s, v in order_ids.items() if v}
         for f in fills:
-            if str(f.get("action", "")).lower() != action:
-                continue
             oid = str(f.get("order_id") or "")
             side = want.get(oid)
-            if side is None:
-                side = str(f.get("side", "")).lower() if f.get("side") in ("yes", "no") else None
             if side in ("yes", "no") and side not in found:
-                p = _fill_price(f, side)
-                if p is not None:
-                    found[side] = p
+                price, _fee, _cnt = parse_fill(f, side)
+                if price is not None:
+                    found[side] = int(round(price))
         return found
 
     def _seconds_to_close(self, win: "W.Window") -> Optional[int]:

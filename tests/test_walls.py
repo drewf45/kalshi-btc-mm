@@ -64,7 +64,7 @@ class TestWalls(unittest.TestCase):
         gw, client, led, _ = _gw()
         led.set_rung(2, lots=4)
         gw.post_entry_pair(WID, MKT, 48, 49, seconds_to_close=300)
-        self.assertTrue(all(o["count"] == 4 for o in client.placed))
+        self.assertTrue(all(o["count"] == "4" for o in client.placed))   # V2 count is a STRING
 
     # ---- W4: no NEW risk inside the flat zone (T-90) ----
     def test_W4_entry_in_flat_zone_blocked(self):

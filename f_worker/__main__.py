@@ -102,6 +102,16 @@ def main() -> None:
     from .lib.kalshi import KalshiClient
     client = KalshiClient(cfg.api_base, cfg.api_prefix, cfg.api_key_id, cfg.private_key_pem_b64)
 
+    # WO-F4: probe the V2 orders/fills routes at boot (FATAL if neither responds) so the
+    # ONLY order path talks to the same endpoints that placed hundreds of real fills.
+    try:
+        client.probe_orders_route()
+        client.probe_fills_route()
+    except Exception as e:
+        notifier.alert(f"FATAL: order/fills route probe failed: {e}")
+        print(f"FATAL: route probe failed: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
     gateway = FGateway(client, ledger, cfg, notifier)
     manager = Manager(gateway, ledger, pricebrain, cfg, notifier)
     settler = Settler(client, ledger, cfg, notifier)

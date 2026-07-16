@@ -96,6 +96,9 @@ class PriceBrain:
         ob_keys, sample = raw_book_sample(orderbook)   # raw material to falsify the parser
         if sigma is None:
             sigma = self.sigma()
+            raw = self._sigma.last_raw    # UN-clamped measurement for the floor/ceil gate
+        else:
+            raw = sigma                   # explicit sigma (tests) is treated as the raw read
         if sigma is None:
             # BLIND: the spot/sigma feed is down. Fail CLOSED with its own reason — never
             # round(None) into a crash, never trade on a feed we can't see. Now REACHABLE
@@ -112,10 +115,13 @@ class PriceBrain:
                               "yes_bid": yb, "yes_ask": ya, "no_bid": nb, "no_ask": na,
                               "ob_keys": ob_keys, "sample": sample}
 
-        # vol regime gate
-        if sigma < self.gate["sigma_floor"]:
+        # vol regime gate — compare the RAW (un-clamped) sigma, else the SigmaCache floor
+        # equals the gate floor and "vol too calm" can NEVER fire (audit fix).
+        gate_sigma = raw if raw is not None else sigma
+        ev["sigma_gate"] = round(gate_sigma, 3)
+        if gate_sigma < self.gate["sigma_floor"]:
             return GateDecision(False, "vol too calm to cross a strike", regime=regime, evidence=ev)
-        if sigma > self.gate["sigma_ceil"]:
+        if gate_sigma > self.gate["sigma_ceil"]:
             return GateDecision(False, "vol too wild for rung 1", regime=regime, evidence=ev)
 
         # need a biddable price on both sides to build a bundle as a maker

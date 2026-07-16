@@ -18,11 +18,14 @@
 # ask): it raises WallViolation AND emits a BUG alert (§5). W2/W4 are also exposed as
 # predicates so the state machine can branch without ever tripping the wall.
 
+import time
+import uuid
 from typing import Any, Dict, Optional, Tuple
 
 from . import feemath
 from .config import Config
 from .ledger import (Ledger, OK_ENTRY_BID, OK_FLIP_ASK, OK_MARKET_OUT, OK_SALVAGE)
+from .lib.order_v2 import build_v2_order   # crypto-free V2 body builder (WO-F4)
 
 
 class WallViolation(RuntimeError):
@@ -33,19 +36,6 @@ class WallViolation(RuntimeError):
         super().__init__(f"{wall}: {detail}")
         self.wall = wall
         self.detail = detail
-
-
-def _build_payload(market_ticker: str, action: str, side: str, price_cents: int,
-                   count: int, post_only: bool, order_type: str = "limit") -> Dict[str, Any]:
-    body: Dict[str, Any] = {
-        "ticker": market_ticker, "action": action, "side": side,
-        "type": order_type, "count": int(count),
-    }
-    if order_type == "limit":
-        body["yes_price" if side == "yes" else "no_price"] = int(price_cents)
-        if post_only:
-            body["post_only"] = True
-    return body
 
 
 class FGateway:
@@ -82,12 +72,11 @@ class FGateway:
 
     # ---------- the single choke point ----------
     def _submit(self, window_id: str, kind: str, market_ticker: str, action: str, side: str,
-                price_cents: int, count: int, post_only: bool, order_type: str,
-                detail: Dict[str, Any]) -> Optional[str]:
-        """The ONLY place that talks to the exchange's create-order endpoint.
-
-        Always re-reads the live balance first (W6). DRY_RUN logs + records intent but
-        never submits."""
+                price_cents: int, count: int, post_only: bool, detail: Dict[str, Any],
+                expiration_ts: Optional[int] = None, v2_price_str: Optional[str] = None) -> Optional[str]:
+        """The ONLY place that talks to the exchange's create-order endpoint. Builds the
+        PROVEN V2 events-order body (WO-F4). Always re-reads the live balance first (W6).
+        DRY_RUN logs + records intent but never submits."""
         avail, total = self.client.get_balance_usd()  # W6: live re-read, EVERY order
         detail = dict(detail)
         detail["bal_avail_usd"] = avail
@@ -99,24 +88,34 @@ class FGateway:
             if avail is not None and avail + 1e-9 < need_usd:
                 raise self._bug("W6", f"insufficient balance {avail} < need {need_usd} for {kind}")
 
-        payload = _build_payload(market_ticker, action, side, price_cents, count, post_only, order_type)
+        # W4b: the order dies with its window at the exchange — but never set a past expiry.
+        exp = int(expiration_ts) if (expiration_ts and int(expiration_ts) > int(time.time())) else None
+        coid = str(uuid.uuid4())
+        body = build_v2_order(market_ticker, action, side, price_cents, count,
+                              post_only=post_only, client_order_id=coid,
+                              expiration_ts=exp, v2_price_str=v2_price_str)
+        detail.update({"v2_side": body["side"], "v2_price": body["price"],
+                       "client_order_id": coid, "post_only": post_only, "expiration_ts": exp})
 
         if self.cfg.dry_run:
             oid = f"DRYRUN-{kind}-{side}-{price_cents}"
-            print(f"[DRY_RUN] would submit {payload}", flush=True)
+            print(f"[DRY_RUN] would submit {body}", flush=True)
         else:
-            oid = self.client.place_order(payload)
+            oid = self.client.create_order(body)
 
         self.ledger.record_order(window_id, kind, side, action, price_cents, count, oid, detail)
         return oid
 
     # ---------- entry (SEEKING) ----------
     def post_entry_pair(self, window_id: str, market_ticker: str, yes_price: int, no_price: int,
-                        seconds_to_close: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+                        seconds_to_close: Optional[int], expiration_ts: Optional[int] = None,
+                        yes_price_str: Optional[str] = None, no_price_str: Optional[str] = None
+                        ) -> Tuple[Optional[str], Optional[str]]:
         """Post the one entry phase for a window: a resting YES bid + NO bid.
 
         Walls fired here: W5 (once per window), W7 (no risk while halted), W4 (no entry
-        in flat zone), W1 (bundle cost <= line), W3 (lots), W6 (inside _submit)."""
+        in flat zone), W1 (bundle cost <= line), W3 (lots), W6 (inside _submit). The
+        optional *_price_str are the exact orderbook_fp touch strings (subpenny rest)."""
         if window_id in self._entry_posted:
             raise self._bug("W5", f"second entry phase attempted for {window_id}")
         if self.is_halted():
@@ -131,17 +130,20 @@ class FGateway:
         # Mark the phase spent BEFORE submitting so a partial failure can never re-arm it.
         self._entry_posted.add(window_id)
         yes_oid = self._submit(window_id, OK_ENTRY_BID, market_ticker, "buy", "yes",
-                               yes_price, lots, post_only=True, order_type="limit",
-                               detail={"phase": "entry", "leg": "yes"})
+                               yes_price, lots, post_only=True,
+                               detail={"phase": "entry", "leg": "yes"},
+                               expiration_ts=expiration_ts, v2_price_str=yes_price_str)
         no_oid = self._submit(window_id, OK_ENTRY_BID, market_ticker, "buy", "no",
-                              no_price, lots, post_only=True, order_type="limit",
-                              detail={"phase": "entry", "leg": "no"})
+                              no_price, lots, post_only=True,
+                              detail={"phase": "entry", "leg": "no"},
+                              expiration_ts=expiration_ts, v2_price_str=no_price_str)
         return yes_oid, no_oid
 
     # ---------- flip (HOLDING) ----------
     def post_flip_ask(self, window_id: str, market_ticker: str, side: str, entry_price: int,
-                      ask_price: int, is_lone: bool, seconds_to_close: Optional[int]) -> Optional[str]:
-        """Post a resting flip ask (sell the held side) at ask_price. Risk-REDUCING, so
+                      ask_price: int, is_lone: bool, seconds_to_close: Optional[int],
+                      expiration_ts: Optional[int] = None) -> Optional[str]:
+        """Post a resting flip ask (SELL the held side) at ask_price. Risk-REDUCING, so
         allowed during halt. W2: a lone leg above single_leg_max must never have been
         held, so posting a flip for it is a bug. W4: past T-90 use market_out, not this."""
         if is_lone and not self.may_hold_lone(entry_price):
@@ -149,10 +151,11 @@ class FGateway:
         if self.in_flat_zone(seconds_to_close):
             raise self._bug("W4", "flip ask attempted in flat zone; use market_out")
         count = self.current_lots(is_lone)
-        # Selling a held YES = sell yes; selling held NO = sell no. Maker, post_only.
+        # Sell the held leg (V2: sell YES -> ask; sell NO -> bid @100-q). Maker, post_only.
         return self._submit(window_id, OK_FLIP_ASK, market_ticker, "sell", side,
-                            ask_price, count, post_only=True, order_type="limit",
-                            detail={"phase": "flip", "entry_price": entry_price, "lone": is_lone})
+                            ask_price, count, post_only=True,
+                            detail={"phase": "flip", "entry_price": entry_price, "lone": is_lone},
+                            expiration_ts=expiration_ts)
 
     # ---------- salvage (crossing exit) ----------
     def salvage_cross(self, window_id: str, market_ticker: str, side: str, entry_price: int,
@@ -162,8 +165,9 @@ class FGateway:
         count = self.current_lots(is_lone)
         fee = feemath.fee_cents(exit_price, count)             # W8: exact roundup, priced first
         net = feemath.net_after_taker_exit(entry_price, exit_price, count)
+        # TAKER (post_only=False) — the one audited-new path; same V2 body, crossing sell.
         oid = self._submit(window_id, OK_SALVAGE, market_ticker, "sell", side,
-                           exit_price, count, post_only=False, order_type="limit",
+                           exit_price, count, post_only=False,
                            detail={"phase": "salvage", "entry_price": entry_price,
                                    "taker_fee_cents": fee, "net_cents": net, "lone": is_lone})
         return oid, fee
@@ -171,15 +175,15 @@ class FGateway:
     # ---------- T-90 flat (EXITING) ----------
     def market_out(self, window_id: str, market_ticker: str, side: str, is_lone: bool,
                    entry_price: Optional[int] = None, mark_price: Optional[int] = None) -> Optional[str]:
-        """W4 executor: market-out a leg at/after T-90. Always allowed (risk-reducing),
-        even in halt. W8: if a mark is known, its taker fee is estimated and recorded."""
+        """W4 executor: flatten a leg at/after T-90. Always allowed (risk-reducing), even
+        in halt. V2 has no market type — this is a crossing (taker) sell at the mark with
+        post_only=False. W8: the taker fee at the mark is estimated and recorded."""
         count = self.current_lots(is_lone)
-        detail: Dict[str, Any] = {"phase": "flat_T90", "entry_price": entry_price, "lone": is_lone}
-        if mark_price is not None:
-            detail["taker_fee_cents"] = feemath.fee_cents(mark_price, count)
+        px = int(mark_price) if mark_price is not None else 1
+        detail: Dict[str, Any] = {"phase": "flat_T90", "entry_price": entry_price, "lone": is_lone,
+                                  "taker_fee_cents": feemath.fee_cents(px, count)}
         return self._submit(window_id, OK_MARKET_OUT, market_ticker, "sell", side,
-                            mark_price or 1, count, post_only=False, order_type="market",
-                            detail=detail)
+                            px, count, post_only=False, detail=detail)
 
     # ---------- cancels ----------
     def cancel(self, order_id: str) -> str:

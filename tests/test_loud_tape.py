@@ -117,3 +117,30 @@ class TestStageErrorsAreLoud(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLostLetters(unittest.TestCase):
+    # WO-F4 §4: a failed Telegram send is queued and flushed on the next send, not lost.
+    def test_failed_send_is_queued_then_flushed(self):
+        from f_worker.notify import Notifier
+        n = Notifier("tok", "chat", sleep=lambda s: None)
+        sent = []
+        n.session = None  # force _do_send to error
+
+        class S:
+            def __init__(self, results): self.results = results; self.i = 0
+            def post(self, *a, **k):
+                r = self.results[min(self.i, len(self.results) - 1)]; self.i += 1
+                if isinstance(r, Exception):
+                    raise r
+                class Resp:
+                    status_code = r
+                sent.append(k.get("json", {}).get("text"))
+                return Resp()
+        # first send: telegram down (500) -> queued; second: up (200) -> flush both
+        n.session = S([500, 200, 200])
+        self.assertFalse(n.send("first"))
+        self.assertEqual(len(n._pending), 1)        # queued, not lost
+        self.assertTrue(n.send("second"))
+        self.assertEqual(n._pending, [])            # queued 'first' + 'second' both delivered
+        self.assertEqual(len(sent), 3)              # 1 fail + 2 deliveries
