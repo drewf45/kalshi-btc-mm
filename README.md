@@ -125,7 +125,7 @@ without its reason + evidence attached:
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 61 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 66 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

@@ -72,7 +72,8 @@ def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:
 
 
 def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, Any]]:
-    now_ts = int(time.time())
+    now = time.time()
+    now_ts = int(now)
 
     def get_ts(obj: Dict[str, Any], key: str) -> Optional[int]:
         v = obj.get(key)
@@ -84,26 +85,30 @@ def pick_active_market(markets: List[Dict[str, Any]]) -> Tuple[str, str, Dict[st
         except Exception:
             return None
 
+    def close_of(m: Dict[str, Any]) -> int:
+        return resolve_close_ts(m, str(m.get("ticker") or m.get("market_ticker") or "")) or 0
+
+    # CLOCK TRUTH BEATS STATUS TRUTH. Kalshi's market list keeps a just-closed window
+    # flagged active/open for ~2-3 minutes; the desk used to keep rediscovering that
+    # corpse and idle. A market whose close_ts has passed is DEAD regardless of reported
+    # status — filter to LIVE (future-close) markets before choosing. We never trade a
+    # corpse, and we never let one mask the freshly-opened window.
+    live = [m for m in markets if close_of(m) > now + 5]
+    if not live:
+        raise RuntimeError("No live (future-close) markets to pick from.")
+
     active, future = [], []
-    for m in markets:
-        status = str(m.get("status", "")).lower()
-        if status and status != "open":
-            continue
+    for m in live:
+        ct = close_of(m)
         ot = get_ts(m, "open_time") or get_ts(m, "open_ts") or get_ts(m, "open_timestamp")
-        ct = get_ts(m, "close_time") or get_ts(m, "close_ts") or get_ts(m, "close_timestamp")
-        if ot is not None and ct is not None and ot <= now_ts < ct:
+        if ot is not None and ot <= now_ts < ct:
             active.append((ct, m))
-        elif ct is not None and ct > now_ts:
+        else:
             future.append((ct, m))
 
-    if active:
-        active.sort(key=lambda x: x[0]); chosen = active[0][1]
-    elif future:
-        future.sort(key=lambda x: x[0]); chosen = future[0][1]
-    elif markets:
-        chosen = markets[0]
-    else:
-        raise RuntimeError("No markets available to pick from.")
+    pool = active or future
+    pool.sort(key=lambda x: x[0])   # nearest close (unchanged tie-breaking)
+    chosen = pool[0][1]
 
     market_ticker = chosen.get("ticker") or chosen.get("market_ticker")
     event_ticker = chosen.get("event_ticker") or (chosen.get("event") or {}).get("ticker")

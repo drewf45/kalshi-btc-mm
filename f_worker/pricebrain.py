@@ -56,6 +56,7 @@ class PriceBrain:
         self.cfg = config
         self.session = session or requests.Session()
         self.gate = dict(DEFAULT_GATE)
+        self.gate_source = "built-in defaults"   # tape must say which priors steer SAT_OUTs
         self._sigma = spotlib.SigmaCache(floor=DEFAULT_GATE["sigma_floor"],
                                          ceil=DEFAULT_GATE["sigma_ceil"])
         self._load_gate(gate_path)
@@ -68,7 +69,9 @@ class PriceBrain:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
                     self.gate.update(loaded)
-                    print(f"[pricebrain] loaded gate constants from {path}", flush=True)
+                    src = loaded.get("_source") or loaded.get("_provenance") or "loaded"
+                    self.gate_source = f"{os.path.basename(path)} ({src})"
+                    print(f"[pricebrain] loaded gate constants from {path} [{src}]", flush=True)
         except Exception as e:
             print(f"[pricebrain] gate load failed ({e}); using boot defaults", flush=True)
 

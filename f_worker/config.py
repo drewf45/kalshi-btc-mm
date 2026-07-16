@@ -65,8 +65,10 @@ class Config:
     # --- THE LAWS AS NUMBERS (§8) ---
     entry_line: int = 99          # DW_ENTRY_LINE  (W1: combined bundle cost <= this)
     single_leg_max: int = 49      # DW_SINGLE_LEG_MAX (W2: lone leg only if fill <= this)
-    flip_x: int = 6               # DW_FLIP_X (flip ask at entry + X per side)
-    entry_window_sec: int = 60    # DW_ENTRY_WINDOW_SEC (one entry phase length)
+    flip_x: int = 4               # DW_FLIP_X (min viable flip; 2-4c beats old math — the
+                                  #   study owns the eventual number; env-tunable)
+    entry_window_sec: int = 120   # DW_ENTRY_WINDOW_SEC (first OR second minute of the
+                                  #   choppy open — still ONE phase, one shot per window)
     flat_at_t: int = 90           # DW_FLAT_AT_T (W4: flat-out at T-90s)
     stop_cents: int = 25          # DW_STOP_CENTS (a window "stopped" if it loses >= this)
     pause_after_stops: int = 2    # DW_PAUSE_AFTER_STOPS (W7: two consecutive stops => halt)
@@ -74,7 +76,12 @@ class Config:
     req_per_min: int = 30         # DW_REQ_PER_MIN (api budget)
 
     # --- Discovery / loop timing ---
-    entry_start_lead_sec: int = 600   # begin seeking this many secs before close
+    # DW_ENTRY_START_LEAD_SEC: begin seeking this many secs before close. NOTE the
+    # doctrine ("the chop lives at the open") wants SEEKING at the bell — for a 900s
+    # window set this to >= 900 so the desk seeks the instant it discovers the freshly
+    # opened window. The default 600 seeks ~5 min after the open; left as-is because it
+    # is env-tunable and outside this patch's stated config changes.
+    entry_start_lead_sec: int = 600
     poll_seconds: float = 1.0
     fill_wait_seconds: int = 30       # how long a resting entry bid waits inside the phase
 
@@ -101,15 +108,19 @@ class Config:
     def flip_target_hi(self) -> int:
         return 7
 
-    def echo_lines(self) -> List[str]:
-        """Config echo for BOOT telegram (§5)."""
-        return [
+    def echo_lines(self, gate_source: Optional[str] = None) -> List[str]:
+        """Config echo for BOOT telegram (§5). gate_source names the priors steering the
+        D4 gate so the tape says which flip-rate math is live."""
+        lines = [
             "🅵 FLIPDESK boot — one shot per window, live from the first bell",
             f"entry_line={self.entry_line}c  single_leg_max={self.single_leg_max}c  flip_x={self.flip_x}c",
             f"entry_window={self.entry_window_sec}s  flat_at_T-{self.flat_at_t}s  stop={self.stop_cents}c",
             f"lots={self.lots} (rung1)  pause_after_stops={self.pause_after_stops}  req/min={self.req_per_min}",
             f"series={self.series_ticker}  dry_run={self.dry_run}  clear_halt={self.clear_halt}",
         ]
+        if gate_source:
+            lines.append(f"gate: {gate_source}")
+        return lines
 
 
 def load_config() -> Config:

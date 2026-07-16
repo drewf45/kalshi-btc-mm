@@ -11,5 +11,6 @@
     "mid": 0.5,
     "high": 0.0
   },
-  "_provenance": "seeded by tools/crossing_study.py (Deliverable 0)"
+  "_provenance": "seeded by tools/crossing_study.py (Deliverable 0)",
+  "_source": "synthetic:3000m"
 }

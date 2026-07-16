@@ -91,7 +91,11 @@ def main() -> None:
         print("BOOT: flip_halt cleared by DW_CLEAR_HALT=1", flush=True)
 
     notifier = Notifier(cfg.tg_token, cfg.tg_chat_id)
-    for line in cfg.echo_lines():
+
+    # Build pricebrain first so the boot echo can name which gate priors are steering
+    # SAT_OUTs (built-in defaults vs a shipped crossing-study file).
+    pricebrain = PriceBrain(cfg)
+    for line in cfg.echo_lines(gate_source=pricebrain.gate_source):
         notifier.send(line)
 
     # The ONLY place the crypto-signing client is constructed.
@@ -99,7 +103,6 @@ def main() -> None:
     client = KalshiClient(cfg.api_base, cfg.api_prefix, cfg.api_key_id, cfg.private_key_pem_b64)
 
     gateway = FGateway(client, ledger, cfg, notifier)
-    pricebrain = PriceBrain(cfg)
     manager = Manager(gateway, ledger, pricebrain, cfg, notifier)
     settler = Settler(client, ledger, cfg, notifier)
     desk = Desk(client, gateway, manager, pricebrain, ledger, cfg, notifier, settler=settler)

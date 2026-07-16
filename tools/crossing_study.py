@@ -318,6 +318,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     gate = build_gate(windows, args.sigma_low, args.sigma_high)
+    gate["_source"] = source   # boot echo cites this so the tape says which priors are live
     os.makedirs(args.out, exist_ok=True)
     write_csv(windows, os.path.join(args.out, "crossing_study.csv"))
     write_summary(windows, gate, os.path.join(args.out, "crossing_study_summary.md"), source)

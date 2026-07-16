@@ -35,6 +35,7 @@ class Desk:
         self.notifier = notifier
         self.settler = settler
         self._last_window_id: Optional[str] = None
+        self._last_close_ts: Optional[int] = None
         self._cur_market: Optional[str] = None
         self._cur_win: Optional["W.Window"] = None
         self._err_seen: Dict[tuple, float] = {}
@@ -228,6 +229,9 @@ class Desk:
                        rung=rung, lots=lots).bind_ledger(self.ledger)
         self.run_window(win)
         self._last_window_id = market_ticker
+        # the current window's close IS the next window's open — wake there, not on a
+        # lazy poll (WAKE AT THE BELL).
+        self._last_close_ts = close_ts
 
         # W7: two consecutive stopped windows -> flip_halt
         if self.ledger.consecutive_stops() >= self.cfg.pause_after_stops:
@@ -236,6 +240,16 @@ class Desk:
                 self.notifier.alert(f"HALT — {self.cfg.pause_after_stops} consecutive stopped "
                                     f"windows. Desk idles until DW_CLEAR_HALT=1 boot.")
         return market_ticker
+
+    def _idle_nap(self, now: Optional[float] = None) -> float:
+        """How long to sleep when idle. After a window is DONE, the next open is a KNOWN
+        time (the just-handled window's close_ts) — nap toward it in shrinking steps so we
+        re-discover within ~1s of the bell, capped at 30s so we never oversleep a gap and
+        floored at 0.25s so we don't spin."""
+        now = time.time() if now is None else now
+        if self._last_close_ts:
+            return max(0.25, min(self._last_close_ts + 0.5 - now, 30.0))
+        return 1.0
 
     def run_forever(self) -> None:
         while not self._stop:
@@ -247,4 +261,4 @@ class Desk:
                 print(f"[desk] loop error: {e}", flush=True)
                 handled = None
             if handled is None:
-                time.sleep(max(1.0, self.cfg.poll_seconds))
+                time.sleep(self._idle_nap())
