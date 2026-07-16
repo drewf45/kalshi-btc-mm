@@ -82,6 +82,10 @@ class Config:
     # from BIRTH", so the lead is the full 900s window: the desk seeks the instant it
     # discovers the freshly-opened window instead of arming 5 min late. Env-tunable.
     entry_start_lead_sec: int = 900
+    window_sec: int = 900             # DW_WINDOW_SEC: 15M window length (wall_open = close - this)
+    gate_delay_sec: int = 1           # DW_GATE_DELAY_SEC: fire at wall_open + this (fresh book)
+    taker_fuse_sec: int = 20          # DW_TAKER_FUSE_SEC: taker orders expire this fast (F5.3)
+    holding_poll_sec: float = 2.0     # DW_HOLDING_POLL_SEC: HOLDING poll cadence (F5.4 budget)
     poll_seconds: float = 1.0
     fill_wait_seconds: int = 30       # how long a resting entry bid waits inside the phase
 
@@ -149,6 +153,10 @@ def load_config() -> Config:
     c.entry_start_lead_sec = env_int("DW_ENTRY_START_LEAD_SEC", c.entry_start_lead_sec)
     c.poll_seconds = env_float("POLL_SECONDS", c.poll_seconds)
     c.fill_wait_seconds = env_int("DW_FILL_WAIT_SEC", c.fill_wait_seconds)
+    c.window_sec = env_int("DW_WINDOW_SEC", c.window_sec)
+    c.gate_delay_sec = env_int("DW_GATE_DELAY_SEC", c.gate_delay_sec)
+    c.taker_fuse_sec = env_int("DW_TAKER_FUSE_SEC", c.taker_fuse_sec)
+    c.holding_poll_sec = env_float("DW_HOLDING_POLL_SEC", c.holding_poll_sec)
 
     c.clear_halt = env_bool("DW_CLEAR_HALT", False)
     c.db_path = getenv_first(["FLIPDESK_DB"], c.db_path)

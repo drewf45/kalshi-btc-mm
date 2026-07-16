@@ -166,10 +166,14 @@ class FGateway:
         fee = feemath.fee_cents(exit_price, count)             # W8: exact roundup, priced first
         net = feemath.net_after_taker_exit(entry_price, exit_price, count)
         # TAKER (post_only=False) — the one audited-new path; same V2 body, crossing sell.
+        # F5.3 SHORT FUSE: a taker that misses a moving book must DIE fast, never rest to
+        # settlement. expiration_time = now + fuse.
+        exp = int(time.time()) + self.cfg.taker_fuse_sec
         oid = self._submit(window_id, OK_SALVAGE, market_ticker, "sell", side,
                            exit_price, count, post_only=False,
                            detail={"phase": "salvage", "entry_price": entry_price,
-                                   "taker_fee_cents": fee, "net_cents": net, "lone": is_lone})
+                                   "taker_fee_cents": fee, "net_cents": net, "lone": is_lone},
+                           expiration_ts=exp)
         return oid, fee
 
     # ---------- T-90 flat (EXITING) ----------
@@ -182,8 +186,10 @@ class FGateway:
         px = int(mark_price) if mark_price is not None else 1
         detail: Dict[str, Any] = {"phase": "flat_T90", "entry_price": entry_price, "lone": is_lone,
                                   "taker_fee_cents": feemath.fee_cents(px, count)}
+        # F5.3 short fuse: the flat cross dies fast too — nothing rests to settlement.
+        exp = int(time.time()) + self.cfg.taker_fuse_sec
         return self._submit(window_id, OK_MARKET_OUT, market_ticker, "sell", side,
-                            px, count, post_only=False, detail=detail)
+                            px, count, post_only=False, detail=detail, expiration_ts=exp)
 
     # ---------- cancels ----------
     def cancel(self, order_id: str) -> str:

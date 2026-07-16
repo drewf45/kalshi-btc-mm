@@ -30,7 +30,7 @@ def _day_start_ts(now: Optional[float] = None) -> float:
 
 
 def render_pack(ledger: Ledger, cfg: Config, client: Any = None,
-                now: Optional[float] = None) -> str:
+                now: Optional[float] = None, api_calls: Optional[int] = None) -> str:
     since = _day_start_ts(now)
     counts = ledger.state_counts(since)
     day_net = ledger.day_net_cents(since)
@@ -64,7 +64,10 @@ def render_pack(ledger: Ledger, cfg: Config, client: Any = None,
 
     lines.append(f"size ladder: rung {rung} ({lots} lot/side)")
     lines.append(f"halt: {'SET — ' + hreason if halted else 'clear'}")
-    lines.append(f"api budget: {cfg.req_per_min}/min cap")
+    if api_calls is not None:
+        lines.append(f"api budget: {cfg.req_per_min}/min cap · {api_calls} calls total (all paths)")
+    else:
+        lines.append(f"api budget: {cfg.req_per_min}/min cap")
     rss = _rss_mb()
     if rss is not None:
         lines.append(f"mem: {rss} MB RSS")
@@ -79,12 +82,13 @@ class PackScheduler(threading.Thread):
     """Fires render_pack once an hour (§5). Also sends the boot echo on start."""
 
     def __init__(self, ledger: Ledger, cfg: Config, notifier: Any, client: Any = None,
-                 interval_sec: float = 3600.0):
+                 interval_sec: float = 3600.0, desk: Any = None):
         super().__init__(name="pack", daemon=True)
         self.ledger = ledger
         self.cfg = cfg
         self.notifier = notifier
         self.client = client
+        self.desk = desk
         self.interval = interval_sec
         self._stop = threading.Event()
 
@@ -98,6 +102,7 @@ class PackScheduler(threading.Thread):
                 break
             try:
                 if self.notifier:
-                    self.notifier.send(render_pack(self.ledger, self.cfg, self.client))
+                    calls = getattr(self.desk, "_api_calls", None)
+                    self.notifier.send(render_pack(self.ledger, self.cfg, self.client, api_calls=calls))
             except Exception as e:
                 print(f"[pack] render error: {e}", flush=True)

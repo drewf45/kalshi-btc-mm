@@ -5,6 +5,7 @@
 
 import math
 import time
+from collections import deque
 from typing import List, Optional
 
 import requests
@@ -72,28 +73,62 @@ class SigmaCache:
     the floor/ceil moved it, so a floor-hugging σ=5.0 can never again be mistaken for a
     real reading."""
 
-    def __init__(self, floor: float = 6.0, ceil: float = 40.0, refresh_sec: float = 5.0):
+    def __init__(self, floor: float = 6.0, ceil: float = 40.0, refresh_sec: float = 5.0,
+                 min_samples: int = 5, min_span_sec: float = 15.0):
         self.floor = floor
         self.ceil = ceil
         self.refresh_sec = refresh_sec
+        self.min_samples = min_samples
+        self.min_span_sec = min_span_sec
         self._val: Optional[float] = None
         self._ts: Optional[float] = None
         self.last_raw: Optional[float] = None
         self.last_clamped: bool = False
+        self.last_source: str = "none"
+        self._samples: "deque" = deque(maxlen=180)   # (ts, spot) — self-sampled (F5.5)
+
+    def add_sample(self, price: Optional[float], now: Optional[float] = None) -> None:
+        """Feed a live spot tick. The rolling sigma is computed from THESE, so the desk
+        stops depending on the candles API — its own 1s-5s spot GETs carry it (F5.5)."""
+        if price is None:
+            return
+        self._samples.append((time.time() if now is None else now, float(price)))
+
+    def _sigma_from_samples(self) -> Optional[float]:
+        s = list(self._samples)
+        if len(s) < self.min_samples or (s[-1][0] - s[0][0]) < self.min_span_sec:
+            return None
+        acc = []
+        for i in range(1, len(s)):
+            dt = s[i][0] - s[i - 1][0]
+            if dt <= 0:
+                continue
+            r = s[i][1] - s[i - 1][1]
+            acc.append((r * r) / dt)               # per-sqrt-second variance contribution
+        if not acc:
+            return None
+        return math.sqrt(sum(acc) / len(acc))
 
     def get(self, session: requests.Session, now: Optional[float] = None) -> Optional[float]:
         now = time.time() if now is None else now
-        if self._ts is not None and (now - self._ts) < self.refresh_sec:
-            return self._val
-        rs = realized_sigma_usd_per_sqrt_sec(session)
+        # 1) our own spot samples (candles-independent). 2) candle warmup (throttled).
+        rs = self._sigma_from_samples()
+        src = "spot_samples"
+        if rs is None:
+            if self._ts is None or (now - self._ts) >= self.refresh_sec:
+                rs = realized_sigma_usd_per_sqrt_sec(session)
+                self._ts = now
+            else:
+                rs = self.last_raw
+            src = "candles"
         self.last_raw = rs
+        self.last_source = src if rs is not None else "none"
         if rs is None or rs <= 0:
-            # feed death or garbage — do NOT fabricate. None => BLIND.
+            # spot AND candles both blind — do NOT fabricate. None => BLIND.
             self._val = None
             self.last_clamped = False
         else:
             clamped = float(max(self.floor, min(self.ceil, rs)))
             self.last_clamped = clamped != rs
             self._val = clamped
-        self._ts = now
         return self._val

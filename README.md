@@ -116,9 +116,28 @@ time in **Eastern** (verified against the fill tape — the `00:30` ticker settl
 `get_market` directly — a `200` on the next ticker *is* the bell, and its `listing_latency`
 (first-200 minus wall-clock open) is recorded as a market fact. A `404` is a quiet knock
 (not born yet); an in-progress window that `404`s is a ticker/tz suspect and degrades
-loudly to the list path (never goes dark). `DW_ENTRY_START_LEAD_SEC` defaults to the full
-window (900s) so a born window is gated at birth — the entry phase runs from the open,
-where the chop lives.
+loudly to the list path (never goes dark).
+
+**Arm at birth, fire at the bell (F5.1).** A market *lists* ~15 min before its wall open,
+so gating at listing would judge an embryo book and lock the window forever on nonsense.
+The window enters an explicit `ARMED` state on discovery and is held until `wall_open +
+DW_GATE_DELAY_SEC`, then gated on a **fresh** book — the entry phase runs from the real
+open, where the chop lives. The born-margin (now negative — listed early) is recorded per
+window.
+
+## Exactness & resource honesty (Work Order F5)
+
+- **Async settlement** — a floor ride's 6×10s result poll runs on a background
+  `SettlementWorker`, so the desk books DONE and proceeds to the next bell instantly
+  instead of blocking for up to a minute right when the next window opens.
+- **Taker short-fuse** — salvage/flat crossing orders carry `expiration_time = now +
+  DW_TAKER_FUSE_SEC` (20s) and recross exactly once on a fresh mark before alerting and
+  handing off to the T-90/orphan machinery. No taker order can ever rest to settlement.
+- **One budget, every path** — discovery, fills, book and market calls all draw the same
+  token bucket; HOLDING polls stretch to `DW_HOLDING_POLL_SEC`; the pack reports true
+  call consumption, not just the cap.
+- **Sigma self-sampling** — `SigmaCache` builds the rolling vol from the desk's own 1–5s
+  spot ticks; the candles API is warmup-only. BLIND still fires when spot itself is dead.
 
 ## Between-windows hardening (Work Order F1)
 
@@ -168,7 +187,7 @@ without its reason + evidence attached:
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 112 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 125 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

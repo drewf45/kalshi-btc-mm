@@ -220,22 +220,43 @@ class Manager:
 
     # ---- salvage walk (quote-skew) for a leftover / lone leg ----
     def salvage_walk(self, win: "W.Window", best_bid: Optional[int],
-                     seconds_to_close: Optional[int]) -> None:
-        """Cross to recover if the resting flip won't clear and the tape says the leg is
-        unlikely to flip. Prices the taker fee BEFORE deciding (W8)."""
+                     seconds_to_close: Optional[int], now: Optional[float] = None) -> None:
+        """Cross to recover if the resting flip won't clear. F5.3: the taker carries a
+        short fuse; we cross ONCE, and if it hasn't filled by the fuse we recross ONCE
+        with a fresh mark, then alert and leave the leg to the T-90 / orphan machinery. A
+        taker fill is confirmed by the desk (on_salvage_fill) — never assumed here."""
+        import time as _t
+        now = _t.time() if now is None else now
         for leg in win.held_legs():
             if best_bid is None:
                 continue
-            # recover when crossing now beats holding a leg that likely won't flip
-            if best_bid >= leg.entry_price or seconds_to_close is None or seconds_to_close <= self.cfg.flat_at_t + 15:
-                oid, fee = self.gw.salvage_cross(win.window_id, win.market_ticker, leg.side,
-                                                 leg.entry_price, best_bid, win.mode == "lone")
-                leg.order_id = oid
-                self.ledger.record_fill(win.window_id, leg.side, best_bid, leg.count,
-                                        fee_cents=fee, is_taker=True)
-                win.resolve_leg(leg.side, best_bid, SALVAGE)
-        if win.state == W.HOLDING and not win.held_legs():
-            win.transition(W.DONE, {"resolution": "salvaged"})
+            crossing = (best_bid >= leg.entry_price or seconds_to_close is None
+                        or seconds_to_close <= self.cfg.flat_at_t + 15)
+            if not crossing:
+                continue
+            # still inside the current taker's fuse? wait for it to fill or expire.
+            if leg.salvage_attempts > 0 and (now - leg.salvage_fired_at) < self.cfg.taker_fuse_sec:
+                continue
+            if leg.salvage_attempts >= 2:
+                if not leg.salvage_alerted and self.notifier:
+                    self.notifier.alert(f"⚠ exit unfilled after recross — {leg.side.upper()}@"
+                                        f"{leg.entry_price}; leaving to T-90/orphan")
+                    leg.salvage_alerted = True
+                continue
+            oid, fee = self.gw.salvage_cross(win.window_id, win.market_ticker, leg.side,
+                                             leg.entry_price, best_bid, win.mode == "lone")
+            leg.order_id = oid
+            leg.salvage_attempts += 1
+            leg.salvage_fired_at = now
+
+    def on_salvage_fill(self, win: "W.Window", side: str, exit_price: int) -> None:
+        """The desk confirmed a taker (salvage) fill. Book it as recovered capital."""
+        fee = feemath.fee_cents(exit_price, win.lots)
+        self.ledger.record_fill(win.window_id, side, exit_price, win.lots, fee_cents=fee, is_taker=True)
+        win.resolve_leg(side, exit_price, SALVAGE)
+        if win.state in (W.HOLDING, W.EXITING) and not win.held_legs():
+            if win.state == W.HOLDING:
+                win.transition(W.DONE, {"resolution": "salvaged"})
             self._book(win)
 
     # ---- ride the floor: complete bundle intact at T-90 ----

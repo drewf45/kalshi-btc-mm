@@ -8,8 +8,10 @@
 # with inventory that rode, we poll the market result and reconcile model-vs-broker,
 # append a settlement row (broker-truth beside ledger-truth), and alert on mismatch.
 
+import queue
+import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from . import window as W
 from .manager import FLOOR
@@ -75,6 +77,36 @@ class Settler:
                                     f"model {booked_net:+d}¢ vs broker {broker_net:+d}¢ "
                                     f"(result={result or 'none'})")
             else:
-                self.notifier.send(f"🅵 ✅ W settled — floor ✓ (result={result}) "
+                self.notifier.send(f"🧾 W{win.tag()} settled ✓ (result={result}) "
                                    f"{broker_net:+d}¢")
         return {"result": result, "broker_net": broker_net, "mismatch": mismatch}
+
+
+class SettlementWorker(threading.Thread):
+    """F5.2 ASYNC SETTLEMENT. Floor-ride verification used to run 6×10s INLINE right when
+    the next window's bell was ringing — every floor ride made the desk late to the next
+    war. Now the desk books DONE and enqueues; this thread does the bounded poll off the
+    hot path. The bell is never blocked by a settlement again."""
+
+    def __init__(self, settler: "Settler"):
+        super().__init__(name="settler", daemon=True)
+        self.settler = settler
+        self._q: "queue.Queue[Tuple[W.Window, int]]" = queue.Queue()
+        self._stop = threading.Event()
+
+    def enqueue(self, win: "W.Window", booked_net: int) -> None:
+        self._q.put((win, int(booked_net)))
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                win, booked = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self.settler.verify_floor(win, booked)
+            except Exception as e:
+                print(f"[settler] verify error: {e}", flush=True)

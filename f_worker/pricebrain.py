@@ -82,6 +82,13 @@ class PriceBrain:
     def sigma(self, now: Optional[float] = None) -> Optional[float]:
         return self._sigma.get(self.session, now=now)
 
+    def sample_spot(self, now: Optional[float] = None) -> Optional[float]:
+        """Feed one live spot tick into the rolling sigma (F5.5). Coinbase spot GET —
+        cheap, off the Kalshi budget. Called frequently by the desk loops."""
+        px = self.spot()
+        self._sigma.add_sample(px, now)
+        return px
+
     def vol_regime(self, sigma: float) -> str:
         if sigma < self.gate["sigma_low"]:
             return "low"

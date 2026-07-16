@@ -39,7 +39,8 @@ class TokenBucket:
 
 class Desk:
     def __init__(self, client: Any, gateway: Any, manager: Any, pricebrain: Any,
-                 ledger: Any, config: Config, notifier: Any = None, settler: Any = None):
+                 ledger: Any, config: Config, notifier: Any = None, settler: Any = None,
+                 settle_worker: Any = None):
         self.client = client
         self.gw = gateway
         self.mgr = manager
@@ -48,13 +49,16 @@ class Desk:
         self.cfg = config
         self.notifier = notifier
         self.settler = settler
+        self.settle_worker = settle_worker
+        self._api_calls = 0                        # true Kalshi call count (F5.4 health)
         self._last_window_id: Optional[str] = None
         self._last_close_ts: Optional[int] = None
         self._cur_market: Optional[str] = None
         self._cur_win: Optional["W.Window"] = None
         self._err_seen: Dict[tuple, Dict[str, float]] = {}
         self._starve: int = 0                      # consecutive empty idle ticks (F3.2)
-        self._disc_bucket = TokenBucket(config.req_per_min, config.req_per_min)  # F3.3
+        # F5.4: ONE budget, EVERY path — discovery, fills, book, market all draw here.
+        self._api_bucket = TokenBucket(config.req_per_min, config.req_per_min)
         self._births_seen: set = set()             # tickers whose birth latency is logged
         self._stop = False
 
@@ -99,6 +103,9 @@ class Desk:
         buy/sell action) and read the price in OUR-side cents via the proven parse_fill.
         For entry fills that's cost; for flip fills it's the exit proceeds."""
         found: Dict[str, int] = {}
+        if not self._api_bucket.allow():          # F5.4: HOLDING polls live under the budget
+            return found
+        self._api_calls += 1
         try:
             fills = self.client.get_fills(win.market_ticker)
         except Exception as e:
@@ -120,6 +127,9 @@ class Desk:
         return int(win.close_ts - time.time())
 
     def _best_bid(self, side: str) -> Optional[int]:
+        if not self._api_bucket.allow():          # F5.4: metered like every other call
+            return None
+        self._api_calls += 1
         try:
             ob = self.client.get_orderbook(self._cur_market)
         except Exception as e:
@@ -135,14 +145,23 @@ class Desk:
         self.ledger.record_window(win.window_id, win.market_ticker, win.event_ticker,
                                   win.open_ts, win.close_ts, win.rung)
 
-        # wait for the seek moment (T - entry_start_lead)
-        while not self._stop:
-            s2c = self._seconds_to_close(win)
-            if s2c is None or s2c <= self.cfg.entry_start_lead_sec:
+        # ARM AT BIRTH, FIRE AT THE BELL (F5.1): a market lists ~15 min before its wall
+        # open — arming on that embryo book and gating it would lock the window forever on
+        # nonsense. Hold in ARMED until wall_open + gate_delay, THEN gate on a FRESH book.
+        wall_open = (win.close_ts - self.cfg.window_sec) if win.close_ts else None
+        win.transition(W.ARMED, {"wall_open": wall_open, "close_ts": win.close_ts})
+        fire_at = (wall_open + self.cfg.gate_delay_sec) if wall_open is not None else None
+        while not self._stop and fire_at is not None:
+            now = time.time()
+            if now >= fire_at:
                 break
-            time.sleep(self.cfg.poll_seconds)
+            try:
+                self.pb.sample_spot(now)          # F5.5: build sigma from our own spot ticks
+            except Exception:
+                pass
+            time.sleep(max(0.1, min(self.cfg.poll_seconds, fire_at - now)))
 
-        # IDLE -> gate
+        # FIRE: gate on a FRESH book fetched at the bell, not the embryo we armed on
         ob = self._safe_ob(win.market_ticker)
         gate = self.pb.gate_window(ob)
         self._check_stuck_gauge(gate)
@@ -194,27 +213,35 @@ class Desk:
                 else:
                     self.mgr.flat_out(win, self._marks(win))
                 break
-            flip_fills = self._poll_fills(
+            fills = self._poll_fills(
                 win, {l.side: l.order_id for l in win.held_legs()}, "sell")
-            for side, px in flip_fills.items():
-                if not win.is_terminal and win.leg_for(side):
+            for side, px in fills.items():
+                leg = win.leg_for(side)
+                if win.is_terminal or leg is None:
+                    continue
+                if leg.salvage_attempts > 0:          # a taker (salvage) order filled
+                    self.mgr.on_salvage_fill(win, side, px)
+                else:
                     self.mgr.on_flip_fill(win, side, px)
             if win.mode == "lone" and not win.is_terminal:
                 s2c = self._seconds_to_close(win)
                 if s2c is not None and s2c <= self.cfg.flat_at_t + 20:
                     self.mgr.salvage_walk(win, self._best_bid(win.open_sides()[0]) if win.open_sides() else None, s2c)
-            time.sleep(self.cfg.poll_seconds)
+            time.sleep(self.cfg.holding_poll_sec)   # F5.4: stretched to fit the budget
 
     def _settle_floor(self, win: "W.Window") -> None:
-        """After a floor ride, reconcile against broker truth (F1.2)."""
-        if self.settler is None:
-            return
+        """After a floor ride, hand verification to the ASYNC settler (F5.2) so the desk
+        proceeds to the next bell INSTANTLY — the 6×10s poll no longer blocks the hot
+        path. Falls back to inline only if no worker is wired."""
         try:
             from .manager import compute_window_pnl
             booked = compute_window_pnl(win, self.cfg)["net_cents"]
-            self.settler.verify_floor(win, booked)
+            if self.settle_worker is not None:
+                self.settle_worker.enqueue(win, booked)
+            elif self.settler is not None:
+                self.settler.verify_floor(win, booked)
         except Exception as e:
-            print(f"[desk] settlement check failed: {e}", flush=True)
+            print(f"[desk] settlement enqueue failed: {e}", flush=True)
 
     def _marks(self, win: "W.Window") -> Dict[str, int]:
         ob = self._safe_ob(win.market_ticker)
@@ -264,8 +291,9 @@ class Desk:
         # F3.3: the discovery spin lives under the printed req/min budget. If we're out of
         # tokens (sustained draw), skip this poll and let the nap space us out — bursts to
         # catch a bell are fine, 4 Hz storms are not.
-        if not self._disc_bucket.allow():
+        if not self._api_bucket.allow():
             return None
+        self._api_calls += 1
         # THE COMPUTED BELL: stop asking the list endpoint (it lists a newborn ~3-4 min
         # late); the ticker is arithmetic — compute it and knock directly. None here means
         # "knocking, not born yet" (normal) — _discover_direct handles the loud cases.

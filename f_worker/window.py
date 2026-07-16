@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 # States
 IDLE = "IDLE"
+ARMED = "ARMED"       # market discovered (often BEFORE its wall open) — held until the bell
 SEEKING = "SEEKING"
 HOLDING = "HOLDING"
 EXITING = "EXITING"
@@ -30,9 +31,12 @@ SAT_OUT = "SAT_OUT"
 
 TERMINAL = {DONE, SAT_OUT}
 
-# Legal adjacency. DONE and SAT_OUT have NO outgoing edges (the wall on §3).
+# Legal adjacency. DONE and SAT_OUT have NO outgoing edges (the wall on §3). ARM AT
+# BIRTH, FIRE AT THE BELL: IDLE->ARMED on discovery, then wait for wall_open before
+# gating (never judge the embryo book a market shows ~15 min before it opens).
 _EDGES: Dict[str, set] = {
-    IDLE: {SEEKING, SAT_OUT},
+    IDLE: {ARMED, SEEKING, SAT_OUT},
+    ARMED: {SEEKING, SAT_OUT},
     SEEKING: {HOLDING, EXITING, SAT_OUT},
     HOLDING: {HOLDING, EXITING, DONE},
     EXITING: {DONE},
@@ -54,6 +58,9 @@ class Leg:
     resolved: bool = False       # flipped, salvaged, or settled
     exit_price: Optional[int] = None
     exit_kind: Optional[str] = None   # flip / salvage / floor / market_out
+    salvage_attempts: int = 0         # taker recross count (F5.3: cross once, recross once)
+    salvage_fired_at: float = 0.0     # ts of the last taker cross (fuse tracking)
+    salvage_alerted: bool = False
 
 
 @dataclass

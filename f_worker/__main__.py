@@ -19,7 +19,7 @@ from .pricebrain import PriceBrain
 from .manager import Manager
 from .desk import Desk
 from .reconcile import Reconciler
-from .settlement import Settler
+from .settlement import Settler, SettlementWorker
 from .feewatch import FeeTripwire, FeeTripwireThread
 from .fpack import PackScheduler, render_pack
 
@@ -115,7 +115,10 @@ def main() -> None:
     gateway = FGateway(client, ledger, cfg, notifier)
     manager = Manager(gateway, ledger, pricebrain, cfg, notifier)
     settler = Settler(client, ledger, cfg, notifier)
-    desk = Desk(client, gateway, manager, pricebrain, ledger, cfg, notifier, settler=settler)
+    settle_worker = SettlementWorker(settler)   # F5.2: floor-ride verification off the hot path
+    settle_worker.start()
+    desk = Desk(client, gateway, manager, pricebrain, ledger, cfg, notifier,
+                settler=settler, settle_worker=settle_worker)
 
     # F1.1 — boot reconcile / orphan sweep BEFORE any new risk is taken. This line
     # reaches Drew's phone before the first window (acceptance).
@@ -129,7 +132,7 @@ def main() -> None:
     feewatch = FeeTripwireThread(tripwire, desk.current_market)
     feewatch.start()
 
-    pack = PackScheduler(ledger, cfg, notifier, client)
+    pack = PackScheduler(ledger, cfg, notifier, client, desk=desk)
     pack.start()
 
     def halt_listener():
