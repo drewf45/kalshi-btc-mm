@@ -12,7 +12,7 @@ from f_worker.manager import Manager
 from f_worker.pricebrain import PriceBrain
 from f_worker.lib import marketutil as mu
 from f_worker.lib.marketutil import pick_active_market
-from f_worker.desk import Desk
+from f_worker.desk import Desk, TokenBucket
 from tests.fakes import FakeClient, FakeNotifier
 
 UTC = timezone.utc
@@ -69,23 +69,50 @@ class TestCorpseFilter(unittest.TestCase):
         ev, mt, obj = pick_active_market([future, active])
         self.assertEqual(mt, "KXBTC15M-ACTIVE")
 
+    def test_unopened_newborn_is_pickable(self):
+        # F3.1: at a bell the just-closed corpse is still "open" and the newborn is
+        # "unopened" — the clock, not the status field, must arbitrate. `markets=1`
+        # becomes `markets=2` and the newborn wins.
+        now = time.time()
+        corpse = _mkt("KXBTC15M-CORPSE", -900, -30, status="open", now=now)
+        newborn = _mkt("KXBTC15M-NEWBORN", 0, 900, status="unopened", now=now)
+        ev, mt, obj = pick_active_market([corpse, newborn])
+        self.assertEqual(mt, "KXBTC15M-NEWBORN")
+
 
 class TestWakeAtBell(unittest.TestCase):
     def _desk(self):
-        return Desk(None, None, None, None, None, Config(), None)
+        return Desk(None, None, None, None, Ledger(":memory:"), Config(), None)
 
-    def test_nap_targets_the_bell(self):
+    def test_nap_races_toward_the_bell(self):
         d = self._desk()
         C = 1_000_000.0
         d._last_close_ts = C
-        self.assertEqual(d._idle_nap(now=C - 100), 30.0)     # far out: capped at 30s
-        self.assertAlmostEqual(d._idle_nap(now=C - 10), 10.5)  # closing in: shrinking nap
-        self.assertEqual(d._idle_nap(now=C + 0.4), 0.25)     # past the bell: floor, re-discover
-        self.assertEqual(d._idle_nap(now=C + 50), 0.25)      # well past: still floored
+        self.assertEqual(d._idle_nap(now=C - 100), 30.0)      # far out: capped at 30s
+        self.assertAlmostEqual(d._idle_nap(now=C - 10), 10.5)   # closing in: shrinking nap
+        self.assertAlmostEqual(d._idle_nap(now=C - 0.4), 0.9)   # ~half-second polls into the bell
 
-    def test_nap_without_close_is_one_second(self):
+    def test_post_bell_backs_off_not_hammers(self):
+        # F3.2: past the bell + empty = STARVATION -> back off, never 4 Hz
         d = self._desk()
-        self.assertEqual(d._idle_nap(now=123.0), 1.0)
+        C = 1000.0
+        d._last_close_ts = C
+        naps = [d._idle_nap(now=C + 1) for _ in range(6)]
+        self.assertEqual(naps, [0.5, 1.0, 2.0, 4.0, 5.0, 5.0])   # cap 5s
+
+    def test_at_most_8_calls_in_first_10s(self):
+        d = self._desk()
+        C = 1000.0
+        d._last_close_ts = C
+        t, calls = 0.0, 0
+        while t < 10.0:
+            calls += 1
+            t += d._idle_nap(now=C + 1 + t)
+        self.assertLessEqual(calls, 8)
+
+    def test_no_known_bell_is_starvation(self):
+        d = self._desk()
+        self.assertEqual(d._idle_nap(now=123.0), 0.5)   # first backoff step
 
 
 class TestSilentDeskIsLoud(unittest.TestCase):
@@ -123,6 +150,42 @@ def _mkt_win(led):
     from f_worker import window as W
     return W.Window(window_id="KXBTC15M-26JUL161430-30", market_ticker="KXBTC15M-26JUL161430-30",
                     event_ticker="E", open_ts=None, close_ts=1_784_212_200, rung=1, lots=1).bind_ledger(led)
+
+
+class TestDiscoveryBudget(unittest.TestCase):
+    # F3.3: the discovery spin lives under a token budget — bursts ok, storms capped.
+    def test_bursts_then_throttles(self):
+        tb = TokenBucket(capacity=3, refill_per_min=60, now=0.0)   # 1 token/sec
+        self.assertTrue(tb.allow(now=0.0))
+        self.assertTrue(tb.allow(now=0.0))
+        self.assertTrue(tb.allow(now=0.0))
+        self.assertFalse(tb.allow(now=0.0))          # bucket drained
+        self.assertTrue(tb.allow(now=1.0))           # +1 token after a second
+        self.assertFalse(tb.allow(now=1.0))
+
+
+class TestRatedAndAggregated(unittest.TestCase):
+    def test_throttled_alert_carries_its_rate(self):
+        # F3.4: a throttled ⚠ says how many it swallowed — storms can't hide in politeness
+        from f_worker.config import Config
+        from f_worker.ledger import Ledger
+        notif = FakeNotifier()
+        d = Desk(FakeClient(), None, None, None, Ledger(":memory:"), Config(), notif)
+        d._stage_err(None, "discovery_empty", Exception("x"), throttle=100.0, now=0.0)   # fires
+        d._stage_err(None, "discovery_empty", Exception("x"), throttle=100.0, now=1.0)   # swallowed
+        d._stage_err(None, "discovery_empty", Exception("x"), throttle=100.0, now=2.0)   # swallowed
+        d._stage_err(None, "discovery_empty", Exception("x"), throttle=100.0, now=200.0) # fires w/ rate
+        self.assertTrue(any("×3 in 200s" in s for s in notif.sent))
+
+    def test_throttled_print_collapses_repeats(self):
+        import io
+        import contextlib
+        mu._print_state.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            for _ in range(5):
+                mu.throttled_print("[discover] same line", min_interval=1000.0)
+        self.assertEqual(buf.getvalue().count("[discover] same line"), 1)   # 4 collapsed
 
 
 if __name__ == "__main__":

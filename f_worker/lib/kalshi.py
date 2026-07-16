@@ -15,7 +15,8 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
-from .marketutil import pick_active_market, resolve_close_ts  # crypto-free helpers
+from .marketutil import (pick_active_market, resolve_close_ts,  # crypto-free helpers
+                         throttled_print as _throttled_print)
 
 
 def now_ms() -> int:
@@ -151,23 +152,30 @@ class KalshiClient:
             return resp.get("market") if isinstance(resp.get("market"), dict) else resp
         return {}
 
-    def list_markets(self, series_ticker: str, status: str = "open", limit: int = 200) -> List[Dict[str, Any]]:
-        resp = self.request("GET", "/markets",
-                            params={"series_ticker": series_ticker, "status": status, "limit": limit})
+    def list_markets(self, series_ticker: str, status: Optional[str] = None,
+                     limit: int = 200) -> List[Dict[str, Any]]:
+        # F3.1: NO status filter by default. At a bell, status="open" returns ONLY the
+        # just-closed corpse (still flagged open) — the newborn window is "unopened" and
+        # invisible. Fetch every status and let the clock filter in pick_active_market be
+        # the sole arbiter (proven by tape: `markets=1` at the bell was the whole bug).
+        params: Dict[str, Any] = {"series_ticker": series_ticker, "limit": limit}
+        if status:
+            params["status"] = status
+        resp = self.request("GET", "/markets", params=params)
         return resp.get("markets", []) if isinstance(resp, dict) else (resp or [])
 
     # ---- discovery: nearest KXBTC15M window (borrowed from bot.py) ----
     def discover_market(self, series_ticker: str) -> Optional[Tuple[str, str, Dict[str, Any], int]]:
-        markets = self.list_markets(series_ticker)
+        markets = self.list_markets(series_ticker)   # all statuses; clock arbitrates
         if not markets:
-            print(f"[discover] list_markets returned 0 markets for {series_ticker}", flush=True)
+            _throttled_print(f"[discover] list_markets returned 0 markets for {series_ticker}")
             return None
         try:
             event_ticker, market_ticker, chosen = pick_active_market(markets)
         except RuntimeError as e:
             # never swallow the picker's reason anonymously — the desk turns None into a
             # loud discovery_empty page, and this print names WHY it was empty.
-            print(f"[discover] {e} (markets={len(markets)})", flush=True)
+            _throttled_print(f"[discover] {e} (markets={len(markets)})")
             return None
         close_ts = resolve_close_ts(chosen, market_ticker)
         if close_ts is None:

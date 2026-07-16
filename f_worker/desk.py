@@ -23,6 +23,27 @@ def _fill_price(fill: Dict[str, Any], side: str) -> Optional[int]:
     return None
 
 
+class TokenBucket:
+    """Simple token bucket so the discovery spin lives under req/min (F3.3). Bursts up to
+    `capacity` are fine (catching a bell); sustained draw is capped at `refill_per_min`.
+    The exchange relationship is a position — every request path lives under a budget."""
+
+    def __init__(self, capacity: int, refill_per_min: int, now: Optional[float] = None):
+        self.capacity = float(max(1, capacity))
+        self.tokens = self.capacity
+        self.refill_per_sec = max(0.001, refill_per_min / 60.0)
+        self._last = now if now is not None else time.time()
+
+    def allow(self, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        self.tokens = min(self.capacity, self.tokens + (now - self._last) * self.refill_per_sec)
+        self._last = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+
 class Desk:
     def __init__(self, client: Any, gateway: Any, manager: Any, pricebrain: Any,
                  ledger: Any, config: Config, notifier: Any = None, settler: Any = None):
@@ -38,7 +59,9 @@ class Desk:
         self._last_close_ts: Optional[int] = None
         self._cur_market: Optional[str] = None
         self._cur_win: Optional["W.Window"] = None
-        self._err_seen: Dict[tuple, float] = {}
+        self._err_seen: Dict[tuple, Dict[str, float]] = {}
+        self._starve: int = 0                      # consecutive empty idle ticks (F3.2)
+        self._disc_bucket = TokenBucket(config.req_per_min, config.req_per_min)  # F3.3
         self._stop = False
 
     def stop(self) -> None:
@@ -49,24 +72,31 @@ class Desk:
 
     # ---- loud-tape law: no error reaches the loop without a tagged row + a phone line ----
     def _stage_err(self, win: Optional["W.Window"], stage: str, e: Exception,
-                   throttle: float = float("inf")) -> None:
+                   throttle: float = float("inf"), now: Optional[float] = None) -> None:
         """Record a STAGE_ERR evidence row and page Drew. Per-window stages report once
         (window_id keys are unique); desk-level stages (discovery) throttle by time so a
-        dead feed pages periodically, not every second."""
+        dead feed pages periodically, not every second. A throttled alert CARRIES ITS
+        RATE (F3.4: `×N in Ts`) — suppression without a count is how a 4 Hz storm hides
+        inside one calm ⚠."""
         wid = win.window_id if win else "-"
         key = (wid, stage)
-        now = time.time()
-        last = self._err_seen.get(key)
-        if last is not None and (now - last) < throttle:
+        now = time.time() if now is None else now
+        rec = self._err_seen.get(key)
+        if rec is not None and (now - rec["last"]) < throttle:
+            rec["supp"] += 1
             return
-        self._err_seen[key] = now
+        supp = int(rec["supp"]) if rec else 0
+        span = int(now - rec["last"]) if rec else 0
+        self._err_seen[key] = {"last": now, "supp": 0}
+        rate = f" (×{supp + 1} in {span}s)" if supp else ""
         try:
-            self.ledger.record_transition(wid, None, "STAGE_ERR", {"stage": stage, "error": str(e)})
+            self.ledger.record_transition(wid, None, "STAGE_ERR",
+                                          {"stage": stage, "error": str(e), "suppressed": supp})
         except Exception:
             pass
         if self.notifier:
             wtag = f"W{win.tag()}" if win else "desk"
-            self.notifier.send(f"⚠ {wtag} — {stage} error: {e}")
+            self.notifier.send(f"⚠ {wtag} — {stage} error: {e}{rate}")
 
     # ---- fill polling (match our order ids on the fills tape) ----
     def _poll_fills(self, win: "W.Window", order_ids: Dict[str, Optional[str]],
@@ -238,6 +268,11 @@ class Desk:
             self.notifier and self.notifier.send(f"desk idle — flip_halt set ({reason}); "
                                                  f"clear with DW_CLEAR_HALT=1 boot")
             return None
+        # F3.3: the discovery spin lives under the printed req/min budget. If we're out of
+        # tokens (sustained draw), skip this poll and let the nap space us out — bursts to
+        # catch a bell are fine, 4 Hz storms are not.
+        if not self._disc_bucket.allow():
+            return None
         try:
             disc = self.client.discover_market(self.cfg.series_ticker)
         except Exception as e:
@@ -245,10 +280,12 @@ class Desk:
             return None
         if not disc:
             # discovery came back empty — the desk is NEVER allowed to be quietly bored.
-            # Pages every 120s (not every poll) so a dead series is loud but not spammy.
+            # Pages every 120s (not every poll) so a dead series is loud but not spammy;
+            # the ⚠ carries its suppressed rate so the storm can't hide in the throttle.
             self._stage_err(None, "discovery_empty",
                             Exception("no live market returned for series"), throttle=120.0)
             return None
+        self._starve = 0   # a live market came back — not starving (F3.2 backoff resets)
         event_ticker, market_ticker, mkt, close_ts = disc
         if market_ticker == self._last_window_id:
             return None
@@ -271,14 +308,18 @@ class Desk:
         return market_ticker
 
     def _idle_nap(self, now: Optional[float] = None) -> float:
-        """How long to sleep when idle. After a window is DONE, the next open is a KNOWN
-        time (the just-handled window's close_ts) — nap toward it in shrinking steps so we
-        re-discover within ~1s of the bell, capped at 30s so we never oversleep a gap and
-        floored at 0.25s so we don't spin."""
+        """How long to sleep when idle — TWO regimes (F3.2). Approaching a known bell we
+        RACE it: shrink toward close_ts, floor 0.25s so we catch the open. Once we're AT
+        or PAST the bell and still empty we're STARVING (status-lag gap) — back off
+        0.5→1→2→4s (cap 5s) instead of hammering the exchange at 4 Hz. Backoff resets on
+        a handled window."""
         now = time.time() if now is None else now
-        if self._last_close_ts:
+        if self._last_close_ts and now < self._last_close_ts:
+            # racing toward the bell (approach regime)
             return max(0.25, min(self._last_close_ts + 0.5 - now, 30.0))
-        return 1.0
+        # starvation regime — progressive backoff so blindness never costs exchange goodwill
+        self._starve += 1
+        return min(5.0, 0.5 * (2 ** min(self._starve - 1, 20)))   # 0.5,1,2,4,5(cap)
 
     def run_forever(self) -> None:
         while not self._stop:

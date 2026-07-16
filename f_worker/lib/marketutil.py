@@ -21,6 +21,24 @@ def clamp_int(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(x)))
 
 
+# Consecutive-identical-line aggregation (F3.4): the `[discover]` line was correct but
+# printed 4x/second during a status-lag gap — loud-law excellence turned to wallpaper.
+# Collapse repeats: print at most once per interval, then re-emit with a repeat count.
+# Lives here (crypto-free) so the testable core can exercise it without the crypto stack.
+_print_state: Dict[str, list] = {}
+
+
+def throttled_print(msg: str, min_interval: float = 5.0) -> None:
+    now = time.time()
+    rec = _print_state.get(msg)
+    if rec is None or (now - rec[0]) >= min_interval:
+        suffix = f" (repeated ×{rec[1]} over {int(now - rec[0])}s)" if rec and rec[1] else ""
+        print(msg + suffix, flush=True)
+        _print_state[msg] = [now, 0]
+    else:
+        rec[1] += 1
+
+
 # ---- close_ts resolution (borrowed verbatim from bot.py) ----
 def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
     try:
