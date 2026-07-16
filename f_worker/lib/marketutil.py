@@ -51,12 +51,12 @@ def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
 
 
 def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optional[int]:
-    """Close-ts from a KXBTC15M ticker's date block. Kalshi's format is YYMONDD then
-    HHMM, and the HHMM names the window's CLOSE time in UTC (verified against the live
-    fill tape: KXBTC15M-26JUL161430-30 closed 2026-07-16T14:30:00Z). The old code read
-    the block as DDMONYY and NY-start+interval — dating every inferred market a decade
-    in the past, which the clock filter then discarded as a corpse. No tz shift, no
-    interval add. interval_minutes is kept for signature/back-compat and unused."""
+    """Close-ts from a KXBTC15M ticker's date block: YYMONDD then HHMM, HHMM = CLOSE
+    time in EASTERN (America/New_York). Confirmed from the live fill tape: the 00:30
+    ticker (KXBTC15M-26JUL150030-30) settled at 04:30Z, i.e. 00:30 ET (EDT). (This
+    corrects the earlier UTC reading — the list path used explicit close_time so the tz
+    bug stayed latent until direct-ticker discovery made it load-bearing.) No interval
+    add. interval_minutes kept for signature/back-compat and unused."""
     if not ticker:
         return None
     try:
@@ -68,10 +68,42 @@ def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optio
         mon = MONTHS[dt_chunk[2:5].upper()]  # MON
         day = int(dt_chunk[5:7])           # DD
         hh = int(dt_chunk[7:9])            # HH
-        mm = int(dt_chunk[9:11])           # MM (close time, UTC)
-        return int(datetime(year, mon, day, hh, mm, tzinfo=UTC).timestamp())
+        mm = int(dt_chunk[9:11])           # MM (close time, ET)
+        return int(datetime(year, mon, day, hh, mm, tzinfo=NY).timestamp())
     except Exception:
         return None
+
+
+# ---- ticker arithmetic (THE COMPUTED BELL): the ticker is math, so stop asking the
+# list endpoint (which lists a newborn ~3-4 min late) and construct it directly. Format
+# verified against the tape: SERIES-{YY}{MON}{DD}{HHMM}-{MM}, close time in ET, suffix =
+# close minute. Boundaries at :00/:15/:30/:45 (minute is tz-agnostic; only the hour
+# digits are ET).
+def _ticker_from_close_et(series: str, close_et: datetime) -> str:
+    return f"{series}-{close_et.strftime('%y%b%d%H%M').upper()}-{close_et.strftime('%M')}"
+
+
+def _next_quarter_close_et(now_ts: float) -> datetime:
+    """The next :00/:15/:30/:45 boundary STRICTLY after now, as an ET-aware datetime."""
+    now_et = datetime.fromtimestamp(now_ts, tz=UTC).astimezone(NY)
+    q = (now_et.minute // 15) * 15
+    return now_et.replace(minute=q, second=0, microsecond=0) + timedelta(minutes=15)
+
+
+def current_window_ticker(series: str, now: Optional[float] = None) -> Tuple[str, int]:
+    """(ticker, close_ts) of the window currently in progress — closes at the next
+    quarter-hour boundary. Covers boots mid-window."""
+    now = time.time() if now is None else now
+    close_et = _next_quarter_close_et(now)
+    return _ticker_from_close_et(series, close_et), int(close_et.astimezone(UTC).timestamp())
+
+
+def next_window_ticker(series: str, now: Optional[float] = None) -> Tuple[str, int]:
+    """(ticker, close_ts) of the NEXT window — the one born when the current one closes.
+    Its 200 from get_market IS the real bell."""
+    now = time.time() if now is None else now
+    close_et = _next_quarter_close_et(now) + timedelta(minutes=15)
+    return _ticker_from_close_et(series, close_et), int(close_et.astimezone(UTC).timestamp())
 
 
 def resolve_close_ts(market_obj: Dict[str, Any], ticker: str) -> Optional[int]:

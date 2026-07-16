@@ -99,7 +99,11 @@ def window_story(win: "W.Window", pnl: Dict[str, Any]) -> str:
         sig = ev.get("sigma")
         reg = ev.get("regime", "?")
         detail = f" | σ={sig} {reg}" if sig is not None else ""
-        return f"⏭ W{tag} — SAT_OUT (gate: {r}{detail}) | DONE"
+        # TEMPORARY diagnostic (THE COMPUTED BELL §4): put the raw book keys on the phone
+        # line so the fp-parse-vs-thin-newborn question is settled from a screenshot.
+        # Remove once a real gate row confirms ob=['orderbook_fp'] parses.
+        ob = f" ob={ev.get('ob_keys')}" if "ob_keys" in ev else ""
+        return f"⏭ W{tag} — SAT_OUT (gate: {r}{detail}){ob} | DONE"
     if kind == KIND_FLOOR:
         cost = sum(l.entry_price * l.count for l in win.legs)
         return f"🔁 W{tag} — bundle {_bundle_str(win)}={cost} | rode floor → {sign}{net}¢ | DONE"

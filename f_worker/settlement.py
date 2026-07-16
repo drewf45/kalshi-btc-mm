@@ -40,7 +40,7 @@ class Settler:
         mkt: Dict[str, Any] = {}
         for _ in range(max(1, tries)):
             try:
-                mkt = self.client.get_market(market_ticker)
+                mkt = self.client.get_market(market_ticker) or {}   # None (404) => not final
             except Exception:
                 mkt = {}
             status = str(mkt.get("status", "")).lower()

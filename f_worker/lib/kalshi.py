@@ -144,13 +144,19 @@ class KalshiClient:
         resp = self.request("GET", f"/markets/{market_ticker}/orderbook", params={"depth": depth})
         return resp if isinstance(resp, dict) else {}
 
-    def get_market(self, market_ticker: str) -> Dict[str, Any]:
-        """Single market object — carries status/result (for settlement broker-truth) and
-        the fee params (for the fee tripwire)."""
-        resp = self.request("GET", f"/markets/{market_ticker}")
+    def get_market(self, market_ticker: str) -> Optional[Dict[str, Any]]:
+        """Single market object — carries status/result (settlement), fee params (tripwire),
+        and is the direct-discovery probe (THE COMPUTED BELL). Returns None on 404 (the
+        market is not born yet); raises on any other error so it never masks a real fault."""
+        try:
+            resp = self.request("GET", f"/markets/{market_ticker}")
+        except RuntimeError as e:
+            if "HTTP 404" in str(e) or "not_found" in str(e):
+                return None
+            raise
         if isinstance(resp, dict):
             return resp.get("market") if isinstance(resp.get("market"), dict) else resp
-        return {}
+        return None
 
     def list_markets(self, series_ticker: str, status: Optional[str] = None,
                      limit: int = 200) -> List[Dict[str, Any]]:

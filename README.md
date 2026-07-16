@@ -88,6 +88,20 @@ FATAL-checked: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM_BASE64`. Soft:
 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` (absent ⇒ notify is a logged no-op). `DRY_RUN=1`
 records intent but never submits.
 
+## Discovery: the computed bell
+
+The Kalshi `/markets` list endpoint lists a newborn 15M window ~3–4 minutes after its
+wall-clock open, so list-based discovery always arrived late. Discovery is now
+**arithmetic, not a query**: the ticker is `SERIES-YYMONDDHHMM-MM` with `HHMM` the close
+time in **Eastern** (verified against the fill tape — the `00:30` ticker settled at
+`04:30Z`). `desk._discover_direct` computes the current/next window tickers and knocks
+`get_market` directly — a `200` on the next ticker *is* the bell, and its `listing_latency`
+(first-200 minus wall-clock open) is recorded as a market fact. A `404` is a quiet knock
+(not born yet); an in-progress window that `404`s is a ticker/tz suspect and degrades
+loudly to the list path (never goes dark). `DW_ENTRY_START_LEAD_SEC` defaults to the full
+window (900s) so a born window is gated at birth — the entry phase runs from the open,
+where the chop lives.
+
 ## Between-windows hardening (Work Order F1)
 
 The walls guard the desk while it trades; F1 guards it while it crashes, restarts,
@@ -136,7 +150,7 @@ without its reason + evidence attached:
 ## Running the tests
 
 ```bash
-python -m unittest discover -s tests    # 91 tests, no network / no crypto needed
+python -m unittest discover -s tests    # 96 tests, no network / no crypto needed
 ```
 
 The testable core is deliberately importable without the `cryptography` stack: only

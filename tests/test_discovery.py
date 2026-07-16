@@ -4,6 +4,7 @@
 import time
 import unittest
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from f_worker.config import Config
 from f_worker.ledger import Ledger
@@ -16,29 +17,51 @@ from f_worker.desk import Desk, TokenBucket
 from tests.fakes import FakeClient, FakeNotifier
 
 UTC = timezone.utc
+NY = ZoneInfo("America/New_York")
 
 
 class TestTickerCentury(unittest.TestCase):
-    # BUG 1: the date block is YYMONDD then HHMM (close, UTC) — NOT DDMONYY. The old code
-    # dated inferred markets a decade in the past, so the clock filter ate them as corpses.
+    # YYMONDD then HHMM, HHMM = close in EASTERN (the 00:30 ticker settled at 04:30Z).
     def test_infer_close_ts_real_ticker(self):
-        # KXBTC15M-26JUL150030-30 closed 2026-07-15T00:30:00Z (from the live fill tape)
-        expected = int(datetime(2026, 7, 15, 0, 30, tzinfo=UTC).timestamp())
+        # KXBTC15M-26JUL150030-30 closed 00:30 ET (= 04:30Z) on 2026-07-15
+        expected = int(datetime(2026, 7, 15, 0, 30, tzinfo=NY).timestamp())
         self.assertEqual(mu.infer_close_ts_from_ticker("KXBTC15M-26JUL150030-30", 15), expected)
 
     def test_infer_close_ts_today(self):
-        expected = int(datetime(2026, 7, 16, 14, 30, tzinfo=UTC).timestamp())
+        expected = int(datetime(2026, 7, 16, 14, 30, tzinfo=NY).timestamp())
         self.assertEqual(mu.infer_close_ts_from_ticker("KXBTC15M-26JUL161430-30", 15), expected)
 
     def test_inferred_market_is_not_a_corpse(self):
-        # a freshly-opened window whose close_ts must be INFERRED must survive the clock
-        # filter (the old century bug made it look ten years dead)
+        # a freshly-opened window whose close_ts must be INFERRED survives the clock filter
         now = time.time()
-        future = datetime.fromtimestamp(now + 600, tz=UTC)
-        tk = f"KXBTC15M-{future.strftime('%y%b%d%H%M').upper()}-30"
+        tk, close = mu.current_window_ticker("KXBTC15M", now)
         m = {"ticker": tk, "event_ticker": "EV", "status": "active"}  # NO close_time field
         ev, mt, obj = pick_active_market([m])
         self.assertEqual(mt, tk)
+
+
+class TestTickerArithmetic(unittest.TestCase):
+    # THE COMPUTED BELL: construct the ticker from the ET clock instead of asking the list.
+    def test_construction_matches_tape(self):
+        # 00:20 ET -> in-progress window closes 00:30 ET -> the tape ticker exactly
+        now = datetime(2026, 7, 15, 0, 20, tzinfo=NY).timestamp()
+        tk, close = mu.current_window_ticker("KXBTC15M", now)
+        self.assertEqual(tk, "KXBTC15M-26JUL150030-30")
+        self.assertEqual(close, int(datetime(2026, 7, 15, 0, 30, tzinfo=NY).timestamp()))
+
+    def test_next_is_one_quarter_later(self):
+        now = datetime(2026, 7, 16, 15, 7, tzinfo=NY).timestamp()
+        cur_tk, cur_close = mu.current_window_ticker("KXBTC15M", now)
+        nxt_tk, nxt_close = mu.next_window_ticker("KXBTC15M", now)
+        self.assertEqual(cur_tk, "KXBTC15M-26JUL161515-15")
+        self.assertEqual(nxt_tk, "KXBTC15M-26JUL161530-30")
+        self.assertEqual(nxt_close - cur_close, 900)
+
+    def test_roundtrip_infer(self):
+        # constructing then inferring a ticker returns the same close_ts (ET consistent)
+        now = datetime(2026, 7, 16, 9, 3, tzinfo=NY).timestamp()
+        tk, close = mu.next_window_ticker("KXBTC15M", now)
+        self.assertEqual(mu.infer_close_ts_from_ticker(tk, 15), close)
 
 
 def _mkt(ticker, open_off, close_off, status="active", now=None):
@@ -126,16 +149,48 @@ class TestSilentDeskIsLoud(unittest.TestCase):
         desk = Desk(client, gw, mgr, PriceBrain(cfg, gate_path=""), led, cfg, notif)
         return desk, led, notif
 
-    def test_empty_discovery_pages_and_throttles(self):
-        client = FakeClient()             # discover_market returns None by default
+    def test_stuck_direct_discovery_pages_and_throttles(self):
+        # every ticker 404s (markets={}) while a window is in progress -> ticker suspect +
+        # loud list fallback, NEVER quietly bored; throttled so it doesn't spam.
+        client = FakeClient(markets={})
         desk, led, notif = self._desk(client)
-        self.assertIsNone(desk.loop_once())
-        self.assertIsNone(desk.loop_once())   # second call within 120s
-        pages = [s for s in notif.sent if "discovery_empty" in s]
-        self.assertEqual(len(pages), 1)       # loud, but throttled to once per 120s
-        n = led._conn.execute(
-            "SELECT COUNT(*) c FROM window_events WHERE to_state='STAGE_ERR'").fetchone()["c"]
-        self.assertEqual(n, 1)
+        now = (int(time.time()) // 900) * 900 + 300   # ~5 min into a window (mid-window)
+        self.assertIsNone(desk._discover_direct(now))
+        self.assertIsNone(desk._discover_direct(now))   # within throttle
+        self.assertTrue(any("ticker_suspect" in s or "discovery_empty" in s for s in notif.sent))
+        self.assertLessEqual(len([s for s in notif.sent if "ticker_suspect" in s]), 1)
+
+    def test_knocking_before_birth_is_quiet(self):
+        # in the first seconds of a window the NEXT window legitimately 404s — knock, no page
+        client = FakeClient(markets={})
+        desk, led, notif = self._desk(client)
+        # place `now` at a window open (0s in) so current exists-check is inside grace and
+        # only the next-window knock happens
+        now = (int(time.time()) // 900) * 900 + 900   # exactly a boundary (new window opens)
+        # current window (just opened) 404s but we're within the 30s grace -> no suspect page
+        desk._discover_direct(now + 1)
+        self.assertEqual([s for s in notif.sent if "ticker_suspect" in s], [])
+
+    def test_born_market_is_handled_with_latency(self):
+        # the NEXT ticker returns 200 -> born: discovered, birth latency recorded + printed
+        cfg = Config()
+        led = Ledger(":memory:")
+        notif = FakeNotifier()
+        now = (int(time.time()) // 900) * 900 + 300   # mid current window
+        cur_tk, _ = mu.current_window_ticker(cfg.series_ticker, now)
+        nxt_tk, nxt_close = mu.next_window_ticker(cfg.series_ticker, now)
+        client = FakeClient(markets={nxt_tk: {"ticker": nxt_tk, "event_ticker": "EV"}})
+        gw = FGateway(client, led, cfg, notif)
+        mgr = Manager(gw, led, PriceBrain(cfg, gate_path=""), cfg, notif)
+        desk = Desk(client, gw, mgr, PriceBrain(cfg, gate_path=""), led, cfg, notif)
+        desk._last_window_id = cur_tk        # current already handled -> knock the next
+        disc = desk._discover_direct(now)
+        self.assertIsNotNone(disc)
+        self.assertEqual(disc[1], nxt_tk)
+        rows = led._conn.execute(
+            "SELECT evidence FROM window_events WHERE to_state='BORN'").fetchall()
+        self.assertTrue(rows)
+        self.assertIn("listing_latency_s", rows[0]["evidence"])
 
     def test_entry_fill_announces_immediately(self):
         client = FakeClient()

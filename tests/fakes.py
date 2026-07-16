@@ -13,13 +13,15 @@ class FakeClient:
                  orderbook: Optional[Dict[str, Any]] = None,
                  positions: Optional[List[Dict[str, Any]]] = None,
                  open_orders: Optional[List[Dict[str, Any]]] = None,
-                 market: Optional[Dict[str, Any]] = None):
+                 market: Optional[Dict[str, Any]] = None,
+                 markets: Optional[Dict[str, Dict[str, Any]]] = None):
         self.avail = avail
         self.total = total
         self.orderbook = orderbook or {}
         self.positions = positions or []
         self.open_orders = open_orders or []
-        self.market = market or {}
+        self.market = market          # single-market mode (settlement/feewatch)
+        self.markets = markets        # per-ticker mode (direct discovery): {ticker: obj}
         self.fills: List[Dict[str, Any]] = []
         self.placed: List[Dict[str, Any]] = []
         self.canceled: List[str] = []
@@ -54,8 +56,10 @@ class FakeClient:
     def get_open_orders(self, market_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
         return list(self.open_orders)
 
-    def get_market(self, market_ticker: str) -> Dict[str, Any]:
-        return dict(self.market)
+    def get_market(self, market_ticker: str) -> Optional[Dict[str, Any]]:
+        if self.markets is not None:                # per-ticker: None == 404 (not born)
+            return self.markets.get(market_ticker)
+        return dict(self.market) if self.market else None
 
     def discover_market(self, series_ticker: str):
         return None

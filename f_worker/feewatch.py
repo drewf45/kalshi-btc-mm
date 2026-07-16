@@ -39,7 +39,7 @@ class FeeTripwire:
     def capture(self, market_ticker: str) -> Optional[str]:
         """Record the current fee fingerprint as the baseline (boot)."""
         try:
-            mkt = self.client.get_market(market_ticker)
+            mkt = self.client.get_market(market_ticker) or {}
         except Exception as e:
             print(f"[feewatch] capture failed: {e}", flush=True)
             return None
@@ -53,7 +53,7 @@ class FeeTripwire:
         Returns True if a change was detected (and the desk halted)."""
         baseline = self.ledger.last_fee_fingerprint()
         try:
-            mkt = self.client.get_market(market_ticker)
+            mkt = self.client.get_market(market_ticker) or {}
         except Exception as e:
             # couldn't read the schedule this cycle — say so; do NOT infer "unchanged".
             print(f"[feewatch] check fetch failed ({e}); will retry next cycle", flush=True)

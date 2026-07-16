@@ -12,7 +12,8 @@ from typing import Any, Dict, Optional
 
 from . import window as W
 from .config import Config
-from .lib.marketutil import parse_best_yes_no
+from .lib.marketutil import (parse_best_yes_no, current_window_ticker, next_window_ticker,
+                             throttled_print)
 
 
 def _fill_price(fill: Dict[str, Any], side: str) -> Optional[int]:
@@ -62,6 +63,7 @@ class Desk:
         self._err_seen: Dict[tuple, Dict[str, float]] = {}
         self._starve: int = 0                      # consecutive empty idle ticks (F3.2)
         self._disc_bucket = TokenBucket(config.req_per_min, config.req_per_min)  # F3.3
+        self._births_seen: set = set()             # tickers whose birth latency is logged
         self._stop = False
 
     def stop(self) -> None:
@@ -273,19 +275,13 @@ class Desk:
         # catch a bell are fine, 4 Hz storms are not.
         if not self._disc_bucket.allow():
             return None
-        try:
-            disc = self.client.discover_market(self.cfg.series_ticker)
-        except Exception as e:
-            self._stage_err(None, "discovery", e, throttle=60.0)
-            return None
+        # THE COMPUTED BELL: stop asking the list endpoint (it lists a newborn ~3-4 min
+        # late); the ticker is arithmetic — compute it and knock directly. None here means
+        # "knocking, not born yet" (normal) — _discover_direct handles the loud cases.
+        disc = self._discover_direct(time.time())
         if not disc:
-            # discovery came back empty — the desk is NEVER allowed to be quietly bored.
-            # Pages every 120s (not every poll) so a dead series is loud but not spammy;
-            # the ⚠ carries its suppressed rate so the storm can't hide in the throttle.
-            self._stage_err(None, "discovery_empty",
-                            Exception("no live market returned for series"), throttle=120.0)
             return None
-        self._starve = 0   # a live market came back — not starving (F3.2 backoff resets)
+        self._starve = 0   # a live/born market came back — not starving (F3.2 backoff resets)
         event_ticker, market_ticker, mkt, close_ts = disc
         if market_ticker == self._last_window_id:
             return None
@@ -306,6 +302,96 @@ class Desk:
                 self.notifier.alert(f"HALT — {self.cfg.pause_after_stops} consecutive stopped "
                                     f"windows. Desk idles until DW_CLEAR_HALT=1 boot.")
         return market_ticker
+
+    # ---- direct-ticker discovery (THE COMPUTED BELL) ----
+    def _discover_direct(self, now: float):
+        """Compute the window tickers and knock get_market directly, so a newborn is found
+        the moment Kalshi creates it (the list lags 3-4 min). Order: current in-progress
+        window (boot mid-window), else knock the NEXT window (its 200 is the real bell).
+        Returns a (event, ticker, mkt, close_ts) tuple or None (knocking / idle). Loud
+        cases (errors, 404-past-open, empty fallback) page from here."""
+        series = self.cfg.series_ticker
+        direct_error = False
+
+        # 1. the window currently in progress — covers boots mid-window and MUST exist
+        cur_ticker, cur_close = current_window_ticker(series, now)
+        cur_open = cur_close - 900
+        if cur_ticker != self._last_window_id and cur_close > now + 5:
+            try:
+                m = self.client.get_market(cur_ticker)
+                if isinstance(m, dict):
+                    return self._disc_tuple(m, cur_ticker, cur_close)
+                # None -> an IN-PROGRESS window returned 404. Once we're comfortably inside
+                # it, it must exist, so the ticker format/tz is suspect: degrade to the list
+                # path loudly instead of going dark on a construction guess.
+                if now > cur_open + 30:
+                    self._stage_err(None, "ticker_suspect",
+                                    Exception(f"{cur_ticker} 404 while in progress"),
+                                    throttle=120.0)
+                    fb = self._list_fallback(now, "current window 404 — ticker format/tz suspect")
+                    if fb:
+                        return fb
+            except Exception as e:
+                direct_error = True
+                self._stage_err(None, "discovery", e, throttle=60.0)
+
+        # 2. the NEXT window — knock until Kalshi gives birth (200 = the real bell). A 404
+        # here is NORMAL (it opens at cur_close); quiet knock print, no page.
+        nxt_ticker, nxt_close = next_window_ticker(series, now)
+        if nxt_ticker != self._last_window_id:
+            try:
+                m = self.client.get_market(nxt_ticker)
+            except Exception as e:
+                direct_error = True
+                self._stage_err(None, "discovery", e, throttle=60.0)
+                m = "ERR"
+            if isinstance(m, dict):
+                self._record_birth(nxt_ticker, nxt_close, now)
+                return self._disc_tuple(m, nxt_ticker, nxt_close)
+            if m is None:   # 404 — not born yet (opens at cur_close); this is expected
+                throttled_print(f"[discover] knocking {nxt_ticker} (not born yet)")
+                return None
+
+        # both direct fetches errored (not 404) -> list fallback (patch §3)
+        if direct_error:
+            return self._list_fallback(now, "both direct fetches errored")
+        return None
+
+    def _disc_tuple(self, m: Dict[str, Any], ticker: str, close_ts: int):
+        ev = m.get("event_ticker") or (m.get("event") or {}).get("ticker") or ""
+        return (ev, ticker, m, close_ts)
+
+    def _record_birth(self, ticker: str, close_ts: int, now: float) -> None:
+        """Listing latency is a measured market fact — the true bell's offset. Record it
+        once per ticker (the entry phase runs from BIRTH, where the chop lives)."""
+        if ticker in self._births_seen:
+            return
+        self._births_seen.add(ticker)
+        lat = int(now - (close_ts - 900))   # 15M window opened close-900s ago
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        wtag = datetime.fromtimestamp(close_ts, tz=timezone.utc).astimezone(
+            ZoneInfo("America/New_York")).strftime("%H:%M")
+        sign = "+" if lat >= 0 else ""
+        throttled_print(f"[discover] W{wtag} born T{sign}{lat}s after wall open")
+        try:
+            self.ledger.record_transition(ticker, None, "BORN",
+                                          {"listing_latency_s": lat, "close_ts": close_ts})
+        except Exception:
+            pass
+
+    def _list_fallback(self, now: float, reason: str):
+        """Old list-based discovery — used only when direct fetch can't answer. Loud."""
+        print(f"[discover] FALLBACK to list ({reason})", flush=True)
+        try:
+            disc = self.client.discover_market(self.cfg.series_ticker)
+        except Exception as e:
+            self._stage_err(None, "discovery", e, throttle=60.0)
+            return None
+        if not disc:
+            self._stage_err(None, "discovery_empty",
+                            Exception(f"list fallback empty ({reason})"), throttle=120.0)
+        return disc
 
     def _idle_nap(self, now: Optional[float] = None) -> float:
         """How long to sleep when idle — TWO regimes (F3.2). Approaching a known bell we

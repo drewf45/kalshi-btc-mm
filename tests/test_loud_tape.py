@@ -82,9 +82,9 @@ class TestStageErrorsAreLoud(unittest.TestCase):
     def test_discovery_error_tags_and_pages(self):
         client = FakeClient()
 
-        def boom(series):
+        def boom(ticker):
             raise RuntimeError("discovery boom")
-        client.discover_market = boom
+        client.get_market = boom            # direct-ticker fetch errors (non-404)
 
         desk, led, notif = self._desk(client)
         handled = desk.loop_once()

@@ -77,12 +77,11 @@ class Config:
     stuck_gauge_n: int = 4        # DW_STUCK_GAUGE_N (same gate refusal N windows => alert)
 
     # --- Discovery / loop timing ---
-    # DW_ENTRY_START_LEAD_SEC: begin seeking this many secs before close. NOTE the
-    # doctrine ("the chop lives at the open") wants SEEKING at the bell — for a 900s
-    # window set this to >= 900 so the desk seeks the instant it discovers the freshly
-    # opened window. The default 600 seeks ~5 min after the open; left as-is because it
-    # is env-tunable and outside this patch's stated config changes.
-    entry_start_lead_sec: int = 600
+    # DW_ENTRY_START_LEAD_SEC: begin seeking this many secs before close. THE COMPUTED
+    # BELL discovers a window AT its birth and rules "gate it NOW — the entry phase runs
+    # from BIRTH", so the lead is the full 900s window: the desk seeks the instant it
+    # discovers the freshly-opened window instead of arming 5 min late. Env-tunable.
+    entry_start_lead_sec: int = 900
     poll_seconds: float = 1.0
     fill_wait_seconds: int = 30       # how long a resting entry bid waits inside the phase
 
