@@ -160,10 +160,14 @@ class KalshiClient:
     def discover_market(self, series_ticker: str) -> Optional[Tuple[str, str, Dict[str, Any], int]]:
         markets = self.list_markets(series_ticker)
         if not markets:
+            print(f"[discover] list_markets returned 0 markets for {series_ticker}", flush=True)
             return None
         try:
             event_ticker, market_ticker, chosen = pick_active_market(markets)
-        except RuntimeError:
+        except RuntimeError as e:
+            # never swallow the picker's reason anonymously — the desk turns None into a
+            # loud discovery_empty page, and this print names WHY it was empty.
+            print(f"[discover] {e} (markets={len(markets)})", flush=True)
             return None
         close_ts = resolve_close_ts(chosen, market_ticker)
         if close_ts is None:

@@ -33,6 +33,12 @@ def _parse_iso_to_epoch_s(s: str) -> Optional[int]:
 
 
 def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optional[int]:
+    """Close-ts from a KXBTC15M ticker's date block. Kalshi's format is YYMONDD then
+    HHMM, and the HHMM names the window's CLOSE time in UTC (verified against the live
+    fill tape: KXBTC15M-26JUL161430-30 closed 2026-07-16T14:30:00Z). The old code read
+    the block as DDMONYY and NY-start+interval — dating every inferred market a decade
+    in the past, which the clock filter then discarded as a corpse. No tz shift, no
+    interval add. interval_minutes is kept for signature/back-compat and unused."""
     if not ticker:
         return None
     try:
@@ -40,14 +46,12 @@ def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optio
         if len(parts) < 2:
             return None
         dt_chunk = parts[1]
-        day = int(dt_chunk[0:2])
-        mon = MONTHS[dt_chunk[2:5].upper()]
-        year = 2000 + int(dt_chunk[5:7])
-        hh = int(dt_chunk[7:9])
-        mm = int(dt_chunk[9:11])
-        start_local = datetime(year, mon, day, hh, mm, tzinfo=NY)
-        close_utc = (start_local + timedelta(minutes=int(interval_minutes))).astimezone(UTC)
-        return int(close_utc.timestamp())
+        year = 2000 + int(dt_chunk[0:2])   # YY
+        mon = MONTHS[dt_chunk[2:5].upper()]  # MON
+        day = int(dt_chunk[5:7])           # DD
+        hh = int(dt_chunk[7:9])            # HH
+        mm = int(dt_chunk[9:11])           # MM (close time, UTC)
+        return int(datetime(year, mon, day, hh, mm, tzinfo=UTC).timestamp())
     except Exception:
         return None
 

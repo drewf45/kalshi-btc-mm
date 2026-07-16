@@ -140,7 +140,11 @@ class Desk:
         deadline = time.time() + self.cfg.entry_window_sec
         fills: Dict[str, int] = {}
         while not self._stop and time.time() < deadline and len(fills) < 2:
-            fills.update(self._poll_fills(win, {"yes": win.yes_entry_oid, "no": win.no_entry_oid}, "buy"))
+            for side, px in self._poll_fills(
+                    win, {"yes": win.yes_entry_oid, "no": win.no_entry_oid}, "buy").items():
+                if side not in fills:
+                    fills[side] = px
+                    self._announce_fill(win, side, px)   # inventory born -> announce loud
             if len(fills) < 2:
                 time.sleep(self.cfg.poll_seconds)
         # one final touch snapshot so a no-fill sat-out shows where the market was
@@ -199,6 +203,14 @@ class Desk:
             self._stage_err(self._cur_win, "book_fetch", e)
             return {}
 
+    def _announce_fill(self, win: "W.Window", side: str, px: int) -> None:
+        """A resting entry bid filled — inventory just came into existence. Announce it
+        immediately (Drew's standing ruling) so HOLDING is never mistaken for stuck."""
+        if self.notifier:
+            flip = self.pb.flip_ask_price(side, px)
+            self.notifier.send(f"🌱 W{win.tag()} — filled {side.upper()}@{px} "
+                               f"(resting flip posted @{flip})")
+
     def _touch(self, market_ticker: str) -> Dict[str, Any]:
         """Final best-bid snapshot at entry-phase end: where the market was while our
         bids sat, so a no-fill sat-out can prove the touch (loud-tape law)."""
@@ -219,6 +231,10 @@ class Desk:
             self._stage_err(None, "discovery", e, throttle=60.0)
             return None
         if not disc:
+            # discovery came back empty — the desk is NEVER allowed to be quietly bored.
+            # Pages every 120s (not every poll) so a dead series is loud but not spammy.
+            self._stage_err(None, "discovery_empty",
+                            Exception("no live market returned for series"), throttle=120.0)
             return None
         event_ticker, market_ticker, mkt, close_ts = disc
         if market_ticker == self._last_window_id:
