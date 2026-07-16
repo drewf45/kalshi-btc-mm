@@ -1,10 +1,21 @@
 services:
   - type: worker
-    name: kalshi-btc-mm
+    name: kalshi-k-worker
     runtime: python
     plan: starter
-    # FLIPDESK: one package, one job, no other option on the box.
-    # Point this Render service's branch at the flipdesk build branch and the desk
-    # runs live from boot. The retired weather desk (d_worker) does not run here.
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -m f_worker
+    buildCommand: pip install -r requirements.txt && python -c "import k_worker.__main__"
+    startCommand: python -m k_worker
+    disk:
+      name: k-worker-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: K_WORKER_DB
+        value: /var/data/k_worker_surface.db
+
+  - type: worker
+    name: kalshi-k-watcher
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt && python -c "import k_worker.__main__"
+    startCommand: python -m k_worker.watcher

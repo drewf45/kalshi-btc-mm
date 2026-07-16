@@ -1,0 +1,300 @@
+"""KAL-D main entry point — two-body architecture.
+
+Outside body (scanner): sweep → classify → reserve → seed → next.
+Inside body (watchdog): re-verify evidence → budget gate → abandon on break.
+
+Boot: envcheck → dstore init → instance lock → budget init → env-var config →
+Telegram BOOT → threads (scanner, settle, watchdog, pack) → supervisor.
+"""
+
+import os
+import sys
+import fcntl
+import time
+import signal
+import logging
+import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from k_worker import kalshi, notify
+
+from . import dstore, scanner, shadow, pack, tg, registry, watchdog, budget, gateway
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("d_worker")
+
+NY = ZoneInfo("America/New_York")
+
+REQUIRED_ENV = [
+    "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PEM_BASE64", "KALSHI_ENV",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+    "DW_NWS_CONTACT",
+]
+
+LOCK_FILE = os.environ.get("DW_LOCK_FILE", "/var/data/kal_d.lock")
+SCAN_CYCLE_TARGET_SEC = int(os.environ.get("DW_SCAN_CYCLE_TARGET_SEC", "300"))
+SETTLE_INTERVAL_SEC = 120
+NIGHTLY_ROLLUP_HOUR = 23
+
+_running = True
+_lock_fd = None
+
+
+def _shutdown(sig, frame):
+    global _running
+    log.warning(f"[MAIN] Signal {sig} — shutting down")
+    _running = False
+
+
+def _envcheck() -> None:
+    """FATAL if any required env var is missing."""
+    missing = [v for v in REQUIRED_ENV if not os.environ.get(v, "").strip()]
+    if missing:
+        msg = f"FATAL: missing env vars: {', '.join(missing)}"
+        log.error(f"[MAIN] {msg}")
+        try:
+            notify.send(f"🅳 🚨 {msg}")
+        except Exception:
+            pass
+        raise RuntimeError(msg)
+
+
+def _acquire_lock() -> None:
+    global _lock_fd
+    lock_dir = os.path.dirname(LOCK_FILE)
+    if lock_dir and not os.path.isdir(lock_dir):
+        os.makedirs(lock_dir, exist_ok=True)
+    _lock_fd = open(LOCK_FILE, "w")
+    deadline = time.time() + 120
+    alerted = False
+    while True:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_fd.write(str(os.getpid()))
+            _lock_fd.flush()
+            log.info("[MAIN] Instance lock acquired")
+            return
+        except (IOError, OSError):
+            if not alerted:
+                log.warning("[MAIN] Waiting for previous d_worker instance...")
+                alerted = True
+            if time.time() >= deadline:
+                notify.alert("🅳 OVERLAP: another d_worker holds the lock")
+                raise RuntimeError("FATAL: d_worker overlap after 120s")
+            time.sleep(10)
+
+
+class SupervisedThread:
+    """Thread with death detection and restart (3 strikes = FATAL)."""
+
+    def __init__(self, name: str, target, args=()):
+        self.name = name
+        self.target = target
+        self.args = args
+        self.thread: threading.Thread = None
+        self.failures = 0
+        self.max_failures = 3
+
+    def start(self) -> None:
+        self.thread = threading.Thread(
+            target=self._wrapper, daemon=True, name=self.name)
+        self.thread.start()
+
+    def _wrapper(self) -> None:
+        try:
+            self.target(*self.args)
+        except Exception as e:
+            log.error(f"[SUPERVISOR] Thread {self.name} died: {e}", exc_info=True)
+            self.failures += 1
+
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def check_and_restart(self) -> bool:
+        if self.is_alive():
+            return True
+        if self.failures >= self.max_failures:
+            return False
+        log.warning(f"[SUPERVISOR] Restarting {self.name} "
+                    f"(failure {self.failures}/{self.max_failures})")
+        notify.send(f"🅳 ⚠ Thread {self.name} restarted "
+                     f"({self.failures}/{self.max_failures})")
+        self.start()
+        return True
+
+
+def _scanner_loop(client: kalshi.KalshiClient) -> None:
+    """Continuous scan loop."""
+    while _running:
+        try:
+            scanner.sweep(client)
+        except Exception as e:
+            log.error(f"[SCANNER] Sweep error: {e}", exc_info=True)
+        sleep_target = max(30, SCAN_CYCLE_TARGET_SEC)
+        end = time.time() + sleep_target
+        while _running and time.time() < end:
+            time.sleep(min(30, end - time.time()))
+
+
+def _settlement_loop(client: kalshi.KalshiClient) -> None:
+    """Periodic settlement polling + nightly rollup."""
+    last_rollup_day = ""
+    governor = scanner._get_governor()
+    while _running:
+        try:
+            settled = shadow.settle_seeds(client, governor=governor)
+            if settled:
+                log.info(f"[SETTLE] Settled {settled} seeds")
+        except Exception as e:
+            log.error(f"[SETTLE] Error: {e}", exc_info=True)
+
+        now = datetime.now(NY)
+        today = now.strftime("%Y-%m-%d")
+        if now.hour >= NIGHTLY_ROLLUP_HOUR and today != last_rollup_day:
+            try:
+                shadow.nightly_rollup()
+                last_rollup_day = today
+                log.info("[SETTLE] Nightly rollup complete")
+            except Exception as e:
+                log.error(f"[SETTLE] Rollup error: {e}", exc_info=True)
+
+        end = time.time() + SETTLE_INTERVAL_SEC
+        while _running and time.time() < end:
+            time.sleep(min(30, end - time.time()))
+
+
+def _watchdog_loop(client: kalshi.KalshiClient) -> None:
+    """Continuous watchdog cycle — re-verify every open position."""
+    governor = scanner._get_governor()
+    while _running:
+        try:
+            stats = watchdog.watch_cycle(client, governor=governor)
+            if stats["broken"] > 0 or stats["settle_lag"] > 0:
+                log.warning(f"[WATCHDOG] Cycle: {stats}")
+        except Exception as e:
+            log.error(f"[WATCHDOG] Error: {e}", exc_info=True)
+        end = time.time() + watchdog.WATCH_INTERVAL_SEC
+        while _running and time.time() < end:
+            time.sleep(min(30, end - time.time()))
+
+
+def _pack_loop() -> None:
+    """Hourly pack to Telegram + DB, every hour."""
+    while _running:
+        try:
+            now = datetime.now(NY)
+            if now.minute == 0 and not pack.hourly_pack_sent_this_hour():
+                pack.send_hourly_pack()
+        except Exception as e:
+            log.error(f"[PACK] Error: {e}", exc_info=True)
+        time.sleep(30)
+
+
+def main():
+    global _running
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    log.info("[MAIN] === KAL-D BOOT ===")
+
+    # 1. Envcheck (FATAL loud)
+    _envcheck()
+
+    # 2. Telegram init (reuse k_worker's notify)
+    try:
+        notify.init()
+    except Exception as e:
+        log.error(f"[MAIN] Telegram init failed: {e}")
+        raise
+
+    # 3. Store init
+    dstore.init_db()
+
+    # 4. Instance lock
+    _acquire_lock()
+
+    # 5. Registry init + env-var approvals + budget + rung
+    registry.load_blacklist()
+    budget.init_budget()
+    newly_approved = tg.apply_env_approvals()
+    newly_blacklisted = tg.apply_env_blacklist()
+    halt_cleared = tg.apply_env_clear_halt()
+    rung_set = tg.apply_env_rung()
+    live_halt_cleared = tg.apply_env_clear_live_halt()
+
+    # 6. Kalshi client
+    client = kalshi.build_client()
+    cash, pv = kalshi.get_balance(client)
+    if cash is None:
+        raise RuntimeError("FATAL: cannot read Kalshi balance")
+
+    # 7. Boot message — config echo
+    all_reg = dstore.list_registry()
+    approved_list = [r for r in all_reg if r.get("approved_ts")]
+    drafted_list = [r for r in all_reg if not r.get("approved_ts")]
+    bl_count = len(registry.CRYPTO_BLACKLIST) + len(registry._user_blacklist)
+    halt_state = dstore.get_state("halt_promotion")
+
+    rung = gateway.current_rung()
+    live_halt_state = dstore.get_state("live_halt")
+    book_cap = budget._book_cap_usd()
+
+    approved_names = ", ".join(r["series_ticker"] for r in approved_list) or "none"
+    boot_lines = [
+        f"🅳 BOOT — KAL-D R{rung} scanner + watchdog",
+        f"  rung: {rung} ({'LIVE' if gateway.is_live_enabled() else 'SHADOW'}) | "
+        f"book cap: ${book_cap:.2f}",
+        f"  scan: {scanner.SCAN_REQ_PER_MIN} req/min, "
+        f"{scanner.SCAN_CYCLE_TARGET_SEC}s target",
+        f"  watchdog: {watchdog.WATCH_INTERVAL_SEC}s cycle",
+        f"  approved ({len(approved_list)}): {approved_names}",
+        f"  blacklist: {bl_count} series | "
+        f"drafted: {len(drafted_list)}",
+        f"  draft prefixes: {', '.join(registry.DRAFT_PREFIXES)}",
+        f"  halt: {'ACTIVE' if halt_state == '1' else 'clear'} | "
+        f"live_halt: {'ACTIVE' if live_halt_state == '1' else 'clear'}",
+    ]
+    if newly_approved:
+        boot_lines.append(f"  env-approved this boot: {', '.join(newly_approved)}")
+    if halt_cleared:
+        boot_lines.append(f"  halt_promotion cleared via DW_CLEAR_HALT")
+    if rung_set:
+        boot_lines.append(f"  rung set to {rung} via DW_RUNG")
+    if live_halt_cleared:
+        boot_lines.append(f"  live_halt cleared via DW_CLEAR_LIVE_HALT")
+    notify.send("\n".join(boot_lines))
+
+    # 8. Launch threads (no tg poller — env-var driven)
+    threads = [
+        SupervisedThread("dw-scanner", _scanner_loop, (client,)),
+        SupervisedThread("dw-settle", _settlement_loop, (client,)),
+        SupervisedThread("dw-watchdog", _watchdog_loop, (client,)),
+        SupervisedThread("dw-pack", _pack_loop),
+    ]
+    for t in threads:
+        t.start()
+    log.info("[MAIN] All threads launched")
+
+    # 9. Supervisor loop
+    while _running:
+        time.sleep(30)
+        for t in threads:
+            if not t.check_and_restart():
+                msg = f"FATAL: thread {t.name} exceeded {t.max_failures} failures"
+                log.error(f"[MAIN] {msg}")
+                notify.alert(f"🅳 {msg}")
+                _running = False
+                break
+
+    log.warning("[MAIN] Shutting down...")
+    notify.send("🅳 KAL-D STOPPED")
+    log.warning("[MAIN] Done.")
+
+
+if __name__ == "__main__":
+    main()
