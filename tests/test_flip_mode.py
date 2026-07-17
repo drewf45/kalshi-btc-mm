@@ -139,7 +139,7 @@ class TestFlipCycle(_RestoreMixin):
         self.P(flip_mode.kalshi, "position_for_market", lambda c, tk: self.net)
         self.P(flip_mode.kalshi, "get_positions", lambda c: [])
 
-        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None):
+        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None, post_only=True):
             oid = f"{side}-{price}"
             self.orders.append(dict(side=side, price=price, count=count,
                                     expiration_ts=expiration_ts, v2=v2_price_str, oid=oid))

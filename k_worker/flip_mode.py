@@ -88,6 +88,41 @@ def _order_fill_price(client, ticker: str, order_id: Optional[str], our_side: st
     return int(round(price)) if price is not None else None
 
 
+def _is_cross_400(e) -> bool:
+    """WO-CROSSFIRE: the exchange's 'post only cross' rejection (a post_only order that would
+    fill immediately). Match narrowly so other 400s aren't mistaken for it."""
+    s = str(e).lower()
+    return "400" in s and "post only cross" in s
+
+
+def _post_entry(client, ticker: str, side: str, join: int, fp_str, exp: int, tag: str):
+    """WO-CROSSFIRE §2 — a PASSIVE entry join with reject-and-recover. On a post-only cross
+    (the book moved between fetch and post) refetch once and re-price at the fresh join; if it
+    would STILL cross, skip the entry this trip (never chase). Returns oid or None."""
+    try:
+        oid, _ = kalshi.place_order_maker(client, ticker, side, join, 1,
+                                          expiration_ts=exp, v2_price_str=fp_str)
+        return oid
+    except Exception as e:
+        if not _is_cross_400(e):
+            notify.send(f"⚠ W{tag} entry {side.upper()}@{join} rejected: {e}")
+            return None
+        try:
+            b = kalshi.fetch_orderbook(client, ticker)          # book moved — refetch once
+            nj = b.yes_bid if side == "yes" else b.no_bid
+            nf = b.yes_bid_fp if side == "yes" else b.no_bid_fp
+            if nj is None or nj > FLIP_SIDE_MAX:
+                notify.send(f"⚠ W{tag} entry {side.upper()} skipped — book moved (would cross)")
+                return None
+            oid, _ = kalshi.place_order_maker(client, ticker, side, nj, 1,
+                                              expiration_ts=exp, v2_price_str=nf)
+            return oid
+        except Exception as e2:
+            notify.send(f"⚠ W{tag} entry {side.upper()} skipped — book moved (would cross)"
+                        if _is_cross_400(e2) else f"⚠ W{tag} entry {side.upper()} reprice failed: {e2}")
+            return None
+
+
 def _record_enter(ticker: str, close_ts: int, side: str,
                   fill_cents: Optional[int] = None, order_id: Optional[str] = None,
                   why_tag: str = "FLIP_ENTER") -> None:
@@ -147,7 +182,8 @@ def _inventory(client, ticker: str, close_ts: int, tag: str, net: int, ctx: str)
             notify.send(f"⚠ W{tag} flatten: no {comp} touch to join")
             return
         roid, _ = kalshi.place_order_maker(client, ticker, comp, cb, abs(int(net)),
-                                           expiration_ts=int(close_ts - 2), v2_price_str=cfp)
+                                           expiration_ts=int(close_ts - 2), v2_price_str=cfp,
+                                           post_only=False)   # WO-CROSSFIRE: fill-now flatten
         # WO-6 §2: story row so settlement resolves the pair and Δ$-explained stays honest
         _record_enter(ticker, close_ts, comp, None, roid, why_tag="FLIP_FLATTEN")
         notify.send(f"🩹 W{tag} — flatten join {comp.upper()}@{cb}×{abs(int(net))} (exp close−2)")
@@ -198,13 +234,23 @@ def _decline_lone(client, ticker: str, close_ts: int, tag: str, lhs: str, lhp: i
         cfp = b.no_bid_fp if comp == "no" else b.yes_bid_fp
         return cb, cfp
 
+    # WO-CROSSFIRE §1: a flatten is a CROSSING intent — it must be allowed to fill NOW, so
+    # post_only=False (a maker rest is fine when it doesn't cross; a cross fills as a taker).
+    def _flatten(price, fp_str):
+        return kalshi.place_order_maker(client, ticker, comp, price, 1,
+                                        expiration_ts=int(close_ts - 2),
+                                        v2_price_str=fp_str, post_only=False)
+
     cb, cfp = _touch()
     if cb is None:
         notify.alert(f"⚠ W{tag} decline: no {comp.upper()} touch to flatten lone "
                      f"{lhs.upper()}@{lhp} — rides bounded")
         return None, False
-    roid, _ = kalshi.place_order_maker(client, ticker, comp, cb, 1,
-                                       expiration_ts=int(close_ts - 2), v2_price_str=cfp)
+    try:
+        roid, _ = _flatten(cb, cfp)
+    except Exception as e:
+        notify.alert(f"🚨 scratch unfillable W{tag} {lhs.upper()}@{lhp}: {e} — T-90 backstop")
+        return None, False
     _record_enter(ticker, close_ts, comp, None, roid, why_tag="FLIP_DECLINE")
     notify.send(f"🚪 W{tag} — declining lone {lhs.upper()}@{lhp}: flatten {comp.upper()}@{cb} "
                 f"(exp close−2)")
@@ -221,11 +267,14 @@ def _decline_lone(client, ticker: str, close_ts: int, tag: str, lhs: str, lhp: i
         kalshi.cancel_all_for_market(client, ticker)
         cb2, cfp2 = _touch()
         if cb2 is not None:
-            roid2, _ = kalshi.place_order_maker(client, ticker, comp, cb2, 1,
-                                                expiration_ts=int(close_ts - 2), v2_price_str=cfp2)
-            _record_enter(ticker, close_ts, comp, None, roid2, why_tag="FLIP_DECLINE")
-            used = cb2
-            notify.send(f"🚪 W{tag} — decline rejoin {comp.upper()}@{cb2} (exp close−2)")
+            try:
+                roid2, _ = _flatten(cb2, cfp2)
+                _record_enter(ticker, close_ts, comp, None, roid2, why_tag="FLIP_DECLINE")
+                used = cb2
+                notify.send(f"🚪 W{tag} — decline rejoin {comp.upper()}@{cb2} (exp close−2)")
+            except Exception as e:
+                notify.alert(f"🚨 scratch unfillable W{tag} rejoin {comp.upper()}@{cb2}: {e} "
+                             f"— T-90 backstop")
         else:
             notify.alert(f"⚠ W{tag} decline rejoin: no {comp.upper()} touch — lone rides bounded")
     return used, filled
@@ -329,8 +378,14 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
 
     # WO-VISION — the ratchet manages from the fill with a multi-trip loop. FLIP_RATCHET=0
     # reverts to the proven require_pair single-shot window below (the one-env kill switch).
+    # WO-CROSSFIRE §2: no order rejection escapes as a stack trace — the window aborts cleanly
+    # and the trip slot is released (the R1 wall re-checks flat next window).
     if FLIP_RATCHET:
-        return _run_ratchet_window(client, ticker, close_ts, tag, exp, market_obj)
+        try:
+            return _run_ratchet_window(client, ticker, close_ts, tag, exp, market_obj)
+        except Exception as e:
+            notify.alert(f"⚠ W{tag} ratchet cycle error: {e} — window aborted, slot released")
+            return "flip_error"
 
     # OPPORTUNISTIC ENTRY (WO-4) — WATCH the early window instead of quoting both at the
     # bell. Each side posts its bid the FIRST time its join ≤ FLIP_SIDE_MAX, at most once,
@@ -372,8 +427,9 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
                     notify.send(f"🔁 W{tag} — would post {side.upper()}@{join} (observe)")
                 continue
             ss, pp = flip_math.entry_args(side, join)
-            oid, _ = kalshi.place_order_maker(client, ticker, ss, pp, 1,
-                                              expiration_ts=exp, v2_price_str=fp_str)
+            oid = _post_entry(client, ticker, ss, pp, fp_str, exp, tag)   # passive, recovers
+            if oid is None:
+                continue
             far = book.no_bid if side == "yes" else book.yes_bid   # §3: far-side bid at post
             booksum = join + far if far is not None else join      # ≪100 or ≈join = lone shape
             posted[side] = {"oid": oid, "price": join, "dt": time.time() - quote_ts,
@@ -681,8 +737,9 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
                 notify.send(f"🔁 W{tag} T{trip_no} — would post {side.upper()}@{join} (observe)")
                 continue
             ss, pp = flip_math.entry_args(side, join)
-            oid, _ = kalshi.place_order_maker(client, ticker, ss, pp, 1,
-                                              expiration_ts=exp, v2_price_str=fp_str)
+            oid = _post_entry(client, ticker, ss, pp, fp_str, exp, tag)   # passive, recovers
+            if oid is None:
+                continue                                 # entry skipped → no phantom slot
             posted[side] = {"oid": oid, "price": join}
         for side in list(posted):
             if side not in fills:
@@ -712,11 +769,15 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
     held_side, entry = next(iter(fills.items()))
     other = "no" if held_side == "yes" else "yes"
 
-    # THE TAKE — exit at entry+X, posted AT the fill (with expiry)
+    # THE TAKE — a passive resting exit at entry+X, posted AT the fill (with expiry)
     q = entry + FLIP_X
     tes, tep = flip_math.exit_args(held_side, q)
-    take_oid, _ = kalshi.place_order_maker(client, ticker, tes, tep, 1, expiration_ts=exp)
-    notify.send(f"🎯 W{tag} T{trip_no} — {held_side.upper()}@{entry}, take @{q} posted")
+    try:
+        take_oid, _ = kalshi.place_order_maker(client, ticker, tes, tep, 1, expiration_ts=exp)
+        notify.send(f"🎯 W{tag} T{trip_no} — {held_side.upper()}@{entry}, take @{q} posted")
+    except Exception as e:                               # never let a take rejection escape
+        take_oid = None
+        notify.send(f"⚠ W{tag} T{trip_no} take post failed: {e} — managing via scratch/T-90")
 
     grace_end = first_fill_ts + FLIP_PAIR_GRACE
     mo_rec = {"m10": None, "m30": None, "m60": None}

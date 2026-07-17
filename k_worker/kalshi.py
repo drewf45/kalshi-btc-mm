@@ -668,14 +668,19 @@ def amend_order(client: KalshiClient, order_id: str, ticker: str, side: str,
 def place_order_maker(client: KalshiClient, ticker: str, side: str,
                       price_cents: int, count: int = 1,
                       expiration_ts: Optional[int] = None,
-                      v2_price_str: Optional[str] = None) -> Tuple[str, Dict]:
-    """Place a post_only (maker) limit order via V2. Returns (order_id, response).
+                      v2_price_str: Optional[str] = None,
+                      post_only: bool = True) -> Tuple[str, Dict]:
+    """Place a limit order via V2. Returns (order_id, response).
 
     side: 'yes'/'no' (engine convention). price_cents: COST of the held side.
     v2_price_str: exact fixed-point dollar string from orderbook_fp — used when
     available so orders rest at the true touch (subpenny precision).
     V2 quotes the YES leg only: buy NO == ask YES at (100 - cost).
-    The ONLY order placement function in the engine — no taker path exists.
+
+    post_only (WO-CROSSFIRE): default True keeps every existing passive-join caller a maker.
+    A DELIBERATE cross — the Ratchet's scratch/flatten pricing at-or-through the opposite
+    touch — passes False so the order is allowed to fill NOW (the exchange rejects a crossing
+    post_only order with "post only cross"). No new function; the flag lives on the proven one.
     """
     from decimal import Decimal
     if v2_price_str is not None:
@@ -699,7 +704,7 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
         "count": str(max(1, int(count))),
         "price": v2_price,
         "time_in_force": "good_till_canceled",
-        "post_only": True,
+        "post_only": bool(post_only),
         "self_trade_prevention_type": "taker_at_cross",
     }
     if expiration_ts is not None and expiration_ts > int(time.time()):

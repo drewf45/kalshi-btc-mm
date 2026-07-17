@@ -208,7 +208,7 @@ class TestRatchetCycle(_Restore):
         self.P(flip_mode.kalshi, "extract_boundaries", lambda m: (None, None))
         self.P(flip_mode.kalshi, "get_btc_spot", lambda: None)
 
-        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None):
+        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None, post_only=True):
             oid = f"{side}-{price}"
             self.orders.append(oid)
             return oid, {}
@@ -244,6 +244,15 @@ class TestRatchetCycle(_Restore):
         self.assertTrue(any("netted rung A" in s for s in self.sent))
         self.assertEqual(self.trips[-1]["outcome"], "netted")
 
+    def test_no_order_400_escapes(self):
+        # every order raises a post-only-cross 400 → entries skip, no fill, clean DONE, no trace
+        self.P(flip_mode.kalshi, "place_order_maker",
+               lambda *a, **k: (_ for _ in ()).throw(
+                   RuntimeError('HTTP 400 /portfolio/events/orders "post only cross"')))
+        out = self._run()                                     # must not raise
+        self.assertEqual(out, "flip_done")
+        self.assertEqual(self.trips, [])
+
     def test_r1_wall_blocks_when_holding(self):
         self.net = 1                                     # already holding → not flat
         out = self._run()
@@ -272,6 +281,72 @@ class TestRatchetCycle(_Restore):
         scratched = [t for t in self.trips if t["outcome"] == "scratched"]
         self.assertEqual(len(scratched), 3)              # stops at the sit-out threshold
         self.assertTrue(any("sitting the window out" in s for s in self.sent))
+
+
+@unittest.skipUnless(_IMPORTABLE, "flip_mode requires the cryptography-bound client")
+class TestCrossfire(_Restore):
+    """WO-CROSSFIRE — post_only intent + reject-and-recover, by intent."""
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self.P(flip_mode.notify, "send", lambda t, **k: self.sent.append(t))
+        self.P(flip_mode.notify, "alert", lambda t: self.sent.append("ALERT:" + t))
+        self.P(flip_mode, "FLIP_SIDE_MAX", 49)
+
+    def _cross(self):
+        return RuntimeError('HTTP 400 /portfolio/events/orders: {"error":"post only cross"}')
+
+    def test_scratch_body_carries_post_only_false(self):
+        # pinned: an entry join is post_only=True; a scratch/flatten is post_only=False
+        seen = {}
+
+        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None, post_only=True):
+            seen[side] = post_only
+            return f"{side}-{price}", {}
+        self.P(flip_mode.kalshi, "place_order_maker", _place)
+        flip_mode._post_entry(None, "T", "yes", 45, "0.45", 1, "20:00")
+        self.assertTrue(seen["yes"])                          # entry = maker
+
+        seen.clear()
+        self.P(flip_mode.kalshi, "fetch_orderbook", lambda c, tk: _bk(45, 52))
+        self.P(flip_mode.kalshi, "cancel_all_for_market", lambda c, tk: None)
+        self.P(flip_mode.engine, "heartbeat", lambda: None)
+        self.P(flip_mode.store, "insert_row", lambda r: None)
+        self.P(flip_mode.store, "SurfaceRow", lambda **k: k)
+        self.P(flip_mode, "_order_fill_price", lambda c, tk, oid, sd: 52)
+        self.P(flip_mode, "time", _Clock(2_000_000_000 - 800))
+        flip_mode._decline_lone(None, "T", 2_000_000_000, "20:00", "yes", 45)
+        self.assertIn("no", seen)
+        self.assertFalse(seen["no"])                          # flatten = deliberate cross
+
+    def test_entry_cross_reprices_once(self):
+        calls = []
+
+        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None, post_only=True):
+            calls.append(price)
+            if len(calls) == 1:
+                raise self._cross()                           # book moved between fetch and post
+            return f"{side}-{price}", {}
+        self.P(flip_mode.kalshi, "place_order_maker", _place)
+        self.P(flip_mode.kalshi, "fetch_orderbook", lambda c, tk: _bk(44, 55))   # fresh join 44
+        oid = flip_mode._post_entry(None, "T", "yes", 45, "0.45", 1, "20:00")
+        self.assertEqual(oid, "yes-44")                       # repriced at the fresh join
+        self.assertEqual(len(calls), 2)                       # exactly one refetch/reprice
+
+    def test_entry_still_cross_skips_and_releases(self):
+        self.P(flip_mode.kalshi, "place_order_maker",
+               lambda *a, **k: (_ for _ in ()).throw(self._cross()))
+        self.P(flip_mode.kalshi, "fetch_orderbook", lambda c, tk: _bk(44, 55))
+        oid = flip_mode._post_entry(None, "T", "yes", 45, "0.45", 1, "20:00")
+        self.assertIsNone(oid)                                # slot released, never chase
+        self.assertTrue(any("would cross" in s for s in self.sent))
+
+    def test_non_cross_400_does_not_reprice(self):
+        self.P(flip_mode.kalshi, "place_order_maker",
+               lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 400 insufficient balance")))
+        oid = flip_mode._post_entry(None, "T", "yes", 45, "0.45", 1, "20:00")
+        self.assertIsNone(oid)
+        self.assertTrue(any("rejected" in s for s in self.sent))   # not the cross-recovery path
 
 
 @unittest.skipUnless(_IMPORTABLE, "notify handler imports discipline/kalshi (CI only)")

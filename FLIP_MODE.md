@@ -111,6 +111,15 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
   Wilson-LB`. The fractional-book scaling conversation opens only when the Wilson LB > 0 at
   N ≥ 40 trips (`🟢 SCALABLE`) — decided at the reads, never intraday.
 
+## post_only vs the scratch (WO-CROSSFIRE)
+`place_order_maker` gained a `post_only=True` parameter (default preserved, every passive
+caller unchanged). A DELIBERATE cross — the scratch/flatten executor and the §1 inventory
+flatten — passes `post_only=False` so it fills NOW instead of being rejected with "post only
+cross". Order rejections never escape as a stack trace: a passive entry that would cross
+refetches once and re-prices at the fresh join, else skips the trip (`entry skipped — book
+moved (would cross)`, slot released); a crossing flatten that still can't fill alerts
+`🚨 scratch unfillable` and falls to the T-90 backstop. Every 400 is one tagged tape line.
+
 ## Resume posture (WO-RESUME)
 - **Pair-or-nothing (`FLIP_REQUIRE_PAIR=1`, default).** At entry-phase end with exactly ONE
   filled leg, the leg is not kept — it is flattened at once via the complement touch (maker,
