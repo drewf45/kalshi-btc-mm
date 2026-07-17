@@ -34,7 +34,7 @@ def test_cycle_census_clean_and_zero_orders():
     assert reasons["F"] == "NO_CLOSE_TS"
     assert reasons["H8"] == "NO_CLOSE_TS"
     assert reasons["FLIP"] == "NO_CLOSE_TS"
-    assert reasons["D"] == "STUB_AWAITING_P3.3_PENDING"
+    assert reasons["D"] == "NO_CLOSE_TS"  # D is live (P3.3); metadata-less ticker passes
     # ZERO orders placed
     assert engine.gateway.shadow_orders == []
     assert engine.gateway.resting == {}

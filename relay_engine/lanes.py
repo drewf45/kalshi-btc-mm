@@ -259,20 +259,60 @@ class FlipLaneWrapper(Lane):
         return FLIP_FLAT_AT
 
 
+class DLaneWrapper(Lane):
+    """Adapter for LaneD: entry proposal, recovery-exit baton, watchdog verdicts."""
+
+    name = "D"
+
+    def __init__(self, laned):
+        self.d = laned
+        self.exit_posted: set = set()
+
+    def evaluate(self, market: str, ctx: dict) -> Decision:
+        close_ts = ctx.get("close_ts") or infer_close_ts_from_ticker(market)
+        if close_ts is None:
+            return Decision(self.name, market, None, pass_reason="NO_CLOSE_TS")
+        fctx = dict(ctx)
+        fctx["close_ts"] = close_ts
+        if not ctx.get("entries_allowed", True):
+            return Decision(self.name, market, None,
+                            pass_reason="ENTRY_HALT_DEGRADE_LADDER", interim=True)
+        # watchdog first: broken evidence on an open seed outranks new entries
+        broken = self.d.watchdog_tick(market, fctx)
+        if broken:
+            return Decision(self.name, market, None, pass_reason=broken, interim=True)
+        # recovery baton: a filled seed gets its resting recovery exit once
+        if (self.d.gateway is not None and market in self.d.seeded
+                and market not in self.exit_posted):
+            event = market.rsplit("-", 1)[0]
+            if self.d.gateway.positions.get((event, market, "D"), 0) != 0:
+                self.exit_posted.add(market)
+                return Decision(self.name, market, self.d.recovery_exit(market))
+        proposal = self.d.evaluate(market, fctx)
+        if proposal is not None:
+            return Decision(self.name, market, proposal)
+        v = getattr(self.d, "last_verdict", None)
+        reason = v.verdict if v is not None else "SKIP_NO_VERDICT"
+        interim = reason in ("SKIP_CANT_VERIFY", "SKIP_NO_BOOK", "SKIP_ALREADY_SEEDED")
+        return Decision(self.name, market, None, pass_reason=reason, interim=interim)
+
+
 def build_registry(ledger=None, gateway=None, custodian=None) -> List[Lane]:
     """All five lanes, always. ORDER IS THE ARBITRATION ORDER (P3 Broker part):
     within a cycle, custodian exits run before lanes (the runner's job), a
     FLIP take/second-leg rides inside FLIP's own multi-proposal list (takes
     first), and new entries submit in F -> H8 -> FLIP -> D -> P order."""
+    from .lane_d import LaneD
     from .lane_flip import LaneFlip
     shared = FH8Shared(ledger)
     flip = LaneFlip(gateway, custodian=custodian,
                     stats=(ledger_stats(ledger) if ledger is not None else None))
+    laned = LaneD(gateway=gateway, custodian=custodian, ledger=ledger)
     return [
         LaneF(shared),
         LaneH8(shared),
         FlipLaneWrapper(flip),
-        StubLane("D", "P3.3_PENDING"),
+        DLaneWrapper(laned),
         StubLane("P", "P3.5_PENDING"),
     ]
 

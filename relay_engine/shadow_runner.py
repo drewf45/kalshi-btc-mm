@@ -63,6 +63,14 @@ class ShadowEngine:
                 self.flip.note_fill(order.market, order.side, price_cents, now)
             else:
                 self.flip.note_exit(order.market, order.side, price_cents, now)
+        elif order.lane == "D":
+            laned = self.lanes[3].d
+            if action == "ENTRY":
+                laned.budget.convert(order.market)  # reservation -> at_risk
+            else:
+                laned.budget.release(order.market, f"{action} filled @{price_cents}c")
+                laned.seeded.pop(order.market, None)
+                self.lanes[3].exit_posted.discard(order.market)
 
     def boot(self, auth_line=None):
         if config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0:
