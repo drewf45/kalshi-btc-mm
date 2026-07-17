@@ -38,9 +38,10 @@ recorder confirmation) on every boot.
 
 ## What is gated
 
-- **F and H8 lane ports** are GATED ON B1 (the live k_worker zip from Drew). They are
-  registered as lanes but evaluate to first-class PASS rows tagged `GATED_ON_B1`. No F/H8
-  logic is ported from memory or from the monolith (§A5).
+- **F and H8 are PORTED** (B1 delivered 2026-07-17): ladder + gates byte-identical to the
+  live tree, proven by golden-tape regression (`docs/GOLDEN_TAPE_REPORT.md`; live source
+  vendored at `reference/live_k_worker/`). The delta table + candle fetcher are borrowed
+  WHOLE (`relay_engine/delta.py`, `relay_engine/delta_builder.py`).
 - **Chunk 2 analysis** is GATED ON B2 (legacy CSVs). `docs/analysis/` stays empty until then.
 - **Chunks 5–7** (demo verification, shadow-lane promotion, cutover) are separate orders cut
   at Drew's word. HARD STOP after verify gate 7.

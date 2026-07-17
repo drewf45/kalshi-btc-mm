@@ -1,7 +1,12 @@
-# VERIFY GATES — WO-2026-07-17-RELAY §D — status report (2026-07-17)
+# VERIFY GATES — WO-2026-07-17-RELAY §D — status report (2026-07-17, rev 2: B1 DELIVERED)
 
 Read-rule (§F) in force: every claim cites files/lines and carries TRUE / FALSE / UNPROVEN.
-Test evidence: `python -m pytest tests/ -q` → **58 passed** at the commit carrying this report.
+Test evidence: `python -m pytest tests/ -q` → **62 passed** at the commit carrying this report.
+
+**Rev 2 delta:** Drew delivered B1 (two zips: the AtDcG live tree and the flipdesk build) and
+granted full-repo branch access. Gate 5 is now GREEN — see the Gate 5 section and
+`docs/GOLDEN_TAPE_REPORT.md`. F/H8 are ported and wired; the delta table + candle fetcher are
+borrowed WHOLE.
 
 ---
 
@@ -61,12 +66,52 @@ Test evidence: `python -m pytest tests/ -q` → **58 passed** at the commit carr
   post-only-everywhere, single-threaded path FATAL, governor printed=enforced with carried
   counts — all exercised in `tests/test_walls.py` (green).
 
-## Gate 5 — Golden-tape regression for F and H8
+## Gate 5 — Golden-tape regression for F and H8 [REV 2: B1 DELIVERED]
 
-- **UNPROVEN — BLOCKED ON B1.** No F/H8 logic exists in this tree (§A5 honored: nothing
-  ported from memory or the monolith). Lanes registered as first-class PASS
-  (`relay_engine/lanes.py:37-45`). Unblocks when Drew supplies the live k_worker zip; the
-  recorder is already banking replay material for the golden tape from first boot.
+- **TRUE — GREEN.** `docs/GOLDEN_TAPE_REPORT.md` committed: **26 watch-ladder tapes +
+  2,941 evaluate sweep cases, 0 mismatches.** The live side is the ACTUAL live code —
+  `reference/live_k_worker/{engine,gateway,delta_table_loader,sessions}.py` vendored
+  byte-identical from the B1 zip (SHA-256 of vendored engine.py == zip's engine.py,
+  verified at vendor time), executed with I/O stubbed and clock faked. The new side is
+  `relay_engine/lane_fh8.py`. Comparison key: (passed, lane, side, cost_cents,
+  cost_exact, reject_code, why_tag) per frame.
+- **TRUE** — byte-identical scope honored: v4 watch-confirm ladder floors 99/98/97
+  (+ the 95 floor of the final-window band), confirms 9/6/3, dropout/side-flip/
+  counterparty (R2) resets (`relay_engine/lane_fh8.py:404-470` vs
+  `reference/live_k_worker/engine.py:35-39,455-597`); every evaluate wall and why_tag
+  string (`lane_fh8.py:203-401` vs `gateway.py:199-410`); H8 delta-gate ≥99% as the
+  wilson_ub ≤ 0.01 dual-gate verdict (`relay_engine/delta.py:220-245`).
+- **TRUE** — harness has TEETH (mutation-tested): four injected bugs — tier-2 floor
+  97→96, tier-1 confirms 6→5, H8 max_secs 60→90, F band-lo 95→94 — each turned the
+  tape RED; restored code is green. The first mutation initially survived (corpus had
+  no 96¢ tape); floor-edge and confirm-edge tapes were added before trusting green.
+- **TRUE** — declared changes isolated with their own treatment (D1-D5, listed in
+  `relay_engine/lane_fh8.py:20-40`): EPOCH 2 balance arithmetic (live treasury accrual
+  stubbed to zero — the equivalence the tape pins), relay cap plumbing downstream,
+  custodian passthrough, evidence-query adapter, queue instrumentation deferred to the
+  live submit path.
+- **TRUE** — delta table + candle fetcher borrowed WHOLE per C.3
+  (`relay_engine/delta.py`, `relay_engine/delta_builder.py`, `relay_engine/sessions.py`
+  from `k_worker/{delta_table_loader,delta_table_builder,sessions}.py`; wiring-only
+  adaptations, noted in each header). R1 synthetic refusal and the
+  floor_strike/expiration_value settlement-anchor law test-enforced
+  (`tests/test_shadow_cycle.py::test_delta_module_laws`).
+- **TRUE** — BUILD_SEQUENCE 3.3 read-first done, scope proven: `is_traded` has exactly
+  ONE consumer in the live tree — the main-loop cross-lane skip
+  (`reference/live_k_worker/`-lineage `k_worker/__main__.py:704`) — which this tree
+  deletes by design (every lane evaluates every market, `tests/test_shadow_cycle.py`);
+  the lane-misattribution marker is the boot-recovery cost-band lane GUESS
+  (`__main__.py:713-717`) — fixed here because lane is recorded per-fill at birth and
+  never inferred (`relay_engine/ledger.py` fills schema).
+- **TRUE** — lanes wired end-to-end: watch ladder → confirm → relay walls → shadow
+  order → surface rows, exercised in `tests/test_lane_port_wiring.py` (ladder confirms
+  at tier 0 on live semantics, proposal rests as SHADOW order, H8 writes
+  COST_IN_F_BAND, single-entry blocks a second proposal).
+- **NOTE** — no recorded live tapes existed in the B1 zips (code only), so the golden
+  tape replays a deterministic scenario corpus through the vendored live code itself
+  rather than through recorded market data. The recorder (`book_snapshots`) is banking
+  real tape from first boot; re-running the harness over recorded frames when they
+  exist is the standing upgrade path.
 
 ## Gate 6 — Attribution acceptance test on a synthetic stacked market
 
@@ -138,6 +183,7 @@ DB: relay_shadow.db (single-writer: this engine's own database)
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
-orders at Drew's word. Standing input requests: **B1** (k_worker zip → unblocks gate 5,
-delta table, F/H8), **B2** (legacy CSVs → unblocks §E), **charter + lens verbatim texts**
-(→ closes the gate-1 placeholder).
+orders at Drew's word. Standing input requests: ~~B1~~ **DELIVERED** (gate 5 green),
+**B2** (legacy CSVs → unblocks §E), **charter + lens verbatim texts** (→ closes the
+gate-1 placeholder). Remaining open action: deploy the shadow to Render (or any
+Kalshi-reachable environment) to start gate 7's 24-hour tape.
