@@ -49,6 +49,8 @@ class Order:
     purpose: str          # "ENTRY" | "EXIT" | "CUT"
     improve_from: Optional[int] = None  # prior price (side terms) this order improves on
     band: Optional[Tuple[int, int]] = None  # lane band (min,max) in side-terms cents
+    crossfire: bool = False  # deliberate cross (post_only=False) — CUT ONLY, enforced here
+    rest_fp: Optional[str] = None  # exact fixed-point price string (true-touch resting)
 
 
 @dataclass
@@ -107,13 +109,14 @@ class RateGovernor:
 
 
 class Gateway:
-    def __init__(self, ledger, surface, sizing_authorized_tier=None):
+    def __init__(self, ledger, surface, sizing_authorized_tier=None, venue_client=None):
         self.ledger = ledger
         self.surface = surface
         # sizing_authorized_tier: callable (lane, market) -> tier the ladder authorizes
         self.sizing_authorized_tier = sizing_authorized_tier or (lambda lane, market: None)
         self.tripwire = FeeTripwire()
         self.governor = RateGovernor()
+        self.venue_client = venue_client  # required for the live branch; None in shadow
         self._submit_thread: Optional[int] = None
         self._shadow_seq = 0
         self.shadow_orders: List[Order] = []
@@ -121,6 +124,10 @@ class Gateway:
         self.positions: Dict[Tuple[str, str, str], int] = {}
         # resting (or shadow-resting) orders by id
         self.resting: Dict[str, Order] = {}
+        # every order ever submitted, by id — the fills loop's attribution index
+        self.order_index: Dict[str, Order] = {}
+        self.filled_counts: Dict[str, int] = {}
+        self.live_order_ids: set = set()
         self.entries_halted_reasons: set = set()
 
     # ------------------------------------------------------------------
@@ -151,12 +158,19 @@ class Gateway:
 
         risk_reducing = self.is_risk_reducing(order) or order.purpose in ("EXIT", "CUT")
 
+        # Crossfire is confined to CUT at the canonical layer — a deliberate
+        # cross anywhere else (even a passive EXIT) is refused outright.
+        if order.crossfire and order.purpose != "CUT":
+            raise WallRejection("REJECT_TAKER_ENTRY",
+                                f"crossfire on purpose={order.purpose}; CUT only")
+
         if not risk_reducing:
             if self.entries_halted_reasons:
                 raise WallRejection("ENTRIES_HALTED", ",".join(sorted(self.entries_halted_reasons)))
             self._wall_band_and_single_entry(order)
             self._wall_net_risk_and_at_risk(order)
             self._wall_wrong_way_tick(order)
+            self._wall_taker_entry(order, book)
             self._wall_pct_of_book(order)
             self._wall_sizing_tier(order)
             self._wall_fee_tripwire(order)
@@ -172,27 +186,69 @@ class Gateway:
 
         payload = self._payload(order)
         if config.live_submit_enabled():
-            # LIVE PATH — hard-disabled in this tree's born state. Chunks 5-7 are
-            # separate orders at Drew's word; nothing here flips RUN_MODE.
-            raise FatalIntegrityError(
-                "live_submit_enabled() returned True in the paper-shadow build; "
-                "this tree must not place orders before the cutover ruling")
+            # LIVE PATH (P3.1). Reached ONLY when Drew set RUN_MODE=LIVE + the
+            # I_UNDERSTAND_LIVE phrase — go-live is a human act, never code's.
+            return self._submit_live(order, payload)
         self._shadow_seq += 1
         oid = f"SHADOW-{self._shadow_seq}"
         self.shadow_orders.append(order)
         self.resting[oid] = order
+        self.order_index[oid] = order
         return SubmitResult(order_id=oid, shadow=True, payload=payload)
 
-    def cancel(self, order_id: str) -> bool:
-        """Cancels skip walls."""
-        return self.resting.pop(order_id, None) is not None
+    def _submit_live(self, order: Order, payload: dict) -> SubmitResult:
+        """The one live door. post_only=False ONLY for crossfire CUTs (already
+        canonically enforced above). Re-reads live balance before every write
+        (the venue module's law)."""
+        from . import venue
+        if self.venue_client is None:
+            self.venue_client = venue.build_client()
+        cash, _pv = venue.get_balance(self.venue_client)
+        cost_usd = order.price_cents * order.count / 100.0
+        if cash is None or cash < cost_usd:
+            raise WallRejection("BALANCE_RECHECK",
+                                f"live balance {cash} < cost ${cost_usd:.2f}")
+        oid, resp = venue.place_order_maker(
+            self.venue_client, order.market, order.side, order.price_cents,
+            count=order.count, v2_price_str=order.rest_fp,
+            post_only=not order.crossfire,
+        )
+        self.resting[oid] = order
+        self.order_index[oid] = order
+        self.live_order_ids.add(oid)
+        log.warning("LIVE ORDER PLACED %s %s %s %d@%dc post_only=%s oid=%s",
+                    order.lane, order.market, order.side, order.count,
+                    order.price_cents, not order.crossfire, oid)
+        return SubmitResult(order_id=oid, shadow=False, payload=payload)
 
-    def on_fill(self, order_id: str) -> None:
+    def cancel(self, order_id: str) -> bool:
+        """Cancels skip walls. Live orders cancel at the venue, verified."""
         order = self.resting.pop(order_id, None)
         if order is None:
+            return False
+        if order_id in self.live_order_ids:
+            from . import venue
+            status = venue.cancel_order(self.venue_client, order_id)
+            if status not in ("canceled", "not_found"):
+                # un-verified cancel: put it back and say so
+                self.resting[order_id] = order
+                return False
+        return True
+
+    def on_fill(self, order_id: str, count: Optional[int] = None) -> Order:
+        """Book a (possibly partial) fill's position effect. The order stays
+        resting until its full count is filled. Returns the order."""
+        order = self.order_index.get(order_id)
+        if order is None:
             raise FatalIntegrityError(f"fill for unknown order {order_id}")
+        cnt = order.count if count is None else int(count)
         key = (order.event, order.market, order.lane)
-        self.positions[key] = self.positions.get(key, 0) + self._signed_yes_delta(order)
+        sign = 1 if self._signed_yes_delta(order) > 0 else -1
+        self.positions[key] = self.positions.get(key, 0) + sign * cnt
+        self.filled_counts[order_id] = self.filled_counts.get(order_id, 0) + cnt
+        if self.filled_counts[order_id] >= order.count:
+            self.resting.pop(order_id, None)
+        return order
 
     def halt_entries(self, reason: str) -> None:
         self.entries_halted_reasons.add(reason)
@@ -254,6 +310,32 @@ class Gateway:
                 "REJECT_WRONG_WAY_TICK",
                 f"{order.action} improvement {order.improve_from}->{order.price_cents} "
                 f"(expected sign {expected:+d})")
+
+    def _wall_taker_entry(self, order: Order, book: OrderBook) -> None:
+        """REJECT_TAKER_ENTRY (P2/P3): an entry may never take. Crossfire on an
+        entry is rejected at the canonical layer above; here the PRICE is checked
+        against the derived opposite touch. STRICTLY-through prices are rejected;
+        resting exactly AT the boundary is legitimate touch-joining — the venue's
+        post_only enforces the exact-cross case and its rejection is a NORMAL
+        reject handled by repricing (Adversary: cross-400 normalization)."""
+        if order.action == "buy":
+            if order.side == "yes":
+                opp = book.best_no_bid()
+                ask = 100 - opp if opp is not None else None
+            else:
+                opp = book.best_yes_bid()
+                ask = 100 - opp if opp is not None else None
+            if ask is not None and order.price_cents > ask:
+                raise WallRejection(
+                    "REJECT_TAKER_ENTRY",
+                    f"{order.side} buy at {order.price_cents}c through derived ask {ask}c")
+        else:
+            # a sell entry (shorting the side) takes if priced through the side's bid
+            bid = book.best_yes_bid() if order.side == "yes" else book.best_no_bid()
+            if bid is not None and order.price_cents < bid:
+                raise WallRejection(
+                    "REJECT_TAKER_ENTRY",
+                    f"{order.side} sell at {order.price_cents}c through bid {bid}c")
 
     def _wall_pct_of_book(self, order: Order) -> None:
         caps = self.ledger.boot_caps

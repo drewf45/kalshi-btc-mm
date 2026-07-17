@@ -11,9 +11,10 @@ from relay_engine.errors import FatalIntegrityError, WallRejection
 from relay_engine.gateway import Gateway, Order
 
 
-def make_book(market="M1"):
+def make_book(market="M1", no_bid=1):
+    # wide derived ask (no_bid=1 -> yes ask 99) so entry prices below 99 rest
     b = OrderBook(market=market)
-    b.apply_snapshot({45: 100, 44: 50}, {52: 80, 51: 40}, ts=1.0)
+    b.apply_snapshot({45: 100, 44: 50}, {no_bid: 80}, ts=1.0)
     return b
 
 
@@ -32,7 +33,8 @@ def test_canonical_yes_terms():
 
 
 def test_book_derived_ask():
-    b = make_book()
+    b = OrderBook(market="M1")
+    b.apply_snapshot({45: 100, 44: 50}, {52: 80, 51: 40}, ts=1.0)
     assert b.best_yes_bid() == 45
     assert b.best_no_bid() == 52
     assert b.best_yes_ask() == 48  # 100 - best_no_bid, derived, never quoted

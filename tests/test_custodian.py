@@ -38,8 +38,9 @@ NEAR_DANGER = dict(spot=64_040.0, boundary_lo=64_000.0, boundary_hi=None)
 
 
 def make_book():
+    # wide derived ask (no_bid=1 -> yes ask 99) so 50-61c entries rest below it
     b = OrderBook(market="M1")
-    b.apply_snapshot({45: 100}, {52: 80}, ts=1.0)
+    b.apply_snapshot({45: 100}, {1: 80}, ts=1.0)
     return b
 
 
