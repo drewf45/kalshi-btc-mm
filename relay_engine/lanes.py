@@ -69,6 +69,7 @@ class Decision:
     proposal: Optional[Order]  # None = Pass (terminal) or still-watching (interim)
     pass_reason: str = ""
     interim: bool = False      # True = not a verdict yet (ladder watching, too early)
+    multi: Optional[list] = None  # multi-proposal lanes (FLIP): list[Order], submitted in order
 
 
 class Lane:
@@ -209,7 +210,7 @@ class LaneH8(_PortedLane):
 
 
 class StubLane(Lane):
-    """D / MM / P shadow stubs: registered and looking, proposing nothing yet."""
+    """Not-yet-built lanes: registered and looking, proposing nothing yet."""
 
     def __init__(self, name: str, chunk: str):
         self.name = name
@@ -219,15 +220,60 @@ class StubLane(Lane):
         return Decision(self.name, market, None, pass_reason=f"STUB_AWAITING_{self.chunk}")
 
 
-def build_registry(ledger=None) -> List[Lane]:
-    """All five lanes, always. Order is stable for the surface census."""
+class FlipLaneWrapper(Lane):
+    """Adapter: LaneFlip proposes 0..n orders per cycle (both sides + takes)."""
+
+    name = "FLIP"
+
+    def __init__(self, flip):
+        self.flip = flip
+
+    def evaluate(self, market: str, ctx: dict) -> Decision:
+        close_ts = ctx.get("close_ts") or infer_close_ts_from_ticker(market)
+        fctx = dict(ctx)
+        fctx["close_ts"] = close_ts
+        if close_ts is None:
+            return Decision(self.name, market, None, pass_reason="NO_CLOSE_TS")
+        now = ctx.get("now", 0.0)
+        secs = close_ts - now
+        if self.flip.killed:
+            return Decision(self.name, market, None, pass_reason="LANE_KILLED_STOP_STREAK")
+        if secs < self.flip_flat_at():
+            # window over: close the books for this window (stop-streak feed)
+            w = self.flip.windows.get(market)
+            if w is not None and not w.done:
+                w.done = True
+                self.flip.note_window_result(market, w.window_realized)
+            return Decision(self.name, market, None, pass_reason="WINDOW_OVER")
+        if not ctx.get("entries_allowed", True):
+            return Decision(self.name, market, None,
+                            pass_reason="ENTRY_HALT_DEGRADE_LADDER", interim=True)
+        proposals = self.flip.evaluate(market, fctx)
+        if proposals:
+            return Decision(self.name, market, None, multi=proposals)
+        return Decision(self.name, market, None, pass_reason="FLIP_WATCHING", interim=True)
+
+    @staticmethod
+    def flip_flat_at():
+        from .lane_flip import FLIP_FLAT_AT
+        return FLIP_FLAT_AT
+
+
+def build_registry(ledger=None, gateway=None, custodian=None) -> List[Lane]:
+    """All five lanes, always. ORDER IS THE ARBITRATION ORDER (P3 Broker part):
+    within a cycle, custodian exits run before lanes (the runner's job), a
+    FLIP take/second-leg rides inside FLIP's own multi-proposal list (takes
+    first), and new entries submit in F -> H8 -> FLIP -> D -> P order."""
+    from .lane_flip import LaneFlip
     shared = FH8Shared(ledger)
+    flip = LaneFlip(gateway, custodian=custodian,
+                    stats=(ledger_stats(ledger) if ledger is not None else None))
     return [
         LaneF(shared),
         LaneH8(shared),
-        StubLane("D", "CHUNK_6"),
-        StubLane("MM", "CHUNK_8"),
-        StubLane("P", "CHUNK_6"),
+        FlipLaneWrapper(flip),
+        StubLane("D", "P3.3_PENDING"),
+        StubLane("P", "P3.5_PENDING"),
     ]
 
 

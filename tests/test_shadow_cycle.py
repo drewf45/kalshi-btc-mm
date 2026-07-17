@@ -8,9 +8,11 @@ from relay_engine.ops import daily_pack
 from relay_engine.shadow_runner import ShadowEngine
 
 
-def test_all_five_lanes_registered_in_stable_order():
+def test_all_five_lanes_registered_in_arbitration_order():
+    """P3: MM renamed to FLIP (a proven lane, not a stub); registry order IS
+    the entry arbitration order F -> H8 -> FLIP -> D -> P."""
     names = [l.name for l in build_registry()]
-    assert names == ["F", "H8", "D", "MM", "P"]
+    assert names == ["F", "H8", "FLIP", "D", "P"]
 
 
 def test_cycle_census_clean_and_zero_orders():
@@ -31,7 +33,8 @@ def test_cycle_census_clean_and_zero_orders():
         "SELECT lane, detail FROM surface_rows WHERE terminal=1 AND market='KXBTC15M-A'"))
     assert reasons["F"] == "NO_CLOSE_TS"
     assert reasons["H8"] == "NO_CLOSE_TS"
-    assert reasons["D"] == "STUB_AWAITING_CHUNK_6"
+    assert reasons["FLIP"] == "NO_CLOSE_TS"
+    assert reasons["D"] == "STUB_AWAITING_P3.3_PENDING"
     # ZERO orders placed
     assert engine.gateway.shadow_orders == []
     assert engine.gateway.resting == {}
@@ -45,7 +48,7 @@ def test_daily_pack_renders_per_lane_sections():
                       venue_statement_cents=0)
     assert f"EPOCH {config.EPOCH}" in pack
     assert "EPOCH BOUNDARY" in pack
-    for lane in ("F", "H8", "D", "MM", "P"):
+    for lane in ("F", "H8", "FLIP", "D", "P"):
         assert f"[lane {lane}]" in pack
     assert "PASS=1" in pack
     assert "TRUE-UP" in pack

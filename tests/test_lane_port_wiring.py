@@ -31,9 +31,11 @@ def test_watch_ladder_drives_shadow_proposal():
     for i in range(12):
         engine.cycle([TICKER], now=start + i * 5)
 
-    # exactly one shadow proposal, lane F, at the touch, flat 1 lot
-    assert len(engine.gateway.shadow_orders) == 1
-    o = engine.gateway.shadow_orders[0]
+    # exactly one F proposal, at the touch, flat 1 lot (FLIP may also be
+    # working the cheap side of the same book — all lanes live, same market)
+    f_orders = [o for o in engine.gateway.shadow_orders if o.lane == "F"]
+    assert len(f_orders) == 1
+    o = f_orders[0]
     assert (o.lane, o.side, o.price_cents, o.count, o.purpose) == ("F", "yes", 99, 1, "ENTRY")
     payload = engine.gateway._payload(o)
     assert payload["post_only"] is True
@@ -53,10 +55,10 @@ def test_watch_ladder_drives_shadow_proposal():
     assert ("F", TICKER) in engine.fh8_shared.state.traded
     assert engine.fh8_shared.state.hourly_exposure_usd() == 0.99
 
-    # further cycles: lane-scoped single entry blocks a second proposal
+    # further cycles: lane-scoped single entry blocks a second F proposal
     for i in range(12, 24):
         engine.cycle([TICKER], now=start + i * 5)
-    assert len(engine.gateway.shadow_orders) == 1
+    assert len([o for o in engine.gateway.shadow_orders if o.lane == "F"]) == 1
 
 
 def test_h8_band_market_waits_without_spot():

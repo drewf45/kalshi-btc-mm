@@ -55,12 +55,16 @@ def _fill_id(record: dict) -> Optional[str]:
 
 
 class FillBooker:
-    def __init__(self, gateway, ledger, surface, custodian=None, alert_fn=None):
+    def __init__(self, gateway, ledger, surface, custodian=None, alert_fn=None,
+                 on_booked=None):
         self.gateway = gateway
         self.ledger = ledger
         self.surface = surface
         self.custodian = custodian
         self.alert = alert_fn or (lambda msg: None)
+        # on_booked(order, action, price_cents, count, now): lane callbacks
+        # (FLIP's pair/trip accounting rides here)
+        self.on_booked = on_booked or (lambda *a: None)
         self.ledger.db.executescript(BOOKED_SCHEMA)
         self.ledger.db.commit()
         self.foreign_seen = 0
@@ -120,6 +124,7 @@ class FillBooker:
                     entry_price_cents=int(round(cost)), entry_p_win=0.0,
                     size_tier=order.size_tier, entry_time=now))
             stats["booked"] += 1
+            self.on_booked(order, action, int(round(cost)), count, now)
             log.warning("FILL BOOKED %s %s %s %s %d@%dc fee=%dc",
                         order.lane, order.market, order.side, action,
                         count, int(round(cost)), fee_cents)

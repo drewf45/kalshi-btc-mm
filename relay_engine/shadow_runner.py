@@ -45,10 +45,24 @@ class ShadowEngine:
         self.feed = Feed(self.ladder, recorder=self.recorder)
         self.gateway = Gateway(self.ledger, self.surface)
         self.custodian = Custodian(self.gateway, self.ledger, self.surface, ladder=self.ladder)
-        self.lanes = build_registry(self.ledger)
+        self.lanes = build_registry(self.ledger, gateway=self.gateway,
+                                    custodian=self.custodian)
         self.fh8_shared = self.lanes[0].shared  # LaneF/LaneH8 shared evaluator
+        self.flip = self.lanes[2].flip          # LaneFlip (arbitration slot 3)
+        from .fills import FillBooker
+        self.fills = FillBooker(self.gateway, self.ledger, self.surface,
+                                custodian=self.custodian,
+                                alert_fn=self.telegram.alert,
+                                on_booked=self._on_fill_booked)
         self.boot_caps = None
         self._window_of = {}  # market -> window_id (market close ts as string)
+
+    def _on_fill_booked(self, order, action, price_cents, count, now):
+        if order.lane == "FLIP":
+            if action == "ENTRY":
+                self.flip.note_fill(order.market, order.side, price_cents, now)
+            else:
+                self.flip.note_exit(order.market, order.side, price_cents, now)
 
     def boot(self, auth_line=None):
         if config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0:
@@ -79,9 +93,16 @@ class ShadowEngine:
                 "cash_usd": self.ledger.book_cents() / 100.0,
                 "entries_allowed": self.ladder.entries_allowed(),
             }
+            # FLIP pair-grace housekeeping: drop the unfilled opposite entry
+            stale_oid = self.flip.pair_grace_expired(market, now)
+            if stale_oid is not None:
+                self.gateway.cancel(stale_oid)
+
             for lane in self.lanes:
                 decision = lane.evaluate(market, ctx)
-                if decision.proposal is None:
+                proposals = decision.multi if decision.multi else (
+                    [decision.proposal] if decision.proposal is not None else [])
+                if not proposals:
                     if decision.interim:
                         # Still deciding — interim row (state change only), never terminal
                         self.surface.write_row(lane.name, market, window, "WATCHING",
@@ -91,26 +112,30 @@ class ShadowEngine:
                     # A Pass is a first-class terminal row (one per window; re-asserts are no-ops).
                     self.surface.write_row(lane.name, market, window, PASS,
                                            transport=transport, detail=decision.pass_reason)
-                else:
+                    continue
+                for proposal in proposals:
                     try:
-                        result = self.gateway.submit(decision.proposal, book)
+                        result = self.gateway.submit(proposal, book)
                     except WallRejection as e:
                         log.warning("wall rejected %s proposal on %s: %s",
                                     lane.name, market, e)
                         continue
-                    # Live submit side-effects, shadow-mirrored: lane-scoped
-                    # single entry + F hourly exposure (k_worker gateway.submit).
-                    self.fh8_shared.state.mark_traded(market, decision.proposal.lane)
-                    if decision.proposal.lane == "F":
-                        self.fh8_shared.state.add_exposure(
-                            decision.proposal.price_cents / 100.0)
+                    if proposal.lane in ("F", "H8"):
+                        # Live submit side-effects, mirrored from k_worker gateway.submit:
+                        # lane-scoped single entry + F hourly exposure.
+                        self.fh8_shared.state.mark_traded(market, proposal.lane)
+                        if proposal.lane == "F":
+                            self.fh8_shared.state.add_exposure(
+                                proposal.price_cents / 100.0)
+                    elif proposal.lane == "FLIP":
+                        self.flip.on_submitted(proposal, result.order_id, now)
                     self.surface.write_row(lane.name, market, window, PROPOSED,
                                            transport=transport,
-                                           detail=f"shadow_order={result.order_id} "
-                                                  f"@{decision.proposal.price_cents}c")
-                    log.warning("SHADOW PROPOSAL %s %s %s @%dc -> %s",
-                                lane.name, market, decision.proposal.side,
-                                decision.proposal.price_cents, result.order_id)
+                                           detail=f"order={result.order_id} "
+                                                  f"{proposal.purpose} @{proposal.price_cents}c")
+                    log.warning("PROPOSAL %s %s %s %s @%dc -> %s",
+                                lane.name, market, proposal.purpose, proposal.side,
+                                proposal.price_cents, result.order_id)
 
     def close_window(self, market):
         self._window_of.pop(market, None)

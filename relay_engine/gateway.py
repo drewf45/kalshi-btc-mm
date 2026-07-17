@@ -208,9 +208,17 @@ class Gateway:
         if cash is None or cash < cost_usd:
             raise WallRejection("BALANCE_RECHECK",
                                 f"live balance {cash} < cost ${cost_usd:.2f}")
+        # The proven engine BUYS ONLY: a sell intent is the complement BUY
+        # (venue nets to flat) — flip_math.exit_args is the pinned translation.
+        from .flip_math import exit_args
+        if order.action == "sell":
+            v_side, v_price = exit_args(order.side, order.price_cents)
+            v_fp = None  # fp string was the held side's touch; complement re-derives
+        else:
+            v_side, v_price, v_fp = order.side, order.price_cents, order.rest_fp
         oid, resp = venue.place_order_maker(
-            self.venue_client, order.market, order.side, order.price_cents,
-            count=order.count, v2_price_str=order.rest_fp,
+            self.venue_client, order.market, v_side, v_price,
+            count=order.count, v2_price_str=v_fp,
             post_only=not order.crossfire,
         )
         self.resting[oid] = order
@@ -264,9 +272,17 @@ class Gateway:
             lo, hi = order.band
             if not (lo <= order.price_cents <= hi):
                 raise WallRejection("BAND", f"{order.price_cents}c outside [{lo},{hi}]")
+        # Lane-scoped single entry, per SIDE: FLIP legitimately quotes BOTH
+        # sides of one market (its bundle walls govern the pair); a second
+        # entry on the SAME side is the violation. F/H8 additionally enforce
+        # their own one-entry-per-ticker inside evaluate (byte-identical port),
+        # and a post-fill second leg nets flat -> risk-reducing at the
+        # canonical layer, skipping walls entirely (Broker arbitration).
         for o in self.resting.values():
-            if o.lane == order.lane and o.market == order.market and o.purpose == "ENTRY":
-                raise WallRejection("SINGLE_ENTRY", f"lane {order.lane} already resting on {order.market}")
+            if (o.lane == order.lane and o.market == order.market
+                    and o.purpose == "ENTRY" and o.side == order.side):
+                raise WallRejection("SINGLE_ENTRY",
+                                    f"lane {order.lane} already resting {order.side} on {order.market}")
         if self.positions.get((order.event, order.market, order.lane), 0) != 0:
             raise WallRejection("SINGLE_ENTRY", f"lane {order.lane} already positioned on {order.market}")
 
