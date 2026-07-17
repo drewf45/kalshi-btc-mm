@@ -116,8 +116,15 @@ class TestFlipCycle(_RestoreMixin):
         self.P(flip_mode.gateway, "mark_traded", lambda tk, lane="F": self.traded.add(tk))
         self.P(flip_mode.engine, "heartbeat", lambda: None)
         self.P(flip_mode.engine, "_observe_mode", False)
-        # default the harness to the lone-KEEP regime; decline tests set REQUIRE_PAIR=1
+        # default the harness to the legacy single-shot window (lone-KEEP regime); the
+        # decline tests set REQUIRE_PAIR=1 and the ratchet tests set FLIP_RATCHET=1.
         self.P(flip_mode, "FLIP_REQUIRE_PAIR", 0)
+        self.P(flip_mode, "FLIP_RATCHET", 0)
+        self.P(flip_mode.store, "insert_markout", lambda *a, **k: None)
+        self.P(flip_mode.store, "insert_trip", lambda *a, **k: 1)
+        self.P(flip_mode.kalshi, "cancel_order", lambda c, oid: "canceled")
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: None)
+        self.P(flip_mode.kalshi, "extract_boundaries", lambda m: (None, None))
 
         self._book_calls = 0
         self.book_provider = None      # optional: clock_ts -> book (time-varying watch)

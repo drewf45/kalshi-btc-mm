@@ -505,6 +505,7 @@ def boot_reconcile(client: kalshi.KalshiClient) -> None:
     # WO-5 §3: standing ruling — wipe accrued/owed once, book = account (before reconcile
     # so the snapshot below sees the cleared state and the invariant reads flat).
     treasury.wipe_owed_once(live_bal)
+    treasury.enforce_accrual_off()   # WO-VISION §4: tap off — fold any rebuilt owed back to $0
 
     t = treasury.snapshot()
     expected = t.book + t.accrued_tax + t.accrued_fee

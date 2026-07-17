@@ -82,7 +82,7 @@ def record_loss(loss_cents: Optional[float] = None, window_id: Optional[str] = N
         msg = (
             f"TAIL-LOSS KILL: {TAIL_LOSS_COUNT} losses in "
             f"{TAIL_LOSS_WINDOW_SEC // 60} minutes.\n"
-            f"Engine halted. Run `python -m k_worker.reset` to resume."
+            f"⛔ halted. Resume? /resume_yes /resume_no"
         )
         log.error(f"[DISCIPLINE] {msg}")
         notify.alert(msg)
@@ -103,7 +103,7 @@ def check_drawdown(balance_usd: float) -> None:
         msg = (
             f"DRAWDOWN HALT: tradeable=${tradeable:.2f} < "
             f"floor=${DRAWDOWN_FLOOR_USD:.2f} (cash=${balance_usd:.2f}).\n"
-            f"Engine halted. Run `python -m k_worker.reset` to resume."
+            f"⛔ halted. Resume? /resume_yes /resume_no"
         )
         log.error(f"[DISCIPLINE] {msg}")
         notify.alert(msg)

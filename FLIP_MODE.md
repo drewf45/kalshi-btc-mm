@@ -82,7 +82,34 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` · `FLIP_STOP_CENTS=25` ·
 `FLIP_PAUSE_AFTER_STOPS=2` · `KW_SERIES_ALLOWLIST=KXBTC15M` (the only series the bot books) ·
 `KW_CLEAR_HALT` (set `=1` for a one-boot halt clear, then remove) · `TAIL_LOSS_MIN_CENTS=10`
-(min per-window loss the tail-loss kill counts) — all overridable.
+(min per-window loss the tail-loss kill counts) ·
+`FLIP_RATCHET=1` · `FLIP_PAIR_GRACE=30` · `FLIP_SCRATCH_S=3` · `FLIP_OFI_TICKS=4` ·
+`FLIP_CURFEW=240` · `FLIP_MAX_TRIPS=4` · `FLIP_SCRATCH_SITOUT=3` · `TREASURY_ACCRUE=0`
+— all overridable.
+
+## The ratchet (WO-VISION — ships ON; `FLIP_RATCHET=0` reverts to the require_pair window)
+- **§1 Fill-clock scratch.** Management starts AT the fill, not phase end. The take (entry+X)
+  posts at the fill; a **pair grace** keeps the opposite bid working `FLIP_PAIR_GRACE`s (a
+  second fill nets rung A); and the leg is **scratched NOW** — cancel the opposite entry
+  first, then flatten via the decline executor (touch, exp close−2, one rejoin) — on any of
+  (a) mark ≤ entry−`FLIP_SCRATCH_S`, (b) spot through the strike sustained 2 polls,
+  (c) markout at +30s ≤ −`FLIP_MARKOUT_STOP` and worsening. The markout curve (+10/+30/+60s)
+  is stored per fill. Tag `SCRATCHED`, realized inclusive. Tape: `✂️ scratched −3`.
+- **§2 Ratchet re-entry.** One position at a time (**R1 wall**: a trip opens only when the
+  broker reads flat; a violation pages). After a trip the desk may re-enter the SAME window
+  before the **curfew** (`FLIP_CURFEW`, T-240) — but only through the **OFI gate**: the last
+  `FLIP_OFI_TICKS` spot deltas must all agree AND the book lean must agree, else it waits
+  (fails closed — never fades the tape). Tape: `🎯 tape↑ → YES@xx` / `🚫` (gated). Governors:
+  `FLIP_MAX_TRIPS`/window, `FLIP_SCRATCH_SITOUT` scratches → sit the window out, the
+  salvage-aware window stop, the magnitude tail-kill, and the hourly budget all stand.
+- **§3 Phone-first.** A halt posts `⛔ halted. Resume? /resume_yes /resume_no`; `/resume_yes`
+  clears it in place, `/resume_no` acknowledges and stays parked, `/restart` re-inits the
+  process. The phone controls DISCIPLINE ONLY — it can never place, size, or override an order.
+- **§4 Treasury tap off.** `TREASURY_ACCRUE=0` — 100% of a win goes to the book, owed stays
+  $0.00; boot folds any rebuilt accrual back to the book (logged). Waterfall stays dormant.
+- **§5 R6 line.** The hourly pack prints `trips N · WR · avg take · avg scratch · net/trip ·
+  Wilson-LB`. The fractional-book scaling conversation opens only when the Wilson LB > 0 at
+  N ≥ 40 trips (`🟢 SCALABLE`) — decided at the reads, never intraday.
 
 ## Resume posture (WO-RESUME)
 - **Pair-or-nothing (`FLIP_REQUIRE_PAIR=1`, default).** At entry-phase end with exactly ONE

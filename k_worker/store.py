@@ -134,6 +134,32 @@ def init_db() -> None:
     _conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_flip_windows_ts ON flip_windows(ts)
     """)
+    # WO-VISION — the markout study (per fill) and the trip ledger (per managed position).
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS flip_markouts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            fill_ts     REAL NOT NULL,
+            ticker      TEXT,
+            side        TEXT,
+            entry_cents INTEGER,
+            m10         INTEGER,
+            m30         INTEGER,
+            m60         INTEGER
+        )
+    """)
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS flip_trips (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             REAL NOT NULL,
+            ticker         TEXT,
+            tag            TEXT,
+            side           TEXT,
+            entry_cents    INTEGER,
+            outcome        TEXT,
+            realized_cents INTEGER
+        )
+    """)
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_flip_trips_ts ON flip_trips(ts)")
     # WO-MORNING §1: a live DB created before WO-4/WO-6 lacks the newer flip_windows columns
     # (the CREATE above only fires on a fresh table). Guarded-ALTER them so window INSERTs
     # with every column succeed on legacy schemas. ALTER is idempotent via the except.
@@ -1032,6 +1058,45 @@ def flip_windows_between(lo_ts: float, hi_ts: float) -> list:
         )
         names = [d[0] for d in cur.description]
         return [dict(zip(names, r)) for r in cur.fetchall()]
+
+
+def insert_markout(fill_ts: float, ticker: str, side: str, entry_cents: int,
+                   m10=None, m30=None, m60=None) -> int:
+    """WO-VISION §1: the markout curve for one entry fill (mark at +10/+30/+60s)."""
+    with _lock:
+        cur = _conn.execute(
+            """INSERT INTO flip_markouts (fill_ts, ticker, side, entry_cents, m10, m30, m60)
+               VALUES (?,?,?,?,?,?,?)""",
+            (fill_ts, ticker, side, entry_cents, m10, m30, m60),
+        )
+        _conn.commit()
+        return cur.lastrowid
+
+
+def insert_trip(ts: float, ticker: str, tag: str, side: str, entry_cents: int,
+                outcome: str, realized_cents: int) -> int:
+    """WO-VISION §5: one managed position (trip) — the row R6 scaling stats read from."""
+    with _lock:
+        cur = _conn.execute(
+            """INSERT INTO flip_trips (ts, ticker, tag, side, entry_cents, outcome, realized_cents)
+               VALUES (?,?,?,?,?,?,?)""",
+            (ts, ticker, tag, side, entry_cents, outcome, realized_cents),
+        )
+        _conn.commit()
+    log.info(f"[STORE] flip_trip {tag} {side} entry={entry_cents} {outcome} "
+             f"realized={realized_cents}¢")
+    return cur.lastrowid
+
+
+def flip_trips_between(lo_ts: float, hi_ts: float) -> list:
+    """Trip rows in [lo_ts, hi_ts), oldest first, as dicts (for the R6 pack line)."""
+    cols = ("id", "ts", "ticker", "tag", "side", "entry_cents", "outcome", "realized_cents")
+    with _lock:
+        cur = _conn.execute(
+            f"SELECT {','.join(cols)} FROM flip_trips WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
+            (lo_ts, hi_ts),
+        )
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def flip_outcome_for_ticker(ticker: str) -> Optional[str]:

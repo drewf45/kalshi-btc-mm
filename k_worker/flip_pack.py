@@ -9,11 +9,14 @@ The pure formatters (fmt_window / reconcile / build_pack) import nothing crypto-
 they unit-test in the offline sandbox; only hourly() touches the live client (lazy import).
 """
 
+import math
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from . import store, notify
+
+SCALE_MIN_TRIPS = 40           # R6: the fractional-book conversation opens only at N ≥ this
 
 NY = ZoneInfo("America/New_York")
 
@@ -45,8 +48,45 @@ def reconcile(account_delta_usd: float, settled_pnl_usd: float,
     return unexplained, flagged
 
 
+def trip_stats(trips: list):
+    """R6 — the number that governs scaling. Over a day's trip rows returns trips N, win
+    rate, avg take/scratch, net per trip, and the lower 95% confidence bound on net/trip
+    (cents) — the conservative per-trip edge floor. None if no trips."""
+    n = len(trips)
+    if n == 0:
+        return None
+    reals = [int(t.get("realized_cents") or 0) for t in trips]
+    takes = [r for t, r in zip(trips, reals) if t.get("outcome") == "take"]
+    scratches = [r for t, r in zip(trips, reals) if t.get("outcome") == "scratched"]
+    wins = sum(1 for r in reals if r > 0)
+    mean = sum(reals) / n
+    if n >= 2:
+        var = sum((r - mean) ** 2 for r in reals) / (n - 1)
+        lb = mean - 1.96 * math.sqrt(var / n)      # lower CI bound on mean net/trip
+    else:
+        lb = float(mean)
+    return {
+        "n": n, "wr": wins / n, "mean": mean, "lb": lb,
+        "avg_take": (sum(takes) / len(takes)) if takes else 0.0,
+        "avg_scratch": (sum(scratches) / len(scratches)) if scratches else 0.0,
+        "scalable": (n >= SCALE_MIN_TRIPS and lb > 0),
+    }
+
+
+def format_r6(stats) -> str:
+    """The R6 pack line — printed where Drew reads it; scaling decided at the reads, never
+    intraday, and only when scalable (N ≥ 40 and Wilson LB > 0)."""
+    if not stats:
+        return "R6: trips 0 · (no trip data yet)"
+    gate = " · 🟢 SCALABLE" if stats["scalable"] else ""
+    return (f"R6: trips {stats['n']} · WR {stats['wr'] * 100:.0f}% · "
+            f"avg take +{stats['avg_take']:.1f} · avg scratch {stats['avg_scratch']:+.1f} · "
+            f"net/trip {stats['mean']:+.1f}¢ · Wilson-LB {stats['lb']:+.1f}¢{gate}")
+
+
 def build_pack(*, account_usd: float, midnight_usd: float, hour_windows: list,
-               day_windows: list, settled_pnl_usd: float, fees_usd: float):
+               day_windows: list, settled_pnl_usd: float, fees_usd: float,
+               day_trips: list = None):
     """Assemble the pack text. Returns (text, unexplained_usd, flagged)."""
     delta = account_usd - midnight_usd
     unexplained, flagged = reconcile(delta, settled_pnl_usd)
@@ -69,6 +109,7 @@ def build_pack(*, account_usd: float, midnight_usd: float, hour_windows: list,
     resid = "🔴" if flagged else "✓"
     lines.append(f"Δ$ = settled ${settled_pnl_usd:+.2f} (fees ${fees_usd:.2f} incl.) "
                  f"— unexplained ${unexplained:+.2f} {resid}")
+    lines.append(format_r6(trip_stats(day_trips or [])))          # R6 scaling line
     return "\n".join(lines), unexplained, flagged
 
 
@@ -96,6 +137,7 @@ def hourly(client) -> str:
     mid = store.et_midnight_ts()
     hour_windows = store.flip_windows_between(now - 3600, now)
     day_windows = store.flip_windows_between(mid, now)
+    day_trips = store.flip_trips_between(mid, now)
     daily = store.daily_stats("live-traded")
     settled_pnl = float(daily.get("net_pnl") or 0.0)
     fees = float(daily.get("total_fees") or 0.0)
@@ -103,7 +145,7 @@ def hourly(client) -> str:
     text, unexplained, flagged = build_pack(
         account_usd=account, midnight_usd=midnight_bal,
         hour_windows=hour_windows, day_windows=day_windows,
-        settled_pnl_usd=settled_pnl, fees_usd=fees,
+        settled_pnl_usd=settled_pnl, fees_usd=fees, day_trips=day_trips,
     )
     if flagged:
         notify.alert(f"🔴 UNEXPLAINED BOOK MOVE ${unexplained:+.2f} — account Δ not "

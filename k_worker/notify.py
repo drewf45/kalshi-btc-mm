@@ -198,17 +198,48 @@ def _listener_loop(client) -> None:
 
 
 _REFUSED = {"Not available over Telegram."}
+# CONSTITUTIONAL NOTE (WO-VISION §3): the phone controls DISCIPLINE ONLY — it may clear a
+# halt (/resume_yes) or re-init the process (/restart). It can NEVER place, size, cancel, or
+# override an order; those paths are not reachable from Telegram, by construction.
 _REFUSED_CMDS = {"/reset", "/halt", "/resume", "/cancel", "/place", "/order",
-                 "/config", "/env", "/restart", "/stop", "/kill"}
+                 "/config", "/env", "/stop", "/kill"}
 
 
 def _handle_inbound(client, text: str, kalshi, treasury, store) -> None:
     """Dispatch a single inbound message."""
+    from . import discipline
     lower = text.lower().strip()
     ts = time.time()
 
     # Audit log
     _log_cmd(store, ts, text)
+
+    # WO-VISION §3 — phone-first resume (discipline only). YES clears the halt in place;
+    # NO acknowledges and stays parked.
+    if lower == "/resume_yes":
+        if discipline.is_halted():
+            reason = discipline.halt_reason() or "?"
+            discipline.reset()
+            reply(f"▶️ resumed — halt cleared ({reason}). Desk is live.")
+        else:
+            reply("Not halted — nothing to resume.")
+        return
+    if lower == "/resume_no":
+        if discipline.is_halted():
+            reply("Acknowledged — staying parked. Send /resume_yes when ready.")
+        else:
+            reply("Not halted.")
+        return
+    # /restart — a clean in-process re-init (boot reconcile recovers all state)
+    if lower == "/restart":
+        reply("♻️ restarting — boot reconcile will re-verify balance and positions.")
+        log.warning("[TELEGRAM] /restart requested — re-execing process")
+        try:
+            import os, sys
+            os.execv(sys.executable, [sys.executable, "-m", "k_worker"])
+        except Exception as e:
+            reply(f"restart failed: {e}")
+        return
 
     # /paid <amount> or /paid
     if lower.startswith("/paid"):

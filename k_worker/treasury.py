@@ -23,6 +23,9 @@ NY = ZoneInfo("America/New_York")
 TAX_RATE = float(os.environ.get("TREASURY_TAX_RATE", "0.30"))
 OPERATOR_FEE = float(os.environ.get("TREASURY_OPERATOR_FEE", "0.05"))
 SEED = float(os.environ.get("TREASURY_SEED", "12.38"))
+# WO-VISION §4: the tap is OFF by ruling — accrual disabled, owed stays $0.00. The waterfall
+# plumbing below is kept dormant so a future ruling can re-enable it with one env.
+TREASURY_ACCRUE = int(os.environ.get("TREASURY_ACCRUE", "0"))
 
 FLOOR_MILESTONES = [
     (60.0, 40.0),
@@ -151,8 +154,39 @@ def tradeable_balance(cash: float) -> float:
     return min(after_owed, t["engine_book"])
 
 
+def enforce_accrual_off() -> bool:
+    """WO-VISION §4: with TREASURY_ACCRUE=0, keep owed at $0.00 — fold any rebuilt accrual
+    back into the book and zero the owed counters, logged with the ruling line. Idempotent
+    (no-op once owed is already flat). Run at boot."""
+    if TREASURY_ACCRUE:
+        return False
+    t = get_totals()
+    owed = t["accrued_tax"] + t["accrued_fee"]
+    if owed < 0.005 and t["paid_tax"] < 0.005 and t["paid_fee"] < 0.005:
+        return False
+    _set_float("treasury_engine_book", t["engine_book"] + owed)   # owed belongs to the book
+    _set_float("treasury_accrued_tax", 0.0)
+    _set_float("treasury_accrued_fee", 0.0)
+    _set_float("treasury_paid_tax", 0.0)
+    _set_float("treasury_paid_fee", 0.0)
+    log.warning(f"[TREASURY] accrual OFF (ruling) — owed ${owed:.2f} → $0.00 (folded to book)")
+    notify.send(f"🧹 treasury accrual OFF (ruling) — owed ${owed:.2f} → $0.00 "
+                f"(no scrape until re-ruled)")
+    return True
+
+
 def waterfall(pnl: float) -> Dict:
     """Slice a win's pnl through the waterfall. Only call on wins with pnl > 0."""
+    if not TREASURY_ACCRUE:
+        # WO-VISION §4: tap off — 100% of the win goes to the book, owed stays $0.00.
+        totals = get_totals()
+        new_book = totals["engine_book"] + pnl
+        _set_float("treasury_engine_book", new_book)
+        return {
+            "tax": 0.0, "fee": 0.0, "remainder": pnl, "engine_book": new_book,
+            "accrued_tax": totals["accrued_tax"], "accrued_fee": totals["accrued_fee"],
+            "treasury_line": f"→ book +${pnl:.3f} (accrual off) ‖ book ${new_book:.2f}",
+        }
     tax = pnl * TAX_RATE
     fee = pnl * OPERATOR_FEE
     remainder = pnl - tax - fee

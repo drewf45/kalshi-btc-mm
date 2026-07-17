@@ -39,15 +39,27 @@ FLIP_STOP_CENTS = int(os.environ.get("FLIP_STOP_CENTS", "25"))
 FLIP_PAUSE_AFTER_STOPS = int(os.environ.get("FLIP_PAUSE_AFTER_STOPS", "2"))
 FLIP_POLL_SEC = float(os.environ.get("FLIP_POLL_SEC", "3"))
 
+# WO-VISION — the ratchet (ships ON and WIDE; =0 reverts to the proven require_pair window).
+FLIP_RATCHET = int(os.environ.get("FLIP_RATCHET", "1"))
+FLIP_PAIR_GRACE = int(os.environ.get("FLIP_PAIR_GRACE", "30"))    # §1 opposite bid works this long
+FLIP_SCRATCH_S = int(os.environ.get("FLIP_SCRATCH_S", "3"))       # §1(a) scratch if mark ≤ entry−S
+FLIP_MARKOUT_STOP = int(os.environ.get("FLIP_MARKOUT_STOP", "2")) # §1(c) markout ≤ −this & worsening
+FLIP_OFI_TICKS = int(os.environ.get("FLIP_OFI_TICKS", "4"))       # §2 spot ticks that must agree
+FLIP_CURFEW = int(os.environ.get("FLIP_CURFEW", "240"))           # §2 no new entries after T-this
+FLIP_MAX_TRIPS = int(os.environ.get("FLIP_MAX_TRIPS", "4"))       # §2 governor
+FLIP_SCRATCH_SITOUT = int(os.environ.get("FLIP_SCRATCH_SITOUT", "3"))  # §2 sit the window out at N
+
 _STOP_STREAK_KEY = "flip_stop_streak"
 
 
 def echo_config() -> None:
+    mode = "RATCHET" if FLIP_RATCHET else f"require_pair {FLIP_REQUIRE_PAIR}"
     notify.send(
         "🔁 <b>FLIP MODE</b> — watch the open, post each side the first time its join ≤ "
         f"{FLIP_SIDE_MAX}c, flip @entry+{FLIP_X}c\n"
-        f"line {FLIP_LINE}c · side_max {FLIP_SIDE_MAX}c · lone_max {FLIP_LONE_MAX}c · "
-        f"require_pair {FLIP_REQUIRE_PAIR} · entry {FLIP_ENTRY_SEC}s · flat T-{FLIP_FLAT_AT} · "
+        f"mode {mode} · line {FLIP_LINE}c · side_max {FLIP_SIDE_MAX}c · x {FLIP_X}c · "
+        f"scratch@entry−{FLIP_SCRATCH_S}c · grace {FLIP_PAIR_GRACE}s · trips≤{FLIP_MAX_TRIPS} · "
+        f"sitout@{FLIP_SCRATCH_SITOUT} · curfew T-{FLIP_CURFEW} · ofi {FLIP_OFI_TICKS} · "
         f"stop {FLIP_STOP_CENTS}c · pause@{FLIP_PAUSE_AFTER_STOPS}"
     )
 
@@ -105,8 +117,8 @@ def _bump_stop_streak(stopped: bool) -> None:
     store.set_state(_STOP_STREAK_KEY, str(streak))
     if stopped and streak >= FLIP_PAUSE_AFTER_STOPS:
         store.set_state("halted", f"flip: {streak} consecutive stopped windows")
-        notify.alert(f"🛑 FLIP PAUSE — {streak} consecutive stopped windows. "
-                     f"Run `python -m k_worker.reset` to resume.")
+        notify.alert(f"🛑 FLIP PAUSE — {streak} consecutive stopped windows.\n"
+                     f"⛔ halted. Resume? /resume_yes /resume_no")
 
 
 def _entry_spreads(book):
@@ -219,6 +231,80 @@ def _decline_lone(client, ticker: str, close_ts: int, tag: str, lhs: str, lhp: i
     return used, filled
 
 
+# ── WO-VISION pure signal helpers (crypto-free, unit-tested) ─────────────────
+def _tick_direction(ticks, n: int) -> Optional[str]:
+    """Sign of the last n spot deltas: all up → 'yes' (rising favors above-strike), all down
+    → 'no', mixed/insufficient → None."""
+    if ticks is None or len(ticks) < n + 1:
+        return None
+    recent = ticks[-(n + 1):]
+    deltas = [recent[i + 1] - recent[i] for i in range(n)]
+    if all(d > 0 for d in deltas):
+        return "yes"
+    if all(d < 0 for d in deltas):
+        return "no"
+    return None
+
+
+def _book_lean(book) -> Optional[str]:
+    """Which side the book leans by best-bid size, or None if unclear/absent."""
+    yq = getattr(book, "yes_bid_qty", None)
+    nq = getattr(book, "no_bid_qty", None)
+    if yq is None or nq is None:
+        return None
+    if yq > nq:
+        return "yes"
+    if nq > yq:
+        return "no"
+    return None
+
+
+def _ofi_side(ticks, lean_side: Optional[str]) -> Optional[str]:
+    """§2 OFI GATE — fail closed. Returns the side to join iff the last FLIP_OFI_TICKS spot
+    deltas ALL agree AND the book lean agrees; otherwise None (no signal / disagreement /
+    would-fade → wait). Never fades the tape."""
+    d = _tick_direction(ticks, FLIP_OFI_TICKS)
+    if d is None or lean_side is None or lean_side != d:
+        return None
+    return d
+
+
+def _spot_adverse(side: str, spot: Optional[float], lo, hi) -> bool:
+    """§1(b) is spot on the losing side of the strike for the held leg? Conservative: only a
+    single clear threshold counts; a two-sided range or missing data → not adverse."""
+    if spot is None:
+        return False
+    strike = None
+    if lo is not None and hi is None:
+        strike = lo
+    elif hi is not None and lo is None:
+        strike = hi
+    if strike is None:
+        return False
+    return (spot < strike) if side == "yes" else (spot > strike)
+
+
+def _scratch_reason(side: str, entry_cents: int, leg_mark, markout_30,
+                    prev_markout, spot_adverse_polls: int) -> Optional[str]:
+    """§1 scratch signal — cross out NOW when any of (a) leg mark ≤ entry−S, (b) spot through
+    the strike sustained ≥2 polls, (c) markout at +30s ≤ −stop and worsening. Else None."""
+    if leg_mark is not None and leg_mark <= entry_cents - FLIP_SCRATCH_S:
+        return f"mark {leg_mark}≤entry−{FLIP_SCRATCH_S}"                       # (a)
+    if spot_adverse_polls >= 2:
+        return "spot through strike (2 polls)"                                # (b)
+    if (markout_30 is not None and markout_30 <= -FLIP_MARKOUT_STOP
+            and prev_markout is not None and markout_30 < prev_markout):
+        return f"markout {markout_30}¢ worsening"                             # (c)
+    return None
+
+
+def _spot():
+    try:
+        return kalshi.get_btc_spot()
+    except Exception:
+        return None
+
+
 def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Optional[str]:
     """One flip window, blocking from the open through the T-90 sweep. Called by
     engine.run_market_cycle when ENABLED. Returns a short outcome string."""
@@ -240,6 +326,11 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     # ARM — one-shot per window (mark BEFORE quoting so a partial failure can't re-arm)
     gateway.mark_traded(ticker, "F")
     exp = int(close_ts - FLIP_FLAT_AT)     # every order dies at T-90 at the exchange
+
+    # WO-VISION — the ratchet manages from the fill with a multi-trip loop. FLIP_RATCHET=0
+    # reverts to the proven require_pair single-shot window below (the one-env kill switch).
+    if FLIP_RATCHET:
+        return _run_ratchet_window(client, ticker, close_ts, tag, exp, market_obj)
 
     # OPPORTUNISTIC ENTRY (WO-4) — WATCH the early window instead of quoting both at the
     # bell. Each side posts its bid the FIRST time its join ≤ FLIP_SIDE_MAX, at most once,
@@ -537,4 +628,232 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     sign = "+" if realized >= 0 else ""
     notify.send(f"🔁 W{tag} — {entry_str} | {rung_str} → {sign}{realized}¢ realized{incl} "
                 f"[{outcome}] | {flat_suffix} | DONE")
+    return "flip_done"
+
+
+# ── WO-VISION — the ratchet: fill-clock management + caged re-entry ──────────
+def _r1_flat(client, ticker: str, tag: str, silent: bool = False) -> bool:
+    """R1 WALL (§2, the wall of walls) — one position at a time. True iff the market reads
+    flat (net 0) before a new trip opens. A non-flat state is a violation and pages Drew.
+    Structurally, the single-trip-at-a-time loop never opens a second managed position."""
+    try:
+        net = kalshi.position_for_market(client, ticker)
+    except Exception as e:
+        if not silent:
+            notify.send(f"⚠ W{tag} R1 check error: {e}")
+        return False
+    if net == 0:
+        return True
+    if not silent:
+        notify.alert(f"🚫 R1 WALL W{tag}: net={net} before a new trip — not flat, standing down")
+    return False
+
+
+def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj: dict,
+              trip_no: int, spot_ticks: list):
+    """§1 fill-clock — one managed position. Watches for a fill, then manages FROM the fill:
+    posts the take at entry+X, runs the pair grace, scratches on adverse signal, stores the
+    markout curve. Returns (outcome, realized_cents, side, entry_cents);
+    outcome ∈ {take, scratched, netted, observe, None(no-fill)}."""
+    now = time.time()
+    try:
+        lo, hi = kalshi.extract_boundaries(market_obj or {})
+    except Exception:
+        lo, hi = None, None
+
+    posted = {}          # side -> {"oid","price"}
+    fills = {}           # side -> entry cents
+    first_fill_ts = None
+    entry_deadline = min(now + FLIP_ENTRY_SEC, close_ts - FLIP_CURFEW)
+    while time.time() < entry_deadline and not fills:
+        book = kalshi.fetch_orderbook(client, ticker)
+        spot_ticks.append(_spot())
+        for side in ("yes", "no"):
+            if side in posted:
+                continue
+            join = book.yes_bid if side == "yes" else book.no_bid
+            fp_str = book.yes_bid_fp if side == "yes" else book.no_bid_fp
+            if join is None or join > FLIP_SIDE_MAX:
+                continue
+            if posted and next(iter(posted.values()))["price"] + join > FLIP_LINE:
+                continue
+            if _is_observe():
+                notify.send(f"🔁 W{tag} T{trip_no} — would post {side.upper()}@{join} (observe)")
+                continue
+            ss, pp = flip_math.entry_args(side, join)
+            oid, _ = kalshi.place_order_maker(client, ticker, ss, pp, 1,
+                                              expiration_ts=exp, v2_price_str=fp_str)
+            posted[side] = {"oid": oid, "price": join}
+        for side in list(posted):
+            if side not in fills:
+                fp = _order_fill_price(client, ticker, posted[side]["oid"], side)
+                if fp is not None:
+                    fills[side] = fp
+                    first_fill_ts = time.time()
+                    _record_enter(ticker, close_ts, side, fp)
+                    notify.send(f"🌱 W{tag} T{trip_no} — filled {side.upper()}@{fp}")
+        if not fills:
+            engine.heartbeat()
+            time.sleep(FLIP_POLL_SEC)
+
+    if _is_observe():
+        return "observe", 0, None, None
+    if not fills:
+        if posted:
+            kalshi.cancel_all_for_market(client, ticker)
+        return None, 0, None, None
+
+    if len(fills) == 2:                                   # both legs filled same tick → netted
+        y, n = fills["yes"], fills["no"]
+        cap = 100 - (y + n)
+        notify.send(f"💰 W{tag} T{trip_no} — both filled {y}+{n} → netted rung A +{cap}¢")
+        return "netted", int(cap), "yes", y
+
+    held_side, entry = next(iter(fills.items()))
+    other = "no" if held_side == "yes" else "yes"
+
+    # THE TAKE — exit at entry+X, posted AT the fill (with expiry)
+    q = entry + FLIP_X
+    tes, tep = flip_math.exit_args(held_side, q)
+    take_oid, _ = kalshi.place_order_maker(client, ticker, tes, tep, 1, expiration_ts=exp)
+    notify.send(f"🎯 W{tag} T{trip_no} — {held_side.upper()}@{entry}, take @{q} posted")
+
+    grace_end = first_fill_ts + FLIP_PAIR_GRACE
+    mo_rec = {"m10": None, "m30": None, "m60": None}
+    prev_mo = None
+    adverse_polls = 0
+
+    def _cancel(*oids):
+        for oid in oids:
+            if oid:
+                try:
+                    kalshi.cancel_order(client, oid)
+                except Exception:
+                    pass
+
+    while (close_ts - time.time()) > FLIP_FLAT_AT:
+        engine.heartbeat()
+        book = kalshi.fetch_orderbook(client, ticker)
+        spot = _spot()
+        spot_ticks.append(spot)
+        age = time.time() - first_fill_ts
+        leg_mark = book.yes_bid if held_side == "yes" else book.no_bid
+        mo = (leg_mark - entry) if leg_mark is not None else None
+        if mo_rec["m10"] is None and age >= 10:
+            mo_rec["m10"] = mo
+        if mo_rec["m30"] is None and age >= 30:
+            mo_rec["m30"] = mo
+        if mo_rec["m60"] is None and age >= 60:
+            mo_rec["m60"] = mo
+
+        # PAIR GRACE — the opposite entry bid keeps working; a second fill nets rung A
+        if other in posted and other not in fills and time.time() <= grace_end:
+            fp2 = _order_fill_price(client, ticker, posted[other]["oid"], other)
+            if fp2 is not None:
+                fills[other] = fp2
+                _record_enter(ticker, close_ts, other, fp2)
+                _cancel(take_oid)                     # netted flat → the take would un-flatten us
+                cap = 100 - (entry + fp2)
+                notify.send(f"💰 W{tag} T{trip_no} — pair grace fill {other.upper()}@{fp2} "
+                            f"→ netted rung A +{cap}¢")
+                store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
+                return "netted", int(cap), held_side, entry
+        elif other in posted and other not in fills and time.time() > grace_end:
+            _cancel(posted[other]["oid"])             # grace over → drop the opposite entry only
+            posted.pop(other, None)
+
+        # THE TAKE filled → +X
+        tfp = _order_fill_price(client, ticker, take_oid, tes)
+        if tfp is not None:
+            _record_enter(ticker, close_ts, tes, tfp, why_tag="FLIP_EXIT")
+            notify.send(f"🎯 W{tag} T{trip_no} — take filled {held_side.upper()} → +{FLIP_X}¢")
+            store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
+            return "take", FLIP_X, held_side, entry
+
+        # SCRATCH — cross out NOW on any adverse signal
+        adverse_polls = adverse_polls + 1 if _spot_adverse(held_side, spot, lo, hi) else 0
+        reason = _scratch_reason(held_side, entry, leg_mark, mo_rec["m30"], prev_mo, adverse_polls)
+        prev_mo = mo
+        if reason:
+            _cancel(posted.get(other, {}).get("oid"), take_oid)   # opposite entry FIRST, then take
+            posted.pop(other, None)
+            notify.send(f"✂️ W{tag} T{trip_no} — scratch {held_side.upper()}@{entry}: {reason}")
+            flat_px, _f = _decline_lone(client, ticker, close_ts, tag, held_side, entry)
+            realized = (100 - flat_px - entry) if flat_px is not None else -entry
+            store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
+            return "scratched", int(realized), held_side, entry
+
+        time.sleep(FLIP_POLL_SEC)
+
+    # T-90 reached with the take resting — flatten to end the trip bounded (reuse executor)
+    _cancel(posted.get(other, {}).get("oid"), take_oid)
+    posted.pop(other, None)
+    notify.send(f"⏱ W{tag} T{trip_no} — T-90, take unfilled → flatten {held_side.upper()}@{entry}")
+    flat_px, _f = _decline_lone(client, ticker, close_ts, tag, held_side, entry)
+    realized = (100 - flat_px - entry) if flat_px is not None else -entry
+    store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
+    return "scratched", int(realized), held_side, entry
+
+
+def _run_ratchet_window(client, ticker: str, close_ts: int, tag: str, exp: int,
+                        market_obj: dict) -> Optional[str]:
+    """§2 the ratchet — up to FLIP_MAX_TRIPS managed positions per window, ONE at a time (R1
+    wall), re-entering only on the OFI gate before the curfew. Governors: sit out at
+    FLIP_SCRATCH_SITOUT scratches, window stop (salvage-aware). The magnitude-aware tail-kill
+    and hourly budget stand elsewhere."""
+    trips, scratches, window_realized = 0, 0, 0
+    outcomes, spot_ticks = [], []
+
+    while (trips < FLIP_MAX_TRIPS and scratches < FLIP_SCRATCH_SITOUT
+           and (close_ts - time.time()) > FLIP_CURFEW):
+        if not _r1_flat(client, ticker, tag):          # R1 wall — must be flat to open a trip
+            break
+        if trips > 0:                                  # re-entry needs the OFI gate's blessing
+            book = kalshi.fetch_orderbook(client, ticker)
+            spot_ticks.append(_spot())
+            side = _ofi_side(spot_ticks, _book_lean(book))
+            if side is None:
+                engine.heartbeat()
+                time.sleep(FLIP_POLL_SEC)
+                continue                               # no signal → wait (never fade the tape)
+            notify.send(f"🎯 W{tag} — tape agrees → re-enter {side.upper()} side")
+
+        outcome, realized, side, entry = _run_trip(client, ticker, close_ts, tag, exp,
+                                                   market_obj, trips + 1, spot_ticks)
+        if outcome == "observe":
+            return "flip_observe"
+        if outcome is None:                            # no fill this trip → window is done
+            break
+        trips += 1
+        window_realized += realized
+        outcomes.append(outcome)
+        try:
+            store.insert_trip(time.time(), ticker, tag, side or "", int(entry or 0),
+                              outcome, int(realized))
+        except Exception as e:
+            notify.send(f"⚠ W{tag} trip row failed: {e}")
+        if outcome == "scratched":
+            scratches += 1
+        if window_realized <= -FLIP_STOP_CENTS:        # salvage-aware window stop
+            notify.send(f"🛑 W{tag} — window stop {window_realized}¢ ≤ −{FLIP_STOP_CENTS}")
+            break
+
+    if scratches >= FLIP_SCRATCH_SITOUT:
+        notify.send(f"🪑 W{tag} — {scratches} scratches → sitting the window out")
+
+    stopped = window_realized <= -FLIP_STOP_CENTS
+    try:
+        store.insert_flip_window(
+            ts=time.time(), close_ts=int(close_ts), tag=tag, ticker=ticker,
+            realized_cents=int(window_realized),
+            outcome_tag=("STOPPED" if stopped else ("RATCHET" if trips else "SAT_no_fill")),
+            broker_flat=(1 if _r1_flat(client, ticker, tag, silent=True) else 0),
+        )
+    except Exception as e:
+        notify.send(f"⚠ W{tag} ratchet window row failed: {e}")
+    _bump_stop_streak(stopped)
+
+    sign = "+" if window_realized >= 0 else ""
+    notify.send(f"🔁 W{tag} — {trips} trips [{' '.join(outcomes) or 'none'}] → "
+                f"{sign}{window_realized}¢ | DONE")
     return "flip_done"
