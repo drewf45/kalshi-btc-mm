@@ -1,7 +1,10 @@
 services:
   - type: worker
-    name: kalshi-btc-mm
+    name: kalshi-relay-shadow
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python -m relay_engine.shadow_runner
+    envVars:
+      - key: RUN_MODE
+        value: SHADOW
