@@ -293,6 +293,37 @@ Suite at this commit: **136 passed** (8 new P4 tests).
   list → RECORDER confirmed → first PASS/WATCHING rows → one clean 15-minute rollover
   (old pruned, new subscribed) → first timer pack. That tape closes gate 7's machinery.
 
+## WO-2026-07-17-RELAY-P5 — "SPEAK ITS DIALECT" (build side closed; the tape is the gate)
+
+Suite at this commit: **150 passed** (14 new P5 tests); golden tape 0/2,941 mismatches.
+
+- **§1 TRUE** — per-channel subscription (`shadow_runner.py::ChannelSubscriber`): one cmd
+  id per channel so a stranger name can only kill itself; code 8 tries the fallback name
+  ONCE (`ticker_v2`->`ticker`, `market_lifecycle_v2`->`market_lifecycle`); the essential
+  `orderbook_delta` failing every name is FATAL with echo (no book, no engine); any other
+  channel failing degrades with a WARN and the engine continues (lifecycle loss covered
+  by the 60s sweep, fill loss by the REST fills sweep). Subscription replies route to the
+  subscriber BEFORE the feed's error classifier. The accepted vocabulary is logged once
+  (`WS channels accepted: [...] / degraded: [...]`) and rollover subscribes speak the
+  LEARNED dialect (test-proven).
+- **§2 TRUE** — code-first classifier (`feed.py`): PER_ORDER_CODES route (25, 27 — the
+  set grows empirically, each growth a reviewed commit); CONFIG_CODES (2, 6, 8) and ALL
+  unknown codes die loud with the payload echo; keywords are a tiebreak for CODELESS
+  frames only. Both adversary directions test-pinned: a config error whose message says
+  "order" still FATALs; a per-order code never does.
+- **§3 TRUE** — first-frame unit assertion (`feed.py::_assert_units`): int 1-99 = cents,
+  decimal-string/float <= 1.00 = dollars (converted at parse), `WS book units: {form}`
+  logged once per connection, units re-asserted after every socket death, neither form =
+  FATAL with the raw level echoed. Deltas parse through the same learned units.
+- **§4 TRUE** — BOOT_LOOP (ledger `boots` table + `engine_state`): >10 boots/hour fires
+  one Telegram alert tagged BOOT_LOOP carrying the last recorded FATAL line; the runner
+  records every FatalIntegrityError before re-raising.
+- **DEPLOY VERIFY (the gate this day points at, needs Render):** boot tape → `WS
+  channels accepted: [...]` → first snapshot with `WS book units:` line → **RECORDER
+  [confirmed writing]** (Scientist: the curriculum starts at that line) → PASS/WATCHING
+  rows → one clean rollover (`window closed + pruned` + new ticker subscribed) → hourly
+  timer pack. Green tape = nothing left between the machine and Drew's two env vars.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

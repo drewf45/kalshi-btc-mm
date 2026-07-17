@@ -14,15 +14,14 @@ from relay_engine.shadow_runner import CYCLE_SECONDS, ShadowEngine, subscribe_cm
 TICKER = "KXBTC15M-02JAN251000-T99"
 
 
-# ── F1e: the subscribe payload snapshot ────────────────────────────────────
+# ── F1e: the subscribe payload snapshot (P5: one channel per cmd) ──────────
 def test_subscribe_payload_grammar():
-    cmd = subscribe_cmd(3, [TICKER, "KXBTC15M-02JAN251015-T99"])
+    cmd = subscribe_cmd(3, [TICKER, "KXBTC15M-02JAN251015-T99"], "orderbook_delta")
     assert cmd["cmd"] == "subscribe" and cmd["id"] == 3
     params = cmd["params"]
     assert "market_tickers" in params and "series_tickers" not in params
     assert params["market_tickers"] == sorted([TICKER, "KXBTC15M-02JAN251015-T99"])
-    assert set(params["channels"]) == {"orderbook_delta", "ticker_v2",
-                                       "market_lifecycle_v2", "fill"}
+    assert params["channels"] == ["orderbook_delta"]  # exactly one channel per cmd
 
 
 # ── F1c/F4: rollover — discovery adds, close prunes ────────────────────────

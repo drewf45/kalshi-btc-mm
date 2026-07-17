@@ -29,13 +29,97 @@ from .surface import PASS, PROPOSED, Surface
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("relay.shadow")
 
-def subscribe_cmd(cmd_id: int, market_tickers) -> dict:
-    """F1b: the subscribe grammar — orderbook_delta takes MARKET tickers,
-    never series_tickers. Lifecycle + fill ride the same subscription."""
+def subscribe_cmd(cmd_id: int, market_tickers, channel: str) -> dict:
+    """F1b/P5 §1: ONE channel per cmd — a stranger channel name can only kill
+    itself, never the book. market_tickers always; never series_tickers."""
     return {"id": int(cmd_id), "cmd": "subscribe",
-            "params": {"channels": ["orderbook_delta", "ticker_v2",
-                                    "market_lifecycle_v2", "fill"],
+            "params": {"channels": [channel],
                        "market_tickers": sorted(market_tickers)}}
+
+
+# P5 §1: the venue-dialect table. Canonical name -> fallback names to try ONCE
+# on code 8 ("Unknown channel name"). orderbook_delta and fill have no alias.
+CHANNEL_FALLBACKS = {
+    "orderbook_delta": [],
+    "ticker_v2": ["ticker"],
+    "market_lifecycle_v2": ["market_lifecycle"],
+    "fill": [],
+}
+ESSENTIAL_CHANNEL = "orderbook_delta"  # no book, no engine
+
+
+class ChannelSubscriber:
+    """P5 §1 — per-channel subscription with empirical fallback, sans-io.
+    The runner sends the cmds this produces and feeds venue replies back in.
+
+    Classification: ESSENTIAL_CHANNEL failing every name = FATAL with echo;
+    any other channel failing = WARN 'degraded' and CONTINUE (lifecycle loss is
+    covered by the 60s sweep, fill loss by the REST fills sweep, ticker loss
+    costs telemetry only). The accepted vocabulary is logged once (Broker knob:
+    the empirical dialect is worth a line in the tape for the next port)."""
+
+    def __init__(self):
+        self.seq = 0
+        self.accepted: dict = {}   # canonical -> venue name that worked
+        self.degraded: list = []
+        self.pending: dict = {}    # cmd_id -> (canonical, tried_name, tickers, remaining_fallbacks)
+        self._vocab_logged = False
+
+    def cmds_for(self, market_tickers, channels=None) -> list:
+        """Subscribe cmds for these markets, one per channel, using the accepted
+        vocabulary where already learned."""
+        out = []
+        for canonical in (channels or list(CHANNEL_FALLBACKS)):
+            if canonical in self.degraded:
+                continue
+            name = self.accepted.get(canonical, canonical)
+            self.seq += 1
+            cmd = subscribe_cmd(self.seq, market_tickers, name)
+            self.pending[self.seq] = (canonical, name, sorted(market_tickers),
+                                      list(CHANNEL_FALLBACKS.get(canonical, []))
+                                      if canonical not in self.accepted else [])
+            out.append(cmd)
+        return out
+
+    def on_reply(self, msg: dict):
+        """Feed a venue reply carrying an id we sent. Returns:
+        None (not ours / handled) | a retry cmd dict (send it) — and raises
+        FatalIntegrityError when the essential channel fails every name."""
+        cmd_id = msg.get("id")
+        if cmd_id not in self.pending:
+            return None
+        canonical, tried, tickers, fallbacks = self.pending.pop(cmd_id)
+        mtype = msg.get("type")
+        code = (msg.get("msg") or {}).get("code")
+        if mtype != "error":
+            self.accepted[canonical] = tried
+            self._maybe_log_vocab()
+            return None
+        if code == 8 and fallbacks:
+            # unknown channel name: try the fallback ONCE
+            self.seq += 1
+            retry = subscribe_cmd(self.seq, tickers, fallbacks[0])
+            self.pending[self.seq] = (canonical, fallbacks[0], tickers, fallbacks[1:])
+            log.warning("WS channel %r unknown — trying dialect %r", tried, fallbacks[0])
+            return retry
+        # no names left (or a non-vocabulary error on subscribe)
+        if canonical == ESSENTIAL_CHANNEL:
+            raise FatalIntegrityError(
+                f"essential channel {canonical!r} rejected by venue "
+                f"(code {code}, tried {tried!r}) — no book, no engine; msg={msg}")
+        if canonical not in self.degraded:
+            self.degraded.append(canonical)
+        log.warning("WS channel %r unavailable (code %s) — degraded, continuing",
+                    canonical, code)
+        self._maybe_log_vocab()
+        return None
+
+    def _maybe_log_vocab(self):
+        want = set(CHANNEL_FALLBACKS) - set(self.degraded)
+        if not self._vocab_logged and want.issubset(self.accepted.keys() | set(self.degraded)):
+            self._vocab_logged = True
+            log.info("WS channels accepted: %s / degraded: %s",
+                     sorted(self.accepted.values()), sorted(self.degraded))
 
 
 CYCLE_SECONDS = 1.0            # F3: the cycle gate (frames update books; sweeps run at 1s)
@@ -140,6 +224,18 @@ class ShadowEngine:
         self.boot_caps = self.ledger.snapshot_caps_at_boot()
         print_boot_tape(recorder=self.recorder, boot_caps=self.boot_caps,
                         auth_line=auth_line)
+        # P5 §4 (CEO knob): a crash-loop tells the sleeping operator its story
+        # in one tagged line, with the last FATAL attached.
+        boots_last_hour = self.ledger.record_boot()
+        if boots_last_hour > 10:
+            last_fatal = self.ledger.get_state("last_fatal") or "(no FATAL recorded)"
+            self.telegram.alert(
+                f"BOOT_LOOP: {boots_last_hour} boots in the last hour — "
+                f"last FATAL: {last_fatal}")
+        return boots_last_hour
+
+    def record_fatal(self, message: str) -> None:
+        self.ledger.set_state("last_fatal", message[:500])
 
     def _on_ladder_move(self, old, new):
         if new == "WS_LOST":
@@ -306,10 +402,10 @@ async def run():
 
     subscribed: set = set()
 
-    async def sync_subscriptions(ws, cmd_seq):
-        """F1a-c: signed REST discovery is the subscription's ground truth.
-        New windows subscribe (market_tickers, NEVER series_tickers on
-        orderbook_delta); closed windows prune everywhere."""
+    async def sync_subscriptions(ws, subscriber):
+        """F1a-c/P5 §1: signed REST discovery is the subscription's ground
+        truth; each channel subscribes in its OWN cmd (a stranger name can
+        only kill itself); closed windows prune everywhere."""
         mkts = await asyncio.to_thread(venue.list_open_markets, client)
         current = set()
         for m in mkts:
@@ -319,10 +415,10 @@ async def run():
         new = sorted(current - subscribed)
         gone = sorted(subscribed - current)
         if new:
-            cmd_seq[0] += 1
-            payload = json.dumps(subscribe_cmd(cmd_seq[0], new))
-            engine.feed.note_sent(payload)
-            await ws.send(payload)
+            for cmd in subscriber.cmds_for(new):
+                payload = json.dumps(cmd)
+                engine.feed.note_sent(payload)
+                await ws.send(payload)
             subscribed.update(new)
             log.warning("WS subscribed: %s", ",".join(new))
         for ticker in gone:
@@ -339,8 +435,8 @@ async def run():
                     additional_headers=auth.signed_headers("GET", ws_path)) as ws:
                 rejections.success()  # venue accepted the handshake
                 subscribed.clear()
-                cmd_seq = [0]
-                await sync_subscriptions(ws, cmd_seq)
+                subscriber = ChannelSubscriber()
+                await sync_subscriptions(ws, subscriber)
                 engine.ladder.snapshot_resynced()
                 last_cycle = 0.0
                 last_discovery = time.monotonic()
@@ -356,28 +452,40 @@ async def run():
                             continue
                         except Exception as pe:
                             raise ConnectionError(f"ping failed after quiet: {pe}")
-                    engine.feed.handle_frame(raw)
+                    # P5 §1: subscription replies route to the subscriber FIRST —
+                    # a vocabulary rejection retries its fallback or degrades;
+                    # only the essential channel's failure is fatal.
                     try:
-                        msg = json.loads(raw)
-                        m = msg.get("msg") or {}
+                        pre = json.loads(raw)
+                    except ValueError:
+                        pre = None
+                    if pre is not None and pre.get("id") in subscriber.pending:
+                        retry = subscriber.on_reply(pre)
+                        if retry is not None:
+                            payload = json.dumps(retry)
+                            engine.feed.note_sent(payload)
+                            await ws.send(payload)
+                        continue
+                    engine.feed.handle_frame(raw)
+                    if pre is not None:
+                        m = pre.get("msg") or {}
                         mkt = m.get("market_ticker")
                         # F1c: lifecycle events drive rollover between sweeps
-                        if msg.get("type") in ("market_lifecycle_v2", "market_lifecycle"):
-                            await sync_subscriptions(ws, cmd_seq)
+                        if pre.get("type") in ("market_lifecycle_v2", "market_lifecycle"):
+                            await sync_subscriptions(ws, subscriber)
                         elif mkt and mkt not in subscribed:
                             subscribed.add(mkt)
-                    except (ValueError, AttributeError):
-                        pass
                     mono = time.monotonic()
                     if mono - last_discovery >= DISCOVERY_SWEEP_S:
                         last_discovery = mono
-                        await sync_subscriptions(ws, cmd_seq)
+                        await sync_subscriptions(ws, subscriber)
                     # F3: frames update books continuously; the five-lane sweep
                     # runs on the CYCLE_SECONDS gate.
                     if mono - last_cycle >= CYCLE_SECONDS:
                         last_cycle = mono
                         engine.cycle(sorted(engine.market_meta.keys() | subscribed))
-        except FatalIntegrityError:
+        except FatalIntegrityError as fe:
+            engine.record_fatal(str(fe))  # P5 §4: the BOOT_LOOP alert's evidence
             raise  # fail loud, stay stopped
         except Exception as e:
             # §2.4: a 401/403 handshake is an AUTH event, not transport damage —

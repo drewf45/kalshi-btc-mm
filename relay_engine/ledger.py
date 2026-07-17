@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS surface_rows (
     detail TEXT NOT NULL DEFAULT '',
     concurrent_lanes TEXT NOT NULL DEFAULT ''  -- Scientist stamp (P3): lanes live on this market at write time
 );
+CREATE TABLE IF NOT EXISTS engine_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS boots (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL                -- P5 §4: boot-loop detection (reader: BOOT_LOOP alert)
+);
 CREATE TABLE IF NOT EXISTS book_snapshots (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -118,6 +126,25 @@ class Ledger:
                  ("CONFIRMED_DEPOSIT" if delta > 0 else "CONFIRMED_WITHDRAWAL"), confirmed_by),
             )
             self.db.commit()
+
+    # ----- engine state (key/value) + boot-loop counter (P5 §4) -----
+    def get_state(self, key: str):
+        row = self.db.execute("SELECT value FROM engine_state WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_state(self, key: str, value: str) -> None:
+        self.db.execute("INSERT INTO engine_state (key, value) VALUES (?,?)"
+                        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, str(value)))
+        self.db.commit()
+
+    def record_boot(self, now=None) -> int:
+        """Insert a boot row; return boots in the last hour (BOOT_LOOP input)."""
+        now = time.time() if now is None else now
+        self.db.execute("INSERT INTO boots (ts) VALUES (?)", (now,))
+        self.db.commit()
+        return int(self.db.execute("SELECT COUNT(*) FROM boots WHERE ts>=?",
+                                   (now - 3600,)).fetchone()[0])
 
     # ----- writes -----
     def record_fill(self, market: str, lane: str, side: str, action: str,
