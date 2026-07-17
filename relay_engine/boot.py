@@ -11,7 +11,7 @@ from typing import List
 from . import config
 
 
-def boot_tape(recorder=None, boot_caps=None) -> List[str]:
+def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines = [
         "==================================================================",
         f"RELAY ENGINE BOOT — EPOCH {config.EPOCH} (born; tradeable = live balance)",
@@ -39,13 +39,15 @@ def boot_tape(recorder=None, boot_caps=None) -> List[str]:
             "RECORDER: ON — book snapshots -> book_snapshots "
             "(reader: replay harness + shadow verdicts)"
             + (" [confirmed writing]" if recorder.confirmed_writing() else " [awaiting first frame]"))
+    if auth_line is not None:
+        lines.append(auth_line)  # "AUTH: key id …last4 loaded, PEM parsed" — never more
     lines.append(f"DB: {config.DB_PATH} (single-writer: this engine's own database)")
     lines.append("==================================================================")
     return lines
 
 
-def print_boot_tape(recorder=None, boot_caps=None) -> List[str]:
-    lines = boot_tape(recorder=recorder, boot_caps=boot_caps)
+def print_boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
+    lines = boot_tape(recorder=recorder, boot_caps=boot_caps, auth_line=auth_line)
     for line in lines:
         print(line, flush=True)
     return lines

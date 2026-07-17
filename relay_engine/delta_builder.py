@@ -10,6 +10,10 @@ validates, and hot-loads into the running engine. Weekly refresh on timer.
 
 The engine trades normally on static gates while the table builds
 (TABLE_ABSENT path). Never blocks or delays a market cycle.
+
+AUTH EXEMPTION (WO-P1 §2.3): the Coinbase candle fetch below is a PUBLIC
+endpoint — it is explicitly exempt from the venue signing scheme in
+relay_engine/auth.py. Every Kalshi call goes through auth.signed_request.
 """
 
 import csv

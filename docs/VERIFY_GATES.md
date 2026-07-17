@@ -186,6 +186,35 @@ DB: relay_shadow.db (single-writer: this engine's own database)
 ==================================================================
 ```
 
+## WO-2026-07-17-RELAY-P1 — "AUTH: SIGN THE HANDSHAKE" (patch order, closed at build side)
+
+- **TRUE** — finding confirmed as stated: the delivered tree had no auth layer; the 401 was
+  structural. The fix is `relay_engine/auth.py`: env `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY`
+  (PEM, literal-`\n` normalized), `signed_headers()` signing `timestamp_ms + METHOD + path`
+  with RSA-PSS(SHA-256, salt=DIGEST_LENGTH) — verified byte-identical in scheme to the live
+  tree's `kalshi.py:59-75` — and `signed_request()` as THE signed-REST helper (§2.3; Coinbase
+  candle fetch explicitly exempt, noted in `delta_builder.py` header).
+- **TRUE** — handshake wired: `shadow_runner.py` connects with
+  `additional_headers=auth.signed_headers("GET", <ws path>)`, signed at connect time per
+  attempt, never import time.
+- **TRUE** — §4 doctrine implemented and tested: absent/unparseable creds → FATAL at boot
+  BEFORE any connect (`auth.boot_check`, wired first in `run()`); 401/403 handshake →
+  three-strike FATAL via `auth.HandshakeRejections` (success resets; non-auth statuses never
+  count); all other socket deaths stay ladder events, unchanged.
+- **TRUE** — boot tape gains exactly one line: `AUTH: key id …last4 loaded, PEM parsed`;
+  test-enforced that neither the full key id nor key material appears.
+- **NOTE (spec deviation, declared)** — §2.5 asked for an "exact expected header" signature
+  vector; RSA-PSS salts are random, so exact signature bytes are impossible. The vector test
+  pins the exact header set / key id / mocked timestamp and CRYPTOGRAPHICALLY VERIFIES the
+  signature over the exact message with the exact PSS parameters, plus a mutated-message
+  negative check (`tests/test_auth.py::test_signature_vector_fixed_timestamp`).
+- **TRUE** — §3.1: suite green at **80 passed** (7 new auth tests: vector, missing-creds
+  boot-stop, last4-only tape line, 3×401 FATAL, 1×401-then-success no-false-FATAL,
+  runner boot-stop-before-connect, PEM normalization).
+- **AWAITING DREW (§3.2-3.4)**: set `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY` on Render,
+  redeploy, confirm `AUTH:` line → `WS subscribed` → recorder confirmed; the 24h gate-7
+  clock starts at the first clean subscribed frame.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

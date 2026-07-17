@@ -12,6 +12,7 @@ import json
 import logging
 import signal
 import time
+from urllib.parse import urlparse
 
 from . import config
 from .boot import print_boot_tape
@@ -49,13 +50,14 @@ class ShadowEngine:
         self.boot_caps = None
         self._window_of = {}  # market -> window_id (market close ts as string)
 
-    def boot(self):
+    def boot(self, auth_line=None):
         if config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0:
             # Paper bankroll so budget walls exercise realistically (paper only).
             self.ledger.baseline(int(config.SHADOW_PAPER_BANKROLL_USD * 100),
                                  confirmed_by="shadow_paper_boot")
         self.boot_caps = self.ledger.snapshot_caps_at_boot()
-        print_boot_tape(recorder=self.recorder, boot_caps=self.boot_caps)
+        print_boot_tape(recorder=self.recorder, boot_caps=self.boot_caps,
+                        auth_line=auth_line)
 
     def _on_ladder_move(self, old, new):
         if new == "WS_LOST":
@@ -115,8 +117,14 @@ class ShadowEngine:
 
 
 async def run():
+    from . import auth
+
+    # Auth boot-stop (§4 doctrine): missing/unparseable creds are FATAL here,
+    # BEFORE any connect attempt — never a retry loop.
+    auth_line = auth.boot_check()
+
     engine = ShadowEngine()
-    engine.boot()
+    engine.boot(auth_line=auth_line)
 
     if config.RUN_MODE != "SHADOW":
         raise FatalIntegrityError(
@@ -137,17 +145,21 @@ async def run():
 
     markets: set = set()
     last_pack = time.time()
+    ws_path = urlparse(config.WS_URL).path or "/trade-api/ws/v2"
+    rejections = auth.HandshakeRejections(limit=3)
 
     while not stop.is_set():
         try:
-            async with websockets.connect(config.WS_URL) as ws:
-                # Public orderbook/ticker channels; auth channels (fill/positions)
-                # ride the same socket once creds are wired (read-only, §B3).
+            # Sign at connect time, never import time — fresh timestamp per attempt.
+            async with websockets.connect(
+                    config.WS_URL,
+                    additional_headers=auth.signed_headers("GET", ws_path)) as ws:
                 await ws.send(json.dumps({
                     "id": 1, "cmd": "subscribe",
                     "params": {"channels": ["orderbook_delta", "ticker_v2"],
                                "series_tickers": [config.SERIES_TICKER]},
                 }))
+                rejections.success()  # venue accepted the handshake
                 log.info("WS subscribed: %s on %s", config.SERIES_TICKER, config.WS_URL)
                 engine.ladder.snapshot_resynced()
                 while not stop.is_set():
@@ -167,6 +179,12 @@ async def run():
         except FatalIntegrityError:
             raise  # fail loud, stay stopped
         except Exception as e:
+            # §2.4: a 401/403 handshake is an AUTH event, not transport damage —
+            # three consecutive rejections escalate FATAL. Everything else is
+            # the ladder's (transport) business, unchanged.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status is not None:
+                rejections.rejected(status)  # raises FatalIntegrityError on strike 3
             engine.feed.socket_died(str(e))
             log.warning("WS down (%s); degrade ladder engaged; reconnecting in 3s", e)
             await asyncio.sleep(3.0)
