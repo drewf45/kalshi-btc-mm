@@ -92,6 +92,12 @@ EXPECTED_FEE_MULTIPLIER = 0.07
 EXPECTED_MAKER_FEE_SERIES = frozenset()  # series currently designated as maker-fee-charging
 
 # ---------------------------------------------------------------------------
+# Paper shadow: the notional bankroll the shadow books against so budget walls
+# exercise realistically. Paper only — no real dollar exists until cutover.
+# ---------------------------------------------------------------------------
+SHADOW_PAPER_BANKROLL_USD = 100.0
+
+# ---------------------------------------------------------------------------
 # Storage — single-writer law (§A1): this engine's OWN database, never the
 # live surface DB.
 # ---------------------------------------------------------------------------

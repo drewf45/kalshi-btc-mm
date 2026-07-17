@@ -26,11 +26,11 @@ def test_cycle_census_clean_and_zero_orders():
     # census: exactly one terminal row per lane per market — 5 lanes x 2 markets
     assert len(rows) == 10
     assert all(n == 1 for _, _, n in rows)
-    # F/H8 pass with the gated reason; stubs with theirs
+    # F/H8 (ported) pass these metadata-less tickers; stubs with their reasons
     reasons = dict(engine.ledger.db.execute(
         "SELECT lane, detail FROM surface_rows WHERE terminal=1 AND market='KXBTC15M-A'"))
-    assert reasons["F"] == "GATED_ON_B1_NOT_PORTED"
-    assert reasons["H8"] == "GATED_ON_B1_NOT_PORTED"
+    assert reasons["F"] == "NO_CLOSE_TS"
+    assert reasons["H8"] == "NO_CLOSE_TS"
     assert reasons["D"] == "STUB_AWAITING_CHUNK_6"
     # ZERO orders placed
     assert engine.gateway.shadow_orders == []
@@ -51,13 +51,31 @@ def test_daily_pack_renders_per_lane_sections():
     assert "TRUE-UP" in pack
 
 
-def test_delta_module_is_loudly_gated():
+def test_delta_module_laws():
+    """B1 landed: delta is the live loader borrowed whole. TABLE_ABSENT is
+    boot-safe (gate inputs return None, static gates rule); R1 refuses
+    synthetic manifests; the settlement-anchor law stands."""
+    import json
     import pytest
+    from pathlib import Path
     from relay_engine import delta
-    from relay_engine.errors import GatedOnMissingInput
-    record = {"floor_strike": 65000.0}
-    with pytest.raises(GatedOnMissingInput):
-        delta.p_survive(record, 300)
+
+    # TABLE_ABSENT: gate inputs are None, verdicts say so, nothing crashes
+    delta._TABLE, delta._LOADED = {}, False
+    assert delta.p_cross(100, 300) is None
+    assert delta.p_survive(100, 300) is None
+    assert delta.h8_table_verdict(100, 300)["reason"] == "TABLE_ABSENT"
+    assert delta.f_top_rung_verdict(100, 700, cost_cents=99)["qualified"] is None
+
+    # R1: synthetic manifest refused by construction
+    tmp = Path("/tmp/claude-0/-home-user-kalshi-btc-mm/d191cf51-af94-51ca-a17b-9fd70307613e/scratchpad/delta_r1")
+    tmp.mkdir(parents=True, exist_ok=True)
+    (tmp / "delta_table.csv").write_text("distance_usd,secs_remaining,p_cross,n,effective_n,wilson_ub,session\n")
+    (tmp / "candles_manifest.json").write_text(json.dumps({"source": "Synthetic GBM", "csv_sha256": "x"}))
+    assert delta.load(str(tmp / "delta_table.csv")) is False
+    assert "synthetic" in delta.refusal_reason()
+
+    # settlement anchor law
     with pytest.raises(ValueError):
         delta.settlement_anchor({"spot": 65000.0})  # generic spot refused
-    assert delta.settlement_anchor(record) == 65000.0
+    assert delta.settlement_anchor({"floor_strike": 65000.0}) == 65000.0
