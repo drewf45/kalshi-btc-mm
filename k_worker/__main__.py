@@ -321,6 +321,31 @@ def _check_fee_tripwire(client: kalshi.KalshiClient) -> None:
 
 BOOT_RECONCILE_TOL = 0.05
 
+# WO-5 §2: only these series are the bot's book. Positions/orders in any other series
+# (e.g. Drew's personal WNBA bets in the shared account) are ignored — no row, no sweep,
+# no settlement, no treasury impact.
+KW_SERIES_ALLOWLIST = [s.strip() for s in
+                       os.environ.get("KW_SERIES_ALLOWLIST", "KXBTC15M").split(",") if s.strip()]
+
+
+def adopt_or_ignore_positions(client) -> None:
+    """Boot orphan scan with the series allowlist (WO-5 §2). Allowlisted positions with no
+    store row are adopted as orphans (the sweep settles them); everything else is a personal
+    position — logged once (persisted), never adopted, never swept, never booked."""
+    for p in kalshi.get_positions(client):
+        tk = p.get("ticker") or p.get("market_ticker")
+        if not tk:
+            continue
+        if not store.series_allowed(tk, KW_SERIES_ALLOWLIST):
+            seen_key = f"personal_ignored:{tk}"
+            if store.get_state(seen_key) is None:
+                store.set_state(seen_key, "1")
+                notify.send(f"👤 {tk} — PERSONAL (ignored, not in KW_SERIES_ALLOWLIST)")
+            continue
+        if not store.has_row_for_ticker(tk):
+            store.insert_orphan_row(tk, p)
+            notify.alert(f"ORPHAN POSITION at boot: {tk} — row created; sweep will settle it")
+
 
 def _fill_timestamp(fill: dict) -> Optional[float]:
     """Extract Unix timestamp from a Kalshi fill record."""
@@ -448,6 +473,10 @@ def boot_reconcile(client: kalshi.KalshiClient) -> None:
     # to any open position's value at boot (+$0.99 observed).
     live_bal = cash_b + (pv_b or 0)
 
+    # WO-5 §3: standing ruling — wipe accrued/owed once, book = account (before reconcile
+    # so the snapshot below sees the cleared state and the invariant reads flat).
+    treasury.wipe_owed_once(live_bal)
+
     t = treasury.snapshot()
     expected = t.book + t.accrued_tax + t.accrued_fee
     delta = round(live_bal - expected, 2)
@@ -477,11 +506,7 @@ def boot_reconcile(client: kalshi.KalshiClient) -> None:
         )
 
     try:
-        for p in kalshi.get_positions(client):
-            tk = p.get("ticker") or p.get("market_ticker")
-            if tk and not store.has_row_for_ticker(tk):
-                store.insert_orphan_row(tk, p)
-                notify.alert(f"ORPHAN POSITION at boot: {tk} — row created; sweep will settle it")
+        adopt_or_ignore_positions(client)
     except Exception as e:
         notify.alert(f"Boot position scan failed: {e} — positions unverified this boot")
 

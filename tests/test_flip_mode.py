@@ -28,18 +28,34 @@ class _FakeClock:
 
 
 @unittest.skipUnless(_IMPORTABLE, "flip_mode requires the cryptography-bound client (CI only)")
-class TestFlipDiscipline(unittest.TestCase):
+class _RestoreMixin(unittest.TestCase):
+    """Monkeypatch shared module attributes and RESTORE them in tearDown, so a test can't
+    leak fakes into the shared store/notify/... modules and pollute later test files."""
     def setUp(self):
+        self._saved = []
+
+    def P(self, obj, attr, val):
+        self._saved.append((obj, attr, getattr(obj, attr)))
+        setattr(obj, attr, val)
+
+    def tearDown(self):
+        for obj, attr, orig in reversed(self._saved):
+            setattr(obj, attr, orig)
+
+
+class TestFlipDiscipline(_RestoreMixin):
+    def setUp(self):
+        super().setUp()
         # in-memory state store
         self.state = {}
         self.sent, self.alerts, self.traded = [], [], set()
-        flip_mode.store.get_state = lambda k: self.state.get(k)
-        flip_mode.store.set_state = lambda k, v: self.state.__setitem__(k, v)
-        flip_mode.notify.send = lambda t, **k: self.sent.append(t)
-        flip_mode.notify.alert = lambda t: self.alerts.append(t)
-        flip_mode.discipline.is_halted = lambda: bool(self.state.get("halted"))
-        flip_mode.gateway.is_traded = lambda tk: tk in self.traded
-        flip_mode.gateway.mark_traded = lambda tk, lane="F": self.traded.add(tk)
+        self.P(flip_mode.store, "get_state", lambda k: self.state.get(k))
+        self.P(flip_mode.store, "set_state", lambda k, v: self.state.__setitem__(k, v))
+        self.P(flip_mode.notify, "send", lambda t, **k: self.sent.append(t))
+        self.P(flip_mode.notify, "alert", lambda t: self.alerts.append(t))
+        self.P(flip_mode.discipline, "is_halted", lambda: bool(self.state.get("halted")))
+        self.P(flip_mode.gateway, "is_traded", lambda tk: tk in self.traded)
+        self.P(flip_mode.gateway, "mark_traded", lambda tk, lane="F": self.traded.add(tk))
 
     def test_two_stops_pause(self):
         flip_mode._bump_stop_streak(True)                 # stop 1
@@ -69,13 +85,14 @@ class TestFlipDiscipline(unittest.TestCase):
 
 
 @unittest.skipUnless(_IMPORTABLE, "flip_mode requires the cryptography-bound client (CI only)")
-class TestFlipCycle(unittest.TestCase):
+class TestFlipCycle(_RestoreMixin):
     """Full-window order path with the proven organs monkeypatched to in-memory fakes.
     Fills are injected by order_id via a patched _order_fill_price (skips get_fills/parse)."""
 
     CLOSE = 2_000_000_000        # fixed epoch; _tag formats it, nothing depends on 'now'
 
     def setUp(self):
+        super().setUp()
         self.state, self.sent, self.alerts, self.traded = {}, [], [], set()
         self.orders, self.rows, self.cancels = [], [], []
         self.windows, self.orphans = [], []
@@ -86,19 +103,19 @@ class TestFlipCycle(unittest.TestCase):
             yes_bid_fp="0.45", no_bid_fp="0.48")
         self.book2 = None                         # second fetch (sweep / flatten); None → book
 
-        flip_mode.store.get_state = lambda k: self.state.get(k)
-        flip_mode.store.set_state = lambda k, v: self.state.__setitem__(k, v)
-        flip_mode.store.insert_row = lambda r: self.rows.append(r)
-        flip_mode.store.SurfaceRow = lambda **kw: kw
-        flip_mode.store.insert_flip_window = lambda **kw: self.windows.append(kw)
-        flip_mode.store.insert_orphan_row = lambda tk, pd: self.orphans.append((tk, pd))
-        flip_mode.notify.send = lambda t, **k: self.sent.append(t)
-        flip_mode.notify.alert = lambda t: self.alerts.append(t)
-        flip_mode.discipline.is_halted = lambda: bool(self.state.get("halted"))
-        flip_mode.gateway.is_traded = lambda tk: tk in self.traded
-        flip_mode.gateway.mark_traded = lambda tk, lane="F": self.traded.add(tk)
-        flip_mode.engine.heartbeat = lambda: None
-        flip_mode.engine._observe_mode = False
+        self.P(flip_mode.store, "get_state", lambda k: self.state.get(k))
+        self.P(flip_mode.store, "set_state", lambda k, v: self.state.__setitem__(k, v))
+        self.P(flip_mode.store, "insert_row", lambda r: self.rows.append(r))
+        self.P(flip_mode.store, "SurfaceRow", lambda **kw: kw)
+        self.P(flip_mode.store, "insert_flip_window", lambda **kw: self.windows.append(kw))
+        self.P(flip_mode.store, "insert_orphan_row", lambda tk, pd: self.orphans.append((tk, pd)))
+        self.P(flip_mode.notify, "send", lambda t, **k: self.sent.append(t))
+        self.P(flip_mode.notify, "alert", lambda t: self.alerts.append(t))
+        self.P(flip_mode.discipline, "is_halted", lambda: bool(self.state.get("halted")))
+        self.P(flip_mode.gateway, "is_traded", lambda tk: tk in self.traded)
+        self.P(flip_mode.gateway, "mark_traded", lambda tk, lane="F": self.traded.add(tk))
+        self.P(flip_mode.engine, "heartbeat", lambda: None)
+        self.P(flip_mode.engine, "_observe_mode", False)
 
         self._book_calls = 0
         self.book_provider = None      # optional: clock_ts -> book (time-varying watch)
@@ -108,24 +125,21 @@ class TestFlipCycle(unittest.TestCase):
             if self.book_provider is not None:
                 return self.book_provider(self._clock.time())
             return self.book if self._book_calls == 1 else (self.book2 or self.book)
-        flip_mode.kalshi.fetch_orderbook = _fetch
-        flip_mode.kalshi.cancel_all_for_market = lambda c, tk: self.cancels.append(tk)
-        flip_mode.kalshi.position_for_market = lambda c, tk: self.net
-        flip_mode.kalshi.get_positions = lambda c: []
+        self.P(flip_mode.kalshi, "fetch_orderbook", _fetch)
+        self.P(flip_mode.kalshi, "cancel_all_for_market", lambda c, tk: self.cancels.append(tk))
+        self.P(flip_mode.kalshi, "position_for_market", lambda c, tk: self.net)
+        self.P(flip_mode.kalshi, "get_positions", lambda c: [])
 
         def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None):
             oid = f"{side}-{price}"
             self.orders.append(dict(side=side, price=price, count=count,
                                     expiration_ts=expiration_ts, v2=v2_price_str, oid=oid))
             return oid, {}
-        flip_mode.kalshi.place_order_maker = _place
-        flip_mode._order_fill_price = lambda c, tk, oid, our_side: self.fills_map.get(oid)
+        self.P(flip_mode.kalshi, "place_order_maker", _place)
+        self.P(flip_mode, "_order_fill_price", lambda c, tk, oid, our_side: self.fills_map.get(oid))
 
         self._clock = _FakeClock(self.CLOSE - 800)        # secs=800: inside the arm window
-        flip_mode.time = self._clock
-
-    def tearDown(self):
-        flip_mode.time = time                             # restore the real module
+        self.P(flip_mode, "time", self._clock)
 
     def _post_entry(self):
         # the first two place_order_maker calls are the entry bids; the rest are rung B / sweep

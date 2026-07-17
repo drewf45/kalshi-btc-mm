@@ -64,7 +64,19 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 ## Env
 `KW_MODE` (unset/anything ⇒ FLIP; `OFF` ⇒ kill switch) · `FLIP_ENTRY_SEC=300` ·
 `FLIP_SIDE_MAX=49` · `FLIP_LINE=99` · `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` ·
-`FLIP_STOP_CENTS=25` · `FLIP_PAUSE_AFTER_STOPS=2` (all overridable).
+`FLIP_STOP_CENTS=25` · `FLIP_PAUSE_AFTER_STOPS=2` ·
+`KW_SERIES_ALLOWLIST=KXBTC15M` (comma-sep; the only series the bot books) — all overridable.
+
+## Guardrails (WO-5)
+- **ENTER-row lineage.** `SurfaceRow` carries `order_id`; every flip leg's ledger row is
+  written with its order id (the fix for the `unexpected keyword 'order_id'` warning) so
+  reconcile and the Δ$-explained pack stay whole.
+- **Series allowlist (§2).** The boot orphan scan adopts positions only in
+  `KW_SERIES_ALLOWLIST`; anything else (e.g. a personal WNBA bet in the shared account) is
+  logged once as `PERSONAL (ignored)` — no row, no sweep, no settlement, no treasury impact.
+- **Treasury wipe (§3).** A one-time boot migration zeroes accrued/lifetime owed and sets
+  book = account per Drew's 0715 ruling (`treasury wiped … owed → $0.00`); the waterfall
+  plumbing stays dormant, no scrape until re-ruled.
 
 ## Before live — required validation (I could not do these here)
 - The offline sandbox has a broken `cryptography` binding, so `flip_mode` and every

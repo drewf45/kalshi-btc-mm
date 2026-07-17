@@ -198,6 +198,16 @@ class SurfaceRow:
     session_tag: Optional[str] = None
     vol_regime: Optional[str] = None
     winner_clip_cents: Optional[float] = None
+    order_id: Optional[str] = None       # WO-5 §1: order-id lineage is the tagging doctrine
+
+
+def series_allowed(ticker: Optional[str], allowlist) -> bool:
+    """WO-5 §2: True if the ticker's series (the segment before the first '-') is in the
+    allowlist. Keeps personal positions in the shared account out of the bot's books."""
+    if not ticker:
+        return False
+    series = str(ticker).split("-", 1)[0].strip().upper()
+    return series in {str(s).strip().upper() for s in allowlist}
 
 
 def insert_row(row: SurfaceRow) -> int:

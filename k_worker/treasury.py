@@ -89,6 +89,31 @@ def set_book(value: float) -> None:
     log.warning(f"[TREASURY] Book set to ${value:.2f}")
 
 
+_WIPE_FLAG = "treasury_wiped_0715"
+
+
+def wipe_owed_once(account: float) -> bool:
+    """WO-5 §3: Drew's standing ruling (0715) — accrued/owed wiped, book = account, no
+    scrape until re-ruled. One-time migration (state-flag guarded); the waterfall plumbing
+    stays dormant. Returns True if it ran this boot."""
+    if store.get_state(_WIPE_FLAG) is not None:
+        return False
+    t = get_totals()
+    owed = t["accrued_tax"] + t["accrued_fee"]
+    _set_float("treasury_accrued_tax", 0.0)
+    _set_float("treasury_accrued_fee", 0.0)
+    _set_float("treasury_paid_tax", 0.0)
+    _set_float("treasury_paid_fee", 0.0)
+    _set_float("treasury_engine_book", account)
+    store.set_state(_WIPE_FLAG, "1")
+    log.warning(f"[TREASURY] wiped per ruling 0715 — owed ${owed:.2f} → $0.00 "
+                f"(book = account ${account:.2f})")
+    if owed > 0.005:
+        notify.send(f"🧹 treasury wiped per ruling 0715 — owed ${owed:.2f} → $0.00 "
+                    f"(book = account ${account:.2f}, no scrape until re-ruled)")
+    return True
+
+
 def rebuild_accruals(tax: float, fee: float) -> None:
     """Redistribute from book to accruals without changing total system value.
     Used on fresh-store boots where book = live_bal (already includes all P&L).
