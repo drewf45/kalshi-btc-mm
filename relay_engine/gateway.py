@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from . import config
+from . import config, failures
 from .book import OrderBook
 from .errors import FatalIntegrityError, WallRejection
 
@@ -152,9 +152,9 @@ class Gateway:
         if self._submit_thread is None:
             self._submit_thread = tid
         elif tid != self._submit_thread:
-            raise FatalIntegrityError(
-                f"gateway submit from thread {tid}; the single submit path is pinned to "
-                f"{self._submit_thread}")
+            failures.fail("SUBMIT_THREAD_VIOLATION",
+                          f"gateway submit from thread {tid}; the single submit path is "
+                          f"pinned to {self._submit_thread}", fatal=True)
 
         risk_reducing = self.is_risk_reducing(order) or order.purpose in ("EXIT", "CUT")
 
@@ -248,7 +248,9 @@ class Gateway:
         resting until its full count is filled. Returns the order."""
         order = self.order_index.get(order_id)
         if order is None:
-            raise FatalIntegrityError(f"fill for unknown order {order_id}")
+            failures.fail("FILL_UNKNOWN_ORDER",
+                          f"fill for unknown order {order_id}", fatal=True,
+                          order_id=order_id)
         cnt = order.count if count is None else int(count)
         key = (order.event, order.market, order.lane)
         sign = 1 if self._signed_yes_delta(order) > 0 else -1
@@ -356,7 +358,9 @@ class Gateway:
     def _wall_pct_of_book(self, order: Order) -> None:
         caps = self.ledger.boot_caps
         if caps is None:
-            raise FatalIntegrityError("boot caps not snapshotted; boot sequence violated")
+            failures.fail("BOOT_SEQUENCE_VIOLATION",
+                          "boot caps not snapshotted; boot sequence violated",
+                          fatal=True)
         notional = order.price_cents * order.count
         if notional > caps.order_budget_cents:
             raise WallRejection(

@@ -324,6 +324,44 @@ Suite at this commit: **150 passed** (14 new P5 tests); golden tape 0/2,941 mism
   rows → one clean rollover (`window closed + pruned` + new ticker subscribed) → hourly
   timer pack. Green tape = nothing left between the machine and Drew's two env vars.
 
+## WO-2026-07-17-RELAY-P6 — "FAIL LOUD, WRITE IT DOWN, PAGE ME" (R5/R6 recorded)
+
+Suite at this commit: **168 passed** (18 new P6 tests); golden tape 0/2,941 mismatches.
+
+- **§1 TRUE** — frame-shape honesty: NO DEFAULTS at the frame edge. Delta price/delta
+  extracted through key ladders (`price/price_dollars/price_fp/yes_price/
+  yes_price_dollars`; `delta/delta_fp/change`); a frame that misses the ladder is
+  FRAME_SHAPE_UNKNOWN — banked WITH THE RAW FRAME, book dropped, ladder resync, engine
+  continues; three consecutive = WS_DELTA_UNPARSEABLE FATAL, evidence banked BEFORE the
+  raise. 0/None are shape failures, never unit failures — the unit assertion only ever
+  sees wire values. Snapshot levels take the same ladder (tuple AND dict forms). The
+  original v5 crash frame replays green in the suite.
+- **§2 TRUE** — Telegram wired (R6): real transport from TELEGRAM_BOT_TOKEN/CHAT_ID
+  (k_worker notify shape — retry, 400 plain-text logic, NEVER raises); absent in LIVE =
+  boot-stop (PAGER_UNWIRED_LIVE), absent in SHADOW = one loud log line. Sends: BOOT
+  (boot #N, mode, markets, WORST-DAY line, accepted channels), every FATAL via the
+  funnel, BOOT_LOOP, ladder transitions, cash prompts, hourly one-liner, 9AM ET full
+  pack, clean-shutdown notice. Inbound long-poll dispatches EXACTLY /confirm_cash and
+  /deny_cash with offset persisted; everything else gets the refusal line (Adversary:
+  the old tree's richer command set did NOT port).
+- **§3 TRUE** — the Failure Ledger (R5, banked as law): `failures` table (ts, why_tag,
+  what, how_json, where_src, run_mode, boot_id) + ONE funnel `failures.fail()` — writes,
+  alerts (FATAL always; WARN throttled with counts), THEN raises for fatal-class.
+  Pre-configure failures buffer and flush at boot. EVERY FatalIntegrityError in the tree
+  routes through it — grep-ENFORCED by test (zero bare raises outside failures.py). The
+  funnel itself never fails the engine (dead pager + dead ledger both test-proven
+  harmless). The pack gains the FAILURES section (count by tag, first/last seen).
+  Doctrine banked: "A failure that didn't write why/how/what/when before raising is
+  itself a failure."
+- **§4 TRUE** — recorder batches; commits on the 1s cycle gate + shutdown flush;
+  confirmed_writing counts the buffer.
+- **§5 TRUE (env in render.yaml; Drew's dashboard applies it)** —
+  `RELAY_DB_PATH=/var/data/relay_shadow.db`: the curriculum survives the classroom.
+- **DEPLOY VERIFY:** the phone buzzes with the BOOT message → accepted channels →
+  book units line → RECORDER [confirmed writing] → PASS/WATCHING rows → a rollover →
+  the hourly one-liner ON THE PHONE. Any failure instead arrives with its tag and its
+  full record is in the table — R5 working even when nothing else is.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -173,10 +173,12 @@ class Ledger:
         book = self.book_cents()
         lo, hi = venue_balance_cents - in_flight_cents, venue_balance_cents + in_flight_cents
         if not (lo <= book <= hi):
-            raise FatalIntegrityError(
-                f"LEDGER INVARIANT VIOLATED: book={book}c not within venue balance "
-                f"{venue_balance_cents}c ± in-flight {in_flight_cents}c"
-            )
+            from . import failures
+            failures.fail("LEDGER_INVARIANT",
+                          f"book={book}c not within venue balance "
+                          f"{venue_balance_cents}c ± in-flight {in_flight_cents}c",
+                          fatal=True, book=book, venue=venue_balance_cents,
+                          in_flight=in_flight_cents)
 
     # ----- drawdown rail (C.2): absolute floor until book > $50 -----
     def drawdown_floor_cents(self) -> int:

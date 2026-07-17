@@ -8,6 +8,7 @@ or the sizing ladder, and this module is where that absence is enforced.
 
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -17,14 +18,57 @@ log = logging.getLogger("relay.ops")
 
 
 class Telegram:
-    """Transport-agnostic alert sink. In shadow (and tests) it logs; a token wires
-    it to real Telegram. Command surface is EXACTLY the accounting pair."""
+    """R6: Telegram is the ledger of record and the operator's phone.
+
+    Real transport (borrowed shape: k_worker/notify.py — HTTP send, retry x2,
+    400 falls back to plain text, NEVER raises; a broken pager can't crash the
+    patient). Env: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID. Absent in LIVE mode
+    = boot-stop (the pager is safety equipment); absent in SHADOW = one loud
+    log line and alerts fall back to the log.
+
+    Command surface is EXACTLY the accounting pair — the old tree's richer
+    command set does NOT port (single-gateway law outranks nostalgia)."""
 
     COMMANDS = ("/confirm_cash", "/deny_cash")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
-        self.send = send_fn or (lambda msg: log.warning("TELEGRAM: %s", msg))
+        self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        self._session = None
+        if send_fn is not None:
+            self.send = send_fn
+        elif self.token and self.chat_id:
+            import requests
+            self._session = requests.Session()
+            self.send = self._send_http
+            log.info("[TELEGRAM] transport armed (chat %s…)", self.chat_id[:4])
+        else:
+            self.send = lambda msg: log.warning("TELEGRAM(unwired): %s", msg)
+            log.warning("[TELEGRAM] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID absent — "
+                        "alerts fall back to the log (LIVE mode refuses to boot this way)")
+
+    def wired(self) -> bool:
+        return self._session is not None
+
+    def _send_http(self, text: str) -> None:
+        """One send, one retry, 400 falls back to plain text. Never raises."""
+        for attempt in range(2):
+            try:
+                resp = self._session.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": text,
+                          "disable_web_page_preview": True},
+                    timeout=10)
+                if resp.status_code == 200:
+                    return
+                log.warning("[TELEGRAM] send HTTP %s: %s",
+                            resp.status_code, resp.text[:200])
+                if resp.status_code == 400:
+                    return  # malformed content won't improve on retry
+            except Exception as e:
+                log.warning("[TELEGRAM] send error (attempt %d): %s", attempt + 1, e)
+        return
 
     def alert(self, msg: str) -> None:
         self.send(msg)
@@ -39,26 +83,69 @@ class Telegram:
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 
+    def poll_updates_once(self, ledger, timeout: int = 25) -> int:
+        """One getUpdates long-poll (offset persisted in engine_state — the old
+        listener's shape). Dispatches EXACTLY the accounting pair; every other
+        message gets the refusal line. Never raises. Returns updates handled."""
+        if not self.wired():
+            return 0
+        offset = int(ledger.get_state("tg_update_offset") or 0)
+        handled = 0
+        try:
+            resp = self._session.get(
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
+                params={"offset": offset, "timeout": timeout,
+                        "allowed_updates": '["message"]'},
+                timeout=timeout + 10)
+            if resp.status_code != 200:
+                log.warning("[TELEGRAM] getUpdates HTTP %s", resp.status_code)
+                return 0
+            for upd in resp.json().get("result", []):
+                offset = int(upd.get("update_id", offset)) + 1
+                text = ((upd.get("message") or {}).get("text") or "").strip()
+                if text:
+                    self.send(self.handle_command(text))
+                    handled += 1
+            ledger.set_state("tg_update_offset", str(offset))
+        except Exception as e:
+            log.warning("[TELEGRAM] poll error (continuing): %s", e)
+        return handled
+
 
 class Recorder:
     """Book-snapshot recorder — ON from first boot (C.2).
-    READER (streams-name-readers law): the replay harness + shadow verdicts."""
+    READER (streams-name-readers law): the replay harness + shadow verdicts.
+
+    P6 §4: frames BUFFER and commit on the 1s cycle gate (the runner calls
+    flush()) with a flush on shutdown — no per-frame sqlite commit churn at
+    BTC frame rates. confirmed_writing counts the buffer."""
 
     def __init__(self, ledger):
         self.ledger = ledger
         self.frames_written = 0
+        self._buffer: list = []
 
     def record(self, market: str, raw_frame: str, ts: Optional[float] = None) -> None:
-        self.ledger.db.execute(
-            "INSERT INTO book_snapshots (ts, market, snapshot) VALUES (?,?,?)",
-            (ts if ts is not None else time.time(), market, raw_frame),
-        )
-        self.ledger.db.commit()
+        self._buffer.append((ts if ts is not None else time.time(), market, raw_frame))
         self.frames_written += 1
 
+    def flush(self) -> int:
+        """Commit the buffer. Called on the cycle gate and at shutdown."""
+        if not self._buffer:
+            return 0
+        n = len(self._buffer)
+        self.ledger.db.executemany(
+            "INSERT INTO book_snapshots (ts, market, snapshot) VALUES (?,?,?)",
+            self._buffer)
+        self.ledger.db.commit()
+        self._buffer.clear()
+        return n
+
     def confirmed_writing(self) -> bool:
+        if self.frames_written > 0:
+            return True
         n = self.ledger.db.execute("SELECT COUNT(*) FROM book_snapshots").fetchone()[0]
-        return n > 0 or self.frames_written > 0
+        return n > 0
 
 
 def worst_day_bound_line(ledger) -> str:
@@ -108,6 +195,14 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     if foreign_fills:
         lines.append(f"FOREIGN FILLS seen: {foreign_fills} "
                      f"(live Kal's until cutover; NONZERO AFTER CUTOVER = ALARM)")
+    # R5: the FAILURES section — the curriculum includes how things DON'T work
+    from . import failures as failure_ledger
+    fail_lines = failure_ledger.pack_section(ledger)
+    if fail_lines:
+        lines.append("FAILURES (by tag, first/last seen):")
+        lines.extend(fail_lines)
+    else:
+        lines.append("FAILURES: none recorded")
     if venue_statement_cents is not None:
         lines.append(cash_protocol.monthly_true_up_line(venue_statement_cents))
     return "\n".join(lines)

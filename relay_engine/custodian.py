@@ -51,7 +51,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
-from . import config
+from . import config, failures
 from .errors import FatalIntegrityError
 from .gateway import Gateway, Order
 
@@ -335,9 +335,11 @@ class Custodian:
         if pos.resting_exit_id is not None:
             canceled = self.gateway.cancel(pos.resting_exit_id)
             if not canceled:
-                raise FatalIntegrityError(
-                    f"baton violation: resting exit {pos.resting_exit_id} on {pos.market} "
-                    f"could not be verified canceled before cut ({trigger})")
+                failures.fail("BATON_VIOLATION",
+                              f"resting exit {pos.resting_exit_id} on {pos.market} "
+                              f"could not be verified canceled before cut ({trigger})",
+                              fatal=True, market=pos.market, lane=pos.lane,
+                              trigger=trigger)
             pos.resting_exit_id = None
         # sell the held side; risk-reducing -> skips walls, allowed in every feed state
         cut = Order(

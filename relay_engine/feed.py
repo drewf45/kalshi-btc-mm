@@ -23,11 +23,26 @@ def Decimal_q(q):
     """Quantities may arrive as ints or fp strings ('5.00') — Decimal both."""
     return int(Decimal(str(q)))
 
-from . import config
+from . import config, failures
 from .book import OrderBook
 from .errors import FatalIntegrityError
 
 log = logging.getLogger("relay.feed")
+
+# P6 §1: the key ladders. NO DEFAULTS — a value either came off the wire
+# through one of these keys or the frame is not a price event.
+PRICE_KEYS = ("price", "price_dollars", "price_fp", "yes_price", "yes_price_dollars")
+DELTA_KEYS = ("delta", "delta_fp", "change")
+QTY_KEYS = ("count", "count_fp", "quantity", "qty", "size")
+MAX_CONSECUTIVE_SHAPE_FAILURES = 3
+
+
+def _extract(m: dict, keys) -> object:
+    for k in keys:
+        v = m.get(k)
+        if v is not None:
+            return v
+    return None
 
 
 class FeedState(Enum):
@@ -97,6 +112,7 @@ class Feed:
         self.last_sent_payload: Optional[str] = None  # F1d: echoed in config-error FATALs
         self.order_errors = 0                         # per-order errors routed, counted
         self.book_units: Optional[str] = None         # P5 §3: asserted on first snapshot
+        self.shape_failures = 0                       # P6 §1: consecutive unparseable deltas
 
     def note_sent(self, payload: str) -> None:
         """Runner registers each subscribe/command payload for the error autopsy."""
@@ -146,22 +162,42 @@ class Feed:
                 self.order_errors += 1
                 log.warning("venue per-order error frame (routed, not fatal): %s", msg)
                 return
-            raise FatalIntegrityError(
-                f"venue config/subscribe error: {msg} — sent payload was: "
-                f"{self.last_sent_payload}")
+            failures.fail("WS_CONFIG_ERROR",
+                          f"venue config/subscribe error: {msg} — sent payload was: "
+                          f"{self.last_sent_payload}", fatal=True, frame=msg)
         mtype = msg.get("type")
         m = msg.get("msg", {})
         market = m.get("market_ticker", "")
         if mtype == "orderbook_snapshot" and market:
-            yes_levels = self._parse_levels(m.get("yes") or [])
-            no_levels = self._parse_levels(m.get("no") or [])
+            yes_levels = self._parse_levels(m.get("yes") or [], market, raw)
+            no_levels = self._parse_levels(m.get("no") or [], market, raw)
             book = self.book(market)
             book.apply_snapshot(yes_levels, no_levels, ts=now)
+            self.shape_failures = 0
             self.ladder.snapshot_resynced()
         elif mtype == "orderbook_delta" and market:
+            # P6 §1: NO DEFAULTS. Price/delta come off the wire through the key
+            # ladder or the frame is not a price event — tagged, banked with
+            # the raw frame, book dropped, resync requested, engine continues.
+            raw_price = _extract(m, PRICE_KEYS)
+            raw_delta = _extract(m, DELTA_KEYS)
+            if raw_price in (None, 0, "0", "0.0") or raw_delta is None:
+                self.shape_failures += 1
+                self.drop_book(market)
+                self.ladder.ws_lost("frame shape unknown — book dropped, resync required")
+                if self.shape_failures >= MAX_CONSECUTIVE_SHAPE_FAILURES:
+                    failures.fail(
+                        "WS_DELTA_UNPARSEABLE",
+                        f"{self.shape_failures} consecutive unparseable delta frames",
+                        fatal=True, last_raw_frame=raw)
+                failures.fail("FRAME_SHAPE_UNKNOWN",
+                              f"delta frame without price/delta on {market}",
+                              raw_frame=raw)
+                return
             self.book(market).apply_delta(m.get("side", "yes"),
-                                          self._parse_price(m.get("price", 0)),
-                                          int(m.get("delta", 0)), ts=now)
+                                          self._parse_price(raw_price),
+                                          int(Decimal(str(raw_delta))), ts=now)
+            self.shape_failures = 0
         if self.recorder is not None and market:
             self.recorder.record(market, raw, now)
         self.ladder.clean_frame()
@@ -185,9 +221,10 @@ class Feed:
                 pass
         if isinstance(price, float) and 0 < price <= 1:
             return "dollars"
-        raise FatalIntegrityError(
-            f"WS book units unrecognized — raw level price {price!r} is neither "
-            f"int cents 1-99 nor dollar form; refusing to guess")
+        failures.fail("WS_UNITS_UNPARSEABLE",
+                      f"WS book units unrecognized — raw level price {price!r} is "
+                      f"neither int cents 1-99 nor dollar form; refusing to guess",
+                      fatal=True, raw_price=repr(price))
 
     def _parse_price(self, price) -> int:
         from decimal import Decimal
@@ -198,9 +235,26 @@ class Feed:
             return int(Decimal(str(price)) * 100)
         return int(price)
 
-    def _parse_levels(self, levels) -> dict:
-        return {self._parse_price(p): Decimal_q(q) for p, q in levels}
+    def _parse_levels(self, levels, market: str = "", raw: str = "") -> dict:
+        """P6 §1c: level tuples AND dict forms, through the same key ladder;
+        an unparseable level is a banked shape failure, never a guess."""
+        out = {}
+        for lv in levels:
+            if isinstance(lv, dict):
+                p = _extract(lv, PRICE_KEYS)
+                q = _extract(lv, QTY_KEYS)
+            else:
+                p = lv[0] if len(lv) > 0 else None
+                q = lv[1] if len(lv) > 1 else None
+            if p in (None, 0, "0", "0.0") or q is None:
+                failures.fail("FRAME_SHAPE_UNKNOWN",
+                              f"snapshot level unparseable on {market}",
+                              level=repr(lv), raw_frame=raw[:1000])
+                continue
+            out[self._parse_price(p)] = Decimal_q(q)
+        return out
 
     def socket_died(self, why: str = "socket closed") -> None:
-        self.book_units = None  # units re-assert per connection
+        self.book_units = None      # units re-assert per connection
+        self.shape_failures = 0     # the consecutive count is per connection
         self.ladder.ws_lost(why)

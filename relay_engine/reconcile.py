@@ -19,7 +19,7 @@ side of profit they sit on.
 import logging
 import time
 
-from . import venue
+from . import failures, venue
 from .errors import FatalIntegrityError
 
 log = logging.getLogger("relay.reconcile")
@@ -29,8 +29,9 @@ def live_boot_reconcile(engine, client) -> dict:
     """Returns a summary dict; raises FatalIntegrityError on unreadable truth."""
     cash, pv = venue.get_balance(client)
     if cash is None:
-        raise FatalIntegrityError(
-            "LIVE boot: venue balance unreadable — cannot baseline, refusing to run")
+        failures.fail("LIVE_BOOT_BALANCE_UNREADABLE",
+                      "LIVE boot: venue balance unreadable — cannot baseline, "
+                      "refusing to run", fatal=True)
     venue_cents = int(round(cash * 100))
 
     summary = {"venue_balance_cents": venue_cents, "cash_state": None,

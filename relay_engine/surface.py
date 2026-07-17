@@ -58,9 +58,10 @@ class Surface:
             if self._last_state[key] == state:
                 return False  # re-asserting the same terminal verdict is a no-op
             # A DIFFERENT second terminal row is an accounting bug.
-            from .errors import FatalIntegrityError
-            raise FatalIntegrityError(
-                f"duplicate terminal row for {key}: had {self._last_state[key]}, got {state}")
+            from . import failures
+            failures.fail("DUPLICATE_TERMINAL_ROW",
+                          f"duplicate terminal row for {key}: had "
+                          f"{self._last_state[key]}, got {state}", fatal=True)
         self._last_state[key] = state
         self.ledger.db.execute(
             "INSERT INTO surface_rows (ts, lane, market, window_id, state, terminal,"

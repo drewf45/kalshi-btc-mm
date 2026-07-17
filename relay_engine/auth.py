@@ -33,7 +33,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 
-from . import config
+from . import config, failures
 from .errors import FatalIntegrityError
 
 ENV_KEY_ID = "KALSHI_API_KEY_ID"
@@ -59,20 +59,22 @@ def load_credentials():
             try:
                 raw_pem = base64.b64decode(b64).decode("utf-8")
             except Exception as e:
-                raise FatalIntegrityError(
-                    f"{ENV_PRIVATE_KEY_B64} present but not valid base64: "
-                    f"{type(e).__name__}")
+                failures.fail("CREDS_BAD_BASE64",
+                              f"{ENV_PRIVATE_KEY_B64} present but not valid base64: "
+                              f"{type(e).__name__}", fatal=True)
     if not key_id or not raw_pem.strip():
-        raise FatalIntegrityError(
-            f"missing credentials: set {ENV_KEY_ID} and {ENV_PRIVATE_KEY} "
-            f"(or {ENV_PRIVATE_KEY_B64}, the live tree's form) "
-            f"(absent credentials are a boot-stop, not a retry loop)")
+        failures.fail("CREDS_ABSENT",
+                      f"missing credentials: set {ENV_KEY_ID} and {ENV_PRIVATE_KEY} "
+                      f"(or {ENV_PRIVATE_KEY_B64}, the live tree's form) "
+                      f"(absent credentials are a boot-stop, not a retry loop)",
+                      fatal=True)
     try:
         private_key = serialization.load_pem_private_key(
             _normalize_pem(raw_pem).encode("utf-8"), password=None)
     except Exception as e:
-        raise FatalIntegrityError(
-            f"{ENV_PRIVATE_KEY} present but unparseable as PEM: {type(e).__name__}")
+        failures.fail("CREDS_BAD_PEM",
+                      f"{ENV_PRIVATE_KEY} present but unparseable as PEM: "
+                      f"{type(e).__name__}", fatal=True)
     return key_id, private_key
 
 
@@ -138,9 +140,10 @@ class HandshakeRejections:
             return  # not an auth event — the ladder owns it
         self.consecutive += 1
         if self.consecutive >= self.limit:
-            raise FatalIntegrityError(
-                f"credentials rejected by venue {self.consecutive}x "
-                f"(HTTP {status_code}) — check key id/PEM pair")
+            failures.fail("CREDS_REJECTED_BY_VENUE",
+                          f"credentials rejected by venue {self.consecutive}x "
+                          f"(HTTP {status_code}) — check key id/PEM pair",
+                          fatal=True, status_code=status_code)
 
     def success(self) -> None:
         self.consecutive = 0

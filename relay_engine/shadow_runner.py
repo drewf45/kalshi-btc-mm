@@ -104,9 +104,11 @@ class ChannelSubscriber:
             return retry
         # no names left (or a non-vocabulary error on subscribe)
         if canonical == ESSENTIAL_CHANNEL:
-            raise FatalIntegrityError(
-                f"essential channel {canonical!r} rejected by venue "
-                f"(code {code}, tried {tried!r}) — no book, no engine; msg={msg}")
+            from . import failures
+            failures.fail("WS_ESSENTIAL_CHANNEL_REJECTED",
+                          f"essential channel {canonical!r} rejected by venue "
+                          f"(code {code}, tried {tried!r}) — no book, no engine",
+                          fatal=True, msg=msg)
         if canonical not in self.degraded:
             self.degraded.append(canonical)
         log.warning("WS channel %r unavailable (code %s) — degraded, continuing",
@@ -227,11 +229,17 @@ class ShadowEngine:
         # P5 §4 (CEO knob): a crash-loop tells the sleeping operator its story
         # in one tagged line, with the last FATAL attached.
         boots_last_hour = self.ledger.record_boot()
+        # R5: the failure funnel gets its ledger, pager, and boot id here
+        boot_id = int(self.ledger.db.execute("SELECT COUNT(*) FROM boots").fetchone()[0])
+        from . import failures
+        failures.configure(self.ledger, alert_fn=self.telegram.alert,
+                           run_mode=config.RUN_MODE, boot_id=boot_id)
         if boots_last_hour > 10:
             last_fatal = self.ledger.get_state("last_fatal") or "(no FATAL recorded)"
             self.telegram.alert(
                 f"BOOT_LOOP: {boots_last_hour} boots in the last hour — "
                 f"last FATAL: {last_fatal}")
+        self.boot_id = boot_id
         return boots_last_hour
 
     def record_fatal(self, message: str) -> None:
@@ -244,6 +252,8 @@ class ShadowEngine:
         elif new == "WS_LIVE":
             self.gateway.resume_entries("DEGRADE_LADDER")
             log.warning("entries resumed after clean-frame count")
+        # R6: transitions are ledger-of-record events — they page
+        self.telegram.alert(f"🪜 DEGRADE LADDER {old} → {new}")
 
     def _meta(self, market):
         return self.market_meta.get(market, {})
@@ -354,15 +364,23 @@ async def run():
     engine = ShadowEngine()
     engine.boot(auth_line=auth_line)
 
+    from . import failures
     if config.RUN_MODE != "SHADOW" and not config.live_submit_enabled():
-        raise FatalIntegrityError(
-            f"RUN_MODE={config.RUN_MODE} without the I_UNDERSTAND_LIVE phrase — "
-            f"go-live is a human act (env var + phrase), refusing to run")
+        failures.fail("RUN_MODE_WITHOUT_PHRASE",
+                      f"RUN_MODE={config.RUN_MODE} without the I_UNDERSTAND_LIVE phrase — "
+                      f"go-live is a human act (env var + phrase), refusing to run",
+                      fatal=True)
+    if config.live_submit_enabled() and not engine.telegram.wired():
+        # R6: the pager is safety equipment — LIVE without it is a boot-stop
+        failures.fail("PAGER_UNWIRED_LIVE",
+                      "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID absent in LIVE mode — "
+                      "the ledger of record cannot be silent", fatal=True)
 
     try:
         import websockets
     except ImportError as e:
-        raise FatalIntegrityError(f"websockets required for the WS-first feed: {e}")
+        failures.fail("DEPENDENCY_MISSING",
+                      f"websockets required for the WS-first feed: {e}", fatal=True)
 
     from . import venue
     client = venue.build_client()
@@ -390,15 +408,40 @@ async def run():
             engine.record_spot(price, time.time())
             await asyncio.sleep(SPOT_POLL_S)
 
-    # ── F7: the pack timer — decoupled from market activity ────────────────
+    # ── F7/R6: the pack timer — hourly one-liner, 9AM ET full pack ─────────
     async def pack_task():
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        last_full_day = None
         while not stop.is_set():
             await asyncio.sleep(PACK_HOURLY_S)
-            print(daily_pack(engine.ledger, engine.surface, engine.cash,
-                             foreign_fills=engine.fills.foreign_seen), flush=True)
+            pack = daily_pack(engine.ledger, engine.surface, engine.cash,
+                              foreign_fills=engine.fills.foreign_seen)
+            print(pack, flush=True)
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            if now_et.hour == 9 and last_full_day != now_et.date():
+                last_full_day = now_et.date()
+                engine.telegram.alert(pack)  # the 9AM full pack, on the phone
+            else:
+                engine.telegram.alert(
+                    f"📗 hourly: book={engine.ledger.book_cents()}c "
+                    f"markets={len(engine.market_meta)} "
+                    f"orders={len(engine.gateway.order_index)} "
+                    f"foreign={engine.fills.foreign_seen} "
+                    f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")
+
+    # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
+    async def listener_task():
+        while not stop.is_set():
+            handled = await asyncio.to_thread(
+                engine.telegram.poll_updates_once, engine.ledger)
+            if handled == 0 and not engine.telegram.wired():
+                return  # nothing to listen on; the log heard the refusal
+            await asyncio.sleep(1.0)
 
     asyncio.create_task(spot_task())
     asyncio.create_task(pack_task())
+    asyncio.create_task(listener_task())
 
     subscribed: set = set()
 
@@ -438,6 +481,15 @@ async def run():
                 subscriber = ChannelSubscriber()
                 await sync_subscriptions(ws, subscriber)
                 engine.ladder.snapshot_resynced()
+                # R6: the BOOT message — the phone hears the boot tape's summary
+                from .ops import worst_day_bound_line
+                engine.telegram.alert(
+                    f"🟢 BOOT #{getattr(engine, 'boot_id', '?')} "
+                    f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
+                    f"{len(subscribed)} market(s) subscribed\n"
+                    f"{worst_day_bound_line(engine.ledger)}\n"
+                    f"channels: {sorted(subscriber.accepted.values()) or 'negotiating'}"
+                    + (f" / degraded: {subscriber.degraded}" if subscriber.degraded else ""))
                 last_cycle = 0.0
                 last_discovery = time.monotonic()
                 while not stop.is_set():
@@ -480,9 +532,11 @@ async def run():
                         last_discovery = mono
                         await sync_subscriptions(ws, subscriber)
                     # F3: frames update books continuously; the five-lane sweep
-                    # runs on the CYCLE_SECONDS gate.
+                    # runs on the CYCLE_SECONDS gate. P6 §4: the recorder's
+                    # buffer commits on the same gate.
                     if mono - last_cycle >= CYCLE_SECONDS:
                         last_cycle = mono
+                        engine.recorder.flush()
                         engine.cycle(sorted(engine.market_meta.keys() | subscribed))
         except FatalIntegrityError as fe:
             engine.record_fatal(str(fe))  # P5 §4: the BOOT_LOOP alert's evidence
@@ -499,8 +553,10 @@ async def run():
             await asyncio.sleep(3.0)
 
     stop.set()
+    engine.recorder.flush()  # P6 §4: shutdown flush — no buffered frame lost
     print(daily_pack(engine.ledger, engine.surface, engine.cash,
                      foreign_fills=engine.fills.foreign_seen), flush=True)
+    engine.telegram.alert("🔵 CLEAN SHUTDOWN — recorder flushed, pack printed")
     log.info("runner stopped; zero orders placed: %s",
              len(engine.gateway.shadow_orders) == 0)
 

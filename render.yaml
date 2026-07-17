@@ -8,3 +8,6 @@ services:
     envVars:
       - key: RUN_MODE
         value: SHADOW
+      # P6 §5: the curriculum must survive the classroom — DB on the mounted disk
+      - key: RELAY_DB_PATH
+        value: /var/data/relay_shadow.db
