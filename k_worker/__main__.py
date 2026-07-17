@@ -281,6 +281,15 @@ def _send_hourly_balance(client: kalshi.KalshiClient) -> None:
         f"today: {broker_fills} fills, {daily['n']} settled, net ${daily['net_pnl']:.2f}\n"
         f"{treas}"
     )
+    # WO-LANE-FLIP-3 §4: the flip hourly pack — dollars, per-window table, explained Δ$.
+    from . import flip_mode, flip_pack
+    if flip_mode.ENABLED:
+        try:
+            pack = flip_pack.hourly(client)
+            if pack:
+                notify.send(pack)
+        except Exception as e:
+            log.warning(f"[MAIN] Flip hourly pack error: {e}")
 
 
 def _check_fee_tripwire(client: kalshi.KalshiClient) -> None:

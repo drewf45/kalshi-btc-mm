@@ -30,8 +30,26 @@ Per window:
 5. **Discipline** — one entry phase per window (`gateway.mark_traded`); two consecutive
    stopped windows (`−FLIP_STOP_CENTS`) pause the engine (reuses `discipline` halt).
 
-Fills are recorded as the engine's own `SurfaceRow` ENTER rows, so the **existing**
-reconcile / settlement / treasury / review-pack machinery books P&L — no new accounting.
+Every filled leg — entry AND rung-B exit — is recorded as the engine's own `SurfaceRow`
+ENTER row (`env=live-traded`), so the **existing** reconcile / settlement / treasury /
+review-pack machinery books P&L — no new accounting.
+
+## Accountable (WO-LANE-FLIP-3)
+- **Two-rung ladder (§2, law).** One shot = one pre-committed sequence. **Rung A** = the
+  entry pair; when both legs fill it nets flat and banks `+(100−cost)¢`. **Rung B** = the
+  exit pair at entry+X, itself a second netted capture on a double fill (its exit IS rung B
+  for a lone leg). **No rung C, ever.** The tape reads `rungA +5¢ · rungB +6¢ → +11¢`.
+- **No-inventory proof (§1).** At every window DONE the broker — not the code — proves
+  flatness: net 0 ⇒ `| flat ✓ (broker)`; a lone ride is the accepted ±1 residual; any other
+  net pages Drew `🚨 INVENTORY`, is handed to the boot reconcile/orphan machinery, and an
+  immediate complement-join (maker touch, exp close−2) tries to flatten it now.
+- **Tagged windows (§3).** One immutable `flip_windows` row per window records entry/exit
+  prices, per-rung captures, realized ¢, open-leg mtm, entry spreads, timings, broker-flat,
+  and an `outcome_tag` ∈ {NETTED_2R, NETTED_1R, FLOOR_RIDE, LONE_FLIP, LONE_SALVAGE,
+  LONE_RIDE, SAT_*, STOPPED} — the desk's own crossing study for Saturday tuning.
+- **Hourly pack v2 (§4, `flip_pack.py`).** Account in real **dollars** (proven `get_balance`)
+  with Δ-vs-midnight, a per-window table, and a day rollup whose `Δ$` is **explained**:
+  settled P&L + fees, any unexplained residual ≥ 2¢ printed 🔴 and paged.
 
 ## Reused verbatim (not touched)
 `place_order_maker`, `fetch_orderbook`, `get_fills`/`parse_fill`, `cancel_all_for_market`,
@@ -46,8 +64,10 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 
 ## Before live — required validation (I could not do these here)
 - The offline sandbox has a broken `cryptography` binding, so `flip_mode` and every
-  `k_worker` test that imports the client run in **CI/deploy only**. Here, only the
-  crypto-free `tests/test_flip_math.py` (the pinned complement math) executes — 8/8 green.
+  `k_worker` test that imports the client run in **CI/deploy only**. Here, the crypto-free
+  `tests/test_flip_math.py` (pinned complement math + mode switch) and `tests/test_flip_pack.py`
+  (dollars rendering + unexplained-residual alert) execute green; the full-cycle
+  `tests/test_flip_mode.py` (two-rung ladder, flat proof, rung tags, rejoin expiry) runs in CI.
 - **Run `K_WORKER_MODE=observe KW_MODE=FLIP` first**: the mode logs "would quote …" per
   window and places nothing — confirm the arm timing and bundle math against real books.
 - Then a **1-lot live window** with eyes on the Kalshi UI: two entry bids at the join,
@@ -55,6 +75,13 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
   the review pack books it before trusting unattended runs.
 
 ## Acceptance (from the order)
-`tests/test_flip_math.py` pins the four intents' complement numbers; `tests/test_flip_mode.py`
-covers the one-shot flag + stop counter (CI). The judging number is **time to first fill** —
+Each window's tape now reads a complete sentence:
+`🔁 W20:15 — 47+48=95 | rungA +5¢ · rungB +6¢ → +11¢ [NETTED_2R] | flat ✓ (broker) | DONE`
+and the hourly pack shows the account in real dollars with its change explained to the cent.
+Anything held, anything unexplained, anything above two rungs pages Drew by name.
+
+Tests: `test_flip_math.py` pins the four complement intents + the mode kill switch;
+`test_flip_pack.py` pins dollars rendering + the unexplained-residual alert; `test_flip_mode.py`
+(CI) covers the two-rung ladder, no-rung-C, the §1 flat proof + inventory flatten, the lone
+paths, and the close−2 rejoin expiry. The judging number remains **time to first fill** —
 quotes at ~50¢ fill orders of magnitude easier than quotes at 98¢.

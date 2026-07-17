@@ -98,6 +98,36 @@ def init_db() -> None:
             label      TEXT NOT NULL
         )
     """)
+    # WO-LANE-FLIP-3 §3: append-only, one row per flip window at DONE. The desk's own
+    # crossing study — Saturday's tuning of FLIP_X and the line reads from these columns.
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS flip_windows (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              REAL NOT NULL,
+            close_ts        INTEGER,
+            tag             TEXT,
+            ticker          TEXT,
+            entry_yes       INTEGER,
+            entry_no        INTEGER,
+            bundle_cost     INTEGER,
+            exit_yes        INTEGER,
+            exit_no         INTEGER,
+            capture_a_cents INTEGER,
+            capture_b_cents INTEGER,
+            realized_cents  INTEGER,
+            mtm_open_cents  INTEGER,
+            spread_yes      INTEGER,
+            spread_no       INTEGER,
+            sigma_at_gate   REAL,
+            ttff_s          REAL,
+            ttflat_s        REAL,
+            outcome_tag     TEXT,
+            broker_flat     INTEGER
+        )
+    """)
+    _conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_flip_windows_ts ON flip_windows(ts)
+    """)
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS epochs (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -935,6 +965,44 @@ def insert_orphan_row(ticker: str, position_data: dict) -> int:
         why_tag="ORPHAN_POSITION_BOOT",
         env="live-traded",
     ))
+
+
+_FLIP_WINDOW_COLS = (
+    "ts", "close_ts", "tag", "ticker", "entry_yes", "entry_no", "bundle_cost",
+    "exit_yes", "exit_no", "capture_a_cents", "capture_b_cents", "realized_cents",
+    "mtm_open_cents", "spread_yes", "spread_no", "sigma_at_gate", "ttff_s",
+    "ttflat_s", "outcome_tag", "broker_flat",
+)
+
+
+def insert_flip_window(**fields) -> int:
+    """WO-LANE-FLIP-3 §3: append one immutable row per flip window at DONE."""
+    cols = [c for c in _FLIP_WINDOW_COLS if c in fields]
+    vals = [fields[c] for c in cols]
+    placeholders = ",".join(["?"] * len(cols))
+    with _lock:
+        cur = _conn.execute(
+            f"INSERT INTO flip_windows ({','.join(cols)}) VALUES ({placeholders})",
+            vals,
+        )
+        _conn.commit()
+        row_id = cur.lastrowid
+    log.info(f"[STORE] flip_window {fields.get('tag')} {fields.get('outcome_tag')} "
+             f"realized={fields.get('realized_cents')}¢ flat={fields.get('broker_flat')} "
+             f"(id={row_id})")
+    return row_id
+
+
+def flip_windows_between(lo_ts: float, hi_ts: float) -> list:
+    """Return flip_windows rows with lo_ts <= ts < hi_ts, oldest first, as dicts."""
+    with _lock:
+        cur = _conn.execute(
+            f"""SELECT id,{','.join(_FLIP_WINDOW_COLS)} FROM flip_windows
+                WHERE ts >= ? AND ts < ? ORDER BY ts ASC""",
+            (lo_ts, hi_ts),
+        )
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, r)) for r in cur.fetchall()]
 
 
 def lookup_lane(ticker: str) -> Optional[str]:

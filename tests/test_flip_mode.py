@@ -78,14 +78,20 @@ class TestFlipCycle(unittest.TestCase):
     def setUp(self):
         self.state, self.sent, self.alerts, self.traded = {}, [], [], set()
         self.orders, self.rows, self.cancels = [], [], []
+        self.windows, self.orphans = [], []
         self.fills_map = {}                       # oid -> fill cents (what filled)
+        self.net = 0                              # broker net for the flat proof (§1)
         self.book = types.SimpleNamespace(
-            yes_bid=45, no_bid=48, yes_bid_fp="0.45", no_bid_fp="0.48")
+            yes_bid=45, no_bid=48, yes_ask=55, no_ask=52,
+            yes_bid_fp="0.45", no_bid_fp="0.48")
+        self.book2 = None                         # second fetch (sweep / flatten); None → book
 
         flip_mode.store.get_state = lambda k: self.state.get(k)
         flip_mode.store.set_state = lambda k, v: self.state.__setitem__(k, v)
         flip_mode.store.insert_row = lambda r: self.rows.append(r)
         flip_mode.store.SurfaceRow = lambda **kw: kw
+        flip_mode.store.insert_flip_window = lambda **kw: self.windows.append(kw)
+        flip_mode.store.insert_orphan_row = lambda tk, pd: self.orphans.append((tk, pd))
         flip_mode.notify.send = lambda t, **k: self.sent.append(t)
         flip_mode.notify.alert = lambda t: self.alerts.append(t)
         flip_mode.discipline.is_halted = lambda: bool(self.state.get("halted"))
@@ -94,9 +100,14 @@ class TestFlipCycle(unittest.TestCase):
         flip_mode.engine.heartbeat = lambda: None
         flip_mode.engine._observe_mode = False
 
-        flip_mode.kalshi.fetch_orderbook = lambda c, tk: self.book
+        self._book_calls = 0
+
+        def _fetch(c, tk):
+            self._book_calls += 1
+            return self.book if self._book_calls == 1 else (self.book2 or self.book)
+        flip_mode.kalshi.fetch_orderbook = _fetch
         flip_mode.kalshi.cancel_all_for_market = lambda c, tk: self.cancels.append(tk)
-        flip_mode.kalshi.position_for_market = lambda c, tk: 0
+        flip_mode.kalshi.position_for_market = lambda c, tk: self.net
         flip_mode.kalshi.get_positions = lambda c: []
 
         def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None):
@@ -113,41 +124,90 @@ class TestFlipCycle(unittest.TestCase):
     def tearDown(self):
         flip_mode.time = time                             # restore the real module
 
-    def _exits(self):
-        # the first two place_order_maker calls are the entry bids; the rest are exits/rejoins
+    def _post_entry(self):
+        # the first two place_order_maker calls are the entry bids; the rest are rung B / sweep
         return self.orders[2:]
 
-    def test_double_fill_nets_no_exits(self):
-        # both legs fill -> the bundle nets flat, exchange banks the floor; no exits/sweep
-        self.fills_map = {"yes-45": 45, "no-48": 48}
-        out = flip_mode.run_flip_cycle(None, "KXBTC15M-D", self.CLOSE, {})
-        self.assertEqual(out, "flip_done_netted")
-        self.assertEqual(self._exits(), [])                       # zero exit orders posted
-        self.assertTrue(any("netted +7" in s for s in self.sent))  # 100-(45+48)=7
-        self.assertTrue(any(r.get("why_tag") == "FLIP_NETTED" for r in self.rows))
-        self.assertEqual(self.state.get(flip_mode._STOP_STREAK_KEY), "0")  # streak reset
+    def _win(self):
+        self.assertTrue(self.windows, "a flip_windows row must be written at DONE")
+        return self.windows[-1]
 
-    def test_lone_fill_posts_one_exit_at_complement(self):
-        # only YES fills @45 -> exactly one exit: buy NO @ (100-(45+X)) = 100-49 = 51
-        self.fills_map = {"yes-45": 45}
+    # ── §2 two-rung ladder ───────────────────────────────────────────
+    def test_double_fill_two_rungs_then_no_rung_c(self):
+        # both entry legs fill (rung A) AND both rung-B exits fill (rung B) -> NETTED_2R.
+        # exits: held YES@45 -> NO@51 ; held NO@48 -> YES@48
+        self.fills_map = {"yes-45": 45, "no-48": 48, "no-51": 51, "yes-48": 48}
+        out = flip_mode.run_flip_cycle(None, "KXBTC15M-D", self.CLOSE, {})
+        self.assertEqual(out, "flip_done")
+        self.assertEqual(self._win()["outcome_tag"], "NETTED_2R")
+        # NO RUNG C: exactly 2 entries + 2 rung-B exits, nothing more
+        self.assertEqual(len(self.orders), 4)
+        self.assertEqual(len(self._post_entry()), 2)
+        self.assertTrue(any("rung A netted" in s for s in self.sent))
+        done = [s for s in self.sent if "DONE" in s][-1]
+        self.assertIn("rungA", done)
+        self.assertIn("rungB", done)
+        self.assertIn("flat ✓ (broker)", done)          # §1 no-inventory proof
+        self.assertEqual(self._win()["broker_flat"], 1)
+
+    def test_double_fill_rung_captures_tagged(self):
+        self.fills_map = {"yes-45": 45, "no-48": 48, "no-51": 51, "yes-48": 48}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-C", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["capture_a_cents"], 100 - (45 + 48))       # rung A = +7
+        self.assertEqual(w["capture_b_cents"], 100 - (51 + 48))       # rung B = +1
+        self.assertEqual(w["realized_cents"], w["capture_a_cents"] + w["capture_b_cents"])
+
+    # ── lone paths ───────────────────────────────────────────────────
+    def test_lone_flip_one_exit_flat(self):
+        # only YES fills @45; its exit (NO@51) fills -> LONE_FLIP, flat, one rung-B order
+        self.fills_map = {"yes-45": 45, "no-51": 51}
         flip_mode.run_flip_cycle(None, "KXBTC15M-L", self.CLOSE, {})
-        exit_orders = [o for o in self.orders if o["side"] == "no" and o["price"] == 51]
-        self.assertEqual(len(exit_orders), 1)
-        # and it is a flip of entry(45)+X(4) at the complement
+        self.assertEqual(self._win()["outcome_tag"], "LONE_FLIP")
+        rungb = [o for o in self._post_entry() if o["side"] == "no" and o["price"] == 51]
+        self.assertEqual(len(rungb), 1)
         self.assertEqual(51, 100 - (45 + flip_mode.FLIP_X))
+        self.assertEqual(self._win()["broker_flat"], 1)
+
+    def test_lone_ride_accepts_one_lot_residual(self):
+        # only YES fills; exit never fills; sweep can't rejoin (no NO touch) -> LONE_RIDE.
+        # broker shows the accepted +1 -> NOT flagged as inventory.
+        self.fills_map = {"yes-45": 45}
+        self.book2 = types.SimpleNamespace(
+            yes_bid=10, no_bid=None, yes_bid_fp="0.10", no_bid_fp=None)
+        self.net = 1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-RD", self.CLOSE, {})
+        self.assertEqual(self._win()["outcome_tag"], "LONE_RIDE")
+        self.assertFalse(any("INVENTORY" in a for a in self.alerts))
+        self.assertTrue(any("riding YES@45" in s for s in self.sent))
+
+    # ── §1 no-inventory proof: a surprise residual pages + flattens ──
+    def test_partial_rung_b_flags_inventory(self):
+        # double entry fill, but only the YES-leg exit (NO@51) fills -> naked NO leg.
+        # broker net=-1 (unexpected) -> 🚨 INVENTORY + orphan handoff + flatten join.
+        self.fills_map = {"yes-45": 45, "no-48": 48, "no-51": 51}   # yes-48 (no's exit) never
+        self.net = -1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-I", self.CLOSE, {})
+        self.assertEqual(self._win()["outcome_tag"], "NETTED_1R")
+        self.assertEqual(self._win()["broker_flat"], 0)
+        self.assertTrue(any("INVENTORY" in a for a in self.alerts))
+        self.assertTrue(self.orphans)                                # handed to reconcile
+        self.assertTrue(any("flatten join" in s for s in self.sent))
 
     def test_no_fill_cancels_and_sats(self):
         self.fills_map = {}                               # nothing fills
         out = flip_mode.run_flip_cycle(None, "KXBTC15M-N", self.CLOSE, {})
         self.assertEqual(out, "flip_sat_nofill")
         self.assertIn("KXBTC15M-N", self.cancels)         # unfilled entries canceled
-        self.assertEqual(self._exits(), [])               # nothing flipped
+        self.assertEqual(self._post_entry(), [])          # nothing flipped
 
+    # ── carried WO-LANE-FLIP-2 F-3 ──────────────────────────────────
     def test_rejoin_expiry_is_close_minus_2(self):
-        # lone leg, exit never fills -> T-90 sweep re-posts with expiry = close-2 (F-3)
+        # lone leg, exit never fills, NO touch present -> sweep rejoin expires at close-2
         self.fills_map = {"yes-45": 45}
+        self.net = 1
         flip_mode.run_flip_cycle(None, "KXBTC15M-R", self.CLOSE, {})
-        rejoins = [o for o in self._exits() if o["v2"] is not None]  # sweep rejoin carries fp
+        rejoins = [o for o in self._post_entry() if o["v2"] is not None]
         self.assertTrue(rejoins)
         for o in rejoins:
             self.assertEqual(o["expiration_ts"], int(self.CLOSE - 2))
