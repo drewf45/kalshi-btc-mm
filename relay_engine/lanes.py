@@ -297,6 +297,31 @@ class DLaneWrapper(Lane):
         return Decision(self.name, market, None, pass_reason=reason, interim=interim)
 
 
+class PLaneWrapper(Lane):
+    """Adapter for LaneP: (proposal, reason) -> Decision."""
+
+    name = "P"
+
+    def __init__(self, lanep):
+        self.p = lanep
+
+    def evaluate(self, market: str, ctx: dict) -> Decision:
+        close_ts = ctx.get("close_ts") or infer_close_ts_from_ticker(market)
+        if close_ts is None:
+            return Decision(self.name, market, None, pass_reason="NO_CLOSE_TS")
+        if not ctx.get("entries_allowed", True):
+            return Decision(self.name, market, None,
+                            pass_reason="ENTRY_HALT_DEGRADE_LADDER", interim=True)
+        fctx = dict(ctx)
+        fctx["close_ts"] = close_ts
+        proposal, reason = self.p.evaluate(market, fctx)
+        if proposal is not None:
+            return Decision(self.name, market, proposal)
+        interim = reason.startswith("CONFIRMING") or reason in (
+            "STALE_FRAME", "NO_NEW_FRAME", "WHIPSAW_RESET", "NO_BOOK")
+        return Decision(self.name, market, None, pass_reason=reason, interim=interim)
+
+
 def build_registry(ledger=None, gateway=None, custodian=None) -> List[Lane]:
     """All five lanes, always. ORDER IS THE ARBITRATION ORDER (P3 Broker part):
     within a cycle, custodian exits run before lanes (the runner's job), a
@@ -304,16 +329,18 @@ def build_registry(ledger=None, gateway=None, custodian=None) -> List[Lane]:
     first), and new entries submit in F -> H8 -> FLIP -> D -> P order."""
     from .lane_d import LaneD
     from .lane_flip import LaneFlip
+    from .lane_p import LaneP
     shared = FH8Shared(ledger)
     flip = LaneFlip(gateway, custodian=custodian,
                     stats=(ledger_stats(ledger) if ledger is not None else None))
     laned = LaneD(gateway=gateway, custodian=custodian, ledger=ledger)
+    lanep = LaneP(gateway=gateway, custodian=custodian)
     return [
         LaneF(shared),
         LaneH8(shared),
         FlipLaneWrapper(flip),
         DLaneWrapper(laned),
-        StubLane("P", "P3.5_PENDING"),
+        PLaneWrapper(lanep),
     ]
 
 

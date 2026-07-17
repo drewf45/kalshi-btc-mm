@@ -79,7 +79,7 @@ def test_worst_day_bound_is_a_number(ledger):
 
 def test_pack_states_live_and_pending_lanes(ledger, surface, cash):
     pack = daily_pack(ledger, surface, cash, foreign_fills=3)
-    assert "LANES LIVE: F, H8, FLIP, D" in pack
-    assert "NOT YET BUILT: P (P3.5)" in pack
+    assert "LANES LIVE: F, H8, FLIP, D, P" in pack
+    assert "NOT YET BUILT: none" in pack
     assert "FOREIGN FILLS seen: 3" in pack
     assert "WORST-DAY BOUND" in pack

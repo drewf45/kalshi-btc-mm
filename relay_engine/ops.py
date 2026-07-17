@@ -76,8 +76,8 @@ def worst_day_bound_line(ledger) -> str:
             f"kill clamp ${kill_clamp_usd:.2f}, drawdown rail ${rail_usd:.2f})")
 
 
-LANES_LIVE = ("F", "H8", "FLIP", "D")
-LANES_PENDING = ("P (P3.5)",)
+LANES_LIVE = ("F", "H8", "FLIP", "D", "P")
+LANES_PENDING = ()  # every lane that exists trades (R1); empty until a new lane is designed
 
 
 def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[int] = None,
@@ -89,7 +89,9 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         f"=== DAILY PACK — EPOCH {config.EPOCH} ===",
         "EPOCH BOUNDARY: this engine's birth; no prior-era rows exist to count.",
         worst_day_bound_line(ledger),
-        f"LANES LIVE: {', '.join(LANES_LIVE)} · NOT YET BUILT: {', '.join(LANES_PENDING)}",
+        f"LANES LIVE: {', '.join(LANES_LIVE)}"
+        + (f" · NOT YET BUILT: {', '.join(LANES_PENDING)}" if LANES_PENDING else
+           " · NOT YET BUILT: none (every lane that exists trades)"),
         f"book={ledger.book_cents()}c lifetime_pnl={ledger.lifetime_pnl_cents()}c "
         f"(honest lifetime = settlements ledger only)",
     ]
