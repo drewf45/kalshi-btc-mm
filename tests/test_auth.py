@@ -73,6 +73,7 @@ def test_signature_vector_fixed_timestamp(creds_env):
 def test_missing_creds_boot_stop(monkeypatch):
     monkeypatch.delenv(auth.ENV_KEY_ID, raising=False)
     monkeypatch.delenv(auth.ENV_PRIVATE_KEY, raising=False)
+    monkeypatch.delenv(auth.ENV_PRIVATE_KEY_B64, raising=False)
     with pytest.raises(FatalIntegrityError, match="boot-stop"):
         auth.boot_check()
     # unparseable PEM is equally a boot-stop
@@ -116,9 +117,40 @@ def test_runner_boot_stops_before_any_connect(monkeypatch):
     import asyncio
     monkeypatch.delenv(auth.ENV_KEY_ID, raising=False)
     monkeypatch.delenv(auth.ENV_PRIVATE_KEY, raising=False)
+    monkeypatch.delenv(auth.ENV_PRIVATE_KEY_B64, raising=False)
     from relay_engine.shadow_runner import run
     with pytest.raises(FatalIntegrityError, match="boot-stop"):
         asyncio.run(run())
+
+
+def test_base64_fallback_matches_live_env_form(monkeypatch, throwaway_pem):
+    """§B3: the Render worker already carries KALSHI_PRIVATE_KEY_PEM_BASE64
+    (the live tree's form) — the shadow reuses it when KALSHI_PRIVATE_KEY is
+    unset; the plain var wins when both are present."""
+    import base64
+    key, pem = throwaway_pem
+    monkeypatch.setenv(auth.ENV_KEY_ID, KEY_ID)
+    monkeypatch.delenv(auth.ENV_PRIVATE_KEY, raising=False)
+    monkeypatch.setenv(auth.ENV_PRIVATE_KEY_B64,
+                       base64.b64encode(pem.encode()).decode())
+    _, k1 = auth.load_credentials()
+    assert k1.public_key().public_numbers().n == key.public_key().public_numbers().n
+
+    # precedence: plain PEM var wins over the base64 fallback
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other_pem = other.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+    monkeypatch.setenv(auth.ENV_PRIVATE_KEY, other_pem)
+    _, k2 = auth.load_credentials()
+    assert k2.public_key().public_numbers().n == other.public_key().public_numbers().n
+
+    # garbage base64 is a boot-stop, not a fall-through
+    monkeypatch.delenv(auth.ENV_PRIVATE_KEY, raising=False)
+    monkeypatch.setenv(auth.ENV_PRIVATE_KEY_B64, "!!!not-base64!!!")
+    with pytest.raises(FatalIntegrityError, match="not valid base64"):
+        auth.load_credentials()
 
 
 def test_pem_normalization_literal_backslash_n(monkeypatch, throwaway_pem):

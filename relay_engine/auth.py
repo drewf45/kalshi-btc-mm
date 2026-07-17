@@ -6,9 +6,14 @@ RSA-PSS (SHA-256, MGF1-SHA256, salt = DIGEST_LENGTH), base64 the signature.
 Path is the request path only — no host, no query.
 
 Env:
-  KALSHI_API_KEY_ID   — UUID key id
-  KALSHI_PRIVATE_KEY  — RSA PEM, full BEGIN/END. Literal `\\n` escapes are
-                        normalized (Render single-line paste tolerance).
+  KALSHI_API_KEY_ID              — UUID key id
+  KALSHI_PRIVATE_KEY             — RSA PEM, full BEGIN/END. Literal `\\n`
+                                   escapes are normalized (Render single-line
+                                   paste tolerance).
+  KALSHI_PRIVATE_KEY_PEM_BASE64  — FALLBACK, read only when KALSHI_PRIVATE_KEY
+                                   is unset: the live tree's env form (base64-
+                                   wrapped PEM), already on the Render worker
+                                   per §B3 — the shadow reuses it read-only.
 
 Doctrine (§4, banked): absent credentials are a BOOT-STOP; rejected
 credentials are a THREE-STRIKE FATAL; only a live socket that dies is a
@@ -33,6 +38,7 @@ from .errors import FatalIntegrityError
 
 ENV_KEY_ID = "KALSHI_API_KEY_ID"
 ENV_PRIVATE_KEY = "KALSHI_PRIVATE_KEY"
+ENV_PRIVATE_KEY_B64 = "KALSHI_PRIVATE_KEY_PEM_BASE64"  # live tree's form (§B3 reuse)
 
 _session = requests.Session()
 
@@ -47,9 +53,19 @@ def load_credentials():
     never a retry loop (§4)."""
     key_id = os.environ.get(ENV_KEY_ID, "").strip()
     raw_pem = os.environ.get(ENV_PRIVATE_KEY, "")
+    if not raw_pem.strip():
+        b64 = os.environ.get(ENV_PRIVATE_KEY_B64, "").strip()
+        if b64:
+            try:
+                raw_pem = base64.b64decode(b64).decode("utf-8")
+            except Exception as e:
+                raise FatalIntegrityError(
+                    f"{ENV_PRIVATE_KEY_B64} present but not valid base64: "
+                    f"{type(e).__name__}")
     if not key_id or not raw_pem.strip():
         raise FatalIntegrityError(
             f"missing credentials: set {ENV_KEY_ID} and {ENV_PRIVATE_KEY} "
+            f"(or {ENV_PRIVATE_KEY_B64}, the live tree's form) "
             f"(absent credentials are a boot-stop, not a retry loop)")
     try:
         private_key = serialization.load_pem_private_key(
