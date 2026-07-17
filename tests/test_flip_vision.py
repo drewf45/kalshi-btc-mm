@@ -7,7 +7,7 @@ stubbed client."""
 import types
 import unittest
 
-from k_worker import flip_pack, treasury
+from k_worker import flip_pack, treasury, flip_pricebrain
 
 try:
     from k_worker import flip_mode
@@ -116,23 +116,46 @@ class TestTreasuryTapOff(_Restore):
         self.assertFalse(treasury.enforce_accrual_off())   # nothing owed → no-op
 
 
+# ── B3 locked-margin computer (crypto-free) ─────────────────────────
+class TestPricebrain(unittest.TestCase):
+    def test_locked_when_avg_cannot_flip(self):
+        # YES leg, strike 100, samples well above, tiny remainder → provably locked
+        self.assertTrue(flip_pricebrain.locked_margin(
+            "yes", 100.0, [130.0, 131.0, 130.5], secs_left=6, max_move_per_s=6.0, poll_sec=3.0))
+
+    def test_unlocked_when_remainder_can_flip(self):
+        # near the strike with a big remainder → cannot prove the lock
+        self.assertFalse(flip_pricebrain.locked_margin(
+            "yes", 100.0, [100.5], secs_left=55, max_move_per_s=6.0, poll_sec=3.0))
+
+    def test_no_lock_without_data(self):
+        self.assertFalse(flip_pricebrain.locked_margin("yes", 100.0, [], 10, 6.0))
+        self.assertFalse(flip_pricebrain.locked_margin("yes", None, [130.0], 10, 6.0))
+
+    def test_no_side_semantics(self):
+        # NO leg wants avg ≤ strike; deep below with tiny remainder → locked
+        self.assertTrue(flip_pricebrain.locked_margin(
+            "no", 100.0, [70.0, 71.0], secs_left=6, max_move_per_s=6.0, poll_sec=3.0))
+
+
 # ── §1/§2 signal units (client-bound → CI / stub) ───────────────────
 @unittest.skipUnless(_IMPORTABLE, "flip_mode requires the cryptography-bound client")
 class TestSignals(_Restore):
-    def test_tick_direction(self):
+    def test_tick_direction_net_3_of_4(self):
         self.P(flip_mode, "FLIP_OFI_TICKS", 4)
-        self.assertEqual(flip_mode._tick_direction([1, 2, 3, 4, 5], 4), "yes")
-        self.assertEqual(flip_mode._tick_direction([5, 4, 3, 2, 1], 4), "no")
-        self.assertIsNone(flip_mode._tick_direction([1, 2, 1, 2, 3], 4))   # mixed
-        self.assertIsNone(flip_mode._tick_direction([1, 2, 3], 4))         # insufficient
+        self.assertEqual(flip_mode._tick_direction([1, 2, 3, 4, 5], 4), "yes")   # 4up
+        self.assertEqual(flip_mode._tick_direction([0, 1, 0, 1, 3], 4), "yes")   # 3up1dn (net)
+        self.assertEqual(flip_mode._tick_direction([5, 4, 5, 4, 3], 4), "no")    # 3dn1up (net)
+        self.assertIsNone(flip_mode._tick_direction([0, 1, 0, 1, 0], 4))         # 2-2 tie → None
+        self.assertIsNone(flip_mode._tick_direction([1, 2, 3], 4))               # insufficient
 
     def test_ofi_gate_fails_closed(self):
         self.P(flip_mode, "FLIP_OFI_TICKS", 4)
-        rising = [1, 2, 3, 4, 5]
-        self.assertEqual(flip_mode._ofi_side(rising, "yes"), "yes")   # ticks up + book yes → yes
-        self.assertIsNone(flip_mode._ofi_side(rising, "no"))          # disagreement → wait
-        self.assertIsNone(flip_mode._ofi_side(rising, None))          # no lean → wait
-        self.assertIsNone(flip_mode._ofi_side([1, 2, 1, 2, 3], "yes"))  # no signal → wait
+        net_up = [0, 1, 0, 1, 3]                                       # 3up1dn → yes
+        self.assertEqual(flip_mode._ofi_side(net_up, "yes"), "yes")   # net up + book yes → yes
+        self.assertIsNone(flip_mode._ofi_side(net_up, "no"))          # disagreement → wait
+        self.assertIsNone(flip_mode._ofi_side(net_up, None))          # no lean → wait
+        self.assertIsNone(flip_mode._ofi_side([0, 1, 0, 1, 0], "yes"))  # 2-2 tie → wait
 
     def test_book_lean(self):
         self.assertEqual(flip_mode._book_lean(
@@ -184,8 +207,9 @@ class TestRatchetCycle(_Restore):
         self.P(flip_mode.store, "SurfaceRow", lambda **k: k)
         self.P(flip_mode.store, "insert_markout", lambda *a, **k: None)
         self.P(flip_mode.store, "insert_trip",
-               lambda ts, tk, tag, side, entry, outcome, realized:
-               self.trips.append(dict(side=side, entry=entry, outcome=outcome, realized_cents=realized)))
+               lambda ts, tk, tag, side, entry, outcome, realized, **kw:
+               self.trips.append(dict(side=side, entry=entry, outcome=outcome,
+                                      realized_cents=realized, **kw)))
         self.P(flip_mode.store, "insert_flip_window", lambda **k: self.windows.append(k))
         self.P(flip_mode.store, "insert_orphan_row", lambda tk, pd: None)
         self.P(flip_mode.notify, "send", lambda t, **k: self.sent.append(t))
@@ -281,6 +305,135 @@ class TestRatchetCycle(_Restore):
         scratched = [t for t in self.trips if t["outcome"] == "scratched"]
         self.assertEqual(len(scratched), 3)              # stops at the sit-out threshold
         self.assertTrue(any("sitting the window out" in s for s in self.sent))
+
+    # ── WO-PREDATOR A2/A3 — side cap + governors ────────────────────
+    def test_ratchet_side_cap_admits_55_refuses_59(self):
+        self.book_fn = lambda i: _bk(55, 60, 10, 2)
+        flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 2, [],
+                            side_cap=58, restrict_side="yes")
+        self.assertIn("yes-55", self.orders)             # 55 ≤ 58 admitted
+        self.orders.clear()
+        self.clock.t = self.CLOSE - 800
+        self.book_fn = lambda i: _bk(59, 60, 10, 2)
+        flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 2, [],
+                            side_cap=58, restrict_side="yes")
+        self.assertFalse(any(o.startswith("yes-") for o in self.orders))  # 59 > 58 refused
+
+    def test_open_watch_refuses_50(self):
+        self.book_fn = lambda i: _bk(50, 60, 10, 2)
+        flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 1, [])  # cap 49
+        self.assertFalse(any(o.startswith("yes-") for o in self.orders))  # 50 > 49
+
+    def test_max_trips_governor(self):
+        self.P(flip_mode, "FLIP_MAX_TRIPS", 1)
+        self.P(flip_mode, "FLIP_SCRATCH_SITOUT", 9)
+        self.fills_map = {"yes-45": 45, "no-51": 51}     # take on trip 1
+        self._run()
+        self.assertEqual(len(self.trips), 1)             # 8th admitted / 9th refused → here MAX=1
+
+    def test_window_loss_sits_out(self):
+        self.P(flip_mode, "FLIP_MAX_TRIPS", 6)
+        self.book_fn = lambda i: _bk(45, 55, 10, 2) if i == 0 else _bk(20, 84, 10, 2)
+        self.fills_map = {"yes-45": 45, "no-84": 84}     # scratch flatten locks −29 ≤ −25
+        self._run()
+        self.assertTrue(any("window stop" in s for s in self.sent))
+        self.assertEqual(len(self.trips), 1)             # loss budget sits the window regardless
+
+    # ── WO-PREDATOR B1 — penny-lead ─────────────────────────────────
+    def test_penny_lead_posts_join_plus_1(self):
+        self.book_fn = lambda i: _bk(50, 60, 10, 2)
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: 102.0)      # led +2 vs snapshot 100
+        out = flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 2, [],
+                                  side_cap=58, restrict_side="yes", signal_side="yes", snapshot_spot=100.0)
+        self.assertIn("yes-51", self.orders)             # join+1
+        self.assertEqual(out[4]["led"], 1)
+
+    def test_penny_lead_fresh_book_uses_join(self):
+        self.book_fn = lambda i: _bk(50, 60, 10, 2)
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: 100.0)      # no move since snapshot
+        out = flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 2, [],
+                                  side_cap=58, restrict_side="yes", signal_side="yes", snapshot_spot=100.0)
+        self.assertIn("yes-50", self.orders)
+        self.assertNotIn("yes-51", self.orders)
+        self.assertEqual(out[4]["led"], 0)
+
+    def test_penny_lead_respects_cap(self):
+        self.book_fn = lambda i: _bk(58, 60, 10, 2)
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: 110.0)
+        flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 2, [],
+                            side_cap=58, restrict_side="yes", signal_side="yes", snapshot_spot=100.0)
+        self.assertIn("yes-58", self.orders)             # join+1=59 > cap → stay at join
+        self.assertNotIn("yes-59", self.orders)
+
+    def test_penny_lead_cross_falls_back(self):
+        self.book_fn = lambda i: _bk(50, 60, 10, 2)
+
+        def _place(c, tk, side, price, count=1, expiration_ts=None, v2_price_str=None, post_only=True):
+            if price == 51:
+                raise RuntimeError('HTTP 400 post only cross')
+            self.orders.append(f"{side}-{price}")
+            return f"{side}-{price}", {}
+        self.P(flip_mode.kalshi, "place_order_maker", _place)
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: 110.0)
+        out = flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 2, [],
+                                  side_cap=58, restrict_side="yes", signal_side="yes", snapshot_spot=100.0)
+        self.assertIn("yes-50", self.orders)             # led join+1 crossed → fell back to join
+        self.assertEqual(out[4]["led"], 0)
+
+    # ── WO-PREDATOR B2 — counterfactual take logger ─────────────────
+    def test_counterfactual_take_logged(self):
+        self.book_fn = lambda i: _bk(40, 55, 10, 2) if i == 0 else _bk(48, 55, 10, 2)
+        self.fills_map = {"yes-40": 40, "no-56": 56}     # entry + take
+        out = flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 1, [])
+        self.assertEqual(out[0], "take")
+        self.assertEqual(out[4]["cf_frac_exit_cents"], 8)   # mark 48 − entry 40 (>15% of cost)
+        self.assertIsNotNone(out[4]["cf_frac_exit_at"])
+
+    # ── WO-PREDATOR B3 — locked-margin veto (patched pricebrain) ────
+    def _late_adverse_spot(self):
+        return lambda: (99.0 if (self.CLOSE - self.clock.t) <= 60 else 101.0)
+
+    def test_locked_rides_and_vetoes_late_b_scratch(self):
+        self.book_fn = lambda i: _bk(45, 55, 10, 2)
+        self.fills_map = {"yes-45": 45}
+        self.P(flip_mode.kalshi, "extract_boundaries", lambda m: (100.0, None))
+        self.P(flip_mode.kalshi, "get_btc_spot", self._late_adverse_spot())
+        self.P(flip_mode.flip_pricebrain, "locked_margin", lambda *a, **k: True)
+        out = flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 1, [])
+        self.assertEqual(out[0], "rode_locked")
+        self.assertEqual(out[4]["locked_margin"], 1)
+        self.assertTrue(any("vetoed" in s for s in self.sent))
+        self.assertFalse(any(s.startswith("✂️") for s in self.sent))
+
+    def test_unlocked_flattens_at_t90(self):
+        self.book_fn = lambda i: _bk(45, 55, 10, 2)
+        self.fills_map = {"yes-45": 45}
+        self.P(flip_mode.kalshi, "extract_boundaries", lambda m: (100.0, None))
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: 101.0)      # never adverse
+        self.P(flip_mode.flip_pricebrain, "locked_margin", lambda *a, **k: False)
+        out = flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 1, [])
+        self.assertEqual(out[0], "scratched")            # normal T-90 flatten
+        self.assertFalse(any("vetoed" in s for s in self.sent))
+
+    def test_veto_never_before_t60(self):
+        self.book_fn = lambda i: _bk(45, 55, 10, 2)
+        self.fills_map = {"yes-45": 45}
+        self.P(flip_mode.kalshi, "extract_boundaries", lambda m: (100.0, None))
+        self.P(flip_mode.kalshi, "get_btc_spot", lambda: 99.0)       # adverse from the start
+        self.P(flip_mode.flip_pricebrain, "locked_margin", lambda *a, **k: True)
+        flip_mode._run_trip(None, "T", self.CLOSE, "20:00", self.CLOSE - 90, {}, 1, [])
+        self.assertTrue(any(s.startswith("✂️") for s in self.sent))  # scratched early, not vetoed
+        self.assertFalse(any("vetoed" in s for s in self.sent))
+
+    # ── WO-PREDATOR B4 — trip row records the regime ────────────────
+    def test_trip_row_tags_regime(self):
+        self.P(flip_mode, "FLIP_MAX_TRIPS", 1)
+        self.fills_map = {"yes-45": 45, "no-51": 51}
+        self._run()
+        t = self.trips[-1]
+        self.assertEqual(t["ofi_mode"], "open")          # first trip = the open watch
+        self.assertEqual(t["side_cap"], flip_mode.FLIP_SIDE_MAX)
+        self.assertIn(t["curfew_band"], ("open", "mid", "late"))
 
 
 @unittest.skipUnless(_IMPORTABLE, "flip_mode requires the cryptography-bound client")

@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 
 from . import kalshi, gateway, notify, store, discipline, engine
-from . import flip_math
+from . import flip_math, flip_pricebrain
 
 NY = ZoneInfo("America/New_York")
 
@@ -40,14 +40,19 @@ FLIP_PAUSE_AFTER_STOPS = int(os.environ.get("FLIP_PAUSE_AFTER_STOPS", "2"))
 FLIP_POLL_SEC = float(os.environ.get("FLIP_POLL_SEC", "3"))
 
 # WO-VISION — the ratchet (ships ON and WIDE; =0 reverts to the proven require_pair window).
+# WO-PREDATOR PART A — gates re-tuned to the scratch-era math (the cage below does not move).
 FLIP_RATCHET = int(os.environ.get("FLIP_RATCHET", "1"))
 FLIP_PAIR_GRACE = int(os.environ.get("FLIP_PAIR_GRACE", "30"))    # §1 opposite bid works this long
 FLIP_SCRATCH_S = int(os.environ.get("FLIP_SCRATCH_S", "3"))       # §1(a) scratch if mark ≤ entry−S
 FLIP_MARKOUT_STOP = int(os.environ.get("FLIP_MARKOUT_STOP", "2")) # §1(c) markout ≤ −this & worsening
-FLIP_OFI_TICKS = int(os.environ.get("FLIP_OFI_TICKS", "4"))       # §2 spot ticks that must agree
-FLIP_CURFEW = int(os.environ.get("FLIP_CURFEW", "240"))           # §2 no new entries after T-this
-FLIP_MAX_TRIPS = int(os.environ.get("FLIP_MAX_TRIPS", "4"))       # §2 governor
-FLIP_SCRATCH_SITOUT = int(os.environ.get("FLIP_SCRATCH_SITOUT", "3"))  # §2 sit the window out at N
+FLIP_OFI_TICKS = int(os.environ.get("FLIP_OFI_TICKS", "4"))       # A1: 3-of-4 net of the last N
+FLIP_RATCHET_SIDE_MAX = int(os.environ.get("FLIP_RATCHET_SIDE_MAX", "58"))  # A2: OFI-gated cap
+FLIP_CURFEW = int(os.environ.get("FLIP_CURFEW", "150"))           # A3: no new entries after T-this
+FLIP_MAX_TRIPS = int(os.environ.get("FLIP_MAX_TRIPS", "8"))       # A3 governor
+FLIP_SCRATCH_SITOUT = int(os.environ.get("FLIP_SCRATCH_SITOUT", "4"))  # A3: 4 scratches OR loss
+FLIP_CLOSE_WINDOW_S = int(os.environ.get("FLIP_CLOSE_WINDOW_S", "60"))  # B3: TWAP close window
+FLIP_MAX_MOVE_PER_S = float(os.environ.get("FLIP_MAX_MOVE_PER_S", "6.0"))  # B3: $/s adverse bound
+FLIP_LEAD_TICK = float(os.environ.get("FLIP_LEAD_TICK", "1.0"))   # B1: spot move ($) to penny-lead
 
 _STOP_STREAK_KEY = "flip_stop_streak"
 
@@ -58,8 +63,9 @@ def echo_config() -> None:
         "🔁 <b>FLIP MODE</b> — watch the open, post each side the first time its join ≤ "
         f"{FLIP_SIDE_MAX}c, flip @entry+{FLIP_X}c\n"
         f"mode {mode} · line {FLIP_LINE}c · side_max {FLIP_SIDE_MAX}c · x {FLIP_X}c · "
-        f"scratch@entry−{FLIP_SCRATCH_S}c · grace {FLIP_PAIR_GRACE}s · trips≤{FLIP_MAX_TRIPS} · "
-        f"sitout@{FLIP_SCRATCH_SITOUT} · curfew T-{FLIP_CURFEW} · ofi {FLIP_OFI_TICKS} · "
+        f"ofi net{FLIP_OFI_TICKS // 2 + 1}/{FLIP_OFI_TICKS} · ratchet_cap {FLIP_RATCHET_SIDE_MAX} · "
+        f"curfew T-{FLIP_CURFEW} · trips≤{FLIP_MAX_TRIPS} · sitout@{FLIP_SCRATCH_SITOUT}/loss · "
+        f"scratch@entry−{FLIP_SCRATCH_S}c · grace {FLIP_PAIR_GRACE}s · "
         f"stop {FLIP_STOP_CENTS}c · pause@{FLIP_PAUSE_AFTER_STOPS}"
     )
 
@@ -282,15 +288,19 @@ def _decline_lone(client, ticker: str, close_ts: int, tag: str, lhs: str, lhp: i
 
 # ── WO-VISION pure signal helpers (crypto-free, unit-tested) ─────────────────
 def _tick_direction(ticks, n: int) -> Optional[str]:
-    """Sign of the last n spot deltas: all up → 'yes' (rising favors above-strike), all down
-    → 'no', mixed/insufficient → None."""
+    """A1: NET majority of the last n spot deltas (net-3-of-4 at n=4). ≥ majority up →
+    'yes' (rising favors above-strike), ≥ majority down → 'no', ties/2-2 → None. Fading
+    stays impossible (a tie never returns a side)."""
     if ticks is None or len(ticks) < n + 1:
         return None
     recent = ticks[-(n + 1):]
     deltas = [recent[i + 1] - recent[i] for i in range(n)]
-    if all(d > 0 for d in deltas):
+    ups = sum(1 for d in deltas if d > 0)
+    downs = sum(1 for d in deltas if d < 0)
+    need = n // 2 + 1                                # majority: 3 of 4
+    if ups >= need and ups > downs:
         return "yes"
-    if all(d < 0 for d in deltas):
+    if downs >= need and downs > ups:
         return "no"
     return None
 
@@ -706,16 +716,23 @@ def _r1_flat(client, ticker: str, tag: str, silent: bool = False) -> bool:
 
 
 def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj: dict,
-              trip_no: int, spot_ticks: list):
-    """§1 fill-clock — one managed position. Watches for a fill, then manages FROM the fill:
-    posts the take at entry+X, runs the pair grace, scratches on adverse signal, stores the
-    markout curve. Returns (outcome, realized_cents, side, entry_cents);
-    outcome ∈ {take, scratched, netted, observe, None(no-fill)}."""
+              trip_no: int, spot_ticks: list, side_cap: Optional[int] = None,
+              restrict_side: Optional[str] = None, signal_side: Optional[str] = None,
+              snapshot_spot: Optional[float] = None):
+    """§1 fill-clock — one managed position. WO-PREDATOR: side_cap governs the join ceiling
+    (A2); a gated re-entry restricts to restrict_side; penny-lead (B1) posts join+1 when spot
+    has led the stale book in the signal direction (maker; falls back to join on a cross); the
+    counterfactual fraction take is logged (B2); and a locked-margin leg vetoes a trigger-(b)
+    scratch in the final ≤60s (B3). Returns (outcome, realized, side, entry_cents, meta)."""
+    if side_cap is None:
+        side_cap = FLIP_SIDE_MAX
     now = time.time()
     try:
         lo, hi = kalshi.extract_boundaries(market_obj or {})
     except Exception:
         lo, hi = None, None
+    strike = lo if (lo is not None and hi is None) else (hi if (hi is not None and lo is None) else None)
+    meta = {"led": 0, "cf_frac_exit_cents": None, "cf_frac_exit_at": None, "locked_margin": 0}
 
     posted = {}          # side -> {"oid","price"}
     fills = {}           # side -> entry cents
@@ -723,23 +740,44 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
     entry_deadline = min(now + FLIP_ENTRY_SEC, close_ts - FLIP_CURFEW)
     while time.time() < entry_deadline and not fills:
         book = kalshi.fetch_orderbook(client, ticker)
-        spot_ticks.append(_spot())
+        cur_spot = _spot()
+        spot_ticks.append(cur_spot)
         for side in ("yes", "no"):
+            if restrict_side and side != restrict_side:
+                continue                                 # A2: a gated re-entry joins ONE side
             if side in posted:
                 continue
             join = book.yes_bid if side == "yes" else book.no_bid
             fp_str = book.yes_bid_fp if side == "yes" else book.no_bid_fp
-            if join is None or join > FLIP_SIDE_MAX:
+            if join is None or join > side_cap:
                 continue
             if posted and next(iter(posted.values()))["price"] + join > FLIP_LINE:
                 continue
             if _is_observe():
                 notify.send(f"🔁 W{tag} T{trip_no} — would post {side.upper()}@{join} (observe)")
                 continue
-            ss, pp = flip_math.entry_args(side, join)
-            oid = _post_entry(client, ticker, ss, pp, fp_str, exp, tag)   # passive, recovers
+            # B1 penny-lead — spot led the stale book in the signal direction → post join+1
+            led = False
+            if (signal_side == side and snapshot_spot is not None and cur_spot is not None
+                    and join + 1 <= side_cap):
+                moved = (cur_spot - snapshot_spot) if side == "yes" else (snapshot_spot - cur_spot)
+                led = moved >= FLIP_LEAD_TICK
+            if led:
+                try:
+                    ss, pp = flip_math.entry_args(side, join + 1)
+                    oid, _ = kalshi.place_order_maker(client, ticker, ss, pp, 1, expiration_ts=exp)
+                    meta["led"] = 1
+                    posted[side] = {"oid": oid, "price": join + 1}
+                    notify.send(f"🎯 W{tag} T{trip_no} — led {side.upper()}@{join + 1} (spot ahead)")
+                    continue
+                except Exception as e:
+                    if not _is_cross_400(e):             # non-cross error → give up this side
+                        notify.send(f"⚠ W{tag} T{trip_no} lead {side.upper()} rejected: {e}")
+                        continue
+                    # join+1 would cross → fall back to the plain join (led stays 0)
+            oid = _post_entry(client, ticker, side, join, fp_str, exp, tag)
             if oid is None:
-                continue                                 # entry skipped → no phantom slot
+                continue
             posted[side] = {"oid": oid, "price": join}
         for side in list(posted):
             if side not in fills:
@@ -754,17 +792,17 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
             time.sleep(FLIP_POLL_SEC)
 
     if _is_observe():
-        return "observe", 0, None, None
+        return "observe", 0, None, None, meta
     if not fills:
         if posted:
             kalshi.cancel_all_for_market(client, ticker)
-        return None, 0, None, None
+        return None, 0, None, None, meta
 
     if len(fills) == 2:                                   # both legs filled same tick → netted
         y, n = fills["yes"], fills["no"]
         cap = 100 - (y + n)
         notify.send(f"💰 W{tag} T{trip_no} — both filled {y}+{n} → netted rung A +{cap}¢")
-        return "netted", int(cap), "yes", y
+        return "netted", int(cap), "yes", y, meta
 
     held_side, entry = next(iter(fills.items()))
     other = "no" if held_side == "yes" else "yes"
@@ -783,6 +821,8 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
     mo_rec = {"m10": None, "m30": None, "m60": None}
     prev_mo = None
     adverse_polls = 0
+    close_samples = []                                   # B3: spot samples approaching the close
+    riding_locked = False                                # B3: a proven winner riding to settlement
 
     def _cancel(*oids):
         for oid in oids:
@@ -792,7 +832,33 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
                 except Exception:
                     pass
 
-    while (close_ts - time.time()) > FLIP_FLAT_AT:
+    def _log_cf(mark, age):
+        # B2: the fraction rule (exit at profit>15% of cost OR gainFraction>50% of max gain) —
+        # a pure LOGGER, zero behavior change. Record the first moment it would have exited.
+        if meta["cf_frac_exit_cents"] is not None or mark is None or entry <= 0:
+            return
+        gain = mark - entry
+        if (gain / entry) > 0.15 or (gain / max(1, 100 - entry)) > 0.50:
+            meta["cf_frac_exit_cents"] = int(gain)
+            meta["cf_frac_exit_at"] = round(age, 1)
+
+    while True:
+        secs_left = close_ts - time.time()
+        if not riding_locked and secs_left <= FLIP_FLAT_AT:
+            # B3 at the T-90 backstop: a PROVABLY-locked winner rides to settlement (flattening
+            # a guaranteed win for breakeven is strictly worse); every other leg flattens now —
+            # the T-90 backstop is unchanged for the normal case.
+            if (strike is not None and close_samples and flip_pricebrain.locked_margin(
+                    held_side, strike, close_samples, secs_left, FLIP_MAX_MOVE_PER_S, FLIP_POLL_SEC)):
+                riding_locked = True
+                meta["locked_margin"] = 1
+                _cancel(posted.get(other, {}).get("oid"), take_oid)
+                notify.send(f"🔒 W{tag} T{trip_no} — locked at T-{int(secs_left)}s; "
+                            f"riding {held_side.upper()} to settlement")
+            else:
+                break
+        if riding_locked and secs_left <= 2:
+            break
         engine.heartbeat()
         book = kalshi.fetch_orderbook(client, ticker)
         spot = _spot()
@@ -806,54 +872,68 @@ def _run_trip(client, ticker: str, close_ts: int, tag: str, exp: int, market_obj
             mo_rec["m30"] = mo
         if mo_rec["m60"] is None and age >= 60:
             mo_rec["m60"] = mo
+        _log_cf(leg_mark, age)
+        if secs_left <= FLIP_CLOSE_WINDOW_S + FLIP_FLAT_AT and spot is not None:
+            close_samples.append(spot)                   # B3: accrue the close-window estimate
 
-        # PAIR GRACE — the opposite entry bid keeps working; a second fill nets rung A
-        if other in posted and other not in fills and time.time() <= grace_end:
-            fp2 = _order_fill_price(client, ticker, posted[other]["oid"], other)
-            if fp2 is not None:
-                fills[other] = fp2
-                _record_enter(ticker, close_ts, other, fp2)
-                _cancel(take_oid)                     # netted flat → the take would un-flatten us
-                cap = 100 - (entry + fp2)
-                notify.send(f"💰 W{tag} T{trip_no} — pair grace fill {other.upper()}@{fp2} "
-                            f"→ netted rung A +{cap}¢")
+        if not riding_locked:
+            # PAIR GRACE — the opposite entry bid keeps working; a second fill nets rung A
+            if other in posted and other not in fills and time.time() <= grace_end:
+                fp2 = _order_fill_price(client, ticker, posted[other]["oid"], other)
+                if fp2 is not None:
+                    fills[other] = fp2
+                    _record_enter(ticker, close_ts, other, fp2)
+                    _cancel(take_oid)                 # netted flat → the take would un-flatten us
+                    cap = 100 - (entry + fp2)
+                    notify.send(f"💰 W{tag} T{trip_no} — pair grace fill {other.upper()}@{fp2} "
+                                f"→ netted rung A +{cap}¢")
+                    store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
+                    return "netted", int(cap), held_side, entry, meta
+            elif other in posted and other not in fills and time.time() > grace_end:
+                _cancel(posted[other]["oid"])         # grace over → drop the opposite entry only
+                posted.pop(other, None)
+
+            # THE TAKE filled → +X
+            tfp = _order_fill_price(client, ticker, take_oid, tes)
+            if tfp is not None:
+                _record_enter(ticker, close_ts, tes, tfp, why_tag="FLIP_EXIT")
+                notify.send(f"🎯 W{tag} T{trip_no} — take filled {held_side.upper()} → +{FLIP_X}¢")
                 store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
-                return "netted", int(cap), held_side, entry
-        elif other in posted and other not in fills and time.time() > grace_end:
-            _cancel(posted[other]["oid"])             # grace over → drop the opposite entry only
-            posted.pop(other, None)
-
-        # THE TAKE filled → +X
-        tfp = _order_fill_price(client, ticker, take_oid, tes)
-        if tfp is not None:
-            _record_enter(ticker, close_ts, tes, tfp, why_tag="FLIP_EXIT")
-            notify.send(f"🎯 W{tag} T{trip_no} — take filled {held_side.upper()} → +{FLIP_X}¢")
-            store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
-            return "take", FLIP_X, held_side, entry
+                return "take", FLIP_X, held_side, entry, meta
 
         # SCRATCH — cross out NOW on any adverse signal
         adverse_polls = adverse_polls + 1 if _spot_adverse(held_side, spot, lo, hi) else 0
         reason = _scratch_reason(held_side, entry, leg_mark, mo_rec["m30"], prev_mo, adverse_polls)
         prev_mo = mo
-        if reason:
+        if reason and riding_locked:
+            # B3 veto — a locked leg ignores last-seconds spot noise; only announced in the
+            # final ≤60s (the veto never fires before T-60).
+            if "strike" in reason and secs_left <= FLIP_CLOSE_WINDOW_S:
+                notify.send(f"🔒 W{tag} T{trip_no} — scratch vetoed (locked, T-{int(secs_left)}s "
+                            f"— avg cannot flip)")
+            adverse_polls = 0
+        elif reason:
             _cancel(posted.get(other, {}).get("oid"), take_oid)   # opposite entry FIRST, then take
             posted.pop(other, None)
             notify.send(f"✂️ W{tag} T{trip_no} — scratch {held_side.upper()}@{entry}: {reason}")
             flat_px, _f = _decline_lone(client, ticker, close_ts, tag, held_side, entry)
             realized = (100 - flat_px - entry) if flat_px is not None else -entry
             store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
-            return "scratched", int(realized), held_side, entry
+            return "scratched", int(realized), held_side, entry, meta
 
         time.sleep(FLIP_POLL_SEC)
 
+    store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
+    if riding_locked:                                    # settled a proven winner (backfill books it)
+        notify.send(f"🔒 W{tag} T{trip_no} — {held_side.upper()}@{entry} rode locked to settlement")
+        return "rode_locked", int(100 - entry), held_side, entry, meta
     # T-90 reached with the take resting — flatten to end the trip bounded (reuse executor)
     _cancel(posted.get(other, {}).get("oid"), take_oid)
     posted.pop(other, None)
     notify.send(f"⏱ W{tag} T{trip_no} — T-90, take unfilled → flatten {held_side.upper()}@{entry}")
     flat_px, _f = _decline_lone(client, ticker, close_ts, tag, held_side, entry)
     realized = (100 - flat_px - entry) if flat_px is not None else -entry
-    store.insert_markout(first_fill_ts, ticker, held_side, entry, **mo_rec)
-    return "scratched", int(realized), held_side, entry
+    return "scratched", int(realized), held_side, entry, meta
 
 
 def _run_ratchet_window(client, ticker: str, close_ts: int, tag: str, exp: int,
@@ -865,22 +945,35 @@ def _run_ratchet_window(client, ticker: str, close_ts: int, tag: str, exp: int,
     trips, scratches, window_realized = 0, 0, 0
     outcomes, spot_ticks = [], []
 
+    # A3 sit-out: 4 scratches OR a window loss ≥ stop, whichever first (loss budget primary).
     while (trips < FLIP_MAX_TRIPS and scratches < FLIP_SCRATCH_SITOUT
+           and window_realized > -FLIP_STOP_CENTS
            and (close_ts - time.time()) > FLIP_CURFEW):
         if not _r1_flat(client, ticker, tag):          # R1 wall — must be flat to open a trip
             break
+
+        secs = close_ts - time.time()
+        band = "open" if secs > 600 else ("mid" if secs > 300 else "late")
+        # first trip = the blind open watch (side_max 49, both sides); re-entries are OFI-gated
+        # (ratchet cap 58, single side), with the gate's spot snapshot for the penny-lead.
+        side_cap, restrict_side, signal_side, snap, ofi_mode = FLIP_SIDE_MAX, None, None, None, "open"
         if trips > 0:                                  # re-entry needs the OFI gate's blessing
             book = kalshi.fetch_orderbook(client, ticker)
-            spot_ticks.append(_spot())
-            side = _ofi_side(spot_ticks, _book_lean(book))
-            if side is None:
+            snap = _spot()
+            spot_ticks.append(snap)
+            gated = _ofi_side(spot_ticks, _book_lean(book))
+            if gated is None:
                 engine.heartbeat()
                 time.sleep(FLIP_POLL_SEC)
                 continue                               # no signal → wait (never fade the tape)
-            notify.send(f"🎯 W{tag} — tape agrees → re-enter {side.upper()} side")
+            side_cap, restrict_side, signal_side, ofi_mode = (
+                FLIP_RATCHET_SIDE_MAX, gated, gated, f"net{FLIP_OFI_TICKS // 2 + 1}{FLIP_OFI_TICKS}")
+            notify.send(f"🎯 W{tag} — tape agrees → re-enter {gated.upper()} side (cap {side_cap})")
 
-        outcome, realized, side, entry = _run_trip(client, ticker, close_ts, tag, exp,
-                                                   market_obj, trips + 1, spot_ticks)
+        outcome, realized, side, entry, meta = _run_trip(
+            client, ticker, close_ts, tag, exp, market_obj, trips + 1, spot_ticks,
+            side_cap=side_cap, restrict_side=restrict_side, signal_side=signal_side,
+            snapshot_spot=snap)
         if outcome == "observe":
             return "flip_observe"
         if outcome is None:                            # no fill this trip → window is done
@@ -890,13 +983,17 @@ def _run_ratchet_window(client, ticker: str, close_ts: int, tag: str, exp: int,
         outcomes.append(outcome)
         try:
             store.insert_trip(time.time(), ticker, tag, side or "", int(entry or 0),
-                              outcome, int(realized))
+                              outcome, int(realized), led=meta.get("led"), ofi_mode=ofi_mode,
+                              side_cap=side_cap, curfew_band=band,
+                              cf_frac_exit_cents=meta.get("cf_frac_exit_cents"),
+                              cf_frac_exit_at=meta.get("cf_frac_exit_at"),
+                              locked_margin=meta.get("locked_margin"))
         except Exception as e:
             notify.send(f"⚠ W{tag} trip row failed: {e}")
         if outcome == "scratched":
             scratches += 1
-        if window_realized <= -FLIP_STOP_CENTS:        # salvage-aware window stop
-            notify.send(f"🛑 W{tag} — window stop {window_realized}¢ ≤ −{FLIP_STOP_CENTS}")
+        if window_realized <= -FLIP_STOP_CENTS:        # salvage-aware window stop (primary governor)
+            notify.send(f"🛑 W{tag} — window stop {window_realized}¢ ≤ −{FLIP_STOP_CENTS} → sit out")
             break
 
     if scratches >= FLIP_SCRATCH_SITOUT:

@@ -172,6 +172,17 @@ def init_db() -> None:
             _conn.execute(f"ALTER TABLE flip_windows ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # WO-PREDATOR: trip attribution (B4) + counterfactual take (B2) + locked-margin (B3),
+    # guarded-ALTER'd onto a flip_trips created by WO-VISION.
+    for col, typ in [
+        ("led", "INTEGER"), ("ofi_mode", "TEXT"), ("side_cap", "INTEGER"),
+        ("curfew_band", "TEXT"), ("cf_frac_exit_cents", "INTEGER"),
+        ("cf_frac_exit_at", "REAL"), ("locked_margin", "INTEGER"),
+    ]:
+        try:
+            _conn.execute(f"ALTER TABLE flip_trips ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS epochs (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1073,24 +1084,39 @@ def insert_markout(fill_ts: float, ticker: str, side: str, entry_cents: int,
         return cur.lastrowid
 
 
+_TRIP_COLS = (
+    "ts", "ticker", "tag", "side", "entry_cents", "outcome", "realized_cents",
+    "led", "ofi_mode", "side_cap", "curfew_band", "cf_frac_exit_cents",
+    "cf_frac_exit_at", "locked_margin",
+)
+
+
 def insert_trip(ts: float, ticker: str, tag: str, side: str, entry_cents: int,
-                outcome: str, realized_cents: int) -> int:
-    """WO-VISION §5: one managed position (trip) — the row R6 scaling stats read from."""
+                outcome: str, realized_cents: int, **attrib) -> int:
+    """WO-VISION §5 / WO-PREDATOR B4: one managed position (trip) — the row R6 scaling stats
+    read from, now tagged with the regime that admitted it (led, ofi_mode, side_cap,
+    curfew_band) plus the B2 counterfactual take and the B3 locked-margin flag."""
+    fields = dict(ts=ts, ticker=ticker, tag=tag, side=side, entry_cents=entry_cents,
+                  outcome=outcome, realized_cents=realized_cents)
+    for k in ("led", "ofi_mode", "side_cap", "curfew_band", "cf_frac_exit_cents",
+              "cf_frac_exit_at", "locked_margin"):
+        if k in attrib:
+            fields[k] = attrib[k]
+    cols = [c for c in _TRIP_COLS if c in fields]
     with _lock:
         cur = _conn.execute(
-            """INSERT INTO flip_trips (ts, ticker, tag, side, entry_cents, outcome, realized_cents)
-               VALUES (?,?,?,?,?,?,?)""",
-            (ts, ticker, tag, side, entry_cents, outcome, realized_cents),
+            f"INSERT INTO flip_trips ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            [fields[c] for c in cols],
         )
         _conn.commit()
     log.info(f"[STORE] flip_trip {tag} {side} entry={entry_cents} {outcome} "
-             f"realized={realized_cents}¢")
+             f"realized={realized_cents}¢ led={attrib.get('led')} ofi={attrib.get('ofi_mode')}")
     return cur.lastrowid
 
 
 def flip_trips_between(lo_ts: float, hi_ts: float) -> list:
-    """Trip rows in [lo_ts, hi_ts), oldest first, as dicts (for the R6 pack line)."""
-    cols = ("id", "ts", "ticker", "tag", "side", "entry_cents", "outcome", "realized_cents")
+    """Trip rows in [lo_ts, hi_ts), oldest first, as dicts (R6 line + regime attribution)."""
+    cols = ("id",) + _TRIP_COLS
     with _lock:
         cur = _conn.execute(
             f"SELECT {','.join(cols)} FROM flip_trips WHERE ts >= ? AND ts < ? ORDER BY ts ASC",

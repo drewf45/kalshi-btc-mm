@@ -84,8 +84,32 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 `KW_CLEAR_HALT` (set `=1` for a one-boot halt clear, then remove) · `TAIL_LOSS_MIN_CENTS=10`
 (min per-window loss the tail-loss kill counts) ·
 `FLIP_RATCHET=1` · `FLIP_PAIR_GRACE=30` · `FLIP_SCRATCH_S=3` · `FLIP_OFI_TICKS=4` ·
-`FLIP_CURFEW=240` · `FLIP_MAX_TRIPS=4` · `FLIP_SCRATCH_SITOUT=3` · `TREASURY_ACCRUE=0`
-— all overridable.
+`FLIP_CURFEW=150` · `FLIP_MAX_TRIPS=8` · `FLIP_SCRATCH_SITOUT=4` · `FLIP_RATCHET_SIDE_MAX=58` ·
+`FLIP_MAX_MOVE_PER_S=6.0` · `FLIP_LEAD_TICK=1.0` · `TREASURY_ACCRUE=0` — all overridable.
+
+## Predator slate (WO-PREDATOR — appetite at entry, discipline at exits; the cage does not move)
+- **A1 OFI net-3-of-4.** `_tick_direction` returns a side when ≥ majority of the last N spot
+  deltas agree net (3-of-4 at N=4); 2-2 ties → None; book-lean agreement still required;
+  fading still impossible.
+- **A2 split side cap.** OFI-gated re-entries use `FLIP_RATCHET_SIDE_MAX=58` (single side); the
+  blind open watch keeps `FLIP_SIDE_MAX=49` (both sides); the ≤99 line holds wherever a pair
+  could form.
+- **A3 defaults.** curfew T-150, trips ≤ 8, sit-out at **4 scratches OR a window loss ≥ stop,
+  whichever first** (the loss budget is the primary governor).
+- **B1 penny-lead.** On a gated entry, if spot has led the stale book ≥ `FLIP_LEAD_TICK` in the
+  signal direction, post at join+1 (≤ cap, maker; falls back to join on a cross). Tag `led=1`.
+- **B2 counterfactual take.** Alongside the fixed +4, each trip logs what the fraction rule
+  (profit > 15% of cost OR gain > 50% of max) would have realized (`cf_frac_exit_cents/at`).
+  Pure logger — zero behavior change.
+- **B3 locked margin.** Settlement is a 60s TWAP. `flip_pricebrain.locked_margin` proves whether
+  the close-window average can still flip; a PROVABLY-locked winner rides to settlement past
+  T-90 instead of flattening for breakeven, and a trigger-(b) scratch on it is vetoed (never
+  before T-60). Every other leg flattens at T-90 exactly as before.
+- **B4 attribution.** Every `flip_trips` row records the regime that admitted it (`ofi_mode`,
+  `side_cap`, `led`, `curfew_band`) — untagged loosening is forbidden; the reads judge by regime.
+
+**Sacred, unmoved:** R1 wall, window stop, magnitude tail-kill, sit-out, the T-90 backstop
+(for every non-locked leg), expiry on every order, flat proofs, line arithmetic, one position.
 
 ## The ratchet (WO-VISION — ships ON; `FLIP_RATCHET=0` reverts to the require_pair window)
 - **§1 Fill-clock scratch.** Management starts AT the fill, not phase end. The take (entry+X)
