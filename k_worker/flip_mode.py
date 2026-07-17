@@ -133,8 +133,10 @@ def _inventory(client, ticker: str, close_ts: int, tag: str, net: int, ctx: str)
         if cb is None:
             notify.send(f"⚠ W{tag} flatten: no {comp} touch to join")
             return
-        kalshi.place_order_maker(client, ticker, comp, cb, abs(int(net)),
-                                 expiration_ts=int(close_ts - 2), v2_price_str=cfp)
+        roid, _ = kalshi.place_order_maker(client, ticker, comp, cb, abs(int(net)),
+                                           expiration_ts=int(close_ts - 2), v2_price_str=cfp)
+        # WO-6 §2: story row so settlement resolves the pair and Δ$-explained stays honest
+        _record_enter(ticker, close_ts, comp, None, roid, why_tag="FLIP_FLATTEN")
         notify.send(f"🩹 W{tag} — flatten join {comp.upper()}@{cb}×{abs(int(net))} (exp close−2)")
     except Exception as e:
         notify.send(f"⚠ W{tag} flatten attempt failed: {e}")
@@ -143,24 +145,31 @@ def _inventory(client, ticker: str, close_ts: int, tag: str, net: int, ctx: str)
 def _flat_proof(client, ticker: str, close_ts: int, tag: str,
                 expected_flat: bool, ride_side: Optional[str], ride_px: Optional[int]):
     """§1 THE NO-INVENTORY PROOF — flatness proven by the broker, not asserted by the code.
-    Returns (broker_flat: Optional[bool], suffix: str) for the DONE line. Netted/flipped/
-    floor-ride windows must read net 0; a lone ride is the accepted ±1 residual. Any other
-    net pages Drew and is flattened (§1 via _inventory)."""
+    Returns (broker_flat: Optional[bool], suffix: str, net: Optional[int]) for the DONE line.
+
+    WO-6 §4 polarity: the 🚨 siren means DANGER only. A mismatch in the SAFE direction —
+    flatter than modeled (e.g. the salvage filled so net=0 when a ±1 ride was expected) —
+    renders as an ℹ️ note, not an alarm. Only a RISK-direction net (more exposure than
+    expected, or the wrong sign) pages Drew and is flattened."""
     try:
         net = kalshi.position_for_market(client, ticker)
     except Exception as e:
         notify.send(f"⚠ W{tag} broker flat-check error: {e}")
-        return None, "flat ? (broker unreachable)"
+        return None, "flat ? (broker unreachable)", None
     if expected_flat:
         if net == 0:
-            return True, "flat ✓ (broker)"
+            return True, "flat ✓ (broker)", 0
         _inventory(client, ticker, close_ts, tag, net, "expected flat")
-        return False, f"🚨 INVENTORY net={net}"
+        return False, f"🚨 INVENTORY net={net}", net
     want = 1 if ride_side == "yes" else -1     # lone ride: exactly the ridden ±1 leg
     if net == want:
-        return True, f"riding {ride_side.upper()}@{ride_px} (±1 accepted)"
-    _inventory(client, ticker, close_ts, tag, net, f"lone ride wanted {want}")
-    return False, f"🚨 INVENTORY net={net} (want {want})"
+        return True, f"riding {ride_side.upper()}@{ride_px} (±1 accepted)", net
+    if net is not None and abs(net) < abs(want) and net * want >= 0:
+        # flatter than modeled — the safe direction. Info, not a siren.
+        return True, (f"ℹ️ position reconciled: flatter than modeled "
+                      f"(net={net}, wanted {want}) — salvage filled"), net
+    _inventory(client, ticker, close_ts, tag, net, f"lone ride risk (want {want})")
+    return False, f"🚨 INVENTORY net={net} (want {want})", net
 
 
 def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Optional[str]:
@@ -227,7 +236,10 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
             ss, pp = flip_math.entry_args(side, join)
             oid, _ = kalshi.place_order_maker(client, ticker, ss, pp, 1,
                                               expiration_ts=exp, v2_price_str=fp_str)
-            posted[side] = {"oid": oid, "price": join, "dt": time.time() - quote_ts}
+            far = book.no_bid if side == "yes" else book.yes_bid   # §3: far-side bid at post
+            booksum = join + far if far is not None else join      # ≪100 or ≈join = lone shape
+            posted[side] = {"oid": oid, "price": join, "dt": time.time() - quote_ts,
+                            "booksum": booksum}
             notify.send(f"🔁 W{tag} — posted {side.upper()}@{join} "
                         f"(t+{int(posted[side]['dt'])}s, exp T-{FLIP_FLAT_AT})")
         for side in list(posted):          # poll fills for whatever is resting
@@ -344,7 +356,7 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
                     roid, _ = kalshi.place_order_maker(client, ticker, comp, comp_bid, 1,
                                                        expiration_ts=rejoin_exp, v2_price_str=comp_fp)
                     swept[hs] = comp_bid
-                    _record_enter(ticker, close_ts, comp, None, roid, why_tag="FLIP_SWEEP")
+                    _record_enter(ticker, close_ts, comp, None, roid, why_tag="FLIP_SALVAGE")
                     notify.send(f"🔁 W{tag} — T-90 rejoin {hs.upper()} exit @{comp_bid} (exp close−2)")
                 except Exception as e:
                     notify.send(f"⚠ W{tag} T-90 rejoin failed: {e}")
@@ -353,6 +365,8 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     exit_yes = exit_fill.get("no")         # yes-terms exit fill (flattened a held NO)
     exit_no = exit_fill.get("yes")         # no-terms exit fill (flattened a held YES)
     ride_side = ride_px = None
+    lone_open = False                      # a lone leg with no target flip (salvage/ride/flatten)
+    lhs = lhp = None
     if n_entry == 2:
         expected_flat = True               # 2 bundles, 1 bundle floor-riding, or a naked leg (flag)
         if len(exit_fill) == 2:
@@ -368,28 +382,48 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
         if lhs in exit_fill:
             captures.append(("B", 100 - (lhp + exit_fill[lhs])))
             outcome, expected_flat = "LONE_FLIP", True
-        elif lhs in swept:
-            outcome, expected_flat = "LONE_SALVAGE", False
-            ride_side, ride_px = lhs, lhp
         else:
-            outcome, expected_flat = "LONE_RIDE", False
+            outcome, expected_flat = "LONE_RIDE", False    # refined below from the broker net
             ride_side, ride_px = lhs, lhp
+            lone_open = True
 
-    realized = sum(c for _, c in captures)
+    # §1 THE NO-INVENTORY PROOF — the counterparty confirms flatness (WO-6 §4 polarity).
+    broker_flat, flat_suffix, net = _flat_proof(client, ticker, close_ts, tag,
+                                                expected_flat, ride_side, ride_px)
+
+    # WO-6 §1 — the SALVAGE-AWARE STOP: `realized` includes leg outcomes at DONE, not just
+    # flip captures, so a salvaged/flattened/ridden lone leg feeds the stop the truth.
+    lone_extra = 0
+    inclusive = False
+    if lone_open:
+        want = 1 if lhs == "yes" else -1
+        if net == 0:                       # the complement filled → flat (safe direction)
+            cb = swept.get(lhs)            # dumped at the touch we rejoined at
+            lone_extra = (100 - cb - lhp) if cb is not None else -lhp
+            outcome = "LONE_SALVAGE"
+        elif net == want:                  # still holding the leg → riding to settlement
+            lone_extra = -lhp              # provisional −entry (settlement books truth later)
+            outcome = "LONE_RIDE"
+        elif net is None:                  # broker unreadable → treat as a ride, provisionally
+            lone_extra = -lhp
+            outcome = "LONE_RIDE"
+        else:                              # risk-direction residual → forced flatten (§1)
+            lone_extra = -lhp
+            outcome = "LONE_FLATTEN"
+        inclusive = True
+
+    realized = sum(c for _, c in captures) + lone_extra
     stopped = realized <= -FLIP_STOP_CENTS
     if stopped:
         outcome = "STOPPED"
 
-    # mark any open leg at the current bid (bid-marked mtm on the ridden residual)
+    # mark any STILL-HELD leg at the current bid (a salvaged/flattened leg is flat → mtm 0)
     mtm_open = 0
-    if ride_side is not None and book2 is not None:
-        cur_bid = book2.yes_bid if ride_side == "yes" else book2.no_bid
-        if cur_bid is not None and ride_px is not None:
+    still_holding = lone_open and net is not None and net == (1 if lhs == "yes" else -1)
+    if still_holding and ride_px is not None and book2 is not None:
+        cur_bid = book2.yes_bid if lhs == "yes" else book2.no_bid
+        if cur_bid is not None:
             mtm_open = int(cur_bid - ride_px)
-
-    # §1 THE NO-INVENTORY PROOF — the counterparty confirms flatness (or we flatten + page).
-    broker_flat, flat_suffix = _flat_proof(client, ticker, close_ts, tag,
-                                           expected_flat, ride_side, ride_px)
 
     ttff = (first_fill_ts - quote_ts) if first_fill_ts else None
     ttflat = (flat_ts - quote_ts) if flat_ts else None
@@ -405,6 +439,8 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
             join_no=(posted.get("no") or {}).get("price"),
             post_dt_yes=(posted.get("yes") or {}).get("dt"),
             post_dt_no=(posted.get("no") or {}).get("dt"),
+            booksum_yes=(posted.get("yes") or {}).get("booksum"),
+            booksum_no=(posted.get("no") or {}).get("booksum"),
             bundle_cost=(cost if n_entry == 2 else None),
             exit_yes=exit_yes, exit_no=exit_no, capture_a_cents=cap_a_c,
             capture_b_cents=cap_b_c, realized_cents=int(realized), mtm_open_cents=mtm_open,
@@ -415,12 +451,13 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     except Exception as e:
         notify.send(f"⚠ W{tag} flip_window row failed: {e}")
 
-    _bump_stop_streak(stopped)
+    _bump_stop_streak(stopped)             # now fed the inclusive number (WO-6 §1)
 
     # DONE line — a complete sentence: money and why, flatness proven by the broker.
-    entry_str = f"{ey}+{en}={cost}" if n_entry == 2 else f"{list(fills)[0].upper()}@{list(fills.values())[0]}"
+    entry_str = f"{ey}+{en}={cost}" if n_entry == 2 else f"{lhs.upper()}@{lhp}"
     rung_str = " · ".join(f"rung{L} +{c}¢" for L, c in captures) if captures else "no capture"
+    incl = " (incl. salvage)" if inclusive else ""
     sign = "+" if realized >= 0 else ""
-    notify.send(f"🔁 W{tag} — {entry_str} | {rung_str} → {sign}{realized}¢ [{outcome}] "
-                f"| {flat_suffix} | DONE")
+    notify.send(f"🔁 W{tag} — {entry_str} | {rung_str} → {sign}{realized}¢ realized{incl} "
+                f"[{outcome}] | {flat_suffix} | DONE")
     return "flip_done"

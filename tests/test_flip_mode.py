@@ -187,16 +187,111 @@ class TestFlipCycle(_RestoreMixin):
         self.assertEqual(self._win()["broker_flat"], 1)
 
     def test_lone_ride_accepts_one_lot_residual(self):
-        # only YES fills; exit never fills; sweep can't rejoin (no NO touch) -> LONE_RIDE.
-        # broker shows the accepted +1 -> NOT flagged as inventory.
-        self.fills_map = {"yes-45": 45}
+        # only a cheap YES@20 fills; exit never fills; sweep can't rejoin (no NO touch).
+        # broker shows the accepted +1 -> LONE_RIDE, not flagged as inventory, not stopped.
+        self.book = types.SimpleNamespace(yes_bid=20, no_bid=55, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.20", no_bid_fp="0.55")
+        self.fills_map = {"yes-20": 20}
         self.book2 = types.SimpleNamespace(
             yes_bid=10, no_bid=None, yes_bid_fp="0.10", no_bid_fp=None)
         self.net = 1
         flip_mode.run_flip_cycle(None, "KXBTC15M-RD", self.CLOSE, {})
         self.assertEqual(self._win()["outcome_tag"], "LONE_RIDE")
         self.assertFalse(any("INVENTORY" in a for a in self.alerts))
-        self.assertTrue(any("riding YES@45" in s for s in self.sent))
+        self.assertTrue(any("riding YES@20" in s for s in self.sent))
+
+    # ── WO-6 §1 salvage-aware stop + §2 story rows + §4 polarity ─────
+    def test_salvage_stops_and_streaks(self):
+        # lone YES@49, exit never fills, sweep rejoins NO@84 and the broker confirms flat
+        # (net=0). realized = (100-84)-49 = -33 → STOPPED, streak 1, salvage row, safe info.
+        self.book = types.SimpleNamespace(yes_bid=49, no_bid=55, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.49", no_bid_fp="0.55")
+        self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=84,
+                                           yes_bid_fp="0.10", no_bid_fp="0.84")
+        self.fills_map = {"yes-49": 49}
+        self.net = 0                                     # salvage complement filled → flat
+        flip_mode.run_flip_cycle(None, "KXBTC15M-SV", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["realized_cents"], -33)       # inclusive of the salvage loss
+        self.assertEqual(w["outcome_tag"], "STOPPED")
+        self.assertEqual(self.state[flip_mode._STOP_STREAK_KEY], "1")
+        done = [s for s in self.sent if "DONE" in s][-1]
+        self.assertIn("-33¢ realized (incl. salvage)", done)          # §1(e) golden
+        self.assertTrue(any(r.get("why_tag") == "FLIP_SALVAGE" for r in self.rows))  # §2
+        self.assertFalse(any("INVENTORY" in a for a in self.alerts))  # §4 safe direction
+        self.assertIn("flatter than modeled", done)                   # §4 info, not siren
+
+    def test_two_salvage_windows_halt(self):
+        def _salvage(tk):
+            self.book = types.SimpleNamespace(yes_bid=49, no_bid=55, yes_ask=60, no_ask=60,
+                                              yes_bid_fp="0.49", no_bid_fp="0.55")
+            self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=84,
+                                               yes_bid_fp="0.10", no_bid_fp="0.84")
+            self.fills_map = {"yes-49": 49}
+            self.net = 0
+            self._book_calls = 0
+            self._clock.t = float(self.CLOSE - 800)      # reset the clock into the arm window
+            flip_mode.run_flip_cycle(None, tk, self.CLOSE, {})
+        _salvage("KXBTC15M-S1")
+        self.assertFalse(self.state.get("halted"))
+        _salvage("KXBTC15M-S2")                          # two consecutive stops
+        self.assertTrue(self.state.get("halted"))
+        self.assertTrue(any("FLIP PAUSE" in a for a in self.alerts))
+
+    def test_netted_window_resets_streak(self):
+        self.state[flip_mode._STOP_STREAK_KEY] = "1"     # a prior stop is on the books
+        self.fills_map = {"yes-45": 45, "no-48": 48, "no-51": 51, "yes-48": 48}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-RS", self.CLOSE, {})
+        self.assertEqual(self._win()["outcome_tag"], "NETTED_2R")
+        self.assertEqual(self.state[flip_mode._STOP_STREAK_KEY], "0")
+
+    def test_provisional_lone_ride_counts_toward_stop(self):
+        # riding leg (net==want, no salvage) counts provisional -entry at DONE
+        self.book = types.SimpleNamespace(yes_bid=30, no_bid=55, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.30", no_bid_fp="0.55")
+        self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=None,
+                                           yes_bid_fp="0.10", no_bid_fp=None)
+        self.fills_map = {"yes-30": 30}
+        self.net = 1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-PR", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["realized_cents"], -30)       # provisional −entry, counted
+        self.assertEqual(w["outcome_tag"], "STOPPED")    # −30 ≤ −25
+
+    def test_risk_direction_still_sirens(self):
+        # a net in the RISK direction (wrong sign) keeps the 🚨 — the siren means danger
+        self.book = types.SimpleNamespace(yes_bid=20, no_bid=55, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.20", no_bid_fp="0.55")
+        self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=48,
+                                           yes_bid_fp="0.10", no_bid_fp="0.48")
+        self.fills_map = {"yes-20": 20}
+        self.net = -1                                    # wrong sign → risk
+        flip_mode.run_flip_cycle(None, "KXBTC15M-RK", self.CLOSE, {})
+        self.assertEqual(self._win()["outcome_tag"], "LONE_FLATTEN")
+        self.assertTrue(any("INVENTORY" in a for a in self.alerts))
+        self.assertTrue(any(r.get("why_tag") == "FLIP_FLATTEN" for r in self.rows))  # §2
+
+    def test_booksum_fingerprint_recorded(self):
+        # far side absent at post -> booksum == join (the lone-leg fingerprint, §3)
+        self.book = types.SimpleNamespace(yes_bid=40, no_bid=None, yes_ask=60, no_ask=None,
+                                          yes_bid_fp="0.40", no_bid_fp=None)
+        self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=None,
+                                           yes_bid_fp="0.10", no_bid_fp=None)
+        self.fills_map = {"yes-40": 40}
+        self.net = 1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-BF", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["join_yes"], 40)
+        self.assertEqual(w["booksum_yes"], 40)           # far absent → booksum == join
+        self.assertIsNone(w["join_no"])                  # NO never posted
+
+    def test_booksum_records_both_sides_when_present(self):
+        # both sides cheap -> booksum ≈ join+far, sum ≪ 100 is the netted-shape fingerprint
+        self.fills_map = {"yes-45": 45, "no-48": 48, "no-51": 51, "yes-48": 48}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-BS", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["booksum_yes"], 45 + 48)      # far NO bid present at YES post
+        self.assertEqual(w["booksum_no"], 45 + 48)
 
     # ── §1 no-inventory proof: a surprise residual pages + flattens ──
     def test_partial_rung_b_flags_inventory(self):

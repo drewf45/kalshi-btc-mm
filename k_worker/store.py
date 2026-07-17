@@ -113,6 +113,8 @@ def init_db() -> None:
             join_no         INTEGER,
             post_dt_yes     REAL,
             post_dt_no      REAL,
+            booksum_yes     INTEGER,
+            booksum_no      INTEGER,
             bundle_cost     INTEGER,
             exit_yes        INTEGER,
             exit_no         INTEGER,
@@ -983,9 +985,10 @@ def insert_orphan_row(ticker: str, position_data: dict) -> int:
 
 _FLIP_WINDOW_COLS = (
     "ts", "close_ts", "tag", "ticker", "entry_yes", "entry_no", "join_yes", "join_no",
-    "post_dt_yes", "post_dt_no", "bundle_cost", "exit_yes", "exit_no", "capture_a_cents",
-    "capture_b_cents", "realized_cents", "mtm_open_cents", "spread_yes", "spread_no",
-    "sigma_at_gate", "ttff_s", "ttflat_s", "outcome_tag", "broker_flat",
+    "post_dt_yes", "post_dt_no", "booksum_yes", "booksum_no", "bundle_cost", "exit_yes",
+    "exit_no", "capture_a_cents", "capture_b_cents", "realized_cents", "mtm_open_cents",
+    "spread_yes", "spread_no", "sigma_at_gate", "ttff_s", "ttflat_s", "outcome_tag",
+    "broker_flat",
 )
 
 

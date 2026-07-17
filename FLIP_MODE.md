@@ -48,12 +48,27 @@ review-pack machinery books P&L — no new accounting.
   net pages Drew `🚨 INVENTORY`, is handed to the boot reconcile/orphan machinery, and an
   immediate complement-join (maker touch, exp close−2) tries to flatten it now.
 - **Tagged windows (§3).** One immutable `flip_windows` row per window records entry/exit
-  prices, per-rung captures, realized ¢, open-leg mtm, entry spreads, timings, broker-flat,
-  and an `outcome_tag` ∈ {NETTED_2R, NETTED_1R, FLOOR_RIDE, LONE_FLIP, LONE_SALVAGE,
-  LONE_RIDE, SAT_*, STOPPED} — the desk's own crossing study for Saturday tuning.
+  prices, both joins + book-sum at each post, per-rung captures, realized ¢, open-leg mtm,
+  entry spreads, timings, broker-flat, and an `outcome_tag` ∈ {NETTED_2R, NETTED_1R,
+  FLOOR_RIDE, LONE_FLIP, LONE_SALVAGE, LONE_FLATTEN, LONE_RIDE, SAT_*, STOPPED} — the desk's
+  own crossing study for Saturday tuning.
 - **Hourly pack v2 (§4, `flip_pack.py`).** Account in real **dollars** (proven `get_balance`)
   with Δ-vs-midnight, a per-window table, and a day rollup whose `Δ$` is **explained**:
   settled P&L + fees, any unexplained residual ≥ 2¢ printed 🔴 and paged.
+
+## Overnight discipline (WO-6)
+- **Salvage-aware stop.** A window's `realized` includes leg outcomes at DONE, not just flip
+  captures: a salvaged/flattened leg counts `(100 − complement_fill) − entry`, a lone leg
+  riding to settlement counts a provisional `−entry`. The two-stop pause is now fed the truth
+  (`→ −33¢ realized (incl. salvage)` → `STOPPED` → streak → halt), so a losing salvage night
+  actually arms it. Netted rungs and lone flips are unchanged.
+- **Salvage/flatten story rows.** Every salvage (T-90 rejoin) and flatten (§1) fill books its
+  own ENTER row (`FLIP_SALVAGE` / `FLIP_FLATTEN`, order-id lineage) so settlement resolves the
+  pair and Δ$-explained stays ✓ on honest salvage nights.
+- **Siren polarity.** 🚨 means danger only. A mismatch in the SAFE direction — flatter than
+  modeled (the salvage filled, net 0 when a ±1 ride was expected) — renders as
+  `ℹ️ position reconciled: flatter than modeled … salvage filled`, never the alarm. Only a
+  risk-direction net (more exposure, or the wrong sign) pages Drew.
 
 ## Reused verbatim (not touched)
 `place_order_maker`, `fetch_orderbook`, `get_fills`/`parse_fill`, `cancel_all_for_market`,
