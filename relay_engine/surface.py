@@ -41,6 +41,10 @@ class Surface:
         self.ledger = ledger
         self._last_state: Dict[tuple, str] = {}  # (lane, market, window) -> last state
         self.interim_counters = defaultdict(int)  # (lane, state) -> count
+        # Scientist stamp (P3): five lanes on one book contaminate each other's
+        # counterfactuals — accepted by ruling, but every row carries which
+        # lanes were concurrently live on the market so analysis can condition.
+        self.concurrent_provider = lambda market: ""
 
     def write_row(self, lane: str, market: str, window_id: str, state: str,
                   transport: str = "WS", detail: str = "", ts: Optional[float] = None) -> bool:
@@ -59,10 +63,10 @@ class Surface:
                 f"duplicate terminal row for {key}: had {self._last_state[key]}, got {state}")
         self._last_state[key] = state
         self.ledger.db.execute(
-            "INSERT INTO surface_rows (ts, lane, market, window_id, state, terminal, transport, detail)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO surface_rows (ts, lane, market, window_id, state, terminal,"
+            " transport, detail, concurrent_lanes) VALUES (?,?,?,?,?,?,?,?,?)",
             (ts if ts is not None else time.time(), lane, market, window_id, state,
-             1 if terminal else 0, transport, detail),
+             1 if terminal else 0, transport, detail, self.concurrent_provider(market)),
         )
         self.ledger.db.commit()
         return True

@@ -185,6 +185,35 @@ class Custodian:
                     lane, len(open_here))
 
     # ------------------------------------------------------------------
+    def tick(self, books: dict, close_ts_of, now: float,
+             balance_usd: float = 0.0, spot=None, boundaries=None) -> list:
+        """P3.4: the live custody loop — every open position, every cycle,
+        winning or losing. Reads the leg's mark from the book, runs should_cut,
+        executes via the baton with crossfire. Returns [(market, lane, trigger)]
+        for cuts executed this tick."""
+        cuts = []
+        for key, pos in list(self.positions.items()):
+            book = books.get(pos.market)
+            if book is None:
+                continue
+            close_ts = close_ts_of(pos.market)
+            if close_ts is None:
+                continue
+            mark = (book.best_yes_bid() if pos.side == "yes"
+                    else book.best_no_bid())
+            if mark is None:
+                continue
+            blo, bhi = (boundaries or {}).get(pos.market, (None, None))
+            trigger = self.should_cut(
+                pos, now=now, secs_remaining=close_ts - now,
+                p_win=mark / 100.0, exit_bid_cents=mark, spot=spot,
+                boundary_lo=blo, boundary_hi=bhi, balance_usd=balance_usd)
+            if trigger:
+                self.execute_cut(pos, mark, book, trigger, crossfire=True)
+                cuts.append((pos.market, pos.lane, trigger))
+        return cuts
+
+    # ------------------------------------------------------------------
     def should_cut(self, pos: OpenPosition, now: float, secs_remaining: float,
                    p_win: float, exit_bid_cents: Optional[int],
                    spot: Optional[float], boundary_lo: Optional[float],
@@ -296,10 +325,12 @@ class Custodian:
 
     # ------------------------------------------------------------------
     def execute_cut(self, pos: OpenPosition, cut_price_cents: int, book,
-                    trigger: str) -> str:
+                    trigger: str, crossfire: bool = True) -> str:
         """BATON LIFECYCLE: cancel the resting exit FIRST, verify, THEN cut.
         Fail-loud on any partial state — a position with both a resting exit and
-        a cut order live is an integrity violation, not a retry."""
+        a cut order live is an integrity violation, not a retry.
+        crossfire=True (the default for a CUT) prices to fill NOW — the one
+        deliberate cross in the engine, confined to CUT by the gateway."""
         key = f"{pos.market}:{pos.lane}"
         if pos.resting_exit_id is not None:
             canceled = self.gateway.cancel(pos.resting_exit_id)
@@ -312,7 +343,7 @@ class Custodian:
         cut = Order(
             lane=pos.lane, event=pos.event, market=pos.market, side=pos.side,
             action="sell", price_cents=cut_price_cents, count=pos.count,
-            size_tier=pos.size_tier, purpose="CUT",
+            size_tier=pos.size_tier, purpose="CUT", crossfire=crossfire,
         )
         result = self.gateway.submit(cut, book)
         transport = self.ladder.custodian_transport() if self.ladder else "WS"

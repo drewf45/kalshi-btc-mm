@@ -56,6 +56,18 @@ class ShadowEngine:
                                 on_booked=self._on_fill_booked)
         self.boot_caps = None
         self._window_of = {}  # market -> window_id (market close ts as string)
+        self.surface.concurrent_provider = self._concurrent_lanes
+
+    def _concurrent_lanes(self, market: str) -> str:
+        """Scientist stamp: lanes with a position or resting order on this market."""
+        live = set()
+        for (ev, mkt, lane), net in self.gateway.positions.items():
+            if mkt == market and net != 0:
+                live.add(lane)
+        for o in self.gateway.resting.values():
+            if o.market == market:
+                live.add(o.lane)
+        return ",".join(sorted(live))
 
     def _on_fill_booked(self, order, action, price_cents, count, now):
         if order.lane == "FLIP":
@@ -90,8 +102,23 @@ class ShadowEngine:
             log.warning("entries resumed after clean-frame count")
 
     def cycle(self, markets, now=None, spot=None):
-        """One evaluation cycle: EVERY lane looks at EVERY market (C.4)."""
+        """One evaluation cycle: EVERY lane looks at EVERY market (C.4).
+        ARBITRATION (P3 Broker part): custodian exits run FIRST, then lanes in
+        registry order (F -> H8 -> FLIP -> D -> P); FLIP's takes lead its own
+        proposal list."""
         now = time.time() if now is None else now
+
+        # 1) custodian exits outrank everything (risk reduction first)
+        from .lanes import infer_close_ts_from_ticker
+        cuts = self.custodian.tick(
+            books={m: self.feed.book(m) for m in markets},
+            close_ts_of=infer_close_ts_from_ticker, now=now,
+            balance_usd=self.ledger.book_cents() / 100.0, spot=spot)
+        for market, lane, trigger in cuts:
+            self.surface.write_row(lane, market,
+                                   self._window_of.get(market, f"w-{market}"),
+                                   "EXITED", detail=f"CUSTODIAN_CUT:{trigger}")
+
         for market in markets:
             window = self._window_of.setdefault(market, f"w-{market}")
             book = self.feed.book(market)
@@ -108,6 +135,15 @@ class ShadowEngine:
 
             for lane in self.lanes:
                 decision = lane.evaluate(market, ctx)
+                # D watchdog abandon: broken evidence -> custodian cut NOW
+                if lane.name == "D" and decision.pass_reason == "EVIDENCE_BROKEN":
+                    pos = self.custodian.positions.get(f"{market}:D")
+                    if pos is not None:
+                        mark = book.best_yes_bid() if pos.side == "yes" else book.best_no_bid()
+                        if mark is not None:
+                            self.custodian.execute_cut(pos, mark, book,
+                                                       "EVIDENCE_BROKEN", crossfire=True)
+                            lane.d.clear_broken()
                 proposals = decision.multi if decision.multi else (
                     [decision.proposal] if decision.proposal is not None else [])
                 if not proposals:

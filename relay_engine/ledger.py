@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS surface_rows (
     state TEXT NOT NULL,            -- PASS | PROPOSED | ENTERED | EXITED | CUSTODIED | SETTLED | ...
     terminal INTEGER NOT NULL,      -- 1 = terminal row (one per lane/market/window)
     transport TEXT NOT NULL DEFAULT 'WS',   -- WS | EXPLORATION (feed-parity law)
-    detail TEXT NOT NULL DEFAULT ''
+    detail TEXT NOT NULL DEFAULT '',
+    concurrent_lanes TEXT NOT NULL DEFAULT ''  -- Scientist stamp (P3): lanes live on this market at write time
 );
 CREATE TABLE IF NOT EXISTS book_snapshots (
     id INTEGER PRIMARY KEY,
