@@ -4,10 +4,13 @@ The dataclass/predicate/treasury classes are crypto-free (sandbox-runnable). The
 and _record_enter round-trip import the client-bound modules, so they run in CI/deploy (or
 against a stubbed client)."""
 
+import os
+import sqlite3
+import tempfile
 import unittest
 from dataclasses import asdict
 
-from k_worker import store, treasury
+from k_worker import store, treasury, discipline
 
 _RealSurfaceRow = store.SurfaceRow    # capture before any test can monkeypatch the module attr
 
@@ -87,6 +90,78 @@ class TestTreasuryWipe(_RestoreMixin):
 
 
 # ── integration: boot scan + _record_enter (client-bound → CI/stub) ──
+# ── WO-MORNING §1 migration parity (crypto-free; real DB fixture) ────
+_LEGACY_FLIP_WINDOWS = """
+    CREATE TABLE flip_windows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, close_ts INTEGER,
+        tag TEXT, ticker TEXT, entry_yes INTEGER, entry_no INTEGER, bundle_cost INTEGER,
+        exit_yes INTEGER, exit_no INTEGER, capture_a_cents INTEGER, capture_b_cents INTEGER,
+        realized_cents INTEGER, mtm_open_cents INTEGER, spread_yes INTEGER, spread_no INTEGER,
+        sigma_at_gate REAL, ttff_s REAL, ttflat_s REAL, outcome_tag TEXT, broker_flat INTEGER)
+"""
+
+
+class TestFlipWindowMigration(unittest.TestCase):
+    def test_legacy_schema_migrates_then_insert_succeeds(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "legacy.db")
+        c = sqlite3.connect(path)                 # a DB predating WO-4/WO-6 columns
+        c.execute(_LEGACY_FLIP_WINDOWS)
+        c.commit()
+        c.close()
+        saved_path, saved_conn = store.DB_PATH, store._conn
+        try:
+            store.DB_PATH = path
+            store.init_db()                        # runs the guarded ALTER on the legacy table
+            rid = store.insert_flip_window(
+                ts=1.0, tag="20:00", ticker="KXBTC15M-X", entry_yes=45, entry_no=48,
+                join_yes=45, join_no=48, post_dt_yes=1.0, post_dt_no=2.0,
+                booksum_yes=93, booksum_no=93, bundle_cost=93, realized_cents=7,
+                outcome_tag="NETTED_2R", broker_flat=1)
+            self.assertTrue(rid)                   # INSERT with every column succeeds
+            row = store.flip_windows_between(0, 9)[0]
+            self.assertEqual(row["booksum_yes"], 93)
+            self.assertEqual(row["post_dt_no"], 2.0)
+        finally:
+            store.DB_PATH, store._conn = saved_path, saved_conn
+
+
+# ── WO-MORNING §2 the kill learns magnitude (crypto-free) ────────────
+class TestTailLossMagnitude(_RestoreMixin):
+    def setUp(self):
+        super().setUp()
+        self.state, self.alerts = {}, []
+        self.P(discipline.store, "get_state", lambda k: self.state.get(k))
+        self.P(discipline.store, "set_state", lambda k, v: self.state.__setitem__(k, v))
+        self.P(discipline.notify, "alert", lambda t: self.alerts.append(t))
+
+    def _halted(self):
+        return bool(self.state.get("halted"))
+
+    def test_small_declines_do_not_kill(self):
+        for i in range(3):                         # three routine −2¢ LONE_DECLINED flattens
+            discipline.record_loss(2, f"W{i}", "LONE_DECLINED")
+        self.assertFalse(self._halted())
+
+    def test_sub_threshold_losses_do_not_kill(self):
+        for i in range(3):                         # three −5¢ (< 10¢) windows
+            discipline.record_loss(5, f"W{i}", "LONE_RIDE")
+        self.assertFalse(self._halted())
+
+    def test_three_real_losses_kill(self):
+        for i in range(3):                         # three −15¢ genuine losing windows
+            discipline.record_loss(15, f"W{i}", "LONE_RIDE")
+        self.assertTrue(self._halted())
+        self.assertTrue(any("TAIL-LOSS KILL" in a for a in self.alerts))
+
+    def test_two_legs_one_window_counts_once(self):
+        discipline.record_loss(15, "W1", "LONE_RIDE")   # both legs of the SAME window
+        discipline.record_loss(48, "W1", "LONE_RIDE")
+        import json
+        self.assertEqual(len(json.loads(self.state["loss_ts"])), 1)
+        self.assertFalse(self._halted())
+
+
 @unittest.skipUnless(_IMPORTABLE, "imports the cryptography-bound client (CI only)")
 class TestBootScanAndEnterRow(_RestoreMixin):
     def test_mixed_positions_allowlist(self):

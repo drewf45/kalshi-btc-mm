@@ -81,7 +81,8 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 `FLIP_SIDE_MAX=49` · `FLIP_REQUIRE_PAIR=1` (pair-or-nothing) · `FLIP_LINE=99` ·
 `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` · `FLIP_STOP_CENTS=25` ·
 `FLIP_PAUSE_AFTER_STOPS=2` · `KW_SERIES_ALLOWLIST=KXBTC15M` (the only series the bot books) ·
-`KW_CLEAR_HALT` (set `=1` for a one-boot halt clear, then remove) — all overridable.
+`KW_CLEAR_HALT` (set `=1` for a one-boot halt clear, then remove) · `TAIL_LOSS_MIN_CENTS=10`
+(min per-window loss the tail-loss kill counts) — all overridable.
 
 ## Resume posture (WO-RESUME)
 - **Pair-or-nothing (`FLIP_REQUIRE_PAIR=1`, default).** At entry-phase end with exactly ONE
@@ -93,6 +94,16 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 - **Boot-clear (`KW_CLEAR_HALT=1`).** Clears discipline halt / tail-loss kill + the flip stop
   streak ONCE at boot (`halt cleared by env (one-boot)`), no shell. A persisted marker stops a
   crash-loop from self-clearing; removing the env re-arms it.
+
+## Kill learns magnitude (WO-MORNING)
+- **Migration parity.** The newer `flip_windows` columns (join/post_dt/booksum) are added to a
+  legacy DB via a guarded ALTER at boot, so window-row INSERTs stop failing on a schema that
+  predates them.
+- **Per-window tail-loss kill.** The 3-in-60 kill now counts per WINDOW net, not per leg:
+  a netted bundle nets positive and a declined window nets ≈ 0, so they no longer read as
+  per-leg losses. Only a genuine losing window ≥ `TAIL_LOSS_MIN_CENTS` (10¢) counts;
+  `LONE_DECLINED` windows never count (the pair rule's bounded cost); each window counts at
+  most once. Treasury still books every leg — only the discipline count moved to per-window.
 
 ## Guardrails (WO-5)
 - **ENTER-row lineage.** `SurfaceRow` carries `order_id`; every flip leg's ledger row is

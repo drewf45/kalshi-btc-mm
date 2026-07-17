@@ -134,6 +134,18 @@ def init_db() -> None:
     _conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_flip_windows_ts ON flip_windows(ts)
     """)
+    # WO-MORNING §1: a live DB created before WO-4/WO-6 lacks the newer flip_windows columns
+    # (the CREATE above only fires on a fresh table). Guarded-ALTER them so window INSERTs
+    # with every column succeed on legacy schemas. ALTER is idempotent via the except.
+    for col, typ in [
+        ("join_yes", "INTEGER"), ("join_no", "INTEGER"),
+        ("post_dt_yes", "REAL"), ("post_dt_no", "REAL"),
+        ("booksum_yes", "INTEGER"), ("booksum_no", "INTEGER"),
+    ]:
+        try:
+            _conn.execute(f"ALTER TABLE flip_windows ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS epochs (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1020,6 +1032,29 @@ def flip_windows_between(lo_ts: float, hi_ts: float) -> list:
         )
         names = [d[0] for d in cur.description]
         return [dict(zip(names, r)) for r in cur.fetchall()]
+
+
+def flip_outcome_for_ticker(ticker: str) -> Optional[str]:
+    """WO-MORNING §2: the most-recent flip_windows outcome_tag for a ticker (or None)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT outcome_tag FROM flip_windows WHERE ticker=? ORDER BY id DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def window_pnl_cents(ticker: str) -> float:
+    """WO-MORNING §2: window NET settled P&L in cents — the sum across a ticker's resolved
+    ENTER legs. Netted bundles net positive; a declined window nets ≈ 0. This is what the
+    tail-loss kill counts, so netted/declined windows don't read as per-leg losses."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT COALESCE(SUM(pnl_net), 0) FROM surface
+               WHERE market_ticker=? AND action='ENTER' AND resolution IN ('win','loss')""",
+            (ticker,),
+        ).fetchone()
+    return float(row[0] or 0.0) * 100.0
 
 
 def lookup_lane(ticker: str) -> Optional[str]:

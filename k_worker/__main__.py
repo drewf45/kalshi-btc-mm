@@ -154,14 +154,12 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
                 if won:
                     pnl = ((100 - eff_cost) * n_ct - (fee_cents or 0)) / 100.0
                     res = "win"
-                    discipline.record_win()
                     treasury.waterfall(pnl)
                     realized_cents = (100.0 - float(eff_cost)) * n_ct - float(fee_cents or 0)
                 else:
                     pnl = -(eff_cost * n_ct + (fee_cents or 0)) / 100.0
                     res = "loss"
-                    discipline.record_loss()
-                    treasury.record_loss(pnl)
+                    treasury.record_loss(pnl)   # treasury books per leg; the kill counts per WINDOW below
                     realized_cents = -(float(eff_cost) * n_ct + float(fee_cents or 0))
                 has_fill = True
             else:
@@ -193,6 +191,15 @@ def _backfill_settlements(client: kalshi.KalshiClient) -> int:
             best_available_cents, regret_missed, regret_avoided,
             outcome_class,
         )
+
+        # WO-MORNING §2: the tail-loss kill counts per WINDOW net (not per leg). A netted
+        # bundle nets positive and a declined window nets ≈ 0, so only a genuinely losing
+        # window ≥ TAIL_LOSS_MIN_CENTS (and not LONE_DECLINED) counts toward the 3-in-60.
+        if has_fill:
+            net_cents = store.window_pnl_cents(ticker)
+            if net_cents < 0:
+                discipline.record_loss(abs(net_cents), ticker,
+                                       store.flip_outcome_for_ticker(ticker))
 
     if updated:
         log.info(f"[BACKFILL] Updated {updated} rows across {len(tickers)} tickers")
