@@ -215,6 +215,46 @@ DB: relay_shadow.db (single-writer: this engine's own database)
   redeploy, confirm `AUTH:` line → `WS subscribed` → recorder confirmed; the 24h gate-7
   clock starts at the first clean subscribed frame.
 
+## WO-2026-07-17-RELAY-P3 — "ALL LANES LIVE" (supersedes the P2 scope guard per R1)
+
+Suite at this commit: **128 passed** (`python -m pytest tests/ -q`).
+
+- **P3.1 TRUE** — venue hands (`relay_engine/venue.py`, flipdesk kalshi.py whole), live
+  gateway branch (RUN_MODE=LIVE + phrase only; balance re-read per write; sells translate
+  to complement buys — the proven engine buys only), fills loop (`relay_engine/fills.py`:
+  exactly-once, order-index attribution, foreign fills counted not claimed, reconcile
+  sweep), REJECT_TAKER_ENTRY (strictly-through prices; exact-boundary joins left to venue
+  post_only whose rejection is a normal reprice). **The Adversary's wall honored: the
+  booking path shipped proven (tests) before any lane beyond F/H8 landed.**
+- **P3.2 TRUE** — Lane FLIP ported (`lane_flip.py` + `flip_math.py` verbatim): internal
+  walls whole at this morning's traded knobs (all DREW-DEFAULT), pure signals
+  byte-identical, orders through gateway.submit (flip bundle reconstructible per-lane
+  from surface rows — acceptance test green), one exit owner (scratch reasons =
+  custodian cut-params; custodian executes), cross-400 normalized, stop-streak -> lane
+  kill. Gateway single-entry wall scoped per side (FLIP quotes both sides; the post-fill
+  second leg is risk-reducing at the canonical layer).
+- **P3.3 TRUE** — Lane D ported from d_worker shapes (`lane_d.py`): classify with
+  evidence rows, reserve-before-seed with the absolute veto and append-only decisions,
+  watchdog re-verify -> abandon through the custodian, recovery baton, 50-80c band with
+  the 60c DREW-DEFAULT floor, delta-gated (evidence-born: TABLE_ABSENT = no trade),
+  hard-pinned KXBTC15M (multi-series scanner = noted seam, not built).
+- **P3.4 TRUE** — custodian live-cut tick first in every cycle (crossfire on CUT only),
+  D-abandon wiring, the Scientist's concurrent-lane stamp on every surface row, ops
+  parity pack: WORST-DAY BOUND as a number (min of cap x events / kill clamp / drawdown
+  rail), LANES LIVE vs NOT YET BUILT, foreign-fills alarm polarity.
+- **P3.5 TRUE** — Lane P built new: displacement fade (0.05 trigger in the 0.03-0.10
+  band), sustained-fresh-frame confirmation, tape stand-down; THE NEGATIVE SPEC SHIPPED
+  FIRST (8 never-trigger tests: flickers, stale frames, re-reads, whipsaws, off-band,
+  tape-confirmed, no-prior). All five lanes live in the registry.
+- **P3.6 PARTIAL** — arbitration ENCODED and test-proven (custodian exits first, FLIP
+  takes lead, entries F->H8->FLIP->D->P: `tests/test_arbitration.py`). The demo session
+  script ships (`scripts/demo_mechanics_check.py`: place/amend/cancel, stacked TROV,
+  netting_enabled probe, fee read) — **UNPROVEN until run where the venue is reachable**
+  (this sandbox's policy blocks it). Any surprise in its report = WALL, back to Drew.
+- **GO-LIVE remains Drew's act**: RUN_MODE=LIVE + `I_UNDERSTAND_LIVE` phrase on the
+  (separate) relay service. Nothing auto-deploys live. Constants at go-live per Part IV,
+  all DREW-DEFAULT.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
