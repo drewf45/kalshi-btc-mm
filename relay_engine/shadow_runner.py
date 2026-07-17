@@ -29,8 +29,20 @@ from .surface import PASS, PROPOSED, Surface
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("relay.shadow")
 
-CYCLE_SECONDS = 1.0
-WINDOW_ROLL_CHECK_SECONDS = 5.0
+def subscribe_cmd(cmd_id: int, market_tickers) -> dict:
+    """F1b: the subscribe grammar — orderbook_delta takes MARKET tickers,
+    never series_tickers. Lifecycle + fill ride the same subscription."""
+    return {"id": int(cmd_id), "cmd": "subscribe",
+            "params": {"channels": ["orderbook_delta", "ticker_v2",
+                                    "market_lifecycle_v2", "fill"],
+                       "market_tickers": sorted(market_tickers)}}
+
+
+CYCLE_SECONDS = 1.0            # F3: the cycle gate (frames update books; sweeps run at 1s)
+SPOT_MAX_AGE_S = 30.0          # F2: BLIND bound — older spot serves as None
+SPOT_POLL_S = 1.5              # F2: spot fetch cadence
+DISCOVERY_SWEEP_S = 60.0       # F1c: rediscovery cadence (belt under lifecycle events)
+PACK_HOURLY_S = 3600.0         # F7: pack timer
 
 
 class ShadowEngine:
@@ -57,6 +69,42 @@ class ShadowEngine:
         self.boot_caps = None
         self._window_of = {}  # market -> window_id (market close ts as string)
         self.surface.concurrent_provider = self._concurrent_lanes
+        # F1/F2: exchange-truth market metadata + the spot tape
+        self.market_meta = {}   # market -> {close_ts, boundary_lo, boundary_hi}
+        self.spot = None
+        self.spot_ts = 0.0
+        self.spot_ticks = []    # rolling tape for FLIP/P features
+
+    # ── F1: market lifecycle (discovery + rollover) ─────────────────────
+    def on_market_discovered(self, ticker: str, market_obj: dict) -> None:
+        from . import venue
+        close_ts = venue.resolve_close_ts(market_obj, ticker)
+        blo, bhi = venue.extract_boundaries(market_obj)
+        self.market_meta[ticker] = {"close_ts": close_ts,
+                                    "boundary_lo": blo, "boundary_hi": bhi}
+
+    def on_market_closed(self, ticker: str) -> None:
+        """F4: settled/closed markets are pruned everywhere, not swept forever."""
+        self.close_window(ticker)
+        self.market_meta.pop(ticker, None)
+        self.feed.drop_book(ticker)
+        self.flip.windows.pop(ticker, None)
+
+    # ── F2: the spot tape ───────────────────────────────────────────────
+    def record_spot(self, price, now) -> None:
+        if price is None:
+            return
+        self.spot = price
+        self.spot_ts = now
+        self.spot_ticks.append(price)
+        del self.spot_ticks[:-64]
+
+    def fresh_spot(self, now, max_age=None):
+        """BLIND behavior: a stale spot is None — lanes degrade safely."""
+        limit = SPOT_MAX_AGE_S if max_age is None else max_age
+        if self.spot is None or (now - self.spot_ts) > limit:
+            return None
+        return self.spot
 
     def _concurrent_lanes(self, market: str) -> str:
         """Scientist stamp: lanes with a position or resting order on this market."""
@@ -101,19 +149,29 @@ class ShadowEngine:
             self.gateway.resume_entries("DEGRADE_LADDER")
             log.warning("entries resumed after clean-frame count")
 
+    def _meta(self, market):
+        return self.market_meta.get(market, {})
+
     def cycle(self, markets, now=None, spot=None):
         """One evaluation cycle: EVERY lane looks at EVERY market (C.4).
         ARBITRATION (P3 Broker part): custodian exits run FIRST, then lanes in
         registry order (F -> H8 -> FLIP -> D -> P); FLIP's takes lead its own
-        proposal list."""
+        proposal list. close_ts and boundaries come from exchange-truth
+        market_meta when discovery has run (F1/F2); ticker inference is the
+        fallback."""
         now = time.time() if now is None else now
+        if spot is None:
+            spot = self.fresh_spot(now)
 
         # 1) custodian exits outrank everything (risk reduction first)
         from .lanes import infer_close_ts_from_ticker
         cuts = self.custodian.tick(
             books={m: self.feed.book(m) for m in markets},
-            close_ts_of=infer_close_ts_from_ticker, now=now,
-            balance_usd=self.ledger.book_cents() / 100.0, spot=spot)
+            close_ts_of=lambda m: (self._meta(m).get("close_ts")
+                                   or infer_close_ts_from_ticker(m)),
+            now=now, balance_usd=self.ledger.book_cents() / 100.0, spot=spot,
+            boundaries={m: (self._meta(m).get("boundary_lo"),
+                            self._meta(m).get("boundary_hi")) for m in markets})
         for market, lane, trigger in cuts:
             self.surface.write_row(lane, market,
                                    self._window_of.get(market, f"w-{market}"),
@@ -122,9 +180,14 @@ class ShadowEngine:
         for market in markets:
             window = self._window_of.setdefault(market, f"w-{market}")
             book = self.feed.book(market)
+            meta = self._meta(market)
             transport = "WS" if self.ladder.entries_allowed() else "EXPLORATION"
             ctx = {
                 "book": book, "now": now, "spot": spot,
+                "spot_ticks": self.spot_ticks,
+                "close_ts": meta.get("close_ts"),
+                "boundary_lo": meta.get("boundary_lo"),
+                "boundary_hi": meta.get("boundary_hi"),
                 "cash_usd": self.ledger.book_cents() / 100.0,
                 "entries_allowed": self.ladder.entries_allowed(),
             }
@@ -195,14 +258,23 @@ async def run():
     engine = ShadowEngine()
     engine.boot(auth_line=auth_line)
 
-    if config.RUN_MODE != "SHADOW":
+    if config.RUN_MODE != "SHADOW" and not config.live_submit_enabled():
         raise FatalIntegrityError(
-            f"shadow_runner requires RUN_MODE=SHADOW, got {config.RUN_MODE}")
+            f"RUN_MODE={config.RUN_MODE} without the I_UNDERSTAND_LIVE phrase — "
+            f"go-live is a human act (env var + phrase), refusing to run")
 
     try:
         import websockets
     except ImportError as e:
         raise FatalIntegrityError(f"websockets required for the WS-first feed: {e}")
+
+    from . import venue
+    client = venue.build_client()
+
+    if config.live_submit_enabled():
+        # F6: LIVE boot reconcile — money truth before the first cycle
+        from .reconcile import live_boot_reconcile
+        live_boot_reconcile(engine, client)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -212,10 +284,52 @@ async def run():
         except NotImplementedError:
             pass
 
-    markets: set = set()
-    last_pack = time.time()
     ws_path = urlparse(config.WS_URL).path or "/trade-api/ws/v2"
     rejections = auth.HandshakeRejections(limit=3)
+
+    # ── F2: the spot task — its own cadence, staleness-bounded ─────────────
+    async def spot_task():
+        while not stop.is_set():
+            price = await asyncio.to_thread(venue.get_btc_spot)
+            engine.record_spot(price, time.time())
+            await asyncio.sleep(SPOT_POLL_S)
+
+    # ── F7: the pack timer — decoupled from market activity ────────────────
+    async def pack_task():
+        while not stop.is_set():
+            await asyncio.sleep(PACK_HOURLY_S)
+            print(daily_pack(engine.ledger, engine.surface, engine.cash,
+                             foreign_fills=engine.fills.foreign_seen), flush=True)
+
+    asyncio.create_task(spot_task())
+    asyncio.create_task(pack_task())
+
+    subscribed: set = set()
+
+    async def sync_subscriptions(ws, cmd_seq):
+        """F1a-c: signed REST discovery is the subscription's ground truth.
+        New windows subscribe (market_tickers, NEVER series_tickers on
+        orderbook_delta); closed windows prune everywhere."""
+        mkts = await asyncio.to_thread(venue.list_open_markets, client)
+        current = set()
+        for m in mkts:
+            ticker = m.get("ticker") or m.get("market_ticker", "")
+            current.add(ticker)
+            engine.on_market_discovered(ticker, m)
+        new = sorted(current - subscribed)
+        gone = sorted(subscribed - current)
+        if new:
+            cmd_seq[0] += 1
+            payload = json.dumps(subscribe_cmd(cmd_seq[0], new))
+            engine.feed.note_sent(payload)
+            await ws.send(payload)
+            subscribed.update(new)
+            log.warning("WS subscribed: %s", ",".join(new))
+        for ticker in gone:
+            subscribed.discard(ticker)
+            engine.on_market_closed(ticker)
+            log.info("window closed + pruned: %s", ticker)
+        return current
 
     while not stop.is_set():
         try:
@@ -223,28 +337,46 @@ async def run():
             async with websockets.connect(
                     config.WS_URL,
                     additional_headers=auth.signed_headers("GET", ws_path)) as ws:
-                await ws.send(json.dumps({
-                    "id": 1, "cmd": "subscribe",
-                    "params": {"channels": ["orderbook_delta", "ticker_v2"],
-                               "series_tickers": [config.SERIES_TICKER]},
-                }))
                 rejections.success()  # venue accepted the handshake
-                log.info("WS subscribed: %s on %s", config.SERIES_TICKER, config.WS_URL)
+                subscribed.clear()
+                cmd_seq = [0]
+                await sync_subscriptions(ws, cmd_seq)
                 engine.ladder.snapshot_resynced()
+                last_cycle = 0.0
+                last_discovery = time.monotonic()
                 while not stop.is_set():
-                    raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        # F5: a quiet stretch is not death — ping; only a
+                        # failed pong walks the ladder.
+                        try:
+                            pong = await ws.ping()
+                            await asyncio.wait_for(pong, timeout=5.0)
+                            continue
+                        except Exception as pe:
+                            raise ConnectionError(f"ping failed after quiet: {pe}")
                     engine.feed.handle_frame(raw)
                     try:
                         msg = json.loads(raw)
-                        mkt = (msg.get("msg") or {}).get("market_ticker")
-                        if mkt:
-                            markets.add(mkt)
+                        m = msg.get("msg") or {}
+                        mkt = m.get("market_ticker")
+                        # F1c: lifecycle events drive rollover between sweeps
+                        if msg.get("type") in ("market_lifecycle_v2", "market_lifecycle"):
+                            await sync_subscriptions(ws, cmd_seq)
+                        elif mkt and mkt not in subscribed:
+                            subscribed.add(mkt)
                     except (ValueError, AttributeError):
                         pass
-                    engine.cycle(sorted(markets))
-                    if time.time() - last_pack > 3600:
-                        print(daily_pack(engine.ledger, engine.surface, engine.cash), flush=True)
-                        last_pack = time.time()
+                    mono = time.monotonic()
+                    if mono - last_discovery >= DISCOVERY_SWEEP_S:
+                        last_discovery = mono
+                        await sync_subscriptions(ws, cmd_seq)
+                    # F3: frames update books continuously; the five-lane sweep
+                    # runs on the CYCLE_SECONDS gate.
+                    if mono - last_cycle >= CYCLE_SECONDS:
+                        last_cycle = mono
+                        engine.cycle(sorted(engine.market_meta.keys() | subscribed))
         except FatalIntegrityError:
             raise  # fail loud, stay stopped
         except Exception as e:
@@ -258,8 +390,10 @@ async def run():
             log.warning("WS down (%s); degrade ladder engaged; reconnecting in 3s", e)
             await asyncio.sleep(3.0)
 
-    print(daily_pack(engine.ledger, engine.surface, engine.cash), flush=True)
-    log.info("shadow runner stopped; zero orders placed: %s",
+    stop.set()
+    print(daily_pack(engine.ledger, engine.surface, engine.cash,
+                     foreign_fills=engine.fills.foreign_seen), flush=True)
+    log.info("runner stopped; zero orders placed: %s",
              len(engine.gateway.shadow_orders) == 0)
 
 

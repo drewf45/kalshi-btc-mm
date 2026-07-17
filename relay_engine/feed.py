@@ -88,11 +88,30 @@ class Feed:
         self.ladder = ladder
         self.recorder = recorder
         self.books: Dict[str, OrderBook] = {}
+        self.last_sent_payload: Optional[str] = None  # F1d: echoed in config-error FATALs
+        self.order_errors = 0                         # per-order errors routed, counted
+
+    def note_sent(self, payload: str) -> None:
+        """Runner registers each subscribe/command payload for the error autopsy."""
+        self.last_sent_payload = payload
 
     def book(self, market: str) -> OrderBook:
         if market not in self.books:
             self.books[market] = OrderBook(market=market)
         return self.books[market]
+
+    def drop_book(self, market: str) -> None:
+        self.books.pop(market, None)
+
+    def _classify_error(self, msg: dict) -> str:
+        """F1d/F10 (Adversary): error frames are CLASSIFIED, not uniformly fatal.
+        per-order errors -> the gateway/fills layer's business (logged, counted);
+        subscribe/config errors -> FATAL with the sent payload echoed;
+        unknown -> FATAL (the default preserved)."""
+        text = json.dumps(msg).lower()
+        if any(k in text for k in ("order", "insufficient", "self_trade", "post only")):
+            return "order"
+        return "config"
 
     def handle_frame(self, raw: str, now: Optional[float] = None) -> None:
         now = time.time() if now is None else now
@@ -102,9 +121,17 @@ class Feed:
             # A garbled frame is not a clean frame; treat as transport damage.
             self.ladder.ws_lost(f"undecodable frame: {e}")
             return
-        # Venue error codes are fail-loud paths (C.3), not silent skips.
+        # Venue error codes are fail-loud paths (C.3), not silent skips —
+        # but CLASSIFIED (F1d): a per-order rejection must not halt a live
+        # book with positions open.
         if msg.get("type") == "error":
-            raise FatalIntegrityError(f"venue error frame: {msg}")
+            if self._classify_error(msg) == "order":
+                self.order_errors += 1
+                log.warning("venue per-order error frame (routed, not fatal): %s", msg)
+                return
+            raise FatalIntegrityError(
+                f"venue config/subscribe error: {msg} — sent payload was: "
+                f"{self.last_sent_payload}")
         mtype = msg.get("type")
         m = msg.get("msg", {})
         market = m.get("market_ticker", "")

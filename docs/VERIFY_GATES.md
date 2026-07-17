@@ -255,6 +255,44 @@ Suite at this commit: **128 passed** (`python -m pytest tests/ -q`).
   (separate) relay service. Nothing auto-deploys live. Constants at go-live per Part IV,
   all DREW-DEFAULT.
 
+## WO-2026-07-17-RELAY-P4 — "MAKE IT WATCH" (build side closed; deploy verify pending)
+
+Suite at this commit: **136 passed** (8 new P4 tests).
+
+- **F1 TRUE** — subscription lifecycle: signed REST discovery at connect
+  (`venue.list_open_markets`), subscribe grammar fixed and SNAPSHOT-TESTED —
+  `market_tickers`, never `series_tickers`, channels orderbook_delta/ticker_v2/
+  market_lifecycle_v2/fill (`shadow_runner.py::subscribe_cmd`); rollover via lifecycle
+  events AND the 60s rediscovery sweep; closed windows pruned everywhere (meta, books,
+  windows, FLIP state — folds F4). Error frames CLASSIFIED (F1d/Adversary): per-order →
+  routed + counted, never fatal; config/subscribe → FATAL **with the sent payload
+  echoed**; unknown → FATAL (default preserved) (`feed.py::_classify_error`).
+- **F2 TRUE** — the blind eye opened: spot task on its own 1.5s cadence
+  (venue.get_btc_spot, ported with its staleness law), BLIND bound 30s (stale serves as
+  None; lanes degrade exactly as before), boundaries + close_ts from exchange-truth
+  market_meta. Test-proven both ways: H8's gate FIRES on wired spot (a live H8 shadow
+  proposal) and degrades to H8_NO_SPOT without it; the custodian's spot-safety master
+  override holds a losing-looking mark when spot is safely ours and cuts when it isn't
+  — through the runner, not just the unit.
+- **F3 TRUE** — cycle throttle: frames update books continuously; the five-lane sweep
+  runs on the CYCLE_SECONDS=1.0 monotonic gate (custodian tick inside — 1s risk
+  latency, matching live cadence).
+- **F5 TRUE** — a 30s quiet stretch pings (5s pong window) and continues; only a failed
+  pong walks the ladder. Real closes/exceptions unchanged.
+- **F6 TRUE (shipped + tested; gates nothing in shadow)** — `reconcile.py::
+  live_boot_reconcile`: venue balance baselines (first boot) or routes through the cash
+  protocol (later boots); positions OUR fills explain are adopted with true attribution;
+  unexplained positions QUARANTINED with an alert (never cost-band-guessed — 3.3's law);
+  foreign resting orders alerted, untouched; unreadable balance = FATAL. Runs
+  automatically when RUN_MODE=LIVE + phrase; a bare RUN_MODE=LIVE without the phrase now
+  refuses to run at boot.
+- **F7 TRUE** — the pack prints on its own hourly timer task (decoupled from market
+  activity) and carries the worst-day tuition line + foreign-fill count (both landed in
+  P3.4; the deployed zip predated that commit).
+- **DEPLOY VERIFY (open, needs Render)**: boot tape → `WS subscribed:` with the market
+  list → RECORDER confirmed → first PASS/WATCHING rows → one clean 15-minute rollover
+  (old pruned, new subscribed) → first timer pack. That tape closes gate 7's machinery.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

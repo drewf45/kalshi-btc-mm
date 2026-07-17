@@ -201,6 +201,21 @@ def get_market(client: KalshiClient, ticker: str) -> Dict:
     return resp.get("market", resp) if isinstance(resp, dict) else {}
 
 
+def list_open_markets(client: KalshiClient) -> List[Dict]:
+    """F1a: all open series markets (signed REST) — the subscription's ground
+    truth at connect and on the 60s rediscovery sweep."""
+    resp = client.request("GET", "/markets",
+                          params={"series_ticker": SERIES_TICKER,
+                                  "status": "open", "limit": 200})
+    mkts = resp.get("markets", []) if isinstance(resp, dict) else []
+    out = []
+    for m in mkts:
+        ticker = m.get("ticker") or m.get("market_ticker", "")
+        if ticker and resolve_close_ts(m, ticker) is not None:
+            out.append(m)
+    return out
+
+
 # ── Orderbook ────────────────────────────────────────────────────
 
 @dataclass
@@ -750,6 +765,88 @@ def get_all_recent_fills(client: KalshiClient, limit: int = 200) -> List[Dict]:
     if isinstance(resp, dict):
         return resp.get("fills", [])
     return resp if isinstance(resp, list) else []
+
+
+# ── BTC Spot (Fix 4) ───────────────────────────────────────────
+
+_spot_cache: Dict[str, Any] = {"price": None, "ts": 0.0}
+SPOT_MAX_STALE_SEC = 30.0
+
+
+def get_btc_spot() -> Optional[float]:
+    """BTC spot from Coinbase public ticker, cached <=5s.
+    P6 (0708): on fetch failure the cache is only served if it is younger
+    than SPOT_MAX_STALE_SEC — an unbounded stale fallback was silently
+    feeding hour-old prices into H8 distance and the top-rung guard.
+    Older than the bound -> None; consumers already fail safe on None
+    (H8_NO_SPOT skip, guard skipped). Fail-loud doctrine."""
+    now = time.time()
+    if _spot_cache["price"] is not None and (now - _spot_cache["ts"]) < 5:
+        return _spot_cache["price"]
+    try:
+        resp = requests.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5,
+        )
+        resp.raise_for_status()
+        price = float(resp.json()["data"]["amount"])
+        _spot_cache["price"] = price
+        _spot_cache["ts"] = now
+        return price
+    except Exception as e:
+        age = now - _spot_cache["ts"]
+        if _spot_cache["price"] is not None and age < SPOT_MAX_STALE_SEC:
+            log.warning(f"[SPOT] Coinbase fetch failed: {e} — serving cache age {age:.0f}s")
+            return _spot_cache["price"]
+        log.warning(f"[SPOT] Coinbase fetch failed: {e} — cache stale ({age:.0f}s) -> BLIND (None)")
+        return None
+
+
+# ── Boundary extraction (Fix 4) ────────────────────────────────
+
+_boundary_keys_logged = False
+
+
+def extract_boundaries(market_obj: Dict) -> Tuple[Optional[float], Optional[float]]:
+    """Extract lo/hi price boundaries from market object. Never parse tickers."""
+    global _boundary_keys_logged
+    if not _boundary_keys_logged:
+        log.info(f"[BOUNDARY] Market keys: {sorted(market_obj.keys())}")
+        _boundary_keys_logged = True
+
+    lo, hi = None, None
+    for k in ("floor_strike", "custom_strike_floor", "strike_low", "range_low"):
+        v = market_obj.get(k)
+        if v is not None:
+            try:
+                lo = float(v)
+                break
+            except (ValueError, TypeError):
+                pass
+    for k in ("cap_strike", "custom_strike_cap", "strike_high", "range_high"):
+        v = market_obj.get(k)
+        if v is not None:
+            try:
+                hi = float(v)
+                break
+            except (ValueError, TypeError):
+                pass
+    cs = market_obj.get("custom_strike")
+    if isinstance(cs, dict):
+        if lo is None:
+            for ck in ("floor", "low", "min"):
+                try:
+                    lo = float(cs[ck])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    pass
+        if hi is None:
+            for ck in ("cap", "high", "max"):
+                try:
+                    hi = float(cs[ck])
+                    break
+                except (KeyError, ValueError, TypeError):
+                    pass
+    return lo, hi
 
 
 # ── Total resting order value (P3.6 demo probe) ────────────────
