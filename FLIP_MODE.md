@@ -13,17 +13,17 @@ stays up and the flip lane goes quiet.
 
 Per window:
 1. **Arm at the open** — `discover_market` returns the active window; arm while
-   `secs_to_expiry` is within the first `FLIP_ENTRY_SEC` (120s) of the 900s window.
-2. **Quote both sides** — join the best YES bid and best NO bid (subpenny `v2_price_str`),
-   two `place_order_maker` calls, each `expiration_ts = close_ts − 90`. WALL: combined
-   ≤ `FLIP_LINE` (99¢).
+   `secs_to_expiry` is within the first `FLIP_ENTRY_SEC` (300s) of the 900s window.
+2. **Opportunistic entry (WO-4)** — WATCH the early window rather than quoting both at the
+   bell. Each side posts its bid (subpenny `v2_price_str`, `expiration_ts = close_ts − 90`)
+   the **first time its join ≤ `FLIP_SIDE_MAX` (49¢)** — at most once per side, no re-peg.
+   The **combined wall** holds: a second side posts only if `resting_first + join ≤
+   FLIP_LINE` (99¢). No side ≤ max by phase end → `SAT (no side ≤ 49 in 300s)`.
 3. **Netted / flip** — if **both** legs fill the bundle NETS FLAT and the exchange banks
-   the `+(100−cost)¢` floor at the second fill (F-1): nothing to flip — the mode books it
-   and stops (broker-truth checks net = 0). A **lone** leg is flipped at entry+`FLIP_X`
-   (4¢) via the complement rule (`k_worker/flip_math.py`, pinned): exit held YES@q → buy
-   NO@100−q; exit held NO@q → buy YES@100−q. A lone leg is keepable only ≤ `FLIP_LONE_MAX`
-   (49¢).
-4. **T-90 sweep** — cancel an unfilled lone exit, re-join at the current touch (rejoin
+   `+(100−cost)¢` (rung A). A **lone** leg is flipped at entry+`FLIP_X` (4¢) via the
+   complement rule (`k_worker/flip_math.py`, pinned): exit held YES@q → buy NO@100−q; exit
+   held NO@q → buy YES@100−q. A lone leg is keepable only ≤ `FLIP_LONE_MAX` (49¢).
+4. **T-90 sweep** — cancel an unfilled exit, re-join at the current touch (rejoin
    `expiration_ts = close_ts − 2`, F-3, so it lives to the bell). An intact bundle rides
    its guaranteed floor; a lone leg (≤49¢) rides settlement as the accepted 1-lot residual.
    **No taker path is added.**
@@ -39,6 +39,10 @@ review-pack machinery books P&L — no new accounting.
   entry pair; when both legs fill it nets flat and banks `+(100−cost)¢`. **Rung B** = the
   exit pair at entry+X, itself a second netted capture on a double fill (its exit IS rung B
   for a lone leg). **No rung C, ever.** The tape reads `rungA +5¢ · rungB +6¢ → +11¢`.
+- **Rung-B guard (WO-4).** The double-fill exit pair costs `200 − cost − 2·FLIP_X`; the
+  cheaper (juicier) rung A is, the more that pair overpays. Rung B posts only if that pair
+  stays ≤ `FLIP_LINE` (at X=4: `cost ≥ 93`); below it, rung A is banked and the bundle rides
+  its floor (`rung B skipped`). A lone-leg exit is a single complement buy and is exempt.
 - **No-inventory proof (§1).** At every window DONE the broker — not the code — proves
   flatness: net 0 ⇒ `| flat ✓ (broker)`; a lone ride is the accepted ±1 residual; any other
   net pages Drew `🚨 INVENTORY`, is handed to the boot reconcile/orphan machinery, and an
@@ -58,9 +62,9 @@ table self-provisioning, notify, review pack, discipline halt. The engine diff i
 lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `flip_math.py`.
 
 ## Env
-`KW_MODE` (unset/anything ⇒ FLIP; `OFF` ⇒ kill switch) · `FLIP_ENTRY_SEC=120` ·
-`FLIP_LINE=99` · `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` · `FLIP_STOP_CENTS=25` ·
-`FLIP_PAUSE_AFTER_STOPS=2` (all overridable).
+`KW_MODE` (unset/anything ⇒ FLIP; `OFF` ⇒ kill switch) · `FLIP_ENTRY_SEC=300` ·
+`FLIP_SIDE_MAX=49` · `FLIP_LINE=99` · `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` ·
+`FLIP_STOP_CENTS=25` · `FLIP_PAUSE_AFTER_STOPS=2` (all overridable).
 
 ## Before live — required validation (I could not do these here)
 - The offline sandbox has a broken `cryptography` binding, so `flip_mode` and every

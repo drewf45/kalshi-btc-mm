@@ -101,9 +101,12 @@ class TestFlipCycle(unittest.TestCase):
         flip_mode.engine._observe_mode = False
 
         self._book_calls = 0
+        self.book_provider = None      # optional: clock_ts -> book (time-varying watch)
 
         def _fetch(c, tk):
             self._book_calls += 1
+            if self.book_provider is not None:
+                return self.book_provider(self._clock.time())
             return self.book if self._book_calls == 1 else (self.book2 or self.book)
         flip_mode.kalshi.fetch_orderbook = _fetch
         flip_mode.kalshi.cancel_all_for_market = lambda c, tk: self.cancels.append(tk)
@@ -211,6 +214,102 @@ class TestFlipCycle(unittest.TestCase):
         self.assertTrue(rejoins)
         for o in rejoins:
             self.assertEqual(o["expiration_ts"], int(self.CLOSE - 2))
+
+    # ── WO-4 item 1: rung-B guard (the cheap-bundle trap) ───────────
+    def test_rung_b_skipped_on_cheap_bundle(self):
+        # entry 45+45=90, X4 -> exit pair complements 51+51=102 > line -> rung B skipped
+        self.book = types.SimpleNamespace(yes_bid=45, no_bid=45, yes_ask=55, no_ask=55,
+                                          yes_bid_fp="0.45", no_bid_fp="0.45")
+        self.fills_map = {"yes-45": 45, "no-45": 45}
+        out = flip_mode.run_flip_cycle(None, "KXBTC15M-G", self.CLOSE, {})
+        self.assertEqual(out, "flip_done")
+        self.assertEqual(self._win()["outcome_tag"], "FLOOR_RIDE")
+        self.assertEqual(self._post_entry(), [])            # no rung-B orders posted
+        self.assertTrue(any("rung B skipped" in s for s in self.sent))
+
+    def test_rung_b_posts_when_pair_within_line(self):
+        # entry 49+49=98, X4 -> exit pair 47+47=94 <= line -> rung B posts (both legs)
+        self.book = types.SimpleNamespace(yes_bid=49, no_bid=49, yes_ask=55, no_ask=55,
+                                          yes_bid_fp="0.49", no_bid_fp="0.49")
+        self.fills_map = {"yes-49": 49, "no-49": 49, "no-47": 47, "yes-47": 47}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-P", self.CLOSE, {})
+        self.assertEqual(self._win()["outcome_tag"], "NETTED_2R")
+        self.assertEqual(len(self._post_entry()), 2)
+
+    # ── WO-4 item 2: opportunistic entry ────────────────────────────
+    def test_only_qualifying_side_posts(self):
+        # YES 55 (> side_max) never posts; NO 45 posts. Nothing fills -> only entry orders,
+        # so the whole order tape is the single NO entry.
+        self.book = types.SimpleNamespace(yes_bid=55, no_bid=45, yes_ask=60, no_ask=55,
+                                          yes_bid_fp="0.55", no_bid_fp="0.45")
+        self.fills_map = {}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-Q", self.CLOSE, {})
+        self.assertFalse(any(o["side"] == "yes" for o in self.orders))    # YES never ≤ max
+        self.assertEqual([(o["side"], o["price"]) for o in self.orders], [("no", 45)])
+
+    def test_side_posts_on_first_sighting_not_bell(self):
+        # YES starts at 55, dips to 45 a few polls in -> posts only once it's <= side_max.
+        # (held YES ⇒ the only YES order is that entry; rung B is the NO exit.)
+        def prov(t):
+            yb = 45 if t >= (self.CLOSE - 795) else 55
+            return types.SimpleNamespace(yes_bid=yb, no_bid=None, yes_ask=60, no_ask=None,
+                                         yes_bid_fp="0.45", no_bid_fp=None)
+        self.book_provider = prov
+        self.fills_map = {"yes-45": 45}
+        self.net = 1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-S", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["join_yes"], 45)
+        self.assertTrue(w["post_dt_yes"] and w["post_dt_yes"] > 0)   # posted after the bell
+        yes_entries = [o for o in self.orders if o["side"] == "yes"]
+        self.assertEqual([o["price"] for o in yes_entries], [45])    # one YES post, at 45
+
+    def test_one_shot_per_side_no_repeg(self):
+        # YES 45 then 40; must post at most once, at the first sighting price
+        def prov(t):
+            yb = 45 if t < (self.CLOSE - 795) else 40
+            return types.SimpleNamespace(yes_bid=yb, no_bid=None, yes_ask=60, no_ask=None,
+                                         yes_bid_fp="0.45", no_bid_fp=None)
+        self.book_provider = prov
+        self.fills_map = {}                       # never fills -> book keeps changing
+        flip_mode.run_flip_cycle(None, "KXBTC15M-O", self.CLOSE, {})
+        yes_posts = [o for o in self.orders if o["side"] == "yes"]
+        self.assertEqual(len(yes_posts), 1)
+        self.assertEqual(yes_posts[0]["price"], 45)
+
+    def test_combined_wall_blocks_second_side(self):
+        # lift side_max so a 51 join is postable; the 49+51=100 > line wall blocks NO
+        self.addCleanup(setattr, flip_mode, "FLIP_SIDE_MAX", flip_mode.FLIP_SIDE_MAX)
+        flip_mode.FLIP_SIDE_MAX = 60
+        self.book = types.SimpleNamespace(yes_bid=49, no_bid=51, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.49", no_bid_fp="0.51")
+        self.fills_map = {}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-W", self.CLOSE, {})
+        self.assertTrue(any(o["side"] == "yes" and o["price"] == 49 for o in self.orders))
+        self.assertFalse(any(o["side"] == "no" for o in self.orders))   # wall blocked NO@51
+
+    def test_no_sighting_sats_new_reason(self):
+        self.book = types.SimpleNamespace(yes_bid=55, no_bid=60, yes_ask=60, no_ask=65,
+                                          yes_bid_fp="0.55", no_bid_fp="0.60")
+        out = flip_mode.run_flip_cycle(None, "KXBTC15M-Z", self.CLOSE, {})
+        self.assertEqual(out, "flip_sat_no_side")
+        self.assertTrue(any("no side ≤" in s for s in self.sent))
+        self.assertEqual(self.orders, [])         # nothing posted
+
+    def test_late_single_sighting_still_posts(self):
+        # YES first dips <= side_max only ~t+250s, still inside the 300s entry phase
+        def prov(t):
+            elapsed = t - (self.CLOSE - 800)
+            yb = 45 if elapsed >= 250 else 55
+            return types.SimpleNamespace(yes_bid=yb, no_bid=None, yes_ask=60, no_ask=None,
+                                         yes_bid_fp="0.45", no_bid_fp=None)
+        self.book_provider = prov
+        self.fills_map = {"yes-45": 45}
+        self.net = 1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-LT", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["join_yes"], 45)
+        self.assertGreaterEqual(w["post_dt_yes"], 250)
 
 
 if __name__ == "__main__":

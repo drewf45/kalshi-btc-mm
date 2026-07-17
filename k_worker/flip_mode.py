@@ -28,9 +28,10 @@ KW_MODE = os.environ.get("KW_MODE", "FLIP").strip().upper()   # F-2: FLIP is the
 ENABLED = flip_math.mode_enabled(os.environ.get("KW_MODE"))   # KW_MODE=OFF is the kill switch
 
 FLIP_WINDOW_SEC = int(os.environ.get("FLIP_WINDOW_SEC", "900"))
-FLIP_ENTRY_SEC = int(os.environ.get("FLIP_ENTRY_SEC", "120"))
+FLIP_ENTRY_SEC = int(os.environ.get("FLIP_ENTRY_SEC", "300"))   # WO-4: watch the first ~5 min
 FLIP_LINE = int(os.environ.get("FLIP_LINE", "99"))
 FLIP_LONE_MAX = int(os.environ.get("FLIP_LONE_MAX", "49"))
+FLIP_SIDE_MAX = int(os.environ.get("FLIP_SIDE_MAX", "49"))      # WO-4: post a side the 1st time ≤ this
 FLIP_X = int(os.environ.get("FLIP_X", "4"))
 FLIP_FLAT_AT = int(os.environ.get("FLIP_FLAT_AT", "90"))
 FLIP_STOP_CENTS = int(os.environ.get("FLIP_STOP_CENTS", "25"))
@@ -42,10 +43,11 @@ _STOP_STREAK_KEY = "flip_stop_streak"
 
 def echo_config() -> None:
     notify.send(
-        "🔁 <b>FLIP MODE</b> — arm at open, quote both @join, flip @entry+"
-        f"{FLIP_X}c\n"
-        f"line {FLIP_LINE}c · lone_max {FLIP_LONE_MAX}c · entry {FLIP_ENTRY_SEC}s · "
-        f"flat T-{FLIP_FLAT_AT} · stop {FLIP_STOP_CENTS}c · pause@{FLIP_PAUSE_AFTER_STOPS}"
+        "🔁 <b>FLIP MODE</b> — watch the open, post each side the first time its join ≤ "
+        f"{FLIP_SIDE_MAX}c, flip @entry+{FLIP_X}c\n"
+        f"line {FLIP_LINE}c · side_max {FLIP_SIDE_MAX}c · lone_max {FLIP_LONE_MAX}c · "
+        f"entry {FLIP_ENTRY_SEC}s · flat T-{FLIP_FLAT_AT} · stop {FLIP_STOP_CENTS}c · "
+        f"pause@{FLIP_PAUSE_AFTER_STOPS}"
     )
 
 
@@ -183,62 +185,85 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     gateway.mark_traded(ticker, "F")
     exp = int(close_ts - FLIP_FLAT_AT)     # every order dies at T-90 at the exchange
 
-    book = kalshi.fetch_orderbook(client, ticker)
-    yb, nb = book.yes_bid, book.no_bid
-    if yb is None or nb is None:
-        notify.send(f"⏭ W{tag} — book missing a side | SAT")
-        return "flip_sat_book"
-    cost = flip_math.bundle_cost(yb, nb)
-    if cost > FLIP_LINE:                   # WALL: combined ≤ FLIP_LINE
-        notify.send(f"⏭ W{tag} — bundle {yb}+{nb}={cost} > {FLIP_LINE} | SAT")
-        return "flip_sat_line"
-    if _is_observe():
-        notify.send(f"🔁 W{tag} — would quote {yb}+{nb}={cost} (observe)")
-        return "flip_observe"
-
-    # QUOTE BOTH SIDES at the join, subpenny fp, expiring T-90
-    ys, yp = flip_math.entry_args("yes", yb)
-    yes_oid, _ = kalshi.place_order_maker(client, ticker, ys, yp, 1,
-                                          expiration_ts=exp, v2_price_str=book.yes_bid_fp)
-    ns, npc = flip_math.entry_args("no", nb)
-    no_oid, _ = kalshi.place_order_maker(client, ticker, ns, npc, 1,
-                                         expiration_ts=exp, v2_price_str=book.no_bid_fp)
-    quote_ts = time.time()                 # §3: time-to-first-fill / time-to-flat anchor
-    sp_yes, sp_no = _entry_spreads(book)   # §3: spread at entry, both sides
-    sigma_raw = None                       # §3: no sigma sampler in flip mode (gate is cost)
-    notify.send(f"🔁 W{tag} — quoting {yb}+{nb}={cost} (both @join, exp T-{FLIP_FLAT_AT})")
-
-    # ENTRY PHASE — poll for fills. RUNG A = this entry pair.
+    # OPPORTUNISTIC ENTRY (WO-4) — WATCH the early window instead of quoting both at the
+    # bell. Each side posts its bid the FIRST time its join ≤ FLIP_SIDE_MAX, at most once,
+    # no re-peg, expiry T-90. The second side may post only if it keeps the combined bundle
+    # ≤ FLIP_LINE against the RESTING first bid (not a stale book). Everything downstream —
+    # rung A netting, rung B, sweep, broker flat proof, tags — is unchanged.
+    quote_ts = now                          # §3: window-open anchor for post/fill timings
+    sp_yes = sp_no = None                   # §3: entry spreads, captured at first book read
+    spreads_done = False
+    sigma_raw = None                        # §3: no sigma sampler in flip mode (gate is cost)
     deadline = now + FLIP_ENTRY_SEC
-    fills = {}   # held_side -> entry cents
+    posted = {}                             # side -> {"oid","price","dt"} (dt = secs from open)
+    observed = set()
+    fills = {}                              # side -> entry cents
     first_fill_ts = None
     flat_ts = None
+
     while time.time() < deadline and len(fills) < 2:
-        for hs, oid in (("yes", yes_oid), ("no", no_oid)):
-            if hs not in fills:
-                fp = _order_fill_price(client, ticker, oid, hs)
+        book = kalshi.fetch_orderbook(client, ticker)
+        if not spreads_done:
+            sp_yes, sp_no = _entry_spreads(book)
+            spreads_done = True
+        for side in ("yes", "no"):
+            if side in posted or side in fills:
+                continue
+            join = book.yes_bid if side == "yes" else book.no_bid
+            fp_str = book.yes_bid_fp if side == "yes" else book.no_bid_fp
+            if join is None or join > FLIP_SIDE_MAX:
+                continue
+            # combined wall: a SECOND side posts only if the bundle stays ≤ line against
+            # the RESTING first bid's price.
+            if posted:
+                first = next(iter(posted.values()))
+                if first["price"] + join > FLIP_LINE:
+                    continue
+            if _is_observe():
+                if side not in observed:
+                    observed.add(side)
+                    notify.send(f"🔁 W{tag} — would post {side.upper()}@{join} (observe)")
+                continue
+            ss, pp = flip_math.entry_args(side, join)
+            oid, _ = kalshi.place_order_maker(client, ticker, ss, pp, 1,
+                                              expiration_ts=exp, v2_price_str=fp_str)
+            posted[side] = {"oid": oid, "price": join, "dt": time.time() - quote_ts}
+            notify.send(f"🔁 W{tag} — posted {side.upper()}@{join} "
+                        f"(t+{int(posted[side]['dt'])}s, exp T-{FLIP_FLAT_AT})")
+        for side in list(posted):          # poll fills for whatever is resting
+            if side not in fills:
+                fp = _order_fill_price(client, ticker, posted[side]["oid"], side)
                 if fp is not None:
-                    fills[hs] = fp
+                    fills[side] = fp
                     if first_fill_ts is None:
                         first_fill_ts = time.time()
-                    _record_enter(ticker, close_ts, hs, fp)
-                    notify.send(f"🌱 W{tag} — filled {hs.upper()}@{fp}")
+                    _record_enter(ticker, close_ts, side, fp)
+                    notify.send(f"🌱 W{tag} — filled {side.upper()}@{fp}")
         if len(fills) == 2 and flat_ts is None:
             flat_ts = time.time()          # rung A nets flat at the second entry fill
         if len(fills) < 2:
-            engine.heartbeat()             # F-4: prove liveness through the blocking phase
+            engine.heartbeat()             # F-4: prove liveness through the watch phase
             time.sleep(FLIP_POLL_SEC)
 
-    # cancel any unfilled entry bids
-    if len(fills) < 2:
+    if _is_observe():
+        notify.send(f"🔁 W{tag} — observe: sighted {sorted(observed) or 'none'} "
+                    f"≤ {FLIP_SIDE_MAX}c in {FLIP_ENTRY_SEC}s")
+        return "flip_observe"
+
+    if not posted:
+        notify.send(f"⏭ W{tag} — no side ≤ {FLIP_SIDE_MAX} in {FLIP_ENTRY_SEC}s | SAT")
+        return "flip_sat_no_side"
+
+    if len(fills) < len(posted):           # cancel any resting bid that didn't fill
         kalshi.cancel_all_for_market(client, ticker)
 
     if not fills:
-        notify.send(f"⏭ W{tag} — no fill ≤ line | SAT")
+        notify.send(f"⏭ W{tag} — posted but no fill | SAT")
         return "flip_sat_nofill"
 
     n_entry = len(fills)
     ey, en = fills.get("yes"), fills.get("no")
+    cost = (ey + en) if n_entry == 2 else None   # WO-4: bundle cost from actual entries
     captures = []                          # [(rung_label, cents)] — each netted/flipped pair
 
     # RUNG A — both entry legs filled ⇒ the entry PAIR nets flat and the exchange banks
@@ -259,14 +284,28 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     # RUNG B — post one exit per filled leg at entry+X via the complement buy (exp T-90).
     # For a double fill the two exits form a SECOND netted pair; for a lone leg its exit IS
     # rung B. No rung C is ever posted (the ladder is a pre-committed two-rung sequence).
+    #
+    # WO-4 GUARD (the cheap-bundle trap): the double-fill exit PAIR costs (200 − cost − 2·X);
+    # the juicier rung A is, the more that pair overpays. Post rung B only if the pair keeps
+    # to the line — otherwise bank rung A and let the bundle ride its floor. A lone-leg exit
+    # is a single complement buy and is exempt.
+    post_rung_b = True
+    if n_entry == 2:
+        pair = 200 - cost - 2 * FLIP_X
+        if pair > FLIP_LINE:
+            post_rung_b = False
+            notify.send(f"🔒 W{tag} — rung B skipped (pair {pair} > line {FLIP_LINE}); "
+                        f"rung A banked, bundle rides floor")
+
     exit_oids = {}                         # held_side -> {oid, target, side}
-    for hs, hp in fills.items():
-        q = hp + FLIP_X
-        es, ep = flip_math.exit_args(hs, q)
-        oid, _ = kalshi.place_order_maker(client, ticker, es, ep, 1, expiration_ts=exp)
-        exit_oids[hs] = {"oid": oid, "target": q, "side": es}
-    notify.send(f"🔁 W{tag} — rung B posted: exits @entry+{FLIP_X} "
-                f"({'+'.join(str(fills[h] + FLIP_X) for h in fills)})")
+    if post_rung_b:
+        for hs, hp in fills.items():
+            q = hp + FLIP_X
+            es, ep = flip_math.exit_args(hs, q)
+            oid, _ = kalshi.place_order_maker(client, ticker, es, ep, 1, expiration_ts=exp)
+            exit_oids[hs] = {"oid": oid, "target": q, "side": es}
+        notify.send(f"🔁 W{tag} — rung B posted: exits @entry+{FLIP_X} "
+                    f"({'+'.join(str(fills[h] + FLIP_X) for h in fills)})")
 
     # MONITOR RUNG B until T-90. An exit fill flattens its leg and books an ENTER row so the
     # existing settlement machinery accounts the complement leg (no new accounting).
@@ -361,7 +400,12 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     try:
         store.insert_flip_window(
             ts=time.time(), close_ts=int(close_ts), tag=tag, ticker=ticker,
-            entry_yes=ey, entry_no=en, bundle_cost=(cost if n_entry == 2 else None),
+            entry_yes=ey, entry_no=en,
+            join_yes=(posted.get("yes") or {}).get("price"),
+            join_no=(posted.get("no") or {}).get("price"),
+            post_dt_yes=(posted.get("yes") or {}).get("dt"),
+            post_dt_no=(posted.get("no") or {}).get("dt"),
+            bundle_cost=(cost if n_entry == 2 else None),
             exit_yes=exit_yes, exit_no=exit_no, capture_a_cents=cap_a_c,
             capture_b_cents=cap_b_c, realized_cents=int(realized), mtm_open_cents=mtm_open,
             spread_yes=sp_yes, spread_no=sp_no, sigma_at_gate=sigma_raw,
