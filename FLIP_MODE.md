@@ -50,8 +50,8 @@ review-pack machinery books P&L — no new accounting.
 - **Tagged windows (§3).** One immutable `flip_windows` row per window records entry/exit
   prices, both joins + book-sum at each post, per-rung captures, realized ¢, open-leg mtm,
   entry spreads, timings, broker-flat, and an `outcome_tag` ∈ {NETTED_2R, NETTED_1R,
-  FLOOR_RIDE, LONE_FLIP, LONE_SALVAGE, LONE_FLATTEN, LONE_RIDE, SAT_*, STOPPED} — the desk's
-  own crossing study for Saturday tuning.
+  FLOOR_RIDE, LONE_FLIP, LONE_SALVAGE, LONE_FLATTEN, LONE_RIDE, LONE_DECLINED, SAT_*,
+  STOPPED} — the desk's own crossing study for Saturday tuning.
 - **Hourly pack v2 (§4, `flip_pack.py`).** Account in real **dollars** (proven `get_balance`)
   with Δ-vs-midnight, a per-window table, and a day rollup whose `Δ$` is **explained**:
   settled P&L + fees, any unexplained residual ≥ 2¢ printed 🔴 and paged.
@@ -78,9 +78,21 @@ lazy dispatch in `run_market_cycle` + a boot echo. New files: `flip_mode.py`, `f
 
 ## Env
 `KW_MODE` (unset/anything ⇒ FLIP; `OFF` ⇒ kill switch) · `FLIP_ENTRY_SEC=300` ·
-`FLIP_SIDE_MAX=49` · `FLIP_LINE=99` · `FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` ·
-`FLIP_STOP_CENTS=25` · `FLIP_PAUSE_AFTER_STOPS=2` ·
-`KW_SERIES_ALLOWLIST=KXBTC15M` (comma-sep; the only series the bot books) — all overridable.
+`FLIP_SIDE_MAX=49` · `FLIP_REQUIRE_PAIR=1` (pair-or-nothing) · `FLIP_LINE=99` ·
+`FLIP_LONE_MAX=49` · `FLIP_X=4` · `FLIP_FLAT_AT=90` · `FLIP_STOP_CENTS=25` ·
+`FLIP_PAUSE_AFTER_STOPS=2` · `KW_SERIES_ALLOWLIST=KXBTC15M` (the only series the bot books) ·
+`KW_CLEAR_HALT` (set `=1` for a one-boot halt clear, then remove) — all overridable.
+
+## Resume posture (WO-RESUME)
+- **Pair-or-nothing (`FLIP_REQUIRE_PAIR=1`, default).** At entry-phase end with exactly ONE
+  filled leg, the leg is not kept — it is flattened at once via the complement touch (maker,
+  exp close−2; one re-join if unfilled after ~30s), tagged `LONE_DECLINED`, realized = the
+  flatten outcome (≈ breakeven). This closes the repeating loss shape (cheap lone fill into a
+  decided book) while leaving the profit shape (netted bundles) untouched. Lone-keeping
+  (rides/salvage) returns only with `FLIP_REQUIRE_PAIR=0` — a morning call made from the tags.
+- **Boot-clear (`KW_CLEAR_HALT=1`).** Clears discipline halt / tail-loss kill + the flip stop
+  streak ONCE at boot (`halt cleared by env (one-boot)`), no shell. A persisted marker stops a
+  crash-loop from self-clearing; removing the env re-arms it.
 
 ## Guardrails (WO-5)
 - **ENTER-row lineage.** `SurfaceRow` carries `order_id`; every flip leg's ledger row is

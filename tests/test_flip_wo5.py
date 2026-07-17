@@ -134,5 +134,40 @@ class TestBootScanAndEnterRow(_RestoreMixin):
         self.assertEqual(rows[1].fill_cost_cents, 45)
 
 
+@unittest.skipUnless(_IMPORTABLE, "imports the cryptography-bound client (CI only)")
+class TestBootClearHalt(_RestoreMixin):
+    """WO-RESUME §2: KW_CLEAR_HALT=1 clears halt once at boot; a marker guards the crash-loop."""
+    def _fakes(self):
+        state, sent = {}, []
+        self.P(kw_main.store, "get_state", lambda k: state.get(k))
+        self.P(kw_main.store, "set_state", lambda k, v: state.__setitem__(k, v))
+        self.P(kw_main.notify, "send", lambda t, **k: sent.append(t))
+        return state, sent
+
+    def test_clears_once_then_guards_crashloop(self):
+        state, sent = self._fakes()
+        state["halted"] = "3 losses in 60min"
+        state["loss_ts"] = "[1,2,3]"
+        state["flip_stop_streak"] = "1"
+        self.P(kw_main, "KW_CLEAR_HALT", True)
+        kw_main.maybe_clear_halt()
+        self.assertEqual(state["halted"], "")                       # halt cleared
+        self.assertEqual(state["loss_ts"], "[]")                    # loss history cleared
+        self.assertEqual(state["flip_stop_streak"], "0")            # flip streak cleared
+        self.assertEqual(state[kw_main._CLEAR_HALT_MARKER], "1")
+        self.assertTrue(any("halt cleared by env" in s for s in sent))
+        # crash-loop: env still set, marker present -> must NOT re-clear
+        state["halted"] = "re-halted"
+        kw_main.maybe_clear_halt()
+        self.assertEqual(state["halted"], "re-halted")
+
+    def test_env_removed_rearms_marker(self):
+        state, _sent = self._fakes()
+        state[kw_main._CLEAR_HALT_MARKER] = "1"
+        self.P(kw_main, "KW_CLEAR_HALT", False)
+        kw_main.maybe_clear_halt()
+        self.assertEqual(state[kw_main._CLEAR_HALT_MARKER], "0")     # re-armed for next env-set
+
+
 if __name__ == "__main__":
     unittest.main()

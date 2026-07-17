@@ -327,6 +327,28 @@ BOOT_RECONCILE_TOL = 0.05
 KW_SERIES_ALLOWLIST = [s.strip() for s in
                        os.environ.get("KW_SERIES_ALLOWLIST", "KXBTC15M").split(",") if s.strip()]
 
+# WO-RESUME §2: one-boot halt clear by env (no shell). A persisted marker stops a crash-loop
+# from repeatedly self-clearing; removing the env re-arms it for next time.
+KW_CLEAR_HALT = os.environ.get("KW_CLEAR_HALT", "").strip() == "1"
+_CLEAR_HALT_MARKER = "clear_halt_env_done"
+
+
+def maybe_clear_halt() -> None:
+    marker = store.get_state(_CLEAR_HALT_MARKER)
+    if not KW_CLEAR_HALT:
+        if marker == "1":
+            store.set_state(_CLEAR_HALT_MARKER, "0")     # env removed → re-arm for next time
+        return
+    if marker == "1":
+        log.warning("[MAIN] KW_CLEAR_HALT still set but already cleared this env — skipping")
+        return
+    store.set_state("halted", "")                        # clear discipline halt / tail-loss kill
+    store.set_state("loss_ts", "[]")                     # and the loss history that feeds it
+    store.set_state("flip_stop_streak", "0")             # don't let the flip pause re-arm instantly
+    store.set_state(_CLEAR_HALT_MARKER, "1")
+    log.warning("[MAIN] halt cleared by env (one-boot)")
+    notify.send("🔓 halt cleared by env (one-boot) — remove KW_CLEAR_HALT after this deploy")
+
 
 def adopt_or_ignore_positions(client) -> None:
     """Boot orphan scan with the series allowlist (WO-5 §2). Allowlisted positions with no
@@ -574,6 +596,7 @@ def main():
     # 4. Load persisted gateway state + treasury
     gateway._load_persisted_state()
     treasury.init_book()
+    maybe_clear_halt()          # WO-RESUME §2: one-boot halt clear by env (before first cycle)
 
     # 5. Kalshi client
     client = kalshi.build_client()

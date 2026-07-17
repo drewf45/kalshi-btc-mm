@@ -116,6 +116,8 @@ class TestFlipCycle(_RestoreMixin):
         self.P(flip_mode.gateway, "mark_traded", lambda tk, lane="F": self.traded.add(tk))
         self.P(flip_mode.engine, "heartbeat", lambda: None)
         self.P(flip_mode.engine, "_observe_mode", False)
+        # default the harness to the lone-KEEP regime; decline tests set REQUIRE_PAIR=1
+        self.P(flip_mode, "FLIP_REQUIRE_PAIR", 0)
 
         self._book_calls = 0
         self.book_provider = None      # optional: clock_ts -> book (time-varying watch)
@@ -292,6 +294,45 @@ class TestFlipCycle(_RestoreMixin):
         w = self._win()
         self.assertEqual(w["booksum_yes"], 45 + 48)      # far NO bid present at YES post
         self.assertEqual(w["booksum_no"], 45 + 48)
+
+    # ── WO-RESUME §1 PAIR-OR-NOTHING (REQUIRE_PAIR=1) ────────────────
+    def test_lone_declined_flattens_at_touch(self):
+        self.P(flip_mode, "FLIP_REQUIRE_PAIR", 1)
+        self.book = types.SimpleNamespace(yes_bid=48, no_bid=55, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.48", no_bid_fp="0.55")
+        self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=52,
+                                           yes_bid_fp="0.10", no_bid_fp="0.52")
+        self.fills_map = {"yes-48": 48, "no-52": 52}     # entry YES fills; decline NO@52 fills
+        self.net = 0
+        flip_mode.run_flip_cycle(None, "KXBTC15M-DC", self.CLOSE, {})
+        w = self._win()
+        self.assertEqual(w["outcome_tag"], "LONE_DECLINED")
+        self.assertEqual(w["realized_cents"], 0)         # (100-52)-48 ≈ breakeven
+        self.assertTrue(any(r.get("why_tag") == "FLIP_DECLINE" for r in self.rows))
+        self.assertTrue(any("declining lone" in s for s in self.sent))
+        done = [s for s in self.sent if "DONE" in s][-1]
+        self.assertIn("(incl. decline)", done)
+        # NOT kept: no rung-B exit at entry+X (that would be NO@48); only the touch flatten NO@52
+        self.assertFalse(any(o["side"] == "no" and o["price"] == 48 for o in self.orders))
+
+    def test_double_fill_unaffected_by_require_pair(self):
+        self.P(flip_mode, "FLIP_REQUIRE_PAIR", 1)
+        self.fills_map = {"yes-45": 45, "no-48": 48, "no-51": 51, "yes-48": 48}
+        flip_mode.run_flip_cycle(None, "KXBTC15M-DP", self.CLOSE, {})
+        self.assertEqual(self._win()["outcome_tag"], "NETTED_2R")   # bundles unchanged
+
+    def test_decline_rejoins_when_unfilled(self):
+        self.P(flip_mode, "FLIP_REQUIRE_PAIR", 1)
+        self.book = types.SimpleNamespace(yes_bid=48, no_bid=55, yes_ask=60, no_ask=60,
+                                          yes_bid_fp="0.48", no_bid_fp="0.55")
+        self.book2 = types.SimpleNamespace(yes_bid=10, no_bid=52,
+                                           yes_bid_fp="0.10", no_bid_fp="0.52")
+        self.fills_map = {"yes-48": 48}                  # entry fills; decline never fills
+        self.net = 1
+        flip_mode.run_flip_cycle(None, "KXBTC15M-DR", self.CLOSE, {})
+        decline_orders = [o for o in self.orders if o["side"] == "no" and o["price"] == 52]
+        self.assertEqual(len(decline_orders), 2)         # initial flatten + one rejoin
+        self.assertTrue(any("decline rejoin" in s for s in self.sent))
 
     # ── §1 no-inventory proof: a surprise residual pages + flattens ──
     def test_partial_rung_b_flags_inventory(self):

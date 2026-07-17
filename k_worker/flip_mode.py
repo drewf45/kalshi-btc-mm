@@ -32,6 +32,7 @@ FLIP_ENTRY_SEC = int(os.environ.get("FLIP_ENTRY_SEC", "300"))   # WO-4: watch th
 FLIP_LINE = int(os.environ.get("FLIP_LINE", "99"))
 FLIP_LONE_MAX = int(os.environ.get("FLIP_LONE_MAX", "49"))
 FLIP_SIDE_MAX = int(os.environ.get("FLIP_SIDE_MAX", "49"))      # WO-4: post a side the 1st time ≤ this
+FLIP_REQUIRE_PAIR = int(os.environ.get("FLIP_REQUIRE_PAIR", "1"))  # WO-RESUME: 1 = pair-or-nothing
 FLIP_X = int(os.environ.get("FLIP_X", "4"))
 FLIP_FLAT_AT = int(os.environ.get("FLIP_FLAT_AT", "90"))
 FLIP_STOP_CENTS = int(os.environ.get("FLIP_STOP_CENTS", "25"))
@@ -46,8 +47,8 @@ def echo_config() -> None:
         "🔁 <b>FLIP MODE</b> — watch the open, post each side the first time its join ≤ "
         f"{FLIP_SIDE_MAX}c, flip @entry+{FLIP_X}c\n"
         f"line {FLIP_LINE}c · side_max {FLIP_SIDE_MAX}c · lone_max {FLIP_LONE_MAX}c · "
-        f"entry {FLIP_ENTRY_SEC}s · flat T-{FLIP_FLAT_AT} · stop {FLIP_STOP_CENTS}c · "
-        f"pause@{FLIP_PAUSE_AFTER_STOPS}"
+        f"require_pair {FLIP_REQUIRE_PAIR} · entry {FLIP_ENTRY_SEC}s · flat T-{FLIP_FLAT_AT} · "
+        f"stop {FLIP_STOP_CENTS}c · pause@{FLIP_PAUSE_AFTER_STOPS}"
     )
 
 
@@ -172,6 +173,52 @@ def _flat_proof(client, ticker: str, close_ts: int, tag: str,
     return False, f"🚨 INVENTORY net={net} (want {want})", net
 
 
+def _decline_lone(client, ticker: str, close_ts: int, tag: str, lhs: str, lhp: int):
+    """WO-RESUME §1 PAIR-OR-NOTHING: a lone filled leg is not kept — flatten it at once via
+    the complement touch (maker, exp close−2). One re-join if unfilled after ~30s; the leg
+    was just bought at the touch, so a flatten at the touch fills in practice. Returns
+    (flatten_price_or_None, filled_bool). Books a FLIP_DECLINE story row per attempt."""
+    comp = "no" if lhs == "yes" else "yes"
+
+    def _touch():
+        b = kalshi.fetch_orderbook(client, ticker)
+        cb = b.no_bid if comp == "no" else b.yes_bid
+        cfp = b.no_bid_fp if comp == "no" else b.yes_bid_fp
+        return cb, cfp
+
+    cb, cfp = _touch()
+    if cb is None:
+        notify.alert(f"⚠ W{tag} decline: no {comp.upper()} touch to flatten lone "
+                     f"{lhs.upper()}@{lhp} — rides bounded")
+        return None, False
+    roid, _ = kalshi.place_order_maker(client, ticker, comp, cb, 1,
+                                       expiration_ts=int(close_ts - 2), v2_price_str=cfp)
+    _record_enter(ticker, close_ts, comp, None, roid, why_tag="FLIP_DECLINE")
+    notify.send(f"🚪 W{tag} — declining lone {lhs.upper()}@{lhp}: flatten {comp.upper()}@{cb} "
+                f"(exp close−2)")
+    used, filled = cb, False
+    deadline = time.time() + 30
+    while time.time() < deadline and (close_ts - time.time()) > 2:
+        engine.heartbeat()
+        fp = _order_fill_price(client, ticker, roid, comp)
+        if fp is not None:
+            used, filled = fp, True
+            break
+        time.sleep(FLIP_POLL_SEC)
+    if not filled:                          # one re-join at the current touch
+        kalshi.cancel_all_for_market(client, ticker)
+        cb2, cfp2 = _touch()
+        if cb2 is not None:
+            roid2, _ = kalshi.place_order_maker(client, ticker, comp, cb2, 1,
+                                                expiration_ts=int(close_ts - 2), v2_price_str=cfp2)
+            _record_enter(ticker, close_ts, comp, None, roid2, why_tag="FLIP_DECLINE")
+            used = cb2
+            notify.send(f"🚪 W{tag} — decline rejoin {comp.upper()}@{cb2} (exp close−2)")
+        else:
+            notify.alert(f"⚠ W{tag} decline rejoin: no {comp.upper()} touch — lone rides bounded")
+    return used, filled
+
+
 def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Optional[str]:
     """One flip window, blocking from the open through the T-90 sweep. Called by
     engine.run_market_cycle when ENABLED. Returns a short outcome string."""
@@ -286,8 +333,19 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
         captures.append(("A", cap_a))
         notify.send(f"💰 W{tag} — rung A netted {ey}+{en}={cost} → +{cap_a}¢")
 
-    # lone-leg keepability (WALL): a lone leg above the max means the line was misjudged
-    if n_entry == 1:
+    # WO-RESUME §1 PAIR-OR-NOTHING — a lone filled leg is DECLINED (flattened at the touch),
+    # not kept. This closes the loss shape (cheap lone into a decided book) while leaving the
+    # profit shape (netted bundles) untouched. Lone-keeping returns only with REQUIRE_PAIR=0.
+    declined = False
+    decline_px = None
+    decline_filled = False
+    if n_entry == 1 and FLIP_REQUIRE_PAIR:
+        (lhs, lhp), = fills.items()
+        decline_px, decline_filled = _decline_lone(client, ticker, close_ts, tag, lhs, lhp)
+        declined = True
+
+    # lone-leg keepability (WALL): only relevant when we KEEP a lone leg (REQUIRE_PAIR=0)
+    if n_entry == 1 and not declined:
         (lhs, lhp), = fills.items()
         if lhp > FLIP_LONE_MAX:
             notify.alert(f"⚠ W{tag} lone {lhs.upper()}@{lhp} > {FLIP_LONE_MAX} — line misjudged "
@@ -301,7 +359,7 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     # the juicier rung A is, the more that pair overpays. Post rung B only if the pair keeps
     # to the line — otherwise bank rung A and let the bundle ride its floor. A lone-leg exit
     # is a single complement buy and is exempt.
-    post_rung_b = True
+    post_rung_b = not declined             # a declined lone leg posts no rung B
     if n_entry == 2:
         pair = 200 - cost - 2 * FLIP_X
         if pair > FLIP_LINE:
@@ -377,6 +435,19 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
             outcome = "NETTED_1R"          # rung A netted; a single rung-B leg → naked (§1 flags)
         else:
             outcome = "FLOOR_RIDE"         # rung A netted; rung B unfilled → the bundle rides floor
+    elif declined:
+        # WO-RESUME §1: the lone leg was flattened at the touch. If the flatten filled we
+        # intend flat; if not, the leg rides bounded (with an alert) — not a full inventory
+        # cascade. Realized is the flatten outcome (booked below).
+        (lhs, lhp), = fills.items()
+        outcome = "LONE_DECLINED"
+        if decline_filled:
+            expected_flat = True
+        else:
+            expected_flat = False
+            ride_side, ride_px = lhs, lhp
+            notify.alert(f"⚠ W{tag} declined but flatten unfilled — lone {lhs.upper()}@{lhp} "
+                         f"rides bounded (maker resting to close−2)")
     else:
         (lhs, lhp), = fills.items()
         if lhs in exit_fill:
@@ -395,7 +466,13 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     # flip captures, so a salvaged/flattened/ridden lone leg feeds the stop the truth.
     lone_extra = 0
     inclusive = False
-    if lone_open:
+    if declined:                           # WO-RESUME §1: realized = the flatten outcome
+        if decline_filled and decline_px is not None:
+            lone_extra = (100 - decline_px) - lhp
+        else:                              # unfilled → provisional −entry (bounded ride)
+            lone_extra = -lhp
+        inclusive = True
+    elif lone_open:
         want = 1 if lhs == "yes" else -1
         if net == 0:                       # the complement filled → flat (safe direction)
             cb = swept.get(lhs)            # dumped at the touch we rejoined at
@@ -456,7 +533,7 @@ def run_flip_cycle(client, ticker: str, close_ts: int, market_obj: dict) -> Opti
     # DONE line — a complete sentence: money and why, flatness proven by the broker.
     entry_str = f"{ey}+{en}={cost}" if n_entry == 2 else f"{lhs.upper()}@{lhp}"
     rung_str = " · ".join(f"rung{L} +{c}¢" for L, c in captures) if captures else "no capture"
-    incl = " (incl. salvage)" if inclusive else ""
+    incl = (" (incl. decline)" if declined else " (incl. salvage)") if inclusive else ""
     sign = "+" if realized >= 0 else ""
     notify.send(f"🔁 W{tag} — {entry_str} | {rung_str} → {sign}{realized}¢ realized{incl} "
                 f"[{outcome}] | {flat_suffix} | DONE")
