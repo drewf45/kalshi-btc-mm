@@ -144,11 +144,17 @@ borrowed WHOLE.
   (`::test_kill_semantics_entries_only`); Lane F passthrough catastrophic-only
   (`relay_engine/custodian.py:117-118`); size buys discipline (`::test_size_buys_discipline`);
   custodian exit attributes to opening lane (`::test_cut_attributes_to_opening_lane`).
-- **NOTE** — the branch `claude/trading-contract-math-2biFE` named in C.5 is not present in
-  this repo's remotes (only `main` and this build branch exist). DUMP mechanics were recovered
-  from `reference/legacy_dump_bot.py` alone (trigger family at its lines 155-162); its
-  truncated tail means the mechanics came from the config surface, not a function body.
-  Parameters were NOT borrowed (§F).
+- **TRUE [REV 2]** — `claude/trading-contract-math-2biFE` recovered: Drew granted full
+  branch access; the real `should_dump_position` + `_btc_is_safe` (branch `bot.py:2325-2680`
+  at commit `85b6c9c`) were read and their MECHANICS folded into the custodian
+  (`relay_engine/custodian.py:214-306`): worst-of(bid, prob) dollar stops firing first,
+  late hold-to-settle with danger-buffer override, early-exit-underwater, grace period,
+  bankroll/position caps preceding spot safety, the spot-safety MASTER OVERRIDE ("if spot
+  is on our side, the book is lying — hold"), rapid-drop bail, windowed-peak reversal
+  (profit-tightened, settling-widened), and the probability floor — in the recovered
+  order, all exercised in `tests/test_custodian.py` (18 tests green). Parameters NOT
+  borrowed (§F): every number is a per-lane CutParams set at wiring, pending Drew's
+  per-lane rulings; the engine ships no defaults.
 
 ## §E — Parallel analysis track
 
