@@ -171,10 +171,11 @@ class Feed:
         m = msg.get("msg", {})
         market = m.get("market_ticker", "")
         if mtype == "orderbook_snapshot" and market:
-            yes_levels = self._parse_levels(m.get("yes") or [], market, raw)
-            no_levels = self._parse_levels(m.get("no") or [], market, raw)
+            yes_levels, yes_fps = self._parse_levels(m.get("yes") or [], market, raw)
+            no_levels, no_fps = self._parse_levels(m.get("no") or [], market, raw)
             book = self.book(market)
-            book.apply_snapshot(yes_levels, no_levels, ts=now)
+            book.apply_snapshot(yes_levels, no_levels, ts=now,
+                                yes_fp=yes_fps, no_fp=no_fps)
             self.shape_failures = 0
             self.ladder.snapshot_resynced()
         elif mtype == "orderbook_delta" and market:
@@ -196,9 +197,12 @@ class Feed:
                               f"delta frame without price/delta on {market}",
                               raw_frame=raw)
                 return
-            self.book(market).apply_delta(m.get("side", "yes"),
-                                          self._parse_price(raw_price),
-                                          int(Decimal(str(raw_delta))), ts=now)
+            cents = self._parse_price(raw_price)
+            fp = str(raw_price) if (self.book_units == "dollars"
+                                    and isinstance(raw_price, str)) else None
+            self.book(market).apply_delta(m.get("side", "yes"), cents,
+                                          int(Decimal(str(raw_delta))), ts=now,
+                                          fp=fp)
             self.shape_failures = 0
         if self.recorder is not None and market:
             self.recorder.record(market, raw, now)
@@ -237,10 +241,13 @@ class Feed:
             return int(Decimal(str(price)) * 100)
         return int(price)
 
-    def _parse_levels(self, levels, market: str = "", raw: str = "") -> dict:
+    def _parse_levels(self, levels, market: str = "", raw: str = ""):
         """P6 §1c: level tuples AND dict forms, through the same key ladder;
-        an unparseable level is a banked shape failure, never a guess."""
+        an unparseable level is a banked shape failure, never a guess.
+        Returns (levels_cents, fp_strings) — the exact touch is kept when the
+        wire speaks dollars (the parts' true-touch resting law)."""
         out = {}
+        fps = {}
         for lv in levels:
             if isinstance(lv, dict):
                 p = _extract(lv, PRICE_KEYS)
@@ -253,8 +260,11 @@ class Feed:
                               f"snapshot level unparseable on {market}",
                               level=repr(lv), raw_frame=raw[:1000])
                 continue
-            out[self._parse_price(p)] = Decimal_q(q)
-        return out
+            cents = self._parse_price(p)
+            out[cents] = Decimal_q(q)
+            if self.book_units == "dollars" and isinstance(p, str):
+                fps[cents] = p
+        return out, fps
 
     def socket_died(self, why: str = "socket closed") -> None:
         self.book_units = None      # units re-assert per connection

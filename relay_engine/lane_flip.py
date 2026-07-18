@@ -330,7 +330,7 @@ class LaneFlip:
             if side in w.posted or side in w.fills:
                 continue
             join = yes_bid if side == "yes" else no_bid
-            fp = None
+            fp = book.best_fp(side)  # true-touch resting (the parts' law)
             if join is None or join > FLIP_SIDE_MAX:
                 continue
             # combined wall: the SECOND side posts only if the bundle stays

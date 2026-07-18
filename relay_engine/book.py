@@ -30,22 +30,43 @@ class OrderBook:
     market: str
     yes_bids: Dict[int, int] = field(default_factory=dict)  # price_cents -> contracts
     no_bids: Dict[int, int] = field(default_factory=dict)
+    # True-touch fp strings (the parts' law: orders rest at the exact touch,
+    # subpenny precision — venue.place_order_maker v2_price_str). Kept per
+    # level when the wire speaks dollars; None on cents-int books.
+    yes_fp: Dict[int, str] = field(default_factory=dict)
+    no_fp: Dict[int, str] = field(default_factory=dict)
     last_update_ts: float = 0.0
     transport: str = "WS"  # "WS" or "EXPLORATION" (REST poll rows, feed-parity law)
 
-    def apply_snapshot(self, yes_bids: Dict[int, int], no_bids: Dict[int, int], ts: float) -> None:
+    def apply_snapshot(self, yes_bids: Dict[int, int], no_bids: Dict[int, int],
+                       ts: float, yes_fp: Dict[int, str] = None,
+                       no_fp: Dict[int, str] = None) -> None:
         self.yes_bids = {int(p): int(q) for p, q in yes_bids.items() if int(q) > 0}
         self.no_bids = {int(p): int(q) for p, q in no_bids.items() if int(q) > 0}
+        self.yes_fp = dict(yes_fp or {})
+        self.no_fp = dict(no_fp or {})
         self.last_update_ts = ts
 
-    def apply_delta(self, side: str, price_cents: int, delta: int, ts: float) -> None:
+    def apply_delta(self, side: str, price_cents: int, delta: int, ts: float,
+                    fp: str = None) -> None:
         levels = self.yes_bids if side == "yes" else self.no_bids
+        fps = self.yes_fp if side == "yes" else self.no_fp
         q = levels.get(int(price_cents), 0) + int(delta)
         if q > 0:
             levels[int(price_cents)] = q
+            if fp is not None:
+                fps[int(price_cents)] = fp
         else:
             levels.pop(int(price_cents), None)
+            fps.pop(int(price_cents), None)
         self.last_update_ts = ts
+
+    def best_fp(self, side: str):
+        """The exact fp string at the side's best level, or None (int books)."""
+        best = self.best_yes_bid() if side == "yes" else self.best_no_bid()
+        if best is None:
+            return None
+        return (self.yes_fp if side == "yes" else self.no_fp).get(best)
 
     # -- canonical views (all derived from yes-bid/no-bid, nothing else) --
     def best_yes_bid(self) -> Optional[int]:
@@ -84,4 +105,6 @@ def touch_view(ob: "OrderBook"):
         no_ask=(100 - yb) if yb is not None else None,
         yes_bid_qty=ob.visible_depth("yes", yb) if yb is not None else 0,
         no_bid_qty=ob.visible_depth("no", nb) if nb is not None else 0,
+        yes_bid_fp=ob.best_fp("yes"),
+        no_bid_fp=ob.best_fp("no"),
     )

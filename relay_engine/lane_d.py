@@ -208,7 +208,8 @@ class LaneD:
             lane="D", event=market.rsplit("-", 1)[0], market=market,
             side=v.side, action="buy", price_cents=v.cost_cents,
             count=D_PER_MARKET_CAP_LOTS, size_tier=config.TIER_PROBE,
-            purpose="ENTRY", band=(D_FLOOR_CENTS, D_BAND_HI))
+            purpose="ENTRY", band=(D_FLOOR_CENTS, D_BAND_HI),
+            rest_fp=book.best_fp(v.side))  # true-touch resting
 
     def recovery_exit(self, market: str) -> Optional[Order]:
         """The resting recovery baton: entry+X passive exit, custodied."""

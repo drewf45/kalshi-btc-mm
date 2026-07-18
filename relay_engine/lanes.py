@@ -141,6 +141,7 @@ class FH8Shared:
             lane=res.lane, event=market.rsplit("-", 1)[0], market=market,
             side=res.side, action="buy", price_cents=res.cost_cents,
             count=1, size_tier=config.TIER_PROBE, purpose="ENTRY", band=band,
+            rest_fp=res.rest_fp,  # the parts' law: rest at the TRUE touch
         )
 
 

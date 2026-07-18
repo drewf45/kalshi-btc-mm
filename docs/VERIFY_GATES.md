@@ -385,15 +385,27 @@ Suite at this commit: **181 passed** (13 new); golden tape 0/2,941 mismatches.
 - **§4 TRUE** — LIVE path: RUN_MODE+phrase → live boot reconcile → LIVE banner + pager
   boot-stop if Telegram unwired; ✅ FILL one-liner per booked fill; render start command
   stays the shadow runner until Drew flips the env vars.
-- **P7 (RECONSTRUCTED — flag)**: the WO-P7 document itself was never delivered; its
-  five items were built from P8 §4.3's explicit list: single book adapter
+- **P7 (RESOLVED — the parts are the spec)**: Drew's ruling 2026-07-18 — no WO-P7
+  document exists; the re-delivered part trees (flipdesk `_21`, AtDcG `_32`,
+  byte-identical to the B1 originals) ARE the spec, compared only where needed.
+  The five items built from P8 §4.3's list stand: single book adapter
   (`book.touch_view`, THE one view every lane reads) + 200-case property test
   (adapter fields == book canon; favorite never fabricated) + replay regression
   (`replay.py`: live-shaped fp-dollars tape → F tracks the favorite on every frame,
   never blind; plus `replay_from_db` — the recorder's named reader, real) + venue
   reject backoff (REJECT_BACKOFF wall, 30s market rest, risk reduction exempt, failure
   rows banked) + storm telemetry (frames/rejects/venue-rejects in the hourly line).
-  **Supply the WO-P7 text to true this up against its actual spec.**
+  **Comparison verdict**: one fidelity gap found and closed — the parts rest orders
+  at the TRUE TOUCH (`place_order_maker` sends `v2_price_str`, subpenny fp-dollars)
+  while the relay book floored to int cents and dropped the fp. Now: `OrderBook`
+  keeps per-level fp strings (`yes_fp`/`no_fp`, `best_fp`), `Feed` preserves them
+  from dollars-form snapshots AND deltas, `touch_view` carries `yes_bid_fp`/
+  `no_bid_fp`, `favorite_side` prices on the exact Decimal (subpenny decides ties,
+  byte-matching the live `_favorite_side`), and every entry lane (F/H8, FLIP, D)
+  passes `rest_fp` into its `Order` → `_submit_live` → `v2_price_str`. Cents-int
+  books yield `None` at every stage — never a fabricated string; sell intents
+  translate to complement buys and re-derive (fp cleared). Proven end-to-end in
+  `tests/test_true_touch_fp.py` (wire → book → adapter → eval → Order).
 - **DEPLOY (two steps, the second is Drew's):** deploy → watch one shadow window price
   correctly (F tracking the live favorite in the log within ~15 min) → flip
   RUN_MODE=LIVE + I_UNDERSTAND_LIVE phrase → LIVE BOOT page → first ✅ FILL → first 📊
