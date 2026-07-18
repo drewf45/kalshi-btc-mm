@@ -21,6 +21,9 @@ def test_cycle_census_clean_and_zero_orders():
     markets = ["KXBTC15M-A", "KXBTC15M-B"]
     for _ in range(3):  # repeated cycles must not duplicate terminal rows
         engine.cycle(markets, now=100.0)
+    # P17 §1.1: PASS terminals are written at window CLOSE, not mid-window
+    for m in markets:
+        engine.close_window(m)
 
     rows = engine.ledger.db.execute(
         "SELECT lane, market, COUNT(*) FROM surface_rows WHERE terminal=1"
@@ -44,6 +47,7 @@ def test_daily_pack_renders_per_lane_sections():
     engine = ShadowEngine(db_path=":memory:")
     engine.boot()
     engine.cycle(["KXBTC15M-A"], now=100.0)
+    engine.close_window("KXBTC15M-A")   # P17: terminal PASS lands at close
     pack = daily_pack(engine.ledger, engine.surface, engine.cash,
                       venue_statement_cents=0)
     assert f"EPOCH {config.EPOCH}" in pack

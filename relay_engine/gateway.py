@@ -223,7 +223,7 @@ class Gateway:
         # Crossfire is confined to CUT at the canonical layer — a deliberate
         # cross anywhere else (even a passive EXIT) is refused outright.
         if order.crossfire and order.purpose != "CUT":
-            raise WallRejection("REJECT_TAKER_ENTRY",
+            raise WallRejection("TAKER_ENTRY",
                                 f"crossfire on purpose={order.purpose}; CUT only")
 
         if not risk_reducing:
@@ -444,11 +444,11 @@ class Gateway:
         side_basis = order.price_cents  # side-terms basis = max loss per contract
         if contracts + order.count > config.NET_RISK_CROSS_LANE_CAP:
             raise WallRejection(
-                "NET_RISK_CAP",
+                "NET_RISK",
                 f"event {order.event}: {contracts}+{order.count} > {config.NET_RISK_CROSS_LANE_CAP}")
         if cents + order.count * side_basis > config.AT_RISK_CAP_CENTS:
             raise WallRejection(
-                "AT_RISK_CAP",
+                "DOLLAR_RISK",
                 f"event {order.event}: {cents}+{order.count * side_basis}c > {config.AT_RISK_CAP_CENTS}c")
 
     def _wall_wrong_way_tick(self, order: Order) -> None:
@@ -460,7 +460,7 @@ class Gateway:
         diff = order.price_cents - order.improve_from
         if diff == 0 or (diff > 0) != (expected > 0):
             raise WallRejection(
-                "REJECT_WRONG_WAY_TICK",
+                "WRONG_WAY",
                 f"{order.action} improvement {order.improve_from}->{order.price_cents} "
                 f"(expected sign {expected:+d})")
 
@@ -480,14 +480,14 @@ class Gateway:
                 ask = 100 - opp if opp is not None else None
             if ask is not None and order.price_cents > ask:
                 raise WallRejection(
-                    "REJECT_TAKER_ENTRY",
+                    "TAKER_ENTRY",
                     f"{order.side} buy at {order.price_cents}c through derived ask {ask}c")
         else:
             # a sell entry (shorting the side) takes if priced through the side's bid
             bid = book.best_yes_bid() if order.side == "yes" else book.best_no_bid()
             if bid is not None and order.price_cents < bid:
                 raise WallRejection(
-                    "REJECT_TAKER_ENTRY",
+                    "TAKER_ENTRY",
                     f"{order.side} sell at {order.price_cents}c through bid {bid}c")
 
     def _wall_flip_unpaired(self, order: Order) -> None:
@@ -503,7 +503,7 @@ class Gateway:
                         (net < 0 and self._signed_yes_delta(order) < 0)
         if adds_same_dir:
             raise WallRejection(
-                "REJECT_FLIP_UNPAIRED",
+                "FLIP_UNPAIRED",
                 f"prior FLIP leg not yet EXITED (net {net:+d}) — "
                 f"second same-side entry refused")
 
@@ -516,20 +516,20 @@ class Gateway:
         notional = order.price_cents * order.count
         if notional > caps.order_budget_cents:
             raise WallRejection(
-                "PCT_OF_BOOK", f"{notional}c > boot budget {caps.order_budget_cents}c")
+                "BUDGET", f"{notional}c > boot budget {caps.order_budget_cents}c")
 
     def _wall_sizing_tier(self, order: Order) -> None:
         if order.size_tier == config.TIER_SUPPRESS:
-            raise WallRejection("SIZING_TIER", "SUPPRESS tier proposes no entries")
+            raise WallRejection("DEPTH", "SUPPRESS tier proposes no entries")
         if order.count > config.TIER_MAX_CONTRACTS.get(order.size_tier, 0):
             raise WallRejection(
-                "SIZING_TIER",
+                "DEPTH",
                 f"count {order.count} exceeds {order.size_tier} max "
                 f"{config.TIER_MAX_CONTRACTS.get(order.size_tier, 0)}")
         authorized = self.sizing_authorized_tier(order.lane, order.market)
         if authorized is not None and order.size_tier != authorized:
             raise WallRejection(
-                "SIZING_TIER", f"tier {order.size_tier} not the authorized {authorized}")
+                "DEPTH", f"tier {order.size_tier} not the authorized {authorized}")
 
     def _wall_fee_tripwire(self, order: Order) -> None:
         if not self.tripwire.ok():

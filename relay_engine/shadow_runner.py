@@ -212,6 +212,7 @@ class ShadowEngine:
         # P13 §3: orientation sentinels + §4 sit-out page wiring
         self.divergence_watches = {}   # market -> {until, strikes}
         self._orientation_checked = False
+        self.windows_seen = 0          # P17 §6.1: the show-up counter
         self.flip.alert_fn = self.telegram.alert
         # P14 §2.1: the cut boundary's on-demand fills sweep
         self.custodian.resweep = self._resweep_market
@@ -219,6 +220,8 @@ class ShadowEngine:
     # ── F1: market lifecycle (discovery + rollover) ─────────────────────
     def on_market_discovered(self, ticker: str, market_obj: dict) -> None:
         from . import venue
+        if ticker not in self.market_meta:
+            self.windows_seen += 1   # P17 §6.1: showing up, counted
         close_ts = venue.resolve_close_ts(market_obj, ticker)
         blo, bhi = venue.extract_boundaries(market_obj)
         # P13 §3: the market record's own touches (explicit form: *_dollars
@@ -450,6 +453,10 @@ class ShadowEngine:
         self.boot_id = boot_id
         # P8 §2.3: restarts and redeploys do NOT clear the two-strike halt
         self.econ.restore_halt_on_boot()
+        # P17 §1.3/§1.4: heal across restarts — reload open brackets (so the
+        # settle sweep retries stuck windows) and mark evidence holes.
+        self.econ.restore_open_brackets_on_boot()
+        self.gap_restart_scan()
         # Tape 0718: the deployed worker booted with DB=relay_shadow.db (no
         # RELAY_DB_PATH) — an EPHEMERAL database. Halt persistence, booking
         # dedup, and every autopsy depend on the disk surviving a redeploy.
@@ -803,13 +810,56 @@ class ShadowEngine:
                                 proposal.price_cents, result.order_id)
 
     def close_window(self, market):
-        self._window_of.pop(market, None)
+        """P17 §6.3/§6.5: at close, every watching/passing lane writes its
+        first-class PASS terminal; a window with NO rows at all is a §6
+        contract breach — paged, never silent."""
+        window = self._window_of.pop(market, None)
+        if window is None:
+            return
+        self.surface.finalize_window(market, window)
+        from . import failures
+        n = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM surface_rows WHERE market=? AND window_id=?",
+            (market, window)).fetchone()[0]
+        if n == 0:
+            failures.fail("SILENT_WINDOW",
+                          f"{market}: window closed with NO rows at all — "
+                          f"§6 contract breach (arrive/arm/evaluate missing)",
+                          market=market)
+
+    def gap_restart_scan(self) -> int:
+        """P17 §1.4: on boot, any tracked window already past close with no
+        terminal row writes GAP_RESTART — evidence holes are counted, never
+        papered over."""
+        from .lanes import infer_close_ts_from_ticker
+        now = time.time()
+        rows = self.ledger.db.execute(
+            "SELECT lane, market, window_id, MAX(terminal) FROM surface_rows"
+            " GROUP BY lane, market, window_id HAVING MAX(terminal)=0").fetchall()
+        wrote = 0
+        for lane, market, window_id, _ in rows:
+            close_ts = infer_close_ts_from_ticker(market)
+            if close_ts is not None and now > close_ts + 60:
+                self.surface.write_row(lane, market, window_id,
+                                       "GAP_RESTART",
+                                       detail="window spanned a restart — "
+                                              "evidence hole, counted")
+                wrote += 1
+        return wrote
 
     def settle_traded_market(self, market: str, settled_yes: bool,
                              now=None) -> None:
         """P8 §1: CLOSE BRACKET — settlement confirmed, fills booked, account
         truth snapshotted. Traded markets only (open brackets); untraded
         markets write no bracket."""
+        # P17 §2.1: a settlement booked well after close is LATE — the streak
+        # still counts it (retroactive halt capable) and the receipt says so.
+        now_eff = time.time() if now is None else now
+        close_ts = self._meta(market).get("close_ts")
+        if close_ts is None:
+            from .lanes import infer_close_ts_from_ticker
+            close_ts = infer_close_ts_from_ticker(market)
+        late = close_ts is not None and now_eff > close_ts + 300
         # P13 §3: settlement cross-check — the free oracle every 15 minutes.
         # The winning side must have been our book's high side near close.
         book = self.feed.books.get(market)
@@ -832,7 +882,7 @@ class ShadowEngine:
         self.econ.close_bracket(
             market, val, fills_pnl,
             lanes_active=",".join(sorted(per_lane)), fills_count=fills_count,
-            now=now, source=src)
+            now=now, source=src, late=late)
 
     def settlement_sweep(self, now=None) -> int:
         """Poll settlement for markets with open brackets whose close passed."""
@@ -880,12 +930,27 @@ BOOK_CHECK_S = 60.0  # P10 §3: the standing arbiter's cadence
 # ~4 req/min — inside the rate governor. Written down so nobody rediscovers it.
 
 
+# P17 §2.2: a stuck safety task states its CONSEQUENCE in words on the page.
+TASK_CONSEQUENCES = {
+    "settle": " — streak & brackets FROZEN until healed",
+    "fills": " — fill knowledge frozen (positions may lag the venue)",
+    "listener": " — /reset_halt and /confirm_cash DEAF until healed",
+}
+
+TASK_STUCK_AFTER = 5       # P17 §3: same error x5 -> one page, then 60s pace
+TASK_STUCK_BACKOFF_S = 60.0
+
+
 async def supervise(name, factory, stop, engine, backoff_s=SUPERVISOR_BACKOFF_S):
     """P9 §1b: NO un-supervised task may hold a safety command path. Any
-    exception -> fail(tag) -> outbound alert (the funnel pages) -> restart
-    after backoff. A clean return ends supervision (the task chose to stop)."""
+    exception -> fail(tag) -> outbound alert -> restart after backoff.
+    P17 §3: the SAME error 5 consecutive times -> ONE `TASK_STUCK` page ->
+    backoff to 60s retries (still supervised, still counted); a different
+    error resets the count. A stuck loop that pages once and waits is honest;
+    one that retries forever quietly is the storm class in a badge."""
     from . import failures
     tag = TASK_TAGS.get(name, "TASK_DOWN")
+    last_err, same_count = None, 0
     while not stop.is_set():
         engine.task_alive[name] = True
         try:
@@ -896,13 +961,31 @@ async def supervise(name, factory, stop, engine, backoff_s=SUPERVISOR_BACKOFF_S)
         except Exception as e:
             engine.task_alive[name] = False
             n = engine.task_restarts[name] = engine.task_restarts.get(name, 0) + 1
+            rep = repr(e)
+            same_count = same_count + 1 if rep == last_err else 1
+            last_err = rep
             try:
                 failures.fail(tag,
                               f"supervised task {name!r} died: {e!r} — "
-                              f"restart #{n} in {backoff_s:.0f}s")
+                              f"restart #{n}"
+                              + TASK_CONSEQUENCES.get(name, ""),
+                              alert=(same_count < TASK_STUCK_AFTER))
             except Exception:
                 pass  # the supervisor itself never dies of its report
-            await asyncio.sleep(backoff_s)
+            if same_count == TASK_STUCK_AFTER:
+                try:
+                    engine.telegram.alert(
+                        f"⚠ TASK_STUCK [{name}] same error x{same_count} — "
+                        f"manual attention"
+                        + TASK_CONSEQUENCES.get(name, "")
+                        + f" · retrying every {TASK_STUCK_BACKOFF_S:.0f}s")
+                    failures.fail("TASK_STUCK",
+                                  f"{name}: same error x{same_count}: {rep[:200]}",
+                                  task=name, alert=False)
+                except Exception:
+                    pass
+            await asyncio.sleep(TASK_STUCK_BACKOFF_S
+                                if same_count >= TASK_STUCK_AFTER else backoff_s)
 
 
 def _send_boot_page_rest(engine) -> None:
@@ -1044,6 +1127,7 @@ async def run():
             else:
                 engine.telegram.alert(
                     f"📗 hourly: book={engine.ledger.book_cents()}c "
+                    f"windows={engine.windows_seen} "
                     f"markets={len(engine.market_meta)} "
                     f"orders={len(engine.gateway.order_index)} "
                     f"foreign={engine.fills.foreign_seen} "

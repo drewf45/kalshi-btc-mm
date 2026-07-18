@@ -142,10 +142,24 @@ class FH8Shared:
             side=res.side, action="buy", price_cents=res.cost_cents,
             count=1, size_tier=config.TIER_PROBE, purpose="ENTRY", band=band,
             rest_fp=res.rest_fp,  # the parts' law: rest at the TRUE touch
-            why=(f"favorite {res.side}@{res.cost_cents}¢ band {band[0]}-{band[1]}"
-                 + (f" · dist {res.distance_pct:.2%}"
-                    if res.distance_pct is not None else "")),
+            # P17 §5: the gate values that ADMITTED the entry — Saturday must
+            # tell ladder from luck before the question is asked.
+            why=self._rich_why(market, res, band),
         )
+
+    def _rich_why(self, market: str, res: lane_fh8.EvalResult, band) -> str:
+        ladder = self.ladders.get(market)
+        parts = [f"{res.lane} tier{res.cost_cents}", f"band{band[0]}-{band[1]}"]
+        if ladder is not None:
+            parts.append(f"confirms{ladder.confirm_count}")
+        if res.breakeven_pct is not None:
+            parts.append(f"ΔP{res.breakeven_pct:.3f}")
+        if res.spot_price is not None:
+            parts.append(f"spot{res.spot_price:,.0f}")
+        if res.distance_pct is not None:
+            parts.append(f"dist{res.distance_pct:.2%}")
+        parts.append(f"{res.side}@{res.cost_cents}")
+        return " ".join(parts)
 
 
 def ledger_stats(ledger) -> lane_fh8.FH8Stats:

@@ -116,7 +116,7 @@ def test_reject_taker_entry_through_price(gateway):
     b.apply_snapshot({45: 100}, {30: 80}, ts=1.0)  # derived yes ask 70
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(price=71), b)  # strictly through the ask
-    assert e.value.wall == "REJECT_TAKER_ENTRY"
+    assert e.value.wall == "TAKER_ENTRY"
     # AT the boundary is touch-joining — allowed (venue post_only owns exact cross)
     assert gateway.submit(entry(price=70), b).shadow
 
@@ -128,7 +128,7 @@ def test_crossfire_confined_to_cut(gateway):
                              action="buy", price_cents=61, count=1,
                              size_tier=config.TIER_PROBE, purpose="ENTRY",
                              crossfire=True), b)
-    assert e.value.wall == "REJECT_TAKER_ENTRY"
+    assert e.value.wall == "TAKER_ENTRY"
     # even a passive EXIT may not crossfire
     gateway.positions[("EV1", "M1", "F")] = 1
     with pytest.raises(WallRejection):

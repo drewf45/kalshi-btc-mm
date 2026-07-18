@@ -750,6 +750,51 @@ Suite at this commit: **295 passed**; preflight **14/14**.
 retro, which judges lanes on margin. The machine writes most of that document
 itself.
 
+## WO-P17 FINAL — "SHOW UP FOR EVERY MARKET"
+
+Suite at this commit: **306 passed**; preflight **15/15**. Doctrine banked:
+showing up is mandatory; trading is earned.
+
+- **§1 TRUE — the terminal-row lattice**: terminal is MONOTONIC
+  (PASS=0 < GAP_RESTART=1 < SETTLED/CUSTODIED_SETTLED=2), not immutable. PASS is
+  PROVISIONAL (interim) mid-window — the terminal PASS is written only by
+  `finalize_window` at close, carrying the last pass reason; a lane that passes
+  at T-12 and enters at T-2 never writes a PASS terminal at all (the 9:30 FATAL
+  shape is now the healthy path, integration-tested). Upgrades log
+  `TERMINAL_UPGRADED` + `upgrade from PASS` detail, never fatal; a REGRESSION
+  stays FATAL. Settlement is idempotent (settled fills can't re-book; a second
+  settle books nothing). Open brackets RELOAD from the DB at boot
+  (`restore_open_brackets_on_boot`) — the stuck 0930 heals on the first sweep
+  retry, its receipt marked `(settled late — books healed)`. `gap_restart_scan`
+  at boot writes GAP_RESTART for windows that spanned a restart — evidence
+  holes counted, never papered. Two pre-P17 tests overturned, cited in place.
+- **§2 TRUE — the leash counts late truths**: a settlement booked >300s after
+  close is LATE — the streak still counts it and a retroactive second strike
+  halts with `⛔ TWO-STRIKE (retroactive: {mkt} settled late)` (test-proven).
+  Task-death pages state consequences in words (settle: "streak & brackets
+  FROZEN until healed"; listener: "/reset_halt DEAF"). Boot tape prints the
+  rail state in words: DISARMED below $50 / ARMED with headroom above.
+- **§3 TRUE — supervision escalates**: same error ×5 → ONE `⚠ TASK_STUCK` page
+  (with the consequence) → 60s paced retries, still supervised and counted; a
+  different error resets. Tested both directions.
+- **§4 TRUE — walls say their names**: PCT_OF_BOOK→BUDGET, SIZING_TIER→DEPTH,
+  NET_RISK_CAP→NET_RISK, AT_RISK_CAP→DOLLAR_RISK, REJECT_WRONG_WAY_TICK→
+  WRONG_WAY, REJECT_TAKER_ENTRY→TAKER_ENTRY, REJECT_FLIP_UNPAIRED→FLIP_UNPAIRED
+  (the BUDGET storms at the $5 book were misread as depth for two passes —
+  ambiguous tags invite confident misdiagnosis; the deposit proved it). Source-
+  asserted no ambiguous tag remains; the grader's names now grade mechanisms.
+- **§5 TRUE — rich why-tags**: F/H8 entries carry the gate values that admitted
+  them (`F tier97 band95-99 confirms{n} ΔP0.970 spot118,500 dist0.42% yes@97`) —
+  ladder-or-luck answerable from the row alone.
+- **§6 TRUE — the window contract, tested end-to-end**:
+  `test_window_lifecycle_end_to_end` drives pass-only · pass-early-enter-late ·
+  restart-spanning windows → one PASS terminal, one ENTERED→SETTLED story with
+  receipt, one GAP_RESTART, zero FATALs, streak correct. `windows_seen` counts
+  up in the hourly line; a window closing with NO rows pages SILENT_WINDOW.
+- **§7**: CHECKS_P17 in tape_grade (terminal regressions, silent windows,
+  windows concluded, specific-tag storms, TASK_STUCK ≤1, stale open brackets,
+  BATON) — third graded suite in the pack, own retirement.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -49,7 +49,7 @@ def test_wrong_way_tick_buy_must_improve_up(gateway):
     # 45 -> 44 is the wrong way
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(lane="P", price=44, improve_from=45), b)
-    assert e.value.wall == "REJECT_WRONG_WAY_TICK"
+    assert e.value.wall == "WRONG_WAY"
     # zero-tick "improvement" also rejected
     with pytest.raises(WallRejection):
         gateway.submit(entry(lane="P", price=45, improve_from=45), b)
@@ -64,7 +64,7 @@ def test_wrong_way_tick_sell_must_improve_down(gateway):
                  improve_from=52)
     with pytest.raises(WallRejection) as e:
         gateway.submit(sell, b)
-    assert e.value.wall == "REJECT_WRONG_WAY_TICK"  # sell improved UP = wrong way
+    assert e.value.wall == "WRONG_WAY"  # sell improved UP = wrong way
     ok = Order(lane="P", event="EV1", market="M1", side="yes", action="sell",
                price_cents=51, count=1, size_tier=config.TIER_PROBE, purpose="ENTRY",
                improve_from=52)
@@ -80,7 +80,7 @@ def test_net_risk_cross_lane_cap(gateway):
     # 4th contract on the same settlement event crosses the <=3 cap
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(lane="F", market="M4", price=30, count=1), b)
-    assert e.value.wall == "NET_RISK_CAP"
+    assert e.value.wall == "NET_RISK"
     # a different settlement event has its own cap
     assert gateway.submit(entry(lane="F", market="M9", event="EV2", price=61, count=1), b).shadow
 
@@ -96,7 +96,7 @@ def test_at_risk_cap_trips_independently(gateway, monkeypatch):
     gateway.submit(entry(lane="MM", market="M3", price=99, count=1), b)  # 297c == cap
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(lane="F", market="M4", price=1, count=1), b)  # 298c > cap
-    assert e.value.wall == "AT_RISK_CAP"
+    assert e.value.wall == "DOLLAR_RISK"
 
 
 def test_at_risk_cap_exact_boundary(gateway):
@@ -163,22 +163,22 @@ def test_pct_of_book_budget(gateway, ledger):
     ledger.snapshot_caps_at_boot()  # budget = 20c
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(price=61, count=1), b)
-    assert e.value.wall == "PCT_OF_BOOK"
+    assert e.value.wall == "BUDGET"
 
 
 def test_sizing_tier_authorization(gateway):
     b = make_book()
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(price=61, tier=config.TIER_SUPPRESS), b)
-    assert e.value.wall == "SIZING_TIER"
+    assert e.value.wall == "DEPTH"
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(price=61, count=2, tier=config.TIER_PROBE), b)  # PROBE max 1
-    assert e.value.wall == "SIZING_TIER"
+    assert e.value.wall == "DEPTH"
     gw2_authorized = lambda lane, market: config.TIER_LEAN
     gateway.sizing_authorized_tier = gw2_authorized
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(price=61, count=1, tier=config.TIER_CLEAR), b)
-    assert e.value.wall == "SIZING_TIER"
+    assert e.value.wall == "DEPTH"
 
 
 def test_fee_tripwire_multiplier_and_designation_list(gateway):

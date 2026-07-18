@@ -28,6 +28,10 @@ def test_stacked_market_reconstructs_per_lane_from_surface_rows_alone(ledger, su
     per_lane = surface.settle_market(MKT, WIN, settled_yes=True)
     assert per_lane == {"F": 39, "D": -70, "P": -8}
 
+    # P17 §1.1: PASS is provisional until close — finalize writes the
+    # terminal PASS rows for the lanes that never entered (MM, H8).
+    surface.finalize_window(MKT, WIN)
+
     # THE ACCEPTANCE READ: surface rows alone, no fills table, no ledger math
     recon = surface.reconstruct_per_lane(MKT, WIN)
     assert recon == {"F": 39, "D": -70, "P": -8, "MM": 0, "H8": 0}
@@ -50,11 +54,33 @@ def test_per_fill_schema_complete(ledger):
     assert (lane, market, side, price, count, tier) == ("F", MKT, "yes", 61, 1, "PROBE")
 
 
-def test_one_terminal_row_per_lane_market_window(surface):
-    surface.write_row("F", MKT, WIN, PASS)
-    assert surface.write_row("F", MKT, WIN, PASS) is False  # same verdict re-asserted: no-op
+def test_terminal_lattice_monotonic(surface):
+    """P17 §1 overturned the old immutable-terminal law here: PASS is
+    provisional (interim) mid-window; a stale PASS terminal meeting SETTLED
+    UPGRADES (logged, never fatal); only a REGRESSION stays FATAL."""
+    surface.write_row("F", MKT, WIN, PASS)                      # provisional
+    assert surface.write_row("F", MKT, WIN, PASS) is False      # dedup no-op
+    assert surface.write_row("F", MKT, WIN, SETTLED) is True    # 9:30 shape heals
     with pytest.raises(FatalIntegrityError):
-        surface.write_row("F", MKT, WIN, SETTLED)  # a DIFFERENT second terminal = bug
+        surface.write_row("F", MKT, WIN, PASS, final=True)      # regression = bug
+
+
+def test_stale_pass_terminal_upgrades_logged(surface, ledger):
+    from relay_engine import failures
+    failures.configure(ledger, alert_fn=lambda m: None, run_mode="TEST", boot_id=1)
+    try:
+        surface.write_row("H8", MKT, WIN, PASS, final=True)     # terminal PASS
+        assert surface.write_row("H8", MKT, WIN, SETTLED, detail="pnl") is True
+        row = ledger.db.execute(
+            "SELECT detail FROM surface_rows WHERE lane='H8' AND state='SETTLED'"
+        ).fetchone()[0]
+        assert "upgrade from PASS" in row
+        assert ledger.db.execute(
+            "SELECT COUNT(*) FROM failures WHERE why_tag='TERMINAL_UPGRADED'"
+        ).fetchone()[0] == 1
+    finally:
+        failures._ledger = None
+        failures._alert_fn = None
 
 
 def test_interim_rows_on_state_change_only(surface):

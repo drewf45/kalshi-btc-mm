@@ -147,7 +147,7 @@ def test_second_same_side_flip_entry_rejected(gateway):
                              side="no", action="buy", price_cents=46, count=1,
                              size_tier=config.TIER_PROBE, purpose="ENTRY",
                              band=(1, 49)), make_book())
-    assert e.value.wall == "REJECT_FLIP_UNPAIRED"
+    assert e.value.wall == "FLIP_UNPAIRED"
     # the OPPOSITE side nets toward flat — risk-reducing at the canonical
     # layer, walls skipped entirely: the pair is legitimate by construction
     r = gateway.submit(Order(lane="FLIP", event=EVENT, market=TICKER,

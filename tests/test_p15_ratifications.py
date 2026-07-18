@@ -162,10 +162,10 @@ def test_tape_grade_all_pass_on_clean_tape(engine):
 
 def test_tape_grade_fails_on_depth_storm(engine):
     failures.fail("WALL_STORM", "PCT_OF_BOOK storm", lane="F", market=TICKER,
-                  wall_tag="PCT_OF_BOOK", alert=False)
+                  wall_tag="BUDGET", alert=False)
     from scripts.tape_grade import grade
     results = {name: ok for name, ok, _ in grade(engine.ledger.db)}
-    assert results["zero depth-class wall storms (Ruling 3)"] is False
+    assert results["zero [BUDGET]/[DEPTH] wall storms (Ruling 3, specific tags §4)"] is False
 
 
 def test_tape_grade_fails_on_same_side_double(engine):

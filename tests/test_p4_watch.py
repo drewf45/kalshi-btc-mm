@@ -73,7 +73,7 @@ def test_spot_flows_into_h8_gate():
     # no spot: blind eye -> H8_NO_SPOT
     engine.cycle([TICKER], now=close - 55)
     reasons = dict(engine.ledger.db.execute(
-        "SELECT lane, detail FROM surface_rows WHERE terminal=1"))
+        "SELECT lane, detail FROM surface_rows WHERE state='PASS'"))
     assert reasons["H8"] == "H8_NO_SPOT"
 
     # spot present and fresh: the gate evaluates distance and fires

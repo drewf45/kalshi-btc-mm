@@ -48,7 +48,7 @@ def test_watch_ladder_drives_shadow_proposal():
 
     # H8 verdict on the same market: terminal Pass, cost in F band
     h8 = engine.ledger.db.execute(
-        "SELECT detail FROM surface_rows WHERE lane='H8' AND terminal=1").fetchone()[0]
+        "SELECT detail FROM surface_rows WHERE lane='H8' AND state='PASS'").fetchone()[0]
     assert h8 == "COST_IN_F_BAND"
 
     # live submit side-effects mirrored: single entry + hourly exposure
@@ -72,6 +72,6 @@ def test_h8_band_market_waits_without_spot():
 
     engine.cycle([TICKER], now=close - 60)  # final window, H8 time gate territory
     reasons = dict(engine.ledger.db.execute(
-        "SELECT lane, detail FROM surface_rows WHERE terminal=1"))
+        "SELECT lane, detail FROM surface_rows WHERE state='PASS'"))
     assert reasons["H8"] == "H8_NO_SPOT"
     assert reasons["F"] == "H8_NO_SPOT"  # shared decision: cost sits in H8's band

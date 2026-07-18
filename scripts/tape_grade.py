@@ -47,11 +47,11 @@ def check_no_depth_storms(db, since):
     bad = 0
     for (how,) in rows:
         try:
-            if json.loads(how).get("wall_tag") in ("PCT_OF_BOOK", "SIZING_TIER"):
+            if json.loads(how).get("wall_tag") in ("BUDGET", "DEPTH"):
                 bad += 1
         except Exception:
             pass
-    return bad == 0, f"{bad} depth-class wall storm(s)"
+    return bad == 0, f"{bad} [BUDGET]/[DEPTH] wall storm(s)"
 
 
 def check_no_same_side_doubles(db, since):
@@ -103,7 +103,7 @@ def check_no_baton_fatals(db, since):
 
 CHECKS = [
     ("zero lone-leg FLIP entries (Ruling 2)", check_no_lone_flip_entries),
-    ("zero depth-class wall storms (Ruling 3)", check_no_depth_storms),
+    ("zero [BUDGET]/[DEPTH] wall storms (Ruling 3, specific tags §4)", check_no_depth_storms),
     ("zero same-side double entries (Fix A)", check_no_same_side_doubles),
     ("orphans adopted, never abandoned (Ruling 1)", check_orphans_adopted),
     ("FLIP R6 pack line ships (R-1)", check_flip_pack_line_ships),
@@ -168,8 +168,84 @@ CHECKS_P16 = [
     ("orphan settlements attribute to ORPHAN", check_orphan_settlements_attributed),
     ("closed brackets source=venue", check_brackets_source_venue),
     ("zero BATON_VIOLATION FATALs", check_no_baton_fatals),
-    ("zero depth-class wall storms", check_no_depth_storms),
+    ("zero [BUDGET]/[DEPTH] wall storms", check_no_depth_storms),
     ("zero unexplained orientation pages", check_no_orientation_pages),
+]
+
+
+# ── P17 "SHOW UP FOR EVERY MARKET" — expected tape ─────────────────────────
+OLD_AMBIGUOUS_TAGS = ("PCT_OF_BOOK", "SIZING_TIER", "NET_RISK_CAP", "AT_RISK_CAP")
+
+
+def check_no_terminal_regressions(db, since):
+    """zero DUPLICATE_TERMINAL_ROW FATALs — the 9:30 class is dead by lattice
+    (upgrades log TERMINAL_UPGRADED instead; those are informational)."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                 " why_tag='DUPLICATE_TERMINAL_ROW' AND ts>?", (since,))
+    up = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                  " why_tag='TERMINAL_UPGRADED' AND ts>?", (since,))
+    return n == 0, f"{n} regression(s) · {up} legal upgrade(s)"
+
+
+def check_no_silent_windows(db, since):
+    """every window from deploy onward has rows — a rowless window is a §6
+    contract breach and pages SILENT_WINDOW."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                 " why_tag='SILENT_WINDOW' AND ts>?", (since,))
+    return n == 0, f"{n} silent window(s)"
+
+
+def check_every_window_concluded(db, since):
+    """every closed window ends in a receipt (SETTLED) or a clean PASS/
+    GAP_RESTART terminal — no window left mid-story."""
+    total = _one(db, "SELECT COUNT(DISTINCT window_id) FROM surface_rows"
+                     " WHERE ts>?", (since,))
+    concluded = _one(db, "SELECT COUNT(DISTINCT window_id) FROM surface_rows"
+                         " WHERE ts>? AND terminal=1", (since,))
+    # windows still LIVE right now legitimately lack terminals — tolerate 2
+    return total - concluded <= 2, f"{concluded}/{total} windows concluded"
+
+
+def check_specific_wall_tags_only(db, since):
+    """storm/reject pages carry SPECIFIC wall tags — zero storms under the
+    old ambiguous names (the BUDGET-misread-as-depth lesson)."""
+    rows = db.execute(
+        "SELECT how_json FROM failures WHERE why_tag='WALL_STORM' AND ts>?",
+        (since,)).fetchall()
+    bad = 0
+    for (how,) in rows:
+        try:
+            if json.loads(how).get("wall_tag") in OLD_AMBIGUOUS_TAGS:
+                bad += 1
+        except Exception:
+            pass
+    return bad == 0, f"{bad} storm(s) under old ambiguous tags"
+
+
+def check_task_stuck_bounded(db, since):
+    """zero TASK_STUCK (or exactly one with its story)."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE why_tag='TASK_STUCK'"
+                 " AND ts>?", (since,))
+    return n <= 1, f"{n} TASK_STUCK page(s)"
+
+
+def check_no_stale_open_brackets(db, since, now=None):
+    """the healed-window proof: no bracket still open 30+ minutes after its
+    row was written (the stuck-0930 shape)."""
+    now = time.time() if now is None else now
+    n = _one(db, "SELECT COUNT(*) FROM window_econ WHERE"
+                 " close_value_cents IS NULL AND ts < ?", (now - 1800,))
+    return n == 0, f"{n} stale open bracket(s)"
+
+
+CHECKS_P17 = [
+    ("zero terminal regressions; upgrades legal (§1)", check_no_terminal_regressions),
+    ("zero silent windows (§6 contract)", check_no_silent_windows),
+    ("every closed window concluded: receipt or PASS (§6.3)", check_every_window_concluded),
+    ("storm pages carry specific wall tags (§4)", check_specific_wall_tags_only),
+    ("TASK_STUCK bounded: zero or one with its story (§3)", check_task_stuck_bounded),
+    ("no stale open brackets — stuck windows heal (§1.3)", check_no_stale_open_brackets),
+    ("zero BATON_VIOLATION FATALs", check_no_baton_fatals),
 ]
 
 
@@ -194,7 +270,8 @@ def main() -> int:
     hours = float(sys.argv[2]) if len(sys.argv) > 2 else 24.0
     db = sqlite3.connect(sys.argv[1])
     total_fails = 0
-    for label, checks in (("P15", CHECKS), ("P16 deposit day", CHECKS_P16)):
+    for label, checks in (("P15", CHECKS), ("P16 deposit day", CHECKS_P16),
+                          ("P17 show up", CHECKS_P17)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

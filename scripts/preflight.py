@@ -68,6 +68,10 @@ CHECKS = [
     ("the scalp profile, funded: db chain, rescale, deposit tape (P16)", [
         "tests/test_p16_funded.py",
     ]),
+    ("show up for every market: lattice, late truths, window contract (P17)", [
+        "tests/test_p17_show_up.py",
+        "tests/test_attribution.py",
+    ]),
 ]
 
 

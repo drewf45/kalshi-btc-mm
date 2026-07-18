@@ -113,6 +113,23 @@ class WindowEcon:
             return True
         return False
 
+    def restore_open_brackets_on_boot(self) -> int:
+        """P17 §1.3: an open bracket (close_value NULL) survives a restart —
+        reloaded so the settle sweep retries it. This is how the stuck 0930
+        window HEALS on the first retry after deploy."""
+        rows = self.ledger.db.execute(
+            "SELECT market, open_value_cents, ts FROM window_econ"
+            " WHERE close_value_cents IS NULL").fetchall()
+        restored = 0
+        for market, open_val, ts in rows:
+            if market not in self.open_brackets:
+                self.open_brackets[market] = Bracket(market, int(open_val), ts)
+                restored += 1
+        if restored:
+            log.warning("restored %d open bracket(s) from DB — settle sweep "
+                        "will retry them", restored)
+        return restored
+
     # ── §1: the bracket ────────────────────────────────────────────────
     def _reject_paper_in_live(self, market: str, source: str) -> None:
         """P9 §2: a bracket/streak/halt decision may only consume venue-sourced
@@ -162,7 +179,7 @@ class WindowEcon:
                       fills_pnl_cents: int, lanes_active: str = "",
                       fills_count: int = 0,
                       now: Optional[float] = None, source: str = "paper",
-                      deferred: str = "") -> Optional[int]:
+                      deferred: str = "", late: bool = False) -> Optional[int]:
         """After settlement confirmed + fills booked. Returns window_pnl_cents.
         account_value_cents=None = live read failed — the close DEFERS (the
         settlement is already booked once; the bracket completes on the next
@@ -204,7 +221,7 @@ class WindowEcon:
                                "close": account_value_cents,
                                "pnl": window_pnl, "lanes": lanes_active,
                                "fills": fills_count}))
-        self._apply_streak(market, window_pnl, account_value_cents)
+        self._apply_streak(market, window_pnl, account_value_cents, late=late)
         return window_pnl
 
     def flush_deferred(self, account_value_cents: int, source: str,
@@ -228,8 +245,9 @@ class WindowEcon:
             done += 1
         return done
 
-    # ── §2: the two-strike leash ───────────────────────────────────────
-    def _apply_streak(self, market: str, window_pnl: int, book_cents: int) -> None:
+    # ── §2: the two-strike leash (P17 §2.1: late truths still count) ───
+    def _apply_streak(self, market: str, window_pnl: int, book_cents: int,
+                      late: bool = False) -> None:
         strikes = json.loads(self.ledger.get_state(STRIKES_KEY) or "[]")
         if window_pnl < 0:
             streak = self.streak + 1
@@ -242,16 +260,19 @@ class WindowEcon:
         self.ledger.set_state(STRIKES_KEY, json.dumps(strikes))
 
         sign = "+" if window_pnl >= 0 else ""
+        late_s = " (settled late — books healed)" if late else ""
         self.telegram.alert(
             f"📊 {market} {sign}${window_pnl / 100:.2f} · "
-            f"book ${book_cents / 100:.2f} · streak {streak}")
+            f"book ${book_cents / 100:.2f} · streak {streak}{late_s}")
 
         if streak >= 2 and not self.halted():
             self.ledger.set_state(HALT_KEY, "1")
             self.gateway.halt_entries(HALT_REASON)
             s1, s2 = strikes[0], strikes[1]
+            retro = (f"⛔ TWO-STRIKE (retroactive: {market} settled late): "
+                     if late else "⛔ TWO-STRIKE HALT: ")
             self.telegram.alert(
-                f"⛔ TWO-STRIKE HALT: {s1['market']} {s1['pnl']}c, "
+                f"{retro}{s1['market']} {s1['pnl']}c, "
                 f"{s2['market']} {s2['pnl']}c · book ${book_cents / 100:.2f} · "
                 f"reply /reset_halt to resume")
             failures.fail("TWO_STRIKE_HALT",

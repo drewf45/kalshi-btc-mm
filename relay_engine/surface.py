@@ -27,19 +27,28 @@ from .ledger import Ledger
 PASS = "PASS"
 SETTLED = "SETTLED"
 CUSTODIED_SETTLED = "CUSTODIED_SETTLED"
+GAP_RESTART = "GAP_RESTART"   # P17 §1.4: an evidence hole, counted not papered
 # Interim states (full row on state change only)
 WATCHING = "WATCHING"
 PROPOSED = "PROPOSED"
 ENTERED = "ENTERED"
 EXITED = "EXITED"
 
-TERMINAL_STATES = {PASS, SETTLED, CUSTODIED_SETTLED}
+TERMINAL_STATES = {PASS, SETTLED, CUSTODIED_SETTLED, GAP_RESTART}
+
+# P17 §1: terminal is MONOTONIC, not immutable. A stale PASS meeting a
+# settlement UPGRADES (logged); a GAP_RESTART heals into a real settlement;
+# only a REGRESSION (rank going down, or two conflicting settlements) is the
+# accounting bug that stays FATAL.
+TERMINAL_RANK = {PASS: 0, GAP_RESTART: 1, SETTLED: 2, CUSTODIED_SETTLED: 2}
 
 
 class Surface:
     def __init__(self, ledger: Ledger):
         self.ledger = ledger
         self._last_state: Dict[tuple, str] = {}  # (lane, market, window) -> last state
+        self._last_detail: Dict[tuple, str] = {}  # last interim reason (finalize keeps it)
+        self._terminal: Dict[tuple, str] = {}    # (lane, market, window) -> terminal verdict
         self.interim_counters = defaultdict(int)  # (lane, state) -> count
         # Scientist stamp (P3): five lanes on one book contaminate each other's
         # counterfactuals — accepted by ruling, but every row carries which
@@ -47,30 +56,73 @@ class Surface:
         self.concurrent_provider = lambda market: ""
 
     def write_row(self, lane: str, market: str, window_id: str, state: str,
-                  transport: str = "WS", detail: str = "", ts: Optional[float] = None) -> bool:
-        """Full row on state change only; repeated same-state writes bump a counter."""
+                  transport: str = "WS", detail: str = "",
+                  ts: Optional[float] = None, final: bool = False) -> bool:
+        """Full row on state change only; repeated same-state writes bump a
+        counter. P17 §1.1: PASS is PROVISIONAL (interim) until the window
+        closes — the terminal PASS is written only by finalize_window
+        (final=True). A lane that passes at T-12 and enters at T-2 therefore
+        never writes a PASS terminal at all."""
         key = (lane, market, window_id)
-        terminal = state in TERMINAL_STATES
-        if not terminal and self._last_state.get(key) == state:
-            self.interim_counters[(lane, state)] += 1
-            return False
-        if terminal and self._last_state.get(key) in TERMINAL_STATES:
-            if self._last_state[key] == state:
+        terminal = state in TERMINAL_STATES and (state != PASS or final)
+        if not terminal:
+            if self._last_state.get(key) == state:
+                self.interim_counters[(lane, state)] += 1
+                return False
+            self._last_state[key] = state
+            self._last_detail[key] = detail
+            self._insert(key, state, 0, transport, detail, ts)
+            return True
+        prev = self._terminal.get(key)
+        if prev is not None:
+            if prev == state:
                 return False  # re-asserting the same terminal verdict is a no-op
-            # A DIFFERENT second terminal row is an accounting bug.
-            from . import failures
-            failures.fail("DUPLICATE_TERMINAL_ROW",
-                          f"duplicate terminal row for {key}: had "
-                          f"{self._last_state[key]}, got {state}", fatal=True)
+            if TERMINAL_RANK.get(state, 0) > TERMINAL_RANK.get(prev, 0):
+                # §1.2: upgrades legal, logged, never fatal
+                from . import failures
+                failures.fail("TERMINAL_UPGRADED",
+                              f"{key}: terminal {prev} -> {state}",
+                              lane=lane, market=market, alert=False)
+                detail = (detail + " · " if detail else "") + f"upgrade from {prev}"
+            else:
+                # a REGRESSION is a real accounting bug — stays FATAL
+                from . import failures
+                failures.fail("DUPLICATE_TERMINAL_ROW",
+                              f"terminal REGRESSION for {key}: had {prev}, "
+                              f"got {state}", fatal=True)
+        self._terminal[key] = state
         self._last_state[key] = state
+        self._insert(key, state, 1, transport, detail, ts)
+        return True
+
+    def _insert(self, key, state, terminal, transport, detail, ts):
+        lane, market, window_id = key
         self.ledger.db.execute(
             "INSERT INTO surface_rows (ts, lane, market, window_id, state, terminal,"
             " transport, detail, concurrent_lanes) VALUES (?,?,?,?,?,?,?,?,?)",
             (ts if ts is not None else time.time(), lane, market, window_id, state,
-             1 if terminal else 0, transport, detail, self.concurrent_provider(market)),
+             terminal, transport, detail, self.concurrent_provider(market)),
         )
         self.ledger.db.commit()
-        return True
+
+    def finalize_window(self, market: str, window_id: str) -> int:
+        """P17 §1.1/§6.3: at window close, every lane that watched or passed —
+        and never entered — writes its first-class terminal PASS. Lanes whose
+        last state is order-shaped (PROPOSED/ENTERED/EXITED) wait for
+        settlement's terminal. Returns terminal rows written."""
+        wrote = 0
+        for (lane, mkt, win), last in list(self._last_state.items()):
+            if mkt != market or win != window_id:
+                continue
+            if (lane, mkt, win) in self._terminal:
+                continue
+            if last in (WATCHING, PASS):
+                detail = self._last_detail.get((lane, mkt, win)) \
+                    or "window closed — no entry"
+                if self.write_row(lane, market, window_id, PASS,
+                                  detail=detail, final=True):
+                    wrote += 1
+        return wrote
 
     # ------------------------------------------------------------------
     # Settlement by fill mapping (stacked markets split per lane)

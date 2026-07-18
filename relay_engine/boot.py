@@ -58,6 +58,16 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     if boot_caps is not None:
         # P8 §3 + P14 §3: 1/12-Kelly honestly stated, at BOTH reference prices.
         lines.append(sizing_line(boot_caps.book_cents))
+        # P17 §2.3: the rail state in words — never a silently-zero bound.
+        floor_c = int(config.DRAWDOWN_ABSOLUTE_FLOOR_USD * 100)
+        if boot_caps.book_cents <= floor_c * 2:
+            lines.append(f"rail: DISARMED (book < "
+                         f"${config.DRAWDOWN_ABSOLUTE_FLOOR_USD * 2:.0f}) — "
+                         f"two-strike is the only engine stop")
+        else:
+            lines.append(f"rail: ARMED — floor "
+                         f"${config.DRAWDOWN_ABSOLUTE_FLOOR_USD:.2f}, headroom "
+                         f"${(boot_caps.book_cents - floor_c) / 100:.2f}")
     if boot_caps is not None:
         lines.append(
             f"BOOT CAPS SNAPSHOT: book={boot_caps.book_cents}c "
