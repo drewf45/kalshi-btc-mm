@@ -213,6 +213,9 @@ class ShadowEngine:
         self.divergence_watches = {}   # market -> {until, strikes}
         self._orientation_checked = False
         self.windows_seen = 0          # P17 §6.1: the show-up counter
+        # P18: the displacement-event anchor per market — ONE hunt per event;
+        # re-anchored on each hunt submit (a new hunt needs a NEW needle).
+        self.hunt_anchor = {}
         self.flip.alert_fn = self.telegram.alert
         # P14 §2.1: the cut boundary's on-demand fills sweep
         self.custodian.resweep = self._resweep_market
@@ -254,6 +257,7 @@ class ShadowEngine:
         # P15 Fix A: settled window — gross exposure for the market is over
         for key in [k for k in self.gateway.gross_open if k[1] == ticker]:
             del self.gateway.gross_open[key]
+        self.hunt_anchor.pop(ticker, None)   # P18: anchors die with the window
 
     # ── P10 §2: poison episodes, quarantine, REST marks ─────────────────
     def note_poison_episode(self, market: str, yb, nb) -> None:
@@ -725,6 +729,19 @@ class ShadowEngine:
                                            "WATCHING", transport=transport,
                                            detail=tag)
                 continue
+            # P18 §4.1: shared eyes, not orders — the spot-lead signal
+            # computes ONCE per cycle here; FLIP·HUNT consumes it as trigger,
+            # F/H8 record it as a why-tag field, P yields the floor.
+            from . import spotlead as _sl
+            from .lanes import infer_close_ts_from_ticker as _infer
+            sl = None
+            if spot is not None:
+                strike = _sl.pick_strike(spot, meta.get("boundary_lo"),
+                                         meta.get("boundary_hi"))
+                close_for = meta.get("close_ts") or _infer(market)
+                if strike is not None and close_for is not None:
+                    anchor = self.hunt_anchor.setdefault(market, spot)
+                    sl = _sl.needle(anchor, spot, strike, close_for - now)
             ctx = {
                 "book": book, "now": now, "spot": spot,
                 "spot_ticks": self.spot_ticks,
@@ -733,6 +750,7 @@ class ShadowEngine:
                 "boundary_hi": meta.get("boundary_hi"),
                 "cash_usd": self.ledger.book_cents() / 100.0,
                 "entries_allowed": self.ladder.entries_allowed(),
+                "spotlead": sl,
             }
             # P13 §3: boot orientation self-test on the first comparable book
             if not self._orientation_checked and book.has_snapshot:
@@ -744,6 +762,17 @@ class ShadowEngine:
                 self.gateway.cancel(stale_oid)
 
             for lane in self.lanes:
+                # P18 §4.2 THE P-SUPPRESSION RULE: a CONFIRMED needle-move
+                # voids the fade thesis — P exists to fade moves the spot
+                # never made; the moment spot ratifies one, P yields the
+                # floor. Logged as a suppression row (its cost measurable).
+                from . import spotlead as _slmod
+                if lane.name == "P" and _slmod.is_confirmed_needle(sl):
+                    self.surface.write_row(
+                        "P", market, window, "WATCHING", transport=transport,
+                        detail=f"P_SUPPRESSED_BY_HUNT needle "
+                               f"+{sl.delta_p:.0f}pts")
+                    continue
                 decision = lane.evaluate(market, ctx)
                 # D watchdog abandon: broken evidence -> custodian cut NOW
                 if lane.name == "D" and decision.pass_reason == "EVIDENCE_BROKEN":
@@ -788,6 +817,12 @@ class ShadowEngine:
                         val, src = self.account_value(now)
                         self.econ.open_bracket(market, val, now=now, source=src,
                                                transport=transport)
+                        # P18: ONE hunt per displacement EVENT — re-anchor at
+                        # the post-event spot; a new hunt needs a NEW needle.
+                        if (proposal.lane == "FLIP"
+                                and proposal.why.startswith("HUNT")
+                                and spot is not None):
+                            self.hunt_anchor[market] = spot
                     if proposal.lane in ("F", "H8"):
                         # Live submit side-effects, mirrored from k_worker gateway.submit:
                         # lane-scoped single entry + F hourly exposure.

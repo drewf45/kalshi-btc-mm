@@ -795,6 +795,53 @@ showing up is mandatory; trading is earned.
   windows concluded, specific-tag storms, TASK_STUCK ≤1, stale open brackets,
   BATON) — third graded suite in the pack, own retirement.
 
+## WO-P18 FINAL — "THE DETECTIVE" (the scalp profile's hunting arm)
+
+Suite at this commit: **324 passed**; preflight **16/16**. The compare was right:
+P18 was NOT in the tree — built here as FOUNDATION on the confirmed organs
+(delta.p_survive, lane_p's confirm pattern, the spot task, custodian/crossfire,
+mode-stamped rows).
+
+- **§0/§2 TRUE — the needle-move equation** (`spotlead.py`, ONE trigger fn):
+  `needle(anchor, spot, strike, t)` computes ΔP = p_side(d_after,t) −
+  p_side(d_before,t) from the DELTA TABLE at current time-remaining — the
+  clock-and-distance law in one line (test: the same $80 jump is a 38-point
+  needle near the strike and a <1-point nothing $5k away; no hand-tuned time
+  rules). p_side derives from `p_survive` (the shared brain D and H8 gate on);
+  TABLE_ABSENT → None → no hunt, evidence-born. Side is ALWAYS with spot —
+  the 0/80 never-build's mirror, structurally.
+  Gates, ALL required: A) ΔP ≥ 5 pts · B) fair − join ≥ 4¢ (the lag in cents) ·
+  C) convergence (a join that DROPS between confirms kills the pending — the
+  crowd fighting the move) + 2-consecutive-evaluation confirm (lane_p's
+  flicker-proof pattern) + t > FLIP_CURFEW + spot fresh (BLIND → no signal →
+  no hunt, tested). Entry: MAKER JOIN at the touch, band (5,95) — no side-max,
+  no price cap. ONE hunt per displacement EVENT: the runner re-anchors at the
+  post-event spot on submit; a new hunt needs a NEW confirmed needle.
+- **§1 TRUE — two modes, stamped**: HUNT casefiles carry `HUNT needle +Npts
+  (d A→B, T-m:ss) · fair F · gap G · converging` in why/PROPOSED detail;
+  PAIR is UNCHANGED (Ruling 2 stands; its 306-test surface passed untouched)
+  and posts only when NO needle is live — the hunt owns the floor while one is.
+- **§3 TRUE — the two jobs, mechanical**: JOB A: take at entry+4 proposed the
+  instant the fill books (registered as the custodian's resting exit — baton
+  intact). JOB B: mark ≤ entry → breakeven reprice IMMEDIATELY (cancel take,
+  EXIT at entry); mark ≤ entry−2 OR not-out-in-20s → crossfire flatten NOW;
+  TIME-BOX 60s → flatten. CURFEW: hunt entries forbidden and hunt inventory
+  flattened at T-240 (PAIR keeps its ported T-90 law — §1's "unchanged"
+  outranks; documented choice). Hunt exits realize against THEIR entry and
+  feed the shared ratchet (scratches → sit-out, stop-streak, trips) — no
+  averaging, no thesis-defense. Custodian FLIP params remain the backstop
+  behind the lane's tighter jobs (P14 re-derive prevents any double-sell).
+- **§4 TRUE — lanes talk, one yields**: the signal computes ONCE per cycle in
+  ctx (engine); F/H8 append `spotlead:+Npts` to their why with gates UNTOUCHED;
+  a CONFIRMED needle SUPPRESSES lane P on that market, logged as a
+  `P_SUPPRESSED_BY_HUNT` row (the fee-bleed collision class, dead pre-birth).
+- **§5 TRUE**: the casefile row carries (d_before, d_after, ΔP, fair, gap,
+  converge); outcome rides the exit reason + round-trip line. The FLIP pack
+  line prints the honest bar (`bar ≥50% to break even (+4/−4)`) and states
+  HUNT volume is EXPECTED LOW — low count reads as discipline.
+- **§7**: CHECKS_P18 (casefiles complete, zero sub-N needles, zero P-vs-HUNT
+  collisions, hunts resolve, PAIR alive, the bar ships) — fourth graded suite.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

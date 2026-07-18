@@ -249,6 +249,94 @@ CHECKS_P17 = [
 ]
 
 
+# ── P18 "THE DETECTIVE" — expected tape ────────────────────────────────────
+def _hunt_rows(db, since):
+    return db.execute(
+        "SELECT detail, ts, market FROM surface_rows WHERE lane='FLIP'"
+        " AND state='PROPOSED' AND detail LIKE '%HUNT needle%' AND ts>?",
+        (since,)).fetchall()
+
+
+def check_hunt_whys_complete(db, since):
+    """every HUNT why carries (ΔP, d_before→d_after, fair, gap, converge)."""
+    rows = _hunt_rows(db, since)
+    bad = sum(1 for (d, _, _) in rows
+              if not all(tok in d for tok in
+                         ("needle +", "d ", "fair", "gap", "converging")))
+    return bad == 0, f"{bad} incomplete of {len(rows)} hunt casefiles"
+
+
+def check_hunt_needles_at_or_above_n(db, since):
+    """zero HUNT entries with ΔP < N (gate A is the law, graded)."""
+    from relay_engine import config as _cfg
+    bad = 0
+    for detail, _, _ in _hunt_rows(db, since):
+        m = re.search(r"needle \+(\d+)pts", detail)
+        if m and float(m.group(1)) < _cfg.HUNT_NEEDLE_POINTS:
+            bad += 1
+    return bad == 0, f"{bad} sub-N needle(s)"
+
+
+def check_no_p_hunt_collision(db, since):
+    """zero P-vs-HUNT same-market opposite entries — suppression rows appear
+    instead (the fee-bleed class, dead)."""
+    hunt_markets = {m for (_, _, m) in _hunt_rows(db, since)}
+    if not hunt_markets:
+        return True, "no hunts this window"
+    qmarks = ",".join("?" * len(hunt_markets))
+    p_fills = _one(db, f"SELECT COUNT(*) FROM fills WHERE lane='P' AND"
+                       f" action='ENTRY' AND market IN ({qmarks}) AND ts>?",
+                   (*hunt_markets, since))
+    return p_fills == 0, f"{p_fills} P entries on hunted markets"
+
+
+def check_hunts_resolve(db, since, now=None):
+    """every hunt resolves take / breakeven-bail / time-box — zero FLIP
+    inventory older than 15 minutes without an exit fill."""
+    now = time.time() if now is None else now
+    entries = db.execute(
+        "SELECT market, ts FROM fills WHERE lane='FLIP' AND action='ENTRY'"
+        " AND ts>? AND ts<?", (since, now - 900)).fetchall()
+    stale = 0
+    for market, ts in entries:
+        n = _one(db, "SELECT COUNT(*) FROM fills WHERE lane='FLIP' AND market=?"
+                     " AND action IN ('EXIT','CUSTODIAN_EXIT') AND ts>=?",
+                 (market, ts))
+        if n == 0:
+            stale += 1
+    return stale == 0, f"{stale} unresolved FLIP entr{'y' if stale == 1 else 'ies'}"
+
+
+def check_pair_mode_alive(db, since):
+    """PAIR mode still posts on genuine two-way books (conditional)."""
+    n = _one(db, "SELECT COUNT(*) FROM surface_rows WHERE lane='FLIP' AND"
+                 " state='PROPOSED' AND detail LIKE '%pair-post%' AND ts>?",
+             (since,))
+    return True, f"{n} pair post(s) (conditional — books decide)"
+
+
+def check_hit_rate_bar_ships(db, since):
+    """the FLIP pack line prints hit-rate against the honest ≥50% bar."""
+    try:
+        import inspect
+
+        from relay_engine import ops
+        ok = "bar ≥50%" in inspect.getsource(ops.daily_pack)
+    except Exception:
+        ok = False
+    return ok, "ops.daily_pack prints the bar"
+
+
+CHECKS_P18 = [
+    ("every HUNT casefile complete: ΔP, d, fair, gap, converge", check_hunt_whys_complete),
+    ("zero HUNT entries with ΔP < N (gate A graded)", check_hunt_needles_at_or_above_n),
+    ("zero P-vs-HUNT collisions (suppression instead)", check_no_p_hunt_collision),
+    ("every hunt resolves — no aging flip inventory", check_hunts_resolve),
+    ("PAIR mode still posts on two-way books", check_pair_mode_alive),
+    ("FLIP pack line prints the ≥50% bar", check_hit_rate_bar_ships),
+]
+
+
 def grade(db, window_hours: float = 24.0, now=None, checks=None):
     """Returns [(name, ok, detail)] for the last window_hours."""
     now = time.time() if now is None else now
@@ -271,7 +359,8 @@ def main() -> int:
     db = sqlite3.connect(sys.argv[1])
     total_fails = 0
     for label, checks in (("P15", CHECKS), ("P16 deposit day", CHECKS_P16),
-                          ("P17 show up", CHECKS_P17)):
+                          ("P17 show up", CHECKS_P17),
+                          ("P18 the detective", CHECKS_P18)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

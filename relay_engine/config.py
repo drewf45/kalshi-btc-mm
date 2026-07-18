@@ -51,6 +51,19 @@ REST_BOOK_STALE_CUSTODY_S = 30.0  # P11.1-d: custody's grace on a failed-fetch b
 FILLS_SWEEP_S = 3.0              # the proven live fills cadence (accepted 3s lag)
 
 # ---------------------------------------------------------------------------
+# P18 "THE DETECTIVE" — the hunt's DREW-DEFAULT knobs (§2/§3). The trigger is
+# EQUATIONAL: needle points from the delta table, gap in cents from the book;
+# hope is nowhere in it.
+# ---------------------------------------------------------------------------
+HUNT_NEEDLE_POINTS = 5.0   # gate A: ΔP >= N points or nothing happened
+HUNT_GAP_CENTS = 4.0       # gate B: fair − cost >= G — the lag, in cents
+HUNT_CONFIRM_FRAMES = 2    # gate C: sustained-confirm (lane_p's pattern)
+HUNT_TAKE_CENTS = 4        # JOB A: resting take at entry + T
+HUNT_BAIL_R_S = 20.0       # JOB B: not out within R of breakeven trigger -> flatten
+HUNT_TIMEBOX_M_S = 60.0    # TIME-BOX: the lag pays in a minute or it never was
+HUNT_BAND = (5, 95)        # no side-max, no price cap — the whole book
+
+# ---------------------------------------------------------------------------
 # Safe defaults in force (A3 / Chunk 0.3)
 # ---------------------------------------------------------------------------
 ONE_LOT_MAX_LOSS_CENTS = 99  # worst-case loss on a single 1-lot maker entry (price -> 0)

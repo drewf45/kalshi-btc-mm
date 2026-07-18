@@ -187,6 +187,10 @@ class FlipWindow:
     done: bool = False
     sitout_paged: bool = False   # P13 §4: the sit-out pages ONCE
     spot_ticks: List[Optional[float]] = field(default_factory=list)
+    # P18 HUNT state: the pending confirm and the open hunt positions.
+    hunt_pending: Optional[dict] = None            # {side, confirms, last_cost}
+    hunts: Dict[str, dict] = field(default_factory=dict)  # side -> position state
+    hunt_count: int = 0
 
 
 class LaneFlip:
@@ -225,6 +229,15 @@ class LaneFlip:
         w = self.windows.get(market)
         if w is None:
             return
+        # P18: a hunt fill opens hunt custody, never the pair machinery
+        if (w.posted.get(side) or {}).get("mode") == "HUNT":
+            w.posted.pop(side, None)
+            w.hunt_count += 1
+            w.trips += 1   # hunts consume the same ratchet discipline
+            w.hunts[side] = {"entry": price_cents, "fill_ts": now,
+                             "take_oid": None, "take_proposed": False,
+                             "be_ts": None, "be_repriced": False}
+            return
         w.fills[side] = price_cents
         if w.first_fill_ts is None:
             w.first_fill_ts = now
@@ -241,6 +254,15 @@ class LaneFlip:
         may then open, R1-gated)."""
         w = self.windows.get(market)
         if w is None:
+            return
+        # P18: a hunt exit realizes against ITS entry and leaves the pair
+        # slots untouched — the two modes never share accounting state.
+        hunt = w.hunts.pop(side, None)
+        if hunt is not None:
+            realized = exit_price_cents - hunt["entry"]
+            w.window_realized += realized
+            if realized < 0:
+                w.scratches += 1
             return
         entry_px = w.fills.get(side)
         if entry_px is not None and len(w.fills) < 2:
@@ -305,6 +327,11 @@ class LaneFlip:
                     size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason=f"take entry+{FLIP_X}"))
 
+        # 1.5) P18 HUNT custody — JOB A takes, JOB B bails, curfew flat.
+        # Runs EVERY cycle regardless of the discipline gates below (risk
+        # management never waits its turn).
+        proposals.extend(self._hunt_custody(w, market, event, book, secs, now))
+
         # 2) ENTRIES — window phase, curfew, trips, sit-out, R1-flat, OFI
         in_entry_phase = secs > FLIP_WINDOW_SEC - FLIP_ENTRY_SEC
         past_curfew = secs <= FLIP_CURFEW
@@ -322,6 +349,15 @@ class LaneFlip:
             return proposals
         if past_curfew:
             return proposals
+
+        # P18 §1: mode selection — a live needle signal makes this HUNT
+        # ground; PAIR posts only on genuinely two-way books with NO needle.
+        sl = ctx.get("spotlead")
+        needle_active = (sl is not None
+                         and sl.delta_p >= config.HUNT_NEEDLE_POINTS)
+        proposals.extend(self._hunt_entry(w, market, event, book, sl, secs))
+        if needle_active:
+            return proposals  # hunt owns the floor while the needle is live
 
         re_entry = w.trips > 0 and not w.fills  # a new trip after a completed one
         if re_entry:
@@ -365,6 +401,113 @@ class LaneFlip:
                 why=f"pair-post ≤{FLIP_SIDE_MAX} · y{yes_bid}/n{no_bid}"))
         return proposals
 
+    # ── P18 THE DETECTIVE: hunt entry (§2) + the two jobs (§3) ─────────────
+    def _hunt_entry(self, w: FlipWindow, market: str, event: str, book,
+                    sl, secs: float) -> List[Order]:
+        """The three questions as arithmetic — ALL required. ONE hunt per
+        displacement event (the runner re-anchors on submit)."""
+        if secs <= FLIP_CURFEW:            # no hunt entries after the handoff
+            w.hunt_pending = None
+            return []
+        if sl is None:                     # spot BLIND / table absent / no move
+            w.hunt_pending = None
+            return []
+        if sl.delta_p < config.HUNT_NEEDLE_POINTS:      # gate A
+            w.hunt_pending = None
+            return []
+        side = sl.side                     # always WITH spot, never against
+        if side in w.hunts or side in w.posted or side in w.fills:
+            return []                      # one open hunt/leg per side
+        join = book.best_yes_bid() if side == "yes" else book.best_no_bid()
+        if join is None:
+            return []
+        gap = sl.fair_cents - join
+        if gap < config.HUNT_GAP_CENTS:                 # gate B
+            w.hunt_pending = None
+            return []
+        # gate C: convergence + sustained confirm (lane_p's flicker-proof
+        # pattern applied to the SPOT move) — the book may tick toward spot
+        # or sit flat; ACTIVELY repricing against kills the hunt.
+        pend = w.hunt_pending
+        if pend is None or pend["side"] != side:
+            w.hunt_pending = {"side": side, "confirms": 1, "last_cost": join}
+            return []
+        if join < pend["last_cost"]:
+            w.hunt_pending = None          # the crowd is fighting the move
+            return []
+        pend["confirms"] += 1
+        pend["last_cost"] = join
+        if pend["confirms"] < config.HUNT_CONFIRM_FRAMES:
+            return []
+        w.hunt_pending = None
+        why = (f"HUNT {sl.casefile()} · gap {gap:.0f} · converging")
+        return [Order(
+            lane="FLIP", event=event, market=market, side=side,
+            action="buy", price_cents=join, count=1,
+            size_tier=config.TIER_PROBE, purpose="ENTRY",
+            band=config.HUNT_BAND, rest_fp=book.best_fp(side), why=why)]
+
+    def _hunt_custody(self, w: FlipWindow, market: str, event: str, book,
+                      secs: float, now: float) -> List[Order]:
+        """§3 — JOB A: flip it (take at entry+T the instant the fill books).
+        JOB B: hold nothing (breakeven reprice, then flatten). TIME-BOX and
+        CURFEW flat. No averaging, no thesis-defense — inventory is F's
+        privilege, not the flip's."""
+        props: List[Order] = []
+        for side, h in list(w.hunts.items()):
+            if h.get("done"):
+                continue
+            mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
+            # JOB A: the take, posted the instant the entry fills
+            if h["take_oid"] is None and not h.get("take_proposed"):
+                h["take_proposed"] = True
+                props.append(Order(
+                    lane="FLIP", event=event, market=market, side=side,
+                    action="sell",
+                    price_cents=h["entry"] + config.HUNT_TAKE_CENTS,
+                    count=1, size_tier=config.TIER_PROBE, purpose="EXIT",
+                    reason=f"hunt take entry+{config.HUNT_TAKE_CENTS}"))
+                continue
+            flatten_reason = None
+            if secs <= FLIP_CURFEW:
+                flatten_reason = "hunt curfew flat (T-curfew handoff to F)"
+            elif mark is not None and mark <= h["entry"] - 2:
+                flatten_reason = "hunt bail mark<=entry-2"
+            elif (h.get("be_ts") is not None
+                  and now - h["be_ts"] >= config.HUNT_BAIL_R_S):
+                flatten_reason = (f"hunt bail not-out-in-"
+                                  f"{int(config.HUNT_BAIL_R_S)}s")
+            elif now - h["fill_ts"] >= config.HUNT_TIMEBOX_M_S:
+                flatten_reason = (f"hunt time-box "
+                                  f"{int(config.HUNT_TIMEBOX_M_S)}s")
+            if flatten_reason:
+                if h["take_oid"] is not None and self.gateway is not None:
+                    self.gateway.cancel(h["take_oid"])
+                    h["take_oid"] = None
+                px = mark if mark is not None else h["entry"]
+                h["done"] = True
+                props.append(Order(
+                    lane="FLIP", event=event, market=market, side=side,
+                    action="sell", price_cents=px, count=1,
+                    size_tier=config.TIER_PROBE, purpose="CUT",
+                    crossfire=True, reason=flatten_reason))
+                continue
+            # JOB B step 1: breakeven trigger — reprice the take to entry
+            if (mark is not None and mark <= h["entry"]
+                    and not h.get("be_repriced")):
+                h["be_repriced"] = True
+                h["be_ts"] = now
+                if h["take_oid"] is not None and self.gateway is not None:
+                    self.gateway.cancel(h["take_oid"])
+                    h["take_oid"] = None
+                h["take_proposed"] = True
+                props.append(Order(
+                    lane="FLIP", event=event, market=market, side=side,
+                    action="sell", price_cents=h["entry"], count=1,
+                    size_tier=config.TIER_PROBE, purpose="EXIT",
+                    reason="hunt breakeven reprice (mark<=entry)"))
+        return props
+
     def on_submitted(self, order: Order, order_id: str, now: float) -> None:
         """Runner callback after a successful gateway submit."""
         w = self.windows.get(order.market)
@@ -372,9 +515,14 @@ class LaneFlip:
             return
         if order.purpose == "ENTRY":
             w.posted[order.side] = {"oid": order_id, "price": order.price_cents,
-                                    "ts": now}
+                                    "ts": now,
+                                    "mode": ("HUNT" if order.why.startswith("HUNT")
+                                             else "PAIR")}
         elif order.purpose == "EXIT":
-            w.takes_posted[order.side] = order_id
+            if order.side in w.hunts and w.hunts[order.side]["take_oid"] is None:
+                w.hunts[order.side]["take_oid"] = order_id  # P18 JOB A registered
+            else:
+                w.takes_posted[order.side] = order_id
             # register the take as the position's resting exit — custodian owns it
             if self.custodian is not None:
                 pos = self.custodian.positions.get(f"{order.market}:FLIP")

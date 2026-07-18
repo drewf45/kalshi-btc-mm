@@ -72,6 +72,10 @@ CHECKS = [
         "tests/test_p17_show_up.py",
         "tests/test_attribution.py",
     ]),
+    ("the detective: needle equation, two jobs, P yields the floor (P18)", [
+        "tests/test_p18_detective.py",
+        "tests/test_p15_ratifications.py::test_pair_formable_posts_both",
+    ]),
 ]
 
 

@@ -242,11 +242,14 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
             lb = wilson_lower_bound(wins, n)
             lines.append(
                 f"FLIP R6: trips {n} · WR {wins / n:.0%} · net/trip "
-                f"{avg:+.1f}¢ · WR-WilsonLB {lb:.0%} — margin UNPROVEN, "
-                f"mechanism proven")
+                f"{avg:+.1f}¢ · WR-WilsonLB {lb:.0%} · bar ≥50% to break even "
+                f"(+{config.HUNT_TAKE_CENTS} wins vs ~−{config.HUNT_TAKE_CENTS} "
+                f"worst-typical bails) — margin UNPROVEN, mechanism proven")
         else:
-            lines.append("FLIP R6: no completed trips yet — margin UNPROVEN, "
-                         "mechanism proven")
+            lines.append("FLIP R6: no completed trips yet · bar ≥50% to break "
+                         "even · HUNT volume expected LOW (gate A is selective; "
+                         "low count reads as discipline, not failure) — margin "
+                         "UNPROVEN, mechanism proven")
     except Exception:
         pass
     # P8 §2.4: the streak, halts, and resets
@@ -301,9 +304,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     # archive. 24h without the expected tape materializing = a FINDING (the
     # code and the world disagree), never silently forgotten.
     try:
-        from scripts.tape_grade import CHECKS, CHECKS_P16, CHECKS_P17
+        from scripts.tape_grade import (CHECKS, CHECKS_P16, CHECKS_P17,
+                                        CHECKS_P18)
         suites = (("P15", "p15", CHECKS), ("P16 deposit day", "p16", CHECKS_P16),
-                  ("P17 show up", "p17", CHECKS_P17))
+                  ("P17 show up", "p17", CHECKS_P17),
+                  ("P18 the detective", "p18", CHECKS_P18))
         from scripts.tape_grade import grade
         for label, prefix, checks in suites:
             passes = int(ledger.get_state(f"{prefix}_grade_passes") or 0)

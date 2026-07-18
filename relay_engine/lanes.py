@@ -201,7 +201,14 @@ class _PortedLane(Lane):
     def evaluate(self, market: str, ctx: dict) -> Decision:
         kind, payload = self.shared.decide(market, ctx)
         if kind == "PROPOSE" and payload.lane == self.name:
-            return Decision(self.name, market, self.shared.to_order(market, payload))
+            order = self.shared.to_order(market, payload)
+            # P18 §4.1: shared eyes, not orders — the spot-lead signal rides
+            # the why-tag (gates UNTOUCHED); Saturday measures whether the
+            # detective's clock predicts the closer's clips too.
+            sl = ctx.get("spotlead")
+            if sl is not None:
+                order.why += f" spotlead:{sl.delta_p:+.0f}pts"
+            return Decision(self.name, market, order)
         if kind == "PROPOSE":  # the decision went to the other lane's band
             return Decision(self.name, market, None, pass_reason=self.other_band_reason)
         return Decision(self.name, market, None, pass_reason=payload,
