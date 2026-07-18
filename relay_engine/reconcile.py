@@ -83,10 +83,33 @@ def live_boot_reconcile(engine, client) -> dict:
             engine.gateway.positions[key] = net
             summary["positions_recognized"] += 1
         else:
+            # RULING 1 (P15, ratified): ORPHAN ADOPTION — every dollar is
+            # OWNED. A position our fills cannot explain is adopted under
+            # lane ORPHAN: custodied to conclusion (D-grade cut params),
+            # NEVER lane evidence (its fills/settlements attribute to ORPHAN
+            # alone; no Wilson cell reads it). P14's no-fills-rows fallback
+            # means its cuts act on the pos object, by design.
             summary["positions_quarantined"] += 1
+            from .custodian import OpenPosition
+            from .lane_d import d_cut_params
+            side = "yes" if net > 0 else "no"
+            engine.custodian.set_lane_params("ORPHAN", d_cut_params())
+            engine.custodian.adopt(OpenPosition(
+                event=ticker.rsplit("-", 1)[0], market=ticker, lane="ORPHAN",
+                side=side, count=abs(net), entry_price_cents=50,
+                entry_p_win=0.0, size_tier="PROBE", entry_time=time.time()))
+            engine.gateway.positions[(ticker.rsplit("-", 1)[0], ticker,
+                                      "ORPHAN")] = net
+            engine.surface.write_row("ORPHAN", ticker, f"w-{ticker}",
+                                     "ORPHAN_ADOPTED", detail=f"net {net:+d}")
+            failures.fail("ORPHAN_FOUND",
+                          f"{ticker}: position {net:+d} has no fill of ours — "
+                          f"adopted as ORPHAN (Ruling 1), custodied to "
+                          f"conclusion, never lane evidence",
+                          market=ticker, net=net, alert=False)
             engine.telegram.alert(
-                f"LIVE BOOT: position {net:+d} on {ticker} has NO fill of ours — "
-                f"QUARANTINED (not adopted, not traded); resolve by hand")
+                f"🧾 ORPHAN adopted: {net:+d} on {ticker} — custodied to "
+                f"conclusion (Ruling 1); never lane evidence")
 
     # resting orders: ours re-registered is future work at cutover; foreign alerted
     try:

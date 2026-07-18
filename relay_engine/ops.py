@@ -215,7 +215,8 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
             "SELECT COALESCE(SUM(fee_cents),0) FROM fills").fetchone()[0])
         scratches = 0
         scratch_cost = 0
-        for market, lane, px, cnt, _fee, xid in exits:
+        flip_trips = []   # P15 R-1: net per completed FLIP trip, fee included
+        for market, lane, px, cnt, fee, xid in exits:
             entry = ledger.db.execute(
                 "SELECT price_cents FROM fills WHERE market=? AND lane=?"
                 " AND action='ENTRY' AND id<? ORDER BY id DESC LIMIT 1",
@@ -225,8 +226,27 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
                 if rt < 0:
                     scratches += 1
                     scratch_cost += -rt
+                if lane == "FLIP":
+                    flip_trips.append(rt - fee)
         lines.append(f"scratches: {scratches} · scratch cost: {scratch_cost}¢ "
                      f"· fees: {total_fees}¢")
+        # P15 R-1: the lane's own pack line is REQUIRED READING — yesterday's
+        # tape measured FLIP's margin NEGATIVE at the lower bound before the
+        # port called it proven. Mechanism PROVEN; margin UNPROVEN until this
+        # line says otherwise.
+        if flip_trips:
+            from .sizing import wilson_lower_bound
+            n = len(flip_trips)
+            wins = sum(1 for t in flip_trips if t > 0)
+            avg = sum(flip_trips) / n
+            lb = wilson_lower_bound(wins, n)
+            lines.append(
+                f"FLIP R6: trips {n} · WR {wins / n:.0%} · net/trip "
+                f"{avg:+.1f}¢ · WR-WilsonLB {lb:.0%} — margin UNPROVEN, "
+                f"mechanism proven")
+        else:
+            lines.append("FLIP R6: no completed trips yet — margin UNPROVEN, "
+                         "mechanism proven")
     except Exception:
         pass
     # P8 §2.4: the streak, halts, and resets
@@ -276,4 +296,41 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.append("FAILURES: none recorded")
     if venue_statement_cents is not None:
         lines.append(cash_protocol.monthly_true_up_line(venue_statement_cents))
+    # P15 §1: THE TAPE GRADES THE DEPLOY — the expected-tape section runs in
+    # every pack until each line passes twice, then retires to the archive.
+    # 24h without the expected tape materializing = a FINDING (the code and
+    # the world disagree), never silently forgotten.
+    try:
+        passes = int(ledger.get_state("p15_grade_passes") or 0)
+        if passes >= 2:
+            lines.append("DEPLOY GRADE (P15): retired — expected tape passed twice")
+        else:
+            from scripts.tape_grade import grade
+            deploy_ts = ledger.get_state("p15_deploy_ts")
+            if deploy_ts is None:
+                deploy_ts = time.time()
+                ledger.set_state("p15_deploy_ts", str(deploy_ts))
+            results = grade(ledger.db)
+            fails = [r for r in results if not r[1]]
+            lines.append(f"DEPLOY GRADE (P15 expected tape): "
+                         f"{len(results) - len(fails)}/{len(results)}")
+            for name, ok, detail in results:
+                lines.append(f"  [{'PASS' if ok else 'FAIL'}] {name} — {detail}")
+            if not fails:
+                ledger.set_state("p15_grade_passes", str(passes + 1))
+            else:
+                ledger.set_state("p15_grade_passes", "0")
+                if time.time() - float(deploy_ts) > 86400:
+                    lines.append("  FINDING: expected tape has NOT materialized "
+                                 "within 24h of deploy — the code and the world "
+                                 "disagree; read the failing lines above")
+                    from . import failures as _f
+                    try:
+                        _f.fail("DEPLOY_GRADE_INCOMPLETE",
+                                f"{len(fails)} expected-tape line(s) unmet 24h "
+                                f"after deploy: {[n for n, _, _ in fails]}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        lines.append(f"DEPLOY GRADE: grader unavailable ({e})")
     return "\n".join(lines)

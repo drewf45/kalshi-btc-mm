@@ -59,7 +59,10 @@ def test_concurrent_lane_stamp():
     close = infer_close_ts_from_ticker(TICKER)
     book = engine.feed.book(TICKER)
     book.apply_snapshot({99: 50}, {1: 40}, ts=0.0)
-    # drive F to a proposal (9 tier-0 confirms) with FLIP also on the market
+    # RULING 2 (P15): a 99/1 book is pair-unformable, so FLIP no longer RESTS
+    # here — concurrency now arises from a HELD FLIP position while F rests.
+    engine.gateway.positions[(TICKER.rsplit("-", 1)[0], TICKER, "FLIP")] = -1
+    # drive F to a proposal (9 tier-0 confirms) with FLIP live on the market
     start = close - 850
     for i in range(10):
         engine.cycle([TICKER], now=start + i * 5)

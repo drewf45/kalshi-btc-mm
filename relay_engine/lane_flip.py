@@ -330,7 +330,17 @@ class LaneFlip:
             side_gate = ofi_side(w.spot_ticks, book_lean(yq, nq))
             sides = [side_gate] if side_gate else []
         elif w.trips == 0 and in_entry_phase:
-            sides = ["yes", "no"]  # the first trip watches the open (entry phase only)
+            # RULING 2 (P15, ratified): PAIR-FORMABLE OR NOTHING. The first
+            # trip posts only when BOTH sides can legally post (each within
+            # side-max, combined within the line) — a lone leg is never
+            # OPENED on purpose (the 00:14 tape's no@34 cost 8¢ at 8:01).
+            # Pair-grace still governs a pair whose second leg dies later.
+            if (yes_bid is not None and no_bid is not None
+                    and yes_bid <= FLIP_SIDE_MAX and no_bid <= FLIP_SIDE_MAX
+                    and yes_bid + no_bid <= FLIP_LINE):
+                sides = ["yes", "no"]
+            else:
+                sides = []
         else:
             sides = []
 

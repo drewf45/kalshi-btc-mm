@@ -42,5 +42,11 @@ def test_thin_book_backoff():
     thin = size_order(config.TIER_CLEAR, book_cents=1_000_000, price_cents=60,
                       visible_depth=config.THIN_BOOK_MIN_DEPTH - 1)
     assert thin.tier == config.TIER_LEAN  # one tier down
+    # RULING 3 (P15, ratified) overturned the old law here: with >=1 visible
+    # lot the backoff FLOORS at PROBE — one lot, never total suppression
+    # (the 7:58 depth-starvation storms).
     d = size_order(config.TIER_PROBE, book_cents=1_000_000, price_cents=60, visible_depth=1)
-    assert d.contracts == 0  # PROBE backs off to SUPPRESS on a thin book
+    assert d.tier == config.TIER_PROBE and d.contracts == 1
+    # a truly empty book still admits nothing
+    empty = size_order(config.TIER_PROBE, book_cents=1_000_000, price_cents=60, visible_depth=0)
+    assert empty.contracts == 0

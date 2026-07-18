@@ -82,23 +82,31 @@ def test_both_sides_proposed_under_side_max(flip):
 
 
 def test_side_over_max_not_posted(flip):
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=55, no=45)))
-    assert [(p.side, p.price_cents) for p in props] == [("no", 45)]  # 55 > 49 skipped
+    """RULING 2 (P15, ratified) overturned the old law here: pre-ruling this
+    posted the lone no@45 (the 00:14 deviation, 8¢ at 8:01); now a pair that
+    cannot form posts NOTHING."""
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=55, no=45))) == []
 
 
 def test_combined_line_wall(flip, monkeypatch):
     """At the traded knobs (side_max 49) two <=49 joins can't exceed the 99
     line — the wall binds when side_max is raised, so raise it to prove the
-    wall (the wall itself ships verbatim)."""
+    wall (the wall itself ships verbatim). RULING 2: the pair must fit the
+    line TOGETHER at the open; the per-side wall still binds cross-cycle."""
     monkeypatch.setattr(lane_flip, "FLIP_SIDE_MAX", 60)
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=49, no=None), secs_left=800))
-    assert len(props) == 1
-    flip.on_submitted(props[0], "OID-1", CLOSE - 800)
-    # second side at 51 would make 100 > 99 -> refused by the lane's own wall
-    props2 = flip.evaluate(TICKER, ctx(flip_book(yes=49, no=51), secs_left=795))
-    assert props2 == []
-    # at 50 the bundle is 99 == line -> allowed
-    props3 = flip.evaluate(TICKER, ctx(flip_book(yes=49, no=50), secs_left=790))
+    # at the open: 49+51 = 100 > 99 -> pair not formable -> NOTHING
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=49, no=51), secs_left=800)) == []
+    # 49+50 = 99 == line -> the pair posts
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=49, no=50), secs_left=795))
+    assert {p.side for p in props} == {"yes", "no"}
+    yes_p = [p for p in props if p.side == "yes"][0]
+    flip.on_submitted(yes_p, "OID-1", CLOSE - 795)
+    # cross-cycle: yes posted at 49; the no join moves to 51 -> 100 > 99
+    # against the RESTING first bid -> refused by the lane's own wall
+    props2 = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=51), secs_left=790))
+    assert [p for p in props2 if p.side == "no"] == []
+    # at 50 the bundle vs the resting bid is 99 == line -> allowed
+    props3 = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=50), secs_left=785))
     assert [(p.side, p.price_cents) for p in props3] == [("no", 50)]
 
 
@@ -112,8 +120,9 @@ def test_entry_phase_and_curfew(flip):
 
 
 def test_take_quote_after_fill(flip, gateway):
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=None)))
-    flip.on_submitted(props[0], "OID-Y", CLOSE - 800)
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=45)))  # pair-formable (Ruling 2)
+    yes_p = [p for p in props if p.side == "yes"][0]
+    flip.on_submitted(yes_p, "OID-Y", CLOSE - 800)
     # the yes entry fills at 40 -> lane learns via note_fill; position is long 1
     event = TICKER.rsplit("-", 1)[0]
     gateway.positions[(event, TICKER, "FLIP")] = 1

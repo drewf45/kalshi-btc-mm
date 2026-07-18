@@ -668,6 +668,48 @@ protective (an unchecked cut would have SOLD a lot we didn't hold).
   service — the engine's own ⚠ page (P13) asks for exactly this; once set, the
   warning disappears from the boot sequence.
 
+## WO-P15 FINAL — RATIFICATIONS AS LAW + THE TAPE-ACCOUNTABILITY LAW
+
+Suite at this commit: **284 passed**; preflight **13/13**. (Read-rule note: the
+"P15 compare" document never reached this chat — Fix A was implemented from the
+wall code's demonstrable gap, stated below; everything else is from P15 FINAL.)
+
+- **RULING 1 (LAW) — ORPHAN adoption**: a boot position our fills cannot explain
+  is ADOPTED under lane ORPHAN — custodied to conclusion (D-grade cut params),
+  gateway-position registered, `ORPHAN_ADOPTED` surface row + `ORPHAN_FOUND`
+  failure row + `🧾` page — and NEVER lane evidence (no Wilson cell reads it;
+  P14's no-fills-rows fallback governs its cuts by design). Every dollar owned.
+- **RULING 2 (LAW) — pair-formable or nothing**: FLIP's first trip posts only
+  when BOTH sides can legally post (each ≤ side-max, combined ≤ the line) — a
+  lone leg is never OPENED on purpose (the 00:14 tape's no@34, 8¢ at 8:01).
+  Pair-grace still governs a pair whose second leg dies later; the cross-cycle
+  combined wall still binds. Two pre-ruling tests overturned, cited in place.
+- **RULING 3 (LAW) — depth floor at one lot**: with ≥1 visible lot the thin-book
+  backoff FLOORS at PROBE and the depth cap admits ≥1 (the 7:58 depth-starvation
+  storms); an empty book still admits nothing. One pre-ruling test overturned.
+- **FIX A (pending/gross exposure — best-evidence implementation)**: the wall
+  code's demonstrable gap: positions track NET yes-terms, so a FILLED yes+no
+  pair (+1/−1) netted to ZERO and vanished from SINGLE_ENTRY and the event
+  caps. `gateway.gross_open` now tracks gross open contracts per (event, market,
+  lane); SINGLE_ENTRY refuses on net OR gross; `_event_exposure` counts
+  max(|net|, gross); gross clears on exit fills, settlement, and rollover.
+- **R-1 (banked)**: "proven" must name WHAT was proven. FLIP's knobs are
+  explicitly UNPROVEN-margin / PROVEN-mechanism; the `FLIP R6:` line (trips ·
+  WR · net/trip · WR-WilsonLB) renders in EVERY daily pack — required reading.
+- **§1 THE TAPE-ACCOUNTABILITY LAW**: `scripts/tape_grade.py` grades the deploy
+  from the DB (shadow windows count — R-2); the pack carries a DEPLOY GRADE
+  section until every line passes twice, then retires; >24h unmet =
+  `DEPLOY_GRADE_INCOMPLETE` FINDING, auto-paged. The weekly Saturday retro is
+  law (docs/RETRO_2026-07-18.md — the first one, with R-1/R-2/R-3 banked and
+  the Adversary owning class-spotting).
+
+### P15 EXPECTED TAPE (§3 — graded by scripts/tape_grade.py, in-pack)
+Within 24h: ✅ zero FLIP entries where either side >49 at the open · ✅ zero
+PCT_OF_BOOK/SIZING storms at depth ≥1 · ✅ zero same-side double entries any
+lane · ✅ ORPHAN adoption recorded for any quarantine (incl. the current mystery
+YES at next boot) · ✅ FLIP R6 pack line rendering daily · ❌ no BATON_VIOLATION
+FATALs on cut-vs-fill races (P14 in force).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

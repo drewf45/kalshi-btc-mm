@@ -85,7 +85,9 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
         assert engine.ledger.book_cents() == 10_000        # venue truth is the baseline
         assert engine.ledger.boot_caps.order_budget_cents > 0  # caps re-snapshotted
         assert summary["positions_quarantined"] == 1
-        assert any("QUARANTINED" in m for m in engine.telegram_sent)
+        # RULING 1 (P15): the mystery position is ADOPTED as ORPHAN, custodied
+        assert any("🧾 ORPHAN adopted" in m for m in engine.telegram_sent)
+        assert f"{FOREIGN_TICKER}:ORPHAN" in engine.custodian.positions
 
         # the BOOT page's other lines exist and speak
         from relay_engine.ops import worst_day_bound_line

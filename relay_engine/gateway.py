@@ -145,6 +145,9 @@ class Gateway:
         self._storm_paged: set = set()
         self.suppressed_counts: Dict[str, int] = {}  # R5: every suppressed attempt counted
         self.alert_fn = lambda msg: None    # runner wires Telegram (WALL_STORM page)
+        # P15 Fix A: gross open contracts per (event, market, lane) — net
+        # yes-terms masks a filled pair; the walls read BOTH.
+        self.gross_open: Dict[Tuple[str, str, str], int] = {}
 
     # P10 §4 knobs
     WALL_BACKOFF_S = 30.0
@@ -370,6 +373,13 @@ class Gateway:
         key = (order.event, order.market, order.lane)
         sign = 1 if self._signed_yes_delta(order) > 0 else -1
         self.positions[key] = self.positions.get(key, 0) + sign * cnt
+        # P15 Fix A: GROSS open contracts — a filled yes+no PAIR nets to zero
+        # in yes-terms and would vanish from every wall; gross keeps the
+        # paired exposure visible (pending-exposure wall).
+        if order.purpose == "ENTRY":
+            self.gross_open[key] = self.gross_open.get(key, 0) + cnt
+        else:
+            self.gross_open[key] = max(0, self.gross_open.get(key, 0) - cnt)
         self.filled_counts[order_id] = self.filled_counts.get(order_id, 0) + cnt
         if self.filled_counts[order_id] >= order.count:
             self.resting.pop(order_id, None)
@@ -400,7 +410,10 @@ class Gateway:
                     and o.purpose == "ENTRY" and o.side == order.side):
                 raise WallRejection("SINGLE_ENTRY",
                                     f"lane {order.lane} already resting {order.side} on {order.market}")
-        if self.positions.get((order.event, order.market, order.lane), 0) != 0:
+        key = (order.event, order.market, order.lane)
+        # P15 Fix A: net OR gross — a filled pair (net 0, gross 2) is still
+        # a position; a fresh entry on top of it is the double the tape saw.
+        if self.positions.get(key, 0) != 0 or self.gross_open.get(key, 0) != 0:
             raise WallRejection("SINGLE_ENTRY", f"lane {order.lane} already positioned on {order.market}")
 
     def _event_exposure(self, event: str) -> Tuple[int, int]:
@@ -408,10 +421,17 @@ class Gateway:
         event: open positions + resting ENTRY orders. Resting EXITs never count."""
         contracts = 0
         cents = 0
-        for (ev, market, lane), net in self.positions.items():
-            if ev == event and net != 0:
-                contracts += abs(net)
-                cents += abs(net) * config.ONE_LOT_MAX_LOSS_CENTS
+        # P15 Fix A: exposure = max(|net|, gross) per key — a filled pair
+        # (net 0, gross 2) stays visible to the caps.
+        keys = set(self.positions) | set(self.gross_open)
+        for (ev, market, lane) in keys:
+            if ev != event:
+                continue
+            eff = max(abs(self.positions.get((ev, market, lane), 0)),
+                      self.gross_open.get((ev, market, lane), 0))
+            if eff:
+                contracts += eff
+                cents += eff * config.ONE_LOT_MAX_LOSS_CENTS
         for o in self.resting.values():
             if o.event == event and o.purpose == "ENTRY":
                 contracts += o.count

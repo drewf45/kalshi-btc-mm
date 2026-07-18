@@ -248,6 +248,9 @@ class ShadowEngine:
         self.poison_episodes.pop(ticker, None)
         self._divergence_pending.pop(ticker, None)
         self.feed.resync_needed.discard(ticker)
+        # P15 Fix A: settled window — gross exposure for the market is over
+        for key in [k for k in self.gateway.gross_open if k[1] == ticker]:
+            del self.gateway.gross_open[key]
 
     # ── P10 §2: poison episodes, quarantine, REST marks ─────────────────
     def note_poison_episode(self, market: str, yb, nb) -> None:

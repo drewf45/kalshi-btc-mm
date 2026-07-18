@@ -56,13 +56,24 @@ def size_order(tier: str, book_cents: int, price_cents: int, visible_depth: int)
     only shrink within it (capital raises budgets, never tiers)."""
     effective_tier = tier
     if visible_depth < config.THIN_BOOK_MIN_DEPTH and tier != config.TIER_SUPPRESS:
-        effective_tier = _TIER_ORDER[_TIER_ORDER.index(tier) - 1]  # thin-book backoff: one tier down
+        # Thin-book backoff: one tier down. RULING 3 (P15, ratified): with
+        # >=1 visible lot the backoff FLOORS at PROBE — depth starvation must
+        # not suppress the one-lot scale entirely (the 7:58 storms).
+        idx = _TIER_ORDER.index(tier) - 1
+        floor_idx = (_TIER_ORDER.index(config.TIER_PROBE)
+                     if visible_depth >= 1 else 0)
+        effective_tier = _TIER_ORDER[max(idx, floor_idx)]
     tier_max = config.TIER_MAX_CONTRACTS[effective_tier]
     if tier_max == 0 or price_cents <= 0:
         return SizeDecision(effective_tier, 0, "suppressed")
     kelly_budget_cents = book_cents * config.KELLY_FRACTION_CEILING
     kelly_max = int(kelly_budget_cents // price_cents)
     depth_max = int(visible_depth * config.DEPTH_FRACTION)
+    # RULING 3 (P15, ratified): the depth floor at one lot — a real book with
+    # >=1 visible lot admits ONE lot even when the fraction rounds to zero
+    # (the 7:58 depth-starvation storms at one-lot scale).
+    if visible_depth >= 1:
+        depth_max = max(1, depth_max)
     contracts = max(0, min(tier_max, kelly_max, depth_max))
     return SizeDecision(
         effective_tier, contracts,
