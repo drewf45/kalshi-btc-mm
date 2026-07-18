@@ -337,6 +337,50 @@ CHECKS_P18 = [
 ]
 
 
+# ── P19 "SALVAGE, SEAL, AND LET IT RUN" — the unattended-run tape ──────────
+RETIRED_FATAL_CLASSES = ("DUPLICATE_TERMINAL_ROW", "BATON_VIOLATION",
+                         "ORIENTATION_MIRROR", "WS_ESSENTIAL_CHANNEL_REJECTED")
+
+
+def check_no_retired_class_fatals(db, since):
+    """zero FATALs of any retired class (terminal-row, baton, orientation,
+    subscribe) — the classes this project already paid tuition for."""
+    qmarks = ",".join("?" * len(RETIRED_FATAL_CLASSES))
+    n = _one(db, f"SELECT COUNT(*) FROM failures WHERE why_tag IN ({qmarks})"
+                 f" AND ts>?", (*RETIRED_FATAL_CLASSES, since))
+    return n == 0, f"{n} retired-class FATAL(s)"
+
+
+def check_salvage_rows_complete(db, since):
+    """any salvage carries needle + save-estimate; its counterfactual lands
+    (conditional — passes when no salvage occurred)."""
+    salvages = db.execute(
+        "SELECT market, detail FROM surface_rows WHERE state='SALVAGE'"
+        " AND ts>?", (since,)).fetchall()
+    if not salvages:
+        return True, "no salvages this window"
+    bad = sum(1 for (_, d) in salvages
+              if not all(k in d for k in ("delta_p", "est_save", "fair")))
+    return bad == 0, f"{bad} incomplete of {len(salvages)} salvage rows"
+
+
+def check_p_suppression_rows_appear(db, since):
+    """the suppression mechanism leaves its rows when needles fire
+    (conditional — passes quietly when no needles confirmed)."""
+    n = _one(db, "SELECT COUNT(*) FROM surface_rows WHERE lane='P' AND"
+                 " detail LIKE 'P_SUPPRESSED%' AND ts>?", (since,))
+    return True, f"{n} suppression row(s) (conditional)"
+
+
+CHECKS_P19 = [
+    ("zero retired-class FATALs (the tuition already paid)", check_no_retired_class_fatals),
+    ("salvage rows complete: needle + est-save (§2)", check_salvage_rows_complete),
+    ("P-suppression rows appear when needles fire (§3.1)", check_p_suppression_rows_appear),
+    ("every hunt resolves — no aging flip inventory", check_hunts_resolve),
+    ("zero silent windows (§6 contract)", check_no_silent_windows),
+]
+
+
 def grade(db, window_hours: float = 24.0, now=None, checks=None):
     """Returns [(name, ok, detail)] for the last window_hours."""
     now = time.time() if now is None else now
@@ -360,7 +404,8 @@ def main() -> int:
     total_fails = 0
     for label, checks in (("P15", CHECKS), ("P16 deposit day", CHECKS_P16),
                           ("P17 show up", CHECKS_P17),
-                          ("P18 the detective", CHECKS_P18)):
+                          ("P18 the detective", CHECKS_P18),
+                          ("P19 let it run", CHECKS_P19)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

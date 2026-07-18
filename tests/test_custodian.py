@@ -57,7 +57,7 @@ def pos(lane="D", tier=config.TIER_PROBE, entry=61, qty=1, entry_p=0.80,
 def custodian(gateway, ledger, surface):
     c = Custodian(gateway, ledger, surface, ladder=DegradeLadder())
     c.set_lane_params("D", BASE)
-    c.set_lane_params("F", CutParams(**{**BASE.__dict__, "passthrough": True}))
+    c.set_lane_params("F", CutParams(**{**BASE.__dict__, "salvage_enabled": True}))
     return c
 
 

@@ -355,7 +355,13 @@ class LaneFlip:
         sl = ctx.get("spotlead")
         needle_active = (sl is not None
                          and sl.delta_p >= config.HUNT_NEEDLE_POINTS)
-        proposals.extend(self._hunt_entry(w, market, event, book, sl, secs))
+        # P19 §2.4: one hand exits, the other waits — a salvage in progress
+        # suppresses HUNT entries; the reversal hunt may fire AFTER, never
+        # during.
+        if ctx.get("salvage_active"):
+            w.hunt_pending = None
+        else:
+            proposals.extend(self._hunt_entry(w, market, event, book, sl, secs))
         if needle_active:
             return proposals  # hunt owns the floor while the needle is live
 

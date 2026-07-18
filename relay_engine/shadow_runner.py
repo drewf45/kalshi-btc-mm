@@ -216,6 +216,11 @@ class ShadowEngine:
         # P18: the displacement-event anchor per market — ONE hunt per event;
         # re-anchored on each hunt submit (a new hunt needs a NEW needle).
         self.hunt_anchor = {}
+        # P19 §2: the custodian earns F/H8 — salvage armed at wiring
+        from .custodian import salvage_params
+        self.custodian.set_lane_params("F", salvage_params())
+        self.custodian.set_lane_params("H8", salvage_params())
+        self.fills.anchor_fn = self._salvage_anchor
         self.flip.alert_fn = self.telegram.alert
         # P14 §2.1: the cut boundary's on-demand fills sweep
         self.custodian.resweep = self._resweep_market
@@ -258,6 +263,11 @@ class ShadowEngine:
         for key in [k for k in self.gateway.gross_open if k[1] == ticker]:
             del self.gateway.gross_open[key]
         self.hunt_anchor.pop(ticker, None)   # P18: anchors die with the window
+        # P19 §3.2: per-market lane state prunes at rollover — hours-safe
+        # today, weeks-safe after (memory is a slow leak's favorite door).
+        self.lanes[4].p.states.pop(ticker, None)
+        self.fh8_shared.ladders.pop(ticker, None)
+        self.fh8_shared._cache.pop(ticker, None)
 
     # ── P10 §2: poison episodes, quarantine, REST marks ─────────────────
     def note_poison_episode(self, market: str, yb, nb) -> None:
@@ -461,6 +471,11 @@ class ShadowEngine:
         # settle sweep retries stuck windows) and mark evidence holes.
         self.econ.restore_open_brackets_on_boot()
         self.gap_restart_scan()
+        # P19 §2.5: the promotion, paged once per boot
+        self.telegram.alert(
+            f"👑 custodian promoted: Lane F salvage armed "
+            f"(K={config.SALVAGE_K_POINTS:.0f} S={config.SALVAGE_S_CENTS:.0f} "
+            f"R={config.SALVAGE_R_S:.0f} floor={config.SALVAGE_T_FLOOR_S:.0f}s)")
         # Tape 0718: the deployed worker booted with DB=relay_shadow.db (no
         # RELAY_DB_PATH) — an EPHEMERAL database. Halt persistence, booking
         # dedup, and every autopsy depend on the disk surviving a redeploy.
@@ -542,6 +557,31 @@ class ShadowEngine:
         if self.task_alive.get("listener", True):
             return "ok" if n == 0 else f"ok({n} restarts)"
         return f"down({n} restarts)"
+
+    def _salvage_anchor(self, market: str, side: str):
+        """P19 §2.1: (d_entry, t_entry, p_entry) at custody registration —
+        the delta table via spotlead's semantics, at the entry instant."""
+        from . import delta, spotlead as _sl
+        spot = self.fresh_spot(time.time())
+        meta = self._meta(market)
+        strike = _sl.pick_strike(spot, meta.get("boundary_lo"),
+                                 meta.get("boundary_hi"))
+        close_ts = meta.get("close_ts")
+        if close_ts is None:
+            from .lanes import infer_close_ts_from_ticker
+            close_ts = infer_close_ts_from_ticker(market)
+        if spot is None or strike is None or close_ts is None:
+            return None
+        t_rem = close_ts - time.time()
+        if t_rem <= 0:
+            return None
+        d = abs(spot - strike)
+        ps = delta.p_survive(d, t_rem)
+        if ps is None:
+            return None
+        on_side = "yes" if spot >= strike else "no"
+        p_entry = ps if on_side == side else 1.0 - ps
+        return (d, t_rem, p_entry)
 
     def _resweep_market(self, market: str) -> None:
         """P14 §2.1: the 3s fills cadence's on-demand version, at the cut
@@ -751,6 +791,9 @@ class ShadowEngine:
                 "cash_usd": self.ledger.book_cents() / 100.0,
                 "entries_allowed": self.ladder.entries_allowed(),
                 "spotlead": sl,
+                # P19 §2.4: mutual suppression — ONE mechanism, both rules.
+                "needle_confirmed": _sl.is_confirmed_needle(sl),
+                "salvage_active": self.custodian.salvage_in_progress(market),
             }
             # P13 §3: boot orientation self-test on the first comparable book
             if not self._orientation_checked and book.has_snapshot:
@@ -762,17 +805,9 @@ class ShadowEngine:
                 self.gateway.cancel(stale_oid)
 
             for lane in self.lanes:
-                # P18 §4.2 THE P-SUPPRESSION RULE: a CONFIRMED needle-move
-                # voids the fade thesis — P exists to fade moves the spot
-                # never made; the moment spot ratifies one, P yields the
-                # floor. Logged as a suppression row (its cost measurable).
-                from . import spotlead as _slmod
-                if lane.name == "P" and _slmod.is_confirmed_needle(sl):
-                    self.surface.write_row(
-                        "P", market, window, "WATCHING", transport=transport,
-                        detail=f"P_SUPPRESSED_BY_HUNT needle "
-                               f"+{sl.delta_p:.0f}pts")
-                    continue
+                # P19 §3.1: P-suppression moved INTO the lane (the ctx flag is
+                # the one mechanism) — the lane returns the suppression Pass
+                # and the ordinary row path logs it, tape-gradable.
                 decision = lane.evaluate(market, ctx)
                 # D watchdog abandon: broken evidence -> custodian cut NOW
                 if lane.name == "D" and decision.pass_reason == "EVIDENCE_BROKEN":
@@ -910,6 +945,28 @@ class ShadowEngine:
         window = self._window_of.get(market, f"w-{market}")
         per_lane = self.surface.settle_market(market, window,
                                               settled_yes=settled_yes)
+        # P19 §2.6: every salvage row gets its settlement COUNTERFACTUAL —
+        # the DODGED_LOSS vs SALVAGE_REGRET curve is Saturday chart #2, and
+        # K is tuned from it, never from a bad night.
+        for lane, detail in self.ledger.db.execute(
+                "SELECT lane, detail FROM surface_rows WHERE market=?"
+                " AND state='SALVAGE'", (market,)).fetchall():
+            try:
+                d = json.loads(detail)
+                held_wins = (settled_yes and d["side"] == "yes") or \
+                            ((not settled_yes) and d["side"] == "no")
+                counterfactual = (100 - d["entry"]) if held_wins else -d["entry"]
+                realized = d["mark"] - d["entry"]
+                dodged = realized - counterfactual
+                self.surface.write_row(
+                    lane, market, window, "SALVAGE_VERDICT",
+                    detail=json.dumps({
+                        "dodged_cents": dodged, "realized": realized,
+                        "counterfactual": counterfactual,
+                        "verdict": ("DODGED_LOSS" if dodged > 0
+                                    else "SALVAGE_REGRET")}))
+            except Exception:
+                pass
         fills_pnl = sum(per_lane.values())
         fills_count = int(self.ledger.db.execute(
             "SELECT COUNT(*) FROM fills WHERE market=?", (market,)).fetchone()[0])

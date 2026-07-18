@@ -65,6 +65,10 @@ class FillBooker:
         # on_booked(order, action, price_cents, count, now, fee_cents): lane
         # callbacks + the P13 §1 narration (FLIP's pair/trip accounting rides here)
         self.on_booked = on_booked or (lambda *a: None)
+        # P19 §2.1: the salvage anchor — anchor_fn(market, side) returns
+        # (d_entry, t_entry, p_entry) or None (table/spot absent at entry =
+        # salvage disabled for that position, tagged). Wired by the runner.
+        self.anchor_fn = lambda market, side: None
         self.ledger.db.executescript(BOOKED_SCHEMA)
         self.ledger.db.commit()
         # Tape 0718: the account's fill history re-scans every sweep — foreign
@@ -129,11 +133,18 @@ class FillBooker:
 
             if action == "ENTRY" and self.custodian is not None:
                 from .custodian import OpenPosition
+                anchor = self.anchor_fn(order.market, order.side)
+                if anchor is None:
+                    log.info("SALVAGE anchor absent for %s %s — salvage "
+                             "disabled for this position", order.market,
+                             order.lane)
+                d_e, t_e, p_e = anchor if anchor is not None else (None,) * 3
                 self.custodian.adopt(OpenPosition(
                     event=order.event, market=order.market, lane=order.lane,
                     side=order.side, count=count,
                     entry_price_cents=int(round(cost)), entry_p_win=0.0,
-                    size_tier=order.size_tier, entry_time=now))
+                    size_tier=order.size_tier, entry_time=now,
+                    d_entry=d_e, t_entry=t_e, p_entry=p_e))
             elif action != "ENTRY" and self.custodian is not None:
                 # P14: the take FILLED — custody of a flat position ends here
                 # (the 7:34 race began with a stale custodian pos object).

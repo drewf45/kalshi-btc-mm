@@ -90,8 +90,8 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  FLIP: pair-formable-or-nothing · take entry+4 · scratch entry-3 "
                  "· sit-out@3 — margin UNPROVEN, mechanism proven (R-1)")
     lines.append("  F: hold-to-settlement · depth floor stands in thin books "
-                 "[STOP-AND-REPORT: passthrough CutParams unregistered — "
-                 "catastrophic backstop unreachable, awaiting Drew's ruling]")
+                 "· SALVAGE armed (P19: needle-collapse exits; catastrophic "
+                 "backstop reachable — P16 stop-and-report resolved)")
     lines.append("  H8: delta-gated >=99% survive · hold to settlement")
     lines.append("  D: cheap entry + resting recovery take (the baton)")
     lines.append("  P: displacement fade with take (negative-spec born)")

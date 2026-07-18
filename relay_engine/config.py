@@ -64,6 +64,16 @@ HUNT_TIMEBOX_M_S = 60.0    # TIME-BOX: the lag pays in a minute or it never was
 HUNT_BAND = (5, 95)        # no side-max, no price cap — the whole book
 
 # ---------------------------------------------------------------------------
+# P19 "SALVAGE" — the custodian earns Lane F. Needle-collapse exits for the
+# hold-to-settlement lanes; K is tuned from the DODGED_LOSS vs SALVAGE_REGRET
+# curve on Saturdays, never from a bad night.
+# ---------------------------------------------------------------------------
+SALVAGE_K_POINTS = 15.0    # needle collapse: p_held − p_entry <= −K, 2 ticks
+SALVAGE_S_CENTS = 10.0     # AND fair_held < entry − S
+SALVAGE_R_S = 10.0         # maker attempt unfilled for R -> crossfire at best
+SALVAGE_T_FLOOR_S = 15.0   # never salvage inside the floor (endgame is F's)
+
+# ---------------------------------------------------------------------------
 # Safe defaults in force (A3 / Chunk 0.3)
 # ---------------------------------------------------------------------------
 ONE_LOT_MAX_LOSS_CENTS = 99  # worst-case loss on a single 1-lot maker entry (price -> 0)

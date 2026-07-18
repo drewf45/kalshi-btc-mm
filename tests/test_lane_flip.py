@@ -189,7 +189,7 @@ def test_cut_params_encode_scratch_reasons():
     assert p.spot_safe_buffer_early_usd == 0.01                      # (b)
     assert p.reversal_threshold == lane_flip.FLIP_MARKOUT_STOP / 100  # (c)
     assert p.hard_stop_usd == lane_flip.FLIP_STOP_CENTS / 100
-    assert p.passthrough is False
+    assert p.salvage_enabled is False  # P19 renamed passthrough
 
 
 def test_custodian_scratches_on_flip_mark_drop(flip, gateway, ledger, surface):

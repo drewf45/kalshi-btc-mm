@@ -842,6 +842,52 @@ mode-stamped rows).
 - **§7**: CHECKS_P18 (casefiles complete, zero sub-N needles, zero P-vs-HUNT
   collisions, hunts resolve, PAIR alive, the bar ships) — fourth graded suite.
 
+## WO-P19 FINAL — "SALVAGE, SEAL, AND LET IT RUN" (the last order before the run)
+
+Suite at this commit: **337 passed**; preflight **17/17**.
+
+- **§1 read-rule correction**: the sweep's "P-suppression is NOT implemented" was
+  TRUE of lane_p.py (zero spotlead references) but FALSE of the deployed system —
+  P18 shipped the suppression at the CYCLE layer (engine skipped P + wrote the row,
+  test-proven). The claimed live consequence could not occur. §3.1 is still the
+  better shape and shipped: the suppression moved INTO the lane via the ctx flag
+  (`needle_confirmed` → Pass `P_SUPPRESSED_SPOTLEAD +Npts`, logged through the
+  ordinary row path) — one mechanism now serves both suppression rules (§2.4).
+- **§2 TRUE — the custodian earns Lane F**:
+  · 2.1 `OpenPosition` gains (d_entry, t_entry, p_entry), computed at custody
+    registration via `fills.anchor_fn` (spot + strike + delta table at the entry
+    instant); no anchor → salvage disabled for that position, tagged.
+  · 2.2 the trigger: ΔP = p_held(d_now,t_now) − p_entry ≤ −15pts sustained 2
+    consecutive ticks AND fair < entry − 10¢ AND t > 15s floor; spot BLIND → no
+    salvage (CATASTROPHIC_PROB stays the backstop beneath everything).
+  · 2.3 execution = Job-B + P14: tri-state cancel of the resting take (UNKNOWN
+    stays FATAL) → resweep + ledger re-derive (flat → skip, logged) → MAKER at the
+    held side's bid with the casefile reason → unfilled in R=10s → tri-state cancel
+    → crossfire via execute_cut (re-derives again — partials bounded) → ONE attempt
+    per position, latched. Page: `✂️ SALVAGE F sold yes@62¢ (cost 95) — needle
+    −18pts (d 200→90, T-6:39) · est save 57¢`.
+  · 2.4 mutual suppression, one mechanism: ctx `needle_confirmed` suppresses P;
+    ctx `salvage_active` (custodian.salvage_in_progress) suppresses HUNT entries —
+    one hand exits, the other waits; the reversal hunt fires AFTER, never during.
+  · 2.5 `passthrough` → `salvage_enabled` (rename, all references); F AND H8
+    register `salvage_params()` at wiring — the catastrophic backstop becomes
+    REACHABLE, resolving P16's STOP-AND-REPORT (PROFILE line updated); `👑` page
+    once per boot with the knobs.
+  · 2.6 salvage rows carry (ΔP, d_entry→d_now, mark, fair, est_save); settlement
+    writes the SALVAGE_VERDICT row (DODGED_LOSS vs SALVAGE_REGRET with the
+    counterfactual arithmetic) — Saturday chart #2's data; K tunes from it only.
+- **§3 TRUE**: 3.1 as above · 3.2 per-market state prunes at rollover (flip
+  windows already; NOW ALSO fh8 ladders + decide cache + P states + hunt anchors)
+  · 3.3 DB retention KNOB banked here: book_snapshots grows ~unbounded (~tens of
+  MB/day at 1/s) — fine for days; a 14-day retention sweep belongs in a later
+  order; do not rediscover this at 90% disk · 3.4 CHECKS_P19 (retired-class FATALs,
+  salvage casefiles, suppression rows, hunts resolve, silent windows) — fifth
+  graded suite, own retirement.
+- **§4**: the expected tape is encoded; the watch guide is Drew's (quiet hours are
+  SUCCESS; a ✂️ SALVAGE page is money SAVED; two 📊 negatives → the halt is the
+  machine OBEYING; a silent phone + a ticking hourly line = fine. Trust the
+  instrument you built).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -58,8 +58,8 @@ def test_profile_block_prints_every_lane():
                   "H8: delta-gated", "D: cheap entry", "P: displacement fade",
                   "ORPHAN: adopted at boot", "WALLS: gross+net"):
         assert token in tape
-    # the §2 verification's finding is stated ON the tape, not buried
-    assert "STOP-AND-REPORT: passthrough CutParams unregistered" in tape
+    # P19 resolved the P16 STOP-AND-REPORT: the tape says salvage is armed
+    assert "SALVAGE armed" in tape and "stop-and-report resolved" in tape
 
 
 # ── §3: deposit day — the confirm law rescales and speaks ──────────────────

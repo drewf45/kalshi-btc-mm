@@ -57,7 +57,7 @@ from .gateway import Gateway, Order
 
 log = logging.getLogger("relay.custodian")
 
-CATASTROPHIC_PROB = 0.05  # passthrough lanes still cut below this survival probability
+CATASTROPHIC_PROB = 0.05  # salvage-class lanes still cut below this survival probability
 
 
 @dataclass
@@ -93,7 +93,7 @@ class CutParams:
     peak_window_s: float             # windowed peak (not all-time — avoids ratcheting)
     proactive_after_s: float         # "settling" phase ends here
     prob_floor: float
-    passthrough: bool = False        # cut-disabled-except-catastrophic (Lane F)
+    salvage_enabled: bool = False    # P19 2.5 (was passthrough): cut-disabled-except-catastrophic-AND-salvage
 
     def scaled(self, size_tier: str) -> "CutParams":
         # Size buys discipline: PROBE=1.0 (base), LEAN/CLEAR tighten. Loss
@@ -135,6 +135,41 @@ class OpenPosition:
     # windowed prob tracking (2biFE mechanic: windowed peak, rapid drop)
     prob_history: List[Tuple[float, float]] = field(default_factory=list)
     peak_prob: float = 0.0
+    # P19 §2.1: the SALVAGE anchor, computed at custody registration from the
+    # delta table via spotlead's semantics. None = no anchor (table absent at
+    # entry) = salvage disabled for this position, tagged.
+    d_entry: Optional[float] = None
+    t_entry: Optional[float] = None
+    p_entry: Optional[float] = None
+    # P19 §2.2/2.3: the salvage state machine — ONE attempt per position.
+    salvage_strikes: int = 0
+    salvage_attempted: bool = False
+    salvage_oid: Optional[str] = None
+    salvage_ts: float = 0.0
+
+
+def salvage_params() -> CutParams:
+    """P19 §2.5 — the promotion: F (and H8) register with the custodian as
+    cut-disabled-except-catastrophic-AND-salvage. The catastrophic backstop
+    (CATASTROPHIC_PROB + a 90c/contract collapse) finally becomes REACHABLE —
+    this resolves P16's STOP-AND-REPORT. All other triggers are inert: the
+    salvage_enabled branch returns before they are read."""
+    return CutParams(
+        hard_stop_usd=999.0, soft_stop_usd=999.0,
+        min_time_remaining_s=2, hold_to_settle_s=0,
+        spot_danger_buffer_usd=0, grace_period_s=0,
+        early_exit_window_s=0, early_exit_loss_fraction=1.0,
+        max_loss_fraction_of_balance=1.0, max_loss_fraction_of_cost=1.0,
+        catastrophic_loss_cents=90,
+        spot_safe_buffer_early_usd=0.01, spot_safe_buffer_late_usd=0.01,
+        spot_safe_cutoff_s=60,
+        rapid_drop_threshold=1.0, rapid_drop_window_s=10,
+        max_loss_cents_per_contract=100,
+        reversal_threshold=1.0, reversal_threshold_settling=1.0,
+        reversal_threshold_profit=1.0, profit_tighten_above_entry=1.0,
+        peak_window_s=30, proactive_after_s=0, prob_floor=0.0,
+        salvage_enabled=True,
+    )
 
 
 def spot_is_safe(side: str, spot: Optional[float], lo: Optional[float],
@@ -224,6 +259,16 @@ class Custodian:
             if mark is None:
                 continue
             blo, bhi = (boundaries or {}).get(pos.market, (None, None))
+            # P19 §2: the SALVAGE machine runs for salvage-enabled lanes
+            # BEFORE the classic triggers (it is gentler: maker-first).
+            base = self.params.get(pos.lane)
+            if base is not None and base.salvage_enabled:
+                salvaged = self._salvage_tick(pos, book, mark,
+                                              close_ts - now, now, spot,
+                                              blo, bhi)
+                if salvaged:
+                    cuts.append((pos.market, pos.lane, salvaged))
+                    continue
             trigger = self.should_cut(
                 pos, now=now, secs_remaining=close_ts - now,
                 p_win=mark / 100.0, exit_bid_cents=mark, spot=spot,
@@ -232,6 +277,117 @@ class Custodian:
                 self.execute_cut(pos, mark, book, trigger, crossfire=True)
                 cuts.append((pos.market, pos.lane, trigger))
         return cuts
+
+    # ── P19 §2: SALVAGE — the custodian earns Lane F ───────────────────
+    def salvage_in_progress(self, market: str) -> bool:
+        """§2.4: one hand exits, the other waits — HUNT entries on this
+        market are suppressed until the salvage resolves (position gone)."""
+        return any(p.market == market and p.salvage_attempted
+                   for p in self.positions.values())
+
+    def _held_p(self, pos: OpenPosition, spot: float, strike: float,
+                t_rem: float) -> Optional[float]:
+        from . import delta
+        d = abs(spot - strike)
+        ps = delta.p_survive(d, t_rem)
+        if ps is None:
+            return None
+        on_side = "yes" if spot >= strike else "no"
+        return ps if on_side == pos.side else 1.0 - ps
+
+    def _salvage_tick(self, pos: OpenPosition, book, mark: int, t_rem: float,
+                      now: float, spot, blo, bhi) -> Optional[str]:
+        """§2.2 the trigger (needle-collapse, 2 sustained ticks) + §2.3 the
+        execution: maker at the held side's best bid, crossfire after R.
+        Spot BLIND → no salvage (catastrophic path unchanged beneath)."""
+        # stage 2: a maker salvage is resting — R-second clock
+        if pos.salvage_oid is not None:
+            if now - pos.salvage_ts >= config.SALVAGE_R_S:
+                state = self.gateway.cancel_tristate(pos.salvage_oid)
+                pos.salvage_oid = None
+                pos.resting_exit_id = None
+                if state == "UNKNOWN":
+                    failures.fail("BATON_VIOLATION",
+                                  f"salvage maker {pos.market} unverifiable "
+                                  f"before crossfire", fatal=True,
+                                  market=pos.market, lane=pos.lane)
+                self.execute_cut(pos, mark, book, "SALVAGE_CROSSFIRE",
+                                 crossfire=True)
+                return "SALVAGE_CROSSFIRE"
+            return None
+        if pos.salvage_attempted or pos.p_entry is None:
+            return None      # one attempt per position; no anchor = disabled
+        if spot is None:
+            return None      # BLIND: no salvage, backstop unchanged
+        if t_rem <= config.SALVAGE_T_FLOOR_S:
+            return None
+        from . import spotlead as _sl
+        strike = _sl.pick_strike(spot, blo, bhi)
+        if strike is None:
+            return None
+        p_held = self._held_p(pos, spot, strike, t_rem)
+        if p_held is None:
+            return None      # table gap now: no evidence, no salvage
+        drop_pts = (p_held - pos.p_entry) * 100.0
+        fair = p_held * 100.0
+        if (drop_pts <= -config.SALVAGE_K_POINTS
+                and fair < pos.entry_price_cents - config.SALVAGE_S_CENTS):
+            pos.salvage_strikes += 1
+        else:
+            pos.salvage_strikes = 0
+            return None
+        if pos.salvage_strikes < 2:
+            return None      # sustained 2 consecutive ticks — no knives
+
+        # TRIGGERED — §2.3: tri-state cancel artifacts, re-derive, maker.
+        pos.salvage_attempted = True
+        if pos.resting_exit_id is not None:
+            state = self.gateway.cancel_tristate(pos.resting_exit_id)
+            if state == "UNKNOWN":
+                failures.fail("BATON_VIOLATION",
+                              f"resting exit {pos.resting_exit_id} on "
+                              f"{pos.market} unverifiable before salvage",
+                              fatal=True, market=pos.market, lane=pos.lane)
+            pos.resting_exit_id = None
+        self.resweep(pos.market)
+        remaining = self.ledger_remaining(pos)
+        if remaining <= 0:
+            log.warning("SALVAGE SKIPPED %s — position already flat (P14)",
+                        pos.market)
+            self.positions.pop(f"{pos.market}:{pos.lane}", None)
+            return None
+        d_now = abs(spot - strike)
+        est_save = mark - fair
+        casefile = (f"needle {drop_pts:+.0f}pts "
+                    f"(d {pos.d_entry:.0f}→{d_now:.0f}, "
+                    f"T-{int(t_rem // 60)}:{int(t_rem % 60):02d})"
+                    if pos.d_entry is not None else
+                    f"needle {drop_pts:+.0f}pts (d ?→{d_now:.0f})")
+        order = Order(
+            lane=pos.lane, event=pos.event, market=pos.market, side=pos.side,
+            action="sell", price_cents=mark, count=remaining,
+            size_tier=pos.size_tier, purpose="EXIT",
+            reason=f"SALVAGE maker — {casefile} · est save {est_save:.0f}¢")
+        result = self.gateway.submit(order, book)
+        pos.salvage_oid = result.order_id
+        pos.salvage_ts = now
+        pos.resting_exit_id = result.order_id
+        import json as _json
+        self.surface.write_row(
+            pos.lane, pos.market, f"w-{pos.market}", "SALVAGE",
+            detail=_json.dumps({"side": pos.side,
+                                "entry": pos.entry_price_cents,
+                                "mark": mark, "delta_p": round(drop_pts, 1),
+                                "d_entry": pos.d_entry, "d_now": round(d_now, 1),
+                                "fair": round(fair, 1),
+                                "est_save": round(est_save, 1)}))
+        self.gateway.alert_fn(
+            f"✂️ SALVAGE {pos.lane} sold {pos.side}@{mark}¢ "
+            f"(cost {pos.entry_price_cents}) — {casefile} · "
+            f"est save {est_save:.0f}¢")
+        log.warning("SALVAGE [%s] %s maker@%dc — %s", pos.lane, pos.market,
+                    mark, casefile)
+        return None  # maker resting; the cut (if any) comes at stage 2
 
     # ------------------------------------------------------------------
     def should_cut(self, pos: OpenPosition, now: float, secs_remaining: float,
@@ -256,7 +412,7 @@ class Custodian:
         loss_bid_usd = (entry - exit_bid) * qty / 100.0
         worst_loss_usd = max(loss_prob_usd, loss_bid_usd)
 
-        if p.passthrough:
+        if p.salvage_enabled:
             # Lane F passthrough (4.4): cut-disabled-except-catastrophic.
             if p_win < CATASTROPHIC_PROB:
                 return "CATASTROPHIC"

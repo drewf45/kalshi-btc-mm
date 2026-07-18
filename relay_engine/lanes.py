@@ -325,6 +325,15 @@ class PLaneWrapper(Lane):
         close_ts = ctx.get("close_ts") or infer_close_ts_from_ticker(market)
         if close_ts is None:
             return Decision(self.name, market, None, pass_reason="NO_CLOSE_TS")
+        # P18.1 §4.2 / P19 §3.1: a CONFIRMED needle voids the fade thesis —
+        # P exists to fade moves the spot never made; the moment spot
+        # ratifies one, P yields the floor. Logged, tape-gradable.
+        if ctx.get("needle_confirmed"):
+            sl = ctx.get("spotlead")
+            pts = f" needle +{sl.delta_p:.0f}pts" if sl is not None else ""
+            return Decision(self.name, market, None,
+                            pass_reason=f"P_SUPPRESSED_SPOTLEAD{pts}",
+                            interim=True)
         if not ctx.get("entries_allowed", True):
             return Decision(self.name, market, None,
                             pass_reason="ENTRY_HALT_DEGRADE_LADDER", interim=True)
