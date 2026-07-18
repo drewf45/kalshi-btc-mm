@@ -888,6 +888,64 @@ Suite at this commit: **337 passed**; preflight **17/17**.
   machine OBEYING; a silent phone + a ticking hourly line = fine. Trust the
   instrument you built).
 
+## WO-2026-07-18-RELAY-P21 — "THE DOCTRINE ENGINE" (the last order of the build era)
+
+Suite at this commit: **351 passed**; preflight **18/18**.
+
+- **A1 TRUE — THE NETTING MODEL**: the venue nets one account's sides (Drew
+  ruling: "Kalshi closed that loophole"; tape: `WINDOW_ECON_DIVERGENCE broker
+  −7c vs fills −65c` at 10:45 and 11:30 — our stale hedge-model, not the
+  broker's error). An opposite-side ENTRY-purpose buy on a held market books
+  as an EXIT of the held side at 100−price (`fills.py` sweep), banks
+  `SELF_NET_BOOKED` (row, no page — the wall should have refused it). Scope
+  is the (event, market, lane) key the fills path owns; the wall covers the
+  account.
+- **A2 TRUE — REJECT_SELF_NET**: `gateway._wall_self_net`, canon position
+  after FLIP_UNPAIRED: an ENTRY that would net down the WHOLE ACCOUNT's net
+  on the market is refused; exits/cuts (risk-reducing) never reach it —
+  netting is an exit's job. Overturned test-law: the old wrong-way sell test
+  held +2 while short-selling (now correctly REJECT_SELF_NET first).
+- **A3 TRUE — the grain**: `grain.py` reads OUR `window_outcomes` (written
+  at `settle_traded_market` via `ledger.record_outcome`, idempotent) →
+  last-K (K=4) streak {direction, length} → `ctx["grain"]` each cycle.
+  Traded windows only today — that partial view is the registry's grain
+  QUESTION.
+- **A4 TRUE — Lane OPEN replaces PAIR (retired)**: setup = BOTH sides in
+  [44,56] AND grain ≥2 (band without grain → pass, `OPEN_NO_GRAIN`, once
+  per window); entry = maker join the GRAIN side ≤49¢, one lot, why-stamped
+  (`OPEN grain nox3 · join 49c · band y48/n49`). The PAIR-era entry phase
+  and OFI re-entry gate retired with it (waiting IS the setup; the herd's
+  screen outranks the last four ticks). P15's lone-leg tape check exempts
+  OPEN whys (one-sided BY LAW; join graded ≤49 in the P21 suite).
+- **A5 TRUE — THE PATIENT HOLD**: `_open_custody`, every cycle before any
+  gate. Inside [35,65]: NO stop, NO scratch, NO time-box (the −11¢ 10:30
+  and −12¢ 11:17 round-trips were OPEN-intent killed by fast-intent stops —
+  the last of their kind). Exits EXACTLY three: TAKE (entry+5 resting from
+  the fill) · DETERMINED-AGAINST (mark leaves the band against us,
+  immediate — the band IS the definition; or ΔP-collapse ≥15pts sustained
+  2 polls → salvage-style out: maker at the join, crossfire after R=10s
+  unfilled) · CURFEW (crossfire flat at T-240, HUNT's handoff law).
+  `flip_cut_params` overturned to catastrophic-only (90¢/contract backstop);
+  the legacy scratch mapping deleted (git history keeps it). OPEN exits
+  count NO scratches — the sit-out never feeds off patience.
+- **A6 TRUE — HUNT seniority**: a live needle (ΔP ≥ N) voids OPEN's premise
+  (undetermined, herd-priced) — hunt owns the floor; OPEN entries suppressed
+  while it lasts.
+- **B1 — docs/SEMANTICS.md**: 16 KNOWNs, each `LAW · CODE (file:line) ·
+  TAPE (a real tape_grade line)`, + the six QUESTIONS with collectors.
+  Boot cites it (`DOCTRINE:` line, missing-from-tree is loud).
+- **B2 — KNOWLEDGE_DRIFT**: `semantics.drift_section` runs EVERY KNOWN's
+  tape test in EVERY pack (registry tests never retire); a failure demotes
+  the answer to QUESTION in the pack, pages `⚠ KNOWLEDGE_DRIFT [{answer}]`
+  ONCE per transition, blocks nothing; re-proof prints `✓ re-proven`.
+- **B3 — the registry's own wall**: `semantics.validate_registry` +
+  `test_registry_wall_*` — every entry must name an existing tape line;
+  doctored-registry negative test included.
+- **§7**: CHECKS_P21 (divergence silent, zero self-net bookings, OPEN whys
+  stamped, zero PAIR entries, exits intentional + params catastrophic-only,
+  registry green, drift-pages conditional) — sixth graded suite in the
+  pack, own retirement; the DOCTRINE section follows it forever.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

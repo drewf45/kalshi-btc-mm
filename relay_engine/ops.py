@@ -305,11 +305,12 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     # code and the world disagree), never silently forgotten.
     try:
         from scripts.tape_grade import (CHECKS, CHECKS_P16, CHECKS_P17,
-                                        CHECKS_P18, CHECKS_P19)
+                                        CHECKS_P18, CHECKS_P19, CHECKS_P21)
         suites = (("P15", "p15", CHECKS), ("P16 deposit day", "p16", CHECKS_P16),
                   ("P17 show up", "p17", CHECKS_P17),
                   ("P18 the detective", "p18", CHECKS_P18),
-                  ("P19 let it run", "p19", CHECKS_P19))
+                  ("P19 let it run", "p19", CHECKS_P19),
+                  ("P21 the doctrine engine", "p21", CHECKS_P21))
         from scripts.tape_grade import grade
         for label, prefix, checks in suites:
             passes = int(ledger.get_state(f"{prefix}_grade_passes") or 0)
@@ -344,4 +345,13 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
                         pass
     except Exception as e:
         lines.append(f"DEPLOY GRADE: grader unavailable ({e})")
+    # P21 B2 — KNOWLEDGE_DRIFT: the registry's tape tests run in EVERY pack;
+    # unlike the deploy grades above, doctrine tests NEVER retire. A failing
+    # KNOWN demotes to QUESTION here, pages once per transition, blocks
+    # nothing — reality outranks the registry.
+    try:
+        from . import semantics
+        lines.extend(semantics.drift_section(ledger))
+    except Exception as e:
+        lines.append(f"DOCTRINE: registry unavailable ({e})")
     return "\n".join(lines)

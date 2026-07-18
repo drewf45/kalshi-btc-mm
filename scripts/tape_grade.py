@@ -27,12 +27,17 @@ def _one(db, sql, args):
 
 
 def check_no_lone_flip_entries(db, since):
-    """zero FLIP entries where either side >49 at the open (Ruling 2)."""
+    """zero FLIP entries where either side >49 at the open (Ruling 2).
+    P21 A4: OPEN entries are exempt — they are one-sided BY LAW (grain
+    side, join <= OPEN_MAX graded in the P21 suite) and their why carries
+    the full band (legally up to 56) for the record."""
     rows = db.execute(
         "SELECT detail FROM surface_rows WHERE lane='FLIP' AND state='PROPOSED'"
         " AND detail LIKE '%ENTRY%' AND ts>?", (since,)).fetchall()
     bad = 0
     for (detail,) in rows:
+        if "OPEN grain" in detail:
+            continue
         m = re.search(r"y(\d+)/n(\d+)", detail)
         if m and (int(m.group(1)) > 49 or int(m.group(2)) > 49):
             bad += 1
@@ -308,11 +313,13 @@ def check_hunts_resolve(db, since, now=None):
 
 
 def check_pair_mode_alive(db, since):
-    """PAIR mode still posts on genuine two-way books (conditional)."""
+    """P21 A4 OVERTURNED this line's premise: PAIR is retired (the venue
+    nets one account's sides — a pair-bundle was a fiction). The P18 line
+    stays for the record as a count; CHECKS_P21 grades it to ZERO."""
     n = _one(db, "SELECT COUNT(*) FROM surface_rows WHERE lane='FLIP' AND"
                  " state='PROPOSED' AND detail LIKE '%pair-post%' AND ts>?",
              (since,))
-    return True, f"{n} pair post(s) (conditional — books decide)"
+    return True, f"{n} pair post(s) (PAIR retired P21 A4 — see P21 suite)"
 
 
 def check_hit_rate_bar_ships(db, since):
@@ -381,6 +388,108 @@ CHECKS_P19 = [
 ]
 
 
+# ── P21 "THE DOCTRINE ENGINE" — expected tape ──────────────────────────────
+def check_econ_divergence_silent(db, since):
+    """A1's proof is QUIET: the netting model makes fills-P&L match broker
+    truth, so the 10:45/11:30 divergence class never pages again."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                 " why_tag='WINDOW_ECON_DIVERGENCE' AND ts>?", (since,))
+    return n == 0, f"{n} divergence page(s)"
+
+
+def check_no_self_net_entries(db, since):
+    """zero self-net entry bookings: the A2 wall refuses opposite-side
+    ENTRY buys on held markets; the A1 belt (SELF_NET_BOOKED) staying
+    silent proves the wall held."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                 " why_tag='SELF_NET_BOOKED' AND ts>?", (since,))
+    return n == 0, f"{n} SELF_NET_BOOKED belt catch(es)"
+
+
+def check_open_whys_stamped(db, since):
+    """every OPEN entry why carries grain>=min, join<=max, both sides in the
+    open band — the herd's compass, stamped on every trade."""
+    from relay_engine import config as _cfg
+    rows = db.execute(
+        "SELECT detail FROM surface_rows WHERE lane='FLIP' AND"
+        " state='PROPOSED' AND detail LIKE '%OPEN grain%' AND ts>?",
+        (since,)).fetchall()
+    bad = 0
+    for (d,) in rows:
+        m = re.search(r"OPEN grain (yes|no)x(\d+) · join (\d+)c ·"
+                      r" band y(\d+)/n(\d+)", d)
+        lo_b, hi_b = _cfg.OPEN_BAND
+        if (m is None or int(m.group(2)) < _cfg.OPEN_MIN_GRAIN
+                or int(m.group(3)) > _cfg.OPEN_MAX_ENTRY_CENTS
+                or not (lo_b <= int(m.group(4)) <= hi_b)
+                or not (lo_b <= int(m.group(5)) <= hi_b)):
+            bad += 1
+    return bad == 0, f"{bad} unstamped of {len(rows)} OPEN entries"
+
+
+def check_zero_pair_entries(db, since):
+    """PAIR is retired (A4): zero pair-post proposals, ever again."""
+    n = _one(db, "SELECT COUNT(*) FROM surface_rows WHERE lane='FLIP' AND"
+                 " state='PROPOSED' AND detail LIKE '%pair-post%' AND ts>?",
+             (since,))
+    return n == 0, f"{n} pair post(s)"
+
+
+def check_open_exits_intentional(db, since):
+    """A5: OPEN exits are EXACTLY take/determined/curfew — zero wiggle
+    exits. Tape-level: every reason=open row names one of the three.
+    Code-level: FLIP cut-params keep ONLY the catastrophic backstop (the
+    −11¢/−12¢ round-trip class is dead)."""
+    rows = db.execute(
+        "SELECT detail FROM surface_rows WHERE lane='FLIP' AND"
+        " state='PROPOSED' AND detail LIKE '%reason=open %' AND ts>?",
+        (since,)).fetchall()
+    bad = sum(1 for (d,) in rows
+              if not any(tok in d for tok in
+                         ("open take", "open determined", "open curfew")))
+    try:
+        from relay_engine.lane_flip import flip_cut_params
+        p = flip_cut_params()
+        inert = (p.max_loss_cents_per_contract >= 100
+                 and p.reversal_threshold >= 1.0 and p.hard_stop_usd >= 999)
+    except Exception:
+        inert = False
+    return (bad == 0 and inert), (f"{bad} off-intent exit(s) of {len(rows)}; "
+                                  f"catastrophic-only={'yes' if inert else 'NO'}")
+
+
+def check_registry_green(db, since):
+    """B1/B3: SEMANTICS.md in tree and every KNOWN names a real tape line."""
+    try:
+        from relay_engine import semantics
+        errs = semantics.validate_registry()
+        if errs:
+            return False, "; ".join(errs[:3])
+        n = len(semantics.parse_registry())
+        return n >= 16, f"{n} entries, all bound to tape lines"
+    except Exception as e:
+        return False, f"registry unreadable: {e}"
+
+
+def check_knowledge_drift_paged(db, since):
+    """conditional: any drift arrives AS A PAGE with its answer's name —
+    reality outranks the registry, and the demotion is recorded."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                 " why_tag='KNOWLEDGE_DRIFT' AND ts>?", (since,))
+    return True, f"{n} drift page(s) (conditional — reality decides)"
+
+
+CHECKS_P21 = [
+    ("WINDOW_ECON_DIVERGENCE silent (A1 netting model)", check_econ_divergence_silent),
+    ("zero self-net entry bookings (A1 belt · A2 wall)", check_no_self_net_entries),
+    ("OPEN whys stamped: grain, join, band (A4)", check_open_whys_stamped),
+    ("zero PAIR entries (A4 — PAIR retired)", check_zero_pair_entries),
+    ("OPEN exits only TAKE/DETERMINED/CURFEW (A5)", check_open_exits_intentional),
+    ("registry green: every KNOWN names its tape line (B1/B3)", check_registry_green),
+    ("KNOWLEDGE_DRIFT arrives as a page (B2)", check_knowledge_drift_paged),
+]
+
+
 def grade(db, window_hours: float = 24.0, now=None, checks=None):
     """Returns [(name, ok, detail)] for the last window_hours."""
     now = time.time() if now is None else now
@@ -405,7 +514,8 @@ def main() -> int:
     for label, checks in (("P15", CHECKS), ("P16 deposit day", CHECKS_P16),
                           ("P17 show up", CHECKS_P17),
                           ("P18 the detective", CHECKS_P18),
-                          ("P19 let it run", CHECKS_P19)):
+                          ("P19 let it run", CHECKS_P19),
+                          ("P21 the doctrine engine", CHECKS_P21)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

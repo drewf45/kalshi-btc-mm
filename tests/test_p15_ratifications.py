@@ -46,8 +46,15 @@ def test_one_sided_book_posts_nothing(engine):
 
 
 def test_pair_formable_posts_both(engine):
-    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(46, 48)))
-    assert {p.side for p in props} == {"yes", "no"}
+    """P21 A4 OVERTURNED Ruling 2's pair-posting (the venue nets one
+    account's sides — a pair-bundle was a fiction): the same two-way book
+    now posts ONE lot on the grain side, and NOTHING without grain."""
+    ctx = flip_ctx(engine, flip_book(46, 48))
+    assert engine.flip.evaluate(TICKER, ctx) == []   # band without grain
+    engine.flip.windows.clear()
+    ctx["grain"] = {"direction": "no", "length": 2, "k": 4}
+    props = engine.flip.evaluate(TICKER, ctx)
+    assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
 
 
 def test_combined_over_line_posts_nothing(engine):

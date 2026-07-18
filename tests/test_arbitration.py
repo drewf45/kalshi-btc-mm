@@ -73,8 +73,10 @@ def test_flip_takes_lead_its_proposal_list(gateway, ledger, surface):
                                                  ladder=DegradeLadder()))
     close = 1_000_000.0
     b = OrderBook(market=TICKER)
-    b.apply_snapshot({40: 20}, {45: 20}, ts=1.0)
-    ctx = {"book": b, "close_ts": close, "now": close - 800}
+    # P21 A4: entries are Lane OPEN now — open-band book + grain streak
+    b.apply_snapshot({48: 20}, {49: 20}, ts=1.0)
+    ctx = {"book": b, "close_ts": close, "now": close - 800,
+           "grain": {"direction": "yes", "length": 2, "k": 4}}
     props = flip.evaluate(TICKER, ctx)
     flip.on_submitted(props[0], "E1", close - 800)
     event = TICKER.rsplit("-", 1)[0]

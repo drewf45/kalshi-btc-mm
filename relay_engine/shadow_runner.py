@@ -782,6 +782,8 @@ class ShadowEngine:
                 if strike is not None and close_for is not None:
                     anchor = self.hunt_anchor.setdefault(market, spot)
                     sl = _sl.needle(anchor, spot, strike, close_for - now)
+            # P21 A3: the herd's compass — OUR settled windows, last-K streak.
+            from . import grain as _grain
             ctx = {
                 "book": book, "now": now, "spot": spot,
                 "spot_ticks": self.spot_ticks,
@@ -794,6 +796,7 @@ class ShadowEngine:
                 # P19 §2.4: mutual suppression — ONE mechanism, both rules.
                 "needle_confirmed": _sl.is_confirmed_needle(sl),
                 "salvage_active": self.custodian.salvage_in_progress(market),
+                "grain": _grain.grain(self.ledger),
             }
             # P13 §3: boot orientation self-test on the first comparable book
             if not self._orientation_checked and book.has_snapshot:
@@ -943,6 +946,10 @@ class ShadowEngine:
                           f"suspect, audit this window's tape",
                           market=market, settled_yes=settled_yes, last_yes_bid=yb)
         window = self._window_of.get(market, f"w-{market}")
+        # P21 A3: bank the outcome for the grain — the herd's screen updates
+        # the moment we learn how the window went (traded windows only today;
+        # that partial view is the registry's grain QUESTION).
+        self.ledger.record_outcome(market, settled_yes, now=now_eff)
         per_lane = self.surface.settle_market(market, window,
                                               settled_yes=settled_yes)
         # P19 §2.6: every salvage row gets its settlement COUNTERFACTUAL —

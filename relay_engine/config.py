@@ -74,6 +74,21 @@ SALVAGE_R_S = 10.0         # maker attempt unfilled for R -> crossfire at best
 SALVAGE_T_FLOOR_S = 15.0   # never salvage inside the floor (endgame is F's)
 
 # ---------------------------------------------------------------------------
+# P21 "THE DOCTRINE ENGINE" — Lane OPEN (A4) + the grain (A3) + patient holds
+# (A5). PAIR is retired: the venue nets one account's sides; the 49/49 penny
+# is real but one-sided now — which side is the herd's, and waiting IS the
+# setup.
+# ---------------------------------------------------------------------------
+GRAIN_K = 4                       # last-K window outcomes feed the streak
+OPEN_BAND = (44, 56)              # setup: BOTH sides in the open band
+OPEN_MIN_GRAIN = 2                # streak >= 2 or pass (OPEN_NO_GRAIN)
+OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
+OPEN_TAKE_CENTS = 5               # A5: TAKE resting at entry+5
+OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box
+OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
+OPEN_BAIL_R_S = 10.0              # determined maker unfilled R -> crossfire
+
+# ---------------------------------------------------------------------------
 # Safe defaults in force (A3 / Chunk 0.3)
 # ---------------------------------------------------------------------------
 ONE_LOT_MAX_LOSS_CENTS = 99  # worst-case loss on a single 1-lot maker entry (price -> 0)

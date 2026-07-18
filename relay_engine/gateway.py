@@ -251,6 +251,7 @@ class Gateway:
                 del self.wall_backoff[(order.lane, order.market)]
             try:
                 self._wall_flip_unpaired(order)  # P13 §4: the named refusal first
+                self._wall_self_net(order)       # P21 A2: netting is an exit's job
                 self._wall_band_and_single_entry(order)
                 self._wall_net_risk_and_at_risk(order)
                 self._wall_wrong_way_tick(order)
@@ -489,6 +490,26 @@ class Gateway:
                 raise WallRejection(
                     "TAKER_ENTRY",
                     f"{order.side} sell at {order.price_cents}c through bid {bid}c")
+
+    def _wall_self_net(self, order: Order) -> None:
+        """P21 A2: no lane BUYS the opposite side of a held market as an
+        ENTRY — accidental netting is a bug; deliberate netting is an exit,
+        and exits/cuts (risk-reducing) never reach this wall. Purpose
+        decides. Scope: the whole ACCOUNT's net on the market — the venue
+        nets across our lanes whether we like it or not."""
+        if order.purpose != "ENTRY":
+            return
+        market_net = sum(net for (ev, mkt, ln), net in self.positions.items()
+                         if mkt == order.market)
+        if market_net == 0:
+            return
+        buy_dir = 1 if (order.side == "yes") == (order.action == "buy") else -1
+        if (market_net > 0) != (buy_dir > 0):
+            raise WallRejection(
+                "REJECT_SELF_NET",
+                f"{order.market}: entry would net down the account's held "
+                f"{'yes' if market_net > 0 else 'no'} side (net {market_net:+d})"
+                f" — netting is an exit's job, not an entry's")
 
     def _wall_flip_unpaired(self, order: Order) -> None:
         """P13 §4: FLIP pair integrity — a second SAME-side ENTRY on a market

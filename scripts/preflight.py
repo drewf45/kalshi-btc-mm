@@ -62,7 +62,7 @@ CHECKS = [
         "tests/test_p14_cut_law.py",
         "tests/test_custodian.py::test_baton_gone_exit_is_terminal_not_fatal",
     ]),
-    ("ratifications: orphans, pair-or-nothing, depth floor, gross wall (P15)", [
+    ("ratifications: orphans, depth floor, gross wall (P15; pair→OPEN per P21)", [
         "tests/test_p15_ratifications.py",
     ]),
     ("the scalp profile, funded: db chain, rescale, deposit tape (P16)", [
@@ -78,6 +78,10 @@ CHECKS = [
     ]),
     ("salvage, seal, let it run: the custodian earns F (P19)", [
         "tests/test_p19_salvage.py",
+    ]),
+    ("the doctrine engine: netting, grain, patient hold, registry (P21)", [
+        "tests/test_p21_doctrine.py",
+        "tests/test_lane_flip.py",
     ]),
 ]
 

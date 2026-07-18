@@ -57,8 +57,9 @@ def test_wrong_way_tick_buy_must_improve_up(gateway):
 
 def test_wrong_way_tick_sell_must_improve_down(gateway):
     b = make_book()
-    gateway.positions[("EV1", "M1", "D")] = 2  # long 2, so a 1-lot sell is risk-reducing...
-    # use a NON-risk-reducing sell (no position) to hit the wall: lane P short-sell entry
+    # P21 A2 overturned the old setup (a held +2 made ANY sell-entry a
+    # self-net — REJECT_SELF_NET now fires first, account scope): the
+    # market must be FLAT so the short-sell entry reaches the tick wall.
     sell = Order(lane="P", event="EV1", market="M1", side="yes", action="sell",
                  price_cents=53, count=1, size_tier=config.TIER_PROBE, purpose="ENTRY",
                  improve_from=52)

@@ -32,6 +32,17 @@ What CHANGES (the relay laws that outrank port fidelity — P3 Part V):
 
 Win/loss path symmetry: both sides of the book are quoted by the same rule;
 a netted bundle and a scratched leg book through the same gateway/fills path.
+
+P21 "THE DOCTRINE ENGINE" OVERTURNED the pair machinery above: the venue
+nets one account's sides (Drew: "Kalshi closed that loophole"), so a
+pair-bundle was a fiction — PAIR is RETIRED (zero pair posts, graded).
+FLIP now runs two intents: HUNT (P18 — fast, needle-triggered, Job-B
+bails) and OPEN (A4 — both sides in the open band + grain streak >= 2,
+maker join the grain side, one lot) with THE PATIENT HOLD (A5 — inside
+the undetermined band no stop/scratch/time-box; exits are exactly
+TAKE / DETERMINED-AGAINST / CURFEW). The pure pair-era helpers below
+(ofi_side, scratch_reason, pair_grace_expired) remain as documentation
+of the retired law; the docstrings carry the citations.
 """
 
 import logging
@@ -135,40 +146,26 @@ def scratch_reason(side: str, entry_cents: int, leg_mark, markout_30,
 
 
 def flip_cut_params() -> CutParams:
-    """The scratch reasons as custodian cut-params (one exit owner — Trader lens).
-    Mapping, knob-for-knob:
-      (a) mark <= entry-S       -> max_loss_cents_per_contract = FLIP_SCRATCH_S
-      (b) spot through strike   -> spot-safety buffers at 0 (any adverse side cuts
-                                   once the custodian's spot check fails)
-      (c) markout worsening     -> reversal_threshold = FLIP_MARKOUT_STOP/100 over
-                                   a 30s windowed peak
-    The dollar stops bound the window at the stop level; the endgame guard is
-    T-(FLIP_FLAT_AT) — at T-90 the custodian flattens rather than holds."""
+    """P21 A5 OVERTURNED the P3-era scratch mapping here: FLIP exits are
+    INTENT-BASED and lane-owned (HUNT: Job-B fast bails · OPEN: the patient
+    hold — no stop, no scratch, no time-box while the book is undetermined).
+    The custodian keeps ONLY the catastrophic backstop. SOURCE: the −11¢
+    (10:30) and −12¢ (11:17) round-trips were OPEN-intent positions killed
+    by fast-intent stops — cited as the last of their kind."""
     return CutParams(
-        hard_stop_usd=FLIP_STOP_CENTS / 100.0,
-        soft_stop_usd=FLIP_STOP_CENTS / 100.0,
-        min_time_remaining_s=2,             # flatten runs to close-2 (flip's rejoin_exp)
-        hold_to_settle_s=0,                 # flip never holds to settle — it flattens at T-90
-        spot_danger_buffer_usd=0,
-        grace_period_s=0,                   # scratch logic live from the fill
-        early_exit_window_s=0,
-        early_exit_loss_fraction=1.0,
-        max_loss_fraction_of_balance=0.05,
-        max_loss_fraction_of_cost=1.0,
-        catastrophic_loss_cents=FLIP_LONE_MAX + 1,
-        spot_safe_buffer_early_usd=0.01,    # (b): any adverse side = not safe
-        spot_safe_buffer_late_usd=0.01,
+        hard_stop_usd=999.0, soft_stop_usd=999.0,
+        min_time_remaining_s=2, hold_to_settle_s=0,
+        spot_danger_buffer_usd=0, grace_period_s=0,
+        early_exit_window_s=0, early_exit_loss_fraction=1.0,
+        max_loss_fraction_of_balance=1.0, max_loss_fraction_of_cost=1.0,
+        catastrophic_loss_cents=90,
+        spot_safe_buffer_early_usd=0.01, spot_safe_buffer_late_usd=0.01,
         spot_safe_cutoff_s=FLIP_FLAT_AT,
-        rapid_drop_threshold=FLIP_MARKOUT_STOP / 100.0,
-        rapid_drop_window_s=10,
-        max_loss_cents_per_contract=FLIP_SCRATCH_S,    # (a)
-        reversal_threshold=FLIP_MARKOUT_STOP / 100.0,  # (c)
-        reversal_threshold_settling=FLIP_MARKOUT_STOP / 100.0,
-        reversal_threshold_profit=FLIP_MARKOUT_STOP / 100.0,
-        profit_tighten_above_entry=1.0,     # no profit-tightening in flip's book
-        peak_window_s=30,
-        proactive_after_s=0,
-        prob_floor=0.0,                     # flip has no probability floor
+        rapid_drop_threshold=1.0, rapid_drop_window_s=10,
+        max_loss_cents_per_contract=100,
+        reversal_threshold=1.0, reversal_threshold_settling=1.0,
+        reversal_threshold_profit=1.0, profit_tighten_above_entry=1.0,
+        peak_window_s=30, proactive_after_s=0, prob_floor=0.0,
     )
 
 
@@ -191,6 +188,10 @@ class FlipWindow:
     hunt_pending: Optional[dict] = None            # {side, confirms, last_cost}
     hunts: Dict[str, dict] = field(default_factory=dict)  # side -> position state
     hunt_count: int = 0
+    # P21 A4/A5 OPEN state: side -> {entry, fill_ts, take_oid, take_proposed,
+    # collapse_polls, det_ts, done}. The patient hold lives here.
+    opens: Dict[str, dict] = field(default_factory=dict)
+    open_no_grain_logged: bool = False   # OPEN_NO_GRAIN tags ONCE per window
 
 
 class LaneFlip:
@@ -238,6 +239,15 @@ class LaneFlip:
                              "take_oid": None, "take_proposed": False,
                              "be_ts": None, "be_repriced": False}
             return
+        # P21 A4: an OPEN fill starts THE PATIENT HOLD — its own custody,
+        # never the retired pair machinery, never HUNT's fast jobs.
+        if (w.posted.get(side) or {}).get("mode") == "OPEN":
+            w.posted.pop(side, None)
+            w.trips += 1   # the ratchet still counts every trip
+            w.opens[side] = {"entry": price_cents, "fill_ts": now,
+                             "take_oid": None, "take_proposed": False,
+                             "collapse_polls": 0, "det_ts": None}
+            return
         w.fills[side] = price_cents
         if w.first_fill_ts is None:
             w.first_fill_ts = now
@@ -263,6 +273,12 @@ class LaneFlip:
             w.window_realized += realized
             if realized < 0:
                 w.scratches += 1
+            return
+        # P21 A5: an OPEN exit realizes against ITS entry. NO scratch count —
+        # the patient hold has no scratches, only TAKE / DETERMINED / CURFEW.
+        o = w.opens.pop(side, None)
+        if o is not None:
+            w.window_realized += exit_price_cents - o["entry"]
             return
         entry_px = w.fills.get(side)
         if entry_px is not None and len(w.fills) < 2:
@@ -311,8 +327,6 @@ class LaneFlip:
 
         proposals: List[Order] = []
         yes_bid, no_bid = book.best_yes_bid(), book.best_no_bid()
-        yq = book.visible_depth("yes", yes_bid) if yes_bid is not None else 0
-        nq = book.visible_depth("no", no_bid) if no_bid is not None else 0
 
         # 1) TAKE QUOTES for held legs (entry+X, passive EXIT — the one exit
         #    proposal; custodian owns it from registration)
@@ -332,8 +346,12 @@ class LaneFlip:
         # management never waits its turn).
         proposals.extend(self._hunt_custody(w, market, event, book, secs, now))
 
-        # 2) ENTRIES — window phase, curfew, trips, sit-out, R1-flat, OFI
-        in_entry_phase = secs > FLIP_WINDOW_SEC - FLIP_ENTRY_SEC
+        # 1.6) P21 A5 OPEN custody — THE PATIENT HOLD's three exits. Also
+        # every cycle, before any entry gate.
+        proposals.extend(self._open_custody(w, market, event, book, ctx,
+                                            secs, now))
+
+        # 2) ENTRIES — curfew, trips, sit-out, R1-flat, the OPEN setup
         past_curfew = secs <= FLIP_CURFEW
         if w.trips >= FLIP_MAX_TRIPS or w.scratches >= FLIP_SCRATCH_SITOUT:
             # P13 §4: sit-out visibility — one page, then quiet discipline
@@ -363,48 +381,44 @@ class LaneFlip:
         else:
             proposals.extend(self._hunt_entry(w, market, event, book, sl, secs))
         if needle_active:
-            return proposals  # hunt owns the floor while the needle is live
+            # P21 A6 — HUNT SENIORITY: a live confirmed needle means the
+            # market is MOVING; OPEN's premise (undetermined, herd-priced)
+            # is void while it lasts. Hunt owns the floor.
+            return proposals
 
-        re_entry = w.trips > 0 and not w.fills  # a new trip after a completed one
-        if re_entry:
-            if self._net(market, event) != 0:
-                return proposals  # R1 WALL: one position at a time
-            side_gate = ofi_side(w.spot_ticks, book_lean(yq, nq))
-            sides = [side_gate] if side_gate else []
-        elif w.trips == 0 and in_entry_phase:
-            # RULING 2 (P15, ratified): PAIR-FORMABLE OR NOTHING. The first
-            # trip posts only when BOTH sides can legally post (each within
-            # side-max, combined within the line) — a lone leg is never
-            # OPENED on purpose (the 00:14 tape's no@34 cost 8¢ at 8:01).
-            # Pair-grace still governs a pair whose second leg dies later.
-            if (yes_bid is not None and no_bid is not None
-                    and yes_bid <= FLIP_SIDE_MAX and no_bid <= FLIP_SIDE_MAX
-                    and yes_bid + no_bid <= FLIP_LINE):
-                sides = ["yes", "no"]
-            else:
-                sides = []
-        else:
-            sides = []
-
-        for side in sides:
-            if side in w.posted or side in w.fills:
-                continue
-            join = yes_bid if side == "yes" else no_bid
-            fp = book.best_fp(side)  # true-touch resting (the parts' law)
-            if join is None or join > FLIP_SIDE_MAX:
-                continue
-            # combined wall: the SECOND side posts only if the bundle stays
-            # <= line against the RESTING first bid (not a stale book)
-            if w.posted:
-                first = next(iter(w.posted.values()))
-                if first["price"] + join > FLIP_LINE:
-                    continue
-            proposals.append(Order(
-                lane="FLIP", event=event, market=market, side=side,
-                action="buy", price_cents=join, count=1,
-                size_tier=config.TIER_PROBE, purpose="ENTRY",
-                band=(1, FLIP_SIDE_MAX), rest_fp=fp,
-                why=f"pair-post ≤{FLIP_SIDE_MAX} · y{yes_bid}/n{no_bid}"))
+        # P21 A4 — LANE OPEN (PAIR retired 0718: the venue nets one
+        # account's sides, so the pair-bundle was a fiction — the 10:45 and
+        # 11:30 WINDOW_ECON_DIVERGENCE pages were its ghost). Setup: BOTH
+        # sides inside the open band AND the grain runs >= OPEN_MIN_GRAIN.
+        # Entry: maker join the GRAIN side, one lot, <= OPEN_MAX_ENTRY_CENTS.
+        # Band without grain -> pass, tagged OPEN_NO_GRAIN (Drew: "if the
+        # last three markets have been down and it's 49/49, you buy no").
+        if w.opens or w.posted or w.fills:
+            return proposals               # one open position/post at a time
+        if self._net(market, event) != 0:
+            return proposals               # R1 WALL: one position at a time
+        lo_b, hi_b = config.OPEN_BAND
+        if not (yes_bid is not None and no_bid is not None
+                and lo_b <= yes_bid <= hi_b and lo_b <= no_bid <= hi_b):
+            return proposals               # setup absent: not a 49/49 book
+        g = ctx.get("grain")
+        if g is None or g.get("length", 0) < config.OPEN_MIN_GRAIN:
+            if not w.open_no_grain_logged:
+                w.open_no_grain_logged = True
+                log.info("OPEN_NO_GRAIN %s — open-band book without grain "
+                         "(grain=%s); waiting IS the setup", market, g)
+            return proposals               # herd has no screen -> no trade
+        side = g["direction"]
+        join = yes_bid if side == "yes" else no_bid
+        if join > config.OPEN_MAX_ENTRY_CENTS:
+            return proposals               # the herd's side is already paid up
+        proposals.append(Order(
+            lane="FLIP", event=event, market=market, side=side,
+            action="buy", price_cents=join, count=1,
+            size_tier=config.TIER_PROBE, purpose="ENTRY",
+            band=config.OPEN_BAND, rest_fp=book.best_fp(side),
+            why=f"OPEN grain {side}x{g['length']} · join {join}c · "
+                f"band y{yes_bid}/n{no_bid}"))
         return proposals
 
     # ── P18 THE DETECTIVE: hunt entry (§2) + the two jobs (§3) ─────────────
@@ -514,19 +528,111 @@ class LaneFlip:
                     reason="hunt breakeven reprice (mark<=entry)"))
         return props
 
+    # ── P21 A5 THE PATIENT HOLD: exits are EXACTLY three ───────────────────
+    def _open_custody(self, w: FlipWindow, market: str, event: str, book,
+                      ctx: dict, secs: float, now: float) -> List[Order]:
+        """While the book stays inside the undetermined band there is NO
+        stop, NO scratch, NO time-box — the position is a bet on the RESOLVE,
+        and wiggles are the product working. SOURCE: the −11¢ (10:30) and
+        −12¢ (11:17) round-trips were OPEN-intent positions killed by
+        fast-intent stops — the last of their kind. Exits:
+          TAKE       — entry+OPEN_TAKE_CENTS, resting from the fill
+          DETERMINED-AGAINST — the book leaves the band against us, or a
+                       ΔP-collapse >= OPEN_DETERMINED_K_POINTS sustained
+                       (2 polls, flicker-proof) → salvage-style out: maker
+                       at the join, crossfire after OPEN_BAIL_R_S unfilled
+          CURFEW     — flatten at T-curfew (the handoff to F, HUNT's law)"""
+        props: List[Order] = []
+        lo_u, _hi_u = config.OPEN_UNDETERMINED_BAND
+        sl = ctx.get("spotlead")
+        for side, o in list(w.opens.items()):
+            if o.get("done"):
+                continue
+            mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
+            # TAKE — posted the instant the entry books
+            if o["take_oid"] is None and not o.get("take_proposed"):
+                o["take_proposed"] = True
+                props.append(Order(
+                    lane="FLIP", event=event, market=market, side=side,
+                    action="sell",
+                    price_cents=o["entry"] + config.OPEN_TAKE_CENTS,
+                    count=1, size_tier=config.TIER_PROBE, purpose="EXIT",
+                    reason=f"open take entry+{config.OPEN_TAKE_CENTS}"))
+                continue
+            # CURFEW — the third exit; nothing survives the handoff
+            if secs <= FLIP_CURFEW:
+                self._cancel_resting(o)
+                o["done"] = True
+                props.append(Order(
+                    lane="FLIP", event=event, market=market, side=side,
+                    action="sell",
+                    price_cents=mark if mark is not None else o["entry"],
+                    count=1, size_tier=config.TIER_PROBE, purpose="CUT",
+                    crossfire=True,
+                    reason="open curfew flat (T-curfew handoff to F)"))
+                continue
+            # DETERMINED-AGAINST stage 2: maker resting — the R-second clock
+            if o["det_ts"] is not None:
+                if now - o["det_ts"] >= config.OPEN_BAIL_R_S:
+                    self._cancel_resting(o)
+                    o["done"] = True
+                    props.append(Order(
+                        lane="FLIP", event=event, market=market, side=side,
+                        action="sell",
+                        price_cents=mark if mark is not None else o["entry"],
+                        count=1, size_tier=config.TIER_PROBE, purpose="CUT",
+                        crossfire=True,
+                        reason=f"open determined crossfire "
+                               f"(maker unfilled {int(config.OPEN_BAIL_R_S)}s)"))
+                continue
+            # DETERMINED-AGAINST stage 1: has the market decided against us?
+            # Band exit is immediate (the band IS the definition of
+            # undetermined); ΔP-collapse needs 2 sustained polls.
+            collapse = (sl is not None and sl.side != side
+                        and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
+            o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
+            determined = None
+            if mark is not None and mark < lo_u:
+                determined = (f"open determined-against: {side} {mark}c "
+                              f"left band {lo_u}-{_hi_u}")
+            elif o["collapse_polls"] >= 2:
+                determined = (f"open determined-against: ΔP-collapse "
+                              f"{sl.delta_p:.0f}pts sustained")
+            if determined:
+                self._cancel_resting(o)
+                px = mark if mark is not None else max(1, o["entry"] - 1)
+                o["det_ts"] = now
+                props.append(Order(
+                    lane="FLIP", event=event, market=market, side=side,
+                    action="sell", price_cents=px, count=1,
+                    size_tier=config.TIER_PROBE, purpose="EXIT",
+                    reason=f"{determined} · maker out"))
+        return props
+
+    def _cancel_resting(self, o: dict) -> None:
+        """Cancel an OPEN position's resting exit (take or determined maker)
+        through the gateway; the slot re-registers on the next submit."""
+        if o["take_oid"] is not None and self.gateway is not None:
+            self.gateway.cancel(o["take_oid"])
+            o["take_oid"] = None
+
     def on_submitted(self, order: Order, order_id: str, now: float) -> None:
         """Runner callback after a successful gateway submit."""
         w = self.windows.get(order.market)
         if w is None:
             return
         if order.purpose == "ENTRY":
+            mode = ("HUNT" if order.why.startswith("HUNT")
+                    else "OPEN" if order.why.startswith("OPEN")
+                    else "PAIR")   # PAIR retired (P21 A4) — legacy tag only
             w.posted[order.side] = {"oid": order_id, "price": order.price_cents,
-                                    "ts": now,
-                                    "mode": ("HUNT" if order.why.startswith("HUNT")
-                                             else "PAIR")}
+                                    "ts": now, "mode": mode}
         elif order.purpose == "EXIT":
             if order.side in w.hunts and w.hunts[order.side]["take_oid"] is None:
                 w.hunts[order.side]["take_oid"] = order_id  # P18 JOB A registered
+            elif (order.side in w.opens
+                  and w.opens[order.side]["take_oid"] is None):
+                w.opens[order.side]["take_oid"] = order_id  # P21 A5 resting exit
             else:
                 w.takes_posted[order.side] = order_id
             # register the take as the position's resting exit — custodian owns it

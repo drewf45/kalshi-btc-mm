@@ -117,9 +117,29 @@ class FillBooker:
             count = max(1, count)
 
             action = PURPOSE_TO_ACTION.get(order.purpose, order.purpose)
-            self.ledger.record_fill(order.market, order.lane, order.side, action,
-                                    int(round(cost)), count, order.size_tier,
-                                    fee_cents=fee_cents)
+            # P21 A1 — THE NETTING MODEL: the venue nets one account's sides
+            # (Drew, 0718: "Kalshi closed that loophole"). An opposite-side
+            # BUY on a held market IS a net-down — booked as an EXIT of the
+            # held side at 100−price, so fills-P&L matches broker truth (the
+            # 10:45/11:30 WINDOW_ECON_DIVERGENCE was this stale model).
+            record_side = order.side
+            key = (order.event, order.market, order.lane)
+            net = self.gateway.positions.get(key, 0)
+            buy_dir = 1 if (order.side == "yes") == (order.action == "buy") else -1
+            if action == "ENTRY" and net != 0 and (net > 0) != (buy_dir > 0):
+                record_side = "yes" if net > 0 else "no"
+                cost = 100 - cost
+                action = "EXIT"
+                from . import failures
+                failures.fail("SELF_NET_BOOKED",
+                              f"{order.market}: ENTRY-purpose opposite-side "
+                              f"buy netted down the held {record_side} leg — "
+                              f"booked as EXIT@{int(round(cost))}c "
+                              f"(A2 wall should have refused this entry)",
+                              market=order.market, lane=order.lane, alert=False)
+            self.ledger.record_fill(order.market, order.lane, record_side,
+                                    action, int(round(cost)), count,
+                                    order.size_tier, fee_cents=fee_cents)
             self.gateway.on_fill(oid, count=count)
             self.ledger.db.execute(
                 "INSERT INTO booked_fills (fill_id, ts, order_id, count) VALUES (?,?,?,?)",

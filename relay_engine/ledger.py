@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS boots (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL                -- P5 §4: boot-loop detection (reader: BOOT_LOOP alert)
 );
+CREATE TABLE IF NOT EXISTS window_outcomes (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    market TEXT NOT NULL UNIQUE,
+    settled_yes INTEGER NOT NULL    -- P21 A3: the herd's screen, as we saw it
+);
 CREATE TABLE IF NOT EXISTS book_snapshots (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -211,6 +217,15 @@ class Ledger:
             (time.time(), market, lane, pnl_cents, detail),
         )
         self.db.execute("UPDATE fills SET settled=1 WHERE market=? AND lane=?", (market, lane))
+        self.db.commit()
+
+    def record_outcome(self, market: str, settled_yes: bool,
+                       now=None) -> None:
+        """P21 A3: bank the window's outcome for the grain (idempotent)."""
+        self.db.execute(
+            "INSERT INTO window_outcomes (ts, market, settled_yes)"
+            " VALUES (?,?,?) ON CONFLICT(market) DO NOTHING",
+            (time.time() if now is None else now, market, int(settled_yes)))
         self.db.commit()
 
     def unsettled_fill_count(self) -> int:

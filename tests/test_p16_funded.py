@@ -54,12 +54,18 @@ def test_boot_tape_notes_derived_source(monkeypatch):
 def test_profile_block_prints_every_lane():
     tape = "\n".join(boot_tape())
     assert "PROFILE — bank small wins, every lane, every market:" in tape
-    for token in ("FLIP: pair-formable-or-nothing", "F: hold-to-settlement",
+    # P21 A4/A5: FLIP's PAIR line retired — the profile now speaks HUNT
+    # (fast intent) and OPEN (patient intent) separately.
+    for token in ("FLIP/HUNT: needle", "FLIP/OPEN: band", "PATIENT HOLD",
+                  "PAIR retired", "F: hold-to-settlement",
                   "H8: delta-gated", "D: cheap entry", "P: displacement fade",
-                  "ORPHAN: adopted at boot", "WALLS: gross+net"):
+                  "ORPHAN: adopted at boot", "WALLS: gross+net",
+                  "REJECT_SELF_NET"):
         assert token in tape
     # P19 resolved the P16 STOP-AND-REPORT: the tape says salvage is armed
     assert "SALVAGE armed" in tape and "stop-and-report resolved" in tape
+    # P21 B1: the boot cites the doctrine page
+    assert "DOCTRINE: docs/SEMANTICS.md" in tape
 
 
 # ── §3: deposit day — the confirm law rescales and speaks ──────────────────

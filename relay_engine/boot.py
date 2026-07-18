@@ -6,6 +6,7 @@ enforced numbers (the printed number IS the enforced number), and recorder
 confirmation.
 """
 
+import os
 from typing import List
 
 from . import config
@@ -87,8 +88,16 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  + db_note)
     # P16 §2: THE SCALP PROFILE — bank small wins, every lane, every market.
     lines.append("PROFILE — bank small wins, every lane, every market:")
-    lines.append("  FLIP: pair-formable-or-nothing · take entry+4 · scratch entry-3 "
-                 "· sit-out@3 — margin UNPROVEN, mechanism proven (R-1)")
+    # P21 A4/A5: PAIR retired (the venue nets one account's sides); FLIP is
+    # now HUNT (fast, needle-triggered) + OPEN (patient, grain-sided).
+    lines.append(f"  FLIP/HUNT: needle ΔP≥{config.HUNT_NEEDLE_POINTS:.0f}pts "
+                 "· take entry+"
+                 f"{config.HUNT_TAKE_CENTS} · Job-B fast bails (P18)")
+    lines.append(f"  FLIP/OPEN: band {config.OPEN_BAND[0]}-"
+                 f"{config.OPEN_BAND[1]}¢ + grain≥{config.OPEN_MIN_GRAIN} "
+                 f"· join ≤{config.OPEN_MAX_ENTRY_CENTS}¢ · PATIENT HOLD — "
+                 f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED/CURFEW "
+                 "only (P21 A4/A5; PAIR retired)")
     lines.append("  F: hold-to-settlement · depth floor stands in thin books "
                  "· SALVAGE armed (P19: needle-collapse exits; catastrophic "
                  "backstop reachable — P16 stop-and-report resolved)")
@@ -98,7 +107,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  ORPHAN: adopted at boot · D-grade custody · own attribution")
     lines.append("  WALLS: gross+net risk<=3/event · $-at-risk cap · two-strike "
                  "halt (/reset_halt) · orientation sentinels · narrated fills · "
-                 "graded tape")
+                 "graded tape · REJECT_SELF_NET (P21 A2)")
+    # P21 B1: the boot cites the doctrine — one page says what the machine
+    # believes, why, and what would change its mind. Cited, and verified
+    # present (a missing registry is worth a loud boot line, never a crash).
+    sem = os.path.join(os.path.dirname(__file__), "..", "docs", "SEMANTICS.md")
+    lines.append("DOCTRINE: docs/SEMANTICS.md — every KNOWN carries "
+                 "LAW · CODE · TAPE; drift demotes and pages (P21 B1/B2)"
+                 + ("" if os.path.exists(sem) else " [MISSING FROM TREE]"))
     lines.append("==================================================================")
     return lines
 
