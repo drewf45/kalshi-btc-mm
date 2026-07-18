@@ -215,9 +215,14 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         by = {}
         for tag, how_json, ts in ep_rows:
             try:
-                mkt = json.loads(how_json).get("market", "?")
+                how = json.loads(how_json)
             except Exception:
-                mkt = "?"
+                how = {}
+            mkt = how.get("market", "?")
+            # CHUNK B(4): transient single-frame trips split from poison
+            # episodes so the science can see both.
+            if tag == "BOOK_INCOHERENT" and how.get("transient"):
+                tag = "BOOK_INCOHERENT(transient trips)"
             d = by.setdefault((tag, mkt), [0, ts, ts])
             d[0] += 1
             d[1] = min(d[1], ts)

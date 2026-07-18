@@ -511,6 +511,48 @@ Suite at this commit: **224 passed** (19 new).
   window: TRUE-book behavior, `book✓` heartbeats hourly → the go-live checklist
   resumes exactly where it left off.
 
+## FINAL CHUNKS (0718) — "MAKE IT TRADE"
+
+Suite at this commit: **230 passed**. `python -m scripts.preflight` → **9/9**.
+
+- **CHUNK A (gap recorded per A3)**: no autopsy output was delivered with the order —
+  the fix report records the gap; the standing conviction remains the three
+  reconstructed-frame tests. The dual-direction harness is LIVE:
+  `test_corrupting_frame_teeth_both_directions` proves its tape corrupts the v7-shim
+  applier (yes97+no55=152 exactly) AND stays coherent through the fixed pipeline —
+  teeth both directions. The verbatim frame drops into its `FRAMES` list the moment
+  the Render-shell autopsy names it.
+- **CHUNK B TRUE** — the calm invariant: sum 102-105 poisons only on the 2nd
+  CONSECUTIVE incoherent apply (the persistence clause is realized at the next
+  apply; a coherent apply clears the pending trip); a single-frame trip writes the
+  row (transient=True, R5 fidelity) but does NOT poison, page, or count toward the
+  A5 ceiling. Sum > 105 poisons IMMEDIATELY — 51/51 can be an honest race, 97/55
+  never is. The pack splits `BOOK_INCOHERENT(transient trips)` from poison episodes;
+  transients are never FINDINGs. Tests: single-frame 102 → row only; two-frame 102 →
+  poison+page+resync; single-frame 152 → immediate; pack split.
+- **CHUNK C TRUE** — `python -m scripts.preflight`: nine PASS/FAIL lines (full suite,
+  01:25 A4 replay + teeth harness, golden tape, ±$5 both branches, two-strike
+  halt/restart//reset_halt, live-rejects-paper, poison→REST→resync→quarantine chain,
+  listener round-trip, the Chunk D dry run), each backed by named tests executed for
+  real; ends `PREFLIGHT: n/n — the book cannot lie, the money cannot lie, the ear is
+  alive.` THE STANDING DEPLOY GATE from now on.
+- **CHUNK D TRUE** — `test_go_live_dry_run.py`: the whole live spine, no network —
+  real-PEM auth boot-check (full key id never printed) → live_boot_reconcile
+  (venue balance baselined; quarantine rule fires on a foreign position; foreign
+  resting sweep tolerated) → boot tape [LIVE]+SIZING, worst-day line + listener ok →
+  the DEPLOYED cycle drives F through the gateway's live branch — venue payload
+  snapshot-asserted `{yes, 97c, x1, v2_price_str="0.97", post_only=True}` → mocked
+  fill books through FillBooker (✅ FILL page, custodian adopts) → bracket
+  source=venue → mocked settlement closes it: window_pnl==fills_pnl==3c, 📊 line,
+  streak 0. **Dry-run-caught wiring bug, fixed**: on a FIRST live boot the caps were
+  snapshotted at book=0 before the venue baseline — PCT_OF_BOOK budget 0 would have
+  rejected every entry until a restart; `live_boot_reconcile` now re-snapshots caps
+  after baselining (C.2: a confirmed movement re-baselines).
+
+**After this there is NOTHING left for code to prove.** The GO-LIVE block is Drew's
+hands only: autopsy + preflight in the Render shell → one quiet shadow window →
+RUN_MODE=LIVE + the phrase → the phone tells the rest.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

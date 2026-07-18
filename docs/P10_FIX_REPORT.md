@@ -57,6 +57,18 @@ forces resync. (Frames without seq skip the check — dialect-tolerant.)
 across a reconnect (reconnect clears `subscribed` and re-snapshots every
 market; within a connection the seq guard now covers it).
 
+## CHUNK A STATUS (0718) — the gap, recorded
+
+No autopsy output has been delivered yet (neither a flagged frame nor a
+reported evidence gap). Per A(3)/the read-rule the gap is RECORDED here: the
+standing conviction remains the three reconstructed-frame tests. The
+dual-direction harness is in place —
+`test_p10_book_truth.py::test_corrupting_frame_teeth_both_directions` proves
+its tape corrupts the v7-shim applier (yes97+no55=152 exactly) AND stays
+coherent through the fixed pipeline. When the Render-shell autopsy names the
+verbatim frame, it drops into that test's `FRAMES` list and this section
+gains the frame verbatim plus which HOLE (1/2/3) it convicts.
+
 ## VERDICT
 
 Which hole was THE 01:25 liar: **UNPROVEN until the autopsy runs on the

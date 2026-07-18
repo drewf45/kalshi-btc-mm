@@ -132,6 +132,9 @@ class Feed:
         self.resync_needed: set = set()
         self.on_poison = on_poison or (lambda market, yb, nb: None)
         self._nosnap_banked: set = set()   # markets already banked for no-foundation deltas
+        # CHUNK B: single-frame incoherence (sum <= 105) is an honest race
+        # candidate — pending until a second consecutive incoherent apply.
+        self._incoherence_pending: dict = {}   # market -> first-trip ts
 
     def note_sent(self, payload: str) -> None:
         """Runner registers each subscribe/command payload for the error autopsy."""
@@ -144,6 +147,7 @@ class Feed:
 
     def drop_book(self, market: str) -> None:
         self.books.pop(market, None)
+        self._incoherence_pending.pop(market, None)
 
     # P5 §2 (Adversary): classification keys on the venue's NUMERIC code first.
     # Known per-order codes route; known config codes (incl. 2 unknown cmd,
@@ -200,7 +204,7 @@ class Feed:
             self.shape_failures = 0
             self._nosnap_banked.discard(market)
             self.resync_needed.discard(market)
-            self._check_coherence(book, market, raw)
+            self._check_coherence(book, market, raw, now)
             self.ladder.snapshot_resynced()
         elif mtype == "orderbook_delta" and market:
             # P6 §1: NO DEFAULTS. Price/delta/SIDE come off the wire through
@@ -257,24 +261,51 @@ class Feed:
                              fp=fp)
             if seq is not None:
                 book.last_seq = int(seq)
-            self._check_coherence(book, market, raw)
+            self._check_coherence(book, market, raw, now)
         if self.recorder is not None and market:
             self.recorder.record(market, raw, now)
         self.ladder.clean_frame()
 
-    # ── P10 §2: the coherence invariant (P7 §1c, now actually built) ────
-    def _check_coherence(self, book: OrderBook, market: str, raw: str) -> None:
-        """After EVERY apply: yes+no > 101 → POISON the book, request resync,
-        page once per episode. Never FATAL — one market's corrupt book must
-        not stop the others; a clean snapshot clears the poison."""
+    # CHUNK B knobs: 102 can be an honest single-frame race (one side's add
+    # lands a frame before the other side's removal); 105+ never is.
+    HARD_INCOHERENCE_SUM = 105
+    INCOHERENCE_PERSIST_S = 0.3
+
+    # ── P10 §2: the coherence invariant (P7 §1c) + CHUNK B debounce ─────
+    def _check_coherence(self, book: OrderBook, market: str, raw: str,
+                         now: float) -> None:
+        """After EVERY apply: yes+no > 101 is incoherent. CHUNK B:
+        - sum > 105 → POISON IMMEDIATELY (the hard line stays hard);
+        - sum 102-105 → poison only on the 2nd CONSECUTIVE incoherent apply
+          for this market, or when the trip has persisted > 300ms; a
+          single-frame trip writes the row (R5 full fidelity, transient=True)
+          but does NOT poison, page, or count toward the A5 ceiling.
+        Never FATAL; a clean snapshot clears the poison."""
         if book.coherent():
+            self._incoherence_pending.pop(market, None)
             return
         yb, nb = book.best_yes_bid(), book.best_no_bid()
+        s = yb + nb
+        # "2 consecutive frames OR persists > 300ms": both conditions are
+        # observed at apply time, and any second consecutive incoherent apply
+        # (whenever it lands) satisfies the ordered shape — a pending trip is
+        # therefore the persistence signal. A coherent apply clears it above.
+        persisted = self._incoherence_pending.get(market) is not None
+        if s <= self.HARD_INCOHERENCE_SUM and not persisted:
+            # single-frame trip: the row, nothing else
+            self._incoherence_pending[market] = now
+            failures.fail("BOOK_INCOHERENT",
+                          f"{market}: yes {yb} + no {nb} = {s} — single-frame "
+                          f"trip (honest-race candidate); row only, no poison",
+                          market=market, yes=yb, no=nb, transient=True,
+                          last_frame=raw[:1000], alert=False)
+            return
+        self._incoherence_pending.pop(market, None)
         new_episode = not book.poisoned
         book.poisoned = True
         self.resync_needed.add(market)
         failures.fail("BOOK_INCOHERENT",
-                      f"{market}: yes {yb} + no {nb} = {yb + nb} > 101 — book "
+                      f"{market}: yes {yb} + no {nb} = {s} > 101 — book "
                       f"POISONED, snapshot resync forced",
                       market=market, yes=yb, no=nb, last_frame=raw[:1000],
                       alert=False)  # the page is the episode line below, once
@@ -344,4 +375,5 @@ class Feed:
         self.shape_failures = 0     # the consecutive count is per connection
         self.resync_needed.clear()  # reconnect re-snapshots every market anyway
         self._nosnap_banked.clear()
+        self._incoherence_pending.clear()
         self.ladder.ws_lost(why)

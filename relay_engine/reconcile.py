@@ -41,6 +41,11 @@ def live_boot_reconcile(engine, client) -> dict:
     if engine.ledger.book_cents() == 0:
         # first live boot: the venue balance IS the baseline
         engine.ledger.baseline(venue_cents, confirmed_by="live_boot")
+        # CHUNK D (dry-run-caught): boot() snapshotted caps BEFORE this
+        # baseline — at book 0 the PCT_OF_BOOK budget is 0 and every entry
+        # would be rejected until the next restart. A confirmed baseline
+        # re-snapshots the caps (C.2: confirmed movements re-baseline).
+        engine.boot_caps = engine.ledger.snapshot_caps_at_boot()
         summary["cash_state"] = "BASELINED"
     else:
         # every later boot: unexplained deltas are the cash protocol's business

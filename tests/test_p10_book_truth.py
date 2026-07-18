@@ -356,6 +356,91 @@ def test_0125_replay_end_to_end_zero_lying_proposals(engine):
     assert ("PASS",) in verdicts or ("WATCHING",) in verdicts
 
 
+# ── CHUNK B: the calm invariant (persistence debounce) ─────────────────────
+def race_102(feed, now=1.0):
+    """y51+n51=102 — the honest single-frame race from the 10PM tape."""
+    feed.handle_frame(snapshot([["0.51", "10"]], [["0.50", "10"]]), now=now)
+    feed.handle_frame(delta("no", "0.51", "5.00"), now=now + 0.05)
+
+
+def test_single_frame_102_row_only_no_poison_no_page(engine):
+    race_102(engine.feed)
+    book = engine.feed.books[TICKER]
+    assert book.poisoned is False
+    assert TICKER not in engine.feed.resync_needed
+    assert fail_rows(engine, "BOOK_INCOHERENT") == 1        # R5: the row, always
+    assert engine.telegram_sent == []                        # no page
+    assert engine.poison_episodes == {}                      # no A5 count
+    row = engine.ledger.db.execute(
+        "SELECT how_json FROM failures WHERE why_tag='BOOK_INCOHERENT'").fetchone()[0]
+    assert json.loads(row).get("transient") is True
+    # the race heals on the next frame: pending clears, still no poison
+    engine.feed.handle_frame(delta("no", "0.51", "-5.00"), now=1.2)
+    assert book.poisoned is False
+    assert TICKER not in engine.feed._incoherence_pending
+
+
+def test_two_consecutive_102_poisons_and_pages(engine):
+    race_102(engine.feed)
+    # second CONSECUTIVE incoherent apply (sum still 102) → poison for real
+    engine.feed.handle_frame(delta("yes", "0.51", "5.00"), now=1.2)
+    book = engine.feed.books[TICKER]
+    assert book.poisoned is True
+    assert TICKER in engine.feed.resync_needed
+    assert any("BOOK_INCOHERENT" in m for m in engine.telegram_sent)
+    assert engine.poison_episodes[TICKER] == 1
+
+
+def test_single_frame_152_poisons_immediately(engine):
+    """97/55 is never an honest race — the hard line (>105) stays hard."""
+    poison_book(engine.feed)  # ONE incoherent frame, sum 152
+    assert engine.feed.books[TICKER].poisoned is True
+    assert len([m for m in engine.telegram_sent if "BOOK_INCOHERENT" in m]) == 1
+
+
+def test_pack_splits_transient_from_episodes(engine):
+    race_102(engine.feed, now=1.0)                 # one transient trip
+    engine.feed.handle_frame(snapshot([["0.45", "100"]], [["0.55", "80"]]),
+                             now=5.0)
+    engine.feed.handle_frame(delta("yes", "0.97", "5.00"), now=6.0)  # one hard poison
+    from relay_engine.ops import daily_pack
+    pack = daily_pack(engine.ledger, engine.surface, engine.cash, econ=engine.econ)
+    assert f"BOOK_INCOHERENT(transient trips) {TICKER}: x1" in pack
+    assert f"BOOK_INCOHERENT {TICKER}: x1" in pack
+    # transient trips are never FINDINGs
+    assert "FINDING" not in pack or "transient" not in \
+        [l for l in pack.splitlines() if "FINDING" in l][0]
+
+
+# ── CHUNK A: the dual-direction frame harness (P10 §1.4) ───────────────────
+def test_corrupting_frame_teeth_both_directions(engine):
+    """The permanent §1.4 test, proven to have teeth BOTH directions: the
+    tape below corrupts the v7-shim applier (the machine that ran at 01:25)
+    AND stays coherent through the FIXED pipeline.
+
+    EVIDENCE NOTE (A3, read-rule): the autopsy output has not been delivered
+    yet — FRAMES is the RECONSTRUCTED 01:25 shape through convicted HOLE 1
+    (the defaulted side). When Drew's Render-shell autopsy names the verbatim
+    frame, it replaces/joins FRAMES below and this same test convicts it."""
+    from scripts.autopsy_replay import bests, legacy_apply
+    FRAMES = [  # <- drop the verbatim tape here when the autopsy lands
+        snapshot([["0.45", "100"]], [["0.55", "80"]]),
+        delta("yes", "0.97", "5.00", omit_side=True),
+    ]
+    # direction 1: the v7 shim CROSSES on this tape — the test has teeth
+    books = {}
+    for raw in FRAMES:
+        legacy_apply(books, json.loads(raw))
+    yb, nb, s = bests(books, TICKER)
+    assert (yb, nb, s) == (97, 55, 152)   # the exact 01:25 lie
+    # direction 2: the FIXED pipeline refuses the same tape — stays coherent
+    for i, raw in enumerate(FRAMES):
+        engine.feed.handle_frame(raw, now=float(i + 1))
+    fb = engine.feed.books.get(TICKER)
+    assert fb is None or fb.coherent()
+    assert engine.gateway.shadow_orders == []
+
+
 # ── §1b regression guard: async plumbing still supervised after P10 edits ──
 def test_resync_cmds_shapes():
     from relay_engine.shadow_runner import ChannelSubscriber
