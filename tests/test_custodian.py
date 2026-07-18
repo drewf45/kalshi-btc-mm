@@ -189,12 +189,19 @@ def test_baton_lifecycle_cancel_then_cut(custodian, gateway):
     assert "M1:D" not in custodian.positions
 
 
-def test_baton_fail_loud_on_uncancelable_exit(custodian):
-    p = pos(exit_id="SHADOW-DOES-NOT-EXIST")
+def test_baton_gone_exit_is_terminal_not_fatal(custodian):
+    """P14 §1 overturned the old law here: an exit id the gateway no longer
+    holds means it FILLED or already canceled — the venue's terminal state is
+    truth, not a violation. The cut proceeds through §2 re-derivation (no
+    fills rows for this adopted pos → the pos object stands, cut goes out).
+    The FATAL now lives ONLY on a genuinely unverifiable cancel
+    (test_p14_cut_law.py::test_genuinely_stuck_resting_still_fatal)."""
+    p = pos(exit_id="FILLED-OR-CANCELED-ALREADY")
     custodian.adopt(p)
-    with pytest.raises(FatalIntegrityError):
-        custodian.execute_cut(p, cut_price_cents=44, book=make_book(), trigger="PROB_FLOOR")
-    assert "M1:D" in custodian.positions  # position NOT silently dropped
+    cut_id = custodian.execute_cut(p, cut_price_cents=44, book=make_book(),
+                                   trigger="PROB_FLOOR")
+    assert cut_id is not None            # the cut went out, race-proof
+    assert "M1:D" not in custodian.positions
 
 
 def test_cut_attributes_to_opening_lane(custodian, gateway, ledger):

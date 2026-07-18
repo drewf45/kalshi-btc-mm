@@ -134,6 +134,13 @@ class FillBooker:
                     side=order.side, count=count,
                     entry_price_cents=int(round(cost)), entry_p_win=0.0,
                     size_tier=order.size_tier, entry_time=now))
+            elif action != "ENTRY" and self.custodian is not None:
+                # P14: the take FILLED — custody of a flat position ends here
+                # (the 7:34 race began with a stale custodian pos object).
+                if self.gateway.positions.get(
+                        (order.event, order.market, order.lane), 0) == 0:
+                    self.custodian.positions.pop(
+                        f"{order.market}:{order.lane}", None)
             stats["booked"] += 1
             self.on_booked(order, action, int(round(cost)), count, now,
                            fee_cents)

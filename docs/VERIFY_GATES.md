@@ -633,6 +633,41 @@ Suite at this commit: **260 passed**; preflight **11/11**.
   reconcile log prints only on change, orders-route probe wired at boot (the
   `/portfolio/events/orders` 404).
 
+## WO-P14 "CUT ONLY WHAT YOU HOLD" — the 7:34 accident, made law
+
+Suite at this commit: **271 passed**; preflight **12/12**. Trigger: the first live
+profitable round-trip (+4¢, fully narrated) followed by FATAL [BATON_VIOLATION] —
+the RAPID_DROP cut raced the take-exit's fill; the FATAL was accidentally
+protective (an unchecked cut would have SOLD a lot we didn't hold).
+
+- **§1 TRUE — tri-state cancel**: `gateway.cancel_tristate` → CANCELED (venue
+  confirmed) · ALREADY_TERMINAL (not resting with us, or the venue says
+  filled/already-canceled — GONE, the venue's word, never a violation) · UNKNOWN
+  (unverifiable — put back, said so). Only UNKNOWN remains FATAL [BATON_VIOLATION].
+  The old test asserting gone-id=FATAL was overturned to the new law, cited.
+- **§2 TRUE — re-derive before EVERY cut (all triggers)**: (1) on-demand fills
+  sweep for that market (`custodian.resweep`, wired to `venue.get_fills` in live,
+  no-op in shadow; failure degrades to the current ledger); (2) position recomputed
+  from BOOKED fills (`ledger_remaining` — a (market,lane) with no fills rows at all
+  falls back to the pos object: no contrary evidence to outrank it, which is every
+  production position since entries always book); (3) remaining 0 → `CUT SKIPPED
+  [{trigger}] {mkt} — position already flat (race with fill)`, no page, no FATAL,
+  pos cleared; (4) remaining >0 → cut EXACTLY that count, reason-signed. THE LAW,
+  BANKED: a cut may only ever sell what the ledger proves we hold at this instant.
+  Belt: when a take's fill books the position flat, custody of the stale pos object
+  ends at booking — the race cannot even arise.
+  Tests: the 7:34 replay (flat → skip, no FATAL, no new position) · partial-fill
+  race (entry ×2, take half-filled → cut exactly 1) · genuinely-stuck-resting →
+  still FATAL · resweep-at-the-boundary · no-rows fallback · custody-ends-at-flat.
+- **§3 TRUE — sizing narration**: `sizing.py` was CORRECT (45¢ budget // 39¢ = 1);
+  the boot line printed lots at a 99¢ reference. One shared `sizing_line()` now
+  feeds the boot tape and BOTH boot pages:
+  `SIZING: 1/12-Kelly · book $5.41 · budget/window 45¢ · max lots: 1 @39¢ · 0 @99¢`
+  — the budget is the invariant; lots depend on price; say both. Exact-string test.
+- **§4 (Drew's env action)**: `RELAY_DB_PATH=/var/data/relay_live.db` on the
+  service — the engine's own ⚠ page (P13) asks for exactly this; once set, the
+  warning disappears from the boot sequence.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

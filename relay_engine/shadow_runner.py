@@ -213,6 +213,8 @@ class ShadowEngine:
         self.divergence_watches = {}   # market -> {until, strikes}
         self._orientation_checked = False
         self.flip.alert_fn = self.telegram.alert
+        # P14 §2.1: the cut boundary's on-demand fills sweep
+        self.custodian.resweep = self._resweep_market
 
     # ── F1: market lifecycle (discovery + rollover) ─────────────────────
     def on_market_discovered(self, ticker: str, market_obj: dict) -> None:
@@ -525,6 +527,19 @@ class ShadowEngine:
         if self.task_alive.get("listener", True):
             return "ok" if n == 0 else f"ok({n} restarts)"
         return f"down({n} restarts)"
+
+    def _resweep_market(self, market: str) -> None:
+        """P14 §2.1: the 3s fills cadence's on-demand version, at the cut
+        boundary — so the cut count is derived from fills booked THIS instant.
+        Failure degrades to the current ledger (the cut still re-derives)."""
+        if not config.live_submit_enabled() or self.gateway.venue_client is None:
+            return
+        from . import venue
+        try:
+            self.fills.sweep(venue.get_fills(self.gateway.venue_client, market))
+        except Exception as e:
+            log.warning("on-demand fills sweep failed for %s "
+                        "(cut proceeds on current ledger): %s", market, e)
 
     # ── P13 §3: engine-side orientation sentinels (keyless) ─────────────
     def orientation_selftest(self, market: str, book) -> None:
@@ -888,17 +903,14 @@ async def supervise(name, factory, stop, engine, backoff_s=SUPERVISOR_BACKOFF_S)
 
 def _send_boot_page_rest(engine) -> None:
     """P11 §C: the REST boot page — transport named, every dollar sourced."""
+    from .boot import sizing_line
     from .ops import worst_day_bound_line
-    from .sizing import size_order
-    book = engine.ledger.book_cents()
-    max_lots = size_order(config.TIER_PROBE, book, 99, 10_000).contracts
     engine.telegram.alert(
         f"🟢 BOOT #{getattr(engine, 'boot_id', '?')} "
         f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
         f"{len(engine.market_meta)} market(s)\n"
         f"transport: REST 1s (A3 proven ground; WS shelved as an upgrade)\n"
-        f"SIZING: 1/12-Kelly ceiling · book ${book / 100:.2f}"
-        f" · current max lots {max_lots}\n"
+        f"{sizing_line(engine.ledger.book_cents())}\n"
         f"{worst_day_bound_line(engine.ledger)}\n"
         f"listener: {engine.listener_status()}")
 
@@ -1164,18 +1176,15 @@ async def run():
                 connect_mono = time.monotonic()
 
                 def send_boot_page():
+                    from .boot import sizing_line
                     from .ops import worst_day_bound_line
-                    from .sizing import size_order
-                    book = engine.ledger.book_cents()
-                    max_lots = size_order(config.TIER_PROBE, book, 99, 10_000).contracts
                     engine.telegram.alert(
                         f"🟢 BOOT #{getattr(engine, 'boot_id', '?')} "
                         f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
                         f"{len(subscribed)} market(s) subscribed\n"
                         f"channels: {sorted(subscriber.accepted.values()) or '(none accepted)'}"
                         + (f" / degraded: {subscriber.degraded}" if subscriber.degraded else "")
-                        + f"\nSIZING: 1/12-Kelly ceiling · book ${book / 100:.2f}"
-                          f" · current max lots {max_lots}\n"
+                        + f"\n{sizing_line(engine.ledger.book_cents())}\n"
                         f"{worst_day_bound_line(engine.ledger)}\n"
                         f"listener: {engine.listener_status()}")
 

@@ -168,6 +168,26 @@ class Custodian:
         self.params: Dict[str, CutParams] = {}
         self.killed_lanes: set = set()
         self.positions: Dict[str, OpenPosition] = {}  # key: market:lane
+        # P14 §2.1: on-demand fills sweep for one market (the 3s cadence's
+        # at-the-cut-boundary version) — wired by the runner; no-op in shadow.
+        self.resweep = lambda market: None
+
+    def ledger_remaining(self, pos: OpenPosition) -> int:
+        """P14 §2.2: the position recomputed from BOOKED fills — the ledger,
+        not the in-memory pos object, is the only truth a cut may act on.
+        A (market, lane) with NO fills rows at all (shadow-adopted, no
+        booking evidence either way) falls back to the pos object — there is
+        no contrary evidence to outrank it."""
+        rows = self.ledger.db.execute(
+            "SELECT action, COALESCE(SUM(count),0) FROM fills"
+            " WHERE market=? AND lane=? GROUP BY action",
+            (pos.market, pos.lane)).fetchall()
+        if not rows:
+            return pos.count
+        net = 0
+        for action, cnt in rows:
+            net += cnt if action == "ENTRY" else -cnt
+        return max(0, net)
 
     def set_lane_params(self, lane: str, params: CutParams) -> None:
         self.params[lane] = params
@@ -325,34 +345,49 @@ class Custodian:
 
     # ------------------------------------------------------------------
     def execute_cut(self, pos: OpenPosition, cut_price_cents: int, book,
-                    trigger: str, crossfire: bool = True) -> str:
-        """BATON LIFECYCLE: cancel the resting exit FIRST, verify, THEN cut.
-        Fail-loud on any partial state — a position with both a resting exit and
-        a cut order live is an integrity violation, not a retry.
+                    trigger: str, crossfire: bool = True) -> Optional[str]:
+        """BATON LIFECYCLE (P14): cancel the resting exit FIRST (tri-state —
+        the venue's terminal states are truth, not violations), RE-DERIVE the
+        position from the ledger, THEN cut exactly what the ledger proves we
+        hold at this instant. A cut may never sell what we do not hold.
         crossfire=True (the default for a CUT) prices to fill NOW — the one
         deliberate cross in the engine, confined to CUT by the gateway."""
         key = f"{pos.market}:{pos.lane}"
         if pos.resting_exit_id is not None:
-            canceled = self.gateway.cancel(pos.resting_exit_id)
-            if not canceled:
+            state = self.gateway.cancel_tristate(pos.resting_exit_id)
+            if state == "UNKNOWN":
+                # genuinely unverifiable — the one remaining FATAL
                 failures.fail("BATON_VIOLATION",
                               f"resting exit {pos.resting_exit_id} on {pos.market} "
                               f"could not be verified canceled before cut ({trigger})",
                               fatal=True, market=pos.market, lane=pos.lane,
                               trigger=trigger)
+            # CANCELED or ALREADY_TERMINAL: it is gone either way — proceed,
+            # but NEVER straight to the cut (§2 re-derivation below).
             pos.resting_exit_id = None
-        # sell the held side; risk-reducing -> skips walls, allowed in every feed state
+
+        # §2: re-derive before EVERY cut (all triggers) — sweep, then ledger.
+        self.resweep(pos.market)
+        remaining = self.ledger_remaining(pos)
+        if remaining <= 0:
+            log.warning("CUT SKIPPED [%s] %s — position already flat "
+                        "(race with fill)", trigger, pos.market)
+            self.positions.pop(key, None)
+            return None  # the round-trip line already told the story
+
+        # sell exactly the ledger's remaining count; risk-reducing -> skips walls
         cut = Order(
             lane=pos.lane, event=pos.event, market=pos.market, side=pos.side,
-            action="sell", price_cents=cut_price_cents, count=pos.count,
+            action="sell", price_cents=cut_price_cents, count=remaining,
             size_tier=pos.size_tier, purpose="CUT", crossfire=crossfire,
             reason=trigger,  # P13 §1: every rule that spends money signs its work
         )
         result = self.gateway.submit(cut, book)
         transport = self.ladder.custodian_transport() if self.ladder else "WS"
         log.warning("CUSTODIAN CUT [%s] %s lane=%s count=%d @%dc transport=%s",
-                    trigger, pos.market, pos.lane, pos.count, cut_price_cents, transport)
+                    trigger, pos.market, pos.lane, remaining, cut_price_cents,
+                    transport)
         self.ledger.record_fill(pos.market, pos.lane, pos.side, "CUSTODIAN_EXIT",
-                                cut_price_cents, pos.count, pos.size_tier)
+                                cut_price_cents, remaining, pos.size_tier)
         del self.positions[key]
         return result.order_id

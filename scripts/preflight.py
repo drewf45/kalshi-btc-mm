@@ -58,6 +58,10 @@ CHECKS = [
     ("say what you did: narration, form map, orientation sentinels (P13)", [
         "tests/test_p13_narration.py",
     ]),
+    ("cut only what you hold: tri-state cancel + re-derive (P14)", [
+        "tests/test_p14_cut_law.py",
+        "tests/test_custodian.py::test_baton_gone_exit_is_terminal_not_fatal",
+    ]),
 ]
 
 

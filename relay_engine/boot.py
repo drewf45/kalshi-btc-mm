@@ -11,6 +11,18 @@ from typing import List
 from . import config
 
 
+def sizing_line(book_cents: int) -> str:
+    """P14 §3: the BUDGET is the invariant; lots depend on price — say both.
+    (The 7:35 confusion: 'max lots 0' printed at a 99¢ reference while the
+    engine correctly traded 1 lot at 39¢ — both were true.)"""
+    from .sizing import size_order
+    budget = int(book_cents * config.KELLY_FRACTION_CEILING)
+    l39 = size_order(config.TIER_PROBE, book_cents, 39, 10_000).contracts
+    l99 = size_order(config.TIER_PROBE, book_cents, 99, 10_000).contracts
+    return (f"SIZING: 1/12-Kelly · book ${book_cents / 100:.2f} · "
+            f"budget/window {budget}¢ · max lots: {l39} @39¢ · {l99} @99¢")
+
+
 def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines = [
         "==================================================================",
@@ -44,13 +56,8 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
         f"RATE GOVERNOR: bucket={config.RATE_BUCKET_CAPACITY} tokens, "
         f"refill={config.RATE_REFILL_PER_SECOND}/s (printed number IS the enforced number)")
     if boot_caps is not None:
-        # P8 §3: 1/12-Kelly honestly stated — at this book the ceiling IS ~one
-        # lot; the same math grows size as the book compounds, no ruling needed.
-        from .sizing import size_order
-        max_lots = size_order(config.TIER_PROBE, boot_caps.book_cents, 99, 10_000).contracts
-        lines.append(
-            f"SIZING: 1/12-Kelly ceiling · book ${boot_caps.book_cents / 100:.2f} · "
-            f"current max lots {max_lots}")
+        # P8 §3 + P14 §3: 1/12-Kelly honestly stated, at BOTH reference prices.
+        lines.append(sizing_line(boot_caps.book_cents))
     if boot_caps is not None:
         lines.append(
             f"BOOT CAPS SNAPSHOT: book={boot_caps.book_cents}c "

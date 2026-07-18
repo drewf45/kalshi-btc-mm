@@ -329,19 +329,34 @@ class Gateway:
                     order.price_cents, not order.crossfire, oid)
         return SubmitResult(order_id=oid, shadow=False, payload=payload)
 
-    def cancel(self, order_id: str) -> bool:
-        """Cancels skip walls. Live orders cancel at the venue, verified."""
+    def cancel_tristate(self, order_id: str) -> str:
+        """P14 §1: CANCELED | ALREADY_TERMINAL | UNKNOWN. The venue's terminal
+        states are TRUTH, not failure — an order that filled (or was already
+        canceled) before our cancel is GONE, never a violation. Only an
+        unverifiable state is UNKNOWN (the caller's fail-loud business)."""
         order = self.resting.pop(order_id, None)
         if order is None:
-            return False
+            # not resting with us: it filled or canceled already (7:34 race)
+            return "ALREADY_TERMINAL"
         if order_id in self.live_order_ids:
             from . import venue
-            status = venue.cancel_order(self.venue_client, order_id)
-            if status not in ("canceled", "not_found"):
-                # un-verified cancel: put it back and say so
-                self.resting[order_id] = order
-                return False
-        return True
+            try:
+                status = venue.cancel_order(self.venue_client, order_id)
+            except Exception as e:
+                self.resting[order_id] = order  # un-verified: put it back, say so
+                log.warning("cancel UNKNOWN for %s: %s", order_id, e)
+                return "UNKNOWN"
+            if status == "canceled":
+                return "CANCELED"
+            if status == "not_found":
+                return "ALREADY_TERMINAL"  # the venue's word: it is gone
+            self.resting[order_id] = order
+            return "UNKNOWN"
+        return "CANCELED"
+
+    def cancel(self, order_id: str) -> bool:
+        """Cancels skip walls. True unless the venue state is UNKNOWN."""
+        return self.cancel_tristate(order_id) != "UNKNOWN"
 
     def on_fill(self, order_id: str, count: Optional[int] = None) -> Order:
         """Book a (possibly partial) fill's position effect. The order stays
