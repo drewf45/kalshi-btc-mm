@@ -411,6 +411,56 @@ Suite at this commit: **181 passed** (13 new); golden tape 0/2,941 mismatches.
   RUN_MODE=LIVE + I_UNDERSTAND_LIVE phrase → LIVE BOOT page → first ✅ FILL → first 📊
   bracket → trading, bracketed, leashed at two.
 
+## WO-2026-07-18-RELAY-P9 — "REAL NUMBERS ONLY" (the last order before live)
+
+Suite at this commit: **205 passed** (17 new). Audit verdicts (read-rule), then the build:
+
+- **Chain 2 hole TRUE** — `account_value_cents` (pre-P9 shadow_runner.py) fell back to
+  `ledger.book_cents()` whenever the live venue read failed or the client was absent —
+  a bracket/streak/halt verdict could consume a paper number while live.
+- **Chain 3 TRUE** — the listener died cross-thread: `poll_updates_once` reads
+  `ledger.get_state` (ops.py) OUTSIDE its try block, via `asyncio.to_thread`
+  (shadow_runner listener task) against a same-thread-checked sqlite connection
+  (ledger.py `sqlite3.connect` default) → ProgrammingError in the worker thread →
+  task death, "exception was never retrieved". Inbound /reset_halt was DEAD.
+- **Found while fixing (same class, worse silence)**: the settle task's
+  `settlement_sweep` and `fills.reconcile_sweep` also touch the ledger via
+  `to_thread` — the same cross-thread error was being SWALLOWED by that task's own
+  `except Exception: log.warning` every 30s: settlement sweeps never completed in the
+  threaded path and said almost nothing. §1a fixes all three callers at the connection.
+
+- **§1 TRUE** — `Ledger` now opens `check_same_thread=False` behind `_LockedConnection`:
+  ONE connection, ONE `threading.RLock` around every execute/executemany/executescript/
+  commit (single-writer law intact, now thread-proof; cross-thread get/set proven via
+  `asyncio.to_thread` in tests). ALL five background tasks (spot, pack, listener, settle,
+  reconcile) run under `supervise()`: any exception → tagged failure row
+  (`TG_LISTENER_DOWN` for the ear) → outbound page → 5s backoff → restart. The settle
+  task's silent `except` is deleted — the supervisor is the only net. Grep-test asserts
+  every `create_task` in the tree is supervise-wrapped. Hourly line carries
+  `listener: ok|ok(n restarts)|down(n restarts)`.
+- **§2 TRUE** — `account_value()` returns `(cents, source)` split by mode. LIVE: venue
+  read only; a failure banks `ACCOUNT_VALUE_UNREADABLE` per attempt (3 attempts paced
+  ≥5s apart = retry ×3 over 15s, across cycles so the loop never blocks), pages at
+  attempt 3, and returns `(None, "venue")` — it NEVER returns the ledger book in live
+  (test-proven). Brackets DEFER on None: pending opens/closes complete on the next
+  successful read with the deferral stamped on the row (`open+Ns`/`close+Ns`); a
+  deferred close never re-settles (settlement booked exactly once), and a deferred red
+  window still counts its strike (no laundering the leash). Every bracket row carries
+  `source` (`venue|paper`); live rejects `paper` FATAL (`BRACKET_PAPER_IN_LIVE`).
+  SHADOW: paper book as before — papers the money, never the market.
+- **§3 TRUE** — standing reconcile task, every 60s in live: venue cash+pv vs ledger
+  expectation, routed to the EXISTING cash protocol — quiescence window (in-flight
+  orders/unsettled fills → DEFERRED), negative drift → entries halt + breakdown page +
+  /confirm_cash | /deny_cash, venue-unreadable → no verdict (never a paper-number
+  prompt). Drift pages between brackets, not at them.
+- **§4 TRUE** — the BOOT page now waits for channel negotiation (sends when the last
+  subscribe reply resolves, 30s cap) and carries: accepted channel list, SIZING
+  1/12-Kelly line, WORST-DAY bound, `boot #N`, `listener: ok`.
+- **§5 (Drew's half)**: deploy → BOOT page with accepted channels + listener ok → text
+  the bot garbage → the refusal line comes back (the ear is ALIVE) → one shadow window
+  where F's cost tracks the live book → RUN_MODE=LIVE + phrase → LIVE BOOT page →
+  first ✅ FILL → first 📊 bracket with `source=venue`.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

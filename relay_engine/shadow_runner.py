@@ -163,6 +163,13 @@ class ShadowEngine:
         self.spot = None
         self.spot_ts = 0.0
         self.spot_ticks = []    # rolling tape for FLIP/P features
+        # P9 §1b/c: supervised-task bookkeeping (the hourly line reads these)
+        self.task_restarts = {}  # name -> restarts
+        self.task_alive = {}     # name -> bool (False while in backoff)
+        # P9 §2: live account-value retry state (3 attempts spaced >= 5s = the
+        # retry-x3-over-15s law, paced across cycles so the loop never blocks)
+        self._av_fail_streak = 0
+        self._av_last_attempt_ts = 0.0
 
     # ── F1: market lifecycle (discovery + rollover) ─────────────────────
     def on_market_discovered(self, ticker: str, market_obj: dict) -> None:
@@ -250,15 +257,74 @@ class ShadowEngine:
         self.econ.restore_halt_on_boot()
         return boots_last_hour
 
-    def account_value_cents(self) -> int:
-        """P8 §1: account truth — venue balance + position value in LIVE;
-        the paper book in shadow (brackets exercise the same machinery)."""
-        if config.live_submit_enabled() and self.gateway.venue_client is not None:
-            from . import venue
+    AV_RETRY_SPACING_S = 5.0   # P9 §2: 3 attempts >= 5s apart = retry x3 over 15s
+    AV_PAGE_AT_STREAK = 3
+
+    def account_value(self, now=None):
+        """P9 §2: account truth, split by mode — NO PAPER NUMBERS IN LIVE, EVER.
+
+        SHADOW: (paper book, "paper") — papers the money, never the market.
+        LIVE:   (venue cash+pv, "venue") on a successful read; (None, "venue")
+        while the read fails — the caller DEFERS. A failed live read NEVER
+        substitutes the ledger book; it banks ACCOUNT_VALUE_UNREADABLE per
+        attempt and pages at attempt 3."""
+        if not config.live_submit_enabled():
+            return self.ledger.book_cents(), "paper"
+        now = time.time() if now is None else now
+        if (self._av_fail_streak > 0
+                and now - self._av_last_attempt_ts < self.AV_RETRY_SPACING_S):
+            return None, "venue"   # between retries — still deferring
+        self._av_last_attempt_ts = now
+        from . import failures, venue
+        cash = pv = None
+        try:
+            if self.gateway.venue_client is None:
+                self.gateway.venue_client = venue.build_client()
             cash, pv = venue.get_balance(self.gateway.venue_client)
-            if cash is not None:
-                return int(round((cash + (pv or 0.0)) * 100))
-        return self.ledger.book_cents()
+        except Exception as e:
+            log.warning("live account value read raised: %s", e)
+        if cash is not None:
+            self._av_fail_streak = 0
+            return int(round((cash + (pv or 0.0)) * 100)), "venue"
+        self._av_fail_streak += 1
+        failures.fail("ACCOUNT_VALUE_UNREADABLE",
+                      f"live account value read failed "
+                      f"(attempt {self._av_fail_streak}/{self.AV_PAGE_AT_STREAK})",
+                      attempt=self._av_fail_streak)
+        if self._av_fail_streak == self.AV_PAGE_AT_STREAK:
+            self.telegram.alert(
+                "💸 ACCOUNT VALUE UNREADABLE x3 over 15s — brackets DEFER until "
+                "the venue answers; no paper number will substitute")
+        return None, "venue"
+
+    def flush_deferred_econ(self, now=None) -> int:
+        """P9 §2: deferred brackets complete on the next successful read."""
+        if not (self.econ.pending_opens or self.econ.pending_closes):
+            return 0
+        val, src = self.account_value(now)
+        if val is None:
+            return 0
+        return self.econ.flush_deferred(val, src, now=now)
+
+    def standing_reconcile(self, now=None) -> str:
+        """P9 §3: every 60s in live — venue truth vs ledger expectation, routed
+        to the EXISTING cash protocol (quiescence window, halt + breakdown page,
+        /confirm_cash | /deny_cash). Drift pages between brackets, not at them."""
+        val, src = self.account_value(now)
+        if val is None or src != "venue":
+            return "UNREADABLE"
+        return self.cash.reconcile(
+            venue_balance_cents=val,
+            in_flight_orders=len(self.gateway.resting),
+            unsettled_fills=self.ledger.unsettled_fill_count(),
+            now=now)
+
+    def listener_status(self) -> str:
+        """P9 §1c: the hourly line's `listener:` field."""
+        n = self.task_restarts.get("listener", 0)
+        if self.task_alive.get("listener", True):
+            return "ok" if n == 0 else f"ok({n} restarts)"
+        return f"down({n} restarts)"
 
     def record_fatal(self, message: str) -> None:
         self.ledger.set_state("last_fatal", message[:500])
@@ -286,6 +352,9 @@ class ShadowEngine:
         now = time.time() if now is None else now
         if spot is None:
             spot = self.fresh_spot(now)
+
+        # P9 §2: deferred brackets complete the moment the venue answers again
+        self.flush_deferred_econ(now)
 
         # 1) custodian exits outrank everything (risk reduction first)
         from .lanes import infer_close_ts_from_ticker
@@ -354,8 +423,10 @@ class ShadowEngine:
                                     lane.name, market, e)
                         continue
                     if proposal.purpose == "ENTRY":
-                        # P8 §1: OPEN BRACKET at the first order submit on this market
-                        self.econ.open_bracket(market, self.account_value_cents(), now=now)
+                        # P8 §1: OPEN BRACKET at the first order submit on this
+                        # market. P9 §2: a failed live read DEFERS the bracket.
+                        val, src = self.account_value(now)
+                        self.econ.open_bracket(market, val, now=now, source=src)
                     if proposal.lane in ("F", "H8"):
                         # Live submit side-effects, mirrored from k_worker gateway.submit:
                         # lane-scoped single entry + F hourly exposure.
@@ -387,10 +458,11 @@ class ShadowEngine:
         fills_pnl = sum(per_lane.values())
         fills_count = int(self.ledger.db.execute(
             "SELECT COUNT(*) FROM fills WHERE market=?", (market,)).fetchone()[0])
+        val, src = self.account_value(now)
         self.econ.close_bracket(
-            market, self.account_value_cents(), fills_pnl,
+            market, val, fills_pnl,
             lanes_active=",".join(sorted(per_lane)), fills_count=fills_count,
-            now=now)
+            now=now, source=src)
 
     def settlement_sweep(self, now=None) -> int:
         """Poll settlement for markets with open brackets whose close passed."""
@@ -415,6 +487,45 @@ class ShadowEngine:
                                           now=now)
                 settled += 1
         return settled
+
+
+SUPERVISOR_BACKOFF_S = 5.0
+
+# P9 §1b: every background task's death is TAGGED — "Task exception was never
+# retrieved" is a banked fail-silent class. The listener's tag is named in the
+# order because it holds a safety command path (/reset_halt, /confirm_cash).
+TASK_TAGS = {
+    "spot": "SPOT_TASK_DOWN",
+    "pack": "PACK_TASK_DOWN",
+    "listener": "TG_LISTENER_DOWN",
+    "settle": "SETTLE_TASK_DOWN",
+    "reconcile": "RECONCILE_TASK_DOWN",
+}
+
+
+async def supervise(name, factory, stop, engine, backoff_s=SUPERVISOR_BACKOFF_S):
+    """P9 §1b: NO un-supervised task may hold a safety command path. Any
+    exception -> fail(tag) -> outbound alert (the funnel pages) -> restart
+    after backoff. A clean return ends supervision (the task chose to stop)."""
+    from . import failures
+    tag = TASK_TAGS.get(name, "TASK_DOWN")
+    while not stop.is_set():
+        engine.task_alive[name] = True
+        try:
+            await factory()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            engine.task_alive[name] = False
+            n = engine.task_restarts[name] = engine.task_restarts.get(name, 0) + 1
+            try:
+                failures.fail(tag,
+                              f"supervised task {name!r} died: {e!r} — "
+                              f"restart #{n} in {backoff_s:.0f}s")
+            except Exception:
+                pass  # the supervisor itself never dies of its report
+            await asyncio.sleep(backoff_s)
 
 
 async def run():
@@ -496,6 +607,7 @@ async def run():
                     f"frames={engine.feed.frames_seen} "
                     f"rejects={sum(engine.gateway.reject_counts.values())} "
                     f"venue_rejects={engine.gateway.venue_rejects} "
+                    f"listener={engine.listener_status()} "
                     f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")
 
     # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
@@ -511,18 +623,24 @@ async def run():
     async def settle_task():
         while not stop.is_set():
             await asyncio.sleep(30.0)
-            try:
-                await asyncio.to_thread(engine.settlement_sweep)
-                if config.live_submit_enabled() and engine.gateway.venue_client is not None:
-                    await asyncio.to_thread(engine.fills.reconcile_sweep,
-                                            engine.gateway.venue_client)
-            except Exception as e:
-                log.warning("settlement/fills sweep error (continuing): %s", e)
+            await asyncio.to_thread(engine.settlement_sweep)
+            if config.live_submit_enabled() and engine.gateway.venue_client is not None:
+                await asyncio.to_thread(engine.fills.reconcile_sweep,
+                                        engine.gateway.venue_client)
 
-    asyncio.create_task(spot_task())
-    asyncio.create_task(pack_task())
-    asyncio.create_task(listener_task())
-    asyncio.create_task(settle_task())
+    # ── P9 §3: standing live reconcile — drift pages BETWEEN brackets ──────
+    async def reconcile_task():
+        while not stop.is_set():
+            await asyncio.sleep(60.0)
+            if config.live_submit_enabled():
+                await asyncio.to_thread(engine.standing_reconcile)
+
+    # P9 §1b: EVERY task runs supervised — a death is banked, paged, restarted.
+    asyncio.create_task(supervise("spot", spot_task, stop, engine))
+    asyncio.create_task(supervise("pack", pack_task, stop, engine))
+    asyncio.create_task(supervise("listener", listener_task, stop, engine))
+    asyncio.create_task(supervise("settle", settle_task, stop, engine))
+    asyncio.create_task(supervise("reconcile", reconcile_task, stop, engine))
 
     subscribed: set = set()
 
@@ -562,15 +680,29 @@ async def run():
                 subscriber = ChannelSubscriber()
                 await sync_subscriptions(ws, subscriber)
                 engine.ladder.snapshot_resynced()
-                # R6: the BOOT message — the phone hears the boot tape's summary
-                from .ops import worst_day_bound_line
-                engine.telegram.alert(
-                    f"🟢 BOOT #{getattr(engine, 'boot_id', '?')} "
-                    f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
-                    f"{len(subscribed)} market(s) subscribed\n"
-                    f"{worst_day_bound_line(engine.ledger)}\n"
-                    f"channels: {sorted(subscriber.accepted.values()) or 'negotiating'}"
-                    + (f" / degraded: {subscriber.degraded}" if subscriber.degraded else ""))
+
+                # P9 §4: the BOOT page waits for channel negotiation — it
+                # carries the ACCEPTED list (not "negotiating"), the SIZING
+                # line, the worst-day bound, boot #N, and the listener state.
+                boot_page_pending = True
+                connect_mono = time.monotonic()
+
+                def send_boot_page():
+                    from .ops import worst_day_bound_line
+                    from .sizing import size_order
+                    book = engine.ledger.book_cents()
+                    max_lots = size_order(config.TIER_PROBE, book, 99, 10_000).contracts
+                    engine.telegram.alert(
+                        f"🟢 BOOT #{getattr(engine, 'boot_id', '?')} "
+                        f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
+                        f"{len(subscribed)} market(s) subscribed\n"
+                        f"channels: {sorted(subscriber.accepted.values()) or '(none accepted)'}"
+                        + (f" / degraded: {subscriber.degraded}" if subscriber.degraded else "")
+                        + f"\nSIZING: 1/12-Kelly ceiling · book ${book / 100:.2f}"
+                          f" · current max lots {max_lots}\n"
+                        f"{worst_day_bound_line(engine.ledger)}\n"
+                        f"listener: {engine.listener_status()}")
+
                 last_cycle = 0.0
                 last_discovery = time.monotonic()
                 while not stop.is_set():
@@ -598,7 +730,14 @@ async def run():
                             payload = json.dumps(retry)
                             engine.feed.note_sent(payload)
                             await ws.send(payload)
+                        if boot_page_pending and not subscriber.pending:
+                            boot_page_pending = False
+                            send_boot_page()  # P9 §4: negotiation done — page now
                         continue
+                    if boot_page_pending and (not subscriber.pending
+                                              or time.monotonic() - connect_mono > 30):
+                        boot_page_pending = False
+                        send_boot_page()
                     engine.feed.handle_frame(raw)
                     if pre is not None:
                         m = pre.get("msg") or {}

@@ -15,6 +15,7 @@ Single-writer law (§A1): this ledger opens the engine's OWN database file.
 """
 
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -89,9 +90,47 @@ class BootCaps:
     order_budget_cents: int
 
 
+class _LockedConnection:
+    """P9 §1a: ONE connection, ONE RLock — every execute/commit path serializes
+    through the same lock, so the listener thread, the settle thread, and the
+    main loop share the single-writer connection safely. The lock is re-entrant
+    (nested calls inside a caller that already holds it are fine); fetches on
+    the returned cursor ride sqlite3's serialized threading mode."""
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+        self._conn = conn
+        self._lock = lock
+
+    def execute(self, sql, params=()):
+        with self._lock:
+            return self._conn.execute(sql, params)
+
+    def executemany(self, sql, rows):
+        with self._lock:
+            return self._conn.executemany(sql, rows)
+
+    def executescript(self, sql):
+        with self._lock:
+            return self._conn.executescript(sql)
+
+    def commit(self):
+        with self._lock:
+            self._conn.commit()
+
+    def close(self):
+        with self._lock:
+            self._conn.close()
+
+
 class Ledger:
     def __init__(self, db_path: Optional[str] = None):
-        self.db = sqlite3.connect(db_path or config.DB_PATH)
+        # P9 §1a: cross-thread by design (supervised tasks run ledger calls via
+        # asyncio.to_thread); safety comes from the single RLock, not sqlite's
+        # same-thread check.
+        self.lock = threading.RLock()
+        self.db = _LockedConnection(
+            sqlite3.connect(db_path or config.DB_PATH, check_same_thread=False),
+            self.lock)
         self.db.executescript(SCHEMA)
         self.db.commit()
         self.boot_caps: Optional[BootCaps] = None
