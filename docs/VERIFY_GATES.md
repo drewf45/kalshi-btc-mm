@@ -461,6 +461,56 @@ Suite at this commit: **205 passed** (17 new). Audit verdicts (read-rule), then 
   where F's cost tracks the live book → RUN_MODE=LIVE + phrase → LIVE BOOT page →
   first ✅ FILL → first 📊 bracket with `source=venue`.
 
+## WO-2026-07-18-RELAY-P10 (FINAL, lens-amended) — "THE BOOK CANNOT LIE"
+
+Suite at this commit: **224 passed** (19 new).
+
+- **§1 (root cause)**: the banked tape lives on the DEPLOYED worker's disk — the
+  verbatim-frame conviction is one Render-shell command away
+  (`python -m scripts.autopsy_replay /var/data/relay_shadow.db <market>`; starts at
+  the banked snapshot per A1, legacy-vs-fixed dual replay, prints the corrupting
+  frame verbatim, states the evidence gap honestly if no snapshot was banked).
+  Three parser holes convicted by inspection and CLOSED — see
+  `docs/P10_FIX_REPORT.md`: (1) the defaulted delta side `m.get("side","yes")` —
+  leading suspect, one side-less frame turns yes45/no55 into the exact observed
+  yes97+no55=152; (2) delta-built books after `drop_book` with no snapshot
+  foundation (v5 tape proves this path ran live); (3) no seq checking. Fixes:
+  SIDE_KEYS no-default ladder, `has_snapshot` foundation law, seq-gap guard —
+  each with reconstructed-frame regression tests (stated as reconstructed, per
+  the read-rule; the verbatim frame joins the suite after the autopsy runs).
+- **§2 TRUE** — the coherence invariant (P7 §1c, now actually built): after EVERY
+  apply, yes+no > 101 → `BOOK_INCOHERENT` row (alert=False; the page is the
+  episode line, once) → book POISONED → snapshot resubscribe forced (sid-based
+  `update_subscription` delete+add; plain resubscribe fallback; tolerant replies;
+  5s per-market send floor) → clean snapshot clears. Lanes refuse a poisoned book
+  (WATCHING `BOOK_POISONED`, never FATAL). **A6**: the custodian's marks flip to
+  the REST book on poison — cuts proceed on REST truth, custody never stalls
+  (test-proven: the substituted book reaches `custodian.tick` with transport=REST).
+  **A5**: 3 episodes in one window → QUARANTINE until window close (entries off all
+  lanes, custody on, exactly one ⛔ page naming the self-heal time); clears at
+  rollover AND time-expires as a belt.
+- **§3 TRUE** — reconcile-to-book: 60s supervised task, REST `orderbook_fp`
+  touches vs the WS book per market. **A2**: >2¢ → `BOOK_DIVERGENCE` row EVERY trip
+  (R5, alert=False) + silent resync on the FIRST; the phone only on the SECOND
+  consecutive trip. Unreadable REST = no verdict. §3.3 multi-series note banked in
+  the runner. §3.4: hourly line carries `book✓ {n}`.
+- **§4 TRUE** — wall-reject backoff: a rejected ENTRY's identical re-propose
+  (same proposal AND same touch — the fingerprint includes the book bests) rests
+  30s pre-wall as `WALL_BACKOFF`; suppressed attempts still count (R5) and still
+  feed storm detection. Same-key rejects >20/60s → ONE `⚠ WALL_STORM` page per
+  episode. Exits/cuts never suppressed (risk-reducing branch skips it entirely,
+  test-proven). §4.3: the runner logs first + every 10th with a count.
+- **§5 TRUE** — the pack renders BOOK EPISODES (by market, first/last seen) and
+  calls out quarantines / 3+ poison episodes as FINDINGS.
+- **§6 [A4] TRUE** — the end-to-end replay runs the DEPLOYED wiring
+  (`Feed.handle_frame → touch_view → FH8Shared.decide → gateway.submit`): both
+  01:25 corruption shapes produce ZERO proposals; the honest mid-priced book after
+  resync gets F's PASS — a quiet log is the discipline working.
+- **DEPLOY (Drew's half)**: deploy → run the autopsy in the Render shell → paste
+  the verbatim frame back (it becomes the §1.4 permanent test) → watch the next
+  window: TRUE-book behavior, `book✓` heartbeats hourly → the go-live checklist
+  resumes exactly where it left off.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

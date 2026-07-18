@@ -203,6 +203,35 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     # P8 §2.4: the streak, halts, and resets
     if econ is not None:
         lines.extend(econ.pack_lines())
+    # P10 §5: episode accounting — a book that went incoherent is a FINDING,
+    # not a nuisance; the pack names the market and the span.
+    try:
+        ep_rows = ledger.db.execute(
+            "SELECT why_tag, how_json, ts FROM failures WHERE why_tag IN"
+            " ('BOOK_INCOHERENT','BOOK_DIVERGENCE','QUARANTINE')").fetchall()
+    except Exception:
+        ep_rows = []
+    if ep_rows:
+        by = {}
+        for tag, how_json, ts in ep_rows:
+            try:
+                mkt = json.loads(how_json).get("market", "?")
+            except Exception:
+                mkt = "?"
+            d = by.setdefault((tag, mkt), [0, ts, ts])
+            d[0] += 1
+            d[1] = min(d[1], ts)
+            d[2] = max(d[2], ts)
+        lines.append("BOOK EPISODES (by market, first/last seen):")
+        for (tag, mkt), (n, first, last_seen) in sorted(by.items()):
+            lines.append(
+                f"  {tag} {mkt}: x{n} "
+                f"(first {time.strftime('%H:%M', time.gmtime(first))}"
+                f" last {time.strftime('%H:%M', time.gmtime(last_seen))} UTC)")
+        for (tag, mkt), (n, _f, _l) in sorted(by.items()):
+            if tag == "QUARANTINE" or (tag == "BOOK_INCOHERENT" and n >= 3):
+                lines.append(f"  FINDING: {mkt} {tag} x{n} — "
+                             f"pull this window's banked tape")
     # R5: the FAILURES section — the curriculum includes how things DON'T work
     from . import failures as failure_ledger
     fail_lines = failure_ledger.pack_section(ledger)

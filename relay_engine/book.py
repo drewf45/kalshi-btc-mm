@@ -37,6 +37,12 @@ class OrderBook:
     no_fp: Dict[int, str] = field(default_factory=dict)
     last_update_ts: float = 0.0
     transport: str = "WS"  # "WS" or "EXPLORATION" (REST poll rows, feed-parity law)
+    # P10 §1/§2: a book is only trustworthy on a snapshot FOUNDATION — deltas
+    # over an empty book build fiction. `poisoned` marks an incoherent book
+    # (yes+no > 101, which the venue cannot produce); a clean snapshot clears it.
+    has_snapshot: bool = False
+    poisoned: bool = False
+    last_seq: Optional[int] = None  # venue delta sequence; a gap = missed frames
 
     def apply_snapshot(self, yes_bids: Dict[int, int], no_bids: Dict[int, int],
                        ts: float, yes_fp: Dict[int, str] = None,
@@ -46,6 +52,9 @@ class OrderBook:
         self.yes_fp = dict(yes_fp or {})
         self.no_fp = dict(no_fp or {})
         self.last_update_ts = ts
+        self.has_snapshot = True
+        if self.coherent():
+            self.poisoned = False  # a clean snapshot is the cure (P10 §2.1)
 
     def apply_delta(self, side: str, price_cents: int, delta: int, ts: float,
                     fp: str = None) -> None:
@@ -60,6 +69,15 @@ class OrderBook:
             levels.pop(int(price_cents), None)
             fps.pop(int(price_cents), None)
         self.last_update_ts = ts
+
+    def coherent(self) -> bool:
+        """P10 §2: the venue's bids-only book can never sum past 101 (100 plus
+        the 1c minimum tick of overlap a race can show). yes 97 + no 55 = 152
+        is a lie — some frame corrupted state."""
+        yb, nb = self.best_yes_bid(), self.best_no_bid()
+        if yb is None or nb is None:
+            return True
+        return yb + nb <= 101
 
     def best_fp(self, side: str):
         """The exact fp string at the side's best level, or None (int books)."""

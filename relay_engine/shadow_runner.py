@@ -64,6 +64,31 @@ class ChannelSubscriber:
         self.degraded: list = []
         self.pending: dict = {}    # cmd_id -> (canonical, tried_name, tickers, remaining_fallbacks)
         self._vocab_logged = False
+        self.sids: dict = {}       # canonical -> venue subscription id (P10 resync)
+        self.resync_ids: set = set()  # cmd ids of in-flight resync cmds (tolerant path)
+
+    def resync_cmds(self, market: str) -> list:
+        """P10 §2.1: force a fresh snapshot for ONE market. With the essential
+        channel's sid known, drop + re-add the market on that subscription (the
+        venue re-sends the snapshot on add); otherwise fall back to a plain
+        re-subscribe. Replies to these ids are TOLERANT (banked, never fatal —
+        the boot-subscribe fatal path is not for resyncs)."""
+        out = []
+        sid = self.sids.get(ESSENTIAL_CHANNEL)
+        if sid is not None:
+            for action in ("delete", "add"):
+                self.seq += 1
+                self.resync_ids.add(self.seq)
+                out.append({"id": self.seq, "cmd": "update_subscription",
+                            "params": {"sids": [sid], "action": action,
+                                       "market_tickers": [market]}})
+        else:
+            self.seq += 1
+            self.resync_ids.add(self.seq)
+            out.append(subscribe_cmd(
+                self.seq, [market],
+                self.accepted.get(ESSENTIAL_CHANNEL, ESSENTIAL_CHANNEL)))
+        return out
 
     def cmds_for(self, market_tickers, channels=None) -> list:
         """Subscribe cmds for these markets, one per channel, using the accepted
@@ -93,6 +118,9 @@ class ChannelSubscriber:
         code = (msg.get("msg") or {}).get("code")
         if mtype != "error":
             self.accepted[canonical] = tried
+            sid = (msg.get("msg") or {}).get("sid")
+            if sid is not None:
+                self.sids[canonical] = sid  # P10: the resync path's handle
             self._maybe_log_vocab()
             return None
         if code == 8 and fallbacks:
@@ -170,6 +198,14 @@ class ShadowEngine:
         # retry-x3-over-15s law, paced across cycles so the loop never blocks)
         self._av_fail_streak = 0
         self._av_last_attempt_ts = 0.0
+        # P10 §2/§3: book-truth machinery
+        self.quarantined = {}       # market -> until_close_ts (A5 poison ceiling)
+        self.poison_episodes = {}   # market -> episodes this window
+        self.book_checks_total = 0  # §3.4: the `book✓ n` heartbeat
+        self._divergence_pending = {}  # market -> True after one diverged check
+        self._wall_log_counts = {}     # §4.3: (lane, market, wall) -> count
+        self.feed.on_poison = self.note_poison_episode
+        self.gateway.alert_fn = self.telegram.alert  # WALL_STORM page path
 
     # ── F1: market lifecycle (discovery + rollover) ─────────────────────
     def on_market_discovered(self, ticker: str, market_obj: dict) -> None:
@@ -185,6 +221,109 @@ class ShadowEngine:
         self.market_meta.pop(ticker, None)
         self.feed.drop_book(ticker)
         self.flip.windows.pop(ticker, None)
+        # P10 §2.4: quarantine + episode counts clear at rollover
+        self.quarantined.pop(ticker, None)
+        self.poison_episodes.pop(ticker, None)
+        self._divergence_pending.pop(ticker, None)
+        self.feed.resync_needed.discard(ticker)
+
+    # ── P10 §2: poison episodes, quarantine, REST marks ─────────────────
+    def note_poison_episode(self, market: str, yb, nb) -> None:
+        """§2.2: one page per episode. §2.4 (A5): 3 episodes in one window →
+        QUARANTINE — entries off for ALL lanes, custody continues on REST
+        marks, exactly one page naming the self-heal time."""
+        n = self.poison_episodes[market] = self.poison_episodes.get(market, 0) + 1
+        self.telegram.alert(f"⚠ BOOK_INCOHERENT {market} y{yb}+n{nb} — resyncing")
+        if n >= 3 and market not in self.quarantined:
+            from . import failures
+            from .lanes import infer_close_ts_from_ticker
+            close_ts = (self._meta(market).get("close_ts")
+                        or infer_close_ts_from_ticker(market)
+                        or (time.time() + 900))
+            self.quarantined[market] = close_ts
+            when = time.strftime("%H:%M", time.gmtime(close_ts)) + " UTC"
+            self.telegram.alert(
+                f"⛔ QUARANTINE {market} until {when} — 3x incoherent")
+            failures.fail("QUARANTINE",
+                          f"{market} quarantined until {when} — "
+                          f"{n} poison episodes in one window (A5 ceiling)",
+                          market=market, episodes=n, alert=False)
+
+    def _rest_book(self, market: str):
+        """§2.3 (A6): REST truth for custodian marks when the WS book is
+        poisoned — a corrupted feed may pause NEW risk; it may never pause
+        the management of EXISTING risk."""
+        from . import venue
+        from .book import OrderBook
+        try:
+            if self.gateway.venue_client is None:
+                self.gateway.venue_client = venue.build_client()
+            rb = venue.fetch_orderbook(self.gateway.venue_client, market)
+        except Exception as e:
+            log.warning("REST book fetch failed for %s: %s", market, e)
+            return None
+        if rb.yes_bid is None and rb.no_bid is None:
+            return None
+        ob = OrderBook(market=market, transport="REST")
+        if rb.yes_bid is not None:
+            ob.yes_bids[rb.yes_bid] = rb.yes_bid_qty or 1
+        if rb.no_bid is not None:
+            ob.no_bids[rb.no_bid] = rb.no_bid_qty or 1
+        ob.has_snapshot = True
+        ob.last_update_ts = time.time()
+        return ob
+
+    # ── P10 §3: the venue REST book is the standing arbiter ─────────────
+    def book_check(self, now=None) -> int:
+        """Every 60s per subscribed market: REST touches vs the WS book.
+        §3.2 (A2): >2c divergence → BOOK_DIVERGENCE row EVERY trip (R5) +
+        silent resync on the FIRST; the PHONE only on the second consecutive
+        trip (a REST snapshot races a fast WS book — honest mid-move trips
+        resync quietly)."""
+        from . import failures, venue
+        now = time.time() if now is None else now
+        try:
+            if self.gateway.venue_client is None:
+                self.gateway.venue_client = venue.build_client()
+        except Exception as e:
+            log.warning("book_check: no venue client (%s)", e)
+            return 0
+        clean = 0
+
+        def side_div(ws_b, r_b):
+            if r_b is None:
+                return 0
+            return 100 if ws_b is None else abs(ws_b - r_b)
+
+        for market, ws in sorted(self.feed.books.items()):
+            if not ws.has_snapshot:
+                continue
+            try:
+                rest = venue.fetch_orderbook(self.gateway.venue_client, market)
+            except Exception:
+                continue
+            if rest.yes_bid is None and rest.no_bid is None:
+                continue  # REST unreadable — no verdict on the WS book
+            div = max(side_div(ws.best_yes_bid(), rest.yes_bid),
+                      side_div(ws.best_no_bid(), rest.no_bid))
+            if div > 2:
+                failures.fail(
+                    "BOOK_DIVERGENCE",
+                    f"{market}: ws y{ws.best_yes_bid()}/n{ws.best_no_bid()} vs "
+                    f"rest y{rest.yes_bid}/n{rest.no_bid} (max {div}c)",
+                    market=market, divergence=div, alert=False)
+                self.feed.resync_needed.add(market)
+                if self._divergence_pending.get(market):
+                    self.telegram.alert(
+                        f"⚠ BOOK_DIVERGENCE {market} persists across two checks: "
+                        f"ws y{ws.best_yes_bid()}/n{ws.best_no_bid()} vs "
+                        f"rest y{rest.yes_bid}/n{rest.no_bid}")
+                self._divergence_pending[market] = True
+            else:
+                self._divergence_pending.pop(market, None)
+                clean += 1
+        self.book_checks_total += clean
+        return clean
 
     # ── F2: the spot tape ───────────────────────────────────────────────
     def record_spot(self, price, now) -> None:
@@ -356,10 +495,28 @@ class ShadowEngine:
         # P9 §2: deferred brackets complete the moment the venue answers again
         self.flush_deferred_econ(now)
 
-        # 1) custodian exits outrank everything (risk reduction first)
+        # P10 §2.4: a quarantine self-heals at its window close (belt under
+        # the rollover prune)
+        for m, until in list(self.quarantined.items()):
+            if now >= until:
+                del self.quarantined[m]
+                self.poison_episodes.pop(m, None)
+
+        # 1) custodian exits outrank everything (risk reduction first).
+        # P10 §2.3 (A6): a poisoned/quarantined WS book must NOT blind the
+        # custodian — its marks for that market switch to the REST book.
         from .lanes import infer_close_ts_from_ticker
+        cust_books = {}
+        held = {p.market for p in self.custodian.positions.values()}
+        for m in markets:
+            b = self.feed.book(m)
+            if (b.poisoned or m in self.quarantined) and m in held:
+                rb = self._rest_book(m)
+                if rb is not None:
+                    b = rb
+            cust_books[m] = b
         cuts = self.custodian.tick(
-            books={m: self.feed.book(m) for m in markets},
+            books=cust_books,
             close_ts_of=lambda m: (self._meta(m).get("close_ts")
                                    or infer_close_ts_from_ticker(m)),
             now=now, balance_usd=self.ledger.book_cents() / 100.0, spot=spot,
@@ -375,6 +532,17 @@ class ShadowEngine:
             book = self.feed.book(market)
             meta = self._meta(market)
             transport = "WS" if self.ladder.entries_allowed() else "EXPLORATION"
+            # P10 §2.2/§2.4: lanes refuse a poisoned or quarantined book —
+            # skipped this cycle, tagged; NEVER fatal (one market's corrupt
+            # book must not stop the others). Custody already ran above.
+            if book.poisoned or market in self.quarantined:
+                tag = ("QUARANTINED" if market in self.quarantined
+                       else "BOOK_POISONED")
+                for lane in self.lanes:
+                    self.surface.write_row(lane.name, market, window,
+                                           "WATCHING", transport=transport,
+                                           detail=tag)
+                continue
             ctx = {
                 "book": book, "now": now, "spot": spot,
                 "spot_ticks": self.spot_ticks,
@@ -419,8 +587,14 @@ class ShadowEngine:
                     except WallRejection as e:
                         self.gateway.reject_counts[e.wall] = \
                             self.gateway.reject_counts.get(e.wall, 0) + 1
-                        log.warning("wall rejected %s proposal on %s: %s",
-                                    lane.name, market, e)
+                        # P10 §4.3: log the first + every 10th (the 01:25 log
+                        # was 60 identical lines); the count keeps fidelity.
+                        k = (lane.name, market, e.wall)
+                        n = self._wall_log_counts[k] = \
+                            self._wall_log_counts.get(k, 0) + 1
+                        if n == 1 or n % 10 == 0:
+                            log.warning("wall rejected %s proposal on %s: %s (x%d)",
+                                        lane.name, market, e, n)
                         continue
                     if proposal.purpose == "ENTRY":
                         # P8 §1: OPEN BRACKET at the first order submit on this
@@ -500,7 +674,12 @@ TASK_TAGS = {
     "listener": "TG_LISTENER_DOWN",
     "settle": "SETTLE_TASK_DOWN",
     "reconcile": "RECONCILE_TASK_DOWN",
+    "book_check": "BOOK_CHECK_TASK_DOWN",
 }
+
+BOOK_CHECK_S = 60.0  # P10 §3: the standing arbiter's cadence
+# §3.3 (banked, no action): the cross-check is per-market; at 4 series it is
+# ~4 req/min — inside the rate governor. Written down so nobody rediscovers it.
 
 
 async def supervise(name, factory, stop, engine, backoff_s=SUPERVISOR_BACKOFF_S):
@@ -608,6 +787,7 @@ async def run():
                     f"rejects={sum(engine.gateway.reject_counts.values())} "
                     f"venue_rejects={engine.gateway.venue_rejects} "
                     f"listener={engine.listener_status()} "
+                    f"book✓ {engine.book_checks_total} "
                     f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")
 
     # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
@@ -635,12 +815,19 @@ async def run():
             if config.live_submit_enabled():
                 await asyncio.to_thread(engine.standing_reconcile)
 
+    # ── P10 §3: the venue REST book audits the WS book every 60s ───────────
+    async def book_check_task():
+        while not stop.is_set():
+            await asyncio.sleep(BOOK_CHECK_S)
+            await asyncio.to_thread(engine.book_check)
+
     # P9 §1b: EVERY task runs supervised — a death is banked, paged, restarted.
     asyncio.create_task(supervise("spot", spot_task, stop, engine))
     asyncio.create_task(supervise("pack", pack_task, stop, engine))
     asyncio.create_task(supervise("listener", listener_task, stop, engine))
     asyncio.create_task(supervise("settle", settle_task, stop, engine))
     asyncio.create_task(supervise("reconcile", reconcile_task, stop, engine))
+    asyncio.create_task(supervise("book_check", book_check_task, stop, engine))
 
     subscribed: set = set()
 
@@ -705,6 +892,7 @@ async def run():
 
                 last_cycle = 0.0
                 last_discovery = time.monotonic()
+                resync_sent = {}   # P10 §2: market -> last resync send (5s floor)
                 while not stop.is_set():
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
@@ -724,6 +912,15 @@ async def run():
                         pre = json.loads(raw)
                     except ValueError:
                         pre = None
+                    # P10 §2: resync-cmd replies are TOLERANT — banked on
+                    # error, never the boot-subscribe fatal path.
+                    if pre is not None and pre.get("id") in subscriber.resync_ids:
+                        subscriber.resync_ids.discard(pre.get("id"))
+                        if pre.get("type") == "error":
+                            failures.fail("RESYNC_REJECTED",
+                                          f"book resync cmd rejected: {pre}",
+                                          frame=pre)
+                        continue
                     if pre is not None and pre.get("id") in subscriber.pending:
                         retry = subscriber.on_reply(pre)
                         if retry is not None:
@@ -739,6 +936,23 @@ async def run():
                         boot_page_pending = False
                         send_boot_page()
                     engine.feed.handle_frame(raw)
+                    # P10 §2.1: poisoned/unfounded books force a snapshot
+                    # resubscribe for THAT market (5s floor per market — the
+                    # A5 ceiling quarantines a market that keeps tripping).
+                    if engine.feed.resync_needed:
+                        mono_now = time.monotonic()
+                        for m in sorted(engine.feed.resync_needed):
+                            if m not in subscribed:
+                                continue
+                            if mono_now - resync_sent.get(m, -1e9) < 5.0:
+                                continue
+                            resync_sent[m] = mono_now
+                            for cmd in subscriber.resync_cmds(m):
+                                payload = json.dumps(cmd)
+                                engine.feed.note_sent(payload)
+                                await ws.send(payload)
+                            log.warning("BOOK RESYNC requested for %s", m)
+                        engine.feed.resync_needed.clear()
                     if pre is not None:
                         m = pre.get("msg") or {}
                         mkt = m.get("market_ticker")

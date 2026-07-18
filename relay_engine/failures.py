@@ -79,8 +79,13 @@ def _write(ts, tag, what, how_json, where_src):
     _ledger.db.commit()
 
 
-def fail(tag: str, what: str, fatal: bool = False, **how) -> None:
-    """THE funnel. Writes the row, alerts, then raises iff fatal-class."""
+def fail(tag: str, what: str, fatal: bool = False, alert: bool = True,
+         **how) -> None:
+    """THE funnel. Writes the row, alerts, then raises iff fatal-class.
+
+    alert=False (P10 §3.2): the ROW is still written — R5 keeps full fidelity
+    in data — but the phone is not paged by this call; the caller owns a
+    debounced page of its own. FATALs always page regardless."""
     ts = time.time()
     caller = inspect.stack()[1]
     where_src = f"{caller.filename.rsplit('/', 1)[-1]}:{caller.lineno}"
@@ -98,7 +103,7 @@ def fail(tag: str, what: str, fatal: bool = False, **how) -> None:
         log.error("failure-ledger write error (continuing): %s", e)
 
     try:
-        if _alert_fn is not None:
+        if _alert_fn is not None and (alert or fatal):
             if fatal:
                 _alert_fn(f"⛔ FATAL [{tag}] {what}")
             else:

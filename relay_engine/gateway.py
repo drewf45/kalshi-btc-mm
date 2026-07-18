@@ -133,6 +133,40 @@ class Gateway:
         self.backoff_until: Dict[str, float] = {}
         self.reject_counts: Dict[str, int] = {}
         self.venue_rejects = 0
+        # P10 §4: wall-reject backoff — identical ENTRY re-proposals rest 30s.
+        # Keyed (lane, market) holding (tag, fingerprint, until); the
+        # fingerprint includes the touch, so a moved book re-opens the door.
+        self.wall_backoff: dict = {}
+        self.wall_reject_times: dict = {}   # (lane, market, tag) -> [monotonic ts]
+        self._storm_paged: set = set()
+        self.suppressed_counts: Dict[str, int] = {}  # R5: every suppressed attempt counted
+        self.alert_fn = lambda msg: None    # runner wires Telegram (WALL_STORM page)
+
+    # P10 §4 knobs
+    WALL_BACKOFF_S = 30.0
+    WALL_STORM_N = 20          # >20 same-key rejects in 60s = a storm
+    WALL_STORM_WINDOW_S = 60.0
+
+    def _note_wall_reject(self, order: "Order", tag: str, now_mono: float) -> None:
+        """§4.2: same-key reject accounting; >20/60s pages ONE WALL_STORM."""
+        key = (order.lane, order.market, tag)
+        times = self.wall_reject_times.setdefault(key, [])
+        times.append(now_mono)
+        cutoff = now_mono - self.WALL_STORM_WINDOW_S
+        while times and times[0] < cutoff:
+            times.pop(0)
+        if len(times) > self.WALL_STORM_N:
+            if key not in self._storm_paged:
+                self._storm_paged.add(key)
+                self.alert_fn(f"⚠ WALL_STORM [{tag}] {order.lane} "
+                              f"{order.market} n={len(times)}")
+                failures.fail("WALL_STORM",
+                              f"{tag} {order.lane} {order.market} "
+                              f"n={len(times)} in {int(self.WALL_STORM_WINDOW_S)}s",
+                              lane=order.lane, market=order.market,
+                              wall_tag=tag, alert=False)
+        else:
+            self._storm_paged.discard(key)  # storm subsided — next one pages again
 
     def note_backoff(self, market: str, seconds: float = 30.0) -> None:
         import time as _t
@@ -165,7 +199,10 @@ class Gateway:
     # ------------------------------------------------------------------
     # THE submit path (single-threaded, stated above)
     # ------------------------------------------------------------------
-    def submit(self, order: Order, book: OrderBook) -> SubmitResult:
+    def submit(self, order: Order, book: OrderBook,
+               now_mono: Optional[float] = None) -> SubmitResult:
+        import time as _t
+        now_mono = _t.monotonic() if now_mono is None else now_mono
         tid = threading.get_ident()
         if self._submit_thread is None:
             self._submit_thread = tid
@@ -189,13 +226,36 @@ class Gateway:
                 # P7: a venue-rejected market rests before it is re-asked
                 raise WallRejection("REJECT_BACKOFF",
                                     f"{order.market} in post-reject backoff")
-            self._wall_band_and_single_entry(order)
-            self._wall_net_risk_and_at_risk(order)
-            self._wall_wrong_way_tick(order)
-            self._wall_taker_entry(order, book)
-            self._wall_pct_of_book(order)
-            self._wall_sizing_tier(order)
-            self._wall_fee_tripwire(order)
+            # P10 §4.1: PRE-wall suppression — an identical rejected ENTRY
+            # (same proposal AND same touch) rests 30s. Exits/cuts never reach
+            # this branch (risk_reducing above). Counters still count (R5).
+            fp_key = (order.side, order.price_cents, order.count,
+                      book.best_yes_bid() if book else None,
+                      book.best_no_bid() if book else None)
+            bo = self.wall_backoff.get((order.lane, order.market))
+            if bo is not None:
+                tag, stored_fp, until = bo
+                if now_mono < until and stored_fp == fp_key:
+                    self.suppressed_counts[tag] = \
+                        self.suppressed_counts.get(tag, 0) + 1
+                    self._note_wall_reject(order, tag, now_mono)  # storms see it
+                    raise WallRejection("WALL_BACKOFF",
+                                        f"identical re-propose suppressed ({tag})")
+                del self.wall_backoff[(order.lane, order.market)]
+            try:
+                self._wall_band_and_single_entry(order)
+                self._wall_net_risk_and_at_risk(order)
+                self._wall_wrong_way_tick(order)
+                self._wall_taker_entry(order, book)
+                self._wall_pct_of_book(order)
+                self._wall_sizing_tier(order)
+                self._wall_fee_tripwire(order)
+            except WallRejection as e:
+                if order.purpose == "ENTRY":
+                    self.wall_backoff[(order.lane, order.market)] = \
+                        (e.wall, fp_key, now_mono + self.WALL_BACKOFF_S)
+                    self._note_wall_reject(order, e.wall, now_mono)
+                raise
 
         # Rate governor: entries need a token; risk reduction is always allowed
         # (it may overdraw the bucket, loudly).

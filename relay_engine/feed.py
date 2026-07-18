@@ -34,7 +34,19 @@ log = logging.getLogger("relay.feed")
 PRICE_KEYS = ("price", "price_dollars", "price_fp", "yes_price", "yes_price_dollars")
 DELTA_KEYS = ("delta", "delta_fp", "change")
 QTY_KEYS = ("count", "count_fp", "quantity", "qty", "size")
+SIDE_KEYS = ("side",)  # P10 §1: side comes off the wire or the frame is refused
 MAX_CONSECUTIVE_SHAPE_FAILURES = 3
+
+
+def _parse_side(raw_side) -> Optional[str]:
+    """P10 §1: NO DEFAULT SIDE — the deployed `m.get("side", "yes")` silently
+    landed every side-less delta on the YES book (a crossed-book factory).
+    Accepts yes/no case-insensitively; anything else is a shape failure."""
+    if isinstance(raw_side, str):
+        s = raw_side.strip().lower()
+        if s in ("yes", "no"):
+            return s
+    return None
 
 
 def _extract(m: dict, keys) -> object:
@@ -105,7 +117,7 @@ class Feed:
     CHANNELS = ("orderbook_delta", "ticker", "trade", "fill", "market_positions",
                 "market_lifecycle")
 
-    def __init__(self, ladder: DegradeLadder, recorder=None):
+    def __init__(self, ladder: DegradeLadder, recorder=None, on_poison=None):
         self.ladder = ladder
         self.recorder = recorder
         self.books: Dict[str, OrderBook] = {}
@@ -114,6 +126,12 @@ class Feed:
         self.book_units: Optional[str] = None         # P5 §3: asserted on first snapshot
         self.shape_failures = 0                       # P6 §1: consecutive unparseable deltas
         self.frames_seen = 0                          # P7: storm telemetry
+        # P10 §2: coherence machinery. resync_needed is the runner's work queue
+        # (markets whose book needs a fresh snapshot); on_poison(market, yb, nb)
+        # fires ONCE per poison episode.
+        self.resync_needed: set = set()
+        self.on_poison = on_poison or (lambda market, yb, nb: None)
+        self._nosnap_banked: set = set()   # markets already banked for no-foundation deltas
 
     def note_sent(self, payload: str) -> None:
         """Runner registers each subscribe/command payload for the error autopsy."""
@@ -170,21 +188,30 @@ class Feed:
         mtype = msg.get("type")
         m = msg.get("msg", {})
         market = m.get("market_ticker", "")
+        seq = msg.get("seq")
         if mtype == "orderbook_snapshot" and market:
             yes_levels, yes_fps = self._parse_levels(m.get("yes") or [], market, raw)
             no_levels, no_fps = self._parse_levels(m.get("no") or [], market, raw)
             book = self.book(market)
             book.apply_snapshot(yes_levels, no_levels, ts=now,
                                 yes_fp=yes_fps, no_fp=no_fps)
+            if seq is not None:
+                book.last_seq = int(seq)
             self.shape_failures = 0
+            self._nosnap_banked.discard(market)
+            self.resync_needed.discard(market)
+            self._check_coherence(book, market, raw)
             self.ladder.snapshot_resynced()
         elif mtype == "orderbook_delta" and market:
-            # P6 §1: NO DEFAULTS. Price/delta come off the wire through the key
-            # ladder or the frame is not a price event — tagged, banked with
-            # the raw frame, book dropped, resync requested, engine continues.
+            # P6 §1: NO DEFAULTS. Price/delta/SIDE come off the wire through
+            # the key ladders or the frame is not a price event — tagged,
+            # banked with the raw frame, book dropped, resync requested,
+            # engine continues.
             raw_price = _extract(m, PRICE_KEYS)
             raw_delta = _extract(m, DELTA_KEYS)
-            if raw_price in (None, 0, "0", "0.0") or raw_delta is None:
+            side = _parse_side(_extract(m, SIDE_KEYS))
+            if (raw_price in (None, 0, "0", "0.0") or raw_delta is None
+                    or side is None):
                 self.shape_failures += 1
                 self.drop_book(market)
                 self.ladder.ws_lost("frame shape unknown — book dropped, resync required")
@@ -194,19 +221,65 @@ class Feed:
                         f"{self.shape_failures} consecutive unparseable delta frames",
                         fatal=True, last_raw_frame=raw)
                 failures.fail("FRAME_SHAPE_UNKNOWN",
-                              f"delta frame without price/delta on {market}",
+                              f"delta frame without price/delta/side on {market}",
                               raw_frame=raw)
+                return
+            # The frame PARSED — the consecutive-unparseable count resets here
+            # even if the delta is refused below (foundation/seq are book-state
+            # laws, not wire-dialect damage).
+            self.shape_failures = 0
+            # P10 §1: a delta may only land on a SNAPSHOT FOUNDATION — a book
+            # rebuilt from deltas alone (post-drop) is fiction and goes crossed.
+            book = self.books.get(market)
+            if book is None or not book.has_snapshot:
+                self.resync_needed.add(market)
+                if market not in self._nosnap_banked:
+                    self._nosnap_banked.add(market)
+                    failures.fail("DELTA_WITHOUT_SNAPSHOT",
+                                  f"delta on {market} with no snapshot foundation "
+                                  f"— refused, resync requested", market=market)
+                return
+            # P10 §1: a seq gap means missed deltas — the book has silently
+            # drifted; refuse to keep applying onto a stale foundation.
+            if seq is not None and book.last_seq is not None \
+                    and int(seq) != book.last_seq + 1:
+                self.drop_book(market)
+                self.resync_needed.add(market)
+                failures.fail("BOOK_SEQ_GAP",
+                              f"{market}: delta seq {seq} after {book.last_seq} "
+                              f"— book dropped, resync requested",
+                              market=market, seq=seq, last_seq=book.last_seq)
                 return
             cents = self._parse_price(raw_price)
             fp = str(raw_price) if (self.book_units == "dollars"
                                     and isinstance(raw_price, str)) else None
-            self.book(market).apply_delta(m.get("side", "yes"), cents,
-                                          int(Decimal(str(raw_delta))), ts=now,
-                                          fp=fp)
-            self.shape_failures = 0
+            book.apply_delta(side, cents, int(Decimal(str(raw_delta))), ts=now,
+                             fp=fp)
+            if seq is not None:
+                book.last_seq = int(seq)
+            self._check_coherence(book, market, raw)
         if self.recorder is not None and market:
             self.recorder.record(market, raw, now)
         self.ladder.clean_frame()
+
+    # ── P10 §2: the coherence invariant (P7 §1c, now actually built) ────
+    def _check_coherence(self, book: OrderBook, market: str, raw: str) -> None:
+        """After EVERY apply: yes+no > 101 → POISON the book, request resync,
+        page once per episode. Never FATAL — one market's corrupt book must
+        not stop the others; a clean snapshot clears the poison."""
+        if book.coherent():
+            return
+        yb, nb = book.best_yes_bid(), book.best_no_bid()
+        new_episode = not book.poisoned
+        book.poisoned = True
+        self.resync_needed.add(market)
+        failures.fail("BOOK_INCOHERENT",
+                      f"{market}: yes {yb} + no {nb} = {yb + nb} > 101 — book "
+                      f"POISONED, snapshot resync forced",
+                      market=market, yes=yb, no=nb, last_frame=raw[:1000],
+                      alert=False)  # the page is the episode line below, once
+        if new_episode:
+            self.on_poison(market, yb, nb)
 
     # ── P5 §3: first-frame unit assertion (Trader verify) ──────────────
     # The REST book is fp-dollars; the WS payload's units are asserted on the
@@ -269,4 +342,6 @@ class Feed:
     def socket_died(self, why: str = "socket closed") -> None:
         self.book_units = None      # units re-assert per connection
         self.shape_failures = 0     # the consecutive count is per connection
+        self.resync_needed.clear()  # reconnect re-snapshots every market anyway
+        self._nosnap_banked.clear()
         self.ladder.ws_lost(why)
