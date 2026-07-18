@@ -313,7 +313,18 @@ class CashProtocol:
         )
         self.ledger.db.commit()
         self.alert(f"CASH DELTA POSITIVE +{delta}c — confirmed without halt. {breakdown}")
+        self._rescale_after_movement()
         return "CONFIRMED_POSITIVE"
+
+    def _rescale_after_movement(self) -> None:
+        """P16 §3: a CONFIRMED movement re-baselines the caps (C.2) and pages
+        the NEW book's sizing — deposit day speaks its own new numbers."""
+        self.ledger.snapshot_caps_at_boot()
+        try:
+            from .boot import sizing_line
+            self.alert(sizing_line(self.ledger.book_cents()))
+        except Exception:
+            pass  # the page is a courtesy; the rescale is the law
 
     def confirm_cash(self, now: Optional[float] = None) -> bool:
         """/confirm_cash — confirmation is consent: re-baseline + row; entries resume."""
@@ -331,6 +342,7 @@ class CashProtocol:
         self.pending = None
         self.entries_halted = False
         self.alert(f"CASH MOVEMENT CONFIRMED {p.delta_cents}c — re-baselined, entries resumed.")
+        self._rescale_after_movement()
         return True
 
     def deny_cash(self) -> None:

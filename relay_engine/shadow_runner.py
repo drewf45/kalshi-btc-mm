@@ -453,13 +453,14 @@ class ShadowEngine:
         # Tape 0718: the deployed worker booted with DB=relay_shadow.db (no
         # RELAY_DB_PATH) — an EPHEMERAL database. Halt persistence, booking
         # dedup, and every autopsy depend on the disk surviving a redeploy.
-        import os as _os
-        if config.live_submit_enabled() and not _os.environ.get("RELAY_DB_PATH"):
+        # P16 §1: the fallback chain means only a truly EPHEMERAL resolution
+        # (no RELAY_DB_PATH, no legacy K_WORKER_DB dir to derive) warns.
+        if config.live_submit_enabled() and config.DB_PATH_SOURCE == "ephemeral":
             self.telegram.alert(
                 "⚠ RELAY_DB_PATH unset in LIVE — the DB is EPHEMERAL: the "
                 "two-strike halt, fill dedup, and autopsy evidence will NOT "
                 "survive a redeploy. Set RELAY_DB_PATH to a persistent disk "
-                "path (e.g. /var/data/relay_shadow.db).")
+                "path (e.g. /var/data/relay_live.db).")
         return boots_last_hour
 
     AV_RETRY_SPACING_S = 5.0   # P9 §2: 3 attempts >= 5s apart = retry x3 over 15s

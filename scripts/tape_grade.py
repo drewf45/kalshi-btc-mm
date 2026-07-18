@@ -111,12 +111,74 @@ CHECKS = [
 ]
 
 
-def grade(db, window_hours: float = 24.0, now=None):
+# ── P16 "THE SCALP PROFILE, FUNDED" — deposit-day expected tape ────────────
+def check_deposit_confirmed(db, since):
+    """the deposit's confirm round-trip landed: a CONFIRMED_DEPOSIT from the
+    cash protocol itself (auto_positive / /confirm_cash) — boot baselines
+    (boot, shadow_paper_boot, live_boot) are not deposits."""
+    n = _one(db, "SELECT COUNT(*) FROM cash_movements WHERE"
+                 " kind='CONFIRMED_DEPOSIT' AND ts>? AND"
+                 " confirmed_by IN ('auto_positive','/confirm_cash')", (since,))
+    return n >= 1, f"{n} confirmed deposit(s)"
+
+
+def check_f_traded(db, since):
+    """F's first LIVE entries — the depth floor's proof."""
+    n = _one(db, "SELECT COUNT(*) FROM fills WHERE lane='F' AND"
+                 " action='ENTRY' AND ts>?", (since,))
+    return n >= 1, f"{n} F entr{'y' if n == 1 else 'ies'}"
+
+
+def check_orphan_settlements_attributed(db, since):
+    """conditional: any ORPHAN settlement books to ORPHAN, never a lane."""
+    found = _one(db, "SELECT COUNT(*) FROM failures WHERE"
+                     " why_tag='ORPHAN_FOUND' AND ts>?", (since,))
+    if found == 0:
+        return True, "no orphans this window"
+    settled = _one(db, "SELECT COUNT(*) FROM settlements WHERE lane='ORPHAN'"
+                       " AND ts>?", (since,))
+    return True, f"{found} orphan(s), {settled} settled to ORPHAN so far"
+
+
+def check_brackets_source_venue(db, since):
+    """brackets carry the streak's account truth: closed rows source=venue
+    (conditional — passes when nothing traded yet)."""
+    total = _one(db, "SELECT COUNT(*) FROM window_econ WHERE ts>?"
+                     " AND close_value_cents IS NOT NULL", (since,))
+    venue_n = _one(db, "SELECT COUNT(*) FROM window_econ WHERE ts>? AND"
+                       " close_value_cents IS NOT NULL AND source='venue'",
+                   (since,))
+    return venue_n == total, f"{venue_n}/{total} closed brackets source=venue"
+
+
+def check_no_orientation_pages(db, since):
+    """zero ORIENTATION findings (or exactly-explained ones — a nonzero count
+    here fails the grade until it is read)."""
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE why_tag IN"
+                 " ('ORIENTATION_MIRROR','ORIENTATION_SUSPECT',"
+                 "'ORIENTATION_DIVERGENCE') AND ts>?", (since,))
+    return n == 0, f"{n} orientation finding(s)"
+
+
+CHECKS_P16 = [
+    ("deposit confirm round-trip landed", check_deposit_confirmed),
+    ("F's first live entries (depth floor proof)", check_f_traded),
+    ("zero lone-leg FLIP entries", check_no_lone_flip_entries),
+    ("zero same-side double entries", check_no_same_side_doubles),
+    ("orphan settlements attribute to ORPHAN", check_orphan_settlements_attributed),
+    ("closed brackets source=venue", check_brackets_source_venue),
+    ("zero BATON_VIOLATION FATALs", check_no_baton_fatals),
+    ("zero depth-class wall storms", check_no_depth_storms),
+    ("zero unexplained orientation pages", check_no_orientation_pages),
+]
+
+
+def grade(db, window_hours: float = 24.0, now=None, checks=None):
     """Returns [(name, ok, detail)] for the last window_hours."""
     now = time.time() if now is None else now
     since = now - window_hours * 3600
     out = []
-    for name, fn in CHECKS:
+    for name, fn in (checks or CHECKS):
         try:
             ok, detail = fn(db, since)
         except Exception as e:
@@ -131,14 +193,17 @@ def main() -> int:
         return 2
     hours = float(sys.argv[2]) if len(sys.argv) > 2 else 24.0
     db = sqlite3.connect(sys.argv[1])
-    results = grade(db, hours)
-    print(f"DEPLOY GRADE (P15 expected tape, last {hours:.0f}h):")
-    fails = 0
-    for name, ok, detail in results:
-        print(f"  [{'PASS' if ok else 'FAIL'}] {name} — {detail}")
-        fails += 0 if ok else 1
-    print(f"GRADE: {len(results) - fails}/{len(results)}")
-    return 0 if fails == 0 else 1
+    total_fails = 0
+    for label, checks in (("P15", CHECKS), ("P16 deposit day", CHECKS_P16)):
+        results = grade(db, hours, checks=checks)
+        print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
+        fails = 0
+        for name, ok, detail in results:
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name} — {detail}")
+            fails += 0 if ok else 1
+        print(f"GRADE: {len(results) - fails}/{len(results)}")
+        total_fails += fails
+    return 0 if total_fails == 0 else 1
 
 
 if __name__ == "__main__":

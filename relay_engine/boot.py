@@ -70,7 +70,25 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
             + (" [confirmed writing]" if recorder.confirmed_writing() else " [awaiting first frame]"))
     if auth_line is not None:
         lines.append(auth_line)  # "AUTH: key id …last4 loaded, PEM parsed" — never more
-    lines.append(f"DB: {config.DB_PATH} (single-writer: this engine's own database)")
+    db_note = {"RELAY_DB_PATH": "",
+               "derived": " — derived from legacy K_WORKER_DB dir; set RELAY_DB_PATH to pin",
+               "ephemeral": " — EPHEMERAL (set RELAY_DB_PATH)"}[config.DB_PATH_SOURCE]
+    lines.append(f"DB: {config.DB_PATH} (single-writer: this engine's own database)"
+                 + db_note)
+    # P16 §2: THE SCALP PROFILE — bank small wins, every lane, every market.
+    lines.append("PROFILE — bank small wins, every lane, every market:")
+    lines.append("  FLIP: pair-formable-or-nothing · take entry+4 · scratch entry-3 "
+                 "· sit-out@3 — margin UNPROVEN, mechanism proven (R-1)")
+    lines.append("  F: hold-to-settlement · depth floor stands in thin books "
+                 "[STOP-AND-REPORT: passthrough CutParams unregistered — "
+                 "catastrophic backstop unreachable, awaiting Drew's ruling]")
+    lines.append("  H8: delta-gated >=99% survive · hold to settlement")
+    lines.append("  D: cheap entry + resting recovery take (the baton)")
+    lines.append("  P: displacement fade with take (negative-spec born)")
+    lines.append("  ORPHAN: adopted at boot · D-grade custody · own attribution")
+    lines.append("  WALLS: gross+net risk<=3/event · $-at-risk cap · two-strike "
+                 "halt (/reset_halt) · orientation sentinels · narrated fills · "
+                 "graded tape")
     lines.append("==================================================================")
     return lines
 

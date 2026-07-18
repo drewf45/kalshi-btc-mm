@@ -65,6 +65,9 @@ CHECKS = [
     ("ratifications: orphans, pair-or-nothing, depth floor, gross wall (P15)", [
         "tests/test_p15_ratifications.py",
     ]),
+    ("the scalp profile, funded: db chain, rescale, deposit tape (P16)", [
+        "tests/test_p16_funded.py",
+    ]),
 ]
 
 

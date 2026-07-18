@@ -710,6 +710,46 @@ lane · ✅ ORPHAN adoption recorded for any quarantine (incl. the current myste
 YES at next boot) · ✅ FLIP R6 pack line rendering daily · ❌ no BATON_VIOLATION
 FATALs on cut-vs-fill races (P14 in force).
 
+## WO-P16 FINAL — "THE SCALP PROFILE, FUNDED" (the capstone)
+
+Suite at this commit: **295 passed**; preflight **14/14**.
+
+- **§1 TRUE — env-name resilience**: `config.resolve_db_path` chain:
+  `RELAY_DB_PATH` → `dirname(K_WORKER_DB)/relay_live.db` (the DISK is the
+  constant; `k_worker_surface.db` itself is NEVER opened — different engine,
+  different schema, single-writer law) → the ephemeral default with the standing
+  warning. Boot tape notes the source; the LIVE ephemeral page now fires only on
+  a truly ephemeral resolution. All three branches tested.
+- **§2 — the scalp profile, verified with ONE STOP-AND-REPORT**: every listed
+  rule confirmed present and reachable (pair-formable, depth floor, orphan
+  adoption, gross wall, orientation sentinels, narration, brackets, tape_grade,
+  H8 delta gate, D baton, P negative-spec) EXCEPT: **F's "custodian passthrough,
+  catastrophic-only" is UNREACHABLE** — the passthrough mechanism exists in
+  `should_cut` (custodian.py, honors CATASTROPHIC_PROB) but no CutParams was
+  ever registered for lane F, so `should_cut` returns None before reaching it.
+  F holds to settlement UNCONDITIONALLY (loss bounded at one-lot by entry cost).
+  Per §2: reported, NOT patched — the fix is one registration line
+  (`set_lane_params("F", CutParams(..., passthrough=True))`) awaiting Drew's
+  ruling. The PROFILE block prints on every boot tape, this finding included.
+- **§3 TRUE — deposit day**: a confirmed movement (auto-positive AND
+  /confirm_cash branches) now re-baselines the caps immediately
+  (`snapshot_caps_at_boot`) and pages the NEW book's sizing line. Rescale math
+  tested at $35/$50/$100 (budgets 291/416/833¢; PROBE still caps at one lot);
+  the worst-day rail arms nonzero at $50 (=$25 over the floor) and reads $0
+  under it. Note: positive deltas auto-confirm without a prompt (the ratified
+  P8 cash law) — stricter than §3's prompt-then-confirm description.
+- **§4 TRUE — the deposit-day expected tape**: `CHECKS_P16` in tape_grade
+  (deposit confirm landed [boot baselines excluded], F's first entries, FLIP
+  pairs only, no doubles, orphan settlements attribute to ORPHAN, closed
+  brackets source=venue, no BATON FATALs, no depth storms, no unexplained
+  orientation pages). The pack grades BOTH suites with SEPARATE retirement
+  (P15 retires on its clean tape while P16 stays active until deposit day);
+  the 24h FINDING law applies per suite.
+
+**Then: HANDS OFF except bugs** — the accumulation window runs to Saturday's
+retro, which judges lanes on margin. The machine writes most of that document
+itself.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -122,7 +122,23 @@ SHADOW_PAPER_BANKROLL_USD = 100.0
 # Storage — single-writer law (§A1): this engine's OWN database, never the
 # live surface DB.
 # ---------------------------------------------------------------------------
-DB_PATH = os.getenv("RELAY_DB_PATH", "relay_shadow.db")
+# P16 §1: the disk is the constant; variable names are not. Fallback chain:
+# RELAY_DB_PATH → the legacy K_WORKER_DB's DIRECTORY (never its file — a
+# different engine's schema; single-writer law) → the ephemeral default.
+def resolve_db_path(env=None):
+    """Returns (path, source) — source in {'RELAY_DB_PATH','derived','ephemeral'}."""
+    env = os.environ if env is None else env
+    p = env.get("RELAY_DB_PATH")
+    if p:
+        return p, "RELAY_DB_PATH"
+    legacy = env.get("K_WORKER_DB")
+    if legacy:
+        return os.path.join(os.path.dirname(legacy) or ".",
+                            "relay_live.db"), "derived"
+    return "relay_shadow.db", "ephemeral"
+
+
+DB_PATH, DB_PATH_SOURCE = resolve_db_path()
 
 # Kalshi endpoints (read-only usage until cutover, §B3)
 API_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com").rstrip("/")
