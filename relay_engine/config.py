@@ -159,6 +159,10 @@ RATE_REFILL_PER_SECOND = 2.0  # tokens/second
 # ---------------------------------------------------------------------------
 # Fee tripwire (C.3): expected fee schedule. The tripwire watches BOTH the
 # multiplier and the maker-fee designation list; any observed deviation halts entries.
+# P24 §2.3: DISPLAY/ESTIMATE-ONLY — booked fees are READ from the venue's
+# fill records and order responses (venue._resolve_fee, one parser, both
+# entrances), never imagined from this number. It survives only in the
+# tripwire's expectation and the scoreboard's breakeven ESTIMATES.
 # ---------------------------------------------------------------------------
 EXPECTED_FEE_MULTIPLIER = 0.07
 EXPECTED_MAKER_FEE_SERIES = frozenset()  # series currently designated as maker-fee-charging

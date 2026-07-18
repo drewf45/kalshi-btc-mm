@@ -228,7 +228,8 @@ def test_confirmed_needle_suppresses_open_entry(flip):
 # ── B1/B3: the registry and its own wall ───────────────────────────────────
 def test_registry_parses_all_knowns():
     entries = semantics.parse_registry()
-    assert len(entries) == 17  # 16 at P21 + "The score decides the size" (P22)
+    # 16 at P21 + the score (P22) + fee truth and the anchor shield (P24)
+    assert len(entries) == 19
     for e in entries:
         assert e["law"] and e["code"] and e["tape"], e["answer"]
 

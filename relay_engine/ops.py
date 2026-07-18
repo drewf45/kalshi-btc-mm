@@ -321,13 +321,14 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     try:
         from scripts.tape_grade import (CHECKS, CHECKS_P16, CHECKS_P17,
                                         CHECKS_P18, CHECKS_P19, CHECKS_P21,
-                                        CHECKS_P22)
+                                        CHECKS_P22, CHECKS_P24)
         suites = (("P15", "p15", CHECKS), ("P16 deposit day", "p16", CHECKS_P16),
                   ("P17 show up", "p17", CHECKS_P17),
                   ("P18 the detective", "p18", CHECKS_P18),
                   ("P19 let it run", "p19", CHECKS_P19),
                   ("P21 the doctrine engine", "p21", CHECKS_P21),
-                  ("P22 the cell scoreboard", "p22", CHECKS_P22))
+                  ("P22 the cell scoreboard", "p22", CHECKS_P22),
+                  ("P24 shield, fees, reversal", "p24", CHECKS_P24))
         from scripts.tape_grade import grade
         for label, prefix, checks in suites:
             passes = int(ledger.get_state(f"{prefix}_grade_passes") or 0)

@@ -589,25 +589,32 @@ class ShadowEngine:
 
     def _salvage_anchor(self, market: str, side: str):
         """P19 §2.1: (d_entry, t_entry, p_entry) at custody registration —
-        the delta table via spotlead's semantics, at the entry instant."""
+        the delta table via spotlead's semantics, at the entry instant.
+        P24 §1.2: a miss returns its CAUSE as a string (spot | strike |
+        close | table) — four distinct organs, no longer indistinguishable;
+        the 1715 class gets a named cause instead of a shrug."""
         from . import delta, spotlead as _sl
         spot = self.fresh_spot(time.time())
+        if spot is None:
+            return "spot"      # spot stale/absent
         meta = self._meta(market)
         strike = _sl.pick_strike(spot, meta.get("boundary_lo"),
                                  meta.get("boundary_hi"))
+        if strike is None:
+            return "strike"    # no boundary metadata
         close_ts = meta.get("close_ts")
         if close_ts is None:
             from .lanes import infer_close_ts_from_ticker
             close_ts = infer_close_ts_from_ticker(market)
-        if spot is None or strike is None or close_ts is None:
-            return None
+        if close_ts is None:
+            return "close"     # no close timestamp anywhere
         t_rem = close_ts - time.time()
         if t_rem <= 0:
-            return None
+            return "close"     # window already over by the clock
         d = abs(spot - strike)
         ps = delta.p_survive(d, t_rem)
         if ps is None:
-            return None
+            return "table"     # delta-table cell miss
         on_side = "yes" if spot >= strike else "no"
         p_entry = ps if on_side == side else 1.0 - ps
         return (d, t_rem, p_entry)

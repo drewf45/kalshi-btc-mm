@@ -461,6 +461,7 @@ DOLLAR_FORM_KEYS = frozenset({
     "yes_price_dollars", "no_price_dollars", "price_dollars",
     "fee_cost",                       # tape 0709: '0.000000' dollars-fp
     "taker_fee_dollars", "maker_fee_dollars",
+    "average_fee_paid",               # P24 §2.1: PER-CONTRACT avg, dollars
 })
 CENT_FORM_KEYS = frozenset({
     "yes_price", "no_price", "price",           # legacy: integer CENTS
@@ -473,8 +474,13 @@ CENT_FORM_KEYS = frozenset({
 _YES_PRICE_KEYS = ("yes_price_dollars", "yes_price", "yes_price_cents")
 _NO_PRICE_KEYS = ("no_price_dollars", "no_price", "no_price_cents")
 _SIDELESS_PRICE_KEYS = ("price_dollars", "price", "price_cents")
-_FEE_KEYS = ("fee_cost", "taker_fee_dollars", "maker_fee_dollars",
-             "fee", "taker_fee", "maker_fee")
+# P24 §2.1: the fee ladder is a (key, per_contract) TABLE. Total-of-record
+# keys stay first (doc-cited, VENUE_SEMANTICS.md); average_fee_paid is the
+# venue's PER-CONTRACT average in dollars (the order-response form):
+# cents = ceil(avg × count × 100). No form-guessing — the migration is live.
+_FEE_KEYS = (("fee_cost", False), ("taker_fee_dollars", False),
+             ("maker_fee_dollars", False), ("average_fee_paid", True),
+             ("fee", False), ("taker_fee", False), ("maker_fee", False))
 
 
 def _field_to_cents(key: str, raw) -> Optional[float]:
@@ -556,13 +562,39 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
         log.warning(f"[FILLS] Unparsed fill record (raw): {fill}")
         _fill_parse_warned = True
 
-    for fk in _FEE_KEYS:
-        c = _field_to_cents(fk, _get(fk))
-        if c is not None:
-            fee_cents = int(round(c))
-            break
+    fee_cents = _resolve_fee(_get, count)
 
     return cost_cents, fee_cents, count
+
+
+def _resolve_fee(get_fn, count: int) -> int:
+    """P24 §2: ONE fee parser, both entrances (fill records AND order
+    responses). Walks the (key, per_contract) table; per-contract averages
+    book ceil(avg × count) — the venue rounds fees UP, so do we."""
+    import math as _math
+    for fk, per_contract in _FEE_KEYS:
+        c = _field_to_cents(fk, get_fn(fk))
+        if c is not None:
+            return (int(_math.ceil(c * max(1, count))) if per_contract
+                    else int(round(c)))
+    return 0
+
+
+def parse_response_fee(resp, count: int) -> int:
+    """P24 §2.2: the order-response entrance (the 21:13:44 cut's entrance) —
+    the venue's own fee on the response, read through the same table.
+    Responses sometimes nest the record under 'order'; both shapes read."""
+    if not isinstance(resp, dict):
+        return 0
+    rec = resp.get("order") if isinstance(resp.get("order"), dict) else resp
+
+    def _get(k):
+        v = rec.get(k)
+        if v is None and rec is not resp:
+            v = resp.get(k)
+        return v
+
+    return _resolve_fee(_get, count)
 
 
 def parse_fills(fill_records: list, our_side: str) -> Tuple[Optional[float], int, int]:

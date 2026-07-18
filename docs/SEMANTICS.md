@@ -141,6 +141,25 @@ re-runs every TAPE line here forever (registry tests never retire).
 - CODE: `relay_engine/scoring.py:1`
 - TAPE: `tier changes earned: Wilson math on every page (§4.2)`
 
+### 18. Fees are read, never imagined
+- LAW: booked fees come from the venue's OWN records — fill records and
+  order responses through ONE parser (the (key, per_contract) table;
+  average_fee_paid is per-contract dollars, booked ceil(avg × count));
+  EXPECTED_FEE_MULTIPLIER is display/estimate-only (P24 §2 — the
+  divergence alarm's meaning restored).
+- CODE: `relay_engine/venue.py:481`
+- TAPE: `crossfire receipts show the venue's fee (§2)`
+
+### 19. The anchor never goes missing
+- LAW: every adopted position carries a salvage anchor — the delta
+  table's p at entry, or the ENTRY PRICE itself as the probability
+  (WARN-tagged with the organ that missed: spot|strike|close|table);
+  shieldless is an impossible class that pages. The anchor's p is also
+  the reversal doctrine's entry probability — a placeholder zero can
+  never mean "infinite profit" (P24 §1/§3).
+- CODE: `relay_engine/fills.py:160`
+- TAPE: `anchor misses name their cause (§1.2)`
+
 ## QUESTION (articulated ignorance — collectors named, running)
 
 - **Lane margins** — which lanes clear fees at what hit-rate? Collector:

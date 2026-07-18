@@ -62,6 +62,10 @@ class SubmitResult:
     order_id: str
     shadow: bool
     payload: dict
+    # P24 §2.2: the venue's raw order response rides back so the booking
+    # path can read the response's OWN fee (parse_response_fee) — never
+    # imagined from a multiplier. None in shadow.
+    resp: Optional[dict] = None
 
 
 class FeeTripwire:
@@ -331,7 +335,8 @@ class Gateway:
         log.warning("LIVE ORDER PLACED %s %s %s %d@%dc post_only=%s oid=%s",
                     order.lane, order.market, order.side, order.count,
                     order.price_cents, not order.crossfire, oid)
-        return SubmitResult(order_id=oid, shadow=False, payload=payload)
+        return SubmitResult(order_id=oid, shadow=False, payload=payload,
+                            resp=resp)
 
     def cancel_tristate(self, order_id: str) -> str:
         """P14 §1: CANCELED | ALREADY_TERMINAL | UNKNOWN. The venue's terminal

@@ -22,6 +22,7 @@ parsed.
 | `fee_cost` | **dollars** (fp string, e.g. `'0.000000'`) | live tape 0709 |
 | `taker_fee_dollars`, `maker_fee_dollars` | **dollars** | migration forms |
 | `fee`, `taker_fee`, `maker_fee` | **cents** (legacy) | legacy API |
+| `average_fee_paid` | **dollars, PER CONTRACT** — cents = ceil(avg × count × 100) | order responses (the 21:13:44 cut's entrance), P24 §2.1 |
 | `count_fp` | fp count string (`'1.00'`) — Decimal→int | live tape 0709 |
 | `count`, `quantity`, `qty` | integer | legacy |
 

@@ -155,23 +155,57 @@ class FillBooker:
 
             window = f"w-{order.market}"
             state = ENTERED if action == "ENTRY" else EXITED
-            self.surface.write_row(order.lane, order.market, window, state,
-                                   detail=f"fill={fid} @{int(round(cost))}c x{count} fee={fee_cents}c")
+            anchor_note = ""
 
             if action == "ENTRY" and self.custodian is not None:
                 from .custodian import OpenPosition
+                # P24 §1 — THE ANCHOR NEVER GOES MISSING. The anchor_fn
+                # returns (d, t, p) on a table hit, or a STRING naming which
+                # organ missed (§1.2: spot|strike|close|table) — the 1715
+                # class gets a named cause instead of a shrug.
                 anchor = self.anchor_fn(order.market, order.side)
+                miss = anchor if isinstance(anchor, str) else None
+                if not isinstance(anchor, tuple):
+                    anchor = None
                 if anchor is None:
-                    log.info("SALVAGE anchor absent for %s %s — salvage "
-                             "disabled for this position", order.market,
-                             order.lane)
-                d_e, t_e, p_e = anchor if anchor is not None else (None,) * 3
+                    from . import failures
+                    if cost > 0:
+                        # §1.1: price-implied shield — the entry price IS a
+                        # probability; salvage never runs shieldless. WARN
+                        # class (the INFO-silence class retired).
+                        anchor = (None, None, cost / 100.0)
+                        failures.fail(
+                            "ANCHOR_FROM_PRICE",
+                            f"{order.market} {order.lane}: salvage anchor "
+                            f"from ENTRY PRICE {int(round(cost))}c — "
+                            f"anchor miss: {miss or 'unknown'}",
+                            market=order.market, lane=order.lane,
+                            cause=miss or "unknown")
+                    else:
+                        # no table AND no price — should be impossible
+                        failures.fail(
+                            "SHIELDLESS",
+                            f"⚠ SHIELDLESS {order.market} {order.lane}: no "
+                            f"anchor and no entry price — impossible class,"
+                            f" audit this booking",
+                            market=order.market, lane=order.lane)
+                if anchor is not None:
+                    d_e, t_e, p_e = anchor
+                    anchor_note = (" anchor="
+                                   + ("table" if d_e is not None else "price"))
+                else:
+                    d_e, t_e, p_e = (None,) * 3
                 self.custodian.adopt(OpenPosition(
                     event=order.event, market=order.market, lane=order.lane,
                     side=order.side, count=count,
-                    entry_price_cents=int(round(cost)), entry_p_win=0.0,
+                    entry_price_cents=int(round(cost)),
+                    # P24 §3: the zero in the reversal dies at the WRITER —
+                    # entry_p_win is the anchor's p_entry (table or
+                    # price-implied), never a placeholder.
+                    entry_p_win=(p_e if p_e is not None else 0.0),
                     size_tier=order.size_tier, entry_time=now,
                     d_entry=d_e, t_entry=t_e, p_entry=p_e))
+
             elif action != "ENTRY" and self.custodian is not None:
                 # P14: the take FILLED — custody of a flat position ends here
                 # (the 7:34 race began with a stale custodian pos object).
@@ -179,6 +213,11 @@ class FillBooker:
                         (order.event, order.market, order.lane), 0) == 0:
                     self.custodian.positions.pop(
                         f"{order.market}:{order.lane}", None)
+
+            self.surface.write_row(order.lane, order.market, window, state,
+                                   detail=f"fill={fid} @{int(round(cost))}c "
+                                          f"x{count} fee={fee_cents}c"
+                                          + anchor_note)
             stats["booked"] += 1
             self.on_booked(order, action, int(round(cost)), count, now,
                            fee_cents)

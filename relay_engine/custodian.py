@@ -486,7 +486,11 @@ class Custodian:
             return "RAPID_DROP"
         if (entry - exit_prob_cents) >= p.max_loss_cents_per_contract:
             return "HARD_STOP_PER_CONTRACT"
-        entry_prob = pos.entry_p_win
+        # P24 §3 belt: a zero can NEVER mean "infinite profit" again — the
+        # DUMP-ported reversal doctrine tightens on REAL gain over entry.
+        # (The 0.0-placeholder at adoption made every position look
+        # infinitely profitable to this one rule; fixed at the writer too.)
+        entry_prob = pos.entry_p_win or (pos.entry_price_cents / 100.0)
         gain_above_entry = windowed_peak - entry_prob
         threshold = (p.reversal_threshold_profit
                      if gain_above_entry >= p.profit_tighten_above_entry
@@ -539,11 +543,16 @@ class Custodian:
             reason=trigger,  # P13 §1: every rule that spends money signs its work
         )
         result = self.gateway.submit(cut, book)
+        # P24 §2.2: the cut's entrance — the venue's OWN fee off the order
+        # response, through the one fee parser (never a multiplier guess).
+        from . import venue as _venue
+        fee_cents = _venue.parse_response_fee(result.resp, remaining)
         transport = self.ladder.custodian_transport() if self.ladder else "WS"
-        log.warning("CUSTODIAN CUT [%s] %s lane=%s count=%d @%dc transport=%s",
-                    trigger, pos.market, pos.lane, remaining, cut_price_cents,
-                    transport)
+        log.warning("CUSTODIAN CUT [%s] %s lane=%s count=%d @%dc fee=%dc "
+                    "transport=%s", trigger, pos.market, pos.lane, remaining,
+                    cut_price_cents, fee_cents, transport)
         self.ledger.record_fill(pos.market, pos.lane, pos.side, "CUSTODIAN_EXIT",
-                                cut_price_cents, remaining, pos.size_tier)
+                                cut_price_cents, remaining, pos.size_tier,
+                                fee_cents=fee_cents)
         del self.positions[key]
         return result.order_id

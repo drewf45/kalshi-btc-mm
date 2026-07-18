@@ -1004,6 +1004,54 @@ Suite at this commit: **364 passed**; preflight **19/19**.
   Wilson math, zero static sizing) — seventh graded suite. Registry: answer 17
   "The score decides the size" banked with its tape line.
 
+## WO-2026-07-18-RELAY-P24 COMBINED FINAL — "SHIELD, FEES, AND THE ZERO IN THE REVERSAL"
+
+Suite at this commit: **374 passed**; preflight **20/20**.
+
+- **P22 certification re-verified**: cell_outcomes writer/backfill in ledger.py,
+  tier_for consumed via scoring at the runner's submit path, /scoreboard
+  whitelisted — TRUE, nothing ordered there, nothing changed there.
+- **§1 the anchor never goes missing**: fills.py adoption — a table miss adopts
+  the PRICE-implied anchor (None, None, cost/100), banks ANCHOR_FROM_PRICE
+  (WARN class, the INFO-silence class retired) naming WHICH organ missed
+  (§1.2: `_salvage_anchor` now returns its cause as a string —
+  spot | strike | close | table — four organs, no longer indistinguishable);
+  no anchor AND no price pages ⚠ SHIELDLESS (impossible class). Every ENTERED
+  row is tagged `anchor=table|price`. §1.3 counterfactual banked as a test:
+  the 1715-15 shape with the price anchor (None, None, 0.95) fires the
+  collapse trigger mid-slide and rests the salvage maker ≥40¢ instead of
+  riding 95→16.
+- **§2 fees are read, never imagined**: the fee ladder is a (key,
+  per_contract) TABLE — total-of-record keys keep precedence;
+  `average_fee_paid` (order-response form, PER-CONTRACT dollars) books
+  ceil(avg × count × 100); VENUE_SEMANTICS.md row added. ONE parser, both
+  entrances: `venue._resolve_fee` serves parse_fill AND the new
+  `parse_response_fee` (nested-'order' and flat shapes). The gateway's
+  SubmitResult now carries the live response; `execute_cut` (the 21:13:44
+  entrance) books the response's own fee into the fill row AND the cell row —
+  scoreboard margins include booked fees. EXPECTED_FEE_MULTIPLIER demoted to
+  display/estimate-only (tripwire expectation + breakeven estimates), stated
+  in config.
+- **§3 the zero in the reversal** (the sweep's catch, verified at source:
+  fills.py hardcoded entry_p_win=0.0 → custodian's gain_above_entry was
+  always ~+1.0 → the TIGHTENED profit-reversal threshold applied to EVERY
+  position; salvage unaffected, it reads p_entry): FIXED AT THE WRITER —
+  adoption sets entry_p_win to the anchor's p_entry (post-§1 always present)
+  — and BELTED AT THE CONSUMER — `entry_prob = pos.entry_p_win or
+  entry_price/100`, a zero can never mean "infinite profit" again. Tests:
+  entry 95 / peak 96 computes gain +0.01 and holds on the STANDARD threshold
+  (pre-P24 this exact shape cut REVERSAL every time); a legacy 0.0 position
+  belts to the same hold; entry 49 / peak 80 cuts on the TIGHTENED branch —
+  the doctrine as ported.
+- **§4**: CHECKS_P24 (anchors tagged, misses named, response-fee entrance,
+  reversal belt, WINDOW_ECON silent) — eighth graded suite in pack + grader.
+  Registry: answers 18 "Fees are read, never imagined" and 19 "The anchor
+  never goes missing" banked with their tape lines (19 KNOWNs).
+- **§5 final standings**: F-bar blind spot CLOSED · fee truth CLOSED ·
+  shieldless positions CLOSED · reversal mis-tune CLOSED (found by reading
+  the consumer, not by bleeding) · salvage-K COLLECTING (every position now
+  contributes) · win-audit SATURDAY.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

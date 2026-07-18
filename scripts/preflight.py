@@ -87,6 +87,10 @@ CHECKS = [
         "tests/test_p22_scoreboard.py",
         "tests/test_sizing.py",
     ]),
+    ("shield, fees, and the zero in the reversal (P24)", [
+        "tests/test_p24_shield_fees_reversal.py",
+        "tests/test_p19_salvage.py",
+    ]),
 ]
 
 

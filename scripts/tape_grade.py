@@ -388,6 +388,66 @@ CHECKS_P19 = [
 ]
 
 
+# ── P24 "SHIELD, FEES, AND THE ZERO IN THE REVERSAL" — expected tape ───────
+ANCHOR_MISS_CAUSES = ("spot", "strike", "close", "table")
+
+
+def check_entries_carry_anchor(db, since):
+    """every F/H8 entry booking carries its anchor source (table|price)."""
+    rows = db.execute(
+        "SELECT detail FROM surface_rows WHERE state='ENTERED' AND"
+        " lane IN ('F','H8') AND ts>?", (since,)).fetchall()
+    if not rows:
+        return True, "no F/H8 entries this window"
+    bad = sum(1 for (d,) in rows if "anchor=" not in d)
+    return bad == 0, f"{bad} untagged of {len(rows)} F/H8 entries"
+
+
+def check_anchor_misses_named(db, since):
+    """every ANCHOR_FROM_PRICE row names WHICH organ missed — the 1715
+    class gets a cause (spot|strike|close|table), never a shrug."""
+    rows = db.execute(
+        "SELECT how_json FROM failures WHERE why_tag='ANCHOR_FROM_PRICE'"
+        " AND ts>?", (since,)).fetchall()
+    bad = 0
+    for (how,) in rows:
+        try:
+            if json.loads(how).get("cause") not in ANCHOR_MISS_CAUSES:
+                bad += 1
+        except Exception:
+            bad += 1
+    return bad == 0, f"{bad} shrug(s) of {len(rows)} anchor misses"
+
+
+def check_crossfire_fee_entrance(db, since):
+    """code-level: the cut's entrance books the response's OWN fee through
+    the one parser (never the multiplier)."""
+    try:
+        import inspect
+
+        from relay_engine import custodian as _c, venue as _v
+        ok = ("parse_response_fee" in inspect.getsource(_c.Custodian.execute_cut)
+              and "average_fee_paid" in inspect.getsource(_v))
+    except Exception:
+        ok = False
+    return ok, "execute_cut reads the venue's response fee"
+
+
+def check_reversal_belt_in_place(db, since):
+    """code-level: the zero in the reversal is dead at BOTH ends — the
+    writer adopts the anchor's p, the consumer belts a legacy zero."""
+    try:
+        import inspect
+
+        from relay_engine import custodian as _c, fills as _f
+        ok = ("pos.entry_p_win or (pos.entry_price_cents"
+              in inspect.getsource(_c.Custodian.should_cut)
+              and "entry_p_win=(p_e" in inspect.getsource(_f.FillBooker.sweep))
+    except Exception:
+        ok = False
+    return ok, "writer + belt both in source"
+
+
 # ── P21 "THE DOCTRINE ENGINE" — expected tape ──────────────────────────────
 def check_econ_divergence_silent(db, since):
     """A1's proof is QUIET: the netting model makes fills-P&L match broker
@@ -570,6 +630,15 @@ CHECKS_P21 = [
 ]
 
 
+CHECKS_P24 = [
+    ("every F/H8 entry carries anchor: table|price (§1.1)", check_entries_carry_anchor),
+    ("anchor misses name their cause (§1.2)", check_anchor_misses_named),
+    ("crossfire receipts show the venue's fee (§2)", check_crossfire_fee_entrance),
+    ("the reversal belt holds: no zero means profit (§3)", check_reversal_belt_in_place),
+    ("WINDOW_ECON_DIVERGENCE silent (A1 netting model)", check_econ_divergence_silent),
+]
+
+
 def grade(db, window_hours: float = 24.0, now=None, checks=None):
     """Returns [(name, ok, detail)] for the last window_hours."""
     now = time.time() if now is None else now
@@ -596,7 +665,8 @@ def main() -> int:
                           ("P18 the detective", CHECKS_P18),
                           ("P19 let it run", CHECKS_P19),
                           ("P21 the doctrine engine", CHECKS_P21),
-                          ("P22 the cell scoreboard", CHECKS_P22)):
+                          ("P22 the cell scoreboard", CHECKS_P22),
+                          ("P24 shield, fees, reversal", CHECKS_P24)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0
