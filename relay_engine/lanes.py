@@ -142,6 +142,9 @@ class FH8Shared:
             side=res.side, action="buy", price_cents=res.cost_cents,
             count=1, size_tier=config.TIER_PROBE, purpose="ENTRY", band=band,
             rest_fp=res.rest_fp,  # the parts' law: rest at the TRUE touch
+            why=(f"favorite {res.side}@{res.cost_cents}¢ band {band[0]}-{band[1]}"
+                 + (f" · dist {res.distance_pct:.2%}"
+                    if res.distance_pct is not None else "")),
         )
 
 

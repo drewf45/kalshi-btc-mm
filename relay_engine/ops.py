@@ -205,6 +205,30 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     if foreign_fills:
         lines.append(f"FOREIGN FILLS seen: {foreign_fills} "
                      f"(live Kal's until cutover; NONZERO AFTER CUTOVER = ALARM)")
+    # P13 (CEO knob): tuition itemized, never mysterious — scratches, their
+    # cost, and fees, from the fills ledger.
+    try:
+        exits = ledger.db.execute(
+            "SELECT market, lane, price_cents, count, fee_cents, id FROM fills"
+            " WHERE action IN ('EXIT','CUSTODIAN_EXIT') ORDER BY id").fetchall()
+        total_fees = int(ledger.db.execute(
+            "SELECT COALESCE(SUM(fee_cents),0) FROM fills").fetchone()[0])
+        scratches = 0
+        scratch_cost = 0
+        for market, lane, px, cnt, _fee, xid in exits:
+            entry = ledger.db.execute(
+                "SELECT price_cents FROM fills WHERE market=? AND lane=?"
+                " AND action='ENTRY' AND id<? ORDER BY id DESC LIMIT 1",
+                (market, lane, xid)).fetchone()
+            if entry is not None:
+                rt = (px - entry[0]) * cnt
+                if rt < 0:
+                    scratches += 1
+                    scratch_cost += -rt
+        lines.append(f"scratches: {scratches} · scratch cost: {scratch_cost}¢ "
+                     f"· fees: {total_fees}¢")
+    except Exception:
+        pass
     # P8 §2.4: the streak, halts, and resets
     if econ is not None:
         lines.extend(econ.pack_lines())

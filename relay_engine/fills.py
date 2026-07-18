@@ -62,12 +62,17 @@ class FillBooker:
         self.surface = surface
         self.custodian = custodian
         self.alert = alert_fn or (lambda msg: None)
-        # on_booked(order, action, price_cents, count, now): lane callbacks
-        # (FLIP's pair/trip accounting rides here)
+        # on_booked(order, action, price_cents, count, now, fee_cents): lane
+        # callbacks + the P13 §1 narration (FLIP's pair/trip accounting rides here)
         self.on_booked = on_booked or (lambda *a: None)
         self.ledger.db.executescript(BOOKED_SCHEMA)
         self.ledger.db.commit()
+        # Tape 0718: the account's fill history re-scans every sweep — foreign
+        # fills are counted ONCE per unique id, or the counter (and the pack's
+        # NONZERO-AFTER-CUTOVER alarm) is noise. Bounded in-memory set.
         self.foreign_seen = 0
+        self._foreign_ids_seen: set = set()
+        self._last_foreign_logged = -1
 
     def _already_booked(self, fill_id: str) -> bool:
         return self.ledger.db.execute(
@@ -86,9 +91,14 @@ class FillBooker:
                 continue
             order = self.gateway.order_index.get(oid)
             if order is None:
-                # Not ours: live Kal shares the account until cutover.
+                # Not ours: this account's history until cutover. Counted
+                # ONCE per unique fill id (tape 0718: 200/sweep re-count).
                 stats["foreign"] += 1
-                self.foreign_seen += 1
+                if fid not in self._foreign_ids_seen:
+                    self._foreign_ids_seen.add(fid)
+                    self.foreign_seen += 1
+                    if len(self._foreign_ids_seen) > 10_000:
+                        self._foreign_ids_seen.clear()  # bound memory; ids re-count at worst
                 continue
             if self._already_booked(fid):
                 stats["duplicate"] += 1
@@ -104,7 +114,8 @@ class FillBooker:
 
             action = PURPOSE_TO_ACTION.get(order.purpose, order.purpose)
             self.ledger.record_fill(order.market, order.lane, order.side, action,
-                                    int(round(cost)), count, order.size_tier)
+                                    int(round(cost)), count, order.size_tier,
+                                    fee_cents=fee_cents)
             self.gateway.on_fill(oid, count=count)
             self.ledger.db.execute(
                 "INSERT INTO booked_fills (fill_id, ts, order_id, count) VALUES (?,?,?,?)",
@@ -124,7 +135,8 @@ class FillBooker:
                     entry_price_cents=int(round(cost)), entry_p_win=0.0,
                     size_tier=order.size_tier, entry_time=now))
             stats["booked"] += 1
-            self.on_booked(order, action, int(round(cost)), count, now)
+            self.on_booked(order, action, int(round(cost)), count, now,
+                           fee_cents)
             log.warning("FILL BOOKED %s %s %s %s %d@%dc fee=%dc",
                         order.lane, order.market, order.side, action,
                         count, int(round(cost)), fee_cents)
@@ -136,7 +148,10 @@ class FillBooker:
         under the seatbelt — it must run before trusting any daily pack."""
         records = venue.get_all_recent_fills(client)
         stats = self.sweep(records)
-        if stats["foreign"]:
-            log.info("[RECONCILE] %d foreign fills (live Kal's until cutover)",
-                     stats["foreign"])
+        # Tape 0718: this line printed every 3s forever — log only when the
+        # unique-foreign count CHANGES (the counter keeps full fidelity).
+        if stats["foreign"] and self.foreign_seen != self._last_foreign_logged:
+            self._last_foreign_logged = self.foreign_seen
+            log.info("[RECONCILE] %d unique foreign fills (this account's "
+                     "history until cutover)", self.foreign_seen)
         return stats

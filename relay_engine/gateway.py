@@ -51,6 +51,10 @@ class Order:
     band: Optional[Tuple[int, int]] = None  # lane band (min,max) in side-terms cents
     crossfire: bool = False  # deliberate cross (post_only=False) — CUT ONLY, enforced here
     rest_fp: Optional[str] = None  # exact fixed-point price string (true-touch resting)
+    # P13 §1: every dollar gets a sentence — the compressed thesis at submit
+    # (entries) and the rule that spent the money (exits/cuts).
+    why: str = ""
+    reason: str = ""
 
 
 @dataclass
@@ -243,6 +247,7 @@ class Gateway:
                                         f"identical re-propose suppressed ({tag})")
                 del self.wall_backoff[(order.lane, order.market)]
             try:
+                self._wall_flip_unpaired(order)  # P13 §4: the named refusal first
                 self._wall_band_and_single_entry(order)
                 self._wall_net_risk_and_at_risk(order)
                 self._wall_wrong_way_tick(order)
@@ -449,6 +454,23 @@ class Gateway:
                 raise WallRejection(
                     "REJECT_TAKER_ENTRY",
                     f"{order.side} sell at {order.price_cents}c through bid {bid}c")
+
+    def _wall_flip_unpaired(self, order: Order) -> None:
+        """P13 §4: FLIP pair integrity — a second SAME-side ENTRY on a market
+        requires the prior leg EXITED. The lane's own guard resets per trip;
+        this wall is the structural belt."""
+        if order.lane != "FLIP" or order.purpose != "ENTRY":
+            return
+        net = self.positions.get((order.event, order.market, "FLIP"), 0)
+        if net == 0:
+            return
+        adds_same_dir = (net > 0 and self._signed_yes_delta(order) > 0) or \
+                        (net < 0 and self._signed_yes_delta(order) < 0)
+        if adds_same_dir:
+            raise WallRejection(
+                "REJECT_FLIP_UNPAIRED",
+                f"prior FLIP leg not yet EXITED (net {net:+d}) — "
+                f"second same-side entry refused")
 
     def _wall_pct_of_book(self, order: Order) -> None:
         caps = self.ledger.boot_caps

@@ -219,7 +219,8 @@ def test_flip_bundle_reconstructible_from_surface_rows(gateway, ledger, surface)
                                 size_tier=config.TIER_PROBE, purpose="ENTRY")
         r = gateway.submit(order, book)
         booker.sweep([{"fill_id": f"fb-{side}", "order_id": r.order_id,
-                       "yes_price": f"{px / 100:.4f}" if side == "yes" else f"{(100 - px) / 100:.4f}",
+                       "yes_price_dollars": f"{px / 100:.4f}" if side == "yes"
+                       else f"{(100 - px) / 100:.4f}",
                        "count": 1}], now=1000.0)
 
     per_lane = surface.settle_market(TICKER, "w1", settled_yes=True)

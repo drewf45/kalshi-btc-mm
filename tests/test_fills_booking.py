@@ -27,9 +27,11 @@ def entry(lane="F", price=61, count=1, market="M1", event="EV1"):
 
 
 def venue_fill(order_id, fill_id, yes_price_cents=61, count=1):
-    """A synthetic venue fill record in the live wire shape (fp strings)."""
+    """A synthetic venue fill record in the live wire shape. P13 §2a: dollars
+    values live in *_dollars keys — a dollars string in legacy `yes_price`
+    (cents form) is exactly the ambiguity the form map outlaws."""
     return {"fill_id": fill_id, "order_id": order_id,
-            "yes_price": f"{yes_price_cents / 100:.4f}",
+            "yes_price_dollars": f"{yes_price_cents / 100:.4f}",
             "count_fp": f"{count}.00", "fee_cost": "0.010000"}
 
 

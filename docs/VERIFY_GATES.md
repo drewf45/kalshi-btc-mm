@@ -592,6 +592,47 @@ Suite at this commit: **241 passed**; `python -m scripts.preflight` → **10/10*
 - **Boot page (§C)**: `transport: REST 1s` + SIZING + worst-day + listener, sent
   after the first discovery+poll. Hourly line gains `fetch_fail={n}`.
 
+## WO-P13 "SAY WHAT YOU DID" — the 6¢ lesson, structural
+
+Suite at this commit: **260 passed**; preflight **11/11**.
+
+- **Part I (evidence-honest)**: `scripts/autopsy_fills.py` committed;
+  `docs/AUTOPSY_0715.md` records the reconstruction (−4¢ scratch + ~2¢ fee = −6¢,
+  the flipdesk discipline executing correctly) AND the evidence status: the deployed
+  DB was EPHEMERAL (`DB: relay_shadow.db`, RELAY_DB_PATH unset) — run the tool on the
+  worker before the next deploy or the gap stands. The engine now PAGES at boot when
+  LIVE runs on an ephemeral DB (halt persistence + dedup + autopsies depend on it).
+- **§1 TRUE — no mute fills**: `Order.why` (thesis at submit: FLIP pair-post w/ touches,
+  F/H8 favorite+band+distance, D verdict) and `Order.reason` (FLIP take entry+X,
+  custodian trigger names) ride the PROPOSED surface row and the pages:
+  `✅ ENTRY … buy no@46¢ — why: …` / `✂️ EXIT … sell no@42¢ (fee 2¢) — PER_CONTRACT_STOP`
+  / `↔ round-trip −4¢ + fee 2¢ = −6¢` (the desk's unit of thought; also the
+  inversion tripwire — a sell paging as a sell makes a true inversion visible in one
+  window). Fee lands in the fills ledger (`fee_cents`, migrated) via parse→book→page.
+- **§2 TRUE — forms pinned**: the `val < 1` heuristic is DEAD; `_field_to_cents` +
+  `DOLLAR_FORM_KEYS`/`CENT_FORM_KEYS` classify every key (unclassified = never
+  parsed); `*_dollars` ×100, legacy `yes_price`/`no_price`/fees = cents (Engineer's
+  KNOB honored). Boundary tests: dollars "1.00" = 100¢; legacy 46 = 46¢. Fixtures
+  verbatim from the wire (0718 fill shape, ORDER-V2 resp counts, orderbook_fp
+  arrays). `docs/VENUE_SEMANTICS.md` cites every field, dated — the future diff is
+  the audit. Pre-P13 fixtures that hid dollars in legacy keys were themselves the
+  bug and were corrected to the documented wire.
+- **§3 TRUE — orientation measured by the venue itself**: boot self-test (our book
+  vs the market record's `yes_bid_dollars`; mirror match = FATAL
+  `ORIENTATION_MIRROR`), settlement cross-check every window (winner must have been
+  our high side; `ORIENTATION_SUSPECT` + page), 30s post-entry divergence watch
+  (>3¢ ×3 checks → entries halt + page), processed by a supervised `orientation`
+  task. Discovery now stores the record's own touches (explicit ×100 form).
+- **§4 TRUE**: `REJECT_FLIP_UNPAIRED` — the named wall, ordered FIRST — refuses a
+  second same-side FLIP entry while the prior leg stands (the opposite leg nets
+  toward flat and remains risk-reducing by construction); the sit-out pages once:
+  `🚪 FLIP sitting out {mkt} — n scratches`. CEO knob: pack itemizes
+  `scratches · scratch cost · fees`.
+- **Tape-0718 hygiene (folded)**: foreign fills counted once per unique id (the
+  200-every-3s counter is meaningful again; NONZERO-AFTER-CUTOVER alarm restored),
+  reconcile log prints only on change, orders-route probe wired at boot (the
+  `/portfolio/events/orders` 404).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

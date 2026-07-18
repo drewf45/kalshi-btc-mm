@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS fills (
     price_cents INTEGER NOT NULL,   -- cost basis, canonical YES terms
     count INTEGER NOT NULL,
     size_tier TEXT NOT NULL,
-    settled INTEGER NOT NULL DEFAULT 0
+    settled INTEGER NOT NULL DEFAULT 0,
+    fee_cents INTEGER NOT NULL DEFAULT 0  -- P13 §1: the true cost, per fill
 );
 CREATE TABLE IF NOT EXISTS surface_rows (
     id INTEGER PRIMARY KEY,
@@ -132,6 +133,12 @@ class Ledger:
             sqlite3.connect(db_path or config.DB_PATH, check_same_thread=False),
             self.lock)
         self.db.executescript(SCHEMA)
+        # P13 §1: fee per fill (the net line needs the true cost per trade).
+        try:
+            self.db.execute(
+                "ALTER TABLE fills ADD COLUMN fee_cents INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already present
         self.db.commit()
         self.boot_caps: Optional[BootCaps] = None
 
@@ -187,11 +194,13 @@ class Ledger:
 
     # ----- writes -----
     def record_fill(self, market: str, lane: str, side: str, action: str,
-                    price_cents: int, count: int, size_tier: str) -> int:
+                    price_cents: int, count: int, size_tier: str,
+                    fee_cents: int = 0) -> int:
         cur = self.db.execute(
-            "INSERT INTO fills (ts, market, lane, side, action, price_cents, count, size_tier)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (time.time(), market, lane, side, action, price_cents, count, size_tier),
+            "INSERT INTO fills (ts, market, lane, side, action, price_cents,"
+            " count, size_tier, fee_cents) VALUES (?,?,?,?,?,?,?,?,?)",
+            (time.time(), market, lane, side, action, price_cents, count,
+             size_tier, int(fee_cents)),
         )
         self.db.commit()
         return cur.lastrowid

@@ -122,7 +122,7 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
         stats = engine.fills.sweep(
             [{"fill_id": "F1", "order_id": "LIVE-1", "count": 1}], now=now + 10)
         assert stats["booked"] == 1
-        assert any(m.startswith("✅ FILL F") for m in engine.telegram_sent)
+        assert any(m.startswith("✅ ENTRY F") for m in engine.telegram_sent)
         assert f"{TICKER}:F" in engine.custodian.positions   # custodied
 
         # ── 5. mocked settlement closes the bracket: the 📊 line ───────

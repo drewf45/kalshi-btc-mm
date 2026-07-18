@@ -185,6 +185,7 @@ class FlipWindow:
     scratches: int = 0
     window_realized: int = 0
     done: bool = False
+    sitout_paged: bool = False   # P13 §4: the sit-out pages ONCE
     spot_ticks: List[Optional[float]] = field(default_factory=list)
 
 
@@ -201,6 +202,7 @@ class LaneFlip:
         self.windows: Dict[str, FlipWindow] = {}
         self.stop_streak = 0
         self.killed = False
+        self.alert_fn = lambda msg: None  # P13 §4: the sit-out page (runner wires)
         if custodian is not None:
             custodian.set_lane_params("FLIP", flip_cut_params())
 
@@ -300,12 +302,18 @@ class LaneFlip:
                 proposals.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell", price_cents=q, count=1,
-                    size_tier=config.TIER_PROBE, purpose="EXIT"))
+                    size_tier=config.TIER_PROBE, purpose="EXIT",
+                    reason=f"take entry+{FLIP_X}"))
 
         # 2) ENTRIES — window phase, curfew, trips, sit-out, R1-flat, OFI
         in_entry_phase = secs > FLIP_WINDOW_SEC - FLIP_ENTRY_SEC
         past_curfew = secs <= FLIP_CURFEW
         if w.trips >= FLIP_MAX_TRIPS or w.scratches >= FLIP_SCRATCH_SITOUT:
+            # P13 §4: sit-out visibility — one page, then quiet discipline
+            if w.scratches >= FLIP_SCRATCH_SITOUT and not w.sitout_paged:
+                w.sitout_paged = True
+                self.alert_fn(f"🚪 FLIP sitting out {market} — "
+                              f"{w.scratches} scratches")
             return proposals
         if w.window_realized <= -FLIP_STOP_CENTS:
             if not w.done:
@@ -343,7 +351,8 @@ class LaneFlip:
                 lane="FLIP", event=event, market=market, side=side,
                 action="buy", price_cents=join, count=1,
                 size_tier=config.TIER_PROBE, purpose="ENTRY",
-                band=(1, FLIP_SIDE_MAX), rest_fp=fp))
+                band=(1, FLIP_SIDE_MAX), rest_fp=fp,
+                why=f"pair-post ≤{FLIP_SIDE_MAX} · y{yes_bid}/n{no_bid}"))
         return proposals
 
     def on_submitted(self, order: Order, order_id: str, now: float) -> None:

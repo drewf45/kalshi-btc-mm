@@ -453,15 +453,55 @@ def probe_fills_route(client: KalshiClient) -> str:
 _fill_parse_warned = False
 
 
+# ── P13 §2a: FIELD → FORM, explicit. The old `val < 1` heuristic misread a
+# dollars "1.00" as 1c and survived only by luck; guessing forms during a
+# venue migration is how inversions are born. Every key is classified; an
+# unclassified key is NEVER parsed. Citations: docs/VENUE_SEMANTICS.md.
+DOLLAR_FORM_KEYS = frozenset({
+    "yes_price_dollars", "no_price_dollars", "price_dollars",
+    "fee_cost",                       # tape 0709: '0.000000' dollars-fp
+    "taker_fee_dollars", "maker_fee_dollars",
+})
+CENT_FORM_KEYS = frozenset({
+    "yes_price", "no_price", "price",           # legacy: integer CENTS
+    "yes_price_cents", "no_price_cents", "price_cents",
+    "fee", "taker_fee", "maker_fee",            # legacy fee keys: cents
+})
+
+# Resolution ladders: (key, ...) in preference order, our side FIRST —
+# complement keys only as fallback (side-correctness before form).
+_YES_PRICE_KEYS = ("yes_price_dollars", "yes_price", "yes_price_cents")
+_NO_PRICE_KEYS = ("no_price_dollars", "no_price", "no_price_cents")
+_SIDELESS_PRICE_KEYS = ("price_dollars", "price", "price_cents")
+_FEE_KEYS = ("fee_cost", "taker_fee_dollars", "maker_fee_dollars",
+             "fee", "taker_fee", "maker_fee")
+
+
+def _field_to_cents(key: str, raw) -> Optional[float]:
+    """The ONE form conversion: dollars keys ×100, cents keys raw — never
+    inferred from magnitude."""
+    if raw is None:
+        return None
+    from decimal import Decimal
+    try:
+        val = Decimal(str(raw))
+    except Exception:
+        return None
+    if key in DOLLAR_FORM_KEYS:
+        return float(val * 100)
+    if key in CENT_FORM_KEYS:
+        return float(val)
+    return None  # unclassified key: refuse to guess
+
+
 def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
     """Parse a Kalshi fill into (cost_cents, fee_cents, count) for our_side.
 
-    Kalshi fills carry yes_price/no_price. We map to cost for our held side.
-    Unwraps one level if nested under 'fill'/'order'. Tries extended key
-    candidates (yes_price_cents, price_cents, yes_price_dollars).
-    Returns (None, fee, count) if price is unparseable — caller uses fallback.
-    Logs the raw fill dict once on first parse failure (self-diagnosing).
-    """
+    Side-correct (our side's keys first, complement only as fallback) AND
+    form-explicit (P13 §2a: field→form map, no magnitude guessing).
+    Unwraps one level if nested under 'fill'/'order'. Returns (None, fee,
+    count) if price is unparseable — caller uses fallback. Logs the raw fill
+    dict once on first parse failure (self-diagnosing)."""
     global _fill_parse_warned
     from decimal import Decimal
 
@@ -479,22 +519,12 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
                 return v
         return None
 
-    def _to_cents(raw):
-        if raw is None:
-            return None
-        try:
-            val = Decimal(str(raw))
-            return float(val * 100) if val < 1 else float(val)
-        except Exception:
-            return None
-
-    def _raw_cents(raw):
-        if raw is None:
-            return None
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return None
+    def _first(keys) -> Optional[float]:
+        for k in keys:
+            c = _field_to_cents(k, _get(k))
+            if c is not None:
+                return c
+        return None
 
     cost_cents = None
     fee_cents = 0
@@ -510,66 +540,26 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
                 pass
             break
 
-    YES_DOLLAR_KEYS = ("yes_price", "yes_price_dollars")
-    NO_DOLLAR_KEYS = ("no_price", "no_price_dollars")
-
-    if our_side == "yes":
-        for k in YES_DOLLAR_KEYS:
-            cost_cents = _to_cents(_get(k))
-            if cost_cents is not None:
-                break
-        if cost_cents is None:
-            cost_cents = _raw_cents(_get("yes_price_cents"))
-        if cost_cents is None:
-            for k in NO_DOLLAR_KEYS:
-                no_c = _to_cents(_get(k))
-                if no_c is not None:
-                    cost_cents = 100 - no_c
-                    break
-        if cost_cents is None:
-            no_c = _raw_cents(_get("no_price_cents"))
-            if no_c is not None:
-                cost_cents = 100 - no_c
-    else:
-        for k in NO_DOLLAR_KEYS:
-            cost_cents = _to_cents(_get(k))
-            if cost_cents is not None:
-                break
-        if cost_cents is None:
-            cost_cents = _raw_cents(_get("no_price_cents"))
-        if cost_cents is None:
-            for k in YES_DOLLAR_KEYS:
-                yes_c = _to_cents(_get(k))
-                if yes_c is not None:
-                    cost_cents = 100 - yes_c
-                    break
-        if cost_cents is None:
-            yes_c = _raw_cents(_get("yes_price_cents"))
-            if yes_c is not None:
-                cost_cents = 100 - yes_c
-
+    own_keys = _YES_PRICE_KEYS if our_side == "yes" else _NO_PRICE_KEYS
+    other_keys = _NO_PRICE_KEYS if our_side == "yes" else _YES_PRICE_KEYS
+    cost_cents = _first(own_keys)
     if cost_cents is None:
-        val = _to_cents(_get("price"))
-        if val is not None:
-            cost_cents = val if our_side == "yes" else (100 - val)
+        other = _first(other_keys)
+        if other is not None:
+            cost_cents = 100 - other
     if cost_cents is None:
-        pc = _raw_cents(_get("price_cents"))
-        if pc is not None:
-            cost_cents = pc if our_side == "yes" else (100 - pc)
+        sideless = _first(_SIDELESS_PRICE_KEYS)
+        if sideless is not None:
+            cost_cents = sideless if our_side == "yes" else (100 - sideless)
 
     if cost_cents is None and not _fill_parse_warned:
         log.warning(f"[FILLS] Unparsed fill record (raw): {fill}")
         _fill_parse_warned = True
 
-    # Tape 0709: live fills carry fee_cost ('0.000000', dollars).
-    for fee_key in ("fee", "fee_cost", "taker_fee", "maker_fee"):
-        raw = _get(fee_key)
-        if raw is not None:
-            try:
-                val = Decimal(str(raw))
-                fee_cents = int(val * 100) if val < 1 else int(val)
-            except Exception:
-                pass
+    for fk in _FEE_KEYS:
+        c = _field_to_cents(fk, _get(fk))
+        if c is not None:
+            fee_cents = int(round(c))
             break
 
     return cost_cents, fee_cents, count

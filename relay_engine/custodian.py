@@ -346,6 +346,7 @@ class Custodian:
             lane=pos.lane, event=pos.event, market=pos.market, side=pos.side,
             action="sell", price_cents=cut_price_cents, count=pos.count,
             size_tier=pos.size_tier, purpose="CUT", crossfire=crossfire,
+            reason=trigger,  # P13 §1: every rule that spends money signs its work
         )
         result = self.gateway.submit(cut, book)
         transport = self.ladder.custodian_transport() if self.ladder else "WS"

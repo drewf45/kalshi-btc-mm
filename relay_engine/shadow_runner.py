@@ -209,14 +209,31 @@ class ShadowEngine:
         self._wall_log_counts = {}     # §4.3: (lane, market, wall) -> count
         self.feed.on_poison = self.note_poison_episode
         self.gateway.alert_fn = self.telegram.alert  # WALL_STORM page path
+        # P13 §3: orientation sentinels + §4 sit-out page wiring
+        self.divergence_watches = {}   # market -> {until, strikes}
+        self._orientation_checked = False
+        self.flip.alert_fn = self.telegram.alert
 
     # ── F1: market lifecycle (discovery + rollover) ─────────────────────
     def on_market_discovered(self, ticker: str, market_obj: dict) -> None:
         from . import venue
         close_ts = venue.resolve_close_ts(market_obj, ticker)
         blo, bhi = venue.extract_boundaries(market_obj)
+        # P13 §3: the market record's own touches (explicit form: *_dollars
+        # ×100) — the free orientation oracle the venue publishes.
+        def _rec_cents(key):
+            v = market_obj.get(key)
+            if v is None:
+                return None
+            try:
+                from decimal import Decimal
+                return int(Decimal(str(v)) * 100)
+            except Exception:
+                return None
         self.market_meta[ticker] = {"close_ts": close_ts,
-                                    "boundary_lo": blo, "boundary_hi": bhi}
+                                    "boundary_lo": blo, "boundary_hi": bhi,
+                                    "rec_yes_bid": _rec_cents("yes_bid_dollars"),
+                                    "rec_yes_ask": _rec_cents("yes_ask_dollars")}
 
     def on_market_closed(self, ticker: str) -> None:
         """F4: settled/closed markets are pruned everywhere, not swept forever."""
@@ -355,10 +372,41 @@ class ShadowEngine:
                 live.add(o.lane)
         return ",".join(sorted(live))
 
-    def _on_fill_booked(self, order, action, price_cents, count, now):
-        # P8 §4.2: every fill pages, one line
-        self.telegram.alert(f"✅ FILL {order.lane} {order.market} "
-                            f"{order.side}@{price_cents}¢ x{count}")
+    def _on_fill_booked(self, order, action, price_cents, count, now,
+                        fee_cents=0):
+        """P13 §1: fill pages say WHAT and WHY. A scratch-sell must never
+        read like a second buy — on live money, mute narration is
+        indistinguishable from inversion."""
+        if action == "ENTRY":
+            why = f" — why: {order.why}" if order.why else ""
+            self.telegram.alert(
+                f"✅ ENTRY {order.lane} {order.market} "
+                f"{order.action} {order.side}@{price_cents}¢ x{count}{why}")
+            # §3 (P12 §4): 30s post-entry divergence watch, armed per entry
+            self.divergence_watches[order.market] = {
+                "until": now + 30.0, "strikes": 0}
+        else:
+            reason = order.reason or ("custodian cut"
+                                      if action == "CUSTODIAN_EXIT" else "exit")
+            fee_s = f" (fee {fee_cents}¢)" if fee_cents else ""
+            self.telegram.alert(
+                f"✂️ EXIT {order.lane} {order.market} "
+                f"{order.action} {order.side}@{price_cents}¢ x{count}{fee_s}"
+                f" — {reason}")
+            # the desk's unit of thought: one glance, one verdict per pair
+            row = self.ledger.db.execute(
+                "SELECT price_cents FROM fills WHERE market=? AND lane=?"
+                " AND action='ENTRY' ORDER BY id DESC LIMIT 1",
+                (order.market, order.lane)).fetchone()
+            if row is not None:
+                rt = (price_cents - row[0]) * count
+                net = rt - fee_cents
+
+                def s(v):
+                    return f"{'+' if v > 0 else ''}{v}"
+                self.telegram.alert(
+                    f"↔ {order.market} {order.lane} round-trip {s(rt)}¢ "
+                    f"+ fee {fee_cents}¢ = {s(net)}¢")
         if order.lane == "FLIP":
             if action == "ENTRY":
                 self.flip.note_fill(order.market, order.side, price_cents, now)
@@ -397,6 +445,16 @@ class ShadowEngine:
         self.boot_id = boot_id
         # P8 §2.3: restarts and redeploys do NOT clear the two-strike halt
         self.econ.restore_halt_on_boot()
+        # Tape 0718: the deployed worker booted with DB=relay_shadow.db (no
+        # RELAY_DB_PATH) — an EPHEMERAL database. Halt persistence, booking
+        # dedup, and every autopsy depend on the disk surviving a redeploy.
+        import os as _os
+        if config.live_submit_enabled() and not _os.environ.get("RELAY_DB_PATH"):
+            self.telegram.alert(
+                "⚠ RELAY_DB_PATH unset in LIVE — the DB is EPHEMERAL: the "
+                "two-strike halt, fill dedup, and autopsy evidence will NOT "
+                "survive a redeploy. Set RELAY_DB_PATH to a persistent disk "
+                "path (e.g. /var/data/relay_shadow.db).")
         return boots_last_hour
 
     AV_RETRY_SPACING_S = 5.0   # P9 §2: 3 attempts >= 5s apart = retry x3 over 15s
@@ -467,6 +525,68 @@ class ShadowEngine:
         if self.task_alive.get("listener", True):
             return "ok" if n == 0 else f"ok({n} restarts)"
         return f"down({n} restarts)"
+
+    # ── P13 §3: engine-side orientation sentinels (keyless) ─────────────
+    def orientation_selftest(self, market: str, book) -> None:
+        """Boot self-test, once per boot: our book vs the venue market
+        record's own yes_bid. A MIRROR match (ours ≈ 100−record) with a bad
+        direct match means the book orientation is INVERTED — FATAL."""
+        if self._orientation_checked:
+            return
+        rec = self._meta(market).get("rec_yes_bid")
+        yb = book.best_yes_bid()
+        if rec is None or yb is None:
+            return
+        self._orientation_checked = True
+        direct = abs(yb - rec)
+        mirror = abs(yb - (100 - rec))
+        if direct > 10 and mirror <= 3:
+            from . import failures
+            failures.fail("ORIENTATION_MIRROR",
+                          f"{market}: our yes_bid {yb}¢ vs venue record "
+                          f"{rec}¢ — MIRROR match (100−rec={100 - rec}) — "
+                          f"book orientation INVERTED, refusing to trade",
+                          fatal=True, market=market, ours=yb, record=rec)
+        log.info("ORIENTATION SELF-TEST OK: %s ours y%d vs record y%d",
+                 market, yb, rec)
+
+    def process_divergence_watches(self, client, now=None) -> None:
+        """§3: 30s post-entry watch — ours vs the venue market record >3¢
+        for 3 consecutive checks → entries halt + page."""
+        from . import failures, venue
+        now = time.time() if now is None else now
+        for market, w in list(self.divergence_watches.items()):
+            if now > w["until"]:
+                del self.divergence_watches[market]
+                continue
+            book = self.feed.books.get(market)
+            ours = book.best_yes_bid() if book is not None else None
+            if ours is None:
+                continue
+            try:
+                rec_obj = venue.get_market(client, market)
+            except Exception:
+                continue
+            try:
+                from decimal import Decimal
+                rec = int(Decimal(str(rec_obj.get("yes_bid_dollars"))) * 100)
+            except Exception:
+                continue
+            if abs(ours - rec) > 3:
+                w["strikes"] += 1
+                if w["strikes"] >= 3:
+                    del self.divergence_watches[market]
+                    self.gateway.halt_entries("ORIENTATION_DIVERGENCE")
+                    self.telegram.alert(
+                        f"⛔ ORIENTATION_DIVERGENCE {market}: ours y{ours}¢ vs "
+                        f"venue record y{rec}¢ >3¢ x3 — entries HALTED")
+                    failures.fail("ORIENTATION_DIVERGENCE",
+                                  f"{market}: ours {ours}¢ vs record {rec}¢ "
+                                  f"diverged 3 consecutive checks post-entry",
+                                  market=market, ours=ours, record=rec,
+                                  alert=False)
+            else:
+                w["strikes"] = 0
 
     def transport_label(self) -> str:
         """P11.1-c: the transport stamp on surface rows and brackets — future
@@ -588,6 +708,10 @@ class ShadowEngine:
                 "cash_usd": self.ledger.book_cents() / 100.0,
                 "entries_allowed": self.ladder.entries_allowed(),
             }
+            # P13 §3: boot orientation self-test on the first comparable book
+            if not self._orientation_checked and book.has_snapshot:
+                self.orientation_selftest(market, book)
+
             # FLIP pair-grace housekeeping: drop the unfilled opposite entry
             stale_oid = self.flip.pair_grace_expired(market, now)
             if stale_oid is not None:
@@ -647,10 +771,14 @@ class ShadowEngine:
                                 proposal.price_cents / 100.0)
                     elif proposal.lane == "FLIP":
                         self.flip.on_submitted(proposal, result.order_id, now)
+                    sentence = (f" why={proposal.why}" if proposal.why else "") \
+                        + (f" reason={proposal.reason}" if proposal.reason else "")
                     self.surface.write_row(lane.name, market, window, PROPOSED,
                                            transport=transport,
                                            detail=f"order={result.order_id} "
-                                                  f"{proposal.purpose} @{proposal.price_cents}c")
+                                                  f"{proposal.purpose} "
+                                                  f"@{proposal.price_cents}c"
+                                                  + sentence)
                     log.warning("PROPOSAL %s %s %s %s @%dc -> %s",
                                 lane.name, market, proposal.purpose, proposal.side,
                                 proposal.price_cents, result.order_id)
@@ -663,6 +791,18 @@ class ShadowEngine:
         """P8 §1: CLOSE BRACKET — settlement confirmed, fills booked, account
         truth snapshotted. Traded markets only (open brackets); untraded
         markets write no bracket."""
+        # P13 §3: settlement cross-check — the free oracle every 15 minutes.
+        # The winning side must have been our book's high side near close.
+        book = self.feed.books.get(market)
+        yb = book.best_yes_bid() if book is not None else None
+        if yb is not None and ((settled_yes and yb < 40)
+                               or (not settled_yes and yb > 60)):
+            from . import failures
+            failures.fail("ORIENTATION_SUSPECT",
+                          f"{market}: settled {'YES' if settled_yes else 'NO'} "
+                          f"but our last yes_bid was {yb}¢ — book orientation "
+                          f"suspect, audit this window's tape",
+                          market=market, settled_yes=settled_yes, last_yes_bid=yb)
         window = self._window_of.get(market, f"w-{market}")
         per_lane = self.surface.settle_market(market, window,
                                               settled_yes=settled_yes)
@@ -713,6 +853,7 @@ TASK_TAGS = {
     "fills": "FILLS_TASK_DOWN",
     "reconcile": "RECONCILE_TASK_DOWN",
     "book_check": "BOOK_CHECK_TASK_DOWN",
+    "orientation": "ORIENTATION_TASK_DOWN",
 }
 
 BOOK_CHECK_S = 60.0  # P10 §3: the standing arbiter's cadence
@@ -837,6 +978,15 @@ async def run():
     client = venue.build_client()
     engine.gateway.venue_client = client  # one client, shared by every organ
 
+    # Tape 0718: the default orders-list route 404'd on this API base — probe
+    # both candidates at boot so cancel/status/foreign-resting all speak the
+    # route the venue actually answers. Non-fatal: order PLACEMENT has its
+    # own route; a failed probe degrades listing only.
+    try:
+        venue.probe_orders_route(client)
+    except Exception as e:
+        log.warning("orders-route probe failed (listing degraded): %s", e)
+
     if config.live_submit_enabled():
         # F6: LIVE boot reconcile — money truth before the first cycle
         from .reconcile import live_boot_reconcile
@@ -931,7 +1081,15 @@ async def run():
             if config.WS_ENABLED:
                 await asyncio.to_thread(engine.book_check)
 
+    # ── P13 §3: the 30s post-entry divergence watch, processed every 10s ───
+    async def orientation_task():
+        while not stop.is_set():
+            await asyncio.sleep(10.0)
+            if engine.divergence_watches:
+                await asyncio.to_thread(engine.process_divergence_watches, client)
+
     # P9 §1b: EVERY task runs supervised — a death is banked, paged, restarted.
+    asyncio.create_task(supervise("orientation", orientation_task, stop, engine))
     asyncio.create_task(supervise("spot", spot_task, stop, engine))
     asyncio.create_task(supervise("pack", pack_task, stop, engine))
     asyncio.create_task(supervise("listener", listener_task, stop, engine))

@@ -55,6 +55,9 @@ CHECKS = [
     ("proven ground: REST feed drop-in, governor, no-fabrication (P11)", [
         "tests/test_p11_proven_ground.py",
     ]),
+    ("say what you did: narration, form map, orientation sentinels (P13)", [
+        "tests/test_p13_narration.py",
+    ]),
 ]
 
 
