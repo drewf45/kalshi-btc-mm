@@ -946,6 +946,64 @@ Suite at this commit: **351 passed**; preflight **18/18**.
   registry green, drift-pages conditional) — sixth graded suite in the
   pack, own retirement; the DOCTRINE section follows it forever.
 
+## WO-2026-07-18-RELAY-P22 — "THE CELL SCOREBOARD" (the ladder gets its floor sensors)
+
+Suite at this commit: **364 passed**; preflight **19/19**.
+
+- **Grounding finding TRUE, and worse**: `sizing.tier_for` had ZERO production
+  callers (tests only) — and the lanes never called `size_order` AT ALL: every
+  proposal hardcoded `TIER_PROBE, count=1`, so `size_order`'s only callers were
+  boot's display line. The ladder was doctrine without a measurement organ OR a
+  sizing path. Both orphans closed.
+- **§1 the cell outcome store**: `cell_outcomes (ts, lane, price_cell, won,
+  pnl_cents, fees_cents, market, kind)`, UNIQUE(market, lane, kind) — idempotent
+  like record_outcome (a multi-trip window banks its FIRST trip; the same key
+  makes custodian/sweep double-booking and backfill replays safe). Writes:
+  · kind=trip inside `ledger.record_fill` on every non-ENTRY booking — the ONE
+    point sweep exits AND custodian cuts both pass; pnl is net of fees; FLIP's
+    intents split to OPEN/HUNT cells via the exit reason (`scoring.cell_lane`).
+  · kind=settle in `settle_traded_market` beside record_outcome — held residue
+    only (round-trips already banked at exit; never double-counted), attributed
+    to the OPENING lane per the attribution law (custodian.py:46).
+  · §1.2 backfill on first boot (guarded by engine_state): one row per
+    (market, lane) — flat lanes bank round-trip math, held lanes bank the
+    settlements verdict, kind=backfill; today's four F clips and the flip
+    round-trips enter history.
+- **§2 scoring.py — one aggregation, three consumers**: `cell_stats` (Wilson LB
+  via the untouched sizing.wilson_lower_bound) · `breakeven` — hold cells
+  L_eff/((100−mid)+L_eff), reducing to mid/100 raw and dropping once the DODGED
+  curve has n ≥ 20 (SALVAGE_ADJ_MIN_N, §3.3 lens note honored) · trip cells
+  (L+fee)/(T+L+fee) from each lane's take/bail geometry (HUNT 4/2, OPEN
+  5/band-distance, generic symmetric — the P18 "≥50% bar" generalized per cell)
+  with the taker fee from EXPECTED_FEE_MULTIPLIER · `margin = lb − breakeven` —
+  THE number · `score()` returns the full verdict.
+- **§3 price-adjusted bars**: TIER_BUFFER {LEAN +0.03, CLEAR +0.05} over the
+  cell's own BE, floored at the old flat bars, CAPPED at {.98, .99} — the bar
+  math never demands the impossible, only the honest. THE regression test: an
+  F 95-99 cell's LEAN bar is .98, not the flat .65 that would promote four
+  hold-wins into a leveraged coin-toss. PROBE stays a ruling, not a bar (R1/R2):
+  scoring never returns SUPPRESS — a virgin cell probes.
+- **§4 the ladder wired**: the runner's submit choke point scores EVERY ENTRY
+  (`_score_and_size`: scoring.tier_for → size_order's untouched
+  min(tier, kelly, depth)); a sizing zero keeps count=1 and lets the walls
+  refuse BY NAME. Tier changes page once (📶/📉 with LB, bar, n, lots), persist
+  in engine_state (survive restarts), bank a TIER_CHANGE row (alert=False), and
+  demotion applies at the NEXT proposal — computed fresh every time, no grace.
+  Gateway wall untouched (it enforces what it is handed). Custody counts ride
+  the fill (note_fill gains count) so an earned 2-lot fill exits at full size.
+- **§5 the scoreboard**: `scoring.scoreboard_lines` — sorted by margin, ⚠ on
+  red, (hold)/(trip) kinds, lots@book, `*salvage-adj pending` until the DODGED
+  curve earns it; empty lanes still listed. In every daily pack unasked, and on
+  demand via `/scoreboard` — the whitelist's ONE commanded addition (read-only;
+  the two whitelist tests updated with the §5 citation).
+- **§6**: tests 13 new (cell writes both kinds + opening-lane attribution,
+  backfill idempotent, breakevens per lane-kind, salvage-adjusted BE, the .98
+  bar regression, tier page-once/persist/demote-instant, runner sizing from the
+  score, the no-static-PROBE grep-test, scoreboard render + command);
+  CHECKS_P22 (cell coverage, scoreboard ships, tier changes earned with their
+  Wilson math, zero static sizing) — seventh graded suite. Registry: answer 17
+  "The score decides the size" banked with its tape line.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

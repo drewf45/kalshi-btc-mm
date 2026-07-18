@@ -79,6 +79,18 @@ CREATE TABLE IF NOT EXISTS window_outcomes (
     market TEXT NOT NULL UNIQUE,
     settled_yes INTEGER NOT NULL    -- P21 A3: the herd's screen, as we saw it
 );
+CREATE TABLE IF NOT EXISTS cell_outcomes (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    lane TEXT NOT NULL,             -- P22 §1.1: the cell's lane (OPEN/HUNT split from FLIP)
+    price_cell INTEGER NOT NULL,    -- entry price bucket lower edge (5c buckets)
+    won INTEGER NOT NULL,           -- net pnl (after fees) > 0
+    pnl_cents INTEGER NOT NULL,     -- net of fees
+    fees_cents INTEGER NOT NULL DEFAULT 0,
+    market TEXT NOT NULL,
+    kind TEXT NOT NULL,             -- trip | settle | backfill
+    UNIQUE(market, lane, kind)      -- idempotent like record_outcome (§1.1)
+);
 CREATE TABLE IF NOT EXISTS book_snapshots (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -201,7 +213,7 @@ class Ledger:
     # ----- writes -----
     def record_fill(self, market: str, lane: str, side: str, action: str,
                     price_cents: int, count: int, size_tier: str,
-                    fee_cents: int = 0) -> int:
+                    fee_cents: int = 0, cell_lane: str = None) -> int:
         cur = self.db.execute(
             "INSERT INTO fills (ts, market, lane, side, action, price_cents,"
             " count, size_tier, fee_cents) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -209,7 +221,89 @@ class Ledger:
              size_tier, int(fee_cents)),
         )
         self.db.commit()
+        # P22 §1.1(a): a non-ENTRY booking CLOSES a unit of risk — the
+        # round-trip receipt (the ↔ line's data) persists as a cell outcome
+        # at the single point every exit passes (sweep exits AND custodian
+        # cuts both book here). cell_lane splits FLIP's intents (OPEN/HUNT);
+        # the fills row keeps the attribution lane unchanged.
+        if action != "ENTRY":
+            row = self.db.execute(
+                "SELECT price_cents FROM fills WHERE market=? AND lane=?"
+                " AND action='ENTRY' ORDER BY id DESC LIMIT 1",
+                (market, lane)).fetchone()
+            if row is not None:
+                rt = (price_cents - row[0]) * count
+                net = rt - int(fee_cents)
+                self.record_cell_outcome(
+                    cell_lane or lane, row[0], won=net > 0, pnl_cents=net,
+                    fees_cents=int(fee_cents), market=market, kind="trip")
         return cur.lastrowid
+
+    def record_cell_outcome(self, lane: str, entry_price_cents: int,
+                            won: bool, pnl_cents: int, fees_cents: int,
+                            market: str, kind: str, now=None) -> None:
+        """P22 §1: one row per CLOSED unit of risk, idempotent by
+        (market, lane, kind) — a multi-trip window banks its FIRST trip and
+        suppresses re-writes (the same key that makes live+custodian double
+        booking and backfill replays safe)."""
+        from . import scoring
+        self.db.execute(
+            "INSERT INTO cell_outcomes (ts, lane, price_cell, won, pnl_cents,"
+            " fees_cents, market, kind) VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(market, lane, kind) DO NOTHING",
+            (time.time() if now is None else now, lane,
+             scoring.price_cell(entry_price_cents), int(bool(won)),
+             int(pnl_cents), int(fees_cents), market, kind))
+        self.db.commit()
+
+    def backfill_cell_outcomes(self) -> int:
+        """P22 §1.2: replay existing fills+settlements into cell_outcomes on
+        first boot — today's clips and round-trips are not lost history.
+        One row per (market, lane), kind=backfill: a lane whose fills fully
+        net out banks its round-trip math; a lane that HELD banks the
+        settlement pnl (which already contains the whole window's story —
+        never both, never double-counted). Guarded + idempotent."""
+        if self.get_state("cell_backfill_done"):
+            return 0
+        wrote = 0
+        pairs = self.db.execute(
+            "SELECT DISTINCT market, lane FROM fills").fetchall()
+        for market, lane in pairs:
+            fills = self.db.execute(
+                "SELECT side, action, price_cents, count FROM fills"
+                " WHERE market=? AND lane=? ORDER BY id",
+                (market, lane)).fetchall()
+            entries = sum(c for _, a, _, c in fills if a == "ENTRY")
+            exits = sum(c for _, a, _, c in fills if a != "ENTRY")
+            entry_px = next((p for _, a, p, _ in reversed(fills)
+                             if a == "ENTRY"), None)
+            if entry_px is None:
+                continue
+            fees = int(self.db.execute(
+                "SELECT COALESCE(SUM(fee_cents),0) FROM fills WHERE market=?"
+                " AND lane=?", (market, lane)).fetchone()[0])
+            if exits >= entries:
+                # flat by round-trips: last exit vs last entry
+                exit_px = next((p for _, a, p, _ in reversed(fills)
+                                if a != "ENTRY"), None)
+                if exit_px is None:
+                    continue
+                net = (exit_px - entry_px) - fees
+            else:
+                # held to settlement: the settlements table has the verdict
+                row = self.db.execute(
+                    "SELECT pnl_cents FROM settlements WHERE market=? AND"
+                    " lane=? ORDER BY id DESC LIMIT 1",
+                    (market, lane)).fetchone()
+                if row is None:
+                    continue  # still open — not a closed unit of risk yet
+                net = int(row[0]) - fees
+            self.record_cell_outcome(lane, entry_px, won=net > 0,
+                                     pnl_cents=net, fees_cents=fees,
+                                     market=market, kind="backfill")
+            wrote += 1
+        self.set_state("cell_backfill_done", "1")
+        return wrote
 
     def record_settlement(self, market: str, lane: str, pnl_cents: int, detail: str = "") -> None:
         self.db.execute(

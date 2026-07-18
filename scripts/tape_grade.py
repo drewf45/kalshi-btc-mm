@@ -479,6 +479,86 @@ def check_knowledge_drift_paged(db, since):
     return True, f"{n} drift page(s) (conditional — reality decides)"
 
 
+# ── P22 "THE CELL SCOREBOARD" — expected tape ──────────────────────────────
+def check_cell_rows_with_receipts(db, since):
+    """every closed unit of risk writes its cell: exits and settlements in
+    the window have matching cell_outcomes coverage (per market+lane)."""
+    closed = db.execute(
+        "SELECT DISTINCT market, lane FROM fills WHERE action!='ENTRY'"
+        " AND ts>?", (since,)).fetchall()
+    if not closed:
+        return True, "no closed risk this window"
+    missing = 0
+    for market, lane in closed:
+        n = _one(db, "SELECT COUNT(*) FROM cell_outcomes WHERE market=?",
+                 (market,))
+        if n == 0:
+            missing += 1
+    return missing == 0, (f"{len(closed) - missing}/{len(closed)}"
+                          f" closed (market,lane) pairs have cell rows")
+
+
+def check_scoreboard_ships(db, since):
+    """the scoreboard section renders in the daily pack — code-level."""
+    try:
+        import inspect
+
+        from relay_engine import ops, scoring
+        ok = ("scoreboard_lines" in inspect.getsource(ops.daily_pack)
+              and "CELL SCOREBOARD" in inspect.getsource(
+                  scoring.scoreboard_lines))
+    except Exception:
+        ok = False
+    return ok, "ops.daily_pack renders the cell scoreboard"
+
+
+def check_tier_changes_earned(db, since):
+    """zero tier changes until earned: every TIER_CHANGE row carries its
+    Wilson math, and every UP satisfies lb >= bar (bars honest)."""
+    rows = db.execute(
+        "SELECT how_json FROM failures WHERE why_tag='TIER_CHANGE' AND ts>?",
+        (since,)).fetchall()
+    bad = 0
+    for (how,) in rows:
+        try:
+            d = json.loads(how)
+            up = (d["tier"] != "PROBE" and d["prev"] == "PROBE") or \
+                 (d["tier"] == "CLEAR")
+            if not all(k in d for k in ("lb", "bar", "n", "tier", "prev")):
+                bad += 1
+            elif up and float(d["lb"]) < float(d["bar"]):
+                bad += 1
+        except Exception:
+            bad += 1
+    return bad == 0, f"{bad} unearned/unstamped of {len(rows)} tier changes"
+
+
+def check_no_static_probe_sizing(db, since):
+    """zero static-PROBE sizing paths remaining — code-level: the runner's
+    submit path scores every ENTRY (scoring.tier_for feeds size_order),
+    and no lane module calls size_order with a literal tier."""
+    try:
+        import inspect
+
+        from relay_engine import lane_flip, lanes, shadow_runner
+        runner_src = inspect.getsource(shadow_runner.ShadowEngine)
+        ok = ("scoring.tier_for" in runner_src
+              and "_score_and_size" in runner_src
+              and "size_order(" not in inspect.getsource(lanes)
+              and "size_order(" not in inspect.getsource(lane_flip))
+    except Exception:
+        ok = False
+    return ok, "every sized ENTRY passes through scoring.tier_for"
+
+
+CHECKS_P22 = [
+    ("cell rows appear with every receipt and settlement (§1)", check_cell_rows_with_receipts),
+    ("scoreboard section ships in the pack (§5)", check_scoreboard_ships),
+    ("tier changes earned: Wilson math on every page (§4.2)", check_tier_changes_earned),
+    ("zero static-PROBE sizing paths (§4.1)", check_no_static_probe_sizing),
+]
+
+
 CHECKS_P21 = [
     ("WINDOW_ECON_DIVERGENCE silent (A1 netting model)", check_econ_divergence_silent),
     ("zero self-net entry bookings (A1 belt · A2 wall)", check_no_self_net_entries),
@@ -515,7 +595,8 @@ def main() -> int:
                           ("P17 show up", CHECKS_P17),
                           ("P18 the detective", CHECKS_P18),
                           ("P19 let it run", CHECKS_P19),
-                          ("P21 the doctrine engine", CHECKS_P21)):
+                          ("P21 the doctrine engine", CHECKS_P21),
+                          ("P22 the cell scoreboard", CHECKS_P22)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

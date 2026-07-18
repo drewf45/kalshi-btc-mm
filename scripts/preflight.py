@@ -83,6 +83,10 @@ CHECKS = [
         "tests/test_p21_doctrine.py",
         "tests/test_lane_flip.py",
     ]),
+    ("the cell scoreboard: score every close, price every bar (P22)", [
+        "tests/test_p22_scoreboard.py",
+        "tests/test_sizing.py",
+    ]),
 ]
 
 

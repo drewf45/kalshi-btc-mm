@@ -186,6 +186,19 @@ class ShadowEngine:
         from .window_econ import WindowEcon
         self.econ = WindowEcon(self.ledger, self.gateway, self.surface, self.telegram)
         self.telegram.reset_halt_fn = self.econ.reset_halt  # Drew's key, entries only
+        # P22 §5: /scoreboard — read-only; the one command the whitelist grows by
+        from . import scoring as _scoring
+        self.telegram.scoreboard_fn = (
+            lambda: "\n".join(_scoring.scoreboard_lines(self.ledger)))
+        # P22 §1.2: first-boot backfill — today's clips and round-trips are
+        # not lost history (guarded + idempotent inside; never boot-fatal)
+        try:
+            n_backfilled = self.ledger.backfill_cell_outcomes()
+            if n_backfilled:
+                log.warning("CELL SCOREBOARD backfilled %d closed units of "
+                            "risk from fills+settlements", n_backfilled)
+        except Exception as e:
+            log.error("cell backfill error (continuing): %s", e)
         self.boot_caps = None
         self._window_of = {}  # market -> window_id (market close ts as string)
         self.surface.concurrent_provider = self._concurrent_lanes
@@ -393,6 +406,22 @@ class ShadowEngine:
             if o.market == market:
                 live.add(o.lane)
         return ",".join(sorted(live))
+
+    def _score_and_size(self, proposal, book) -> None:
+        """P22 §4: tier from scoring.tier_for (paged + persisted on change),
+        contracts from size_order — the static PROBE path is dead. A zero
+        from sizing keeps count=1 and lets the walls refuse it BY NAME
+        (the walls are the refusal organ, not a silent skip here)."""
+        from . import scoring
+        from .sizing import size_order
+        lane = scoring.cell_lane(proposal.lane, proposal.why)
+        tier = scoring.tier_for(self.ledger, lane, proposal.price_cents,
+                                alert_fn=self.telegram.alert)
+        depth = book.visible_depth(proposal.side, proposal.price_cents) or 0
+        dec = size_order(tier, self.ledger.book_cents(),
+                         proposal.price_cents, depth)
+        proposal.size_tier = dec.tier
+        proposal.count = max(1, dec.contracts)
 
     def _on_fill_booked(self, order, action, price_cents, count, now,
                         fee_cents=0):
@@ -835,6 +864,13 @@ class ShadowEngine:
                                            transport=transport, detail=decision.pass_reason)
                     continue
                 for proposal in proposals:
+                    # P22 §4.1: the ladder gains its caller — every ENTRY is
+                    # sized from its cell's score (tier from Wilson LB vs the
+                    # cell's OWN bars; lots from size_order's untouched
+                    # min(tier, kelly, depth)). Demotion applies HERE, at the
+                    # next proposal, no grace. Exits/cuts are never resized.
+                    if proposal.purpose == "ENTRY":
+                        self._score_and_size(proposal, book)
                     try:
                         result = self.gateway.submit(proposal, book)
                     except WallRejection as e:
@@ -950,6 +986,32 @@ class ShadowEngine:
         # the moment we learn how the window went (traded windows only today;
         # that partial view is the registry's grain QUESTION).
         self.ledger.record_outcome(market, settled_yes, now=now_eff)
+        # P22 §1.1(b): positions HELD to settlement close their unit of risk
+        # here, attributed to the OPENING lane (the attribution law). Read
+        # the unsettled fills BEFORE settle_market flips them; round-trips
+        # already banked their trip rows at exit booking — held residue only.
+        held_rows = self.ledger.db.execute(
+            "SELECT lane, side, action, price_cents, count FROM fills"
+            " WHERE market=? AND settled=0", (market,)).fetchall()
+        by_lane: dict = {}
+        for lane, side, action, price, count in held_rows:
+            d = by_lane.setdefault(lane, {})
+            s = d.setdefault(side, {"net": 0, "entry": None})
+            if action == "ENTRY":
+                s["net"] += count
+                s["entry"] = price
+            else:
+                s["net"] -= count
+        for lane, sides in by_lane.items():
+            for side, s in sides.items():
+                if s["net"] <= 0 or s["entry"] is None:
+                    continue
+                won = (settled_yes and side == "yes") or \
+                      (not settled_yes and side == "no")
+                pnl = ((100 - s["entry"]) if won else -s["entry"]) * s["net"]
+                self.ledger.record_cell_outcome(
+                    lane, s["entry"], won=won, pnl_cents=pnl, fees_cents=0,
+                    market=market, kind="settle", now=now_eff)
         per_lane = self.surface.settle_market(market, window,
                                               settled_yes=settled_yes)
         # P19 §2.6: every salvage row gets its settlement COUNTERFACTUAL —

@@ -119,6 +119,19 @@ TIER_MAX_CONTRACTS = {TIER_SUPPRESS: 0, TIER_PROBE: 1, TIER_LEAN: 2, TIER_CLEAR:
 THIN_BOOK_MIN_DEPTH = 5  # visible contracts below this = thin book -> back off one tier
 
 # ---------------------------------------------------------------------------
+# P22 "THE CELL SCOREBOARD" — the ladder's floor sensors. Every closed unit
+# of risk writes its cell (lane × price bucket); bars price to each cell's
+# OWN breakeven (the F-bar blind spot dies). PROBE stays a ruling, not a
+# bar — R1/R2 stand; only LEAN/CLEAR are earned.
+# ---------------------------------------------------------------------------
+CELL_WIDTH_CENTS = 5              # DREW-DEFAULT: 35-39, 40-44, ... 95-99
+TIER_BUFFER = {TIER_LEAN: 0.03, TIER_CLEAR: 0.05}   # DREW-DEFAULT bar over BE
+# §3.3: the bar math must never demand the impossible, only the honest —
+# bars cap below 1.0 (a 97¢ hold-cell LEAN bar lands at the cap, .98).
+TIER_BAR_CAP = {TIER_LEAN: 0.98, TIER_CLEAR: 0.99}
+SALVAGE_ADJ_MIN_N = 20            # DODGED curve n before salvage-adj BE applies
+
+# ---------------------------------------------------------------------------
 # Ledger / drawdown (C.2)
 # ---------------------------------------------------------------------------
 DRAWDOWN_ABSOLUTE_FLOOR_USD = 25.0  # absolute-floor semantics...

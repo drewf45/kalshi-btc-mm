@@ -224,9 +224,11 @@ class LaneFlip:
             return 0
         return self.gateway.positions.get((event, market, "FLIP"), 0)
 
-    def note_fill(self, market: str, side: str, price_cents: int, now: float) -> None:
+    def note_fill(self, market: str, side: str, price_cents: int, now: float,
+                  count: int = 1) -> None:
         """Called by the fills wiring when a FLIP entry books. Updates window
-        state (pair math, trip accounting)."""
+        state (custody counts, trip accounting). count rides in so an
+        earned-tier fill (P22: LEAN=2 lots) exits at its full size."""
         w = self.windows.get(market)
         if w is None:
             return
@@ -236,6 +238,7 @@ class LaneFlip:
             w.hunt_count += 1
             w.trips += 1   # hunts consume the same ratchet discipline
             w.hunts[side] = {"entry": price_cents, "fill_ts": now,
+                             "count": max(1, count),
                              "take_oid": None, "take_proposed": False,
                              "be_ts": None, "be_repriced": False}
             return
@@ -245,6 +248,7 @@ class LaneFlip:
             w.posted.pop(side, None)
             w.trips += 1   # the ratchet still counts every trip
             w.opens[side] = {"entry": price_cents, "fill_ts": now,
+                             "count": max(1, count),
                              "take_oid": None, "take_proposed": False,
                              "collapse_polls": 0, "det_ts": None}
             return
@@ -485,7 +489,7 @@ class LaneFlip:
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=h["entry"] + config.HUNT_TAKE_CENTS,
-                    count=1, size_tier=config.TIER_PROBE, purpose="EXIT",
+                    count=h["count"], size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason=f"hunt take entry+{config.HUNT_TAKE_CENTS}"))
                 continue
             flatten_reason = None
@@ -508,7 +512,7 @@ class LaneFlip:
                 h["done"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=px, count=1,
+                    action="sell", price_cents=px, count=h["count"],
                     size_tier=config.TIER_PROBE, purpose="CUT",
                     crossfire=True, reason=flatten_reason))
                 continue
@@ -523,7 +527,7 @@ class LaneFlip:
                 h["take_proposed"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=h["entry"], count=1,
+                    action="sell", price_cents=h["entry"], count=h["count"],
                     size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason="hunt breakeven reprice (mark<=entry)"))
         return props
@@ -556,7 +560,7 @@ class LaneFlip:
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=o["entry"] + config.OPEN_TAKE_CENTS,
-                    count=1, size_tier=config.TIER_PROBE, purpose="EXIT",
+                    count=o["count"], size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason=f"open take entry+{config.OPEN_TAKE_CENTS}"))
                 continue
             # CURFEW — the third exit; nothing survives the handoff
@@ -567,7 +571,7 @@ class LaneFlip:
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=mark if mark is not None else o["entry"],
-                    count=1, size_tier=config.TIER_PROBE, purpose="CUT",
+                    count=o["count"], size_tier=config.TIER_PROBE, purpose="CUT",
                     crossfire=True,
                     reason="open curfew flat (T-curfew handoff to F)"))
                 continue
@@ -580,7 +584,7 @@ class LaneFlip:
                         lane="FLIP", event=event, market=market, side=side,
                         action="sell",
                         price_cents=mark if mark is not None else o["entry"],
-                        count=1, size_tier=config.TIER_PROBE, purpose="CUT",
+                        count=o["count"], size_tier=config.TIER_PROBE, purpose="CUT",
                         crossfire=True,
                         reason=f"open determined crossfire "
                                f"(maker unfilled {int(config.OPEN_BAIL_R_S)}s)"))
@@ -604,7 +608,7 @@ class LaneFlip:
                 o["det_ts"] = now
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=px, count=1,
+                    action="sell", price_cents=px, count=o["count"],
                     size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason=f"{determined} · maker out"))
         return props

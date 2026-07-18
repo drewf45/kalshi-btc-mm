@@ -137,9 +137,16 @@ class FillBooker:
                               f"booked as EXIT@{int(round(cost))}c "
                               f"(A2 wall should have refused this entry)",
                               market=order.market, lane=order.lane, alert=False)
+            # P22 §1.1: exits close a unit of risk — the ledger banks the
+            # cell outcome inside record_fill; FLIP's intent (OPEN/HUNT)
+            # rides the exit reason / entry why so the cells split.
+            from . import scoring
             self.ledger.record_fill(order.market, order.lane, record_side,
                                     action, int(round(cost)), count,
-                                    order.size_tier, fee_cents=fee_cents)
+                                    order.size_tier, fee_cents=fee_cents,
+                                    cell_lane=scoring.cell_lane(
+                                        order.lane,
+                                        order.reason or order.why))
             self.gateway.on_fill(oid, count=count)
             self.ledger.db.execute(
                 "INSERT INTO booked_fills (fill_id, ts, order_id, count) VALUES (?,?,?,?)",

@@ -130,6 +130,17 @@ re-runs every TAPE line here forever (registry tests never retire).
 - CODE: `relay_engine/spotlead.py:1`
 - TAPE: `zero HUNT entries with ΔP < N (gate A graded)`
 
+### 17. The score decides the size
+- LAW: every closed unit of risk writes its cell (lane × 5¢ entry
+  bucket — round-trips at exit booking, held positions at settlement,
+  opening-lane attributed); the Wilson lower bound against the cell's
+  OWN fee-adjusted breakeven earns LEAN/CLEAR (PROBE stays a ruling,
+  not a bar — R1/R2 stand); promotion pages with its math; demotion
+  applies at the next proposal, no grace (P22 — the graveyard audit's
+  answer: measure the asymmetry, never assume it).
+- CODE: `relay_engine/scoring.py:1`
+- TAPE: `tier changes earned: Wilson math on every page (§4.2)`
+
 ## QUESTION (articulated ignorance — collectors named, running)
 
 - **Lane margins** — which lanes clear fees at what hit-rate? Collector:

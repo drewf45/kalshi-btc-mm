@@ -108,6 +108,11 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  WALLS: gross+net risk<=3/event · $-at-risk cap · two-strike "
                  "halt (/reset_halt) · orientation sentinels · narrated fills · "
                  "graded tape · REJECT_SELF_NET (P21 A2)")
+    # P22: the ladder's floor sensors — the score decides the size.
+    lines.append("  SIZING: cell scoreboard — every close writes its "
+                 f"(lane × {config.CELL_WIDTH_CENTS}¢) cell; Wilson LB vs the "
+                 "cell's OWN breakeven earns LEAN/CLEAR; demotion instant; "
+                 "/scoreboard on demand (P22)")
     # P21 B1: the boot cites the doctrine — one page says what the machine
     # believes, why, and what would change its mind. Cited, and verified
     # present (a missing registry is worth a loud boot line, never a crash).

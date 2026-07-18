@@ -26,16 +26,21 @@ class Telegram:
     = boot-stop (the pager is safety equipment); absent in SHADOW = one loud
     log line and alerts fall back to the log.
 
-    Command surface is EXACTLY the accounting pair — the old tree's richer
+    Command surface is EXACTLY the accounting pair + Drew's key — plus, per
+    P22 §5, the ONE read-only addition /scoreboard (Adversary: it places
+    nothing, changes nothing — accounting-read only). The old tree's richer
     command set does NOT port (single-gateway law outranks nostalgia)."""
 
-    COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt")
+    COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
         # P8 §2.3: /reset_halt — Drew's key to the two-strike leash. Wired by
         # the runner to WindowEcon.reset_halt; re-enables ENTRIES only.
         self.reset_halt_fn = lambda: "no halt manager wired"
+        # P22 §5: the scoreboard on demand — wired by the runner to
+        # scoring.scoreboard_lines. Read-only by construction.
+        self.scoreboard_fn = lambda: "no scoreboard wired"
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         self._session = None
@@ -85,6 +90,8 @@ class Telegram:
             return "denied — FATAL"
         if cmd == "/reset_halt":
             return self.reset_halt_fn()
+        if cmd == "/scoreboard":
+            return self.scoreboard_fn()
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 
@@ -299,18 +306,28 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.append("FAILURES: none recorded")
     if venue_statement_cents is not None:
         lines.append(cash_protocol.monthly_true_up_line(venue_statement_cents))
+    # P22 §5: THE SCOREBOARD — the daily confrontation, sorted by margin,
+    # red where it bleeds, unasked. The offense map and the fee-negative-
+    # cell exposure become visible the day they exist.
+    try:
+        from . import scoring
+        lines.extend(scoring.scoreboard_lines(ledger))
+    except Exception as e:
+        lines.append(f"CELL SCOREBOARD: unavailable ({e})")
     # P15 §1: THE TAPE GRADES THE DEPLOY — each WO's expected-tape section
     # runs in every pack until its lines pass twice, then retires to the
     # archive. 24h without the expected tape materializing = a FINDING (the
     # code and the world disagree), never silently forgotten.
     try:
         from scripts.tape_grade import (CHECKS, CHECKS_P16, CHECKS_P17,
-                                        CHECKS_P18, CHECKS_P19, CHECKS_P21)
+                                        CHECKS_P18, CHECKS_P19, CHECKS_P21,
+                                        CHECKS_P22)
         suites = (("P15", "p15", CHECKS), ("P16 deposit day", "p16", CHECKS_P16),
                   ("P17 show up", "p17", CHECKS_P17),
                   ("P18 the detective", "p18", CHECKS_P18),
                   ("P19 let it run", "p19", CHECKS_P19),
-                  ("P21 the doctrine engine", "p21", CHECKS_P21))
+                  ("P21 the doctrine engine", "p21", CHECKS_P21),
+                  ("P22 the cell scoreboard", "p22", CHECKS_P22))
         from scripts.tape_grade import grade
         for label, prefix, checks in suites:
             passes = int(ledger.get_state(f"{prefix}_grade_passes") or 0)
