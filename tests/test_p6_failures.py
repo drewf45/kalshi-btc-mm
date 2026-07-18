@@ -227,11 +227,13 @@ def test_telegram_unwired_shadow_falls_back_to_log(monkeypatch, cash):
     tg.alert("goes to the log, loudly")  # no raise
 
 
-def test_command_surface_is_exactly_the_accounting_pair(cash):
+def test_command_surface_is_exactly_the_whitelist(cash):
+    """The pair + /reset_halt (P8 §2.3). Still no order-shaped command, ever."""
     tg = Telegram(cash, send_fn=lambda m: None)
-    assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash")
+    assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt")
     for stray in ("/resume_yes", "/paid", "/buy KXBTC15M 5", "/status", "hello"):
         assert "accounting commands only" in tg.handle_command(stray)
+    assert tg.handle_command("/reset_halt") == "no halt manager wired"
 
 
 def test_poll_updates_dispatches_and_tracks_offset(monkeypatch, ledger, cash):

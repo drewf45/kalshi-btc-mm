@@ -69,3 +69,19 @@ class OrderBook:
 
     def is_stale(self, now: float, limit_seconds: float) -> bool:
         return (now - self.last_update_ts) > limit_seconds
+
+
+def touch_view(ob: "OrderBook"):
+    """P7 §1 — THE single book adapter: one book, one truth. Every lane's touch
+    read comes through here (F/H8's favorite, FLIP's joins, D's cheap side, the
+    custodian's marks all derive from the same OrderBook instance per market).
+    Property-tested: fields equal the book's canonical queries, always."""
+    from .lane_fh8 import TouchBook
+    yb, nb = ob.best_yes_bid(), ob.best_no_bid()
+    return TouchBook(
+        yes_bid=yb, no_bid=nb,
+        yes_ask=(100 - nb) if nb is not None else None,
+        no_ask=(100 - yb) if yb is not None else None,
+        yes_bid_qty=ob.visible_depth("yes", yb) if yb is not None else 0,
+        no_bid_qty=ob.visible_depth("no", nb) if nb is not None else 0,
+    )

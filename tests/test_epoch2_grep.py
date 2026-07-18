@@ -36,6 +36,8 @@ def test_monolith_quarantined_and_never_imported():
 
 
 def test_no_paid_command():
-    """/paid is retired; only the two accounting commands exist."""
+    """/paid is retired. The surface is the accounting pair plus /reset_halt
+    (P8 §2.3 — Drew's key to the two-strike leash; entries only)."""
     from relay_engine.ops import Telegram
-    assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash")
+    assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt")
+    assert "/paid" not in Telegram.COMMANDS

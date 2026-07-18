@@ -362,6 +362,43 @@ Suite at this commit: **168 passed** (18 new P6 tests); golden tape 0/2,941 mism
   the hourly one-liner ON THE PHONE. Any failure instead arrives with its tag and its
   full record is in the table — R5 working even when nothing else is.
 
+## WO-2026-07-18-RELAY-P8 (+P7) — "GO LIVE: BRACKET EVERY MARKET, STOP AT TWO"
+
+Suite at this commit: **181 passed** (13 new); golden tape 0/2,941 mismatches.
+
+- **§1 TRUE** — `window_econ.py`: OPEN BRACKET at first order submit (account truth:
+  venue balance+positions in LIVE, paper book in shadow), CLOSE BRACKET after confirmed
+  settlement + booked fills; window_pnl = close − open − confirmed-cash-moves-inside
+  (a mid-window deposit provably does not masquerade as trading profit); broker-vs-fills
+  divergence > 2c banks WINDOW_ECON_DIVERGENCE with BOTH numbers and pages; WINDOW_ECON
+  surface row per traded market; 📊 one-liner with streak; untraded markets write no
+  bracket. Settlement sweep task (30s) closes brackets from venue `get_settlement_result`.
+- **§2 TRUE** — the two-strike leash: consecutive-negative streak over traded markets,
+  account-level; streak==2 → TWO_STRIKE_HALT (entries engine-wide; custody of existing
+  risk continues — test-proven an EXIT still submits under the halt); halt PERSISTS in
+  the DB across restarts (test: new engine, same DB, still halted); `/reset_halt` from
+  the configured chat is the only key — entries only, streak reset, HALT_RESET surface
+  row, reply carries book value. Pack shows streak/halts/resets.
+- **§3 TRUE** — boot tape prints `SIZING: 1/12-Kelly ceiling · book $Y · current max
+  lots {n}` — n computed by the ladder itself (at a $100-class book: 1 lot, which is
+  what 1/12 Kelly IS at this bankroll; the same math grows size as the book compounds).
+- **§4 TRUE** — LIVE path: RUN_MODE+phrase → live boot reconcile → LIVE banner + pager
+  boot-stop if Telegram unwired; ✅ FILL one-liner per booked fill; render start command
+  stays the shadow runner until Drew flips the env vars.
+- **P7 (RECONSTRUCTED — flag)**: the WO-P7 document itself was never delivered; its
+  five items were built from P8 §4.3's explicit list: single book adapter
+  (`book.touch_view`, THE one view every lane reads) + 200-case property test
+  (adapter fields == book canon; favorite never fabricated) + replay regression
+  (`replay.py`: live-shaped fp-dollars tape → F tracks the favorite on every frame,
+  never blind; plus `replay_from_db` — the recorder's named reader, real) + venue
+  reject backoff (REJECT_BACKOFF wall, 30s market rest, risk reduction exempt, failure
+  rows banked) + storm telemetry (frames/rejects/venue-rejects in the hourly line).
+  **Supply the WO-P7 text to true this up against its actual spec.**
+- **DEPLOY (two steps, the second is Drew's):** deploy → watch one shadow window price
+  correctly (F tracking the live favorite in the log within ~15 min) → flip
+  RUN_MODE=LIVE + I_UNDERSTAND_LIVE phrase → LIVE BOOT page → first ✅ FILL → first 📊
+  bracket → trading, bracketed, leashed at two.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

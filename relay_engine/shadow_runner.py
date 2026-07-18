@@ -152,6 +152,9 @@ class ShadowEngine:
                                 custodian=self.custodian,
                                 alert_fn=self.telegram.alert,
                                 on_booked=self._on_fill_booked)
+        from .window_econ import WindowEcon
+        self.econ = WindowEcon(self.ledger, self.gateway, self.surface, self.telegram)
+        self.telegram.reset_halt_fn = self.econ.reset_halt  # Drew's key, entries only
         self.boot_caps = None
         self._window_of = {}  # market -> window_id (market close ts as string)
         self.surface.concurrent_provider = self._concurrent_lanes
@@ -204,6 +207,9 @@ class ShadowEngine:
         return ",".join(sorted(live))
 
     def _on_fill_booked(self, order, action, price_cents, count, now):
+        # P8 §4.2: every fill pages, one line
+        self.telegram.alert(f"✅ FILL {order.lane} {order.market} "
+                            f"{order.side}@{price_cents}¢ x{count}")
         if order.lane == "FLIP":
             if action == "ENTRY":
                 self.flip.note_fill(order.market, order.side, price_cents, now)
@@ -240,7 +246,19 @@ class ShadowEngine:
                 f"BOOT_LOOP: {boots_last_hour} boots in the last hour — "
                 f"last FATAL: {last_fatal}")
         self.boot_id = boot_id
+        # P8 §2.3: restarts and redeploys do NOT clear the two-strike halt
+        self.econ.restore_halt_on_boot()
         return boots_last_hour
+
+    def account_value_cents(self) -> int:
+        """P8 §1: account truth — venue balance + position value in LIVE;
+        the paper book in shadow (brackets exercise the same machinery)."""
+        if config.live_submit_enabled() and self.gateway.venue_client is not None:
+            from . import venue
+            cash, pv = venue.get_balance(self.gateway.venue_client)
+            if cash is not None:
+                return int(round((cash + (pv or 0.0)) * 100))
+        return self.ledger.book_cents()
 
     def record_fatal(self, message: str) -> None:
         self.ledger.set_state("last_fatal", message[:500])
@@ -330,9 +348,14 @@ class ShadowEngine:
                     try:
                         result = self.gateway.submit(proposal, book)
                     except WallRejection as e:
+                        self.gateway.reject_counts[e.wall] = \
+                            self.gateway.reject_counts.get(e.wall, 0) + 1
                         log.warning("wall rejected %s proposal on %s: %s",
                                     lane.name, market, e)
                         continue
+                    if proposal.purpose == "ENTRY":
+                        # P8 §1: OPEN BRACKET at the first order submit on this market
+                        self.econ.open_bracket(market, self.account_value_cents(), now=now)
                     if proposal.lane in ("F", "H8"):
                         # Live submit side-effects, mirrored from k_worker gateway.submit:
                         # lane-scoped single entry + F hourly exposure.
@@ -352,6 +375,46 @@ class ShadowEngine:
 
     def close_window(self, market):
         self._window_of.pop(market, None)
+
+    def settle_traded_market(self, market: str, settled_yes: bool,
+                             now=None) -> None:
+        """P8 §1: CLOSE BRACKET — settlement confirmed, fills booked, account
+        truth snapshotted. Traded markets only (open brackets); untraded
+        markets write no bracket."""
+        window = self._window_of.get(market, f"w-{market}")
+        per_lane = self.surface.settle_market(market, window,
+                                              settled_yes=settled_yes)
+        fills_pnl = sum(per_lane.values())
+        fills_count = int(self.ledger.db.execute(
+            "SELECT COUNT(*) FROM fills WHERE market=?", (market,)).fetchone()[0])
+        self.econ.close_bracket(
+            market, self.account_value_cents(), fills_pnl,
+            lanes_active=",".join(sorted(per_lane)), fills_count=fills_count,
+            now=now)
+
+    def settlement_sweep(self, now=None) -> int:
+        """Poll settlement for markets with open brackets whose close passed."""
+        from . import venue
+        now = time.time() if now is None else now
+        settled = 0
+        for market in list(self.econ.open_brackets):
+            meta = self._meta(market)
+            close_ts = meta.get("close_ts")
+            if close_ts is not None and now < close_ts + 10:
+                continue
+            client = self.gateway.venue_client
+            if client is None:
+                from . import venue as _v
+                try:
+                    client = self.gateway.venue_client = _v.build_client()
+                except Exception:
+                    return settled
+            result = venue.get_settlement_result(client, market)
+            if result in ("yes", "no"):
+                self.settle_traded_market(market, settled_yes=(result == "yes"),
+                                          now=now)
+                settled += 1
+        return settled
 
 
 async def run():
@@ -416,7 +479,8 @@ async def run():
         while not stop.is_set():
             await asyncio.sleep(PACK_HOURLY_S)
             pack = daily_pack(engine.ledger, engine.surface, engine.cash,
-                              foreign_fills=engine.fills.foreign_seen)
+                              foreign_fills=engine.fills.foreign_seen,
+                              econ=engine.econ)
             print(pack, flush=True)
             now_et = datetime.now(ZoneInfo("America/New_York"))
             if now_et.hour == 9 and last_full_day != now_et.date():
@@ -428,6 +492,10 @@ async def run():
                     f"markets={len(engine.market_meta)} "
                     f"orders={len(engine.gateway.order_index)} "
                     f"foreign={engine.fills.foreign_seen} "
+                    f"streak={engine.econ.streak} "
+                    f"frames={engine.feed.frames_seen} "
+                    f"rejects={sum(engine.gateway.reject_counts.values())} "
+                    f"venue_rejects={engine.gateway.venue_rejects} "
                     f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")
 
     # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
@@ -439,9 +507,22 @@ async def run():
                 return  # nothing to listen on; the log heard the refusal
             await asyncio.sleep(1.0)
 
+    # ── P8: settlement sweep + (LIVE) fills reconcile, every 30s ───────────
+    async def settle_task():
+        while not stop.is_set():
+            await asyncio.sleep(30.0)
+            try:
+                await asyncio.to_thread(engine.settlement_sweep)
+                if config.live_submit_enabled() and engine.gateway.venue_client is not None:
+                    await asyncio.to_thread(engine.fills.reconcile_sweep,
+                                            engine.gateway.venue_client)
+            except Exception as e:
+                log.warning("settlement/fills sweep error (continuing): %s", e)
+
     asyncio.create_task(spot_task())
     asyncio.create_task(pack_task())
     asyncio.create_task(listener_task())
+    asyncio.create_task(settle_task())
 
     subscribed: set = set()
 
@@ -555,7 +636,8 @@ async def run():
     stop.set()
     engine.recorder.flush()  # P6 §4: shutdown flush — no buffered frame lost
     print(daily_pack(engine.ledger, engine.surface, engine.cash,
-                     foreign_fills=engine.fills.foreign_seen), flush=True)
+                     foreign_fills=engine.fills.foreign_seen, econ=engine.econ),
+          flush=True)
     engine.telegram.alert("🔵 CLEAN SHUTDOWN — recorder flushed, pack printed")
     log.info("runner stopped; zero orders placed: %s",
              len(engine.gateway.shadow_orders) == 0)

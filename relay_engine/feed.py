@@ -113,6 +113,7 @@ class Feed:
         self.order_errors = 0                         # per-order errors routed, counted
         self.book_units: Optional[str] = None         # P5 §3: asserted on first snapshot
         self.shape_failures = 0                       # P6 §1: consecutive unparseable deltas
+        self.frames_seen = 0                          # P7: storm telemetry
 
     def note_sent(self, payload: str) -> None:
         """Runner registers each subscribe/command payload for the error autopsy."""
@@ -148,6 +149,7 @@ class Feed:
 
     def handle_frame(self, raw: str, now: Optional[float] = None) -> None:
         now = time.time() if now is None else now
+        self.frames_seen += 1
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError as e:

@@ -30,6 +30,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
         f"RATE GOVERNOR: bucket={config.RATE_BUCKET_CAPACITY} tokens, "
         f"refill={config.RATE_REFILL_PER_SECOND}/s (printed number IS the enforced number)")
     if boot_caps is not None:
+        # P8 §3: 1/12-Kelly honestly stated — at this book the ceiling IS ~one
+        # lot; the same math grows size as the book compounds, no ruling needed.
+        from .sizing import size_order
+        max_lots = size_order(config.TIER_PROBE, boot_caps.book_cents, 99, 10_000).contracts
+        lines.append(
+            f"SIZING: 1/12-Kelly ceiling · book ${boot_caps.book_cents / 100:.2f} · "
+            f"current max lots {max_lots}")
+    if boot_caps is not None:
         lines.append(
             f"BOOT CAPS SNAPSHOT: book={boot_caps.book_cents}c "
             f"order_budget={boot_caps.order_budget_cents}c "

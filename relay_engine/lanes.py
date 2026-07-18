@@ -50,16 +50,7 @@ def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optio
         return None
 
 
-def touch_book_from(ob: OrderBook) -> lane_fh8.TouchBook:
-    """Adapter: relay bids-only book -> the touch view the F/H8 logic reads."""
-    yb, nb = ob.best_yes_bid(), ob.best_no_bid()
-    return lane_fh8.TouchBook(
-        yes_bid=yb, no_bid=nb,
-        yes_ask=(100 - nb) if nb is not None else None,
-        no_ask=(100 - yb) if yb is not None else None,
-        yes_bid_qty=ob.visible_depth("yes", yb) if yb is not None else 0,
-        no_bid_qty=ob.visible_depth("no", nb) if nb is not None else 0,
-    )
+from .book import touch_view as touch_book_from  # P7 §1: THE single adapter (one book, one truth)
 
 
 @dataclass

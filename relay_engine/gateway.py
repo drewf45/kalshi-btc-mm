@@ -129,6 +129,24 @@ class Gateway:
         self.filled_counts: Dict[str, int] = {}
         self.live_order_ids: set = set()
         self.entries_halted_reasons: set = set()
+        # P7: venue-reject backoff (per market) + storm telemetry counters
+        self.backoff_until: Dict[str, float] = {}
+        self.reject_counts: Dict[str, int] = {}
+        self.venue_rejects = 0
+
+    def note_backoff(self, market: str, seconds: float = 30.0) -> None:
+        import time as _t
+        self.backoff_until[market] = _t.monotonic() + seconds
+
+    def in_backoff(self, market: str) -> bool:
+        import time as _t
+        until = self.backoff_until.get(market)
+        if until is None:
+            return False
+        if _t.monotonic() >= until:
+            del self.backoff_until[market]
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Canonical layer: risk-reducing classification happens HERE, once,
@@ -167,6 +185,10 @@ class Gateway:
         if not risk_reducing:
             if self.entries_halted_reasons:
                 raise WallRejection("ENTRIES_HALTED", ",".join(sorted(self.entries_halted_reasons)))
+            if self.in_backoff(order.market):
+                # P7: a venue-rejected market rests before it is re-asked
+                raise WallRejection("REJECT_BACKOFF",
+                                    f"{order.market} in post-reject backoff")
             self._wall_band_and_single_entry(order)
             self._wall_net_risk_and_at_risk(order)
             self._wall_wrong_way_tick(order)
@@ -216,11 +238,24 @@ class Gateway:
             v_fp = None  # fp string was the held side's touch; complement re-derives
         else:
             v_side, v_price, v_fp = order.side, order.price_cents, order.rest_fp
-        oid, resp = venue.place_order_maker(
-            self.venue_client, order.market, v_side, v_price,
-            count=order.count, v2_price_str=v_fp,
-            post_only=not order.crossfire,
-        )
+        try:
+            oid, resp = venue.place_order_maker(
+                self.venue_client, order.market, v_side, v_price,
+                count=order.count, v2_price_str=v_fp,
+                post_only=not order.crossfire,
+            )
+        except RuntimeError as e:
+            # P7: a venue reject is a NORMAL reject with a rest — backoff the
+            # market, bank the failure, and let the lane re-propose later.
+            self.venue_rejects += 1
+            self.note_backoff(order.market)
+            err = str(e)
+            definitive = "HTTP 4" in err and "HTTP 429" not in err
+            failures.fail("VENUE_REJECTED" if definitive else "VENUE_AMBIGUOUS",
+                          f"{order.lane} {order.market} {order.side}@{order.price_cents}c: {err[:200]}",
+                          lane=order.lane, market=order.market)
+            raise WallRejection("VENUE_REJECTED" if definitive else "VENUE_AMBIGUOUS",
+                                err[:200])
         self.resting[oid] = order
         self.order_index[oid] = order
         self.live_order_ids.add(oid)

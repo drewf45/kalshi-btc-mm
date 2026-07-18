@@ -29,10 +29,13 @@ class Telegram:
     Command surface is EXACTLY the accounting pair — the old tree's richer
     command set does NOT port (single-gateway law outranks nostalgia)."""
 
-    COMMANDS = ("/confirm_cash", "/deny_cash")
+    COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
+        # P8 §2.3: /reset_halt — Drew's key to the two-strike leash. Wired by
+        # the runner to WindowEcon.reset_halt; re-enables ENTRIES only.
+        self.reset_halt_fn = lambda: "no halt manager wired"
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         self._session = None
@@ -80,6 +83,8 @@ class Telegram:
         if cmd == "/deny_cash":
             self.cash.deny_cash()
             return "denied — FATAL"
+        if cmd == "/reset_halt":
+            return self.reset_halt_fn()
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 
@@ -168,7 +173,7 @@ LANES_PENDING = ()  # every lane that exists trades (R1); empty until a new lane
 
 
 def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[int] = None,
-               foreign_fills: int = 0) -> str:
+               foreign_fills: int = 0, econ=None) -> str:
     """The daily pack: EPOCH 2 header, the worst-day bound, live-vs-pending
     lanes (a reader never wonders why a lane is silent), honest lifetime,
     per-lane sections from terminal rows, and (monthly) the true-up line."""
@@ -195,6 +200,9 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     if foreign_fills:
         lines.append(f"FOREIGN FILLS seen: {foreign_fills} "
                      f"(live Kal's until cutover; NONZERO AFTER CUTOVER = ALARM)")
+    # P8 §2.4: the streak, halts, and resets
+    if econ is not None:
+        lines.extend(econ.pack_lines())
     # R5: the FAILURES section — the curriculum includes how things DON'T work
     from . import failures as failure_ledger
     fail_lines = failure_ledger.pack_section(ledger)
