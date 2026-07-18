@@ -30,6 +30,27 @@ RATIFICATIONS_ASSUMED = (
 )
 
 # ---------------------------------------------------------------------------
+# RULINGS — Drew's, recorded with scope and sunset (printed every boot).
+# ---------------------------------------------------------------------------
+RULINGS = (
+    "A3 PROVEN GROUND (Drew, 2026-07-18): the go-live transport is REST 1s at "
+    "one-lot / <=3 net per event — yesterday's proven live surface. The WS "
+    "dialect is SHELVED with its lessons and fixes; it returns as an upgrade, "
+    "re-certified separately, and never again gates a go-live.",
+)
+
+# ---------------------------------------------------------------------------
+# P11 PROVEN GROUND — transport selection + the REST feed's enforced numbers.
+# WS_ENABLED=false (the default, per A3) runs the REST 1s loop; the ws path
+# is import-inert under this flag.
+# ---------------------------------------------------------------------------
+WS_ENABLED = os.environ.get("WS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+REST_BUCKET_CAPACITY = 10        # P11.1-b: token bucket around ALL REST calls
+REST_REFILL_PER_SECOND = 8.0     # books 4/s + spot 0.7/s + fills 0.3/s + headroom
+REST_BOOK_STALE_CUSTODY_S = 30.0  # P11.1-d: custody's grace on a failed-fetch book
+FILLS_SWEEP_S = 3.0              # the proven live fills cadence (accepted 3s lag)
+
+# ---------------------------------------------------------------------------
 # Safe defaults in force (A3 / Chunk 0.3)
 # ---------------------------------------------------------------------------
 ONE_LOT_MAX_LOSS_CENTS = 99  # worst-case loss on a single 1-lot maker entry (price -> 0)

@@ -23,6 +23,20 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     ]
     for r in config.RATIFICATIONS_ASSUMED:
         lines.append(f"  ASSUMED: {r}")
+    lines.append("RULINGS (Drew's, recorded with scope and sunset):")
+    for r in config.RULINGS:
+        lines.append(f"  RULED: {r}")
+    # P11: the transport is named on every boot; the governor's printed
+    # numbers ARE the enforced numbers (P11.1-b).
+    if config.WS_ENABLED:
+        lines.append("TRANSPORT: WS (upgrade path — re-certified separately)")
+    else:
+        lines.append("TRANSPORT: REST 1s (A3 proven ground) · books 1/s · "
+                     "spot 1.5s · fills 3s · discovery 60s")
+    lines.append(
+        f"REST GOVERNOR: bucket={config.REST_BUCKET_CAPACITY} tokens, "
+        f"refill={config.REST_REFILL_PER_SECOND}/s around ALL REST calls "
+        f"(printed number IS the enforced number)")
     lines.append("DREW-DEFAULT constants in force:")
     for k, v in config.drew_defaults().items():
         lines.append(f"  DREW-DEFAULT {k} = {v}")

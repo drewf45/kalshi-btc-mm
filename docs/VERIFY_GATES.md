@@ -553,6 +553,45 @@ Suite at this commit: **230 passed**. `python -m scripts.preflight` → **9/9**.
 hands only: autopsy + preflight in the Render shell → one quiet shadow window →
 RUN_MODE=LIVE + the phrase → the phone tells the rest.
 
+## WO-P11 "PROVEN GROUND" + P11.1 fold-ins — the REST reversion (A3)
+
+Suite at this commit: **241 passed**; `python -m scripts.preflight` → **10/10**.
+
+- **A3 RULING recorded** (`config.RULINGS`, printed every boot): go-live transport is
+  REST 1s at one-lot / ≤3 net — yesterday's proven live surface; WS is SHELVED with
+  its lessons and fixes, returns as an upgrade re-certified separately, never again
+  gating a go-live. `WS_ENABLED=false` is the default; the flag restores the WS loop.
+- **P11.1-a TRUE — the runner never rewired**: `rest_feed.RestFeed` SUBCLASSES Feed —
+  the FeedLike surface (books/book/drop_book/resync_needed/on_poison/frames_seen) is
+  inherited, not reimplemented. A poll fetches `venue.fetch_orderbook_raw` (FULL
+  depth, fp-dollar strings preserved) and pipes the synthesized snapshot through the
+  inherited `handle_frame` — so the unit assertion, true-touch fp law, coherence
+  debounce, and recorder all ride along verbatim. Poison/resync are near-no-ops by
+  construction: the next 1s poll IS the resync. All 230 prior tests passed unchanged.
+- **P11.1-b TRUE (Marta's flag confirmed then closed)**: the request core had NO
+  governor — only 429/5xx retry backoff. Now `_RestGovernor` (ONE thread-safe token
+  bucket, pace-not-reject) wraps EVERY attempt of EVERY REST call
+  (`KalshiClient.request`); budget `bucket=10, refill=8/s` printed in the boot tape —
+  the printed number is the enforced number. Source-asserted by test.
+- **P11.1-c TRUE**: the REST recorder format IS the synthesized snapshot through the
+  existing `record()` path — replay-compatible by construction (test: poll →
+  `replay_from_db` prices the favorite at the subpenny touch). `transport` stamped on
+  surface rows (REST|WS|EXPLORATION via `transport_label()`) and on brackets
+  (window_econ `transport` column, migrated in place).
+- **P11.1-d TRUE — no-defaults extended to books**: a failed fetch = NO book this
+  cycle: `BOOK_FETCH_FAILED` banked + counted, the old book left untouched with its
+  old timestamp (never a fabricated freshness), lanes skip tagged; custody reads the
+  last book only WITHIN `REST_BOOK_STALE_CUSTODY_S=30`, beyond it custody marks DEFER
+  (the custodian receives no book and holds — P9's deferral shape applied to books);
+  recovery on the next good poll. The ws path is import-inert under the flag
+  (ast-proven: no top-level websockets import; the import lives inside the WS branch).
+- **Cadences (Marta-certified)**: books 1/s (cycle-paced), spot 1.5s, fills 3s (new
+  supervised `fills` task; settle task keeps 30s settlements), discovery 60s. The
+  pack header names the 3s fill lag as accepted-at-scope, not a bug (Trader's knob).
+  The P10 book_check auditor stands down in REST mode (no second truth to arbitrate).
+- **Boot page (§C)**: `transport: REST 1s` + SIZING + worst-day + listener, sent
+  after the first discovery+poll. Hourly line gains `fetch_fail={n}`.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

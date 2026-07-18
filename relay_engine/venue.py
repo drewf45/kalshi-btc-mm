@@ -15,6 +15,7 @@ exits identically.
 """
 
 import time
+import threading
 import uuid
 import base64
 import logging
@@ -46,6 +47,38 @@ class OrderStatusUnavailable(Exception):
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+class _RestGovernor:
+    """P11.1-b: ONE token bucket around ALL REST calls — the retry-storm
+    lesson does not get to regress on the transport we reverted TO. A feed
+    PACES (waits for its token), it is never rejected. Thread-safe: polls,
+    sweeps, and custody reads share the bucket across to_thread workers.
+    The boot tape prints these numbers; these numbers are what is enforced."""
+
+    def __init__(self, capacity: float, refill_per_s: float):
+        self.capacity = float(capacity)
+        self.refill = float(refill_per_s)
+        self.tokens = float(capacity)
+        self.ts = time.monotonic()
+        self._lock = threading.Lock()
+
+    def pace(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity,
+                                  self.tokens + (now - self.ts) * self.refill)
+                self.ts = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                wait = (1.0 - self.tokens) / self.refill
+            time.sleep(wait)
+
+
+REST_GOVERNOR = _RestGovernor(config.REST_BUCKET_CAPACITY,
+                              config.REST_REFILL_PER_SECOND)
 
 
 class KalshiClient:
@@ -87,6 +120,7 @@ class KalshiClient:
         max_retries = 3
         base_delay = 0.5
         for attempt in range(max_retries + 1):
+            REST_GOVERNOR.pace()  # P11.1-b: every attempt takes a token
             headers = self._sign_headers(method, url)
             headers["Accept"] = "application/json"
             if json_body is not None:
@@ -231,6 +265,29 @@ class Book:
 
 
 _ob_shape_logged = False
+
+
+def fetch_orderbook_raw(client: KalshiClient, ticker: str) -> Optional[Dict]:
+    """P11: FULL-depth book arrays for the REST feed, wire-form preserved.
+    Returns {"yes": [[price, count], ...], "no": [...]} — fp-dollar strings
+    when the venue speaks them (orderbook_fp), int cents otherwise — or None
+    when the fetch FAILED (P11.1-d: a failed fetch is NO book, never a
+    fabrication). An empty-but-present book returns empty arrays: that is a
+    real (bidless) book, not a failure."""
+    try:
+        resp = client.request("GET", f"/markets/{ticker}/orderbook")
+    except Exception as e:
+        log.warning(f"[OB] {ticker}: {e}")
+        return None
+    if not isinstance(resp, dict):
+        return None
+    if "orderbook_fp" in resp:
+        ob = resp.get("orderbook_fp") or {}
+        return {"yes": ob.get("yes_dollars") or [], "no": ob.get("no_dollars") or []}
+    if "orderbook" in resp:
+        ob = resp.get("orderbook") or {}
+        return {"yes": ob.get("yes") or [], "no": ob.get("no") or []}
+    return None  # unknown shape — refuse to guess
 
 
 def fetch_orderbook(client: KalshiClient, ticker: str) -> Book:

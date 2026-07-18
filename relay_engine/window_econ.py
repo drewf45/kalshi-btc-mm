@@ -54,14 +54,16 @@ CREATE TABLE IF NOT EXISTS window_econ (
     lanes_active TEXT NOT NULL DEFAULT '',
     fills_count INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT 'paper',   -- P9 §2: venue|paper — live rejects paper
-    deferred TEXT NOT NULL DEFAULT ''       -- P9 §2: deferral stamps (open+Ns / close+Ns)
+    deferred TEXT NOT NULL DEFAULT '',      -- P9 §2: deferral stamps (open+Ns / close+Ns)
+    transport TEXT NOT NULL DEFAULT ''      -- P11.1-c: REST|WS — evidence separable
 );
 """
 
-# P9 §2: columns added after the table shipped — migrate in place.
+# P9 §2 / P11.1-c: columns added after the table shipped — migrate in place.
 ECON_MIGRATIONS = (
     ("source", "TEXT NOT NULL DEFAULT 'paper'"),
     ("deferred", "TEXT NOT NULL DEFAULT ''"),
+    ("transport", "TEXT NOT NULL DEFAULT ''"),  # REST|WS — evidence separable
 )
 
 
@@ -124,7 +126,7 @@ class WindowEcon:
 
     def open_bracket(self, market: str, account_value_cents: Optional[int],
                      now: Optional[float] = None, source: str = "paper",
-                     deferred: str = "") -> None:
+                     deferred: str = "", transport: str = "") -> None:
         """At the FIRST order submit on this market. account_value_cents=None
         means the live read failed — the bracket DEFERS (P9 §2): it opens on
         the next successful read, stamped with the deferral."""
@@ -142,9 +144,9 @@ class WindowEcon:
         self._reject_paper_in_live(market, source)
         self.open_brackets[market] = Bracket(market, account_value_cents, now)
         self.ledger.db.execute(
-            "INSERT INTO window_econ (ts, market, open_value_cents, source, deferred)"
-            " VALUES (?,?,?,?,?)",
-            (now, market, account_value_cents, source, deferred))
+            "INSERT INTO window_econ (ts, market, open_value_cents, source,"
+            " deferred, transport) VALUES (?,?,?,?,?,?)",
+            (now, market, account_value_cents, source, deferred, transport))
         self.ledger.db.commit()
         log.info("WINDOW_ECON open %s at %dc (source=%s)", market,
                  account_value_cents, source)

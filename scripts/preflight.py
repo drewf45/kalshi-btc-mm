@@ -52,6 +52,9 @@ CHECKS = [
     ("the LIVE spine, dry-proven end-to-end (Chunk D)", [
         "tests/test_go_live_dry_run.py::test_go_live_dry_run",
     ]),
+    ("proven ground: REST feed drop-in, governor, no-fabrication (P11)", [
+        "tests/test_p11_proven_ground.py",
+    ]),
 ]
 
 

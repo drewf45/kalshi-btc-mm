@@ -168,7 +168,10 @@ class ShadowEngine:
         self.cash.alert = self.telegram.alert
         self.recorder = Recorder(self.ledger)
         self.ladder = DegradeLadder(on_transition=self._on_ladder_move)
-        self.feed = Feed(self.ladder, recorder=self.recorder)
+        # P11.1-a: RestFeed IS a Feed (the FeedLike drop-in) — the WS path and
+        # the REST path share one object; the runner never rewires.
+        from .rest_feed import RestFeed
+        self.feed = RestFeed(self.ladder, recorder=self.recorder)
         self.gateway = Gateway(self.ledger, self.surface)
         self.custodian = Custodian(self.gateway, self.ledger, self.surface, ladder=self.ladder)
         self.lanes = build_registry(self.ledger, gateway=self.gateway,
@@ -465,6 +468,22 @@ class ShadowEngine:
             return "ok" if n == 0 else f"ok({n} restarts)"
         return f"down({n} restarts)"
 
+    def transport_label(self) -> str:
+        """P11.1-c: the transport stamp on surface rows and brackets — future
+        evidence stays separable when WS returns as an upgrade."""
+        if not config.WS_ENABLED:
+            return "REST"
+        return "WS" if self.ladder.entries_allowed() else "EXPLORATION"
+
+    def rest_poll_all(self, client, now=None) -> int:
+        """P11: one pass of the 1s book poll over every discovered market."""
+        now = time.time() if now is None else now
+        ok = 0
+        for m in sorted(self.market_meta):
+            if self.feed.poll_market(client, m, now=now):
+                ok += 1
+        return ok
+
     def record_fatal(self, message: str) -> None:
         self.ledger.set_state("last_fatal", message[:500])
 
@@ -514,6 +533,15 @@ class ShadowEngine:
                 rb = self._rest_book(m)
                 if rb is not None:
                     b = rb
+            # P11.1-d: a failed-fetch book serves custody only WITHIN the
+            # staleness bound; beyond it custody marks DEFER (no key → the
+            # custodian holds) exactly as P9 defers money. Never a stale
+            # fabrication.
+            if (not config.WS_ENABLED
+                    and m in getattr(self.feed, "fetch_failed", ())
+                    and b.has_snapshot
+                    and b.is_stale(now, config.REST_BOOK_STALE_CUSTODY_S)):
+                continue
             cust_books[m] = b
         cuts = self.custodian.tick(
             books=cust_books,
@@ -531,13 +559,21 @@ class ShadowEngine:
             window = self._window_of.setdefault(market, f"w-{market}")
             book = self.feed.book(market)
             meta = self._meta(market)
-            transport = "WS" if self.ladder.entries_allowed() else "EXPLORATION"
+            transport = self.transport_label()
             # P10 §2.2/§2.4: lanes refuse a poisoned or quarantined book —
             # skipped this cycle, tagged; NEVER fatal (one market's corrupt
             # book must not stop the others). Custody already ran above.
-            if book.poisoned or market in self.quarantined:
-                tag = ("QUARANTINED" if market in self.quarantined
-                       else "BOOK_POISONED")
+            # P11.1-d: a failed REST fetch means NO book this cycle — lanes
+            # skip, same shape, never a fabrication.
+            if (book.poisoned or market in self.quarantined
+                    or (not config.WS_ENABLED
+                        and market in getattr(self.feed, "fetch_failed", ()))):
+                if market in self.quarantined:
+                    tag = "QUARANTINED"
+                elif book.poisoned:
+                    tag = "BOOK_POISONED"
+                else:
+                    tag = "BOOK_FETCH_FAILED"
                 for lane in self.lanes:
                     self.surface.write_row(lane.name, market, window,
                                            "WATCHING", transport=transport,
@@ -600,7 +636,8 @@ class ShadowEngine:
                         # P8 §1: OPEN BRACKET at the first order submit on this
                         # market. P9 §2: a failed live read DEFERS the bracket.
                         val, src = self.account_value(now)
-                        self.econ.open_bracket(market, val, now=now, source=src)
+                        self.econ.open_bracket(market, val, now=now, source=src,
+                                               transport=transport)
                     if proposal.lane in ("F", "H8"):
                         # Live submit side-effects, mirrored from k_worker gateway.submit:
                         # lane-scoped single entry + F hourly exposure.
@@ -673,6 +710,7 @@ TASK_TAGS = {
     "pack": "PACK_TASK_DOWN",
     "listener": "TG_LISTENER_DOWN",
     "settle": "SETTLE_TASK_DOWN",
+    "fills": "FILLS_TASK_DOWN",
     "reconcile": "RECONCILE_TASK_DOWN",
     "book_check": "BOOK_CHECK_TASK_DOWN",
 }
@@ -707,6 +745,72 @@ async def supervise(name, factory, stop, engine, backoff_s=SUPERVISOR_BACKOFF_S)
             await asyncio.sleep(backoff_s)
 
 
+def _send_boot_page_rest(engine) -> None:
+    """P11 §C: the REST boot page — transport named, every dollar sourced."""
+    from .ops import worst_day_bound_line
+    from .sizing import size_order
+    book = engine.ledger.book_cents()
+    max_lots = size_order(config.TIER_PROBE, book, 99, 10_000).contracts
+    engine.telegram.alert(
+        f"🟢 BOOT #{getattr(engine, 'boot_id', '?')} "
+        f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
+        f"{len(engine.market_meta)} market(s)\n"
+        f"transport: REST 1s (A3 proven ground; WS shelved as an upgrade)\n"
+        f"SIZING: 1/12-Kelly ceiling · book ${book / 100:.2f}"
+        f" · current max lots {max_lots}\n"
+        f"{worst_day_bound_line(engine.ledger)}\n"
+        f"listener: {engine.listener_status()}")
+
+
+async def _rest_main(engine, client, stop) -> None:
+    """P11 "PROVEN GROUND" — the REST 1s main loop: discovery every 60s,
+    every book polled every cycle through the FeedLike drop-in, the same
+    five-lane cycle. No dialect to learn; the organs already existed."""
+    from . import failures, venue
+    auth_strikes = 0
+    booted = False
+    last_discovery = -1e9
+    while not stop.is_set():
+        t0 = time.monotonic()
+        try:
+            if t0 - last_discovery >= DISCOVERY_SWEEP_S:
+                last_discovery = t0
+                mkts = await asyncio.to_thread(venue.list_open_markets, client)
+                current = set()
+                for m in mkts:
+                    ticker = m.get("ticker") or m.get("market_ticker", "")
+                    if not ticker:
+                        continue
+                    current.add(ticker)
+                    engine.on_market_discovered(ticker, m)
+                for gone in sorted(set(engine.market_meta) - current):
+                    engine.on_market_closed(gone)
+                    log.info("window closed + pruned: %s", gone)
+            await asyncio.to_thread(engine.rest_poll_all, client)
+            if not booted:
+                booted = True
+                _send_boot_page_rest(engine)
+            engine.recorder.flush()  # P6 §4: the cycle gate commits the tape
+            engine.cycle(sorted(engine.market_meta.keys()))
+            auth_strikes = 0
+        except FatalIntegrityError as fe:
+            engine.record_fatal(str(fe))  # P5 §4: the BOOT_LOOP alert's evidence
+            raise  # fail loud, stay stopped
+        except Exception as e:
+            msg = str(e)
+            if "HTTP 401" in msg or "HTTP 403" in msg:
+                auth_strikes += 1
+                if auth_strikes >= 3:
+                    failures.fail("AUTH_REJECTED",
+                                  f"3 consecutive REST auth rejections: {msg[:200]}",
+                                  fatal=True)
+            log.warning("REST loop error (continuing): %s", e)
+            await asyncio.sleep(3.0)
+            continue
+        elapsed = time.monotonic() - t0
+        await asyncio.sleep(max(0.05, CYCLE_SECONDS - elapsed))
+
+
 async def run():
     from . import auth
 
@@ -729,14 +833,9 @@ async def run():
                       "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID absent in LIVE mode — "
                       "the ledger of record cannot be silent", fatal=True)
 
-    try:
-        import websockets
-    except ImportError as e:
-        failures.fail("DEPENDENCY_MISSING",
-                      f"websockets required for the WS-first feed: {e}", fatal=True)
-
     from . import venue
     client = venue.build_client()
+    engine.gateway.venue_client = client  # one client, shared by every organ
 
     if config.live_submit_enabled():
         # F6: LIVE boot reconcile — money truth before the first cycle
@@ -788,6 +887,7 @@ async def run():
                     f"venue_rejects={engine.gateway.venue_rejects} "
                     f"listener={engine.listener_status()} "
                     f"book✓ {engine.book_checks_total} "
+                    f"fetch_fail={getattr(engine.feed, 'failed_fetches', 0)} "
                     f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")
 
     # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
@@ -799,11 +899,18 @@ async def run():
                 return  # nothing to listen on; the log heard the refusal
             await asyncio.sleep(1.0)
 
-    # ── P8: settlement sweep + (LIVE) fills reconcile, every 30s ───────────
+    # ── P8: settlement sweep, every 30s ────────────────────────────────────
     async def settle_task():
         while not stop.is_set():
             await asyncio.sleep(30.0)
             await asyncio.to_thread(engine.settlement_sweep)
+
+    # ── P11 (Marta's cadence): LIVE fills reconcile every 3s — the proven
+    # live rhythm; fill knowledge up to 3s late is yesterday's accepted
+    # reality at one-lot, stated in the pack header (not a bug).
+    async def fills_task():
+        while not stop.is_set():
+            await asyncio.sleep(config.FILLS_SWEEP_S)
             if config.live_submit_enabled() and engine.gateway.venue_client is not None:
                 await asyncio.to_thread(engine.fills.reconcile_sweep,
                                         engine.gateway.venue_client)
@@ -815,19 +922,43 @@ async def run():
             if config.live_submit_enabled():
                 await asyncio.to_thread(engine.standing_reconcile)
 
-    # ── P10 §3: the venue REST book audits the WS book every 60s ───────────
+    # ── P10 §3: the venue REST book audits the WS book every 60s.
+    # In REST mode the book IS the venue's REST book — there is no second
+    # truth to arbitrate, so the auditor stands down (WS-only).
     async def book_check_task():
         while not stop.is_set():
             await asyncio.sleep(BOOK_CHECK_S)
-            await asyncio.to_thread(engine.book_check)
+            if config.WS_ENABLED:
+                await asyncio.to_thread(engine.book_check)
 
     # P9 §1b: EVERY task runs supervised — a death is banked, paged, restarted.
     asyncio.create_task(supervise("spot", spot_task, stop, engine))
     asyncio.create_task(supervise("pack", pack_task, stop, engine))
     asyncio.create_task(supervise("listener", listener_task, stop, engine))
     asyncio.create_task(supervise("settle", settle_task, stop, engine))
+    asyncio.create_task(supervise("fills", fills_task, stop, engine))
     asyncio.create_task(supervise("reconcile", reconcile_task, stop, engine))
     asyncio.create_task(supervise("book_check", book_check_task, stop, engine))
+
+    if not config.WS_ENABLED:
+        # ── A3 PROVEN GROUND: the REST 1s main loop. The ws path below is
+        # never entered and websockets is never imported (P11.1-d).
+        await _rest_main(engine, client, stop)
+        stop.set()
+        engine.recorder.flush()  # P6 §4: shutdown flush — no buffered frame lost
+        print(daily_pack(engine.ledger, engine.surface, engine.cash,
+                         foreign_fills=engine.fills.foreign_seen,
+                         econ=engine.econ), flush=True)
+        engine.telegram.alert("🔵 CLEAN SHUTDOWN — recorder flushed, pack printed")
+        log.info("runner stopped; zero orders placed: %s",
+                 len(engine.gateway.shadow_orders) == 0)
+        return
+
+    try:
+        import websockets
+    except ImportError as e:
+        failures.fail("DEPENDENCY_MISSING",
+                      f"websockets required for the WS feed: {e}", fatal=True)
 
     subscribed: set = set()
 

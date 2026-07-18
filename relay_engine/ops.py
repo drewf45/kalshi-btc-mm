@@ -184,6 +184,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         f"LANES LIVE: {', '.join(LANES_LIVE)}"
         + (f" · NOT YET BUILT: {', '.join(LANES_PENDING)}" if LANES_PENDING else
            " · NOT YET BUILT: none (every lane that exists trades)"),
+        # P11 (Trader's knob): the transport header — so nobody later mistakes
+        # the accepted 3s fill lag for a bug.
+        ("TRANSPORT: WS" if config.WS_ENABLED else
+         "TRANSPORT: REST 1s (A3 proven ground) · fills sweep 3s — fill "
+         "knowledge up to 3s late: accepted at one-lot scope, not a bug"),
         f"book={ledger.book_cents()}c lifetime_pnl={ledger.lifetime_pnl_cents()}c "
         f"(honest lifetime = settlements ledger only)",
     ]
