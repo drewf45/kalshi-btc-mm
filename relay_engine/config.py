@@ -145,6 +145,13 @@ OPEN_FLAT_BY = 360                # OPEN flat by T-6 (YIELD_TO_F, crossfire)
 # §3.4: geometry gate — determined trigger tightens to entry−drop (floored
 # at the band), and entry requires risk <= TAKE+1 or pass OPEN_BAD_GEOMETRY.
 OPEN_DETERMINED_DROP = 6
+# P-FLIP-THESIS-1 §2 (DREW-RULED 2026-07-19): THE PATIENCE FLOOR — a fresh
+# FLIP entry holds through this assessment window (measured from FIRST FILL);
+# a first-minute 1-2c dip is NOISE, not a decision (the 48->41 evacuate at
+# -9c was a hair-trigger, not patience). Determined-against fires only AFTER
+# the window, on a real decision — and then it fires HARD (anti-ride-to-zero:
+# patience is upside-only).
+OPEN_PATIENCE_S = 300
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20

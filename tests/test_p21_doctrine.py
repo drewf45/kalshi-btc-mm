@@ -156,6 +156,9 @@ def test_determined_against_band_exit(flip, gateway):
     _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
+    # P-FLIP-THESIS-1 §2: the patience floor gates the cut — this law-test
+    # exercises the POST-window decision, so the fill ages past the floor
+    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
     # yes mark 41 < trigger 42: determined against us — crossfire NOW
     props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770))
     assert len(props) == 1
@@ -172,6 +175,8 @@ def test_determined_against_needle_collapse_sustained(flip, gateway):
     _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
+    # P-FLIP-THESIS-1 §2: post-patience-window law (the floor is its own test)
+    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
     collapse = Needle(side="no", d_before=10.0, d_after=80.0,
                       delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
                       fair_cents=30.0, t_remaining=700.0)

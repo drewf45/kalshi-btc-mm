@@ -843,6 +843,14 @@ class LaneFlip:
             elif o["collapse_polls"] >= 2:
                 determined = (f"open determined-against: ΔP-collapse "
                               f"{sl.delta_p:.0f}pts sustained")
+            # P-FLIP-THESIS-1 §2 — THE PATIENCE FLOOR (anti-churn): the cut
+            # may only fire after the assessment window, measured from FIRST
+            # FILL (Engineer: never from proposal; the merge keeps the first
+            # fill's ts). A pre-window flinch is noise and holds; a sustained
+            # collapse keeps counting and fires the moment the window ends.
+            # Post-window the cut stays HARD — anti-ride-to-zero.
+            if determined and now - o["fill_ts"] < config.OPEN_PATIENCE_S:
+                determined = None
             if determined:
                 self._cancel_resting(o)
                 o["done"] = True

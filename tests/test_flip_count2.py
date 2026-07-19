@@ -89,6 +89,10 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     assert r.order_id not in gateway.resting
     w = flip.windows[TICKER]
     assert w.opens["yes"]["count"] == 2 and "yes" not in w.fills
+    # P-FLIP-THESIS-1 §2: the patience floor now also holds this shape
+    # through the first minutes — age the fill so the POST-window
+    # determined decision (this test's law) fires
+    w.opens["yes"]["fill_ts"] = CLOSE - 1100
     # quiescent now: the take posts at FULL size (custody order: take
     # first), then the determined evacuation fires — also at full size
     p_take = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=778))
@@ -118,6 +122,9 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)  # fake oid: gate off
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
+    # P-FLIP-THESIS-1 §2: age past the patience floor — this test's law is
+    # the CLOSING-bucket race, not the floor
+    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
     # take posts on the 1-lot leg, then determined fires -> done=True,
     # CUT x1 in flight (the pre-merge exit — the race's first half)
     p_take = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=781))

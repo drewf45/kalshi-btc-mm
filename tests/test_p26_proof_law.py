@@ -165,6 +165,9 @@ def test_evacuation_crosses_at_trigger_price(flip, gateway):
     _open_position(flip, gateway, entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
+    # P-FLIP-THESIS-1 §2: this law is about the CROSSFIRE PRICE — age the
+    # fill past the patience floor so the post-window cut fires
+    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
     props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770))
     assert len(props) == 1
     p = props[0]
