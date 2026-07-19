@@ -1201,6 +1201,40 @@ Suite at this commit: **411 passed**; preflight **23/23**.
   kill, proof-field wall, margin gate, TABLE_NON_REVERSAL mute, 1-lot
   expectations in the dry run/port wiring/sizing line).
 
+## WO-FLIP-COUNT-1 — "THE ORPHANED SECOND CONTRACT" (hot fix, one commit)
+
+**Root cause (read-rule TRUE at source):** `note_fill` popped the
+`w.posted[side]["mode"]` marker on the FIRST fill; a SECOND same-side fill
+fell through to the legacy `w.fills` rung-A dict, whose only exit hardcoded
+`count=1`. Today's tape: OPEN bought no@48¢ ×2, sold ×1 (+5¢), the
+surviving ×1 rode to $0 (−$0.43).
+
+- **§2.1 the merge**: a same-side fill with an existing HUNT/OPEN custody
+  bucket MERGES — count-weighted blended entry (Engineer: the take math
+  stays honest), resting take cancelled, `take_proposed` cleared so
+  custody re-proposes at the merged size. Never routes to `w.fills`.
+- **§2.2 booked-size exits**: `_booked_held` reads the ledger's unsettled
+  ENTRY−exit counts per (market, FLIP, side) — `None` when no ENTRY rows
+  (no truth to clamp to; memory governs, ledger-less unit paths honest).
+  The rung-A take sells booked size, never a literal 1; every custody
+  exit (hunt take/bail/breakeven, OPEN take/yield/determined) sells
+  `max(0, min(memory, booked))` (Adversary) — zero proposes nothing and
+  marks the bucket done. `note_exit` gains `count`: realizes ×count,
+  decrements, pops only when depleted; runner passes fill count into
+  BOTH `note_fill` and `note_exit`.
+- **§2.3 FLIP_UNCOVERED_LEG**: per cycle, a side whose booked-held
+  exceeds the covered resting-exit counts — with no exit proposed this
+  cycle — writes a failures row and pages, ONCE per (market, close_ts,
+  side), with bucket provenance (Scientist: which dict lost the
+  contract). Take COUNTS register beside oids at `on_submitted`.
+- **§5 scope guard**: no bands, gates, take cents, ratchet trips, or
+  sizing tiers touched — custody routing and exit sizing only. Boot
+  PROFILE gains the P-FLIP-COUNT-1 line.
+- **§3**: `tests/test_flip_count1.py` — 9 tests (merge OPEN + HUNT,
+  LEAN ×2 single fill, rung-A booked size on today's tape shape, clamp
+  to booked, zero-clamp no-order, full/partial note_exit realization,
+  uncovered-leg pages once with provenance). Suite 434 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

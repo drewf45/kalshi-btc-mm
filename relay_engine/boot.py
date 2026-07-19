@@ -101,6 +101,9 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"PATIENT HOLD within entry−{config.OPEN_DETERMINED_DROP} — "
                  f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED/"
                  "YIELD@T-6, evacuations cross (P26 §2-3; PAIR retired)")
+    lines.append("  FLIP: every contract flipped — same-side fills merge to "
+                 "one custody bucket; exits sell booked size; UNCOVERED_LEG "
+                 "pages (P-FLIP-COUNT-1)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

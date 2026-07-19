@@ -178,6 +178,10 @@ class FlipWindow:
     fills: Dict[str, int] = field(default_factory=dict)     # side -> entry cents
     first_fill_ts: Optional[float] = None
     takes_posted: Dict[str, str] = field(default_factory=dict)  # held side -> exit oid
+    # FLIP-COUNT-1: the resting exit's COUNT per rung-A side (the invariant
+    # compares booked-held against covered size, not covered existence).
+    take_counts: Dict[str, int] = field(default_factory=dict)
+    uncovered_paged: set = field(default_factory=set)  # sides paged this window
     trips: int = 0
     scratches: int = 0
     window_realized: int = 0
@@ -230,6 +234,32 @@ class LaneFlip:
             return 0
         return self.gateway.positions.get((event, market, "FLIP"), 0)
 
+    def _booked_held(self, market: str, side: str) -> Optional[int]:
+        """FLIP-COUNT-1 §2.2: the booked ledger's held count for a FLIP
+        side — unsettled ENTRY counts minus exit counts. Returns None when
+        the ledger holds no ENTRY rows for the side (no truth to clamp to;
+        in-memory counts govern — ledger-less unit paths stay honest)."""
+        ledger = getattr(self.gateway, "ledger", None) if self.gateway else None
+        if ledger is None:
+            return None
+        held, entries = ledger.db.execute(
+            "SELECT COALESCE(SUM(CASE WHEN action='ENTRY' THEN count"
+            " ELSE -count END), 0), SUM(CASE WHEN action='ENTRY' THEN 1"
+            " ELSE 0 END) FROM fills WHERE market=? AND lane='FLIP'"
+            " AND side=? AND settled=0", (market, side)).fetchone()
+        if not entries:
+            return None
+        return max(0, int(held))
+
+    def _exit_count(self, market: str, side: str, rec_count: int) -> int:
+        """FLIP-COUNT-1 (Adversary): an exit sells min(memory, booked-held),
+        clamped >= 0 — the lane must never offer more contracts than the
+        ledger says the account holds."""
+        booked = self._booked_held(market, side)
+        if booked is None:
+            return rec_count
+        return max(0, min(rec_count, booked))
+
     def note_fill(self, market: str, side: str, price_cents: int, now: float,
                   count: int = 1) -> None:
         """Called by the fills wiring when a FLIP entry books. Updates window
@@ -238,6 +268,30 @@ class LaneFlip:
         w = self.windows.get(market)
         if w is None:
             return
+        # FLIP-COUNT-1 §2.1 (the orphaned second contract): a SECOND
+        # same-side fill MERGES into the existing custody bucket — the
+        # popped mode marker must never route it to the legacy rung-A dict
+        # (whose only exit sold a literal 1; today's ×2 no@48 left one
+        # contract riding to $0). Entry blends count-weighted (Engineer:
+        # the take math stays honest) and any resting take is cancelled so
+        # custody re-proposes at the merged size and blended entry.
+        for bucket in (w.hunts, w.opens):
+            rec = bucket.get(side)
+            if rec is not None:
+                add = max(1, count)
+                total = rec["count"] + add
+                rec["entry"] = int(round((rec["entry"] * rec["count"]
+                                          + price_cents * add) / total))
+                rec["count"] = total
+                if rec.get("take_oid") and self.gateway is not None:
+                    self.gateway.cancel(rec["take_oid"])
+                    rec["take_oid"] = None
+                rec["take_proposed"] = False
+                w.posted.pop(side, None)
+                log.warning("FLIP-COUNT-1 merge %s %s: +%d -> count %d @ "
+                            "blended %dc", market, side, add, total,
+                            rec["entry"])
+                return
         # P18: a hunt fill opens hunt custody, never the pair machinery
         if (w.posted.get(side) or {}).get("mode") == "HUNT":
             w.posted.pop(side, None)
@@ -268,34 +322,46 @@ class LaneFlip:
             log.warning("FLIP rung A netted %s: %d+%d -> +%dc", market,
                         w.fills["yes"], w.fills["no"], cap)
 
-    def note_exit(self, market: str, side: str, exit_price_cents: int, now: float) -> None:
+    def note_exit(self, market: str, side: str, exit_price_cents: int,
+                  now: float, count: int = 1) -> None:
         """Called by the fills wiring when a FLIP exit/cut books. Realizes the
         leg against its entry and resets the trip slot (the ratchet's next trip
-        may then open, R1-gated)."""
+        may then open, R1-gated). FLIP-COUNT-1: count rides in — a merged
+        bucket realizes ×count, decrements, and survives until depleted (a
+        partial fill must never orphan the remainder's accounting)."""
         w = self.windows.get(market)
         if w is None:
             return
+        n = max(1, count)
         # P18: a hunt exit realizes against ITS entry and leaves the pair
         # slots untouched — the two modes never share accounting state.
-        hunt = w.hunts.pop(side, None)
+        hunt = w.hunts.get(side)
         if hunt is not None:
-            realized = exit_price_cents - hunt["entry"]
+            sold = min(n, hunt["count"])
+            realized = (exit_price_cents - hunt["entry"]) * sold
             w.window_realized += realized
             if realized < 0:
                 w.scratches += 1
+            hunt["count"] -= sold
+            if hunt["count"] <= 0:
+                w.hunts.pop(side, None)
             return
         # P21 A5: an OPEN exit realizes against ITS entry. NO scratch count —
         # the patient hold has no scratches, only TAKE / DETERMINED / YIELD.
-        o = w.opens.pop(side, None)
+        o = w.opens.get(side)
         if o is not None:
-            w.window_realized += exit_price_cents - o["entry"]
+            sold = min(n, o["count"])
+            w.window_realized += (exit_price_cents - o["entry"]) * sold
+            o["count"] -= sold
+            if o["count"] <= 0:
+                w.opens.pop(side, None)
             # P26 §3.1: ANY OPEN exit consumes the window's one shot — the
             # pop above no longer re-opens the door (the located loophole).
             w.open_consumed = True
             return
         entry_px = w.fills.get(side)
         if entry_px is not None and len(w.fills) < 2:
-            realized = exit_price_cents - entry_px
+            realized = (exit_price_cents - entry_px) * n
             w.window_realized += realized
             if realized < 0:
                 w.scratches += 1
@@ -303,6 +369,7 @@ class LaneFlip:
         w.posted.clear()
         w.fills.clear()
         w.takes_posted.clear()
+        w.take_counts.clear()
         w.first_fill_ts = None
 
     def note_window_result(self, market: str, realized_cents: int) -> None:
@@ -348,9 +415,17 @@ class LaneFlip:
             held = (net > 0 and side == "yes") or (net < 0 and side == "no")
             if held and side not in w.takes_posted and len(w.fills) < 2:
                 q = entry_px + FLIP_X
+                # FLIP-COUNT-1 §2.2: the take sells the BOOKED held size,
+                # never a literal 1 (today's orphan: ×2 filled, ×1 sold,
+                # the survivor rode to $0). Ledger truth governs; the
+                # in-memory fallback is 1 only when no ledger exists.
+                booked = self._booked_held(market, side)
+                take_n = booked if booked is not None else 1
+                if take_n <= 0:
+                    continue
                 proposals.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=q, count=1,
+                    action="sell", price_cents=q, count=take_n,
                     size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason=f"take entry+{FLIP_X}"))
 
@@ -363,6 +438,10 @@ class LaneFlip:
         # every cycle, before any entry gate.
         proposals.extend(self._open_custody(w, market, event, book, ctx,
                                             secs, now))
+
+        # 1.7) FLIP-COUNT-1 §2.3 — FAIL-LOUD invariant: every booked-held
+        # contract is covered by a resting or this-cycle-proposed exit.
+        self._check_uncovered(w, market, proposals)
 
         # 2) ENTRIES — curfew, trips, sit-out, R1-flat, the OPEN setup
         past_curfew = secs <= FLIP_CURFEW
@@ -520,14 +599,19 @@ class LaneFlip:
             if h.get("done"):
                 continue
             mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
-            # JOB A: the take, posted the instant the entry fills
+            # JOB A: the take, posted the instant the entry fills.
+            # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
             if h["take_oid"] is None and not h.get("take_proposed"):
+                n = self._exit_count(market, side, h["count"])
+                if n <= 0:
+                    h["done"] = True
+                    continue
                 h["take_proposed"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=h["entry"] + config.HUNT_TAKE_CENTS,
-                    count=h["count"], size_tier=config.TIER_PROBE, purpose="EXIT",
+                    count=n, size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason=f"hunt take entry+{config.HUNT_TAKE_CENTS}"))
                 continue
             flatten_reason = None
@@ -548,11 +632,13 @@ class LaneFlip:
                     h["take_oid"] = None
                 px = mark if mark is not None else h["entry"]
                 h["done"] = True
-                props.append(Order(
-                    lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=px, count=h["count"],
-                    size_tier=config.TIER_PROBE, purpose="CUT",
-                    crossfire=True, reason=flatten_reason))
+                n = self._exit_count(market, side, h["count"])
+                if n > 0:
+                    props.append(Order(
+                        lane="FLIP", event=event, market=market, side=side,
+                        action="sell", price_cents=px, count=n,
+                        size_tier=config.TIER_PROBE, purpose="CUT",
+                        crossfire=True, reason=flatten_reason))
                 continue
             # JOB B step 1: breakeven trigger — reprice the take to entry
             if (mark is not None and mark <= h["entry"]
@@ -563,9 +649,13 @@ class LaneFlip:
                     self.gateway.cancel(h["take_oid"])
                     h["take_oid"] = None
                 h["take_proposed"] = True
+                n = self._exit_count(market, side, h["count"])
+                if n <= 0:
+                    h["done"] = True
+                    continue
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=h["entry"], count=h["count"],
+                    action="sell", price_cents=h["entry"], count=n,
                     size_tier=config.TIER_PROBE, purpose="EXIT",
                     reason="hunt breakeven reprice (mark<=entry)"))
         return props
@@ -591,14 +681,19 @@ class LaneFlip:
             if o.get("done"):
                 continue
             mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
-            # TAKE — posted the instant the entry books (the maker intent)
+            # TAKE — posted the instant the entry books (the maker intent).
+            # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
             if o["take_oid"] is None and not o.get("take_proposed"):
+                n = self._exit_count(market, side, o["count"])
+                if n <= 0:
+                    o["done"] = True
+                    continue
                 o["take_proposed"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=o["entry"] + config.OPEN_TAKE_CENTS,
-                    count=o["count"], size_tier=config.TIER_PROBE,
+                    count=n, size_tier=config.TIER_PROBE,
                     purpose="EXIT",
                     reason=f"open take entry+{config.OPEN_TAKE_CENTS}"))
                 continue
@@ -606,13 +701,15 @@ class LaneFlip:
             if secs <= config.OPEN_FLAT_BY:
                 self._cancel_resting(o)
                 o["done"] = True
-                props.append(Order(
-                    lane="FLIP", event=event, market=market, side=side,
-                    action="sell",
-                    price_cents=mark if mark is not None else o["entry"],
-                    count=o["count"], size_tier=config.TIER_PROBE,
-                    purpose="CUT", crossfire=True,
-                    reason="open yield to F (YIELD_TO_F flat by T-6)"))
+                n = self._exit_count(market, side, o["count"])
+                if n > 0:
+                    props.append(Order(
+                        lane="FLIP", event=event, market=market, side=side,
+                        action="sell",
+                        price_cents=mark if mark is not None else o["entry"],
+                        count=n, size_tier=config.TIER_PROBE,
+                        purpose="CUT", crossfire=True,
+                        reason="open yield to F (YIELD_TO_F flat by T-6)"))
                 continue
             # DETERMINED-AGAINST — §3.4 v2 trigger; §3.2 evacuate NOW
             det_trigger = max(lo_u, o["entry"] - config.OPEN_DETERMINED_DROP)
@@ -629,14 +726,55 @@ class LaneFlip:
             if determined:
                 self._cancel_resting(o)
                 o["done"] = True
-                props.append(Order(
-                    lane="FLIP", event=event, market=market, side=side,
-                    action="sell",
-                    price_cents=mark if mark is not None else max(1, o["entry"] - 1),
-                    count=o["count"], size_tier=config.TIER_PROBE,
-                    purpose="CUT", crossfire=True,
-                    reason=f"{determined} · evacuate now"))
+                n = self._exit_count(market, side, o["count"])
+                if n > 0:
+                    props.append(Order(
+                        lane="FLIP", event=event, market=market, side=side,
+                        action="sell",
+                        price_cents=mark if mark is not None else max(1, o["entry"] - 1),
+                        count=n, size_tier=config.TIER_PROBE,
+                        purpose="CUT", crossfire=True,
+                        reason=f"{determined} · evacuate now"))
         return props
+
+    def _check_uncovered(self, w: FlipWindow, market: str,
+                         proposals: List[Order]) -> None:
+        """FLIP-COUNT-1 §2.3: if the booked ledger holds more FLIP contracts
+        on a side than the resting exits cover — and no exit is being
+        proposed this cycle to close the gap — the tape gets a
+        FLIP_UNCOVERED_LEG row and the phone gets a page, ONCE per
+        (market, close_ts, side), with bucket provenance (Scientist: which
+        custody dict lost the contract is the debugging fact)."""
+        from . import failures
+        proposing = {p.side for p in proposals
+                     if p.action == "sell" and p.purpose in ("EXIT", "CUT")}
+        for side in ("yes", "no"):
+            if side in proposing or side in w.uncovered_paged:
+                continue
+            held = self._booked_held(market, side)
+            if held is None or held <= 0:
+                continue
+            covered = 0
+            provenance = []
+            h = w.hunts.get(side)
+            if h is not None and h.get("take_oid") is not None:
+                covered += h.get("take_count", h["count"])
+                provenance.append(f"hunts:{h['count']}")
+            o = w.opens.get(side)
+            if o is not None and o.get("take_oid") is not None:
+                covered += o.get("take_count", o["count"])
+                provenance.append(f"opens:{o['count']}")
+            if side in w.takes_posted:
+                covered += w.take_counts.get(side, 1)
+                provenance.append(f"fills:{w.fills.get(side)}")
+            if held > covered:
+                w.uncovered_paged.add(side)
+                failures.fail(
+                    "FLIP_UNCOVERED_LEG",
+                    f"{market} {side}: held {held} > covered {covered}",
+                    fatal=False, alert=True, market=market, side=side,
+                    held=held, covered=covered,
+                    buckets=";".join(provenance) or "none")
 
     def _cancel_resting(self, o: dict) -> None:
         """Cancel an OPEN position's resting exit (take or determined maker)
@@ -657,13 +795,18 @@ class LaneFlip:
             w.posted[order.side] = {"oid": order_id, "price": order.price_cents,
                                     "ts": now, "mode": mode}
         elif order.purpose == "EXIT":
+            # FLIP-COUNT-1 §2.3: the COUNT registers beside the oid — the
+            # uncovered-leg invariant compares sizes, not existence.
             if order.side in w.hunts and w.hunts[order.side]["take_oid"] is None:
                 w.hunts[order.side]["take_oid"] = order_id  # P18 JOB A registered
+                w.hunts[order.side]["take_count"] = order.count
             elif (order.side in w.opens
                   and w.opens[order.side]["take_oid"] is None):
                 w.opens[order.side]["take_oid"] = order_id  # P21 A5 resting exit
+                w.opens[order.side]["take_count"] = order.count
             else:
                 w.takes_posted[order.side] = order_id
+                w.take_counts[order.side] = order.count
             # register the take as the position's resting exit — custodian owns it
             if self.custodian is not None:
                 pos = self.custodian.positions.get(f"{order.market}:FLIP")

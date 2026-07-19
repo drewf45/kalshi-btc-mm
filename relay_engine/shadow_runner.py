@@ -466,10 +466,14 @@ class ShadowEngine:
                     f"↔ {order.market} {order.lane} round-trip {s(rt)}¢ "
                     f"+ fee {fee_cents}¢ = {s(net)}¢")
         if order.lane == "FLIP":
+            # FLIP-COUNT-1: the fill's COUNT rides into custody — a second
+            # same-side fill merges, an exit realizes ×count and decrements.
             if action == "ENTRY":
-                self.flip.note_fill(order.market, order.side, price_cents, now)
+                self.flip.note_fill(order.market, order.side, price_cents,
+                                    now, count=count)
             else:
-                self.flip.note_exit(order.market, order.side, price_cents, now)
+                self.flip.note_exit(order.market, order.side, price_cents,
+                                    now, count=count)
         elif order.lane == "D":
             laned = self.lanes[3].d
             if action == "ENTRY":
