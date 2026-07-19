@@ -171,10 +171,19 @@ def test_flip_sitout_pages_once(engine):
 
 
 # ── §3: orientation sentinels ──────────────────────────────────────────────
-def test_boot_selftest_fatal_on_mirror(engine):
+def test_boot_selftest_fatal_on_mirror(engine, monkeypatch):
+    """ORIENT-1 amended the conviction path: the stale discovery record
+    ACCUSES; only a FRESH record convicts (the 12:22:59Z false FATAL).
+    Here the fresh record confirms the mirror on both touches — still
+    FATAL, as P13 always demanded for a truly inverted book."""
+    from relay_engine import venue
     engine.market_meta[TICKER] = {"close_ts": 2000.0, "rec_yes_bid": 97}
     book = OrderBook(market=TICKER)
     book.apply_snapshot({3: 10}, {97: 10}, ts=1.0)   # OUR book is the mirror
+    monkeypatch.setattr(venue, "get_market",
+                        lambda c, t: {"yes_bid_dollars": "0.97",
+                                      "yes_ask_dollars": "0.98"})
+    engine.gateway.venue_client = object()
     with pytest.raises(FatalIntegrityError):
         engine.orientation_selftest(TICKER, book)
     assert engine.ledger.db.execute(

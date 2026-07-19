@@ -261,7 +261,11 @@ class ShadowEngine:
         self.market_meta[ticker] = {"close_ts": close_ts,
                                     "boundary_lo": blo, "boundary_hi": bhi,
                                     "rec_yes_bid": _rec_cents("yes_bid_dollars"),
-                                    "rec_yes_ask": _rec_cents("yes_ask_dollars")}
+                                    "rec_yes_ask": _rec_cents("yes_ask_dollars"),
+                                    # ORIENT-1 §1.4: the record's age is part
+                                    # of every orientation verdict — a 60s-
+                                    # stale record forged today's mirror.
+                                    "rec_captured_ts": time.time()}
 
     def on_market_closed(self, ticker: str) -> None:
         """F4: settled/closed markets are pruned everywhere, not swept forever."""
@@ -680,28 +684,109 @@ class ShadowEngine:
                         "(cut proceeds on current ledger): %s", market, e)
 
     # ── P13 §3: engine-side orientation sentinels (keyless) ─────────────
+    @staticmethod
+    def _mirror_signature(ours: int, rec: int) -> bool:
+        """The inversion signature: no direct match, tight mirror match."""
+        return abs(ours - rec) > 10 and abs(ours - (100 - rec)) <= 3
+
+    def _fresh_record_touches(self, market: str):
+        """ORIENT-1 §1.1-1.3: the SECOND witness — a fresh market record via
+        venue.get_market (the same call the divergence watch uses). One
+        retry; two failures -> None (the caller FATALs UNVERIFIABLE:
+        cannot prove innocence -> refuse, fail-loud unchanged). A success
+        also refreshes market_meta's record + captured_ts."""
+        from decimal import Decimal
+
+        from . import venue
+        for attempt in (1, 2):
+            try:
+                client = self.gateway.venue_client
+                if client is None:
+                    client = self.gateway.venue_client = venue.build_client()
+                rec_obj = venue.get_market(client, market)
+
+                def cents(key):
+                    v = rec_obj.get(key)
+                    if v is None:
+                        return None
+                    return int(Decimal(str(v)) * 100)
+
+                fbid, fask = cents("yes_bid_dollars"), cents("yes_ask_dollars")
+                meta = self.market_meta.get(market)
+                if meta is not None:
+                    meta.update(rec_yes_bid=fbid, rec_yes_ask=fask,
+                                rec_captured_ts=time.time())
+                return fbid, fask
+            except Exception as e:
+                log.warning("fresh orientation record pull %d/2 failed for "
+                            "%s: %s", attempt, market, e)
+        return None
+
     def orientation_selftest(self, market: str, book) -> None:
         """Boot self-test, once per boot: our book vs the venue market
-        record's own yes_bid. A MIRROR match (ours ≈ 100−record) with a bad
-        direct match means the book orientation is INVERTED — FATAL."""
+        record's own touches. ORIENT-1 — TWO-WITNESS: the discovery record
+        can be up to DISCOVERY_SWEEP_S (60s) stale, so a symmetric cross of
+        50¢ inside the gap FORGES a mirror (tape 12:22:59Z: FATAL rec=37/
+        ours=66; 7s later the fresh record read 66 — staleness, not
+        inversion). On a mirror signature we do NOT fail: we pull a FRESH
+        record and FATAL only if the signature holds on the fresh record on
+        BOTH touches (bid AND ask; bid alone governs when the record lacks
+        an ask — stated in the line). An unpullable fresh record is
+        ORIENTATION_UNVERIFIABLE — still FATAL, still loud."""
         if self._orientation_checked:
             return
-        rec = self._meta(market).get("rec_yes_bid")
+        meta = self._meta(market)
+        rec = meta.get("rec_yes_bid")
         yb = book.best_yes_bid()
         if rec is None or yb is None:
             return
         self._orientation_checked = True
-        direct = abs(yb - rec)
-        mirror = abs(yb - (100 - rec))
-        if direct > 10 and mirror <= 3:
-            from . import failures
-            failures.fail("ORIENTATION_MIRROR",
-                          f"{market}: our yes_bid {yb}¢ vs venue record "
-                          f"{rec}¢ — MIRROR match (100−rec={100 - rec}) — "
-                          f"book orientation INVERTED, refusing to trade",
-                          fatal=True, market=market, ours=yb, record=rec)
-        log.info("ORIENTATION SELF-TEST OK: %s ours y%d vs record y%d",
-                 market, yb, rec)
+        from . import failures
+        age = time.time() - meta.get("rec_captured_ts", time.time())
+        if not self._mirror_signature(yb, rec):
+            log.info("ORIENTATION SELF-TEST OK: %s ours y%d vs record y%d "
+                     "(record age %.0fs)", market, yb, rec, age)
+            return
+        # WITNESS 2: the stale record accuses; only a fresh record convicts.
+        fresh = self._fresh_record_touches(market)
+        if fresh is None:
+            failures.fail(
+                "ORIENTATION_UNVERIFIABLE",
+                f"{market}: mirror signature (ours {yb}¢ vs record {rec}¢, "
+                f"record age {age:.0f}s) and the fresh record pull failed "
+                f"twice — cannot prove innocence, refusing to trade",
+                fatal=True, market=market, ours=yb, record=rec,
+                record_age_s=round(age, 1))
+            return
+        fbid, fask = fresh
+        if fbid is None:
+            failures.fail(
+                "ORIENTATION_UNVERIFIABLE",
+                f"{market}: mirror signature and the fresh record carries "
+                f"no yes_bid — cannot prove innocence, refusing to trade",
+                fatal=True, market=market, ours=yb, record=rec)
+            return
+        bid_mirror = self._mirror_signature(yb, fbid)
+        if fask is not None:
+            mirrored = bid_mirror and self._mirror_signature(yb, fask)
+            mode = "BOTH touches (bid+ask)"
+        else:
+            mirrored = bid_mirror
+            mode = "single-touch fallback (fresh record lacks an ask)"
+        if mirrored:
+            failures.fail(
+                "ORIENTATION_MIRROR",
+                f"{market}: our yes_bid {yb}¢ mirrored by the FRESH record "
+                f"(bid {fbid}¢, ask {fask}¢) on {mode} — book orientation "
+                f"INVERTED, refusing to trade (stale record was {rec}¢, "
+                f"age {age:.0f}s)",
+                fatal=True, market=market, ours=yb, fresh_bid=fbid,
+                fresh_ask=fask, stale_record=rec)
+            return
+        log.warning("ORIENTATION SELF-TEST OK: %s — stale-record mirror "
+                    "CLEARED by fresh record (stale y%d age %.0fs → fresh "
+                    "y%s/ask %s; ours y%d; %s)", market, rec, age,
+                    fbid, fask, yb, mode)
 
     def process_divergence_watches(self, client, now=None) -> None:
         """§3: 30s post-entry watch — ours vs the venue market record >3¢
