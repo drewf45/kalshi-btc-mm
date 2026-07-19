@@ -113,8 +113,10 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  F: hold-to-settlement · depth floor stands in thin books "
                  "· SALVAGE armed (P19: needle-collapse exits; catastrophic "
                  "backstop reachable — P16 stop-and-report resolved)")
-    lines.append("  SALVAGE: reason-taped (P-SALV-1: every gag says its "
-                 "name; one summary per position)")
+    lines.append("  SALVAGE: reason-taped (P-SALV-1) · anchor survives "
+                 "adoption (P-SALV-2: re-anchored from current spot+table "
+                 "at every adoption; disabled loudly, never silently; the "
+                 "5% backstop reads no anchor)")
     lines.append("  H8: delta-gated >=99% survive · hold to settlement")
     lines.append("  D: cheap entry + resting recovery take (the baton)")
     lines.append("  P: displacement fade with take (negative-spec born)")

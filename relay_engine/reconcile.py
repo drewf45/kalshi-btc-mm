@@ -14,6 +14,18 @@ the old engine's during transition).
 Win/loss path symmetry: surpluses and deficits both route through the same
 cash-protocol reconcile; recovered positions are custodied the same whichever
 side of profit they sit on.
+
+SALV-2 — THE ANCHOR SURVIVES RESTARTS. Every adoption here computes the
+salvage anchor from CURRENT spot + delta table (the entry path's own
+derivation, engine._salvage_anchor — reused, never reimplemented); if spot
+or table is unavailable the position adopts anchorless but LOUDLY
+(SALVAGE_DISABLED_TAGGED via the SALV-1 tape). DOCUMENTED LIMITATION
+(Engineer, accepted): an adoption-time anchor measures collapse from
+custody start, not original entry — salvage on a re-adopted mid-fall
+position triggers later than the original anchor would have. Honest-but-
+weaker; strictly better than disabled. BOUNDED BY DESIGN (Adversary): the
+catastrophic backstop reads no anchor — a crash-loop re-anchor cannot
+postpone the 5% floor.
 """
 
 import logging
@@ -23,6 +35,42 @@ from . import failures, venue
 from .errors import FatalIntegrityError
 
 log = logging.getLogger("relay.reconcile")
+
+
+def _adoption_anchor(engine, ticker: str, side: str):
+    """SALV-2 §1: the anchor at adoption time — the ENTRY path's exact
+    derivation (engine._salvage_anchor: current spot + strike + delta
+    table). Returns ((d, t, p) | None, miss_reason | None)."""
+    try:
+        anchor = engine._salvage_anchor(ticker, side)
+    except Exception as e:
+        return None, f"anchor derivation raised: {e}"
+    if isinstance(anchor, tuple):
+        return anchor, None
+    return None, (anchor if isinstance(anchor, str) else "unknown")
+
+
+def _orphan_mark_cents(engine, client, ticker: str, side: str):
+    """SALV-2 §3: an ORPHAN's entry price is the venue mark for the held
+    side when a book/record is readable — 50c only as a LOGGED fallback
+    (real dollars stop being priced at a fiction)."""
+    book = engine.feed.books.get(ticker)
+    if book is not None:
+        bid = book.best_yes_bid() if side == "yes" else book.best_no_bid()
+        if bid is not None:
+            return int(bid), "book"
+    try:
+        from decimal import Decimal
+        rec = venue.get_market(client, ticker)
+        v = rec.get("yes_bid_dollars")
+        if v is not None:
+            yes_bid = int(Decimal(str(v)) * 100)
+            return (yes_bid if side == "yes" else 100 - yes_bid), "record"
+    except Exception:
+        pass
+    log.warning("ORPHAN_MARK_FALLBACK %s: no readable book or record — "
+                "entry priced at the 50c fallback", ticker)
+    return 50, "fallback_50"
 
 
 def live_boot_reconcile(engine, client) -> dict:
@@ -75,10 +123,21 @@ def live_boot_reconcile(engine, client) -> dict:
         if row is not None:
             lane, side, price_cents, size_tier = row
             from .custodian import OpenPosition
+            # SALV-2 §1: re-adoption carries an anchor — computed from
+            # CURRENT spot+table (custody-start baseline; see module
+            # docstring for the accepted limitation). No anchor -> adopt
+            # anyway, DISABLED LOUDLY via the SALV-1 tape.
+            anchor, miss = _adoption_anchor(engine, ticker, side)
+            d_e, t_e, p_e = anchor if anchor else (None, None, None)
             engine.custodian.adopt(OpenPosition(
                 event=ticker.rsplit("-", 1)[0], market=ticker, lane=lane,
                 side=side, count=abs(net), entry_price_cents=price_cents,
-                entry_p_win=0.0, size_tier=size_tier, entry_time=time.time()))
+                entry_p_win=(p_e if p_e is not None
+                             else price_cents / 100.0),
+                size_tier=size_tier, entry_time=time.time(),
+                d_entry=d_e, t_entry=t_e, p_entry=p_e),
+                disabled_reason=(f"adoption anchor miss: {miss}"
+                                 if anchor is None else None))
             key = (ticker.rsplit("-", 1)[0], ticker, lane)
             engine.gateway.positions[key] = net
             summary["positions_recognized"] += 1
@@ -94,10 +153,23 @@ def live_boot_reconcile(engine, client) -> dict:
             from .lane_d import d_cut_params
             side = "yes" if net > 0 else "no"
             engine.custodian.set_lane_params("ORPHAN", d_cut_params())
+            # SALV-2 §3: the venue mark, not a fictional 50c; §1: anchored
+            # from current spot+table like every other adoption.
+            mark_cents, mark_src = _orphan_mark_cents(engine, client,
+                                                      ticker, side)
+            anchor, miss = _adoption_anchor(engine, ticker, side)
+            d_e, t_e, p_e = anchor if anchor else (None, None, None)
             engine.custodian.adopt(OpenPosition(
                 event=ticker.rsplit("-", 1)[0], market=ticker, lane="ORPHAN",
-                side=side, count=abs(net), entry_price_cents=50,
-                entry_p_win=0.0, size_tier="PROBE", entry_time=time.time()))
+                side=side, count=abs(net), entry_price_cents=mark_cents,
+                entry_p_win=(p_e if p_e is not None
+                             else mark_cents / 100.0),
+                size_tier="PROBE", entry_time=time.time(),
+                d_entry=d_e, t_entry=t_e, p_entry=p_e),
+                disabled_reason=(f"adoption anchor miss: {miss}"
+                                 if anchor is None else None))
+            log.info("ORPHAN %s adopted at %dc (%s)", ticker, mark_cents,
+                     mark_src)
             engine.gateway.positions[(ticker.rsplit("-", 1)[0], ticker,
                                       "ORPHAN")] = net
             engine.surface.write_row("ORPHAN", ticker, f"w-{ticker}",
