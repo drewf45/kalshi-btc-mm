@@ -108,6 +108,40 @@ def test_collapse_counts_pre_window_but_fires_only_after(flip, gateway,
     assert len(cuts) == 1 and "collapse" in cuts[0].reason
 
 
+# ── §3 stage 2: the retune — ~20¢ scalp target, T-10 entry cutoff ──────────
+def test_scalp_take_rests_at_entry_plus_20(flip, gateway, ledger):
+    """§5: entry 49¢, the market swings — the take rests at ~entry+20
+    (69¢), not the retired +5 nibble that fees ate."""
+    assert config.OPEN_TAKE_CENTS == 20            # DREW-RULED §3
+    props = flip.evaluate(TICKER, _ctx(_book(yes=49), secs_left=800,
+                                       grain=GRAIN_YES2))
+    flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 49, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 49, CLOSE - 790)
+    take = next(p for p in flip.evaluate(TICKER, _ctx(_book(yes=49),
+                                                      secs_left=780))
+                if p.purpose == "EXIT")
+    assert take.price_cents == 69 and take.action == "sell"
+    # the swing arrives: the fill books the 20c capture
+    flip.on_submitted(take, "OID-T", CLOSE - 780)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 69, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 69, CLOSE - 500)
+    assert flip.windows[TICKER].window_realized == 20
+
+
+def test_no_new_scalp_entry_at_or_after_t10(flip):
+    """§3.5: FLIP owns T-15→T-10; no fresh scalp inventory once
+    secs_left <= 600. F owns the final five minutes."""
+    assert config.OPEN_ENTRY_CUTOFF == 600         # DREW-RULED §3.5
+    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=600,
+                                      grain=GRAIN_YES2)) == []
+    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=550,
+                                      grain=GRAIN_YES2)) == []
+    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=601,
+                                       grain=GRAIN_YES2))
+    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
+
+
 def test_post_window_genuine_decision_cuts_hard(flip, gateway, ledger):
     """§5: still against after the window, mark genuinely through trigger →
     the cut fires, loss bounded. Patience is upside-only."""

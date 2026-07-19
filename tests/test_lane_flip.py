@@ -125,11 +125,12 @@ def test_open_grain_side_paid_up_passes(flip):
 def test_open_curfew_and_no_entry_phase(flip):
     """P21 retired the PAIR-era first-5-minutes entry phase — waiting IS the
     setup, so an open-band + grain book posts mid-window. The curfew stands."""
+    # P-FLIP-THESIS-1 §3.5: the scalp window is T-15→T-10 (was T-8)
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                      secs_left=500, grain=GRAIN_NO3))
+                                      secs_left=650, grain=GRAIN_NO3))
     assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
     flip.windows.clear()
-    # past curfew nothing posts; window over posts nothing
+    # past the T-10 cutoff nothing posts; window over posts nothing
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
                                      secs_left=200, grain=GRAIN_NO3)) == []
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
@@ -184,10 +185,11 @@ def test_reentry_is_open_gated(flip, gateway):
     w = flip._window(TICKER, CLOSE)
     w.trips = 1
     # flat but no grain -> wait (was: OFI disagreement -> wait)
+    # P-FLIP-THESIS-1 §3.5: re-entry times sit inside T-15→T-10 now
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                     secs_left=500)) == []
+                                     secs_left=650)) == []
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                      secs_left=495, grain=GRAIN_NO3))
+                                      secs_left=645, grain=GRAIN_NO3))
     assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
 
 

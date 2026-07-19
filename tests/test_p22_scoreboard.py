@@ -123,8 +123,14 @@ def test_breakeven_trip_fee_adjusted(ledger):
     fee = scoring.taker_fee_cents(45)
     assert be_hunt == pytest.approx((2 + fee) / (4 + 2 + fee))
     assert 0.33 < be_hunt < 0.5
+    # P-FLIP-THESIS-1 §3 (take 5 -> 20): the ~20c scalp target LOWERS the
+    # cell's required win-rate below the coin-flip — bail L = 47-35 = 12
+    # vs T=20; the loss exit pays taker AT THE BAIL PRICE (35c)
     be_open = scoring.breakeven(ledger, "OPEN", 45)
-    assert be_open > 0.5   # bail L = 47-35 = 12 vs take 5: patience pays
+    fee_open = scoring.taker_fee_cents(35)
+    assert be_open == pytest.approx(
+        (12 + fee_open) / (config.OPEN_TAKE_CENTS + 12 + fee_open))
+    assert 0.33 < be_open < 0.5
     # generic trip lanes: the old symmetric bar, fee-pushed past 50%
     assert 0.5 < scoring.breakeven(ledger, "P", 45) < 0.6
 

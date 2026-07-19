@@ -197,7 +197,11 @@ def test_open_entry_schedule(flip):
 
 
 def test_bad_geometry_passes(flip, monkeypatch):
-    """§3.4: risk beyond take+1 -> pass, tagged (knob-shifted to force)."""
+    """§3.4: risk beyond take+1 -> pass, tagged (knob-shifted to force).
+    P-FLIP-THESIS-1 §3 (take 5 -> 20): at the ruled take the in-band risk
+    (max 14c) can never exceed take+1 — the gate is dormant arithmetic,
+    kept as law; both knobs shift here to exercise the mechanism."""
+    monkeypatch.setattr(config, "OPEN_TAKE_CENTS", 5)
     monkeypatch.setattr(config, "OPEN_DETERMINED_DROP", 9)
     assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2)) == []
     assert flip.windows[TICKER].open_geometry_logged

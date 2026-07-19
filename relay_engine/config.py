@@ -86,7 +86,12 @@ GRAIN_K = 4                       # last-K window outcomes feed the streak
 OPEN_BAND = (44, 56)              # setup: BOTH sides in the open band
 OPEN_MIN_GRAIN = 2                # streak >= 2 or pass (OPEN_NO_GRAIN)
 OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
-OPEN_TAKE_CENTS = 5               # A5: TAKE resting at entry+5
+# P-FLIP-THESIS-1 §3 (DREW-RULED 2026-07-19, was 5): the scalp target is
+# the ~20c swing, not a 5c nibble — the nibble couldn't outrun fees+tails
+# (2c taker fee ate 40% of the old edge). A delta-table-derived target
+# (spot's reachable move in time left) is routed to measurement before it
+# replaces the constant.
+OPEN_TAKE_CENTS = 20
 OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box
 OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
 # OPEN_BAIL_R_S retired (P26 §3.2): evacuations cross IMMEDIATELY — the
@@ -138,10 +143,13 @@ CELL_WIDTH_CENTS = 5              # DREW-DEFAULT: 35-39, 40-44, ... 95-99
 # (delta_builder's own path, A1-A5 gated, hot-load on PASS). Env-off for
 # air-gapped runs; tests disable via conftest.
 TABLE_AUTOBUILD = os.environ.get("TABLE_AUTOBUILD", "true").lower() == "true"
-# §3.3: OPEN yields to F — entries T-15→T-8 only, flat by T-6. The SELF_NET
-# storm class (n=21, F locked out of 1830) dies by schedule.
-OPEN_ENTRY_CUTOFF = 480           # no OPEN entries once secs_left <= this
+# P-FLIP-THESIS-1 §3.5 (DREW-RULED, was 480/T-8): FLIP owns the scalp
+# window T-15→T-10; F owns the final five minutes. No fresh scalp
+# inventory once secs_left <= 600.
+OPEN_ENTRY_CUTOFF = 600           # no OPEN entries once secs_left <= this
 OPEN_FLAT_BY = 360                # OPEN flat by T-6 (YIELD_TO_F, crossfire)
+# ^ stage 3 of P-FLIP-THESIS-1 moves this to 600 WITH the book-aware
+# handoff semantics — the constant and its behavior ship together.
 # §3.4: geometry gate — determined trigger tightens to entry−drop (floored
 # at the band), and entry requires risk <= TAKE+1 or pass OPEN_BAD_GEOMETRY.
 OPEN_DETERMINED_DROP = 6
