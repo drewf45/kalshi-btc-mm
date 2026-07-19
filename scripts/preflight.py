@@ -95,6 +95,9 @@ CHECKS = [
         "tests/test_p26_proof_law.py",
         "tests/test_p21_doctrine.py",
     ]),
+    ("the interrogator: questions in code, answers on the phone (DIAG-1)", [
+        "tests/test_diag1_interrogator.py",
+    ]),
 ]
 
 

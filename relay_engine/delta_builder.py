@@ -144,6 +144,10 @@ def _wilson_ub(p: float, n: int, z: float = 1.96) -> float:
 def compute_delta_table(candles: list) -> list:
     """Compute P(cross) + wilson_ub for each (distance, time, session) cell.
 
+    p_cross measures ANY-TOUCH: the probability that the max intraperiod
+    excursion (candle highs/lows vs the start close) reaches distance d at
+    ANY moment within the remaining time — NOT the at-close outcome.
+
     wilson_ub uses effective_n = distinct 15-minute windows, not overlapping
     minute observations. This prevents overstated confidence from correlated
     samples.

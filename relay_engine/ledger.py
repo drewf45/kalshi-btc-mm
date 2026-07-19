@@ -157,6 +157,13 @@ class Ledger:
                 "ALTER TABLE fills ADD COLUMN fee_cents INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already present
+        # DIAG-1 §2: cell rows stamp the proof era — v1 vs v2 outcomes stay
+        # separable forever (the Scientist's requirement).
+        try:
+            self.db.execute(
+                "ALTER TABLE cell_outcomes ADD COLUMN proof TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already present
         self.db.commit()
         self.boot_caps: Optional[BootCaps] = None
 
@@ -246,14 +253,15 @@ class Ledger:
         (market, lane, kind) — a multi-trip window banks its FIRST trip and
         suppresses re-writes (the same key that makes live+custodian double
         booking and backfill replays safe)."""
-        from . import scoring
+        from . import config, scoring
         self.db.execute(
             "INSERT INTO cell_outcomes (ts, lane, price_cell, won, pnl_cents,"
-            " fees_cents, market, kind) VALUES (?,?,?,?,?,?,?,?)"
+            " fees_cents, market, kind, proof) VALUES (?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(market, lane, kind) DO NOTHING",
             (time.time() if now is None else now, lane,
              scoring.price_cell(entry_price_cents), int(bool(won)),
-             int(pnl_cents), int(fees_cents), market, kind))
+             int(pnl_cents), int(fees_cents), market, kind,
+             config.F_PROOF_MODE))
         self.db.commit()
 
     def backfill_cell_outcomes(self) -> int:

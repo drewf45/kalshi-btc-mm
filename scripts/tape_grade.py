@@ -631,6 +631,60 @@ CHECKS_P21 = [
 ]
 
 
+# ── DIAG-1 "THE INTERROGATOR" — expected tape ──────────────────────────────
+def check_diag_answers_delivered(db, since):
+    """§1: every registered diagnostic has run once and closed itself —
+    the sentinel rows exist (the phone got its answers)."""
+    from relay_engine.diagnostics import REGISTRY
+    missing = []
+    for diag_id, _ in REGISTRY:
+        row = db.execute("SELECT value FROM engine_state WHERE key=?",
+                         (f"diag_done:{diag_id}",)).fetchone()
+        if row is None:
+            missing.append(diag_id)
+    return not missing, (f"{len(REGISTRY) - len(missing)}/{len(REGISTRY)} "
+                         f"answered" + (f" — pending: {missing}" if missing
+                                        else ""))
+
+
+def check_proof_eras_stamped(db, since):
+    """§2: the boot speaks F-proof, whys stamp proof={mode}, cell rows
+    carry the era column (code-level + schema-level)."""
+    try:
+        import inspect
+
+        from relay_engine import boot as _b, lanes as _l
+        cols = [r[1] for r in db.execute(
+            "PRAGMA table_info(cell_outcomes)").fetchall()]
+        ok = ("F-proof:" in inspect.getsource(_b.boot_tape)
+              and "proof={stamp}" in inspect.getsource(_l)
+              and "proof" in cols)
+    except Exception:
+        ok = False
+    return ok, "boot line + why stamps + cell era column"
+
+
+def check_diagnostics_pack_ships(db, since):
+    """§3: the DIAGNOSTICS section renders in every pack — permanent."""
+    try:
+        import inspect
+
+        from relay_engine import diagnostics as _d, ops as _o
+        ok = ("pack_section" in inspect.getsource(_o.daily_pack)
+              and "DIAGNOSTICS (last 24h):" in inspect.getsource(
+                  _d.pack_section))
+    except Exception:
+        ok = False
+    return ok, "ops.daily_pack renders DIAGNOSTICS"
+
+
+CHECKS_DIAG1 = [
+    ("DIAG answers delivered and closed (§1)", check_diag_answers_delivered),
+    ("F-proof mode spoken + eras stamped (§2)", check_proof_eras_stamped),
+    ("DIAGNOSTICS section ships in the pack (§3)", check_diagnostics_pack_ships),
+]
+
+
 # ── P26 "EVERY WHY IS A PROOF" — expected tape ─────────────────────────────
 def check_no_unproven_entries(db, since):
     """the wall stands: every PROPOSED ENTRY row carries a why (the proof),
@@ -747,7 +801,8 @@ def main() -> int:
                           ("P21 the doctrine engine", CHECKS_P21),
                           ("P22 the cell scoreboard", CHECKS_P22),
                           ("P24 shield, fees, reversal", CHECKS_P24),
-                          ("P26 every why is a proof", CHECKS_P26)):
+                          ("P26 every why is a proof", CHECKS_P26),
+                          ("DIAG-1 the interrogator", CHECKS_DIAG1)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

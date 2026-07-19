@@ -199,12 +199,21 @@ def _lookup(distance_usd: float, secs_remaining: float,
     if cell is None:
         # P26 §1.3 (P25 §6): a miss WITH a loaded table names its (d, t) —
         # grid gaps become Saturday data, not mysteries. Once per pair.
+        # DIAG-1 §1.3: PERSISTED as a failures row (alert=False) — the
+        # in-memory set dies at restart; the interrogator reads the ledger.
         key = (d, t, session)
         if key not in _MISS_LOGGED and len(_MISS_LOGGED) < 500:
             _MISS_LOGGED.add(key)
             log.warning("[DELTA_TABLE] cell miss with LOADED table: "
                         "d=%d t=%d session=%s — grid gap, log for regrid",
                         d, t, session)
+            try:
+                from . import failures
+                failures.fail("TABLE_CELL_MISS",
+                              f"grid gap: d={d} t={t} session={session}",
+                              alert=False, d=d, t=t, session=session)
+            except Exception:
+                pass  # the diagnostic never blocks the lookup
     return cell
 
 

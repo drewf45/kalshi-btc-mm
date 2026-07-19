@@ -103,6 +103,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  PROOF LAW: every ENTRY why is arithmetic from a named "
                  "source or the wall refuses it — REJECT_UNPROVEN_WHY "
                  "(P26 §2); brain loaded at boot or explained hourly")
+    # DIAG-1 §2: which mathematical language F speaks — v1 (any-touch
+    # survival vs price) or v2 (at-close; buffered until the column ships).
+    lines.append(f"F-proof: {config.F_PROOF_MODE}"
+                 + (" (v2 interim: bar = price − "
+                    f"{config.F_PROOF_V2_BUFFER_PTS}pts, stamped v2-buffer)"
+                    if config.F_PROOF_MODE == "v2" else
+                    " (any-touch survival ≥ price paid)"))
     lines.append("  F: hold-to-settlement · depth floor stands in thin books "
                  "· SALVAGE armed (P19: needle-collapse exits; catastrophic "
                  "backstop reachable — P16 stop-and-report resolved)")

@@ -1104,6 +1104,52 @@ Suite at this commit: **390 passed**; preflight **21/21**.
   check now admits "open yield"; boot PROFILE speaks the schedule, the
   gate, and the proof law.
 
+## WO-2026-07-19-RELAY-DIAG-1-FINAL — "THE INTERROGATOR"
+
+Suite at this commit: **404 passed**; preflight **22/22**.
+
+- **§0 the units question, verified at source**: the builder computes
+  `max_move = max(max_high − start_close, start_close − min_low)` over the
+  window's candles — **p_cross measures ANY-TOUCH**, not the at-close
+  outcome. The builder docstring now states it verbatim ("p_cross measures
+  ANY-TOUCH: …") — the exact line DIAG-001 quotes onto the phone, so one
+  page settles the definition half of the question; the histogram settles
+  the rest.
+- **§1 diagnostics.py — the standing pattern**: a registry of one-time
+  diagnostics; sentinel `diag_done:{id}` = one run EVER; executed in run()
+  after reconcile, before the first cycle; chunked Telegram paging
+  (≤3500/chunk, line-boundary splits, nothing lost); read-only; errors page
+  honestly and still close; missing data says so ("NO F pass rows…
+  honestly absent"). DIAG-001 F-SILENCE: 24h F pass rows → reason
+  histogram · surv-vs-bar gap min/median/max · uniform-2-6pt? · 8-sample
+  with (d,t) (new rows carry them — `_table_survival` returns (surv, d, t)
+  and the pass_reason is enriched; pre-DIAG rows honestly noted) · the
+  quoted TABLE SEMANTICS line · verdict hint (uniform → H-SEMANTICS with
+  the exact env flip; table-mutes minority → DISCIPLINE; else H-MARKET).
+  DIAG-002 TABLE-COVERAGE: top-10 (d,t) misses (now PERSISTED as
+  TABLE_CELL_MISS failures rows — the in-memory set died at restart) +
+  loaded grid bounds.
+- **§2 the fix ships blind, armed by env**: `F_PROOF_MODE` (default v1).
+  v1 = any-touch survival ≥ price paid (current law). v2 = the AT-CLOSE
+  comparison — interim (no at-close column yet): bar = price −
+  `F_PROOF_V2_BUFFER_PTS` (4), stamped `proof=v2-buffer`; the proper
+  at-close column is the follow-up. The Proof Law untouched — the proof
+  now measures what the position IS. Boot prints `F-proof: {mode}`;
+  why-tags and pass reasons stamp `proof={stamp}`; cell_outcomes gains a
+  `proof` column (migration) stamped at write — eras separable forever.
+  Drew's move: H-SEMANTICS page → Render env `F_PROOF_MODE=v2` → done.
+- **§3 the daily answers**: permanent DIAGNOSTICS pack section —
+  pass-reason histogram per lane (24h) · anchor sources table×/price× +
+  (d,t) miss count · `F-proof: {mode}` + closed risk by era. Every morning
+  answers "why didn't we trade" before it's asked.
+- **§6**: 14 new tests (sentinel once-only incl. restart shape · chunk
+  bounds + reassembly · error-still-closes · uniform/varied/discipline/
+  empty verdicts · DIAG-002 both branches · v1 mute with full cell + era ·
+  v2 buffered bar admits and stamps · cell-row era stamp · boot line both
+  modes · pack section + daily_pack render); CHECKS_DIAG1 (answers
+  delivered, eras stamped, section ships) — tenth graded suite; registry
+  #21 "The phone is the console" (21 KNOWNs, all bound).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

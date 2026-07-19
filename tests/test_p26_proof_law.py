@@ -114,11 +114,14 @@ def test_fh8_nonreversal_gate_and_tag(monkeypatch):
     # table absent -> None (price-implied path tags)
     monkeypatch.setattr(delta, "is_loaded", lambda: False)
     assert _PortedLane._table_survival("yes", ctx) is None
-    # table loaded: survival for the spot-favored side
+    # table loaded: (surv, d, t) — DIAG-1 rides the cell along for the
+    # interrogator's histogram
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
     monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.9)
-    assert _PortedLane._table_survival("yes", ctx) == pytest.approx(0.9)
-    assert _PortedLane._table_survival("no", ctx) == pytest.approx(0.1)
+    surv, d_usd, t_rem = _PortedLane._table_survival("yes", ctx)
+    assert surv == pytest.approx(0.9)
+    assert d_usd == pytest.approx(50.0) and t_rem == pytest.approx(500.0)
+    assert _PortedLane._table_survival("no", ctx)[0] == pytest.approx(0.1)
 
 
 # ── §3.1: one shot per window (consumed on ANY exit, takes too) ────────────

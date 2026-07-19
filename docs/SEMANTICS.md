@@ -174,6 +174,18 @@ re-runs every TAPE line here forever (registry tests never retire).
 - CODE: `relay_engine/gateway.py:515`
 - TAPE: `zero UNPROVEN entries: the wall stands (§2)`
 
+### 21. The phone is the console
+- LAW: the builder cannot see the live DB — Claude Code writes, GitHub
+  carries, Render runs, and TELEGRAM IS THE ONLY WAY ANSWERS COME BACK.
+  So every question ships as code (a diagnostics registry entry) that
+  runs itself once on the next boot, pages its answer in chunks, and
+  closes itself; every fix ships in the SAME deploy behind an env flag
+  so acting on the answer is one variable, no second deploy. The daily
+  DIAGNOSTICS section answers "why didn't we trade" before it's asked
+  (DIAG-1 §1-§4 — the standing pattern, never re-invented).
+- CODE: `relay_engine/diagnostics.py:1`
+- TAPE: `DIAGNOSTICS section ships in the pack (§3)`
+
 ## QUESTION (articulated ignorance — collectors named, running)
 
 - **Lane margins** — which lanes clear fees at what hit-rate? Collector:

@@ -233,8 +233,8 @@ def test_confirmed_needle_suppresses_open_entry(flip):
 def test_registry_parses_all_knowns():
     entries = semantics.parse_registry()
     # 16 at P21 + the score (P22) + fee truth and the anchor shield (P24)
-    # + the proof law (P26 — Drew's "law #17", twentieth in sequence)
-    assert len(entries) == 20
+    # + the proof law (P26) + the phone-is-the-console pattern (DIAG-1)
+    assert len(entries) == 21
     for e in entries:
         assert e["law"] and e["code"] and e["tape"], e["answer"]
 

@@ -1316,6 +1316,15 @@ async def run():
         from .reconcile import live_boot_reconcile
         live_boot_reconcile(engine, client)
 
+    # DIAG-1 §1: THE INTERROGATOR — one-time diagnostics run here, after
+    # reconcile and before the first cycle: each pages its answer once
+    # ever and closes itself. Never boot-fatal; the phone is the console.
+    try:
+        from . import diagnostics
+        diagnostics.run_boot_diagnostics(engine)
+    except Exception as e:
+        log.error("boot diagnostics error (continuing): %s", e)
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

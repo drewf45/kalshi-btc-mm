@@ -145,6 +145,17 @@ OPEN_DETERMINED_DROP = 6
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20
+
+# ---------------------------------------------------------------------------
+# DIAG-1 "THE INTERROGATOR" §2 — the fix ships blind, armed by env. v1 = the
+# current comparison (survival >= price paid, ANY-TOUCH table). v2 = the
+# AT-CLOSE comparison; until the at-close correction column exists in the
+# table, v2 is implemented as bar = price − buffer, stamped proof=v2-buffer.
+# Drew flips ONE Render env var after reading the DIAG-001 page: H-SEMANTICS
+# verdict → F_PROOF_MODE=v2; H-MARKET or DISCIPLINE → touch nothing.
+# ---------------------------------------------------------------------------
+F_PROOF_MODE = os.environ.get("F_PROOF_MODE", "v1").strip().lower()
+F_PROOF_V2_BUFFER_PTS = 4         # v2 interim: touch→close correction stand-in
 TIER_BUFFER = {TIER_LEAN: 0.03, TIER_CLEAR: 0.05}   # DREW-DEFAULT bar over BE
 # §3.3: the bar math must never demand the impossible, only the honest —
 # bars cap below 1.0 (a 97¢ hold-cell LEAN bar lands at the cap, .98).
