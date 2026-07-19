@@ -73,7 +73,7 @@ def test_first_minute_dip_is_noise_not_a_decision(flip, gateway, ledger):
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)             # the scalp take rests
     # 60 seconds after the fill, mark 41 < trigger 42 — still NOISE
-    p2 = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=730))
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=730))
     assert [p for p in p2 if p.purpose == "CUT"] == []
     assert o.get("done") is not True                     # the position HOLDS
 
@@ -214,10 +214,10 @@ def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
     assert o["hold"] is True
     # inside the patience floor the reversal is still noise (custodian's
     # catastrophic backstop guards the gap); past it, the cut fires
-    assert [p for p in flip.evaluate(TICKER, _ctx(_book(yes=40),
+    assert [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
                                                   secs_left=580))
             if p.purpose == "CUT"] == []
-    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=40),
+    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
                                                   secs_left=480))
             if p.purpose == "CUT"]
     assert len(cuts) == 1 and "determined-against" in cuts[0].reason
@@ -308,7 +308,7 @@ def test_post_window_genuine_decision_cuts_hard(flip, gateway, ledger):
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
     o["fill_ts"] = CLOSE - 1100                          # window long over
-    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=41),
+    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
                                                   secs_left=700))
             if p.purpose == "CUT"]
     assert len(cuts) == 1

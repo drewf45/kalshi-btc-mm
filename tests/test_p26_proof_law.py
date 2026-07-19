@@ -168,10 +168,11 @@ def test_evacuation_crosses_at_trigger_price(flip, gateway):
     # P-FLIP-THESIS-1 §2: this law is about the CROSSFIRE PRICE — age the
     # fill past the patience floor so the post-window cut fires
     flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
-    props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770))
+    # A-PLAYER B5: the trigger is the band floor (P&L-blind)
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=770))
     assert len(props) == 1
     p = props[0]
-    trigger = 48 - config.OPEN_DETERMINED_DROP
+    trigger = config.OPEN_UNDETERMINED_BAND[0]
     assert p.purpose == "CUT" and p.crossfire
     assert abs(p.price_cents - trigger) <= 2
 

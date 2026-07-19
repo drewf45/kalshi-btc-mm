@@ -80,7 +80,7 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
     assert r.order_id in gateway.resting               # the partial, live
     # the book collapses to determined territory BETWEEN the two halves
-    p_mid = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=780))
+    p_mid = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=780))
     assert [p for p in p_mid if p.purpose in ("EXIT", "CUT")] == []  # §3.1 defers
     # venue fill record 2 of 2: entry fully booked, merge lands
     gateway.on_fill(r.order_id, count=1)
@@ -95,18 +95,18 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     w.opens["yes"]["fill_ts"] = CLOSE - 1100
     # quiescent now: the take posts at FULL size (custody order: take
     # first), then the determined evacuation fires — also at full size
-    p_take = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=778))
+    p_take = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=778))
     take = next(p for p in p_take if p.purpose == "EXIT")
     assert take.count == 2                             # never a 1-lot split
     flip.on_submitted(take, "OID-T", CLOSE - 778)
-    p_exit = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=777))
+    p_exit = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=777))
     cuts = [p for p in p_exit if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].count == 2       # ONE covered action
     assert "determined-against" in cuts[0].reason
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 41, 2, "PROBE")
-    flip.note_exit(TICKER, "yes", 41, CLOSE - 776, count=2)
-    assert w.window_realized == -14                    # bound loss, together
-    flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=775))
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 2, "PROBE")
+    flip.note_exit(TICKER, "yes", 34, CLOSE - 776, count=2)
+    assert w.window_realized == -28                    # bound loss, together
+    flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=775))
     assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 0    # ZERO pages, ever
 
 
@@ -127,10 +127,10 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
     flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
     # take posts on the 1-lot leg, then determined fires -> done=True,
     # CUT x1 in flight (the pre-merge exit — the race's first half)
-    p_take = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=781))
+    p_take = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=781))
     flip.on_submitted(next(p for p in p_take if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 781)
-    p_cut = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=780))
+    p_cut = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=780))
     cut = next(p for p in p_cut if p.purpose == "CUT")
     assert cut.count == 1
     w = flip.windows[TICKER]
@@ -143,14 +143,14 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
                                    "bucket": "opens"}
     # the old leg's CUT books -> conclude -> REOPEN fires
     with caplog.at_level(logging.WARNING, logger="relay.lane_flip"):
-        ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 41, 1, "PROBE")
-        flip.note_exit(TICKER, "yes", 41, CLOSE - 778, count=1)
+        ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 1, "PROBE")
+        flip.note_exit(TICKER, "yes", 34, CLOSE - 778, count=1)
     assert any("FLIP_LATE_FILL_REOPEN" in r.message for r in caplog.records)
     assert w.opens["yes"]["count"] == 1                # fresh, position-aware
     assert not w.opens["yes"].get("done")
     assert "yes" not in w.late_fills
     # the reopened leg gets a normal exit next cycle; nothing orphans
-    p2 = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=777))
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=777))
     assert any(p.purpose in ("EXIT", "CUT") and p.count == 1 for p in p2)
     assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 0
 

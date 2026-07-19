@@ -159,11 +159,12 @@ def test_determined_against_band_exit(flip, gateway):
     # P-FLIP-THESIS-1 §2: the patience floor gates the cut — this law-test
     # exercises the POST-window decision, so the fill ages past the floor
     flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
-    # yes mark 41 < trigger 42: determined against us — crossfire NOW
-    props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770))
+    # A-PLAYER B5: the trigger is the BAND FLOOR (35c, P&L-blind) — the
+    # basis-anchored entry-6 trigger is retired; mark 34 < 35 cuts
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=770))
     assert len(props) == 1
     p = props[0]
-    assert (p.purpose, p.action, p.price_cents) == ("CUT", "sell", 41)
+    assert (p.purpose, p.action, p.price_cents) == ("CUT", "sell", 34)
     assert p.crossfire
     assert "open determined-against" in p.reason
     assert "evacuate now" in p.reason

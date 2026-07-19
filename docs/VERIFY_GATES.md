@@ -1406,6 +1406,45 @@ change — proves itself at one lot before any size.**
 - Suite 479 · preflight 23/23. UNPROVEN, routed to measurement:
   continuity edge; 20¢-vs-5¢ superiority (the one-lot tape decides).
 
+## THE A-PLAYER DOCUMENT (build 33) — the machine that doesn't need watching
+
+**Doctrine (banked):** every dead run died to operator intolerance of a
+single loss, not to the market — so the fix removes the hand: the book
+speaks the venue's units, noise re-baselines silently, only a loss-RATE
+halts, size is the premise (Drew's dial), and exit thresholds never read
+their own P&L. **Staged as the Adversary mandated: B1-B3 (overnight
+survival) committed and proven standalone, then B4-B5.**
+
+- **B1 half-cent precision** (root cause proven: `int(round(cost))` at
+  the fills booking truncated the venue's half-cents into the day's
+  phantom 1-2¢ deltas): the book stores exact cents ('0.9650' → 96.5,
+  round-trip asserted; INTEGER affinity keeps old rows valid — no
+  destructive migration); sums round ONCE so residues cancel.
+- **B2 silent small re-baseline**: `CASH_SILENT_REBASE_CENTS=5`
+  (DREW-DEFAULT) — noise deltas re-baseline silently (SILENT_REBASE row,
+  log only, zero pages); above the bound the WO-CASH-FATAL-1 machinery is
+  byte-identical. The overnight book runs untouched.
+- **B3 the rate halt** (OVERTURNS two-consecutive-strikes): 2-of-last-4
+  settled traded markets negative → halt (per-market BROKER P&L is the
+  unit; settled-only). One loss NEVER halts; a win no longer forgives
+  (the rate rolls — red-win-red halts; test_win_resets_streak overturned
+  with citation). Persistence/custody//reset_halt unchanged; wall reason
+  → RATE_HALT; consecutive streak reports as info.
+- **B4 the fraction is Drew's dial**: `KELLY_FRACTION_CEILING` reads the
+  KELLY_FRACTION env (default holds 1/12 until Drew turns it — code
+  never chooses the fraction); boot SIZING line states the live value;
+  Kelly/depth/net-risk math untouched.
+- **B5 the P&L-blind cut**: the determined trigger is the UNDETERMINED
+  band floor + the table's ΔP-collapse — never the entry basis (the
+  basis-anchored entry−6 trigger retired; `OPEN_DETERMINED_DROP` now
+  feeds only the dormant geometry law). Acceptance: up-5 and down-5 with
+  identical book/table/time state get the SAME decision (hold at 48,
+  cut at 34). The take stays pre-committed at entry+20 from fill time —
+  never moved by unrealized P&L. Determined law-tests re-marked to the
+  band floor with citations.
+- **HARD RAIL held**: genuine-dispute cash-FATAL, salvage loss-term,
+  flip-cover custody untouched and green. Suite 490 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -629,8 +629,9 @@ class LaneFlip:
             return proposals               # the herd's side is already paid up
         # §3.4 GEOMETRY GATE: risk to the determined trigger must not exceed
         # the take + 1 — a trade whose bail is bigger than its win passes.
-        det_trigger = max(config.OPEN_UNDETERMINED_BAND[0],
-                          join - config.OPEN_DETERMINED_DROP)
+        # A-PLAYER B5: the trigger is the band floor (P&L-blind), so the
+        # entry-time risk is join − floor.
+        det_trigger = config.OPEN_UNDETERMINED_BAND[0]
         risk = join - det_trigger
         if risk > config.OPEN_TAKE_CENTS + 1:
             if not w.open_geometry_logged:
@@ -864,15 +865,21 @@ class LaneFlip:
                 # held to settlement — no scalp take, no yield; the
                 # determined-against floor below still guards it
                 pass
-            # DETERMINED-AGAINST — §3.4 v2 trigger; §3.2 evacuate NOW
-            det_trigger = max(lo_u, o["entry"] - config.OPEN_DETERMINED_DROP)
+            # DETERMINED-AGAINST — §3.2 evacuate NOW. A-PLAYER B5: the
+            # trigger is P&L-BLIND — the UNDETERMINED BAND FLOOR (the
+            # book saying the swing is gone) + the table's ΔP-collapse,
+            # never the position's entry basis (a basis-anchored trigger
+            # is the human moving the bar; two positions with identical
+            # book/table/time state get the SAME decision, up or down).
+            det_trigger = lo_u
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
             o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
             determined = None
             if mark is not None and mark < det_trigger:
                 determined = (f"open determined-against: {side} {mark}c < "
-                              f"trigger {det_trigger}c (geometry=v2)")
+                              f"trigger {det_trigger}c (band floor, "
+                              "P&L-blind)")
             elif o["collapse_polls"] >= 2:
                 determined = (f"open determined-against: ΔP-collapse "
                               f"{sl.delta_p:.0f}pts sustained")

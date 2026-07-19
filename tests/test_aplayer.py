@@ -166,3 +166,42 @@ def test_boot_sizing_line_states_the_dial():
     line = sizing_line(1174)
     assert "DREW dial: KELLY_FRACTION env" in line
     assert f"fraction={config.KELLY_FRACTION_CEILING:.4f}" in line
+
+
+# ── B5: THE P&L-BLIND CUT ──────────────────────────────────────────────────
+def test_exit_decision_is_provably_independent_of_pnl(ledger, gateway,
+                                                      surface):
+    """Acceptance: a position UP 5c and one DOWN 5c, identical book/table/
+    time state, get the SAME exit decision — the trigger is the band floor
+    (the table's 'swing is gone'), never the entry basis. A human moves
+    the bar when up (greed) or down (hope); the machine cannot."""
+    from relay_engine.book import OrderBook
+    from relay_engine.custodian import Custodian
+    from relay_engine.feed import DegradeLadder
+    from relay_engine.lane_flip import LaneFlip
+    CLOSE = 1_000_000.0
+    failures._warn_last.clear()
+    failures.configure(ledger, alert_fn=lambda m: None, run_mode="TEST",
+                       boot_id=1)
+    decisions = {}
+    for name, entry in (("down5", 53), ("up5", 43)):   # both mark 48 below
+        mkt = f"KXBTC15M-02JAN25100{1 if entry == 53 else 2}-T99"
+        flip = LaneFlip(gateway, custodian=Custodian(
+            gateway, ledger, surface, ladder=DegradeLadder()))
+        w = flip._window(mkt, CLOSE)
+        w.opens["yes"] = {"entry": entry, "fill_ts": CLOSE - 1100,
+                          "count": 1, "take_oid": "OID-T",
+                          "take_proposed": True, "collapse_polls": 0,
+                          "det_ts": None, "entry_oid": None,
+                          "defer_polls": 0}
+        for mark in (48, 34):                          # identical states
+            b = OrderBook(market=mkt)
+            b.apply_snapshot({mark: 10}, {40: 10}, ts=1.0)
+            props = flip.evaluate(mkt, {"book": b, "now": CLOSE - 700 - (48 - mark),
+                                        "close_ts": CLOSE, "spot": None,
+                                        "grain": None, "spotlead": None})
+            decisions.setdefault(name, []).append(
+                bool([p for p in props if p.purpose == "CUT"]))
+    # same table/time state -> same decision, up or down: hold at 48, cut at 34
+    assert decisions["down5"] == decisions["up5"] == [False, True]
+    failures._ledger = None
