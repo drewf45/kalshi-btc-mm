@@ -213,7 +213,8 @@ def test_stop_audit_honors_and_fatals(ledger, surface):
     ledger.set_state(HALT_KEY, "1")
     with pytest.raises(FatalIntegrityError):
         audit(eng)                       # halted in DB, wall never told
-    eng.gateway.halt_entries("TWO_STRIKE_HALT")
+    from relay_engine.window_econ import HALT_REASON
+    eng.gateway.halt_entries(HALT_REASON)   # B3: the rate halt's reason
     assert "two-strike=HONORED" in audit(eng)
 
 

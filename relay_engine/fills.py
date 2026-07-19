@@ -141,8 +141,14 @@ class FillBooker:
             # cell outcome inside record_fill; FLIP's intent (OPEN/HUNT)
             # rides the exit reason / entry why so the cells split.
             from . import scoring
+            # A-PLAYER B1 — HALF-CENT PRECISION: the venue prices in
+            # half-cents above 90c; int(round(96.5)) truncated the residue
+            # that accumulated into the day's phantom 1-2c cash deltas.
+            # The BOOK stores the fill's exact cents (SQLite INTEGER
+            # affinity keeps 96.5 as REAL, losslessly); narration and
+            # custody may round, the ledger never does.
             self.ledger.record_fill(order.market, order.lane, record_side,
-                                    action, int(round(cost)), count,
+                                    action, cost, count,
                                     order.size_tier, fee_cents=fee_cents,
                                     cell_lane=scoring.cell_lane(
                                         order.lane,

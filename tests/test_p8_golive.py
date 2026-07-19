@@ -55,7 +55,7 @@ def test_bracket_writes_window_econ_and_pages(engine):
         "SELECT detail FROM surface_rows WHERE state='WINDOW_ECON' AND market=?",
         (TICKER,)).fetchone()[0]
     assert json.loads(surf)["pnl"] == 39
-    assert any("📊" in m and "+$0.39" in m and "streak 0" in m
+    assert any("📊" in m and "+$0.39" in m and "rate 0/" in m
                for m in engine.telegram_sent)
 
 
@@ -98,18 +98,23 @@ def test_two_negatives_halt_and_page(engine):
     assert engine.econ.streak == 1 and not engine.econ.halted()
     trade_and_settle(engine, TICKER2, -15, now=3000.0)
     assert engine.econ.streak == 2 and engine.econ.halted()
-    assert "TWO_STRIKE_HALT" in engine.gateway.entries_halted_reasons
-    page = [m for m in engine.telegram_sent if "TWO-STRIKE HALT" in m]
+    assert "RATE_HALT" in engine.gateway.entries_halted_reasons
+    page = [m for m in engine.telegram_sent if "RATE HALT" in m]
     assert page and "/reset_halt" in page[0]
     assert TICKER in page[0] and TICKER2 in page[0]
 
 
 def test_win_resets_streak(engine):
+    """A-PLAYER B3 OVERTURNED the forgiving win: the consecutive streak
+    still resets for the packs (info), but the HALT is a RATE — a win no
+    longer forgives; red-win-red is 2 losses of the last 3 and HALTS
+    (two-in-a-row was never the signal; the rate is)."""
     trade_and_settle(engine, TICKER, -20, now=1000.0)
     trade_and_settle(engine, TICKER2, +5, now=3000.0)
     assert engine.econ.streak == 0
     trade_and_settle(engine, TICKER3, -8, now=5000.0)
-    assert engine.econ.streak == 1 and not engine.econ.halted()
+    assert engine.econ.streak == 1
+    assert engine.econ.halted()          # 2 of last 3 <= bound 2-of-4
 
 
 def test_halt_persists_across_restart(engine, tmp_path):
@@ -120,7 +125,7 @@ def test_halt_persists_across_restart(engine, tmp_path):
     engine2 = ShadowEngine(db_path=str(tmp_path / "econ.db"))
     engine2.boot()
     assert engine2.econ.halted()
-    assert "TWO_STRIKE_HALT" in engine2.gateway.entries_halted_reasons
+    assert "RATE_HALT" in engine2.gateway.entries_halted_reasons
     # ...and risk reduction is still allowed (the halt stops NEW risk only)
     from relay_engine.gateway import Order
     from relay_engine import config
@@ -141,7 +146,7 @@ def test_reset_halt_is_drews_word(engine):
     reply = engine.telegram.handle_command("/reset_halt")
     assert "entries re-enabled" in reply and "book $" in reply
     assert not engine.econ.halted() and engine.econ.streak == 0
-    assert "TWO_STRIKE_HALT" not in engine.gateway.entries_halted_reasons
+    assert "RATE_HALT" not in engine.gateway.entries_halted_reasons
     row = engine.ledger.db.execute(
         "SELECT detail FROM surface_rows WHERE state='HALT_RESET'").fetchone()
     assert "confirmed_by=telegram" in row[0]
@@ -151,7 +156,7 @@ def test_pack_shows_streak_and_resets(engine):
     from relay_engine.ops import daily_pack
     trade_and_settle(engine, TICKER, -20, now=1000.0)
     pack = daily_pack(engine.ledger, engine.surface, engine.cash, econ=engine.econ)
-    assert "TWO-STRIKE: streak=1 halted=False" in pack
+    assert "RATE-HALT: rate=1/1 (bound 2/4) halted=False" in pack
 
 
 # ── P7 §1: the single book adapter, property-tested ────────────────────────

@@ -33,7 +33,11 @@ def sizing_line(book_cents: int) -> str:
     # stays honest if the fraction ever moves by Drew's ruling)
     b2 = math.ceil(2 * 97 / config.KELLY_FRACTION_CEILING / 100)
     b3 = math.ceil(3 * 97 / config.KELLY_FRACTION_CEILING / 100)
-    return (f"SIZING: 1/12-Kelly · book ${book_cents / 100:.2f} · "
+    # A-PLAYER B4: the fraction is Drew's dial (KELLY_FRACTION env) — the
+    # boot states the LIVE value; code never chooses it.
+    frac = config.KELLY_FRACTION_CEILING
+    return (f"SIZING: Kelly fraction={frac:.4f} (DREW dial: KELLY_FRACTION"
+            f" env) · book ${book_cents / 100:.2f} · "
             f"budget/window {budget}¢ · max lots: {l39} @39¢ · {l99} @99¢ · "
             f"kelly-bound: {l97} lot @97¢ ({l98} @98¢) — throttle is book "
             f"size, not a wall; self-scales ~${b2}→2 @97¢, ~${b3}→3")
@@ -79,7 +83,7 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
         if boot_caps.book_cents <= floor_c * 2:
             lines.append(f"rail: DISARMED (book < "
                          f"${config.DRAWDOWN_ABSOLUTE_FLOOR_USD * 2:.0f}) — "
-                         f"two-strike is the only engine stop")
+                         f"the rate halt is the only engine stop")
         else:
             lines.append(f"rail: ARMED — floor "
                          f"${config.DRAWDOWN_ABSOLUTE_FLOOR_USD:.2f}, headroom "
@@ -146,19 +150,28 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  D: cheap entry + resting recovery take (the baton)")
     lines.append("  P: displacement fade with take (negative-spec born)")
     lines.append("  ORPHAN: adopted at boot · D-grade custody · own attribution")
-    lines.append("  WALLS: gross+net risk<=3/event · $-at-risk cap · two-strike "
-                 "halt (/reset_halt) · orientation sentinels · narrated fills · "
+    lines.append(f"  WALLS: gross+net risk<=3/event · $-at-risk cap · rate "
+                 f"halt {config.RATE_HALT_LOSSES}-of-"
+                 f"{config.RATE_HALT_WINDOW} (/reset_halt) · orientation "
+                 "sentinels · narrated fills · "
                  "graded tape · REJECT_SELF_NET (P21 A2)")
     # P27 §1/§4: full Kelly; the ladder reports, never votes; one governor.
     lines.append("  SIZING: FULL KELLY — min(kelly, depth); the Wilson "
                  "ladder reports (scoreboard, pages, custody scaling) and "
                  "never votes (P27 §1); /scoreboard on demand")
-    lines.append("GOVERNOR: halt-only — walls stop bugs, custody stops "
-                 "losses, the two-strike account halt stops bad days, "
-                 "NOTHING stops trading (P27; era stamped on every cell row)")
-    lines.append("CASH INTEGRITY: fatal + pending prompt persist across boot "
-                 "(P-CASH-FATAL-1); deny outranks boot baseline; "
-                 "/clear_cash_fatal is the only key")
+    lines.append(f"GOVERNOR: halt-only — walls stop bugs, custody stops "
+                 f"losses, the {config.RATE_HALT_LOSSES}-of-"
+                 f"{config.RATE_HALT_WINDOW} rate halt stops bad runs "
+                 "(A-PLAYER B3: a single loss is NOISE and halts nothing), "
+                 "NOTHING else stops trading (P27; era stamped on every "
+                 "cell row)")
+    lines.append("CASH INTEGRITY: half-cent exact (B1 — the venue's own "
+                 f"units above 90¢) · noise deltas ≤"
+                 f"{config.CASH_SILENT_REBASE_CENTS}¢ re-baseline SILENTLY "
+                 "(B2 — the overnight book runs untouched) · fatal + "
+                 "pending prompt persist across boot (P-CASH-FATAL-1); "
+                 "deny outranks boot baseline; /clear_cash_fatal is the "
+                 "only key")
     # P21 B1: the boot cites the doctrine — one page says what the machine
     # believes, why, and what would change its mind. Cited, and verified
     # present (a missing registry is worth a loud boot line, never a crash).

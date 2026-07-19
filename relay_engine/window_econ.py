@@ -11,14 +11,18 @@ any divergence > 2c writes WINDOW_ECON_DIVERGENCE with both numbers — that
 divergence is exactly the class of lie the legacy era died of; now it pages
 the phone the moment it exists.
 
-THE TWO-STRIKE HALT: consecutive-negative streak over TRADED markets only,
-account-level (all lanes share one account). streak==2 → entries halted
-engine-wide (TWO_STRIKE_HALT); open positions and resting exits stay
-custodied to conclusion — the halt stops NEW risk, never the management of
-existing risk. The halt PERSISTS in the DB across boots and redeploys.
-Resume is Drew's word alone: /reset_halt from the configured chat. It
-re-enables ENTRIES only; it cannot place, amend, or cancel anything
-(single-gateway law).
+THE RATE HALT (A-PLAYER B3, DREW-RULED 2026-07-19 — OVERTURNS the
+two-consecutive-strike law): a single losing market is NOISE and carries
+no information; only a loss-RATE is the signature of a bug or regime
+break. The halt fires when RATE_HALT_LOSSES of the last RATE_HALT_WINDOW
+settled TRADED markets are negative (per-market BROKER P&L is the unit —
+a market that wins net while a lane bled inside it is a WIN, with the
+composition logged so a win-that-hid-a-loss stays visible). Everything
+else stands from the two-strike era: entries halted engine-wide
+(RATE_HALT), open positions custodied to conclusion, the halt PERSISTS in
+the DB across boots and redeploys, resume is Drew's word alone
+(/reset_halt — entries only; single-gateway law). The consecutive streak
+still COUNTS for the packs; it halts nothing.
 
 Win/loss path symmetry: every traded market writes a bracket, green or red;
 the streak reads the sign of broker truth, nothing else.
@@ -36,10 +40,11 @@ from . import config, failures
 log = logging.getLogger("relay.window_econ")
 
 DIVERGENCE_TOLERANCE_CENTS = 2
-HALT_KEY = "two_strike_halt"
-STREAK_KEY = "two_strike_streak"
+HALT_KEY = "two_strike_halt"      # key name kept: persisted halts survive the rename
+STREAK_KEY = "two_strike_streak"  # consecutive streak — reporting only (B3)
 STRIKES_KEY = "two_strike_markets"
-HALT_REASON = "TWO_STRIKE_HALT"
+OUTCOMES_KEY = "rate_halt_outcomes"   # B3: rolling last-M window outcomes
+HALT_REASON = "RATE_HALT"
 
 ECON_SCHEMA = """
 CREATE TABLE IF NOT EXISTS window_econ (
@@ -109,7 +114,7 @@ class WindowEcon:
         """P8 §2.3: restarts and redeploys do NOT clear the halt."""
         if self.halted():
             self.gateway.halt_entries(HALT_REASON)
-            log.warning("TWO-STRIKE HALT restored from DB — /reset_halt is the only key")
+            log.warning("RATE HALT restored from DB — /reset_halt is the only key")
             return True
         return False
 
@@ -258,40 +263,42 @@ class WindowEcon:
             done += 1
         return done
 
-    # ── §2: the two-strike leash (P17 §2.1: late truths still count) ───
+    # ── §2: THE RATE HALT (A-PLAYER B3; P17 §2.1: late truths count) ───
     def _apply_streak(self, market: str, window_pnl: int, book_cents: int,
                       late: bool = False) -> None:
-        strikes = json.loads(self.ledger.get_state(STRIKES_KEY) or "[]")
-        if window_pnl < 0:
-            streak = self.streak + 1
-            strikes.append({"market": market, "pnl": window_pnl})
-            strikes = strikes[-2:]
-        else:
-            streak = 0
-            strikes = []
+        # the rolling window of settled traded markets — per-market BROKER
+        # P&L is the unit (Engineer: settled-only; never in-flight marks)
+        outcomes = json.loads(self.ledger.get_state(OUTCOMES_KEY) or "[]")
+        outcomes.append({"market": market, "pnl": window_pnl})
+        outcomes = outcomes[-config.RATE_HALT_WINDOW:]
+        self.ledger.set_state(OUTCOMES_KEY, json.dumps(outcomes))
+        losses = [o for o in outcomes if o["pnl"] < 0]
+        # the consecutive streak still REPORTS (packs); it halts nothing
+        streak = self.streak + 1 if window_pnl < 0 else 0
         self._set_streak(streak)
-        self.ledger.set_state(STRIKES_KEY, json.dumps(strikes))
+        self.ledger.set_state(STRIKES_KEY, json.dumps(losses[-2:]))
 
         sign = "+" if window_pnl >= 0 else ""
         late_s = " (settled late — books healed)" if late else ""
         self.telegram.alert(
             f"📊 {market} {sign}${window_pnl / 100:.2f} · "
-            f"book ${book_cents / 100:.2f} · streak {streak}{late_s}")
+            f"book ${book_cents / 100:.2f} · "
+            f"rate {len(losses)}/{len(outcomes)}{late_s}")
 
-        if streak >= 2 and not self.halted():
+        if len(losses) >= config.RATE_HALT_LOSSES and not self.halted():
             self.ledger.set_state(HALT_KEY, "1")
             self.gateway.halt_entries(HALT_REASON)
-            s1, s2 = strikes[0], strikes[1]
-            retro = (f"⛔ TWO-STRIKE (retroactive: {market} settled late): "
-                     if late else "⛔ TWO-STRIKE HALT: ")
+            named = ", ".join(f"{o['market']} {o['pnl']}c" for o in losses)
+            retro = (f"⛔ RATE HALT (retroactive: {market} settled late): "
+                     if late else "⛔ RATE HALT: ")
             self.telegram.alert(
-                f"{retro}{s1['market']} {s1['pnl']}c, "
-                f"{s2['market']} {s2['pnl']}c · book ${book_cents / 100:.2f} · "
+                f"{retro}{len(losses)} of last {len(outcomes)} markets "
+                f"negative — {named} · book ${book_cents / 100:.2f} · "
                 f"reply /reset_halt to resume")
-            failures.fail("TWO_STRIKE_HALT",
-                          f"two consecutive negative windows: "
-                          f"{s1['market']} {s1['pnl']}c, {s2['market']} {s2['pnl']}c",
-                          strikes=strikes, book_cents=book_cents)
+            failures.fail("RATE_HALT",
+                          f"{len(losses)} of last {len(outcomes)} settled "
+                          f"markets negative: {named}",
+                          outcomes=outcomes, book_cents=book_cents)
 
     def reset_halt(self, confirmed_by: str = "telegram") -> str:
         """Drew's word alone. Re-enables ENTRIES only — it cannot place, amend,
@@ -301,6 +308,7 @@ class WindowEcon:
         self.ledger.set_state(HALT_KEY, "0")
         self._set_streak(0)
         self.ledger.set_state(STRIKES_KEY, "[]")
+        self.ledger.set_state(OUTCOMES_KEY, "[]")   # B3: the window restarts clean
         self.gateway.resume_entries(HALT_REASON)
         self.surface.write_row("ECON", "ENGINE", f"halt-{int(time.time())}",
                                "HALT_RESET", detail=f"confirmed_by={confirmed_by}")
@@ -310,10 +318,15 @@ class WindowEcon:
 
     # ── §2.4: the pack lines ───────────────────────────────────────────
     def pack_lines(self) -> list:
-        lines = [f"TWO-STRIKE: streak={self.streak} halted={self.halted()}"]
+        outcomes = json.loads(self.ledger.get_state(OUTCOMES_KEY) or "[]")
+        losses = sum(1 for o in outcomes if o["pnl"] < 0)
+        lines = [f"RATE-HALT: rate={losses}/{len(outcomes)} "
+                 f"(bound {config.RATE_HALT_LOSSES}/{config.RATE_HALT_WINDOW})"
+                 f" halted={self.halted()} · streak={self.streak} (info)"]
         day_ago = time.time() - 86400
         halts = self.ledger.db.execute(
-            "SELECT COUNT(*) FROM failures WHERE why_tag='TWO_STRIKE_HALT' AND ts>?",
+            "SELECT COUNT(*) FROM failures WHERE why_tag IN"
+            " ('RATE_HALT','TWO_STRIKE_HALT') AND ts>?",
             (day_ago,)).fetchone()[0]
         resets = self.ledger.db.execute(
             "SELECT ts FROM surface_rows WHERE state='HALT_RESET' AND ts>?",

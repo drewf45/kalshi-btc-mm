@@ -115,7 +115,13 @@ NET_RISK_CROSS_LANE_CAP = 3  # net contracts at risk per settlement event, acros
 # Sizing (C.3 / Charter §8): tiers move on Wilson lower bounds only.
 # Capital raises budgets, never tiers.
 # ---------------------------------------------------------------------------
-KELLY_FRACTION_CEILING = 1.0 / 12.0
+# A-PLAYER B4 (CEO lens): the fraction is DREW'S DIAL, never code's
+# choice — size is the premise, re-derived from the book (Kelly stays the
+# SHAPE; it self-scales as the book compounds). Set via the KELLY_FRACTION
+# env at deploy; the default holds the last ruled value until Drew turns
+# it. The boot SIZING line states the live fraction.
+KELLY_FRACTION_CEILING = float(os.environ.get("KELLY_FRACTION",
+                                              str(1.0 / 12.0)))
 WILSON_Z = 1.96
 TIER_SUPPRESS = "SUPPRESS"
 TIER_PROBE = "PROBE"
@@ -164,6 +170,21 @@ OPEN_DETERMINED_DROP = 6
 # the window, on a real decision — and then it fires HARD (anti-ride-to-zero:
 # patience is upside-only).
 OPEN_PATIENCE_S = 300
+
+# ---------------------------------------------------------------------------
+# A-PLAYER doctrine (banked 2026-07-19): the machine runs untouched
+# overnight; only a loss-RATE stops trading; a single loss is noise.
+# ---------------------------------------------------------------------------
+# B2 (DREW-DEFAULT ≤5c suggested): a cash delta at or under this magnitude
+# is NOISE — silently re-baselined and logged, never prompted, never
+# halted (the hourly-confirmation tax killed the overnight book). Above
+# it, the WO-CASH-FATAL-1 genuine-dispute path stands untouched.
+CASH_SILENT_REBASE_CENTS = 5
+# B3 (DREW-DEFAULT): the halt is a RATE — N losing markets of the last M
+# settled traded markets (per-market broker P&L is the unit). One loss
+# NEVER halts; two-in-a-row was never a reliable signal, 2-of-4 is.
+RATE_HALT_LOSSES = 2
+RATE_HALT_WINDOW = 4
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20

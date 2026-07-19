@@ -136,7 +136,7 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
             "SELECT window_pnl_cents, fills_pnl_cents, source, deferred"
             " FROM window_econ WHERE market=?", (TICKER,)).fetchone()
         assert row == (3, 3, "venue", "")      # broker truth == fills truth
-        assert any("📊" in m and "+$0.03" in m and "streak 0" in m
+        assert any("📊" in m and "+$0.03" in m and "rate 0/" in m
                    for m in engine.telegram_sent)
         assert engine.econ.streak == 0
     finally:

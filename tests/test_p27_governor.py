@@ -89,7 +89,7 @@ def test_mixed_lane_window_nets_one_strike_two_halt(engine, tmp_path):
                               now=3000.0)
     assert net2 == -8
     assert engine.econ.streak == 2 and engine.econ.halted()
-    assert "TWO_STRIKE_HALT" in engine.gateway.entries_halted_reasons
+    assert "RATE_HALT" in engine.gateway.entries_halted_reasons
     # restart: a NEW engine on the SAME database still halted
     e2 = ShadowEngine(db_path=str(tmp_path / "p27.db"))
     e2.boot()
@@ -122,4 +122,4 @@ def test_boot_speaks_the_constitution():
     tape = "\n".join(boot_tape())
     assert "GOVERNOR: halt-only" in tape
     assert "FULL KELLY" in tape
-    assert "NOTHING stops trading" in tape
+    assert "NOTHING else stops trading" in tape

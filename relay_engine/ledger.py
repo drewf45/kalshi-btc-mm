@@ -15,6 +15,7 @@ Single-writer law (§A1): this ledger opens the engine's OWN database file.
 """
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -23,6 +24,8 @@ from typing import List, Optional
 
 from . import config
 from .errors import FatalIntegrityError
+
+log = logging.getLogger("relay.ledger")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cash_movements (
@@ -49,7 +52,8 @@ CREATE TABLE IF NOT EXISTS fills (
     lane TEXT NOT NULL,             -- attribution: opening lane owns the position (C.2)
     side TEXT NOT NULL,
     action TEXT NOT NULL,           -- ENTRY | EXIT | CUSTODIAN_EXIT
-    price_cents INTEGER NOT NULL,   -- cost basis, canonical YES terms
+    price_cents INTEGER NOT NULL,   -- cost basis, canonical YES terms; B1: may hold
+                                    -- exact half-cents (SQLite affinity stores 96.5 as REAL)
     count INTEGER NOT NULL,
     size_tier TEXT NOT NULL,
     settled INTEGER NOT NULL DEFAULT 0,
@@ -187,15 +191,20 @@ class Ledger:
     def book_cents(self) -> int:
         # P-CASH-FATAL-1 §4.6: divergent settlement rows are DISPUTED —
         # they never inflate the book that cash then reconciles against.
+        # A-PLAYER B1: rows may carry exact half-cents (the venue's own
+        # units above 90c) — sum at full precision, round ONCE at the end
+        # (the same rule the venue-balance read uses), so residues cancel
+        # instead of truncating into phantom cash deltas.
         cash = self.db.execute("SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements").fetchone()[0]
         pnl = self.db.execute(
             "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0]
-        return int(cash) + int(pnl)
+        return int(round(float(cash) + float(pnl)))
 
     def lifetime_pnl_cents(self) -> int:
-        """Honest lifetime = settlements ledger, full stop (disputed rows out)."""
-        return int(self.db.execute(
-            "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0])
+        """Honest lifetime = settlements ledger, full stop (disputed rows
+        out; B1: summed exact, rounded once)."""
+        return int(round(float(self.db.execute(
+            "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0])))
 
     def quarantine_divergent_settlements(self, market: str,
                                          fills_pnl_cents: int) -> int:
@@ -527,6 +536,22 @@ class CashProtocol:
             f"last_reconcile={self.last_reconcile_ts} fills_since={fills_since_cents}c "
             f"fees_since={fees_since_cents}c delta={delta}c"
         )
+        # A-PLAYER B2 — SILENT SMALL RE-BASELINE: a delta at or under the
+        # noise bound is NOT information (post-B1 the half-cent residue is
+        # gone; what's left at this size is venue rounding, never theft).
+        # Logged and re-baselined silently — no prompt, no halt, no page:
+        # the overnight book runs untouched. Above the bound, the
+        # WO-CASH-FATAL-1 genuine-dispute machinery stands exactly as
+        # proven (Adversary: silence is BOUNDED, never structural).
+        if abs(delta) <= config.CASH_SILENT_REBASE_CENTS:
+            self.ledger.db.execute(
+                "INSERT INTO cash_movements (ts, amount_cents, kind,"
+                " confirmed_by, breakdown) VALUES (?,?,?,?,?)",
+                (now, delta, "SILENT_REBASE", "auto_noise", breakdown))
+            self.ledger.db.commit()
+            log.info("CASH SILENT_REBASE %+dc (<=%dc noise bound) — %s",
+                     delta, config.CASH_SILENT_REBASE_CENTS, breakdown)
+            return "SILENT_REBASED"
         if delta < 0:
             self.entries_halted = True
             self.pending = CashPrompt(

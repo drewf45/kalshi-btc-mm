@@ -190,7 +190,8 @@ def test_sizing_line_says_both_prices():
     from relay_engine.boot import sizing_line
     line = sizing_line(541)   # the 7:35 book: $5.41
     assert line.startswith(
-        "SIZING: 1/12-Kelly · book $5.41 · budget/window 45¢ · "
+        "SIZING: Kelly fraction=0.0833 (DREW dial: KELLY_FRACTION env) · "
+        "book $5.41 · budget/window 45¢ · "
         "max lots: 1 @39¢ · 0 @99¢")
     assert "throttle is book size, not a wall" in line   # B4 legibility
 

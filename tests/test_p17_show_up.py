@@ -57,7 +57,7 @@ def test_late_settlement_marks_receipt_and_retroactive_halt(engine):
     late_receipts = [m for m in engine.telegram_sent
                      if "📊" in m and "(settled late — books healed)" in m]
     assert len(late_receipts) == 2
-    assert any(m.startswith("⛔ TWO-STRIKE (retroactive:")
+    assert any(m.startswith("⛔ RATE HALT (retroactive:")
                for m in engine.telegram_sent)
 
 
@@ -66,7 +66,7 @@ def test_boot_tape_states_the_rail_in_words():
     from relay_engine.ledger import BootCaps
     tape_small = "\n".join(boot_tape(boot_caps=BootCaps(3_500, 350)))
     assert "rail: DISARMED" in tape_small
-    assert "two-strike is the only engine stop" in tape_small
+    assert "the rate halt is the only engine stop" in tape_small
     tape_big = "\n".join(boot_tape(boot_caps=BootCaps(10_000, 1_000)))
     assert "rail: ARMED" in tape_big and "headroom $75.00" in tape_big
 

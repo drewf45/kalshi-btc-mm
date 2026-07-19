@@ -93,12 +93,12 @@ def test_every_create_task_is_supervised():
 def test_reset_halt_full_round_trip(engine):
     engine.ledger.set_state("two_strike_halt", "1")
     assert engine.econ.restore_halt_on_boot() is True
-    assert "TWO_STRIKE_HALT" in engine.gateway.entries_halted_reasons
+    assert "RATE_HALT" in engine.gateway.entries_halted_reasons
     reply = engine.telegram.handle_command("/reset_halt")
     assert "halt cleared" in reply and "book $" in reply
     assert engine.econ.halted() is False
     assert engine.econ.streak == 0
-    assert "TWO_STRIKE_HALT" not in engine.gateway.entries_halted_reasons
+    assert "RATE_HALT" not in engine.gateway.entries_halted_reasons
     row = engine.ledger.db.execute(
         "SELECT detail FROM surface_rows WHERE state='HALT_RESET'").fetchone()
     assert row is not None
