@@ -200,3 +200,70 @@ def test_b2_restart_amnesia_shape_pages_with_no_bucket(ledger, surface,
     ).fetchone()[0]
     d = json.loads(row)
     assert d["buckets"] == "none" and d["held"] == 2 and d["covered"] == 0
+
+
+# ── B3: the cash-fatal survives reboot — ENGINE level ──────────────────────
+def _entry_order():
+    from relay_engine.gateway import Order
+    return Order(lane="F", event=EVENT, market=TICKER, side="yes",
+                 action="buy", price_cents=48, count=1,
+                 size_tier=config.TIER_PROBE, purpose="ENTRY",
+                 why="F tier48 · surv~price")
+
+
+def test_b3_deny_reboot_boots_halted_and_walled(tmp_path, capsys):
+    """B3 acceptance end-to-end: deny -> full engine reboot -> the boot
+    tape prints the restored fatal AND the stop audit honors it AND the
+    gateway wall refuses an ENTRY. No re-baseline: the book is unchanged
+    across the reboot."""
+    from relay_engine.errors import WallRejection
+    from relay_engine.shadow_runner import ShadowEngine
+    db = str(tmp_path / "b3.db")
+    e1 = ShadowEngine(db_path=db)
+    e1.boot()
+    assert e1.cash.reconcile(e1.ledger.book_cents() - 99, 0, 0,
+                             now=1000.0) == "PROMPTED"
+    e1.cash.deny_cash()
+    book_denied = e1.ledger.book_cents()
+    capsys.readouterr()                                  # drop e1's tape
+
+    e2 = ShadowEngine(db_path=db)                        # THE REBOOT
+    alerts = []
+    e2.telegram.send = alerts.append
+    e2.boot()
+    out = capsys.readouterr().out
+    assert any("CASH FATAL restored from DB — manual /clear_cash_fatal"
+               in a for a in alerts)                     # §B3 the exact line
+    assert "cash-fatal=HONORED" in out                   # audit line on tape
+    assert "CASH INTEGRITY:" in out                      # the profile states the law
+    assert e2.cash.fatal
+    assert e2.ledger.book_cents() == book_denied         # no re-baseline
+    with pytest.raises(WallRejection) as w:
+        e2.gateway.submit(_entry_order(), _flip_book())
+    assert "CASH_FATAL" in w.value.detail
+    failures._ledger = None
+
+
+def test_b3_pending_prompt_reboot_still_prompted_engine_level(tmp_path,
+                                                              capsys):
+    from relay_engine.errors import WallRejection
+    from relay_engine.shadow_runner import ShadowEngine
+    db = str(tmp_path / "b3p.db")
+    e1 = ShadowEngine(db_path=db)
+    e1.boot()
+    import time as _t
+    assert e1.cash.reconcile(e1.ledger.book_cents() - 99, 0, 0,
+                             now=_t.time()) == "PROMPTED"
+    capsys.readouterr()
+
+    e2 = ShadowEngine(db_path=db)                        # reboot mid-prompt
+    e2.boot()
+    out = capsys.readouterr().out
+    assert "cash-pending=HONORED" in out
+    assert e2.cash.pending is not None and not e2.cash.fatal
+    with pytest.raises(WallRejection) as w:
+        e2.gateway.submit(_entry_order(), _flip_book())
+    assert "CASH_PROMPT" in w.value.detail
+    # consent still works after the restore
+    assert e2.cash.confirm_cash(now=_t.time())
+    failures._ledger = None
