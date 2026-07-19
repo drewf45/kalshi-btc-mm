@@ -538,6 +538,10 @@ class ShadowEngine:
         # knows must be honored on the wall before the first cycle — or
         # FATAL loud rather than trade.
         print(self.audit_durable_stops(), flush=True)
+        # WO-VERIFY-LOSSTERM-1 B1: the salvage registration path must be
+        # provably reachable before the first cycle — ARMED or
+        # DISABLED_TAGGED, never silence on a held position.
+        print(self.salvage_selftest(), flush=True)
         self.gap_restart_scan()
         # P19 §2.5: the promotion — P26 §3.5 fold: paged ONCE per DEPLOY
         # (ledger-keyed dedup; the 6:22 restart double-page was cosmetic,
@@ -668,6 +672,60 @@ class ShadowEngine:
                     + " · ".join(f"{n}=HONORED" for n, _ in stops)
                     + " — restored stops hold before the first cycle")
         return "STOP AUDIT: no durable stops in DB — clean boot"
+
+    def salvage_selftest(self) -> str:
+        """WO-VERIFY-LOSSTERM-1 B1: prove at boot that adoption REGISTERS
+        the loss-term — a held position lands SALVAGE_ARMED (with its
+        anchor values) or SALVAGE_DISABLED_TAGGED (with its reason), never
+        silence — and that the catastrophic backstop stays reachable with
+        NO anchor. Runs against a throwaway in-memory ledger; the live
+        surface sees nothing. An unreachable path is FATAL loud at boot:
+        silence on a dying position is recklessness by omission (the
+        doctrine's loss-term must always be computed)."""
+        from . import failures
+        from .custodian import Custodian, OpenPosition, salvage_params
+        from .gateway import Gateway
+        from .ledger import Ledger
+        from .surface import Surface
+        led = Ledger(":memory:")
+        surf = Surface(led)
+        cust = Custodian(Gateway(led, surf), led, surf, ladder=DegradeLadder())
+        cust.set_lane_params("F", salvage_params())
+        mkt = "SELFTEST-B1"
+        cust.adopt(OpenPosition(
+            event="SELFTEST", market=mkt, lane="F", side="yes", count=1,
+            entry_price_cents=95, entry_p_win=0.95,
+            size_tier=config.TIER_PROBE, entry_time=0.0,
+            d_entry=200.0, t_entry=500.0, p_entry=0.93))
+        armed = led.db.execute(
+            "SELECT detail FROM surface_rows WHERE state='SALVAGE_ARMED'"
+            " AND market=?", (mkt,)).fetchone()
+        blind = OpenPosition(
+            event="SELFTEST", market=mkt + "-D", lane="F", side="yes",
+            count=1, entry_price_cents=95, entry_p_win=0.95,
+            size_tier=config.TIER_PROBE, entry_time=0.0, p_entry=None)
+        cust.adopt(blind, disabled_reason="table")
+        tagged = led.db.execute(
+            "SELECT detail FROM surface_rows WHERE"
+            " state='SALVAGE_DISABLED_TAGGED' AND market=?",
+            (mkt + "-D",)).fetchone()
+        backstop = cust.should_cut(
+            blind, now=1.0, secs_remaining=400, p_win=0.04, exit_bid_cents=4,
+            spot=None, boundary_lo=None, boundary_hi=None, balance_usd=100.0)
+        ok_armed = armed is not None and "p_entry" in armed[0]
+        ok_tagged = tagged is not None and "table" in tagged[0]
+        ok_backstop = backstop == "CATASTROPHIC"
+        if not (ok_armed and ok_tagged and ok_backstop):
+            failures.fail(
+                "SALVAGE_SELFTEST_FAILED",
+                f"salvage registration unreachable: armed={ok_armed} "
+                f"tagged={ok_tagged} backstop={ok_backstop} — the loss-term "
+                "would go silent on a held position; refusing to run",
+                fatal=True, armed=ok_armed, tagged=ok_tagged,
+                backstop=ok_backstop)
+        return ("SALVAGE SELF-TEST: ARMED fires · DISABLED_TAGGED names its "
+                "reason · catastrophic backstop reads no anchor — loss-term "
+                "wired (B1)")
 
     def standing_reconcile(self, now=None) -> str:
         """P9 §3: every 60s in live — venue truth vs ledger expectation, routed
