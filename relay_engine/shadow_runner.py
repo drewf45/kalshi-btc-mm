@@ -219,6 +219,9 @@ class ShadowEngine:
         self._av_last_attempt_ts = 0.0
         # P26 §1.2: UNPROVEN tagged once per (market, window) while unloaded
         self._unproven_tagged = set()
+        # B4: SIZE_ZERO_BY_KELLY logged once per (market, price); rollover
+        # cleanup in on_market_closed
+        self._size_zero_logged = set()
         # P10 §2/§3: book-truth machinery
         self.quarantined = {}       # market -> until_close_ts (A5 poison ceiling)
         self.poison_episodes = {}   # market -> episodes this window
@@ -280,6 +283,8 @@ class ShadowEngine:
         self.quarantined.pop(ticker, None)
         self.poison_episodes.pop(ticker, None)
         self._divergence_pending.pop(ticker, None)
+        self._size_zero_logged = {k for k in self._size_zero_logged
+                                  if k[0] != ticker}
         self.feed.resync_needed.discard(ticker)
         # P15 Fix A: settled window — gross exposure for the market is over
         for key in [k for k in self.gateway.gross_open if k[1] == ticker]:
@@ -432,6 +437,22 @@ class ShadowEngine:
                          proposal.price_cents, depth)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
         proposal.count = max(1, dec.contracts)
+        # WO-VERIFY-LOSSTERM-1 B4 (pure logging): when Kelly is the term
+        # that zeroed a favorite, say so BY NAME once per (market, price) —
+        # "0 @98c" must be self-explaining arithmetic, never a mystery bug.
+        if dec.contracts == 0:
+            book_c = self.ledger.book_cents()
+            kelly_budget = int(book_c * config.KELLY_FRACTION_CEILING)
+            if kelly_budget // max(1, proposal.price_cents) == 0:
+                key = (proposal.market, proposal.price_cents)
+                if key not in self._size_zero_logged:
+                    self._size_zero_logged.add(key)
+                    log.info(
+                        "SIZE_ZERO_BY_KELLY %s price=%dc book=%dc "
+                        "kelly_budget=%dc — throttle is book size, not a "
+                        "wall (count=1 proposed; the walls refuse by name)",
+                        proposal.market, proposal.price_cents, book_c,
+                        kelly_budget)
 
     def _on_fill_booked(self, order, action, price_cents, count, now,
                         fee_cents=0):

@@ -184,10 +184,15 @@ def test_exit_booking_ends_custody_of_flat_position(engine, monkeypatch):
 
 # ── §3: sizing narration — the budget is the invariant ─────────────────────
 def test_sizing_line_says_both_prices():
+    """WO-VERIFY-LOSSTERM-1 B4 EXTENDED this line (kelly-bound stated in
+    words + self-scale points); the P14 law — say the budget AND the lots
+    at both reference prices — stands as a prefix."""
     from relay_engine.boot import sizing_line
     line = sizing_line(541)   # the 7:35 book: $5.41
-    assert line == ("SIZING: 1/12-Kelly · book $5.41 · budget/window 45¢ · "
-                    "max lots: 1 @39¢ · 0 @99¢")
+    assert line.startswith(
+        "SIZING: 1/12-Kelly · book $5.41 · budget/window 45¢ · "
+        "max lots: 1 @39¢ · 0 @99¢")
+    assert "throttle is book size, not a wall" in line   # B4 legibility
 
 
 def test_boot_tape_carries_the_two_price_readout(engine):

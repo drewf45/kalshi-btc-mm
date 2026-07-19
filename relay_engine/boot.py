@@ -15,14 +15,28 @@ from . import config
 def sizing_line(book_cents: int) -> str:
     """P14 §3: the BUDGET is the invariant; lots depend on price — say both.
     (The 7:35 confusion: 'max lots 0' printed at a 99¢ reference while the
-    engine correctly traded 1 lot at 39¢ — both were true.)"""
+    engine correctly traded 1 lot at 39¢ — both were true.)
+
+    WO-VERIFY-LOSSTERM-1 B4: the binding constraint stated IN WORDS — the
+    one-lot floor at a high-priced favorite is Kelly arithmetic on a small
+    book, not a bug; it self-scales as the book compounds. Every number
+    printed here is computed from the live constants, never asserted."""
+    import math
     from .sizing import size_order
     budget = int(book_cents * config.KELLY_FRACTION_CEILING)
     # P27 §1: full Kelly — the printed lots are min(kelly, depth), no tier
     l39 = size_order(book_cents, 39, 10_000).contracts
     l99 = size_order(book_cents, 99, 10_000).contracts
+    l97 = size_order(book_cents, 97, 10_000).contracts
+    l98 = size_order(book_cents, 98, 10_000).contracts
+    # book needed for n lots at the 97c favorite reference (computed, so it
+    # stays honest if the fraction ever moves by Drew's ruling)
+    b2 = math.ceil(2 * 97 / config.KELLY_FRACTION_CEILING / 100)
+    b3 = math.ceil(3 * 97 / config.KELLY_FRACTION_CEILING / 100)
     return (f"SIZING: 1/12-Kelly · book ${book_cents / 100:.2f} · "
-            f"budget/window {budget}¢ · max lots: {l39} @39¢ · {l99} @99¢")
+            f"budget/window {budget}¢ · max lots: {l39} @39¢ · {l99} @99¢ · "
+            f"kelly-bound: {l97} lot @97¢ ({l98} @98¢) — throttle is book "
+            f"size, not a wall; self-scales ~${b2}→2 @97¢, ~${b3}→3")
 
 
 def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:

@@ -1284,6 +1284,43 @@ wall never heard about any cash stop, reboot or no reboot.**
   FATALs; divergent quarantine + clean-settlement no-op; command routing).
   COMMANDS-tuple test-laws updated with citation. Suite 444 · 23/23.
 
+## WO-VERIFY-LOSSTERM-1 — verification + legibility only (4 commits, no behavior change)
+
+Governing doctrine (Drew 2026-07-19): one goal — maximize EV to grow the
+live book, no deposits; safety mechanisms are the honestly-computed
+loss-term, nothing governs upside. **Hard rail honored: zero changes to
+KELLY_FRACTION_CEILING, DEPTH_FRACTION, NET_RISK_CROSS_LANE_CAP,
+LANE_D_FLOOR_CENTS, any band, tier bound, or gate.**
+
+- **B1** salvage self-test at every boot (throwaway in-memory ledger):
+  adoption must land SALVAGE_ARMED (anchor values) or
+  SALVAGE_DISABLED_TAGGED (named reason) and the catastrophic backstop
+  must fire anchorless — unreachable → SALVAGE_SELFTEST_FAILED, FATAL
+  before the first cycle. Sabotage-tested (a verification that cannot
+  fail cannot verify).
+- **B2** flip coverage verified: full 2-lot same-side OPEN lifecycle
+  (fill → resting take → second fill → merged 2-lot re-take → 2-lot
+  exit) with ZERO FLIP_UNCOVERED_LEG pages; forced held-2/covered-1
+  still pages exactly once. **The 12:18/191230 live firing root-caused
+  and encoded as a test: FlipWindow custody is in-memory — the
+  FLIP-COUNT-1 deploy's own restart orphaned the lane bucket
+  (buckets=none in the row), the merge itself holds. Custodian owns the
+  risk via boot adoption; lane re-hydration is a future order.**
+- **B3** cash-fatal engine-level: deny → full engine reboot → restored
+  page + cash-fatal=HONORED on tape + book byte-identical (no
+  re-baseline) + wall refuses ENTRY by name; pending-prompt reboot stays
+  PROMPTED, consent still works; two-strike untouched and green.
+- **B4** legibility (pure logging): the SIZING line states the binder in
+  words (`kelly-bound: 1 lot @97¢ (0 @98¢) — throttle is book size, not
+  a wall; self-scales ~$24→2 @97¢, ~$35→3` — all computed from live
+  constants; the ~$35 differs from the order's ~$36 example because the
+  printed number is 97¢ arithmetic, not 98¢); SIZE_ZERO_BY_KELLY logs
+  once per (market, price) when Kelly zeroes a favorite, count=1 walls
+  path unchanged. P14 sizing-line test-law updated to prefix-match with
+  citation.
+- Suite 456 · preflight 23/23. Out of scope, untouched: edge
+  measurement (step 2), Kelly re-derivation (step 3), D-floor (data).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

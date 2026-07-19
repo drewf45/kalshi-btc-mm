@@ -267,3 +267,67 @@ def test_b3_pending_prompt_reboot_still_prompted_engine_level(tmp_path,
     # consent still works after the restore
     assert e2.cash.confirm_cash(now=_t.time())
     failures._ledger = None
+
+
+# ── B4: the Kelly throttle is legible (pure logging) ───────────────────────
+def test_b4_sizing_line_states_the_binder_in_words():
+    """Today's exact book: $11.74 -> kelly budget 97c -> 1 lot @97c, 0
+    @98c. The line says WHY and that it self-scales — computed from the
+    live constants, never asserted."""
+    from relay_engine.boot import sizing_line
+    line = sizing_line(1174)
+    assert "kelly-bound: 1 lot @97¢ (0 @98¢)" in line
+    assert "throttle is book size, not a wall" in line
+    # computed at the 97c reference: 2*97*12=$23.28->~$24, 3*97*12=$34.92
+    # ->~$35 (the order's "~$36" example was 98c math; the PRINTED number
+    # is the COMPUTED number — the read-rule outranks the illustration)
+    assert "self-scales ~$24→2 @97¢, ~$35→3" in line
+    # and it scales UP with the book, as the doctrine states
+    assert "kelly-bound: 2 lot @97¢" in sizing_line(2400)
+    assert "kelly-bound: 3 lot @97¢" in sizing_line(3600)
+
+
+def test_b4_boot_tape_carries_the_legible_sizing_line(tmp_path, capsys):
+    from relay_engine.shadow_runner import ShadowEngine
+    e = ShadowEngine(db_path=str(tmp_path / "b4.db"))
+    e.boot()
+    out = capsys.readouterr().out
+    assert "throttle is book size, not a wall" in out
+    failures._ledger = None
+
+
+def test_b4_size_zero_by_kelly_logs_once_and_changes_nothing(tmp_path,
+                                                             caplog):
+    """A 98c favorite on today's $11.74 book sizes to 0 by Kelly: the INFO
+    line names price/book/kelly_budget ONCE per (market, price); the
+    proposal still carries count=1 for the walls to refuse by name — NO
+    contract count changes anywhere (B5 rail)."""
+    from relay_engine.book import OrderBook
+    from relay_engine.gateway import Order
+    from relay_engine.shadow_runner import ShadowEngine
+    e = ShadowEngine(db_path=str(tmp_path / "b4z.db"))
+    e.ledger.baseline(1174, confirmed_by="boot")         # today's live book
+    book = OrderBook(market=TICKER)
+    book.apply_snapshot({98: 10}, {1: 10}, ts=1.0)
+
+    def prop(price):
+        return Order(lane="F", event=EVENT, market=TICKER, side="yes",
+                     action="buy", price_cents=price, count=1,
+                     size_tier=config.TIER_PROBE, purpose="ENTRY",
+                     why="F tier98 · surv~price")
+    with caplog.at_level(logging.INFO, logger="relay.shadow"):
+        p = prop(98)
+        e._score_and_size(p, book)
+        assert p.count == 1                              # behavior unchanged
+        e._score_and_size(prop(98), book)                # dedup: once only
+        e._score_and_size(prop(39), book)                # 39c sizes fine
+    zero_lines = [r.message for r in caplog.records
+                  if "SIZE_ZERO_BY_KELLY" in r.message]
+    assert len(zero_lines) == 1
+    assert "price=98c" in zero_lines[0]
+    assert "book=1174c" in zero_lines[0]
+    assert "kelly_budget=97c" in zero_lines[0]
+    # rollover clears the dedup key with the window
+    e.on_market_closed(TICKER)
+    assert (TICKER, 98) not in e._size_zero_logged
+    failures._ledger = None
