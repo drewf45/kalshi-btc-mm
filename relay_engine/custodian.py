@@ -47,6 +47,7 @@ Custodian exits ATTRIBUTE TO THE OPENING LANE's Wilson cells (C.2): fills are
 recorded under the opening lane with action=CUSTODIAN_EXIT.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
@@ -146,6 +147,13 @@ class OpenPosition:
     salvage_attempted: bool = False
     salvage_oid: Optional[str] = None
     salvage_ts: float = 0.0
+    # SALV-1: the reason tape — which gag is active, how often each gagged,
+    # whether salvage fired, and the one-summary latch.
+    salvage_gag_reason: Optional[str] = None
+    salvage_gag_counts: Dict[str, int] = field(default_factory=dict)
+    salvage_gag_transitions: int = 0
+    salvage_fired: Optional[str] = None
+    salvage_summary_emitted: bool = False
 
 
 def salvage_params() -> CutParams:
@@ -227,8 +235,25 @@ class Custodian:
     def set_lane_params(self, lane: str, params: CutParams) -> None:
         self.params[lane] = params
 
-    def adopt(self, pos: OpenPosition) -> None:
+    def adopt(self, pos: OpenPosition, disabled_reason: str = None) -> None:
         self.positions[f"{pos.market}:{pos.lane}"] = pos
+        # SALV-1 §2.4: registration event, ONCE per position — armed with
+        # its anchor values, or disabled LOUDLY with its reason.
+        try:
+            if pos.p_entry is not None:
+                self.surface.write_row(
+                    pos.lane, pos.market, f"w-{pos.market}", "SALVAGE_ARMED",
+                    detail=json.dumps({
+                        "d": pos.d_entry, "t": pos.t_entry,
+                        "p_entry": round(pos.p_entry, 4)}))
+            else:
+                self.surface.write_row(
+                    pos.lane, pos.market, f"w-{pos.market}",
+                    "SALVAGE_DISABLED_TAGGED",
+                    detail=json.dumps(
+                        {"reason": disabled_reason or "NO_ANCHOR"}))
+        except Exception:
+            pass  # registration narration never blocks custody
 
     # ------------------------------------------------------------------
     def kill_lane(self, lane: str) -> None:
@@ -295,6 +320,49 @@ class Custodian:
         on_side = "yes" if spot >= strike else "no"
         return ps if on_side == pos.side else 1.0 - ps
 
+    def _note_salvage_gag(self, pos: OpenPosition, reason: str,
+                          **ctx) -> None:
+        """SALV-1 §2: the seven gags get a voice — STATE-CHANGE-ONLY rows
+        (Engineer: no write amplification), flap-capped (Adversary: an
+        oscillating reason cannot hide in volume; the summary still counts
+        every tick), with the delta-table inputs riding along (Scientist:
+        TABLE_GAP traces to specific missing cells for the A1-A5 loop)."""
+        pos.salvage_gag_counts[reason] = \
+            pos.salvage_gag_counts.get(reason, 0) + 1
+        if reason == pos.salvage_gag_reason:
+            return
+        pos.salvage_gag_reason = reason
+        pos.salvage_gag_transitions += 1
+        if pos.salvage_gag_transitions > config.SALVAGE_GAG_MAX_TRANSITIONS:
+            return
+        try:
+            self.surface.write_row(
+                pos.lane, pos.market, f"w-{pos.market}", "SALVAGE_GAG",
+                detail=json.dumps({"reason": f"SALVAGE_GAG {reason}", **ctx}))
+        except Exception:
+            pass  # the tape never blocks the tick
+
+    def emit_salvage_summary(self, pos: OpenPosition, exit_trigger: str,
+                             realized_cents=None) -> None:
+        """SALV-1 §2.3: ONE summary per position at conclusion — gagged
+        tick totals per reason, whether salvage fired, the exit trigger,
+        realized cents. The data source for DODGED_LOSS vs SALVAGE_REGRET
+        and the K/S tuning (thresholds untouched in this order)."""
+        if pos.salvage_summary_emitted:
+            return
+        pos.salvage_summary_emitted = True
+        try:
+            self.surface.write_row(
+                pos.lane, pos.market, f"w-{pos.market}", "SALVAGE_SUMMARY",
+                detail=json.dumps({
+                    "gagged": pos.salvage_gag_counts,
+                    "salvage_fired": pos.salvage_fired,
+                    "exit_trigger": exit_trigger,
+                    "realized_cents": realized_cents,
+                    "entry": pos.entry_price_cents}))
+        except Exception:
+            pass
+
     def _salvage_tick(self, pos: OpenPosition, book, mark: int, t_rem: float,
                       now: float, spot, blo, bhi) -> Optional[str]:
         """§2.2 the trigger (needle-collapse, 2 sustained ticks) + §2.3 the
@@ -311,22 +379,37 @@ class Custodian:
                                   f"salvage maker {pos.market} unverifiable "
                                   f"before crossfire", fatal=True,
                                   market=pos.market, lane=pos.lane)
+                pos.salvage_fired = "SALVAGE_CROSSFIRE"
                 self.execute_cut(pos, mark, book, "SALVAGE_CROSSFIRE",
                                  crossfire=True)
                 return "SALVAGE_CROSSFIRE"
             return None
         if pos.salvage_attempted or pos.p_entry is None:
-            return None      # one attempt per position; no anchor = disabled
+            # one attempt per position; no anchor = disabled — SAID (SALV-1)
+            self._note_salvage_gag(
+                pos, "SPENT" if pos.salvage_attempted else "NO_ANCHOR",
+                mark=mark, t_rem=round(t_rem, 1))
+            return None
         if spot is None:
+            self._note_salvage_gag(pos, "BLIND", mark=mark,
+                                   t_rem=round(t_rem, 1))
             return None      # BLIND: no salvage, backstop unchanged
         if t_rem <= config.SALVAGE_T_FLOOR_S:
+            self._note_salvage_gag(pos, "T_FLOOR", mark=mark,
+                                   t_rem=round(t_rem, 1))
             return None
         from . import spotlead as _sl
         strike = _sl.pick_strike(spot, blo, bhi)
         if strike is None:
+            self._note_salvage_gag(pos, "NO_STRIKE", mark=mark,
+                                   t_rem=round(t_rem, 1))
             return None
         p_held = self._held_p(pos, spot, strike, t_rem)
         if p_held is None:
+            # Scientist: (d, t_rem) ride along — the gap names its cell
+            self._note_salvage_gag(pos, "TABLE_GAP",
+                                   d=round(abs(spot - strike), 1),
+                                   t_rem=round(t_rem, 1), mark=mark)
             return None      # table gap now: no evidence, no salvage
         drop_pts = (p_held - pos.p_entry) * 100.0
         fair = p_held * 100.0
@@ -335,8 +418,20 @@ class Custodian:
             pos.salvage_strikes += 1
         else:
             pos.salvage_strikes = 0
+            self._note_salvage_gag(pos, "BELOW_K",
+                                   p_held=round(p_held, 3),
+                                   drop_pts=round(drop_pts, 1),
+                                   fair=round(fair, 1), mark=mark,
+                                   d=round(abs(spot - strike), 1),
+                                   t_rem=round(t_rem, 1))
             return None
         if pos.salvage_strikes < 2:
+            self._note_salvage_gag(pos, "STRIKES_1",
+                                   p_held=round(p_held, 3),
+                                   drop_pts=round(drop_pts, 1),
+                                   fair=round(fair, 1), mark=mark,
+                                   d=round(abs(spot - strike), 1),
+                                   t_rem=round(t_rem, 1))
             return None      # sustained 2 consecutive ticks — no knives
 
         # TRIGGERED — §2.3: tri-state cancel artifacts, re-derive, maker.
@@ -372,6 +467,7 @@ class Custodian:
         pos.salvage_oid = result.order_id
         pos.salvage_ts = now
         pos.resting_exit_id = result.order_id
+        pos.salvage_fired = "SALVAGE_MAKER"
         import json as _json
         self.surface.write_row(
             pos.lane, pos.market, f"w-{pos.market}", "SALVAGE",
@@ -532,6 +628,7 @@ class Custodian:
         if remaining <= 0:
             log.warning("CUT SKIPPED [%s] %s — position already flat "
                         "(race with fill)", trigger, pos.market)
+            self.emit_salvage_summary(pos, "FLAT_RACE")   # SALV-1 §2.3
             self.positions.pop(key, None)
             return None  # the round-trip line already told the story
 
@@ -554,5 +651,9 @@ class Custodian:
         self.ledger.record_fill(pos.market, pos.lane, pos.side, "CUSTODIAN_EXIT",
                                 cut_price_cents, remaining, pos.size_tier,
                                 fee_cents=fee_cents)
+        # SALV-1 §2.3: the position concludes here — one summary, always
+        self.emit_salvage_summary(pos, trigger,
+                                  realized_cents=cut_price_cents
+                                  - pos.entry_price_cents)
         del self.positions[key]
         return result.order_id

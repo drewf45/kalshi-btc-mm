@@ -1132,6 +1132,17 @@ class ShadowEngine:
                           f"suspect, audit this window's tape",
                           market=market, settled_yes=settled_yes, last_yes_bid=yb)
         window = self._window_of.get(market, f"w-{market}")
+        # SALV-1 §2.3: positions that RODE to settlement conclude here —
+        # one summary each (win pays 100−entry, loss pays −entry).
+        for key in [k for k, p in self.custodian.positions.items()
+                    if p.market == market]:
+            pos = self.custodian.positions.pop(key)
+            won = (settled_yes and pos.side == "yes") or \
+                  (not settled_yes and pos.side == "no")
+            realized = (100 - pos.entry_price_cents) if won \
+                else -pos.entry_price_cents
+            self.custodian.emit_salvage_summary(pos, "SETTLED",
+                                                realized_cents=realized)
         # P21 A3: bank the outcome for the grain — the herd's screen updates
         # the moment we learn how the window went (traded windows only today;
         # that partial view is the registry's grain QUESTION).

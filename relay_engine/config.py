@@ -72,6 +72,9 @@ SALVAGE_K_POINTS = 15.0    # needle collapse: p_held − p_entry <= −K, 2 tick
 SALVAGE_S_CENTS = 10.0     # AND fair_held < entry − S
 SALVAGE_R_S = 10.0         # maker attempt unfilled for R -> crossfire at best
 SALVAGE_T_FLOOR_S = 15.0   # never salvage inside the floor (endgame is F's)
+# SALV-1 §2.3 (Adversary): flap guard — logged gag TRANSITIONS per position
+# per window cap here; the settlement summary still counts every tick.
+SALVAGE_GAG_MAX_TRANSITIONS = 12
 
 # ---------------------------------------------------------------------------
 # P21 "THE DOCTRINE ENGINE" — Lane OPEN (A4) + the grain (A3) + patient holds

@@ -64,6 +64,7 @@ def test_cell_row_on_settlement_attributes_opening_lane(ledger, surface,
     ledger.record_fill(TICKER, "F", "no", "ENTRY", 96, 1, config.TIER_PROBE)
     eng = object.__new__(ShadowEngine)   # only the settle path's organs
     eng.ledger, eng.surface = ledger, surface
+    eng.custodian = type("C", (), {"positions": {}})()   # SALV-1 sweep
     eng._window_of = {}
     eng._meta = lambda market: {}
     eng.feed = type("Feed", (), {"books": {}})()

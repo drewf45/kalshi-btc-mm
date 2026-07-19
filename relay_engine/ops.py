@@ -314,6 +314,32 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(scoring.scoreboard_lines(ledger))
     except Exception as e:
         lines.append(f"CELL SCOREBOARD: unavailable ({e})")
+    # SALV-1 §2.5: the salvage review — saves vs backstop exits vs rides,
+    # with gag-reason totals. The data source for the DODGED_LOSS vs
+    # SALVAGE_REGRET curves that K/S tuning requires (thresholds untouched).
+    try:
+        rows = ledger.db.execute(
+            "SELECT detail FROM surface_rows WHERE state='SALVAGE_SUMMARY'"
+            " AND ts>?", (time.time() - 86400,)).fetchall()
+        fired = backstop = rides = 0
+        reason_totals = {}
+        for (d,) in rows:
+            j = json.loads(d)
+            if j.get("salvage_fired"):
+                fired += 1
+            elif j.get("exit_trigger") == "CATASTROPHIC":
+                backstop += 1
+            elif j.get("exit_trigger") == "SETTLED":
+                rides += 1
+            for r, n in (j.get("gagged") or {}).items():
+                reason_totals[r] = reason_totals.get(r, 0) + n
+        gag_s = " ".join(f"{k}×{v}" for k, v in
+                         sorted(reason_totals.items())) or "none"
+        lines.append(f"SALVAGE REVIEW (24h): saves {fired} · backstop exits "
+                     f"{backstop} · rides-to-settlement {rides} · "
+                     f"gagged ticks: {gag_s}")
+    except Exception as e:
+        lines.append(f"SALVAGE REVIEW: unavailable ({e})")
     # DIAG-1 §3: THE DAILY ANSWERS — every morning answers "why didn't we
     # trade" before it's asked. Permanent section.
     try:

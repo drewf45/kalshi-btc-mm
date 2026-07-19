@@ -211,8 +211,15 @@ class FillBooker:
                 # (the 7:34 race began with a stale custodian pos object).
                 if self.gateway.positions.get(
                         (order.event, order.market, order.lane), 0) == 0:
-                    self.custodian.positions.pop(
+                    pos_done = self.custodian.positions.pop(
                         f"{order.market}:{order.lane}", None)
+                    # SALV-1 §2.3: the position concluded by a filled exit —
+                    # one summary, with the realized round trip.
+                    if pos_done is not None:
+                        self.custodian.emit_salvage_summary(
+                            pos_done, "EXIT_FILLED",
+                            realized_cents=int(round(cost))
+                            - pos_done.entry_price_cents)
 
             self.surface.write_row(order.lane, order.market, window, state,
                                    detail=f"fill={fid} @{int(round(cost))}c "
