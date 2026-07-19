@@ -130,6 +130,10 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "down); T-10 book-aware handoff — winners left to F at "
                  "basis, losers cleared; determined-against cuts a genuine "
                  "loser post-window (P-FLIP-THESIS-1)")
+    lines.append(f"  FLIP CHEAP-LIVE: cheap entry to {config.OPEN_BAND[0]}¢ "
+                 f"(two-sided p_cross gate ≥{config.OPEN_SWING_MIN_P:.2f}); "
+                 "swing + loser-cut logged (FLIP_SWING / FLIP_LOSER_CUT); "
+                 "one lot until measured (WO-FLIP-CHEAP-LIVE)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

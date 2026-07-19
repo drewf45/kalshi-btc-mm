@@ -1445,6 +1445,42 @@ survival) committed and proven standalone, then B4-B5.**
 - **HARD RAIL held**: genuine-dispute cash-FATAL, salvage loss-term,
   flip-cover custody untouched and green. Suite 490 · preflight 23/23.
 
+## WO-FLIP-CHEAP-LIVE — prove the swing, live, measured (build 34, one commit)
+
+**Drew's ruling:** cheap-entry FLIP ships LIVE at one lot; the 2-of-4
+rate-halt is the backstop; the live proof MEASURES instead of guessing.
+
+- **§2.1 band** (DREW-RULED): OPEN_BAND (44,56) → (39,56). Upper bound
+  kept per ruling — noted for Drew: a tight-spread 39/59 book stays
+  refused by the 56¢ complement bound; only wide/uncertain books admit
+  the 39¢ side.
+- **§2.2 two-sided swing gate**: p_cross(|spot−strike|, t_rem) ≥
+  OPEN_SWING_MIN_P=0.55 (DREW-DEFAULT, permissive — live-proof wants
+  data). Apples-to-apples per the Engineer: the take REQUIRES the
+  strike-touch and every cut-first path is a no-touch path, so ONE
+  p_cross cell answers both legs; ≥0.55 > 0.5 ⇒ P(reach take) >
+  P(reach cut) by the no-touch bound. Refusals log OPEN_SWING_REFUSED
+  ("losing-cheap, not oversold-cheap"); the gate value narrates on the
+  why (`swing p=0.72` / `swing~untabled` when the table is absent —
+  permissive, already UNPROVEN-tagged by P26).
+- **§2.3 floor confirmed**: the B5 P&L-blind band-floor cut is the
+  salvage floor — test-proven to cut the non-swinger at 34¢ (−5 on a 39¢
+  entry; the −15¢ region at a 49¢ entry), never a −39¢ ride.
+- **§3 Instrument 1 — FLIP_SWING**: every cheap OPEN entry logs at
+  CONCLUSION (exit, or hold-conversion with held_to_settle=true):
+  entry/exit/gross/took_swing/salvaged/secs_to_swing. The pack gains
+  `FLIP SWING (24h): rate a/b (x%) · avg win · avg salvaged ·
+  net/market · floor breaches` — 20-30 rows replace the guessed 80%.
+- **§3 Instrument 2 — FLIP_LOSER_CUT** (CEO: mandatory): every loser
+  audits ok = loss ≤ (entry − band floor) + FLIP_FLOOR_SLIP_CENTS=5; a
+  ride past the floor writes ok=false AND pages FLIP_FLOOR_BREACH on
+  the FIRST loser — the EV-inverting assumption, flagged before the
+  rate-halt could see a streak.
+- **RAIL held**: Kelly untouched (one lot at current book — the
+  Adversary's one-lot-until-measured is structural: sizing waits on
+  Instruments 1+2), cash-integrity B1/B2 untouched, rate-halt B3
+  untouched (asserted in-test). Suite 501 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

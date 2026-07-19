@@ -45,6 +45,7 @@ TAKE / DETERMINED-AGAINST / CURFEW). The pure pair-era helpers below
 of the retired law; the docstrings carry the citations.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -468,6 +469,12 @@ class LaneFlip:
             o["count"] -= sold
             if o["count"] <= 0:
                 w.opens.pop(side, None)
+                # WO-FLIP-CHEAP-LIVE §3 — the two instruments fire at
+                # CONCLUSION (Engineer: never at entry; took_swing is
+                # unknowable until the position is flat)
+                self._log_swing_outcome(market, o["entry"],
+                                        exit_price_cents, now,
+                                        o.get("fill_ts", now))
                 self._promote_late_fill(w, market, side, now)
             # P26 §3.1: ANY OPEN exit consumes the window's one shot — the
             # pop above no longer re-opens the door (the located loophole).
@@ -639,6 +646,23 @@ class LaneFlip:
                 log.info("OPEN_BAD_GEOMETRY %s — risk %dc > take+1 %dc",
                          market, risk, config.OPEN_TAKE_CENTS + 1)
             return proposals
+        # WO-FLIP-CHEAP-LIVE §2.2 — THE TWO-SIDED SWING GATE: buy the
+        # cheap side only when the table says the swing to the take is
+        # more likely than the cut firing first. p_cross(d_strike, t) =
+        # P(spot touches the strike within the window) — the take REQUIRES
+        # the touch, every cut-first path is a no-touch path, so one cell
+        # answers both legs (Engineer: same p_cross, apples-to-apples).
+        # Table/spot absent -> permissive (live-proof wants data; the
+        # UNPROVEN tagging already narrates the blindness).
+        swing = self._swing_gate(ctx, now)
+        if swing is not None and not swing["ok"]:
+            if not w.open_no_grain_logged:   # reuse the once-per-window mute
+                w.open_no_grain_logged = True
+                log.info("OPEN_SWING_REFUSED %s — p_swing %.2f < %.2f "
+                         "(d=%.0f t=%.0f): losing-cheap, not oversold-cheap",
+                         market, swing["p"], config.OPEN_SWING_MIN_P,
+                         swing["d"], swing["t"])
+            return proposals
         # P27 §2(b) OVERTURNED the margin GATE: entry proceeds on band +
         # grain + geometry + one-shot (the doctrine); the cell's margin
         # PRINTS on the why either way — the scoreboard informs daily,
@@ -658,8 +682,38 @@ class LaneFlip:
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=config.OPEN_BAND, rest_fp=book.best_fp(side),
             why=f"OPEN grain {side}x{g['length']} · join {join}c · "
-                f"band y{yes_bid}/n{no_bid} · {proof} · geometry=v2"))
+                f"band y{yes_bid}/n{no_bid} · {proof} · "
+                + (f"swing p={swing['p']:.2f}" if swing is not None
+                   else "swing~untabled")
+                + " · geometry=v2"))
         return proposals
+
+    def _swing_gate(self, ctx: dict, now: float) -> Optional[dict]:
+        """WO-FLIP-CHEAP-LIVE §2.2: the swing leg from the delta table —
+        p_cross(|spot−strike|, t_rem) = P(the 50/50 swing arrives). None
+        when the table/spot/strike is absent (permissive; tagged on the
+        why). ok = p >= OPEN_SWING_MIN_P (> 0.5 ⇒ two-sided by the
+        no-touch bound on every cut-first path)."""
+        from . import delta, spotlead as _sl
+        if not delta.is_loaded():
+            return None
+        spot = ctx.get("spot")
+        close_ts = ctx.get("close_ts")
+        if spot is None or close_ts is None:
+            return None
+        strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
+                                 ctx.get("boundary_hi"))
+        if strike is None:
+            return None
+        t_rem = close_ts - now
+        if t_rem <= 0:
+            return None
+        d = abs(spot - strike)
+        p = delta.p_cross(d, t_rem)
+        if p is None:
+            return None
+        return {"ok": p >= config.OPEN_SWING_MIN_P, "p": p, "d": d,
+                "t": t_rem}
 
     # ── P18 THE DETECTIVE: hunt entry (§2) + the two jobs (§3) ─────────────
     def _hunt_entry(self, w: FlipWindow, market: str, event: str, book,
@@ -836,7 +890,8 @@ class LaneFlip:
                     and mark is not None):
                 from .lane_fh8 import COST_BAND_LO_INT
                 if mark >= COST_BAND_LO_INT:
-                    self._convert_to_hold(o, market, side, mark, "F-agrees")
+                    self._convert_to_hold(o, market, side, mark, "F-agrees",
+                                          now=now)
                     continue
             # §3.5 T-10 BOOK-AWARE HANDOFF (replaces the blind YIELD_TO_F
             # flat): per position, never reflexive. Winner (mark at/above
@@ -847,7 +902,7 @@ class LaneFlip:
                     continue    # no book truth: never a BLIND flat; retry
                 if mark >= o["entry"]:
                     self._convert_to_hold(o, market, side, mark,
-                                          "T-10-handoff-winner")
+                                          "T-10-handoff-winner", now=now)
                     continue
                 self._cancel_resting(o)
                 o["done"] = True
@@ -1030,8 +1085,59 @@ class LaneFlip:
                  "(log-only — votes after measurement)", market, prior,
                  row[0], side, side == prior)
 
+    def _log_swing_outcome(self, market: str, entry: int, exit_px: int,
+                           now: float, fill_ts: float,
+                           held_to_settle: bool = False) -> None:
+        """WO-FLIP-CHEAP-LIVE §3 INSTRUMENT 1+2: every cheap OPEN entry
+        logs its conclusion — after 20-30 rows this IS the measured swing
+        rate (the 80% stops being a guess). Losers additionally audit the
+        salvage floor: a cut past the band-floor expectation flags
+        FLIP_FLOOR_BREACH — the assumption whose failure inverts the EV,
+        caught on the FIRST loser, before the rate-halt could see a
+        streak. Per-contract cents."""
+        surface = getattr(self.custodian, "surface", None) \
+            if self.custodian is not None else None
+        if surface is None:
+            return
+        gross = exit_px - entry
+        took = exit_px >= entry + config.OPEN_TAKE_CENTS - 1
+        detail = {"market": market, "entry_price": entry,
+                  "took_swing": bool(took), "exit_price": exit_px,
+                  "gross_cents": gross, "salvaged": gross < 0,
+                  "secs_to_swing": round(max(0.0, now - fill_ts), 1),
+                  "held_to_settle": held_to_settle}
+        try:
+            surface.write_row("FLIP", market, f"w-{market}", "FLIP_SWING",
+                              detail=json.dumps(detail))
+        except Exception:
+            return   # the instrument never blocks custody accounting
+        if gross < 0:
+            floor_expected = entry - config.OPEN_UNDETERMINED_BAND[0]
+            loss = -gross
+            ok = loss <= floor_expected + config.FLIP_FLOOR_SLIP_CENTS
+            try:
+                surface.write_row(
+                    "FLIP", market, f"w-{market}", "FLIP_LOSER_CUT",
+                    detail=json.dumps({
+                        "market": market, "entry": entry,
+                        "cut_price": exit_px, "loss_cents": loss,
+                        "floor_expected": floor_expected, "ok": bool(ok)}))
+            except Exception:
+                return
+            if not ok:
+                from . import failures
+                failures.fail(
+                    "FLIP_FLOOR_BREACH",
+                    f"{market}: loser cut {loss}c past the band-floor "
+                    f"expectation {floor_expected}c (+"
+                    f"{config.FLIP_FLOOR_SLIP_CENTS}c slip) — the -15c "
+                    "salvage assumption is BREAKING; the EV table inverts "
+                    "if losers ride",
+                    fatal=False, alert=True, market=market, entry=entry,
+                    cut_price=exit_px, loss=loss)
+
     def _convert_to_hold(self, o: dict, market: str, side: str, mark,
-                         reason: str) -> None:
+                         reason: str, now: float = None) -> None:
         """P-FLIP-THESIS-1 §4/§3.5: the scalp becomes the settlement
         position — cancel the resting take, keep the inventory at FLIP's
         cheap basis, and let F stand down (shared inventory). The position
@@ -1044,6 +1150,14 @@ class LaneFlip:
         log.warning("FLIP_HOLD_TO_SETTLE %s %s basis=%dc mark=%sc x%d "
                     "reason=%s — left to F at the cheaper basis",
                     market, side, o["entry"], mark, o["count"], reason)
+        # WO-FLIP-CHEAP-LIVE §3: a hold-conversion IS a swing that arrived
+        # (mark at/above basis or through F's band) — instrument it at the
+        # conversion mark; the settlement print covers the rest (§1).
+        if mark is not None:
+            self._log_swing_outcome(market, o["entry"], int(mark),
+                                    now if now is not None else time.time(),
+                                    o.get("fill_ts", 0.0),
+                                    held_to_settle=True)
 
     def held(self, market: str) -> Dict[str, dict]:
         """§4 THE SHARED INVENTORY: side -> {count, basis} of live FLIP

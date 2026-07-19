@@ -345,6 +345,34 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
                      f"gagged ticks: {gag_s}")
     except Exception as e:
         lines.append(f"SALVAGE REVIEW: unavailable ({e})")
+    # WO-FLIP-CHEAP-LIVE §3 INSTRUMENT 1: the measured swing rate — after
+    # 20-30 rows the guessed 80% becomes this number, from tape.
+    try:
+        rows = [json.loads(d) for (d,) in ledger.db.execute(
+            "SELECT detail FROM surface_rows WHERE state='FLIP_SWING'"
+            " AND ts>?", (time.time() - 86400,)).fetchall()]
+        if rows:
+            swings = [r for r in rows if r.get("took_swing")]
+            losers = [r for r in rows if r.get("gross_cents", 0) < 0]
+            avg_win = (sum(r["gross_cents"] for r in swings) / len(swings)
+                       if swings else 0.0)
+            avg_loss = (sum(r["gross_cents"] for r in losers) / len(losers)
+                        if losers else 0.0)
+            net = sum(r["gross_cents"] for r in rows) / len(rows)
+            breaches = ledger.db.execute(
+                "SELECT COUNT(*) FROM surface_rows WHERE"
+                " state='FLIP_LOSER_CUT' AND detail LIKE '%\"ok\": false%'"
+                " AND ts>?", (time.time() - 86400,)).fetchone()[0]
+            lines.append(
+                f"FLIP SWING (24h): rate {len(swings)}/{len(rows)} "
+                f"({len(swings) / len(rows):.0%}) · avg win "
+                f"{avg_win:+.1f}c · avg salvaged {avg_loss:+.1f}c · "
+                f"net/market {net:+.1f}c · floor breaches {breaches}"
+                + (" ⚠" if breaches else ""))
+        else:
+            lines.append("FLIP SWING (24h): no concluded cheap entries yet")
+    except Exception as e:
+        lines.append(f"FLIP SWING: unavailable ({e})")
     # DIAG-1 §3: THE DAILY ANSWERS — every morning answers "why didn't we
     # trade" before it's asked. Permanent section.
     try:

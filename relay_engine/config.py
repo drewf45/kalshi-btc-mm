@@ -83,7 +83,11 @@ SALVAGE_GAG_MAX_TRANSITIONS = 12
 # setup.
 # ---------------------------------------------------------------------------
 GRAIN_K = 4                       # last-K window outcomes feed the streak
-OPEN_BAND = (44, 56)              # setup: BOTH sides in the open band
+# WO-FLIP-CHEAP-LIVE §2.1 (DREW-RULED 2026-07-19, was (44,56)): the band
+# widens DOWN — the edge is the cheap side, admitted to ~39c. Upper bound
+# kept per the ruling (a tight-spread 39/59 book stays refused by the
+# 56c complement bound; only wide/uncertain books admit the 39c side).
+OPEN_BAND = (39, 56)              # setup: BOTH sides in the open band
 OPEN_MIN_GRAIN = 2                # streak >= 2 or pass (OPEN_NO_GRAIN)
 OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
 # P-FLIP-THESIS-1 §3 (DREW-RULED 2026-07-19, was 5): the scalp target is
@@ -185,6 +189,16 @@ CASH_SILENT_REBASE_CENTS = 5
 # NEVER halts; two-in-a-row was never a reliable signal, 2-of-4 is.
 RATE_HALT_LOSSES = 2
 RATE_HALT_WINDOW = 4
+# WO-FLIP-CHEAP-LIVE §2.2 (DREW-DEFAULT, permissive for live-proof — we
+# WANT data): the two-sided swing gate's floor. p_cross(d_strike, t) is
+# P(spot touches the strike = the 50/50 swing en route to the take);
+# every cut-first path is a no-touch path, so p >= this (> 0.5) implies
+# P(reach take) > P(reach cut) from the SAME table cell.
+OPEN_SWING_MIN_P = 0.55
+# Instrument 2: a loser's cut may exceed the band-floor expectation by at
+# most this slip before FLIP_LOSER_CUT flags ok=False (the EV inverts if
+# losers ride past the floor — the early warning the rate-halt can't give).
+FLIP_FLOOR_SLIP_CENTS = 5
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20
