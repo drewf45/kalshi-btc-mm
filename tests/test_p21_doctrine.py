@@ -234,7 +234,8 @@ def test_registry_parses_all_knowns():
     entries = semantics.parse_registry()
     # 16 at P21 + the score (P22) + fee truth and the anchor shield (P24)
     # + the proof law (P26) + the phone-is-the-console pattern (DIAG-1)
-    assert len(entries) == 21
+    # + the-governor-is-the-halt constitution (P27)
+    assert len(entries) == 22
     for e in entries:
         assert e["law"] and e["code"] and e["tape"], e["answer"]
 

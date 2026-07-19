@@ -4,14 +4,14 @@ THIS IS A SINGLE-THREADED SUBMIT PATH. One thread, one queue, one venue session.
 The first submit pins the thread; any submit from another thread is a FATAL
 integrity violation. There is no second path to the venue anywhere in this tree.
 
-Walls run IN ORDER (canon):
+Walls run IN ORDER (canon — P27: bug-walls only; the tier wall is dead,
+the account halt is THE stop):
   1. band + lane-scoped single entry
   2. NET-RISK cross-lane cap (<=3) + $-at-risk cap per settlement event
      — risk-reducing orders EXEMPT, classified at the canonical layer here
   3. REJECT_WRONG_WAY_TICK — sign derived per order, never hardcoded
   4. %-of-book budgets (caps snapshotted at boot)
-  5. sizing-tier authorization
-  6. fee tripwire (multiplier AND maker-fee designation list)
+  5. fee tripwire (multiplier AND maker-fee designation list)
 Exits/cancels SKIP walls. Maker-only/post-only on every payload.
 Rate governor: token bucket; the printed number IS the enforced number.
 
@@ -262,7 +262,6 @@ class Gateway:
                 self._wall_wrong_way_tick(order)
                 self._wall_taker_entry(order, book)
                 self._wall_pct_of_book(order)
-                self._wall_sizing_tier(order)
                 self._wall_fee_tripwire(order)
             except WallRejection as e:
                 if order.purpose == "ENTRY":
@@ -497,51 +496,20 @@ class Gateway:
                     "TAKER_ENTRY",
                     f"{order.side} sell at {order.price_cents}c through bid {bid}c")
 
-    # P26 §2 THE PROOF LAW: "Every ENTRY's why contains a computable edge
-    # from a named source, or the lane passes." These are the per-lane
-    # proof fields the wall demands — no lane, present or future, trades
-    # on vibes (Adversary: the wall wanted since the charter).
-    PROOF_REQUIRED = {
-        "F": ("tier", "surv"),          # sizing tier + non-reversal survival
-        "H8": ("tier", "surv"),         # the dual gate, printed
-        "D": ("d-table verdict",),      # the table names the entry
-        "P": ("displ",),                # the fade's displacement arithmetic
-    }
-    _FLIP_PROOFS = {
-        "HUNT": ("needle +", "gap", "converging"),        # the casefile
-        "OPEN": ("grain", ("margin", "PROBE")),           # receipts or probe
-    }
-
     def _wall_unproven_why(self, order: Order) -> None:
+        """P27 §2(c) relaxed P26's per-lane proof-field demands: whys
+        REPORT, doctrine gates, process gates die (Drew's ruling). The
+        wall now enforces the NARRATION LAW only — every ENTRY carries a
+        non-empty why string, never a threshold. The lanes still print
+        their arithmetic (surv, margin, casefiles) because narration is
+        how the packs learn; the wall just stopped grading it."""
         if order.purpose != "ENTRY":
             return
-        why = order.why or ""
-        if order.lane == "FLIP":
-            intent = why.split(" ", 1)[0] if why else ""
-            need = self._FLIP_PROOFS.get(intent)
-            if need is None:
-                raise WallRejection(
-                    "REJECT_UNPROVEN_WHY",
-                    f"FLIP entry with neither HUNT nor OPEN proof: "
-                    f"'{why[:60]}'")
-        else:
-            need = self.PROOF_REQUIRED.get(order.lane)
-            if need is None:
-                raise WallRejection(
-                    "REJECT_UNPROVEN_WHY",
-                    f"lane {order.lane} has no registered proof form — "
-                    f"register its arithmetic before it trades")
-        missing = []
-        for t in need:
-            present = (t in why) if isinstance(t, str) \
-                else any(x in why for x in t)
-            if not present:
-                missing.append(t if isinstance(t, str) else "|".join(t))
-        if missing:
+        if not (order.why or "").strip():
             raise WallRejection(
                 "REJECT_UNPROVEN_WHY",
-                f"{order.lane} why lacks proof field(s) {missing}: "
-                f"'{why[:60]}'")
+                f"{order.lane} ENTRY with an EMPTY why — every dollar "
+                f"narrates (the one thing that still walls here)")
 
     def _wall_self_net(self, order: Order) -> None:
         """P21 A2: no lane BUYS the opposite side of a held market as an
@@ -591,18 +559,9 @@ class Gateway:
             raise WallRejection(
                 "BUDGET", f"{notional}c > boot budget {caps.order_budget_cents}c")
 
-    def _wall_sizing_tier(self, order: Order) -> None:
-        if order.size_tier == config.TIER_SUPPRESS:
-            raise WallRejection("DEPTH", "SUPPRESS tier proposes no entries")
-        if order.count > config.TIER_MAX_CONTRACTS.get(order.size_tier, 0):
-            raise WallRejection(
-                "DEPTH",
-                f"count {order.count} exceeds {order.size_tier} max "
-                f"{config.TIER_MAX_CONTRACTS.get(order.size_tier, 0)}")
-        authorized = self.sizing_authorized_tier(order.lane, order.market)
-        if authorized is not None and order.size_tier != authorized:
-            raise WallRejection(
-                "DEPTH", f"tier {order.size_tier} not the authorized {authorized}")
+    # _wall_sizing_tier DELETED (P27 §1a): the tier ladder no longer votes
+    # anywhere on the entry path — sizing is min(kelly, depth), the tier is
+    # a reporting stamp, and the account halt is THE stop.
 
     def _wall_fee_tripwire(self, order: Order) -> None:
         if not self.tripwire.ok():

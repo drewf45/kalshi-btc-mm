@@ -329,7 +329,7 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         from scripts.tape_grade import (CHECKS, CHECKS_DIAG1, CHECKS_P16,
                                         CHECKS_P17, CHECKS_P18, CHECKS_P19,
                                         CHECKS_P21, CHECKS_P22, CHECKS_P24,
-                                        CHECKS_P26)
+                                        CHECKS_P26, CHECKS_P27)
         suites = (("P15", "p15", CHECKS), ("P16 deposit day", "p16", CHECKS_P16),
                   ("P17 show up", "p17", CHECKS_P17),
                   ("P18 the detective", "p18", CHECKS_P18),
@@ -338,7 +338,8 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
                   ("P22 the cell scoreboard", "p22", CHECKS_P22),
                   ("P24 shield, fees, reversal", "p24", CHECKS_P24),
                   ("P26 every why is a proof", "p26", CHECKS_P26),
-                  ("DIAG-1 the interrogator", "diag1", CHECKS_DIAG1))
+                  ("DIAG-1 the interrogator", "diag1", CHECKS_DIAG1),
+                  ("P27 the governor is the halt", "p27", CHECKS_P27))
         from scripts.tape_grade import grade
         for label, prefix, checks in suites:
             passes = int(ledger.get_state(f"{prefix}_grade_passes") or 0)

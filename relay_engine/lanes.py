@@ -210,31 +210,18 @@ class _PortedLane(Lane):
             sl = ctx.get("spotlead")
             if sl is not None:
                 order.why += f" spotlead:{sl.delta_p:+.0f}pts"
-            # P26 §2 — THE NON-REVERSAL PROOF (Drew: "F must prove the
-            # favorite won't reverse"): with the table loaded, entry
-            # requires survival p at (d, t) over the bar. Table absent ->
-            # price-implied, TAGGED (never silently unproven).
-            # DIAG-1 §2: the bar forks by F_PROOF_MODE — v1 compares the
-            # ANY-TOUCH survival to the price paid; v2 is the AT-CLOSE
-            # comparison (interim: price − buffer, stamped v2-buffer until
-            # the at-close column ships). Eras separable forever.
+            # P27 §2(a) OVERTURNED the P26 TABLE_NON_REVERSAL gate: whys
+            # REPORT, doctrine gates, process gates die. Survival is still
+            # COMPUTED and printed with its (d, t) cell — the packs, the
+            # scoreboard, and the at-close rebuild (DIAG-1) all keep
+            # learning from it — but the mute is DELETED. It returns as a
+            # gate only by future Drew ruling with v2 at-close units.
             anchor = self._table_survival(order.side, ctx)
-            if config.F_PROOF_MODE == "v2":
-                bar = max(0.0, (order.price_cents
-                                - config.F_PROOF_V2_BUFFER_PTS) / 100.0)
-                stamp = "v2-buffer"
-            else:
-                bar = order.price_cents / 100.0
-                stamp = "v1"
+            stamp = "v2-buffer" if config.F_PROOF_MODE == "v2" else "v1"
             if anchor is not None:
                 surv, d_usd, t_rem = anchor
-                if surv < bar:
-                    return Decision(
-                        self.name, market, None,
-                        pass_reason=(f"TABLE_NON_REVERSAL p={surv:.2f}"
-                                     f"<bar{bar:.2f} d={d_usd:.0f} "
-                                     f"t={t_rem:.0f} proof={stamp}"))
-                order.why += f" surv{surv:.2f}≥{bar:.2f} proof={stamp}"
+                order.why += (f" surv{surv:.2f} (any-touch, info) "
+                              f"d={d_usd:.0f} t={t_rem:.0f} proof={stamp}")
             else:
                 order.why += f" surv~price proof={stamp}"
             return Decision(self.name, market, order)

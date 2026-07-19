@@ -203,8 +203,9 @@ def test_tier_up_pages_once_persists_and_demotes_instantly(ledger):
 
 
 def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
-    """§4.1: the submit path replaces static PROBE — an earned CLEAR cell
-    proposes 3 lots; size_order's min(tier, kelly, depth) untouched."""
+    """P27 §1 OVERTURNED tier-capped sizing: contracts = min(kelly, depth,
+    risk cap) for EVERY cell — the tier still computes (the REPORTING
+    stamp on the order; pages; custody scaling) but it never votes."""
     from relay_engine.shadow_runner import ShadowEngine
     _bank_wins(ledger, "OPEN", 48, 60)   # LB(60,60)=.94 >= OPEN clear bar
     eng = object.__new__(ShadowEngine)
@@ -215,15 +216,17 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
                  size_tier=config.TIER_PROBE, purpose="ENTRY",
                  why="OPEN grain yesx2 · join 48c")
     eng._score_and_size(prop, _book(yes=48, no=49))
-    assert prop.size_tier == config.TIER_CLEAR
-    assert prop.count == config.TIER_MAX_CONTRACTS[config.TIER_CLEAR]
-    # a virgin cell stays PROBE at 1 lot — zero tier changes until earned
+    assert prop.size_tier == config.TIER_CLEAR   # earned, stamped, reported
+    assert prop.count == config.NET_RISK_CROSS_LANE_CAP  # kelly under the wall
+    # a virgin cell: PROBE stamp, SAME full-Kelly size — the ladder
+    # reports, it does not govern (zero tier changes still earned honestly)
     prop2 = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
                   action="buy", price_cents=44, count=1,
                   size_tier=config.TIER_PROBE, purpose="ENTRY",
                   why="OPEN grain nox2 · join 44c")
     eng._score_and_size(prop2, _book(yes=48, no=44))
-    assert prop2.size_tier == config.TIER_PROBE and prop2.count == 1
+    assert prop2.size_tier == config.TIER_PROBE
+    assert prop2.count == config.NET_RISK_CROSS_LANE_CAP
 
 
 def test_no_static_probe_sizing_paths_remain():

@@ -1,12 +1,10 @@
-"""Sizing — born-in (C.3 / Charter §8). P16-B ladder on Wilson lower bounds.
+"""Sizing — P27 "THE GOVERNOR IS THE HALT": full Kelly, bounded by depth.
 
-Tiers: SUPPRESS / PROBE / LEAN / CLEAR, admitted strictly by the Wilson lower
-bound of the lane's cell record. Size is then capped by ALL of:
-  - the tier's max contracts,
-  - ~1/12 Kelly ceiling on the book,
-  - per-level size <= depth_fraction of visible depth (thin-book backoff below).
-CAPITAL RAISES BUDGETS, NEVER TIERS: more book means bigger budgets inside a
-tier; only Wilson evidence moves the tier.
+Size = min(~1/12-Kelly on the book, depth_fraction of visible depth).
+The Wilson tier ladder (SUPPRESS/PROBE/LEAN/CLEAR, tier_for below) REMAINS
+as REPORTING — the scoreboard, the tier pages, and custody scaling read
+it — but nothing on the entry path consumes it. Walls stop bugs, custody
+stops losses, the account halt stops bad days; nothing stops trading.
 
 Win/loss path symmetry: the Wilson cell counts wins and losses in the same
 record; a loss lowers the bound exactly as a win raises it — sizing reads one
@@ -46,36 +44,37 @@ _TIER_ORDER = [config.TIER_SUPPRESS, config.TIER_PROBE, config.TIER_LEAN, config
 
 @dataclass
 class SizeDecision:
-    tier: str
+    tier: str        # P27: the REPORTING stamp only — it never caps contracts
     contracts: int
     reason: str
 
 
-def size_order(tier: str, book_cents: int, price_cents: int, visible_depth: int) -> SizeDecision:
-    """Contracts for one entry at one level. Tier is an input — this function can
-    only shrink within it (capital raises budgets, never tiers)."""
-    effective_tier = tier
-    if visible_depth < config.THIN_BOOK_MIN_DEPTH and tier != config.TIER_SUPPRESS:
-        # Thin-book backoff: one tier down. RULING 3 (P15, ratified): with
-        # >=1 visible lot the backoff FLOORS at PROBE — depth starvation must
-        # not suppress the one-lot scale entirely (the 7:58 storms).
-        idx = _TIER_ORDER.index(tier) - 1
-        floor_idx = (_TIER_ORDER.index(config.TIER_PROBE)
-                     if visible_depth >= 1 else 0)
-        effective_tier = _TIER_ORDER[max(idx, floor_idx)]
-    tier_max = config.TIER_MAX_CONTRACTS[effective_tier]
-    if tier_max == 0 or price_cents <= 0:
-        return SizeDecision(effective_tier, 0, "suppressed")
+def size_order(book_cents: int, price_cents: int,
+               visible_depth: int) -> SizeDecision:
+    """P27 §1 — SIZING = FULL KELLY; GOVERNORS DIE (Drew's ruling, twice):
+    contracts = min(kelly_lots, depth_lots). The tier term is REMOVED from
+    the entry path — the Wilson ladder remains as reporting (scoreboard,
+    pages, custody scaling), but it no longer votes. The account halt is
+    THE stop.
+
+    RULING 3 (P15, ratified) stands — it is depth doctrine, not a
+    governor: a real book with >=1 visible lot admits ONE lot even when
+    the fraction rounds to zero (the 7:58 depth-starvation storms)."""
+    if price_cents <= 0:
+        return SizeDecision("-", 0, "no price")
     kelly_budget_cents = book_cents * config.KELLY_FRACTION_CEILING
     kelly_max = int(kelly_budget_cents // price_cents)
     depth_max = int(visible_depth * config.DEPTH_FRACTION)
-    # RULING 3 (P15, ratified): the depth floor at one lot — a real book with
-    # >=1 visible lot admits ONE lot even when the fraction rounds to zero
-    # (the 7:58 depth-starvation storms at one-lot scale).
     if visible_depth >= 1:
         depth_max = max(1, depth_max)
-    contracts = max(0, min(tier_max, kelly_max, depth_max))
+    # The kept walls are LAW (P27 §2d): net-risk <=3/event stands, so
+    # sizing proposes at most the cap — full Kelly lives UNDER the wall,
+    # it does not fight it (a 7-lot proposal dying whole at the wall would
+    # be a governor by accident).
+    contracts = max(0, min(kelly_max, depth_max,
+                           config.NET_RISK_CROSS_LANE_CAP))
     return SizeDecision(
-        effective_tier, contracts,
-        f"min(tier={tier_max}, kelly={kelly_max}, depth={depth_max})",
+        "-", contracts,
+        f"min(kelly={kelly_max}, depth={depth_max}, "
+        f"risk_cap={config.NET_RISK_CROSS_LANE_CAP})",
     )

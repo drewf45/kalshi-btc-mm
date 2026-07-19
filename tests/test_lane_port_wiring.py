@@ -31,12 +31,12 @@ def test_watch_ladder_drives_shadow_proposal():
     for i in range(12):
         engine.cycle([TICKER], now=start + i * 5)
 
-    # exactly one F proposal, at the touch, flat 1 lot (FLIP may also be
-    # working the cheap side of the same book — all lanes live, same market)
+    # exactly one F proposal, at the touch. P27 §1: full Kelly — 3 lots
+    # (min(kelly=8, depth=12, risk cap=3)); the tier no longer caps at 1.
     f_orders = [o for o in engine.gateway.shadow_orders if o.lane == "F"]
     assert len(f_orders) == 1
     o = f_orders[0]
-    assert (o.lane, o.side, o.price_cents, o.count, o.purpose) == ("F", "yes", 99, 1, "ENTRY")
+    assert (o.lane, o.side, o.price_cents, o.count, o.purpose) == ("F", "yes", 99, 3, "ENTRY")
     payload = engine.gateway._payload(o)
     assert payload["post_only"] is True
 

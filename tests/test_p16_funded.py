@@ -88,7 +88,8 @@ def test_confirm_cash_branch_also_rescales(cash, ledger):
 
 def test_rescale_math_at_35_50_100():
     assert "budget/window 291¢" in sizing_line(3_500)
-    assert "1 @99¢" in sizing_line(3_500)          # PROBE caps at one lot
+    # P27 §1: full Kelly — 291c budget affords 2 lots at 99c (no tier cap)
+    assert "2 @99¢" in sizing_line(3_500)
     assert "budget/window 416¢" in sizing_line(5_000)
     assert "budget/window 833¢" in sizing_line(10_000)
 

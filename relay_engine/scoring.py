@@ -193,7 +193,7 @@ def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
         s = score(ledger, lane, cell)
         kind = "hold" if lane in HOLD_LANES else "trip"
         mid = cell + config.CELL_WIDTH_CENTS // 2
-        lots = size_order(s["tier"], book_cents, mid, 10_000).contracts
+        lots = size_order(book_cents, mid, 10_000).contracts  # P27: kelly×depth
         pend = (lane in HOLD_LANES and salvage_n < config.SALVAGE_ADJ_MIN_N)
         entries.append((s["margin"], lane, cell, kind, s, lots, pend))
     entries.sort(key=lambda e: e[0], reverse=True)

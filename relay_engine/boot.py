@@ -18,8 +18,9 @@ def sizing_line(book_cents: int) -> str:
     engine correctly traded 1 lot at 39¢ — both were true.)"""
     from .sizing import size_order
     budget = int(book_cents * config.KELLY_FRACTION_CEILING)
-    l39 = size_order(config.TIER_PROBE, book_cents, 39, 10_000).contracts
-    l99 = size_order(config.TIER_PROBE, book_cents, 99, 10_000).contracts
+    # P27 §1: full Kelly — the printed lots are min(kelly, depth), no tier
+    l39 = size_order(book_cents, 39, 10_000).contracts
+    l99 = size_order(book_cents, 99, 10_000).contracts
     return (f"SIZING: 1/12-Kelly · book ${book_cents / 100:.2f} · "
             f"budget/window {budget}¢ · max lots: {l39} @39¢ · {l99} @99¢")
 
@@ -96,20 +97,19 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append(f"  FLIP/OPEN: band {config.OPEN_BAND[0]}-"
                  f"{config.OPEN_BAND[1]}¢ + grain≥{config.OPEN_MIN_GRAIN} "
                  f"· join ≤{config.OPEN_MAX_ENTRY_CENTS}¢ · T-15→T-8 · "
-                 "one shot/window · receipts-gated (margin or PROBE) · "
+                 "one shot/window · margin printed (info — P27 §2b) · "
                  f"PATIENT HOLD within entry−{config.OPEN_DETERMINED_DROP} — "
                  f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED/"
                  "YIELD@T-6, evacuations cross (P26 §2-3; PAIR retired)")
-    lines.append("  PROOF LAW: every ENTRY why is arithmetic from a named "
-                 "source or the wall refuses it — REJECT_UNPROVEN_WHY "
-                 "(P26 §2); brain loaded at boot or explained hourly")
+    lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
+                 "the lanes still print their arithmetic, the wall stopped "
+                 "grading it (P27 §2c); brain loaded at boot or explained "
+                 "hourly")
     # DIAG-1 §2: which mathematical language F speaks — v1 (any-touch
     # survival vs price) or v2 (at-close; buffered until the column ships).
-    lines.append(f"F-proof: {config.F_PROOF_MODE}"
-                 + (" (v2 interim: bar = price − "
-                    f"{config.F_PROOF_V2_BUFFER_PTS}pts, stamped v2-buffer)"
-                    if config.F_PROOF_MODE == "v2" else
-                    " (any-touch survival ≥ price paid)"))
+    lines.append(f"F-proof: {config.F_PROOF_MODE} — surv prints as INFO "
+                 "on every F/H8 why (P27 §2a: the gate is dead; returns "
+                 "only by Drew ruling with at-close units)")
     lines.append("  F: hold-to-settlement · depth floor stands in thin books "
                  "· SALVAGE armed (P19: needle-collapse exits; catastrophic "
                  "backstop reachable — P16 stop-and-report resolved)")
@@ -120,11 +120,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  WALLS: gross+net risk<=3/event · $-at-risk cap · two-strike "
                  "halt (/reset_halt) · orientation sentinels · narrated fills · "
                  "graded tape · REJECT_SELF_NET (P21 A2)")
-    # P22: the ladder's floor sensors — the score decides the size.
-    lines.append("  SIZING: cell scoreboard — every close writes its "
-                 f"(lane × {config.CELL_WIDTH_CENTS}¢) cell; Wilson LB vs the "
-                 "cell's OWN breakeven earns LEAN/CLEAR; demotion instant; "
-                 "/scoreboard on demand (P22)")
+    # P27 §1/§4: full Kelly; the ladder reports, never votes; one governor.
+    lines.append("  SIZING: FULL KELLY — min(kelly, depth); the Wilson "
+                 "ladder reports (scoreboard, pages, custody scaling) and "
+                 "never votes (P27 §1); /scoreboard on demand")
+    lines.append("GOVERNOR: halt-only — walls stop bugs, custody stops "
+                 "losses, the two-strike account halt stops bad days, "
+                 "NOTHING stops trading (P27; era stamped on every cell row)")
     # P21 B1: the boot cites the doctrine — one page says what the machine
     # believes, why, and what would change its mind. Cited, and verified
     # present (a missing registry is worth a loud boot line, never a crash).

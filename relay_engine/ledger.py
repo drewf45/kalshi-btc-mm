@@ -164,6 +164,13 @@ class Ledger:
                 "ALTER TABLE cell_outcomes ADD COLUMN proof TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # column already present
+        # P27 §4: the governor era — rows from the halt-only constitution vs
+        # the muted era, judged at the retro.
+        try:
+            self.db.execute(
+                "ALTER TABLE cell_outcomes ADD COLUMN governor TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already present
         self.db.commit()
         self.boot_caps: Optional[BootCaps] = None
 
@@ -256,12 +263,13 @@ class Ledger:
         from . import config, scoring
         self.db.execute(
             "INSERT INTO cell_outcomes (ts, lane, price_cell, won, pnl_cents,"
-            " fees_cents, market, kind, proof) VALUES (?,?,?,?,?,?,?,?,?)"
+            " fees_cents, market, kind, proof, governor)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(market, lane, kind) DO NOTHING",
             (time.time() if now is None else now, lane,
              scoring.price_cell(entry_price_cents), int(bool(won)),
              int(pnl_cents), int(fees_cents), market, kind,
-             config.F_PROOF_MODE))
+             config.F_PROOF_MODE, "halt-only"))
         self.db.commit()
 
     def backfill_cell_outcomes(self) -> int:

@@ -109,9 +109,11 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
 
         assert placed, "F never reached the live door"
         payload = placed[0]
+        # P27 §1: full Kelly — 2 lots at 97c (min(kelly, depth, risk cap));
+        # maker, true touch, unchanged.
         assert payload == {"market": TICKER, "side": "yes", "price_cents": 97,
-                           "count": 1, "v2_price_str": "0.97",
-                           "post_only": True}   # maker, true touch, one lot
+                           "count": 2, "v2_price_str": "0.97",
+                           "post_only": True}
         assert "LIVE-1" in engine.gateway.live_order_ids
 
         # bracket OPENED at submit, source=venue

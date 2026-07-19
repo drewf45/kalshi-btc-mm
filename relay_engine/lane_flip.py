@@ -306,16 +306,16 @@ class LaneFlip:
         w.first_fill_ts = None
 
     def note_window_result(self, market: str, realized_cents: int) -> None:
-        """Window close accounting: feed the stop-streak (two consecutive
-        stopped windows -> lane kill, R2's per-lane kill semantics)."""
+        """Window close accounting. P27 §1b OVERTURNED the stop-streak lane
+        kill (R2's per-lane kill semantics — the same class as fh8's Wall
+        3c): the streak still COUNTS for the packs, but it kills nothing.
+        The account halt is THE stop; nothing else stops entries, ever."""
         stopped = realized_cents <= -FLIP_STOP_CENTS
         self.stop_streak = self.stop_streak + 1 if stopped else 0
-        if stopped and self.stop_streak >= FLIP_PAUSE_AFTER_STOPS and not self.killed:
-            self.killed = True
-            if self.custodian is not None:
-                self.custodian.kill_lane("FLIP")
-            log.warning("FLIP PAUSE — %d consecutive stopped windows; lane killed "
-                        "(entries halt, positions custodied)", self.stop_streak)
+        if stopped and self.stop_streak >= FLIP_PAUSE_AFTER_STOPS:
+            log.warning("FLIP stop-streak %d (reporting only — P27: the "
+                        "per-lane kill is dead; the account halt governs)",
+                        self.stop_streak)
 
     # -- the cycle ----------------------------------------------------------
     def evaluate(self, market: str, ctx: dict) -> List[Order]:
@@ -445,21 +445,15 @@ class LaneFlip:
                 log.info("OPEN_BAD_GEOMETRY %s — risk %dc > take+1 %dc",
                          market, risk, config.OPEN_TAKE_CENTS + 1)
             return proposals
-        # §2 THE PROOF: the cell's own receipts (Wilson LB − breakeven), or
-        # explicit PROBE while the cells fill (one-lot, one-shot, geometry
-        # already gated above).
+        # P27 §2(b) OVERTURNED the margin GATE: entry proceeds on band +
+        # grain + geometry + one-shot (the doctrine); the cell's margin
+        # PRINTS on the why either way — the scoreboard informs daily,
+        # governs never. (OPEN_CELL_NEGATIVE's sit died with the ruling.)
         from . import scoring
         s = scoring.score(self.gateway.ledger, "OPEN",
                           scoring.price_cell(join))
-        if s["margin"] >= 0:
-            proof = f"margin {s['margin']:+.2f} (n={s['n']})"
-        elif s["n"] < config.OPEN_PROBE_MAX_N:
-            proof = f"PROBE n={s['n']} margin {s['margin']:+.2f}"
-        else:
-            log.info("OPEN_CELL_NEGATIVE %s — margin %.2f at n=%d: the "
-                     "receipts argue against the lane; it sits", market,
-                     s["margin"], s["n"])
-            return proposals
+        proof = (f"margin {s['margin']:+.2f} (n={s['n']}"
+                 + (", info)" if s["margin"] < 0 else ")"))
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,

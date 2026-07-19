@@ -18,35 +18,36 @@ def test_tiers_move_on_wilson_lower_bound_only():
     assert tier_for(950, 1000) == config.TIER_CLEAR
 
 
-def test_capital_raises_budgets_never_tiers():
-    # same evidence, 100x the book: tier identical, contracts may grow within tier
-    small = size_order(config.TIER_PROBE, book_cents=1_000, price_cents=60, visible_depth=100)
-    large = size_order(config.TIER_PROBE, book_cents=100_000, price_cents=60, visible_depth=100)
-    assert small.tier == large.tier == config.TIER_PROBE
-    assert large.contracts <= config.TIER_MAX_CONTRACTS[config.TIER_PROBE]  # tier still caps
+def test_full_kelly_no_tier_term():
+    """P27 §1 OVERTURNED 'capital raises budgets, never tiers': sizing is
+    min(kelly, depth, net-risk cap) — the tier ladder REPORTS (tier_for
+    above stays tested) and never votes. Drew's ruling, twice."""
+    small = size_order(book_cents=1_000, price_cents=60, visible_depth=100)
+    large = size_order(book_cents=100_000, price_cents=60, visible_depth=100)
+    assert small.contracts == 1          # kelly caps: 83c budget // 60c
+    assert large.contracts == config.NET_RISK_CROSS_LANE_CAP  # the kept wall caps
+    # THE §5 case: 2 lots at 49c at the current book — depth-bounded
+    d = size_order(book_cents=10_000, price_cents=49, visible_depth=10)
+    assert d.contracts == 2
 
 
 def test_kelly_ceiling():
     # book 1200c, ceiling 1/12 -> 100c budget; at 60c that's 1 contract
-    d = size_order(config.TIER_CLEAR, book_cents=1_200, price_cents=60, visible_depth=1_000)
+    d = size_order(book_cents=1_200, price_cents=60, visible_depth=1_000)
     assert d.contracts == 1
 
 
 def test_depth_fraction_cap():
     # DREW-DEFAULT 25% of visible depth: depth 8 -> max 2
-    d = size_order(config.TIER_CLEAR, book_cents=1_000_000, price_cents=60, visible_depth=8)
+    d = size_order(book_cents=1_000_000, price_cents=60, visible_depth=8)
     assert d.contracts == 2
 
 
-def test_thin_book_backoff():
-    thin = size_order(config.TIER_CLEAR, book_cents=1_000_000, price_cents=60,
-                      visible_depth=config.THIN_BOOK_MIN_DEPTH - 1)
-    assert thin.tier == config.TIER_LEAN  # one tier down
-    # RULING 3 (P15, ratified) overturned the old law here: with >=1 visible
-    # lot the backoff FLOORS at PROBE — one lot, never total suppression
-    # (the 7:58 depth-starvation storms).
-    d = size_order(config.TIER_PROBE, book_cents=1_000_000, price_cents=60, visible_depth=1)
-    assert d.tier == config.TIER_PROBE and d.contracts == 1
-    # a truly empty book still admits nothing
-    empty = size_order(config.TIER_PROBE, book_cents=1_000_000, price_cents=60, visible_depth=0)
+def test_depth_floor_stands():
+    """RULING 3 (P15) survives P27 — it is depth doctrine, not a governor:
+    >=1 visible lot admits ONE lot; an empty book admits nothing. (The
+    tier backoff died with the tier term.)"""
+    d = size_order(book_cents=1_000_000, price_cents=60, visible_depth=1)
+    assert d.contracts == 1
+    empty = size_order(book_cents=1_000_000, price_cents=60, visible_depth=0)
     assert empty.contracts == 0

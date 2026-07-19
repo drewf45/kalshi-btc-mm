@@ -136,28 +136,31 @@ def _gate_ctx():
             "boundary_hi": 118_000.0, "book": None}
 
 
-def test_proof_mode_v1_compares_price_and_stamps(monkeypatch):
-    from relay_engine.lane_fh8 import EvalResult
+def test_surv_prints_as_info_never_gates(monkeypatch):
+    """P27 §2(a) OVERTURNED the TABLE_NON_REVERSAL gate (was: surv < bar
+    -> mute): survival still computes and prints with its full (d, t)
+    cell + era stamp, but F ENTERS — whys report, doctrine gates. The
+    gate returns only by Drew ruling with v2 at-close units."""
     from relay_engine.lanes import LaneF
     monkeypatch.setattr(config, "F_PROOF_MODE", "v1")
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
     monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.93)
+    res = type("R", (), {"lane": "F"})()
     shared = type("S", (), {})()
     shared.decide = lambda m, c: ("PROPOSE", res)
     shared.to_order = lambda m, r: Order(
         lane="F", event=EVENT, market=TICKER, side="yes", action="buy",
         price_cents=95, count=1, size_tier=config.TIER_PROBE,
         purpose="ENTRY", why="F tier95")
-    res = type("R", (), {"lane": "F"})()
     lane = LaneF(shared)
     d = lane.evaluate(TICKER, _gate_ctx())
-    # v1: surv .93 < bar .95 -> the mute, with the full cell + era stamped
-    assert d.proposal is None
-    assert "TABLE_NON_REVERSAL p=0.93<bar0.95" in d.pass_reason
-    assert "d=50 t=500 proof=v1" in d.pass_reason
+    # pre-P27 this exact shape MUTED (surv .93 < bar .95); now it enters
+    assert d.proposal is not None
+    assert "surv0.93 (any-touch, info) d=50 t=500 proof=v1" \
+        in d.proposal.why
 
 
-def test_proof_mode_v2_buffers_bar_and_stamps_era(monkeypatch):
+def test_proof_mode_still_stamps_the_era(monkeypatch):
     from relay_engine.lanes import LaneF
     monkeypatch.setattr(config, "F_PROOF_MODE", "v2")
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
@@ -171,9 +174,8 @@ def test_proof_mode_v2_buffers_bar_and_stamps_era(monkeypatch):
         purpose="ENTRY", why="F tier95")
     lane = LaneF(shared)
     d = lane.evaluate(TICKER, _gate_ctx())
-    # v2: bar = .95 − .04 = .91; surv .93 clears — F speaks, era stamped
     assert d.proposal is not None
-    assert "surv0.93≥0.91 proof=v2-buffer" in d.proposal.why
+    assert "proof=v2-buffer" in d.proposal.why
 
 
 def test_cell_rows_stamp_the_proof_era(ledger, monkeypatch):
@@ -188,11 +190,11 @@ def test_cell_rows_stamp_the_proof_era(ledger, monkeypatch):
 def test_boot_line_prints_proof_mode(monkeypatch):
     from relay_engine.boot import boot_tape
     monkeypatch.setattr(config, "F_PROOF_MODE", "v1")
-    assert any(ln.startswith("F-proof: v1") for ln in boot_tape())
+    # P27: the line says the mode AND that surv is info-only now
+    assert any(ln.startswith("F-proof: v1") and "INFO" in ln
+               for ln in boot_tape())
     monkeypatch.setattr(config, "F_PROOF_MODE", "v2")
-    tape = boot_tape()
-    assert any(ln.startswith("F-proof: v2") and "v2-buffer" in ln
-               for ln in tape)
+    assert any(ln.startswith("F-proof: v2") for ln in boot_tape())
 
 
 # ── §3: the permanent pack section ─────────────────────────────────────────

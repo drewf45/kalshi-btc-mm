@@ -255,14 +255,8 @@ def evaluate(ticker: str, book: TouchBook, secs_to_expiry: float,
         base.why_tag = "SKIP_CROSS_LANE_CAP"
         return base
 
-    # Wall 3c: Per-lane kill rule (3 losses/60min)
-    lane_cfg = LANES["F"]
-    recent_losses = stats.lane_losses_recent("F", lane_cfg["kill_window_sec"])
-    if recent_losses >= lane_cfg["kill_losses"]:
-        base.reject_code = "LANE_KILLED"
-        base.reject_reason = f"Lane F: {recent_losses} losses in {lane_cfg['kill_window_sec']}s"
-        base.why_tag = "SKIP_LANE_KILLED_F"
-        return base
+    # Wall 3c DELETED (P27 §1b): the per-lane kill rule is dead — the
+    # account halt is THE stop. lane_losses_recent remains as reporting.
 
     # Wall 4: Insufficient tradeable capital — D1: tradeable = live balance (EPOCH 2)
     cost_usd = cost_float / 100.0
@@ -279,16 +273,9 @@ def evaluate(ticker: str, book: TouchBook, secs_to_expiry: float,
         base.why_tag = "SKIP_BALANCE"
         return base
 
-    # Wall 5: Hourly exposure cap
-    current_exposure = state.hourly_exposure_usd()
-    if current_exposure + cost_usd > HOURLY_EXPOSURE_CAP_USD:
-        base.reject_code = "HOURLY_CAP"
-        base.reject_reason = (
-            f"hourly exposure=${current_exposure:.2f} + ${cost_usd:.2f} "
-            f"> cap=${HOURLY_EXPOSURE_CAP_USD:.2f}"
-        )
-        base.why_tag = "SKIP_HOURLY_CAP"
-        return base
+    # Wall 5 DELETED (P27 §1c): HOURLY_CAP is dead — yesterday's pass
+    # histogram showed it muting the lane (HOURLY_CAP:4). Exposure still
+    # ACCUMULATES (hourly_exposure_usd) for the packs; it governs nothing.
 
     why_tag = f"FAV_{cost_float}c_T-{int(secs_to_expiry)}"
     base.allowed = True
@@ -326,30 +313,10 @@ def _evaluate_h8_probe(base: EvalResult, cost_d: Decimal, secs_to_expiry: float,
         base.why_tag = "SKIP_H8_UNQUALIFIED"
         return base
 
-    # Probe kill: 3 losses before any win
-    lifetime = stats.h8_probe_lifetime()
-    if lifetime["losses"] >= 3 and lifetime["wins"] == 0:
-        base.reject_code = "H8_PROBE_KILLED"
-        base.reject_reason = f"Probe killed: {lifetime['losses']} losses, 0 wins"
-        base.why_tag = "SKIP_H8_KILLED"
-        return base
-
-    # Per-lane kill rule
-    recent_losses = stats.lane_losses_recent("H8", h8_cfg["kill_window_sec"])
-    if recent_losses >= h8_cfg["kill_losses"]:
-        base.reject_code = "LANE_KILLED"
-        base.reject_reason = f"Lane H8: {recent_losses} losses in {h8_cfg['kill_window_sec']}s"
-        base.why_tag = "SKIP_LANE_KILLED_H8"
-        return base
-
-    # Budget wall
-    daily = stats.h8_probe_daily()
+    # P27 §1b/§1c: the probe-kill, per-lane kill, and daily probe budget
+    # are DELETED — all three were per-lane governors; the account halt is
+    # THE stop. The stats they read stay banked for the packs.
     cost_usd = cost_float / 100.0
-    if daily["at_risk"] + cost_usd > h8_cfg["daily_budget"]:
-        base.reject_code = "H8_BUDGET"
-        base.reject_reason = f"probe budget ${daily['at_risk']:.2f} + ${cost_usd:.2f} > ${h8_cfg['daily_budget']:.2f}"
-        base.why_tag = "SKIP_H8_BUDGET"
-        return base
 
     # Lane-scoped single entry
     if ("H8", ticker) in state.traded:

@@ -63,7 +63,8 @@ def tape_lines() -> Dict[str, object]:
     lines: Dict[str, object] = {}
     for suite in (tg.CHECKS, tg.CHECKS_P16, tg.CHECKS_P17, tg.CHECKS_P18,
                   tg.CHECKS_P19, tg.CHECKS_P21, tg.CHECKS_P22,
-                  tg.CHECKS_P24, tg.CHECKS_P26, tg.CHECKS_DIAG1):
+                  tg.CHECKS_P24, tg.CHECKS_P26, tg.CHECKS_DIAG1,
+                  tg.CHECKS_P27):
         for name, fn in suite:
             lines[name] = fn
     return lines

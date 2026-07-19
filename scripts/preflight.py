@@ -98,6 +98,10 @@ CHECKS = [
     ("the interrogator: questions in code, answers on the phone (DIAG-1)", [
         "tests/test_diag1_interrogator.py",
     ]),
+    ("the governor is the halt: full Kelly, one leash (P27)", [
+        "tests/test_p27_governor.py",
+        "tests/test_p8_golive.py",
+    ]),
 ]
 
 

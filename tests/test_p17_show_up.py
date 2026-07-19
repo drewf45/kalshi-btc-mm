@@ -115,7 +115,8 @@ def test_wall_tags_are_specific():
 
     from relay_engine import gateway
     src = inspect.getsource(gateway)
-    for specific in ("BUDGET", "DEPTH", "NET_RISK", "DOLLAR_RISK",
+    # P27 §1a: "DEPTH" left with the tier wall — the survivors stay specific
+    for specific in ("BUDGET", "NET_RISK", "DOLLAR_RISK",
                      "WRONG_WAY", "TAKER_ENTRY", "FLIP_UNPAIRED"):
         assert f'"{specific}"' in src, specific
     for ambiguous in ("PCT_OF_BOOK", "SIZING_TIER", "NET_RISK_CAP",

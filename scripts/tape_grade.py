@@ -631,6 +631,75 @@ CHECKS_P21 = [
 ]
 
 
+# ── P27 "THE GOVERNOR IS THE HALT" — expected tape ─────────────────────────
+def check_sizing_is_kelly_only(db, since):
+    """§1: sizing = min(kelly, depth, risk cap) — no tier term, no tier
+    wall, in source."""
+    try:
+        import inspect
+
+        from relay_engine import gateway as _g, sizing as _s
+        src = inspect.getsource(_s.size_order)
+        ok = ("kelly" in src and "TIER_MAX_CONTRACTS" not in src
+              and "_wall_sizing_tier(order)"
+              not in inspect.getsource(_g.Gateway.submit))
+    except Exception:
+        ok = False
+    return ok, "min(kelly, depth, risk_cap); tier wall dead"
+
+
+def check_per_lane_governors_dead(db, since):
+    """§1(b)/(c): zero entries stopped by a per-lane governor — the retired
+    reject codes never appear on the tape again (and are gone from source)."""
+    try:
+        import inspect
+
+        from relay_engine import lane_fh8 as _f
+        src = inspect.getsource(_f)
+        gone = all(f'base.reject_code = "{c}"' not in src for c in
+                   ("LANE_KILLED", "HOURLY_CAP", "H8_PROBE_KILLED",
+                    "H8_BUDGET"))
+    except Exception:
+        gone = False
+    n = _one(db, "SELECT COUNT(*) FROM failures WHERE why_tag IN"
+                 " ('LANE_KILLED','HOURLY_CAP') AND ts>?", (since,))
+    return gone and n == 0, (f"retired codes {'gone' if gone else 'PRESENT'}"
+                             f" · {n} governor stop(s) on tape")
+
+
+def check_one_governor_alive(db, since):
+    """§3: the two-strike account halt is THE stop — streak machinery in
+    source, /reset_halt the only key."""
+    try:
+        import inspect
+
+        from relay_engine import window_econ as _w
+        src = inspect.getsource(_w)
+        ok = ("two_strike_streak" in src and "reset_halt" in src)
+    except Exception:
+        ok = False
+    return ok, "window-econ streak + /reset_halt"
+
+
+def check_governor_era_stamped(db, since):
+    """§4: every cell row from this deploy carries governor=halt-only."""
+    total = _one(db, "SELECT COUNT(*) FROM cell_outcomes WHERE ts>?",
+                 (since,))
+    stamped = _one(db, "SELECT COUNT(*) FROM cell_outcomes WHERE ts>? AND"
+                       " governor='halt-only'", (since,))
+    if total == 0:
+        return True, "no closed risk this window"
+    return stamped == total, f"{stamped}/{total} rows stamped halt-only"
+
+
+CHECKS_P27 = [
+    ("sizing is full Kelly — no tier term (§1)", check_sizing_is_kelly_only),
+    ("per-lane governors dead in source and on tape (§1b/c)", check_per_lane_governors_dead),
+    ("the one governor: streak + /reset_halt alive (§3)", check_one_governor_alive),
+    ("era stamped governor=halt-only (§4)", check_governor_era_stamped),
+]
+
+
 # ── DIAG-1 "THE INTERROGATOR" — expected tape ──────────────────────────────
 def check_diag_answers_delivered(db, since):
     """§1: every registered diagnostic has run once and closed itself —
@@ -802,7 +871,8 @@ def main() -> int:
                           ("P22 the cell scoreboard", CHECKS_P22),
                           ("P24 shield, fees, reversal", CHECKS_P24),
                           ("P26 every why is a proof", CHECKS_P26),
-                          ("DIAG-1 the interrogator", CHECKS_DIAG1)):
+                          ("DIAG-1 the interrogator", CHECKS_DIAG1),
+                          ("P27 the governor is the halt", CHECKS_P27)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

@@ -70,12 +70,12 @@ def test_combined_over_line_posts_nothing(engine):
 
 # ── RULING 3: depth floor at one lot ───────────────────────────────────────
 def test_depth_one_admits_one_lot():
-    d = size_order(config.TIER_PROBE, 10_000, 46, visible_depth=1)
+    d = size_order(10_000, 46, visible_depth=1)
     assert d.contracts == 1     # 0.25×1 rounds to 0 — the floor admits 1
 
 
 def test_depth_zero_admits_nothing():
-    d = size_order(config.TIER_PROBE, 10_000, 46, visible_depth=0)
+    d = size_order(10_000, 46, visible_depth=0)
     assert d.contracts == 0     # no book is still no book
 
 

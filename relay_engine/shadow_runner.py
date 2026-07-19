@@ -410,19 +410,20 @@ class ShadowEngine:
         return ",".join(sorted(live))
 
     def _score_and_size(self, proposal, book) -> None:
-        """P22 §4: tier from scoring.tier_for (paged + persisted on change),
-        contracts from size_order — the static PROBE path is dead. A zero
-        from sizing keeps count=1 and lets the walls refuse it BY NAME
-        (the walls are the refusal organ, not a silent skip here)."""
+        """P27 §1 — SIZING = FULL KELLY: contracts = min(kelly, depth); the
+        Wilson ladder still scores every cell (tier_for — the REPORTING
+        stamp, its pages, and custody scaling read it) but it no longer
+        votes on size. A zero from sizing keeps count=1 and lets the walls
+        refuse BY NAME (the walls are the refusal organ)."""
         from . import scoring
         from .sizing import size_order
         lane = scoring.cell_lane(proposal.lane, proposal.why)
         tier = scoring.tier_for(self.ledger, lane, proposal.price_cents,
                                 alert_fn=self.telegram.alert)
         depth = book.visible_depth(proposal.side, proposal.price_cents) or 0
-        dec = size_order(tier, self.ledger.book_cents(),
+        dec = size_order(self.ledger.book_cents(),
                          proposal.price_cents, depth)
-        proposal.size_tier = dec.tier
+        proposal.size_tier = tier   # reporting + custody scaling, never a cap
         proposal.count = max(1, dec.contracts)
 
     def _on_fill_booked(self, order, action, price_cents, count, now,

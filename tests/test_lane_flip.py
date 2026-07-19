@@ -191,19 +191,18 @@ def test_reentry_is_open_gated(flip, gateway):
     assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
 
 
-def test_stop_streak_kills_lane(flip, gateway):
+def test_stop_streak_reports_never_kills(flip, gateway):
+    """P27 §1b OVERTURNED the stop-streak lane kill (R2's per-lane kill
+    class, same as fh8 Wall 3c): the streak still COUNTS for the packs,
+    but the lane keeps trading — the account halt is THE stop."""
     flip.note_window_result(TICKER, -30)   # stopped window 1
+    flip.note_window_result(TICKER, -26)   # stopped window 2 — NO kill
     assert not flip.killed
-    flip.note_window_result(TICKER, -26)   # stopped window 2 -> kill
-    assert flip.killed
-    assert "LANE_KILL:FLIP" in gateway.entries_halted_reasons
-    assert flip.evaluate(TICKER, ctx(flip_book())) == []
-    # a green window would have reset the streak
-    flip2 = LaneFlip(gateway)
-    flip2.note_window_result(TICKER, -30)
-    flip2.note_window_result(TICKER, +4)
-    flip2.note_window_result(TICKER, -30)
-    assert not flip2.killed and flip2.stop_streak == 1
+    assert flip.stop_streak == 2
+    assert "LANE_KILL:FLIP" not in gateway.entries_halted_reasons
+    # a green window still resets the streak (reporting stays honest)
+    flip.note_window_result(TICKER, +4)
+    assert flip.stop_streak == 0
 
 
 def test_cut_params_catastrophic_only():

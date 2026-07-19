@@ -179,19 +179,15 @@ def test_pct_of_book_budget(gateway, ledger):
     assert e.value.wall == "BUDGET"
 
 
-def test_sizing_tier_authorization(gateway):
+def test_tier_never_walls(gateway):
+    """P27 §1a OVERTURNED the sizing-tier wall: the tier is a REPORTING
+    stamp — a 2-lot PROBE order and a SUPPRESS-stamped order both pass
+    (the kept walls still bound risk; the ladder never votes)."""
     b = make_book()
-    with pytest.raises(WallRejection) as e:
-        gateway.submit(entry(price=61, tier=config.TIER_SUPPRESS), b)
-    assert e.value.wall == "DEPTH"
-    with pytest.raises(WallRejection) as e:
-        gateway.submit(entry(price=61, count=2, tier=config.TIER_PROBE), b)  # PROBE max 1
-    assert e.value.wall == "DEPTH"
-    gw2_authorized = lambda lane, market: config.TIER_LEAN
-    gateway.sizing_authorized_tier = gw2_authorized
-    with pytest.raises(WallRejection) as e:
-        gateway.submit(entry(price=61, count=1, tier=config.TIER_CLEAR), b)
-    assert e.value.wall == "DEPTH"
+    assert gateway.submit(entry(price=61, count=2,
+                                tier=config.TIER_PROBE), b).shadow
+    assert gateway.submit(entry(lane="P", market="M2", price=30, count=1,
+                                tier=config.TIER_SUPPRESS), b).shadow
 
 
 def test_fee_tripwire_multiplier_and_designation_list(gateway):

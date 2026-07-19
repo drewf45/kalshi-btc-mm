@@ -186,6 +186,18 @@ re-runs every TAPE line here forever (registry tests never retire).
 - CODE: `relay_engine/diagnostics.py:1`
 - TAPE: `DIAGNOSTICS section ships in the pack (§3)`
 
+### 22. The governor is the halt
+- LAW: walls stop bugs, custody stops losses, the two-strike account
+  halt stops bad days — NOTHING stops trading (Drew's ruling, twice —
+  the constitution as written on day one). Sizing is full Kelly bounded
+  by depth and the kept risk walls; the Wilson ladder, the survival
+  table, and the cell margins all REPORT on every why and govern
+  nothing; the halt is account-level and lane-blind, persists across
+  restarts, and answers only to /reset_halt (P27; era stamped
+  governor=halt-only on every cell row).
+- CODE: `relay_engine/sizing.py:1`
+- TAPE: `the one governor: streak + /reset_halt alive (§3)`
+
 ## QUESTION (articulated ignorance — collectors named, running)
 
 - **Lane margins** — which lanes clear fees at what hit-rate? Collector:

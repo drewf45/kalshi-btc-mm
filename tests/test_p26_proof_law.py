@@ -49,24 +49,21 @@ def _entry(lane, why, price=48, side="yes", market=TICKER, event=EVENT):
                  size_tier=config.TIER_PROBE, purpose="ENTRY", why=why)
 
 
-# ── §2: REJECT_UNPROVEN_WHY, per lane ──────────────────────────────────────
-def test_wall_rejects_unproven_whys_per_lane(gateway):
+# ── §2: REJECT_UNPROVEN_WHY — P27 §2(c): the NARRATION law only ───────────
+def test_wall_rejects_only_empty_whys(gateway):
+    """P27 §2(c) OVERTURNED P26's per-lane proof-field demands: whys
+    REPORT, doctrine gates, process gates die. The wall now demands ONE
+    thing — a non-empty why string (every dollar narrates) — and never a
+    threshold. Any narrated why passes, any lane."""
     book = _book()
-    cases = [
-        ("F", "F likes this market"),               # no tier/surv
-        ("H8", "H8 tier95"),                        # missing surv
-        ("P", "P feels a fade coming"),             # no displ arithmetic
-        ("D", "cheap entry"),                       # no table verdict
-        ("FLIP", ""),                               # neither HUNT nor OPEN
-        ("FLIP", "OPEN grain yesx2 · join 48c"),    # no margin|PROBE receipt
-        ("MM", "brand new lane, no proof form"),    # unregistered lane
-    ]
-    for i, (lane, why) in enumerate(cases):
-        # distinct markets: the P10 wall-backoff must not shadow the verdict
+    for i, why in enumerate(("", "   ")):
         with pytest.raises(WallRejection) as e:
-            gateway.submit(_entry(lane, why, market=f"M{i}", event=f"EV{i}"),
-                           book)
-        assert e.value.wall == "REJECT_UNPROVEN_WHY", (lane, why)
+            gateway.submit(_entry("FLIP", why, market=f"M{i}",
+                                  event=f"EV{i}"), book)
+        assert e.value.wall == "REJECT_UNPROVEN_WHY"
+    # narrated whys pass regardless of proof-field shape — even a new lane
+    assert gateway.submit(_entry("MM", "a new lane, narrating its thesis",
+                                 market="M9", event="EV9"), book).shadow
 
 
 def test_wall_admits_proven_whys(gateway):
@@ -203,18 +200,23 @@ def test_bad_geometry_passes(flip, monkeypatch):
     assert flip.windows[TICKER].open_geometry_logged
 
 
-# ── §2: the OPEN margin gate — receipts or PROBE, then sit ─────────────────
-def test_open_margin_gate_probe_then_sit(flip, gateway, ledger):
-    # virgin cell: PROBE mode, stamped
+# ── §2: OPEN's margin — P27 §2(b): prints always, gates never ──────────────
+def test_open_margin_prints_never_gates(flip, gateway, ledger):
+    """P27 §2(b) OVERTURNED the margin gate (and OPEN_CELL_NEGATIVE's
+    sit): entry proceeds on band + grain + geometry + one-shot; the cell
+    margin prints on the why either way — informs daily, governs never."""
+    # virgin cell: enters, margin printed as info
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
-    assert "PROBE n=0" in props[0].why and "geometry=v2" in props[0].why
-    # a mature NEGATIVE cell: the receipts argue against the lane — it sits
+    assert len(props) == 1
+    assert "margin" in props[0].why and "geometry=v2" in props[0].why
+    # a mature NEGATIVE cell: STILL enters — the margin prints (info)
     flip.windows.clear()
     for i in range(config.OPEN_PROBE_MAX_N):
         ledger.record_cell_outcome("OPEN", 48, won=False, pnl_cents=-5,
                                    fees_cents=0, market=f"L{i}", kind="trip")
-    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2)) == []
-    # a mature POSITIVE cell: margin >= 0, the proof is the receipts
+    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    assert len(props) == 1 and "info" in props[0].why
+    # a mature POSITIVE cell: enters with the positive margin printed
     ledger.db.execute("DELETE FROM cell_outcomes")
     ledger.db.commit()
     for i in range(60):

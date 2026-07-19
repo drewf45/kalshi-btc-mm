@@ -1150,6 +1150,57 @@ Suite at this commit: **404 passed**; preflight **22/22**.
   delivered, eras stamped, section ships) — tenth graded suite; registry
   #21 "The phone is the console" (21 KNOWNs, all bound).
 
+## WO-P27-FINAL — "THE GOVERNOR IS THE HALT" (the constitution as written)
+
+Suite at this commit: **411 passed**; preflight **23/23**.
+
+- **Compare verdict CONFIRMED at source, and extended**: every cited governor
+  was live at its cited line. The kill-list grew by its own class-members —
+  the same rule wearing different badges: fh8 Wall 3c (F kill) AND H8's
+  per-lane kill, probe-kill (3-losses-before-win), and daily probe budget;
+  FLIP's stop-streak kill (the port doc itself called it "the per-lane kill
+  rule, R2"); the gateway's sizing-tier wall (the tier governor's
+  enforcement arm — with it alive, full Kelly would have died at the wall).
+- **§1 sizing = full Kelly**: `size_order(book, price, depth)` =
+  min(kelly, depth, NET_RISK_CROSS_LANE_CAP) — the risk-cap clamp because
+  the kept walls are LAW: a 7-lot Kelly proposal dying whole at the ≤3 wall
+  would be a governor by accident (caught by the replay corpus). The tier
+  ladder REMAINS as reporting: tier_for still scores/pages/persists; the
+  order's size_tier is the reporting stamp (custody scaling reads it);
+  RULING 3's depth floor stands (depth doctrine, not a governor). All
+  reporting stats keep accumulating (hourly exposure, lane losses, probe
+  ledgers) — they inform the packs and govern nothing.
+- **§2 whys report, doctrine gates**: (a) TABLE_NON_REVERSAL gate DELETED —
+  surv still computes and prints (`surv0.93 (any-touch, info) d= t=
+  proof=`); returns as a gate only by Drew ruling with v2 at-close units.
+  (b) OPEN's margin gate + OPEN_CELL_NEGATIVE sit DELETED — entry proceeds
+  on band + grain + geometry + one-shot; margin prints either way. (c)
+  REJECT_UNPROVEN_WHY relaxed to the NARRATION LAW: non-empty why string,
+  never a threshold (PROOF_REQUIRED per-lane demands retired; the lanes
+  still print their arithmetic because the packs learn from it). (d) the
+  keep-list verified untouched: SELF_NET · TAKER_ENTRY · pending/gross ·
+  net-risk ≤3 · $-at-risk · BUDGET · OPEN one-shot/geometry/yield/fast
+  evacuations · HUNT one-per-displacement · all custody.
+- **§3 the one governor, confirmed**: the mixed-lane strike test (the
+  Adversary's requirement) — two lanes trade one window, F +4 / OPEN −10 →
+  net −6 → EXACTLY one strike; two consecutive mixed-red windows → halt;
+  persists across restart; /reset_halt only. And the mirror: OPEN −5 but
+  F +12 → net green → zero strikes. Lane-blind both directions.
+- **§4 era stamp**: cell_outcomes gains `governor` column, every row from
+  this deploy stamped `halt-only`; boot prints the constitution
+  (`GOVERNOR: halt-only — … NOTHING stops trading`).
+- **Golden tape**: declared change D2 (same class as D1) — where the
+  vendored LIVE tree stops on a retired governor code, the relay
+  intentionally proceeds; everything else stays byte-parity (26 ladder +
+  2941 eval cases, 0 mismatches; report regenerated). The dry run now
+  places 2 lots at 97¢ — §5's tape, proven end-to-end.
+- **§5**: CHECKS_P27 (kelly-only sizing, governors dead in source AND on
+  tape, streak+reset alive, era stamped) — eleventh graded suite; registry
+  #22 "The governor is the halt" (22 KNOWNs, all bound); overturned
+  test-laws updated with citations (tier caps, tier wall, stop-streak
+  kill, proof-field wall, margin gate, TABLE_NON_REVERSAL mute, 1-lot
+  expectations in the dry run/port wiring/sizing line).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

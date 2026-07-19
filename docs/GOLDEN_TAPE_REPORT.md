@@ -28,8 +28,8 @@ reject_code, why_tag). Free-text reject_reason excluded (declared change D1).
 | floor_flicker | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-790_confirms_9/9')` | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-790_confirms_9/9')` | ✓ |
 | toprung_guard_fail | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-570_confirms_6/6')` | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-570_confirms_6/6')` | ✓ |
 | toprung_lowtail_tag | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-855_LOWTAIL_confirms_9/9')` | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-855_LOWTAIL_confirms_9/9')` | ✓ |
-| hourly_cap_blocks | Pass(no entry) | Pass(no entry) | ✓ |
-| lane_f_killed | Pass(no entry) | Pass(no entry) | ✓ |
+| hourly_cap_blocks | Pass(no entry) | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-855_confirms_9/9')` | ✓ |
+| lane_f_killed | Pass(no entry) | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-855_confirms_9/9')` | ✓ |
 | single_entry_blocks | Pass(no entry) | Pass(no entry) | ✓ |
 | cross_lane_cap_blocks | Pass(no entry) | Pass(no entry) | ✓ |
 | tier_transition | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-855_confirms_9/9')` | `(True, 'F', 'yes', 99, 99.0, None, 'FAV_99.0c_T-855_confirms_9/9')` | ✓ |

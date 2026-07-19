@@ -513,18 +513,39 @@ def evaluate_grid() -> List[Tuple[Scenario, float]]:
 # ---------------------------------------------------------------------------
 # Comparison driver
 # ---------------------------------------------------------------------------
+# P27 "THE GOVERNOR IS THE HALT" — DECLARED DIVERGENCE (change D2, same
+# class as D1): the per-lane governors are retired in the relay by Drew's
+# ruling (Wall 3c kill, HOURLY_CAP, H8 probe-kill, H8 daily budget). Where
+# the vendored LIVE tree stops on one of these, the relay INTENTIONALLY
+# proceeds — those cases compare as declared-divergent, not mismatched.
+# Everything else remains byte-identical parity.
+P27_RETIRED_CODES = frozenset({"HOURLY_CAP", "LANE_KILLED",
+                               "H8_PROBE_KILLED", "H8_BUDGET"})
+P27_DECLARED_LADDER = frozenset({"hourly_cap_blocks", "lane_f_killed"})
+
+
+def _p27_declared_eval(live) -> bool:
+    try:
+        return live is not None and live[5] in P27_RETIRED_CODES
+    except Exception:
+        return False
+
+
 def compare_all() -> dict:
     ladder_results = []
     for sc in ladder_scenarios():
         live = run_live_ladder(sc)
         ported = run_port_ladder(sc)
-        ladder_results.append((sc.name, live, ported, live == ported))
+        ok = (live == ported
+              or (sc.name in P27_DECLARED_LADDER and live is None))
+        ladder_results.append((sc.name, live, ported, ok))
 
     eval_results = []
     for sc, t in evaluate_grid():
         live = run_live_evaluate(sc, t)
         ported = run_port_evaluate(sc, t)
-        eval_results.append((sc.name, live, ported, live == ported))
+        ok = live == ported or _p27_declared_eval(live)
+        eval_results.append((sc.name, live, ported, ok))
 
     # restore relay delta module state
     relay_delta._TABLE = {}
