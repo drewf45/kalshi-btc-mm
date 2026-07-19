@@ -1364,6 +1364,48 @@ FLIP_UNCOVERED_LEG "held 1 > covered 0").
   covered-next-cycle; uncovered-after-heal FATALs; stuck partial defers
   then cancels loudly; exit never exceeds booked-held. Suite 465 · 23/23.
 
+## WO-FLIP-THESIS-1 — "SCALP-OR-HOLD + F COORDINATION" (4 staged commits)
+
+**RAIL EXCEPTION honored as written**: ONLY the §3-named constants moved
+(OPEN_TAKE_CENTS 5→20 · OPEN_ENTRY_CUTOFF 480→600 · OPEN_FLAT_BY 360→600
+with §3.5 semantics · OPEN_PATIENCE_S=300 new); Kelly, depth, net-risk,
+and every integrity path untouched. **CEO condition standing: strategy
+change — proves itself at one lot before any size.**
+
+- **Stage 1 — the patience floor (§2)**: determined-against fires only
+  after OPEN_PATIENCE_S from FIRST FILL (Engineer: the merge keeps the
+  first fill's ts). First-minute dips are noise (the 48→41 −9¢ evacuate
+  at 9s is dead); a sustained collapse counts through the window and
+  fires the moment it ends; post-window the cut stays HARD.
+- **Stage 2 — the retune (§3)**: scalp target entry+20 (fee = 10% of
+  edge, was 40%; OPEN cell breakeven now BELOW coin-flip:
+  (12+fee)/(32+fee)≈0.40); entries T-15→T-10.
+- **Stage 3 — T-10 handoff + coordination (§3.5/§4)**: blind YIELD_TO_F
+  replaced by the book-aware per-position handoff — winner converts to
+  hold-to-settle at FLIP's basis (FLIP_HOLD_TO_SETTLE), loser SOLD
+  before F's window, no mark = retry (never blind), flat hands off
+  nothing. Hold-instead-of-scalp pre-T-10 when the mark crosses F's
+  band floor (F-agrees). Holds stay under the determined floor +
+  custodian backstop (anchored at fill, B1) and are exempt from the
+  UNCOVERED page (deliberate no-resting-exit). Shared inventory:
+  `LaneFlip.held` wired to `FH8Shared.flip_inventory` (one object; F
+  evaluates first, fills book between cycles — the atomic cycle-start
+  snapshot). F_STANDS_DOWN pass + once-per-(market,side) log with
+  basis/would-pay. **Read-rule finding: no main-loop rule ever forbade
+  multi-lane same-market entries (SINGLE_ENTRY is lane-scoped;
+  NET_RISK≤3 is the only cross-lane brake) — F could double-buy
+  blindly; coordination replaces blindness, not a ban.**
+- **Stage 4 — continuity (§1, Scientist)**: OPEN_CONTINUITY logs
+  prior-window direction vs chosen side, once per window, LOG-ONLY —
+  votes only after measurement shows edge.
+- **Overturned test-laws (with citations)**: P21/P26 yield tests → T-10
+  handoff; determined tests re-timed past the patience floor; OPEN
+  breakeven above-coin-flip assertion inverted; geometry gate dormant at
+  the ruled take (both knobs shifted in-test to keep the mechanism
+  exercised); entry-window times moved inside T-15→T-10; PROFILE tokens.
+- Suite 479 · preflight 23/23. UNPROVEN, routed to measurement:
+  continuity edge; 20¢-vs-5¢ superiority (the one-lot tape decides).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -193,6 +193,9 @@ class FlipWindow:
     # a closed record, never falls to the legacy w.fills path.
     late_fills: Dict[str, dict] = field(default_factory=dict)
     uncovered_healed: set = field(default_factory=set)  # §3.3 cover-once guard
+    # P-FLIP-THESIS-1 §1 (Scientist: LOG-ONLY until measured): continuity —
+    # does the prior window's settlement direction predict this entry side?
+    continuity_logged: bool = False
     trips: int = 0
     scratches: int = 0
     window_realized: int = 0
@@ -644,6 +647,10 @@ class LaneFlip:
                           scoring.price_cell(join))
         proof = (f"margin {s['margin']:+.2f} (n={s['n']}"
                  + (", info)" if s["margin"] < 0 else ")"))
+        # P-FLIP-THESIS-1 §1 — THE CONTINUITY SIGNAL, LOG-ONLY (Scientist:
+        # it votes on entry side only after the data shows edge; the
+        # Adversary: it may never override a determined cut)
+        self._log_continuity(w, market, side)
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
@@ -989,6 +996,32 @@ class LaneFlip:
                          "det_ts": None, "entry_oid": None, "defer_polls": 0}
         log.warning("FLIP_UNCOVERED self-heal %s %s: opened fresh record "
                     "x%d @ %sc (booked entry)", market, side, gap, entry)
+
+    def _log_continuity(self, w: FlipWindow, market: str, side: str) -> None:
+        """P-FLIP-THESIS-1 §1: the crowd wants the last regime to continue
+        (bear begets bear). LOG-ONLY — once per window, agree/disagree
+        between the prior settled window's direction and the chosen entry
+        side. It earns a VOTE only after measurement shows edge; today it
+        builds the dataset."""
+        if w.continuity_logged:
+            return
+        ledger = getattr(self.gateway, "ledger", None) if self.gateway else None
+        if ledger is None:
+            return
+        try:
+            row = ledger.db.execute(
+                "SELECT market, settled_yes FROM window_outcomes"
+                " WHERE market != ? ORDER BY ts DESC LIMIT 1",
+                (market,)).fetchone()
+        except Exception:
+            return
+        if row is None:
+            return
+        w.continuity_logged = True
+        prior = "yes" if row[1] else "no"
+        log.info("OPEN_CONTINUITY %s prior_window=%s (%s) side=%s agree=%s "
+                 "(log-only — votes after measurement)", market, prior,
+                 row[0], side, side == prior)
 
     def _convert_to_hold(self, o: dict, market: str, side: str, mark,
                          reason: str) -> None:

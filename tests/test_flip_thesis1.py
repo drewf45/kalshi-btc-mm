@@ -238,6 +238,34 @@ def test_f_agrees_conversion_pre_t10(flip, gateway, ledger, caplog):
     assert any("reason=F-agrees" in r.message for r in caplog.records)
 
 
+# ── §1 stage 4: continuity — a LOGGED feature, never a vote ────────────────
+def test_continuity_logs_agreement_and_never_votes(flip, gateway, ledger,
+                                                   caplog):
+    """Scientist: prior-window direction is logged beside the chosen side
+    (agree=True/False) ONCE per window; the entry side stays the grain's —
+    the signal builds its dataset before it may vote."""
+    import logging
+    ledger.record_outcome("KXBTC15M-PRIOR-T99", False)     # prior went NO
+    with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
+        props = flip.evaluate(TICKER, _ctx(_book(), secs_left=800,
+                                           grain=GRAIN_YES2))
+        flip.evaluate(TICKER, _ctx(_book(), secs_left=799,
+                                   grain=GRAIN_YES2))      # once per window
+    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
+    lines = [r.message for r in caplog.records if "OPEN_CONTINUITY" in r.message]
+    assert len(lines) == 1
+    assert "prior_window=no" in lines[0] and "agree=False" in lines[0]
+    assert "log-only" in lines[0]
+
+
+def test_continuity_silent_with_no_prior_window(flip, gateway, ledger,
+                                                caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
+        flip.evaluate(TICKER, _ctx(_book(), secs_left=800, grain=GRAIN_YES2))
+    assert not any("OPEN_CONTINUITY" in r.message for r in caplog.records)
+
+
 # ── §3 stage 2: the retune — ~20¢ scalp target, T-10 entry cutoff ──────────
 def test_scalp_take_rests_at_entry_plus_20(flip, gateway, ledger):
     """§5: entry 49¢, the market swings — the take rests at ~entry+20
