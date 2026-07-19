@@ -1321,6 +1321,49 @@ LANE_D_FLOOR_CENTS, any band, tier bound, or gate.**
 - Suite 456 · preflight 23/23. Out of scope, untouched: edge
   measurement (step 2), Kelly re-derivation (step 3), D-floor (data).
 
+## WO-FLIP-COUNT-2 — "THE LAST LOSS-TERM LEAK" (custody-routing only, one commit)
+
+**Root cause (191030 tape, read-rule TRUE at source):** not a missing
+merge — a fill-vs-exit RACE. A 2-lot entry the venue fills as two 1-lot
+records can have a determined-against exit fire BETWEEN the halves; the
+merge then re-incremented a record whose exit had already fired, leaving
+the second contract invisible to every exit (two 1-lot exits +
+FLIP_UNCOVERED_LEG "held 1 > covered 0").
+
+- **§3.1 quiescence gate**: `_entry_in_flight` reads venue truth (order
+  still in `gateway.resting` with `filled_counts > 0`); every custody exit
+  DEFERS while the entry is partially filled. Adversary(b): after
+  FLIP_STUCK_PARTIAL_POLLS=3 unresolved polls the remainder is CANCELLED
+  and the position exits at booked size — FLIP_STUCK_PARTIAL pages (fail
+  toward a known state, loud).
+- **§3.2 idempotent late merge**: a fill landing on a CLOSING (done)
+  bucket never re-increments it — it buffers in `w.late_fills` (blended)
+  and `FLIP_LATE_FILL_REOPEN` opens a fresh position-aware record the
+  moment the old leg's exit accounting concludes (note_exit pop), clamped
+  to booked-net (a venue that holds nothing opens no leg). The reopened
+  record carries the fill's own entry (Engineer: the loss-term geometry —
+  take/determined/yield — stays armed on the reopened leg).
+- **§3.3 UNCOVERED self-heals**: the page stays loud AND the gap is
+  covered — the closed record revives (own entry keeps realization
+  honest) or a fresh record opens at the ledger's booked entry, sized to
+  held−covered; the normal exit path owns it next cycle. Adversary(c):
+  cover ONCE — a leg still uncovered after its heal is
+  FLIP_UNCOVERED_UNHEALABLE, FATAL. A live record whose take is merely
+  pending proposal is the normal path, never a false page.
+- **§3.4**: `_exit_count` (booked-net clamp ≥0) confirmed authoritative on
+  every exit including the reopen and heal paths — phantom sells
+  (the 9:27 REJECT_SELF_NET class) impossible.
+- **HARD RAIL honored**: no change to KELLY_FRACTION_CEILING,
+  DEPTH_FRACTION, NET_RISK_CROSS_LANE_CAP, LANE_D_FLOOR_CENTS, any band,
+  tier bound, take-cent, or gate. Boot PROFILE FLIP line → P-FLIP-COUNT-2.
+- **§4 tests** (`tests/test_flip_count2.py`, 9): the 191030 replay (two
+  1-lot fills straddling determined → defer → merged → ONE 2-lot covered
+  exit, zero pages); late-fill buffer → REOPEN → position-aware exit,
+  zero orphan; reopen clamps to booked (no phantom); single 2-lot fill
+  regression; two-fills-no-exit regression; uncovered pages AND heals
+  covered-next-cycle; uncovered-after-heal FATALs; stuck partial defers
+  then cancels loudly; exit never exceeds booked-held. Suite 465 · 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

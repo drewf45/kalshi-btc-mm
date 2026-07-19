@@ -37,6 +37,7 @@ def ctx(book, secs_left=800, spot=None, grain=None, spotlead=None):
 @pytest.fixture(autouse=True)
 def funnel(ledger):
     alerts = []
+    failures._warn_last.clear()   # per-tag WARN throttle is cross-test state
     failures.configure(ledger, alert_fn=alerts.append, run_mode="TEST",
                        boot_id=1)
     yield alerts

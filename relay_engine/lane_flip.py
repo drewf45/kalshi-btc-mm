@@ -74,6 +74,11 @@ FLIP_OFI_TICKS = 4          # DREW-DEFAULT: spot ticks that must agree for re-en
 FLIP_CURFEW = 240           # DREW-DEFAULT: no new entries after T-this
 FLIP_MAX_TRIPS = 4          # DREW-DEFAULT
 FLIP_SCRATCH_SITOUT = 3     # DREW-DEFAULT: sit the window out at N scratches
+# FLIP-COUNT-2 Adversary(b): a partial fill that never resolves defers exits
+# at most this many polls, then the unfilled remainder is CANCELLED and the
+# position proceeds at its booked size (fail toward a known state, loud).
+# Custody mechanism, not a trading threshold.
+FLIP_STUCK_PARTIAL_POLLS = 3
 
 
 # ── pure signal helpers — byte-identical to flip_mode.py:284-347 ───────────
@@ -182,6 +187,12 @@ class FlipWindow:
     # compares booked-held against covered size, not covered existence).
     take_counts: Dict[str, int] = field(default_factory=dict)
     uncovered_paged: set = field(default_factory=set)  # sides paged this window
+    # FLIP-COUNT-2 §3.2: a fill landing while its bucket is CLOSING buffers
+    # here (side -> {entry, count, bucket}) and re-opens position-aware the
+    # moment the old leg's exit accounting concludes — never re-increments
+    # a closed record, never falls to the legacy w.fills path.
+    late_fills: Dict[str, dict] = field(default_factory=dict)
+    uncovered_healed: set = field(default_factory=set)  # §3.3 cover-once guard
     trips: int = 0
     scratches: int = 0
     window_realized: int = 0
@@ -260,6 +271,75 @@ class LaneFlip:
             return rec_count
         return max(0, min(rec_count, booked))
 
+    def _entry_in_flight(self, market: str, side: str) -> bool:
+        """FLIP-COUNT-2 §3.1: venue truth — a FLIP ENTRY order for this side
+        is PARTIALLY filled and still resting (the gateway keeps an order in
+        `resting` until its full count books; `filled_counts` says whether
+        any part has). Exits act only on fully-booked positions — the
+        cash-protocol quiescence posture, never act mid-settlement."""
+        if self.gateway is None:
+            return False
+        for oid, o in getattr(self.gateway, "resting", {}).items():
+            if (o.lane == "FLIP" and o.market == market and o.side == side
+                    and o.purpose == "ENTRY" and o.action == "buy"
+                    and self.gateway.filled_counts.get(oid, 0) > 0):
+                return True
+        return False
+
+    def _defer_or_cancel_partial(self, rec: dict, market: str,
+                                 side: str) -> bool:
+        """§3.1 + Adversary(b): returns True while the exit should DEFER
+        (entry partially filled, under the poll budget). At the budget the
+        unfilled remainder is CANCELLED — the position proceeds at its
+        booked size, loudly (fail toward a known state)."""
+        if not self._entry_in_flight(market, side):
+            rec["defer_polls"] = 0
+            return False
+        rec["defer_polls"] = rec.get("defer_polls", 0) + 1
+        if rec["defer_polls"] < FLIP_STUCK_PARTIAL_POLLS:
+            return True
+        from . import failures
+        for oid, o in list(getattr(self.gateway, "resting", {}).items()):
+            if (o.lane == "FLIP" and o.market == market and o.side == side
+                    and o.purpose == "ENTRY" and o.action == "buy"):
+                self.gateway.cancel(oid)
+        failures.fail("FLIP_STUCK_PARTIAL",
+                      f"{market} {side}: entry partial unresolved for "
+                      f"{FLIP_STUCK_PARTIAL_POLLS} polls — remainder "
+                      "cancelled, exiting the booked size",
+                      fatal=False, alert=True, market=market, side=side)
+        rec["defer_polls"] = 0
+        return False
+
+    def _promote_late_fill(self, w: FlipWindow, market: str, side: str,
+                           now: float) -> None:
+        """FLIP-COUNT-2 §3.2: the closing bucket concluded — the buffered
+        late leg re-opens as a FRESH position-aware custody record (clamped
+        to booked truth), so it gets the normal exit machinery. Its entry
+        price is the fill's own (the blended anchor rides with it —
+        Engineer: a reopened leg with no entry would silently disable the
+        loss-term geometry)."""
+        lf = w.late_fills.pop(side, None)
+        if lf is None:
+            return
+        n = self._exit_count(market, side, lf["count"])
+        if n <= 0:
+            return                      # venue says nothing is held: no leg
+        if lf["bucket"] == "hunts":
+            w.hunts[side] = {"entry": lf["entry"], "fill_ts": now,
+                             "count": n, "take_oid": None,
+                             "take_proposed": False, "be_ts": None,
+                             "be_repriced": False, "entry_oid": None,
+                             "defer_polls": 0}
+        else:
+            w.opens[side] = {"entry": lf["entry"], "fill_ts": now,
+                             "count": n, "take_oid": None,
+                             "take_proposed": False, "collapse_polls": 0,
+                             "det_ts": None, "entry_oid": None,
+                             "defer_polls": 0}
+        log.warning("FLIP_LATE_FILL_REOPEN %s %s x%d @ %dc — late leg gets "
+                    "a position-aware exit", market, side, n, lf["entry"])
+
     def note_fill(self, market: str, side: str, price_cents: int, now: float,
                   count: int = 1) -> None:
         """Called by the fills wiring when a FLIP entry books. Updates window
@@ -278,39 +358,66 @@ class LaneFlip:
         for bucket in (w.hunts, w.opens):
             rec = bucket.get(side)
             if rec is not None:
+                if not rec.get("done"):
+                    add = max(1, count)
+                    total = rec["count"] + add
+                    rec["entry"] = int(round((rec["entry"] * rec["count"]
+                                              + price_cents * add) / total))
+                    rec["count"] = total
+                    if rec.get("take_oid") and self.gateway is not None:
+                        self.gateway.cancel(rec["take_oid"])
+                        rec["take_oid"] = None
+                    rec["take_proposed"] = False
+                    w.posted.pop(side, None)
+                    log.warning("FLIP-COUNT-1 merge %s %s: +%d -> count %d @ "
+                                "blended %dc", market, side, add, total,
+                                rec["entry"])
+                    return
+                # FLIP-COUNT-2 §3.2 (the 191030 race): the bucket is CLOSING
+                # — its exit already fired between the two halves of the
+                # fill. NEVER re-increment a closed record (that made the
+                # second contract invisible to every exit). Buffer the late
+                # leg; note_exit promotes it to a fresh position-aware
+                # record the moment the old leg's accounting concludes.
+                lf = w.late_fills.get(side)
                 add = max(1, count)
-                total = rec["count"] + add
-                rec["entry"] = int(round((rec["entry"] * rec["count"]
-                                          + price_cents * add) / total))
-                rec["count"] = total
-                if rec.get("take_oid") and self.gateway is not None:
-                    self.gateway.cancel(rec["take_oid"])
-                    rec["take_oid"] = None
-                rec["take_proposed"] = False
+                if lf is None:
+                    w.late_fills[side] = {
+                        "entry": price_cents, "count": add,
+                        "bucket": "opens" if bucket is w.opens else "hunts"}
+                else:
+                    total = lf["count"] + add
+                    lf["entry"] = int(round((lf["entry"] * lf["count"]
+                                             + price_cents * add) / total))
+                    lf["count"] = total
                 w.posted.pop(side, None)
-                log.warning("FLIP-COUNT-1 merge %s %s: +%d -> count %d @ "
-                            "blended %dc", market, side, add, total,
-                            rec["entry"])
+                log.warning("FLIP-COUNT-2 late fill %s %s x%d @ %dc buffered "
+                            "— bucket closing; reopens when the old leg "
+                            "concludes", market, side, add, price_cents)
                 return
         # P18: a hunt fill opens hunt custody, never the pair machinery
         if (w.posted.get(side) or {}).get("mode") == "HUNT":
+            entry_oid = (w.posted.get(side) or {}).get("oid")
             w.posted.pop(side, None)
             w.hunt_count += 1
             w.trips += 1   # hunts consume the same ratchet discipline
             w.hunts[side] = {"entry": price_cents, "fill_ts": now,
                              "count": max(1, count),
                              "take_oid": None, "take_proposed": False,
-                             "be_ts": None, "be_repriced": False}
+                             "be_ts": None, "be_repriced": False,
+                             "entry_oid": entry_oid, "defer_polls": 0}
             return
         # P21 A4: an OPEN fill starts THE PATIENT HOLD — its own custody,
         # never the retired pair machinery, never HUNT's fast jobs.
         if (w.posted.get(side) or {}).get("mode") == "OPEN":
+            entry_oid = (w.posted.get(side) or {}).get("oid")
             w.posted.pop(side, None)
             w.trips += 1   # the ratchet still counts every trip
             w.opens[side] = {"entry": price_cents, "fill_ts": now,
                              "count": max(1, count),
                              "take_oid": None, "take_proposed": False,
-                             "collapse_polls": 0, "det_ts": None}
+                             "collapse_polls": 0, "det_ts": None,
+                             "entry_oid": entry_oid, "defer_polls": 0}
             return
         w.fills[side] = price_cents
         if w.first_fill_ts is None:
@@ -345,6 +452,9 @@ class LaneFlip:
             hunt["count"] -= sold
             if hunt["count"] <= 0:
                 w.hunts.pop(side, None)
+                # FLIP-COUNT-2 §3.2: the old leg concluded — a buffered
+                # late fill re-opens NOW, position-aware, never orphaned
+                self._promote_late_fill(w, market, side, now)
             return
         # P21 A5: an OPEN exit realizes against ITS entry. NO scratch count —
         # the patient hold has no scratches, only TAKE / DETERMINED / YIELD.
@@ -355,6 +465,7 @@ class LaneFlip:
             o["count"] -= sold
             if o["count"] <= 0:
                 w.opens.pop(side, None)
+                self._promote_late_fill(w, market, side, now)
             # P26 §3.1: ANY OPEN exit consumes the window's one shot — the
             # pop above no longer re-opens the door (the located loophole).
             w.open_consumed = True
@@ -598,6 +709,11 @@ class LaneFlip:
         for side, h in list(w.hunts.items()):
             if h.get("done"):
                 continue
+            # FLIP-COUNT-2 §3.1: an exit fires only on a FULLY-BOOKED
+            # position — a partial in flight defers (bounded, then the
+            # remainder cancels loudly). The 191030 race dies here.
+            if self._defer_or_cancel_partial(h, market, side):
+                continue
             mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
             # JOB A: the take, posted the instant the entry fills.
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
@@ -680,6 +796,10 @@ class LaneFlip:
         for side, o in list(w.opens.items()):
             if o.get("done"):
                 continue
+            # FLIP-COUNT-2 §3.1: never exit a partial — defer until the
+            # entry is fully booked (bounded; then cancel the remainder)
+            if self._defer_or_cancel_partial(o, market, side):
+                continue
             mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
             # TAKE — posted the instant the entry books (the maker intent).
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
@@ -739,17 +859,20 @@ class LaneFlip:
 
     def _check_uncovered(self, w: FlipWindow, market: str,
                          proposals: List[Order]) -> None:
-        """FLIP-COUNT-1 §2.3: if the booked ledger holds more FLIP contracts
-        on a side than the resting exits cover — and no exit is being
-        proposed this cycle to close the gap — the tape gets a
-        FLIP_UNCOVERED_LEG row and the phone gets a page, ONCE per
-        (market, close_ts, side), with bucket provenance (Scientist: which
-        custody dict lost the contract is the debugging fact)."""
+        """FLIP-COUNT-1 §2.3 + FLIP-COUNT-2 §3.3: if the booked ledger holds
+        more FLIP contracts on a side than the resting exits cover — and no
+        exit is being proposed this cycle — the tape gets a
+        FLIP_UNCOVERED_LEG row, the phone gets a page, AND the leg is
+        COVERED: a position-aware custody record opens for the gap so the
+        normal exit path handles it next cycle (an alarm that names an
+        uncomputed loss-term is only half the job). Cover-once guard
+        (Adversary c): a leg that is STILL uncovered after its heal is an
+        integrity fault — FATAL loud, not a retry loop."""
         from . import failures
         proposing = {p.side for p in proposals
                      if p.action == "sell" and p.purpose in ("EXIT", "CUT")}
         for side in ("yes", "no"):
-            if side in proposing or side in w.uncovered_paged:
+            if side in proposing:
                 continue
             held = self._booked_held(market, side)
             if held is None or held <= 0:
@@ -767,7 +890,16 @@ class LaneFlip:
             if side in w.takes_posted:
                 covered += w.take_counts.get(side, 1)
                 provenance.append(f"fills:{w.fills.get(side)}")
-            if held > covered:
+            if held <= covered:
+                continue
+            # a live (not-done) record with its take pending proposal will
+            # cover on the next cycle — that is the normal path, not a leak
+            if ((h is not None and not h.get("done")
+                 and not h.get("take_proposed"))
+                    or (o is not None and not o.get("done")
+                        and not o.get("take_proposed"))):
+                continue
+            if side not in w.uncovered_paged:
                 w.uncovered_paged.add(side)
                 failures.fail(
                     "FLIP_UNCOVERED_LEG",
@@ -775,6 +907,48 @@ class LaneFlip:
                     fatal=False, alert=True, market=market, side=side,
                     held=held, covered=covered,
                     buckets=";".join(provenance) or "none")
+                self._heal_uncovered(w, market, side, held - covered)
+            elif side in w.uncovered_healed:
+                failures.fail(
+                    "FLIP_UNCOVERED_UNHEALABLE",
+                    f"{market} {side}: held {held} > covered {covered} "
+                    "AFTER a self-heal — a leg that cannot be covered is "
+                    "an integrity fault, not a retry",
+                    fatal=True, market=market, side=side,
+                    held=held, covered=covered)
+
+    def _heal_uncovered(self, w: FlipWindow, market: str, side: str,
+                        gap: int) -> None:
+        """§3.3: cover the uncovered — revive the closed record (its own
+        entry price keeps realization honest) or open a fresh one at the
+        ledger's booked entry, sized to the gap. The normal exit machinery
+        (take / determined / yield, all booked-net clamped) owns it from
+        the next cycle."""
+        w.uncovered_healed.add(side)
+        w.late_fills.pop(side, None)          # absorbed into the healed leg
+        for bucket in (w.hunts, w.opens):
+            rec = bucket.get(side)
+            if rec is not None:               # revive the closed record
+                rec.update(done=False, take_proposed=False, take_oid=None,
+                           count=gap, defer_polls=0)
+                log.warning("FLIP_UNCOVERED self-heal %s %s: revived closed "
+                            "record x%d @ %dc", market, side, gap,
+                            rec["entry"])
+                return
+        entry = None
+        ledger = getattr(self.gateway, "ledger", None) if self.gateway else None
+        if ledger is not None:
+            row = ledger.db.execute(
+                "SELECT price_cents FROM fills WHERE market=? AND lane='FLIP'"
+                " AND side=? AND action='ENTRY' AND settled=0"
+                " ORDER BY id DESC LIMIT 1", (market, side)).fetchone()
+            entry = row[0] if row else None
+        w.opens[side] = {"entry": entry if entry is not None else 50,
+                         "fill_ts": 0.0, "count": gap, "take_oid": None,
+                         "take_proposed": False, "collapse_polls": 0,
+                         "det_ts": None, "entry_oid": None, "defer_polls": 0}
+        log.warning("FLIP_UNCOVERED self-heal %s %s: opened fresh record "
+                    "x%d @ %sc (booked entry)", market, side, gap, entry)
 
     def _cancel_resting(self, o: dict) -> None:
         """Cancel an OPEN position's resting exit (take or determined maker)
