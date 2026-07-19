@@ -108,6 +108,136 @@ def test_collapse_counts_pre_window_but_fires_only_after(flip, gateway,
     assert len(cuts) == 1 and "collapse" in cuts[0].reason
 
 
+# ── §3.5/§4 stage 3: the T-10 handoff + F coordination ─────────────────────
+def _stub_shared(inv, side="yes", cost=96):
+    """A minimal FH8Shared-shaped stub: F decides to buy `side` at `cost`;
+    the shared inventory answers `inv`."""
+    from types import SimpleNamespace
+
+    class _S:
+        def __init__(self):
+            self.flip_inventory = lambda market: inv
+            self.stands_down_logged = set()
+
+        def decide(self, market, ctx):
+            return ("PROPOSE", SimpleNamespace(
+                lane="F", side=side, cost_cents=cost, rest_fp=None,
+                breakeven_pct=None, spot_price=None, distance_pct=None))
+
+        def to_order(self, market, res):
+            from relay_engine.gateway import Order
+            return Order(lane="F", event=EVENT, market=market,
+                         side=res.side, action="buy",
+                         price_cents=res.cost_cents, count=1,
+                         size_tier=config.TIER_PROBE, purpose="ENTRY",
+                         why=f"F tier{res.cost_cents}")
+    return _S()
+
+
+def test_f_stands_down_when_flip_holds_the_side(caplog):
+    """§5: FLIP holds X, market decides X, F would buy X → F_STANDS_DOWN,
+    F does NOT buy — one position, held at FLIP's cheaper basis."""
+    import logging
+
+    from relay_engine.lanes import LaneF
+    lane = LaneF(_stub_shared({"yes": {"count": 1, "basis": 49}}))
+    with caplog.at_level(logging.WARNING, logger="relay.lanes"):
+        d = lane.evaluate(TICKER, {"now": 0.0})
+    assert d.proposal is None and d.pass_reason == "F_STANDS_DOWN"
+    line = next(r.message for r in caplog.records
+                if "F_STANDS_DOWN" in r.message)
+    assert "flip_basis=49c" in line and "f_would_pay=96c" in line
+    # logged once per (market, side); the stand-down itself repeats
+    with caplog.at_level(logging.WARNING, logger="relay.lanes"):
+        d2 = lane.evaluate(TICKER, {"now": 1.0})
+    assert d2.pass_reason == "F_STANDS_DOWN"
+
+
+def test_f_buys_freely_when_flip_does_not_hold_the_side():
+    """§5: market decides Y against FLIP's X — F is free to act on Y (and
+    coordination never double-buys: the gate keys on the SIDE)."""
+    from relay_engine.lanes import LaneF
+    lane = LaneF(_stub_shared({"yes": {"count": 1, "basis": 49}},
+                              side="no", cost=96))
+    d = lane.evaluate(TICKER, {"now": 0.0, "spotlead": None})
+    assert d.proposal is not None and d.proposal.side == "no"
+
+
+def test_runner_wires_the_shared_inventory(tmp_path):
+    """§4 atomicity (Adversary b): ONE inventory object — the F evaluator's
+    read IS LaneFlip.held, wired at engine construction."""
+    from relay_engine.shadow_runner import ShadowEngine
+    e = ShadowEngine(db_path=str(tmp_path / "wire.db"))
+    assert e.fh8_shared.flip_inventory == e.flip.held
+    failures._ledger = None
+
+
+def test_t10_handoff_winner_left_to_f_not_sold(flip, gateway, ledger,
+                                               caplog):
+    """§5: winner at T-10 → NOT sold; converted to hold-to-settle at
+    FLIP's basis; the shared inventory still shows the side so F stands
+    down; no UNCOVERED page for the deliberate hold."""
+    import logging
+    o = _open_position(flip, gateway, ledger)          # yes @ 48
+    p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
+    flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
+                      "OID-T1", CLOSE - 780)
+    with caplog.at_level(logging.WARNING, logger="relay.lane_flip"):
+        props = flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=599))
+    assert props == []                                 # nothing SOLD
+    assert o["hold"] is True
+    assert any("FLIP_HOLD_TO_SETTLE" in r.message
+               and "T-10-handoff-winner" in r.message
+               for r in caplog.records)
+    assert flip.held(TICKER) == {"yes": {"count": 1, "basis": 48}}
+    # the hold is deliberate: cycles pass, zero UNCOVERED pages
+    flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=598))
+    assert ledger.db.execute(
+        "SELECT COUNT(*) FROM failures WHERE why_tag='FLIP_UNCOVERED_LEG'"
+    ).fetchone()[0] == 0
+
+
+def test_t10_handoff_flat_hands_off_nothing(flip):
+    """§5: flat at T-10 → no handoff artifact; F's window is simply F's."""
+    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=599)) == []
+    assert flip.held(TICKER) == {}
+
+
+def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
+    """Adversary (a): the hold-to-settle is NOT exempt from the
+    determined floor — a deep reversal still cuts; never a ride to zero."""
+    o = _open_position(flip, gateway, ledger)
+    p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
+    flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
+                      "OID-T1", CLOSE - 780)
+    flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=599))  # convert
+    assert o["hold"] is True
+    # inside the patience floor the reversal is still noise (custodian's
+    # catastrophic backstop guards the gap); past it, the cut fires
+    assert [p for p in flip.evaluate(TICKER, _ctx(_book(yes=40),
+                                                  secs_left=580))
+            if p.purpose == "CUT"] == []
+    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=40),
+                                                  secs_left=480))
+            if p.purpose == "CUT"]
+    assert len(cuts) == 1 and "determined-against" in cuts[0].reason
+
+
+def test_f_agrees_conversion_pre_t10(flip, gateway, ledger, caplog):
+    """§4: post-patience, the mark runs through F's band floor (95¢) with
+    the take unfilled → convert to hold-to-settle, reason F-agrees."""
+    import logging
+    o = _open_position(flip, gateway, ledger)
+    p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
+    flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
+                      "OID-T1", CLOSE - 780)
+    o["fill_ts"] = CLOSE - 1100                        # patience elapsed
+    with caplog.at_level(logging.WARNING, logger="relay.lane_flip"):
+        props = flip.evaluate(TICKER, _ctx(_book(yes=95), secs_left=700))
+    assert props == [] and o["hold"] is True
+    assert any("reason=F-agrees" in r.message for r in caplog.records)
+
+
 # ── §3 stage 2: the retune — ~20¢ scalp target, T-10 entry cutoff ──────────
 def test_scalp_take_rests_at_entry_plus_20(flip, gateway, ledger):
     """§5: entry 49¢, the market swings — the take rests at ~entry+20

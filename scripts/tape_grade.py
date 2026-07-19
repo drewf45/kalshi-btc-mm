@@ -504,10 +504,13 @@ def check_open_exits_intentional(db, since):
         "SELECT detail FROM surface_rows WHERE lane='FLIP' AND"
         " state='PROPOSED' AND detail LIKE '%reason=open %' AND ts>?",
         (since,)).fetchall()
+    # P-FLIP-THESIS-1 §3.5: "open yield" retired for the T-10 book-aware
+    # handoff — the loser-clear is an intentional exit; "open yield" stays
+    # for historical rows.
     bad = sum(1 for (d,) in rows
               if not any(tok in d for tok in
                          ("open take", "open determined", "open curfew",
-                          "open yield")))
+                          "open yield", "open T-10 handoff")))
     try:
         from relay_engine.lane_flip import flip_cut_params
         p = flip_cut_params()

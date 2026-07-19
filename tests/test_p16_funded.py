@@ -56,7 +56,11 @@ def test_profile_block_prints_every_lane():
     assert "PROFILE — bank small wins, every lane, every market:" in tape
     # P21 A4/A5: FLIP's PAIR line retired — the profile now speaks HUNT
     # (fast intent) and OPEN (patient intent) separately.
-    for token in ("FLIP/HUNT: needle", "FLIP/OPEN: band", "PATIENT HOLD",
+    # P-FLIP-THESIS-1: "PATIENT HOLD…YIELD@T-6" became the thesis line —
+    # patient hold with a floor, T-10 book-aware handoff, F stands down
+    for token in ("FLIP/HUNT: needle", "FLIP/OPEN: band",
+                  "FLIP THESIS: buy cheap", "patient hold",
+                  "T-10 book-aware handoff", "F stands down",
                   "PAIR retired", "F: hold-to-settlement",
                   "H8: delta-gated", "D: cheap entry", "P: displacement fade",
                   "ORPHAN: adopted at boot", "WALLS: gross+net",

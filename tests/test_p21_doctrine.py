@@ -196,10 +196,10 @@ def test_determined_against_needle_collapse_sustained(flip, gateway):
     assert "ΔP-collapse" in props[0].reason
 
 
-def test_open_yield_flattens(flip, gateway):
-    """Exit three of three, P26 §3.3: YIELD — OPEN is flat by T-6
-    (YIELD_TO_F, crossfire); F owns the endgame floor and the SELF_NET
-    storm class dies by schedule. (Was CURFEW at T-4 pre-P26.)"""
+def test_t10_handoff_clears_the_loser(flip, gateway):
+    """P-FLIP-THESIS-1 §3.5 OVERTURNED the blind T-6 YIELD_TO_F flat: at
+    T-10 the handoff is BOOK-AWARE — a side below basis is SOLD before
+    F's window (crossfire), never dumped into the settlement zone."""
     _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
@@ -207,7 +207,8 @@ def test_open_yield_flattens(flip, gateway):
                                        secs_left=config.OPEN_FLAT_BY - 1))
     assert len(props) == 1
     assert props[0].purpose == "CUT" and props[0].crossfire
-    assert "open yield to F" in props[0].reason
+    assert "open T-10 handoff" in props[0].reason
+    assert props[0].price_cents == 47                 # sold at the mark, now
 
 
 def test_open_exit_realizes_no_scratch_count(flip, gateway):

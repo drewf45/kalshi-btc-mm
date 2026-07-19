@@ -181,6 +181,11 @@ class ShadowEngine:
                                     custodian=self.custodian)
         self.fh8_shared = self.lanes[0].shared  # LaneF/LaneH8 shared evaluator
         self.flip = self.lanes[2].flip          # LaneFlip (arbitration slot 3)
+        # P-FLIP-THESIS-1 §4: ONE shared inventory — F consults FLIP's held
+        # state before buying a decided side (F_STANDS_DOWN). Atomic per
+        # cycle: F evaluates first in registry order; fills book between
+        # cycles, so the read is the cycle-start snapshot (Adversary b).
+        self.fh8_shared.flip_inventory = self.flip.held
         from .fills import FillBooker
         self.fills = FillBooker(self.gateway, self.ledger, self.surface,
                                 custodian=self.custodian,

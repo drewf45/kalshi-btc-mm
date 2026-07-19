@@ -147,9 +147,13 @@ TABLE_AUTOBUILD = os.environ.get("TABLE_AUTOBUILD", "true").lower() == "true"
 # window T-15→T-10; F owns the final five minutes. No fresh scalp
 # inventory once secs_left <= 600.
 OPEN_ENTRY_CUTOFF = 600           # no OPEN entries once secs_left <= this
-OPEN_FLAT_BY = 360                # OPEN flat by T-6 (YIELD_TO_F, crossfire)
-# ^ stage 3 of P-FLIP-THESIS-1 moves this to 600 WITH the book-aware
-# handoff semantics — the constant and its behavior ship together.
+# P-FLIP-THESIS-1 §3.5 (DREW-RULED, was 360/T-6 blind YIELD_TO_F
+# crossfire): at T-10 the handoff is BOOK-AWARE, per position — a winner
+# (mark at/above basis) is LEFT TO F as hold-to-settle at FLIP's cheap
+# basis (F stands down via shared inventory, §4); a loser is SOLD now,
+# never dumped into the settlement zone; flat hands off nothing. F owns
+# the final five minutes uncontested.
+OPEN_FLAT_BY = 600                # T-10: the book-aware handoff boundary
 # §3.4: geometry gate — determined trigger tightens to entry−drop (floored
 # at the band), and entry requires risk <= TAKE+1 or pass OPEN_BAD_GEOMETRY.
 OPEN_DETERMINED_DROP = 6

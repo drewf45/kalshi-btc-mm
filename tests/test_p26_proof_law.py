@@ -176,14 +176,17 @@ def test_evacuation_crosses_at_trigger_price(flip, gateway):
     assert abs(p.price_cents - trigger) <= 2
 
 
-def test_yield_to_f_at_flat_by(flip, gateway):
+def test_t10_handoff_replaces_yield_to_f(flip, gateway):
+    """P-FLIP-THESIS-1 §3.5 OVERTURNED §3.3's blind YIELD_TO_F: the T-10
+    boundary is a book-aware handoff — this loser (47 < 48 basis) clears
+    with crossfire; a winner would convert to hold-to-settle instead."""
     _open_position(flip, gateway)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     props = flip.evaluate(TICKER, _ctx(_book(yes=47, no=50),
                                        secs_left=config.OPEN_FLAT_BY - 1))
     assert len(props) == 1 and props[0].crossfire
-    assert "YIELD_TO_F" in props[0].reason
+    assert "open T-10 handoff" in props[0].reason
 
 
 def test_open_entry_schedule(flip):

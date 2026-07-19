@@ -817,20 +817,46 @@ class LaneFlip:
                     purpose="EXIT",
                     reason=f"open take entry+{config.OPEN_TAKE_CENTS}"))
                 continue
-            # YIELD — §3.3: flat by T-6; F owns the endgame floor
-            if secs <= config.OPEN_FLAT_BY:
+            # P-FLIP-THESIS-1 §4 — HOLD-INSTEAD-OF-SCALP: at the patience
+            # assessment, a side deciding in FLIP's favor hard enough that
+            # F would be buying it (mark through F's band floor) converts —
+            # never sell the scalp and re-buy high; the 49c basis IS the
+            # settlement position. Determined-against stays armed on the
+            # hold (Engineer: a hold-to-settle is not exempt).
+            if (not o.get("hold")
+                    and now - o["fill_ts"] >= config.OPEN_PATIENCE_S
+                    and mark is not None):
+                from .lane_fh8 import COST_BAND_LO_INT
+                if mark >= COST_BAND_LO_INT:
+                    self._convert_to_hold(o, market, side, mark, "F-agrees")
+                    continue
+            # §3.5 T-10 BOOK-AWARE HANDOFF (replaces the blind YIELD_TO_F
+            # flat): per position, never reflexive. Winner (mark at/above
+            # basis) -> LEFT TO F as hold-to-settle at FLIP's cheap basis;
+            # loser -> SOLD now, never dumped into the settlement zone.
+            if secs <= config.OPEN_FLAT_BY and not o.get("hold"):
+                if mark is None:
+                    continue    # no book truth: never a BLIND flat; retry
+                if mark >= o["entry"]:
+                    self._convert_to_hold(o, market, side, mark,
+                                          "T-10-handoff-winner")
+                    continue
                 self._cancel_resting(o)
                 o["done"] = True
                 n = self._exit_count(market, side, o["count"])
                 if n > 0:
                     props.append(Order(
                         lane="FLIP", event=event, market=market, side=side,
-                        action="sell",
-                        price_cents=mark if mark is not None else o["entry"],
-                        count=n, size_tier=config.TIER_PROBE,
+                        action="sell", price_cents=mark, count=n,
+                        size_tier=config.TIER_PROBE,
                         purpose="CUT", crossfire=True,
-                        reason="open yield to F (YIELD_TO_F flat by T-6)"))
+                        reason="open T-10 handoff: clear loser before "
+                               "F's window"))
                 continue
+            if o.get("hold"):
+                # held to settlement — no scalp take, no yield; the
+                # determined-against floor below still guards it
+                pass
             # DETERMINED-AGAINST — §3.4 v2 trigger; §3.2 evacuate NOW
             det_trigger = max(lo_u, o["entry"] - config.OPEN_DETERMINED_DROP)
             collapse = (sl is not None and sl.side != side
@@ -900,6 +926,12 @@ class LaneFlip:
                 provenance.append(f"fills:{w.fills.get(side)}")
             if held <= covered:
                 continue
+            # P-FLIP-THESIS-1: a HOLD-TO-SETTLE deliberately rests no exit
+            # — its loss-term lives in the determined floor + custodian
+            # backstop, not a resting take. Never a leak, never a page.
+            if ((h is not None and h.get("hold"))
+                    or (o is not None and o.get("hold"))):
+                continue
             # a live (not-done) record with its take pending proposal will
             # cover on the next cycle — that is the normal path, not a leak
             if ((h is not None and not h.get("done")
@@ -957,6 +989,42 @@ class LaneFlip:
                          "det_ts": None, "entry_oid": None, "defer_polls": 0}
         log.warning("FLIP_UNCOVERED self-heal %s %s: opened fresh record "
                     "x%d @ %sc (booked entry)", market, side, gap, entry)
+
+    def _convert_to_hold(self, o: dict, market: str, side: str, mark,
+                         reason: str) -> None:
+        """P-FLIP-THESIS-1 §4/§3.5: the scalp becomes the settlement
+        position — cancel the resting take, keep the inventory at FLIP's
+        cheap basis, and let F stand down (shared inventory). The position
+        stays under the determined-against floor and the custodian's
+        backstop (salvage-anchored at fill time by the B1 wiring) — a held
+        winner that reverses is still cut, never ridden to zero."""
+        self._cancel_resting(o)
+        o["hold"] = True
+        o["take_proposed"] = True     # the scalp take never re-proposes
+        log.warning("FLIP_HOLD_TO_SETTLE %s %s basis=%dc mark=%sc x%d "
+                    "reason=%s — left to F at the cheaper basis",
+                    market, side, o["entry"], mark, o["count"], reason)
+
+    def held(self, market: str) -> Dict[str, dict]:
+        """§4 THE SHARED INVENTORY: side -> {count, basis} of live FLIP
+        custody (scalp or hold) on this market. F consults this BEFORE
+        buying a decided side (Adversary: atomic per cycle — F evaluates
+        first in registry order and fills book between cycles, so this
+        read IS the cycle-start snapshot)."""
+        w = self.windows.get(market)
+        if w is None:
+            return {}
+        out: Dict[str, dict] = {}
+        for bucket in (w.hunts, w.opens):
+            for side, rec in bucket.items():
+                if rec.get("done") and not rec.get("hold"):
+                    continue
+                if rec["count"] > 0:
+                    out[side] = {"count": rec["count"],
+                                 "basis": rec["entry"]}
+        for side, px in w.fills.items():
+            out.setdefault(side, {"count": 1, "basis": px})
+        return out
 
     def _cancel_resting(self, o: dict) -> None:
         """Cancel an OPEN position's resting exit (take or determined maker)

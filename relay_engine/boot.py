@@ -110,15 +110,22 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"{config.HUNT_TAKE_CENTS} · Job-B fast bails (P18)")
     lines.append(f"  FLIP/OPEN: band {config.OPEN_BAND[0]}-"
                  f"{config.OPEN_BAND[1]}¢ + grain≥{config.OPEN_MIN_GRAIN} "
-                 f"· join ≤{config.OPEN_MAX_ENTRY_CENTS}¢ · T-15→T-8 · "
+                 f"· join ≤{config.OPEN_MAX_ENTRY_CENTS}¢ · T-15→T-10 · "
                  "one shot/window · margin printed (info — P27 §2b) · "
-                 f"PATIENT HOLD within entry−{config.OPEN_DETERMINED_DROP} — "
-                 f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED/"
-                 "YIELD@T-6, evacuations cross (P26 §2-3; PAIR retired)")
+                 f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED "
+                 "(post-patience)/T-10 handoff, evacuations cross "
+                 "(P26 §3.2; P-FLIP-THESIS-1; PAIR retired)")
     lines.append("  FLIP: every contract flipped — same-side fills merge "
                  "even across partial-fill timing; exits fire only on "
                  "booked-net; UNCOVERED self-heals then FATALs "
                  "(P-FLIP-COUNT-2)")
+    lines.append(f"  FLIP THESIS: buy cheap into ~50/50, patient hold "
+                 f"({config.OPEN_PATIENCE_S // 60}min floor, no reflexive "
+                 f"cut), scalp ~{config.OPEN_TAKE_CENTS}¢ into the swing OR "
+                 "hold-to-settle when F agrees (shared inventory, F stands "
+                 "down); T-10 book-aware handoff — winners left to F at "
+                 "basis, losers cleared; determined-against cuts a genuine "
+                 "loser post-window (P-FLIP-THESIS-1)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

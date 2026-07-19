@@ -15,12 +15,15 @@ This module holds no capital state; proposals go to the gateway, which owns the
 walls. (Win/loss path symmetry lives where the capital lives.)
 """
 
+import logging
 import time
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
+
+_log = logging.getLogger("relay.lanes")
 
 from . import config, lane_fh8
 from .book import OrderBook
@@ -82,6 +85,11 @@ class FH8Shared:
                       else lane_fh8.FH8Stats())
         self.ladders: Dict[str, lane_fh8.WatchLadder] = {}
         self._cache: Dict[str, tuple] = {}  # market -> (now, outcome)
+        # P-FLIP-THESIS-1 §4: THE SHARED INVENTORY — wired by the runner to
+        # LaneFlip.held; F consults it before buying a decided side. The
+        # default (empty) keeps ported-lane tests byte-identical.
+        self.flip_inventory = lambda market: {}
+        self.stands_down_logged: set = set()
 
     def decide(self, market: str, ctx: dict):
         """Returns ('PASS', reason) or ('PROPOSE', EvalResult)."""
@@ -203,6 +211,27 @@ class _PortedLane(Lane):
     def evaluate(self, market: str, ctx: dict) -> Decision:
         kind, payload = self.shared.decide(market, ctx)
         if kind == "PROPOSE" and payload.lane == self.name:
+            # P-FLIP-THESIS-1 §4 — F STANDS DOWN: before F buys a decided
+            # side it consults the shared inventory; if FLIP already holds
+            # it (any count), the position exists at a BETTER basis — never
+            # pay 95c for what the book holds at 49c. Logged once per
+            # (market, side) so the saved cost is visible on the tape.
+            if self.name == "F":
+                inv_fn = getattr(self.shared, "flip_inventory", None)
+                inv = inv_fn(market) if inv_fn is not None else {}
+                rec = inv.get(getattr(payload, "side", None))
+                if rec is not None:
+                    key = (market, payload.side)
+                    if key not in self.shared.stands_down_logged:
+                        self.shared.stands_down_logged.add(key)
+                        _log.warning(
+                            "F_STANDS_DOWN %s %s held_by=FLIP x%d "
+                            "flip_basis=%dc f_would_pay=%dc — the position "
+                            "exists at the better basis", market,
+                            payload.side, rec["count"], rec["basis"],
+                            payload.cost_cents)
+                    return Decision(self.name, market, None,
+                                    pass_reason="F_STANDS_DOWN")
             order = self.shared.to_order(market, payload)
             # P18 §4.1: shared eyes, not orders — the spot-lead signal rides
             # the why-tag (gates UNTOUCHED); Saturday measures whether the
