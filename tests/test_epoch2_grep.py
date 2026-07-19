@@ -38,8 +38,10 @@ def test_monolith_quarantined_and_never_imported():
 def test_no_paid_command():
     """/paid is retired. The surface is the accounting pair plus /reset_halt
     (P8 §2.3 — Drew's key to the two-strike leash; entries only) plus
-    /scoreboard (P22 §5 — read-only, the one commanded addition)."""
+    /scoreboard (P22 §5 — read-only, the one commanded addition) plus
+    /clear_cash_fatal (P-CASH-FATAL-1 §4.4 — the only key to a denied
+    delta; a restart is not)."""
     from relay_engine.ops import Telegram
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
-                                 "/scoreboard")
+                                 "/scoreboard", "/clear_cash_fatal")
     assert "/paid" not in Telegram.COMMANDS

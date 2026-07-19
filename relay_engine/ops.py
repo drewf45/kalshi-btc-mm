@@ -31,7 +31,10 @@ class Telegram:
     nothing, changes nothing — accounting-read only). The old tree's richer
     command set does NOT port (single-gateway law outranks nostalgia)."""
 
-    COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard")
+    # P-CASH-FATAL-1 §4.4: /clear_cash_fatal — the ONLY key to a denied
+    # cash delta (a restart is not); symmetric with /reset_halt.
+    COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard",
+                "/clear_cash_fatal")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
@@ -92,6 +95,8 @@ class Telegram:
             return self.reset_halt_fn()
         if cmd == "/scoreboard":
             return self.scoreboard_fn()
+        if cmd == "/clear_cash_fatal":
+            return self.cash.clear_cash_fatal()
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 

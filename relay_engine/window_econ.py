@@ -206,6 +206,19 @@ class WindowEcon:
                           f"{fills_pnl_cents}c (tolerance {DIVERGENCE_TOLERANCE_CENTS}c)",
                           broker_pnl=window_pnl, fills_pnl=fills_pnl_cents,
                           market=market)
+            # P-CASH-FATAL-1 §4.6 (stopgap until E1): the window's settlement
+            # value is DISPUTED — quarantine it from the book and re-book at
+            # fills-truth. The 190945 phantom (+103c the fills said was +4c)
+            # entered the book here, then armed the deny-reboot breach; a
+            # divergent number never again silently inflates the book that
+            # cash reconciles against.
+            phantom = self.ledger.quarantine_divergent_settlements(
+                market, fills_pnl_cents)
+            if phantom:
+                self.telegram.alert(
+                    f"🧾 DIVERGENT settlement {market}: {phantom:+d}c "
+                    f"quarantined from the book — fills-truth "
+                    f"{fills_pnl_cents}c booked instead (E1 traces the source)")
 
         self.ledger.db.execute(
             "UPDATE window_econ SET close_value_cents=?, cash_moves_cents=?,"

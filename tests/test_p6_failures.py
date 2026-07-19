@@ -229,11 +229,12 @@ def test_telegram_unwired_shadow_falls_back_to_log(monkeypatch, cash):
 
 def test_command_surface_is_exactly_the_whitelist(cash):
     """The pair + /reset_halt (P8 §2.3) + /scoreboard (P22 §5 — the ONE
-    read-only addition, Drew's word; it places nothing, changes nothing).
-    Still no order-shaped command, ever."""
+    read-only addition, Drew's word; it places nothing, changes nothing)
+    + /clear_cash_fatal (P-CASH-FATAL-1 §4.4 — the only key to a denied
+    delta). Still no order-shaped command, ever."""
     tg = Telegram(cash, send_fn=lambda m: None)
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
-                                 "/scoreboard")
+                                 "/scoreboard", "/clear_cash_fatal")
     for stray in ("/resume_yes", "/paid", "/buy KXBTC15M 5", "/status", "hello"):
         assert "accounting commands only" in tg.handle_command(stray)
     assert tg.handle_command("/reset_halt") == "no halt manager wired"

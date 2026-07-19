@@ -134,6 +134,9 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("GOVERNOR: halt-only — walls stop bugs, custody stops "
                  "losses, the two-strike account halt stops bad days, "
                  "NOTHING stops trading (P27; era stamped on every cell row)")
+    lines.append("CASH INTEGRITY: fatal + pending prompt persist across boot "
+                 "(P-CASH-FATAL-1); deny outranks boot baseline; "
+                 "/clear_cash_fatal is the only key")
     # P21 B1: the boot cites the doctrine — one page says what the machine
     # believes, why, and what would change its mind. Cited, and verified
     # present (a missing registry is worth a loud boot line, never a crash).

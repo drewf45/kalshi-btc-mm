@@ -173,6 +173,9 @@ class ShadowEngine:
         from .rest_feed import RestFeed
         self.feed = RestFeed(self.ladder, recorder=self.recorder)
         self.gateway = Gateway(self.ledger, self.surface)
+        # P-CASH-FATAL-1: the cash protocol's stops reach the GATEWAY WALL —
+        # pre-fix its entries_halted/fatal flags were read by no one.
+        self.cash.gateway = self.gateway
         self.custodian = Custodian(self.gateway, self.ledger, self.surface, ladder=self.ladder)
         self.lanes = build_registry(self.ledger, gateway=self.gateway,
                                     custodian=self.custodian)
@@ -499,7 +502,13 @@ class ShadowEngine:
         self.telegram.alert(f"{tag}\n{msg[:600]}")
 
     def boot(self, auth_line=None):
-        if config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0:
+        # P-CASH-FATAL-1 §4.3 (Engineer: this ORDER is load-bearing): the
+        # operator's durable cash stops restore BEFORE any baseline — the
+        # deny-reboot breach was exactly an amnesiac re-baseline running
+        # ahead of a stop nobody had persisted.
+        self.cash.restore_on_boot()
+        if (config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0
+                and not self.cash.fatal):
             # Paper bankroll so budget walls exercise realistically (paper only).
             self.ledger.baseline(int(config.SHADOW_PAPER_BANKROLL_USD * 100),
                                  confirmed_by="shadow_paper_boot")
@@ -525,6 +534,10 @@ class ShadowEngine:
         # P17 §1.3/§1.4: heal across restarts — reload open brackets (so the
         # settle sweep retries stuck windows) and mark evidence holes.
         self.econ.restore_open_brackets_on_boot()
+        # P-CASH-FATAL-1 §4.5 (defense in depth): every durable stop the DB
+        # knows must be honored on the wall before the first cycle — or
+        # FATAL loud rather than trade.
+        print(self.audit_durable_stops(), flush=True)
         self.gap_restart_scan()
         # P19 §2.5: the promotion — P26 §3.5 fold: paged ONCE per DEPLOY
         # (ledger-keyed dedup; the 6:22 restart double-page was cosmetic,
@@ -621,6 +634,40 @@ class ShadowEngine:
         if val is None:
             return 0
         return self.econ.flush_deferred(val, src, now=now)
+
+    def audit_durable_stops(self) -> str:
+        """P-CASH-FATAL-1 §4.5: ONE boot assertion that every durable stop
+        persisted in the DB is loaded AND honored on the gateway wall
+        before the first cycle. A stop the DB knows and the wall doesn't
+        is the deny-reboot breach shape — FATAL loud rather than trade.
+        Covers the whole class (two-strike, cash-fatal, pending prompt),
+        not just the stop that failed this time."""
+        from . import failures
+        from .ledger import (CASH_FATAL_KEY, CASH_FATAL_REASON,
+                             CASH_PENDING_KEY, CASH_PROMPT_REASON)
+        from .window_econ import HALT_KEY, HALT_REASON
+        wall = self.gateway.entries_halted_reasons
+        stops = []
+        if self.ledger.get_state(HALT_KEY) == "1":
+            stops.append(("two-strike", HALT_REASON in wall))
+        if self.ledger.get_state(CASH_FATAL_KEY) is not None:
+            stops.append(("cash-fatal",
+                          self.cash.fatal and CASH_FATAL_REASON in wall))
+        if self.ledger.get_state(CASH_PENDING_KEY) is not None:
+            stops.append(("cash-pending", self.cash.pending is not None
+                          and CASH_PROMPT_REASON in wall))
+        for name, honored in stops:
+            if not honored:
+                failures.fail(
+                    "STOP_AUDIT_FAILED",
+                    f"durable stop '{name}' present in DB but NOT honored "
+                    "on the gateway wall — refusing to trade",
+                    fatal=True, stop=name, wall=sorted(wall))
+        if stops:
+            return ("STOP AUDIT: "
+                    + " · ".join(f"{n}=HONORED" for n, _ in stops)
+                    + " — restored stops hold before the first cycle")
+        return "STOP AUDIT: no durable stops in DB — clean boot"
 
     def standing_reconcile(self, now=None) -> str:
         """P9 §3: every 60s in live — venue truth vs ledger expectation, routed

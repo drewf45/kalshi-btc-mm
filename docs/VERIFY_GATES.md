@@ -1235,6 +1235,55 @@ surviving ×1 rode to $0 (−$0.43).
   to booked, zero-clamp no-order, full/partial note_exit realization,
   uncovered-leg pages once with provenance). Suite 434 · preflight 23/23.
 
+## WO-CASH-FATAL-1 — "THE DENY-CASH REBOOT BREACH" (governance hot fix, one commit)
+
+**Incident (2026-07-19 ~09:44-09:56, read-rule TRUE at source):** a
+`/deny_cash` integrity FATAL lived only in memory (`CashProtocol.__init__`
+hardcoded `fatal=False`; `_go_fatal` wrote nothing; the runner builds a
+fresh protocol every boot). Each restart re-baselined the disputed cash to
+the venue and traded again — three deny → reboot → rebuy cycles. Upstream:
+a 99¢ WINDOW_ECON_DIVERGENCE phantom entered the book via a settlement
+value the fills could not reproduce. **Widened during the build (Adversary
+was right to be strict): `cash.entries_halted`/`fatal` were read by NO
+code path at all — the "entries HALTED" prompt was narration; the gateway
+wall never heard about any cash stop, reboot or no reboot.**
+
+- **§4.1-§4.2 durable + restored**: `_go_fatal` writes `cash_fatal` to
+  engine_state the moment it fires (the two-strike halt's proven pattern);
+  the negative-delta prompt writes `cash_pending` (Adversary: a reboot
+  mid-prompt resumes PROMPTED, never trading; the 30-min silence law
+  counts wall-clock across the restart). `restore_on_boot()` mirrors
+  `window_econ.restore_halt_on_boot` and both stops now halt the GATEWAY
+  WALL (`CASH_FATAL` / `CASH_PROMPT` reasons) — enforcement, not narration.
+- **§4.3 deny outranks baseline (Engineer: the ORDER is load-bearing)**:
+  `ShadowEngine.boot()` restores cash stops as its FIRST act, before any
+  baseline; `live_boot_reconcile` refuses to baseline under a restored
+  fatal (`FATAL_RESTORED`) — a crash loop can no longer launder a disputed
+  delta to zero. Custody of existing risk continues (halts stop new risk).
+- **§4.4 the only key**: `/clear_cash_fatal` (COMMANDS whitelist grows by
+  exactly one; symmetric with `/reset_halt`). Clearing is NOT accepting:
+  no re-baseline happens; a persisting delta re-prompts from scratch.
+- **§4.5 all-stops boot audit**: `audit_durable_stops()` — one boot
+  assertion that every persisted stop (two-strike, cash-fatal,
+  cash-pending) is loaded AND honored on the wall before the first cycle;
+  any stop the DB knows and the wall doesn't → STOP_AUDIT_FAILED, FATAL
+  loud rather than trade. Closes the class, not the instance.
+- **§4.6 DIVERGENT quarantine (stopgap until E1)**: settlements gain a
+  `divergent` flag excluded from `book_cents`/lifetime; on
+  WINDOW_ECON_DIVERGENCE the window's settlement rows are tagged and the
+  window re-books at fills-truth, paged with the removed phantom. A
+  broker number the fills can't reproduce never again silently inflates
+  the book that cash reconciles against.
+- **Out of scope honored**: zero changes to F/FLIP order placement, bands,
+  gates, sizing (the orders were valid; the gate was missing). E1
+  (99¢ root cause) and E2 (reboot provenance) remain routed to Saturday.
+- **Tests**: `tests/test_cash_fatal1.py` — 10 (deny persists → reboot
+  restores → wall refuses → /clear_cash_fatal only; the exact 3× loop
+  dead; pending prompt survives + confirm still works + expiry across
+  reboot; live-boot refuses baseline under fatal; stop audit honors and
+  FATALs; divergent quarantine + clean-settlement no-op; command routing).
+  COMMANDS-tuple test-laws updated with citation. Suite 444 · 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

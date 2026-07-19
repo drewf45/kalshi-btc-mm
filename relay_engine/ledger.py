@@ -14,6 +14,7 @@ through the same CASH_MOVEMENTS row).
 Single-writer law (§A1): this ledger opens the engine's OWN database file.
 """
 
+import json
 import sqlite3
 import threading
 import time
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS settlements (
     market TEXT NOT NULL,
     lane TEXT NOT NULL,
     pnl_cents INTEGER NOT NULL,
-    detail TEXT NOT NULL DEFAULT ''
+    detail TEXT NOT NULL DEFAULT '',
+    divergent INTEGER NOT NULL DEFAULT 0  -- P-CASH-FATAL-1 §4.6: disputed rows never enter the book
 );
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY,
@@ -171,18 +173,53 @@ class Ledger:
                 "ALTER TABLE cell_outcomes ADD COLUMN governor TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # column already present
+        # P-CASH-FATAL-1 §4.6: a settlement value the fills cannot reproduce
+        # is DISPUTED — the divergent flag keeps it out of book_cents.
+        try:
+            self.db.execute(
+                "ALTER TABLE settlements ADD COLUMN divergent INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already present
         self.db.commit()
         self.boot_caps: Optional[BootCaps] = None
 
     # ----- book value (EPOCH 2: cash movements + settlements, nothing else) -----
     def book_cents(self) -> int:
+        # P-CASH-FATAL-1 §4.6: divergent settlement rows are DISPUTED —
+        # they never inflate the book that cash then reconciles against.
         cash = self.db.execute("SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements").fetchone()[0]
-        pnl = self.db.execute("SELECT COALESCE(SUM(pnl_cents),0) FROM settlements").fetchone()[0]
+        pnl = self.db.execute(
+            "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0]
         return int(cash) + int(pnl)
 
     def lifetime_pnl_cents(self) -> int:
-        """Honest lifetime = settlements ledger, full stop."""
-        return int(self.db.execute("SELECT COALESCE(SUM(pnl_cents),0) FROM settlements").fetchone()[0])
+        """Honest lifetime = settlements ledger, full stop (disputed rows out)."""
+        return int(self.db.execute(
+            "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0])
+
+    def quarantine_divergent_settlements(self, market: str,
+                                         fills_pnl_cents: int) -> int:
+        """P-CASH-FATAL-1 §4.6 (stopgap until E1 traces the source): a
+        WINDOW_ECON_DIVERGENCE means this window's settlement value cannot
+        be trusted into the book. Tag the rows DIVERGENT (excluded from
+        book_cents) and re-book the window at fills-truth — never silently
+        trust a broker number the fills cannot reproduce (the 99c phantom
+        that armed the deny-reboot breach). Returns the cents removed."""
+        booked = int(self.db.execute(
+            "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements"
+            " WHERE market=? AND divergent=0", (market,)).fetchone()[0])
+        if booked == fills_pnl_cents:
+            return 0        # settlement already equals fills-truth: no dispute
+        self.db.execute("UPDATE settlements SET divergent=1 WHERE market=?",
+                        (market,))
+        self.db.execute(
+            "INSERT INTO settlements (ts, market, lane, pnl_cents, detail, divergent)"
+            " VALUES (?,?,?,?,?,0)",
+            (time.time(), market, "ECON", fills_pnl_cents,
+             "DIVERGENT quarantine: fills-truth re-book "
+             "(WINDOW_ECON_DIVERGENCE; E1 traces the source)"))
+        self.db.commit()
+        return booked - fills_pnl_cents
 
     # ----- boot -----
     def snapshot_caps_at_boot(self) -> BootCaps:
@@ -214,6 +251,10 @@ class Ledger:
         self.db.execute("INSERT INTO engine_state (key, value) VALUES (?,?)"
                         " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         (key, str(value)))
+        self.db.commit()
+
+    def del_state(self, key: str) -> None:
+        self.db.execute("DELETE FROM engine_state WHERE key=?", (key,))
         self.db.commit()
 
     def record_boot(self, now=None) -> int:
@@ -378,6 +419,15 @@ class CashPrompt:
     deadline: float
 
 
+# P-CASH-FATAL-1: the durable-stop keys and the gateway wall reasons. The
+# deny-reboot breach (2026-07-19): both stops were memory-only AND narration-
+# only — nothing persisted them, and nothing told the gateway wall.
+CASH_FATAL_KEY = "cash_fatal"
+CASH_PENDING_KEY = "cash_pending"
+CASH_FATAL_REASON = "CASH_FATAL"
+CASH_PROMPT_REASON = "CASH_PROMPT"
+
+
 class CashProtocol:
     """Reconciles venue balance against the book under a quiescence window.
 
@@ -385,6 +435,12 @@ class CashProtocol:
     /confirm_cash -> re-baseline + CASH_MOVEMENTS row + surface row; resume.
     /deny_cash or 30-min silence -> FATAL, stay stopped.
     positive delta -> confirm without halt (row still written).
+
+    P-CASH-FATAL-1 (the deny-reboot breach): the FATAL and the pending
+    prompt PERSIST in the DB (the two-strike halt's proven pattern) and
+    both actually halt the GATEWAY wall, not just this object's flags.
+    A restart restores them via restore_on_boot(); only the operator's
+    /clear_cash_fatal clears a deny — never a reboot.
     """
 
     def __init__(self, ledger: Ledger, alert_fn=None):
@@ -394,6 +450,58 @@ class CashProtocol:
         self.fatal = False
         self.pending: Optional[CashPrompt] = None
         self.last_reconcile_ts: float = 0.0
+        # wired by the runner after the gateway exists; None in bare tests
+        self.gateway = None
+
+    # ── P-CASH-FATAL-1: the wall hears every cash stop ─────────────────
+    def _halt_gateway(self, reason: str) -> None:
+        if self.gateway is not None:
+            self.gateway.halt_entries(reason)
+
+    def _resume_gateway(self, reason: str) -> None:
+        if self.gateway is not None:
+            self.gateway.resume_entries(reason)
+
+    def restore_on_boot(self, now: Optional[float] = None) -> Optional[str]:
+        """§4.2 (mirrors window_econ.restore_halt_on_boot): restarts and
+        redeploys do NOT clear a cash fatal or a pending prompt. MUST run
+        before any baseline (§4.3 — the amnesiac re-baseline was the
+        breach). Returns the boot-tape line, or None when clean."""
+        now = time.time() if now is None else now
+        raw = self.ledger.get_state(CASH_FATAL_KEY)
+        if raw is not None:
+            self.fatal = True
+            self.entries_halted = True
+            self.pending = None
+            self._halt_gateway(CASH_FATAL_REASON)
+            line = ("CASH FATAL restored from DB — manual /clear_cash_fatal "
+                    f"required · {raw}")
+            self.alert(line)
+            return line
+        raw = self.ledger.get_state(CASH_PENDING_KEY)
+        if raw is not None:
+            try:
+                p = json.loads(raw)
+                prompt = CashPrompt(ts=p["ts"], delta_cents=p["delta_cents"],
+                                    breakdown=p["breakdown"],
+                                    deadline=p["deadline"])
+            except Exception:
+                self._go_fatal("cash pending state unreadable at boot")
+                return "CASH FATAL: pending prompt unreadable at boot"
+            if now >= prompt.deadline:
+                # the 30-min silence law counts wall-clock, reboot or not
+                self._go_fatal("cash prompt unanswered for 30 minutes "
+                               "(expired across restart)")
+                return "CASH FATAL: prompt expired across restart"
+            self.pending = prompt
+            self.entries_halted = True
+            self._halt_gateway(CASH_PROMPT_REASON)
+            line = (f"CASH PROMPT restored from DB — delta "
+                    f"{prompt.delta_cents}c still awaiting /confirm_cash or "
+                    "/deny_cash")
+            self.alert(line)
+            return line
+        return None
 
     def reconcile(self, venue_balance_cents: int, in_flight_orders: int,
                   unsettled_fills: int, now: Optional[float] = None,
@@ -425,6 +533,14 @@ class CashProtocol:
                 ts=now, delta_cents=delta, breakdown=breakdown,
                 deadline=now + config.CASH_DENY_TIMEOUT_SECONDS,
             )
+            # P-CASH-FATAL-1 (Adversary amendment): the prompt PERSISTS —
+            # a reboot mid-prompt resumes PROMPTED, never trading — and the
+            # gateway wall actually halts (pre-fix "entries HALTED" was
+            # narration only; no code path reached the wall).
+            self.ledger.set_state(CASH_PENDING_KEY, json.dumps({
+                "ts": now, "delta_cents": delta, "breakdown": breakdown,
+                "deadline": self.pending.deadline}))
+            self._halt_gateway(CASH_PROMPT_REASON)
             self.alert(
                 f"CASH DELTA NEGATIVE {delta}c — entries HALTED. {breakdown}\n"
                 f"Reply /confirm_cash to re-baseline or /deny_cash to stop."
@@ -466,6 +582,8 @@ class CashProtocol:
         self.ledger.db.commit()
         self.pending = None
         self.entries_halted = False
+        self.ledger.del_state(CASH_PENDING_KEY)   # P-CASH-FATAL-1: consent clears the durable prompt
+        self._resume_gateway(CASH_PROMPT_REASON)
         self.alert(f"CASH MOVEMENT CONFIRMED {p.delta_cents}c — re-baselined, entries resumed.")
         self._rescale_after_movement()
         return True
@@ -479,7 +597,33 @@ class CashProtocol:
         self.fatal = True
         self.entries_halted = True
         self.pending = None
-        self.alert(f"FATAL: {reason}. Engine stays stopped; manual restart required.")
+        # P-CASH-FATAL-1 §4.1: the deny is DURABLE — written to the DB the
+        # moment it happens (the two-strike halt's proven pattern). A
+        # restart may never reverse an operator's integrity stop.
+        self.ledger.set_state(CASH_FATAL_KEY, json.dumps(
+            {"reason": reason, "ts": time.time()}))
+        self.ledger.del_state(CASH_PENDING_KEY)
+        self._resume_gateway(CASH_PROMPT_REASON)  # subsumed by the fatal wall
+        self._halt_gateway(CASH_FATAL_REASON)
+        self.alert(f"FATAL: {reason}. Engine stays stopped; "
+                   "/clear_cash_fatal is the only key (a restart is not).")
+
+    def clear_cash_fatal(self, confirmed_by: str = "telegram") -> str:
+        """/clear_cash_fatal — the ONLY key (§4.4, symmetric with
+        /reset_halt). Clearing the fatal is NOT accepting the money: no
+        re-baseline happens here; if the delta still exists, the next
+        reconcile re-prompts from scratch. Single-gateway law: the human
+        is the only door — a reboot must never be."""
+        if not self.fatal and self.ledger.get_state(CASH_FATAL_KEY) is None:
+            return "no cash fatal active"
+        self.fatal = False
+        self.entries_halted = False
+        self.ledger.del_state(CASH_FATAL_KEY)
+        self._resume_gateway(CASH_FATAL_REASON)
+        self.alert(f"CASH FATAL cleared by {confirmed_by} — entries "
+                   "re-enabled; the delta re-prompts if it persists.")
+        return ("cash fatal cleared — entries re-enabled; next reconcile "
+                "re-checks the delta from scratch")
 
     def monthly_true_up_line(self, venue_statement_cents: int) -> str:
         """The daily-pack monthly true-up line vs the Kalshi statement (verification)."""

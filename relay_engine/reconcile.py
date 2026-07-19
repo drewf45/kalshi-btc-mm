@@ -86,7 +86,16 @@ def live_boot_reconcile(engine, client) -> dict:
                "positions_recognized": 0, "positions_quarantined": 0,
                "foreign_resting": 0}
 
-    if engine.ledger.book_cents() == 0:
+    if engine.cash.fatal:
+        # P-CASH-FATAL-1 §4.3: a denied delta may NOT be silently
+        # re-baselined to the venue — the operator's stop outranks the
+        # boot baseline (the deny-reboot breach was exactly this line
+        # running without this guard). Entries stay walled; custody of
+        # EXISTING risk continues below (the halt stops new risk only).
+        summary["cash_state"] = "FATAL_RESTORED"
+        log.warning("LIVE boot reconcile: CASH FATAL active — refusing to "
+                    "baseline; /clear_cash_fatal is the only key")
+    elif engine.ledger.book_cents() == 0:
         # first live boot: the venue balance IS the baseline
         engine.ledger.baseline(venue_cents, confirmed_by="live_boot")
         # CHUNK D (dry-run-caught): boot() snapshotted caps BEFORE this
