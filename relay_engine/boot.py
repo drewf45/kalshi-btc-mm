@@ -95,9 +95,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"{config.HUNT_TAKE_CENTS} · Job-B fast bails (P18)")
     lines.append(f"  FLIP/OPEN: band {config.OPEN_BAND[0]}-"
                  f"{config.OPEN_BAND[1]}¢ + grain≥{config.OPEN_MIN_GRAIN} "
-                 f"· join ≤{config.OPEN_MAX_ENTRY_CENTS}¢ · PATIENT HOLD — "
-                 f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED/CURFEW "
-                 "only (P21 A4/A5; PAIR retired)")
+                 f"· join ≤{config.OPEN_MAX_ENTRY_CENTS}¢ · T-15→T-8 · "
+                 "one shot/window · receipts-gated (margin or PROBE) · "
+                 f"PATIENT HOLD within entry−{config.OPEN_DETERMINED_DROP} — "
+                 f"exits TAKE(+{config.OPEN_TAKE_CENTS})/DETERMINED/"
+                 "YIELD@T-6, evacuations cross (P26 §2-3; PAIR retired)")
+    lines.append("  PROOF LAW: every ENTRY why is arithmetic from a named "
+                 "source or the wall refuses it — REJECT_UNPROVEN_WHY "
+                 "(P26 §2); brain loaded at boot or explained hourly")
     lines.append("  F: hold-to-settlement · depth floor stands in thin books "
                  "· SALVAGE armed (P19: needle-collapse exits; catastrophic "
                  "backstop reachable — P16 stop-and-report resolved)")

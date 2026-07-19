@@ -183,6 +183,9 @@ def _nearest_time_down(secs: float) -> int:
     return best
 
 
+_MISS_LOGGED: set = set()   # P26 §1.3: (d, t, session) grid gaps, once each
+
+
 def _lookup(distance_usd: float, secs_remaining: float,
             session: str = "ALL") -> Optional[dict]:
     """Raw cell lookup. Returns dict with p_cross, n, effective_n, wilson_ub."""
@@ -192,7 +195,17 @@ def _lookup(distance_usd: float, secs_remaining: float,
     if d > 2000:
         d = 2000
     t = _nearest_time_down(secs_remaining)
-    return _TABLE.get((d, t, session))
+    cell = _TABLE.get((d, t, session))
+    if cell is None:
+        # P26 §1.3 (P25 §6): a miss WITH a loaded table names its (d, t) —
+        # grid gaps become Saturday data, not mysteries. Once per pair.
+        key = (d, t, session)
+        if key not in _MISS_LOGGED and len(_MISS_LOGGED) < 500:
+            _MISS_LOGGED.add(key)
+            log.warning("[DELTA_TABLE] cell miss with LOADED table: "
+                        "d=%d t=%d session=%s — grid gap, log for regrid",
+                        d, t, session)
+    return cell
 
 
 def p_cross(distance_usd: float, secs_remaining: float,

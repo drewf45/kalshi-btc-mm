@@ -15,6 +15,8 @@ This module holds no capital state; proposals go to the gateway, which owns the
 walls. (Win/loss path symmetry lives where the capital lives.)
 """
 
+import time
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -208,11 +210,52 @@ class _PortedLane(Lane):
             sl = ctx.get("spotlead")
             if sl is not None:
                 order.why += f" spotlead:{sl.delta_p:+.0f}pts"
+            # P26 §2 — THE NON-REVERSAL PROOF (Drew: "F must prove the
+            # favorite won't reverse"): with the table loaded, entry
+            # requires survival p at (d, t) >= the price paid (the hold
+            # breakeven — H8's dual-gate shape, extended to F). Table
+            # absent -> price-implied, TAGGED (never silently unproven).
+            surv = self._table_survival(order.side, ctx)
+            bar = order.price_cents / 100.0
+            if surv is not None:
+                if surv < bar:
+                    return Decision(
+                        self.name, market, None,
+                        pass_reason=(f"TABLE_NON_REVERSAL p={surv:.2f}"
+                                     f"<bar{bar:.2f}"))
+                order.why += f" surv{surv:.2f}≥{bar:.2f}"
+            else:
+                order.why += " surv~price"
             return Decision(self.name, market, order)
         if kind == "PROPOSE":  # the decision went to the other lane's band
             return Decision(self.name, market, None, pass_reason=self.other_band_reason)
         return Decision(self.name, market, None, pass_reason=payload,
                         interim=(kind == "WAIT"))
+
+
+    @staticmethod
+    def _table_survival(side: str, ctx: dict):
+        """Held-side survival probability from the loaded table at the
+        entry instant's (d, t) — None when the brain is absent or blind."""
+        from . import delta, spotlead as _sl
+        if not delta.is_loaded():
+            return None
+        spot = ctx.get("spot")
+        close_ts = ctx.get("close_ts")
+        if spot is None or close_ts is None:
+            return None
+        strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
+                                 ctx.get("boundary_hi"))
+        if strike is None:
+            return None
+        t_rem = close_ts - ctx.get("now", time.time())
+        if t_rem <= 0:
+            return None
+        ps = delta.p_survive(abs(spot - strike), t_rem)
+        if ps is None:
+            return None
+        on_side = "yes" if spot >= strike else "no"
+        return ps if on_side == side else 1.0 - ps
 
 
 class LaneF(_PortedLane):

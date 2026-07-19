@@ -21,9 +21,10 @@ def make_book():
 
 
 def entry(lane="F", price=61, count=1, market="M1", event="EV1"):
+    # P26 §2: fixtures carry the lane's proof (the wall demands it)
     return Order(lane=lane, event=event, market=market, side="yes", action="buy",
                  price_cents=price, count=count, size_tier=config.TIER_PROBE,
-                 purpose="ENTRY")
+                 purpose="ENTRY", why=f"{lane} tier{price} · surv~price")
 
 
 def venue_fill(order_id, fill_id, yes_price_cents=61, count=1):
@@ -76,7 +77,8 @@ def test_foreign_fills_counted_never_claimed(booker, ledger):
 def test_partial_fills_accumulate(booker, gateway, monkeypatch, ledger):
     monkeypatch.setattr(config, "NET_RISK_CROSS_LANE_CAP", 10)
     order = Order(lane="F", event="EV1", market="M1", side="yes", action="buy",
-                  price_cents=61, count=3, size_tier=config.TIER_CLEAR, purpose="ENTRY")
+                  price_cents=61, count=3, size_tier=config.TIER_CLEAR,
+                  purpose="ENTRY", why="F tier61 · surv~price")
     r = gateway.submit(order, make_book())
     booker.sweep([venue_fill(r.order_id, "p1", count=1)], now=1000.0)
     assert r.order_id in gateway.resting  # 1/3 filled: still resting
@@ -127,6 +129,7 @@ def test_crossfire_confined_to_cut(gateway):
         gateway.submit(Order(lane="F", event="EV1", market="M1", side="yes",
                              action="buy", price_cents=61, count=1,
                              size_tier=config.TIER_PROBE, purpose="ENTRY",
+                             why="F tier61 · surv~price",
                              crossfire=True), b)
     assert e.value.wall == "TAKER_ENTRY"
     # even a passive EXIT may not crossfire

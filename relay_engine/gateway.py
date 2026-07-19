@@ -256,6 +256,7 @@ class Gateway:
             try:
                 self._wall_flip_unpaired(order)  # P13 §4: the named refusal first
                 self._wall_self_net(order)       # P21 A2: netting is an exit's job
+                self._wall_unproven_why(order)   # P26 §2: every why is a proof
                 self._wall_band_and_single_entry(order)
                 self._wall_net_risk_and_at_risk(order)
                 self._wall_wrong_way_tick(order)
@@ -495,6 +496,52 @@ class Gateway:
                 raise WallRejection(
                     "TAKER_ENTRY",
                     f"{order.side} sell at {order.price_cents}c through bid {bid}c")
+
+    # P26 §2 THE PROOF LAW: "Every ENTRY's why contains a computable edge
+    # from a named source, or the lane passes." These are the per-lane
+    # proof fields the wall demands — no lane, present or future, trades
+    # on vibes (Adversary: the wall wanted since the charter).
+    PROOF_REQUIRED = {
+        "F": ("tier", "surv"),          # sizing tier + non-reversal survival
+        "H8": ("tier", "surv"),         # the dual gate, printed
+        "D": ("d-table verdict",),      # the table names the entry
+        "P": ("displ",),                # the fade's displacement arithmetic
+    }
+    _FLIP_PROOFS = {
+        "HUNT": ("needle +", "gap", "converging"),        # the casefile
+        "OPEN": ("grain", ("margin", "PROBE")),           # receipts or probe
+    }
+
+    def _wall_unproven_why(self, order: Order) -> None:
+        if order.purpose != "ENTRY":
+            return
+        why = order.why or ""
+        if order.lane == "FLIP":
+            intent = why.split(" ", 1)[0] if why else ""
+            need = self._FLIP_PROOFS.get(intent)
+            if need is None:
+                raise WallRejection(
+                    "REJECT_UNPROVEN_WHY",
+                    f"FLIP entry with neither HUNT nor OPEN proof: "
+                    f"'{why[:60]}'")
+        else:
+            need = self.PROOF_REQUIRED.get(order.lane)
+            if need is None:
+                raise WallRejection(
+                    "REJECT_UNPROVEN_WHY",
+                    f"lane {order.lane} has no registered proof form — "
+                    f"register its arithmetic before it trades")
+        missing = []
+        for t in need:
+            present = (t in why) if isinstance(t, str) \
+                else any(x in why for x in t)
+            if not present:
+                missing.append(t if isinstance(t, str) else "|".join(t))
+        if missing:
+            raise WallRejection(
+                "REJECT_UNPROVEN_WHY",
+                f"{order.lane} why lacks proof field(s) {missing}: "
+                f"'{why[:60]}'")
 
     def _wall_self_net(self, order: Order) -> None:
         """P21 A2: no lane BUYS the opposite side of a held market as an

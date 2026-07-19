@@ -109,7 +109,8 @@ def test_orphan_adopted_custodied_never_evidence(engine, monkeypatch):
 def pair_fill(engine, side, price):
     o = Order(lane="FLIP", event=EVENT, market=TICKER, side=side, action="buy",
               price_cents=price, count=1, size_tier=config.TIER_PROBE,
-              purpose="ENTRY", band=(1, 49))
+              purpose="ENTRY", band=(1, 49),
+              why=f"OPEN grain {side}x2 · join {price}c · PROBE n=0 · geometry=v2")
     r = engine.gateway.submit(o, flip_book(46, 48))
     engine.gateway.on_fill(r.order_id)
     return r
@@ -126,7 +127,8 @@ def test_filled_pair_stays_visible_to_walls(engine):
         engine.gateway.submit(
             Order(lane="FLIP", event=EVENT, market=TICKER, side="yes",
                   action="buy", price_cents=46, count=1,
-                  size_tier=config.TIER_PROBE, purpose="ENTRY", band=(1, 49)),
+                  size_tier=config.TIER_PROBE, purpose="ENTRY", band=(1, 49),
+                  why="OPEN grain yesx2 · join 46c · PROBE n=0 · geometry=v2"),
             flip_book(46, 48))
     assert e.value.wall == "SINGLE_ENTRY"
     # and the event exposure counts the pair, not zero

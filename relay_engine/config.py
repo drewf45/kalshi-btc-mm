@@ -86,7 +86,8 @@ OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
 OPEN_TAKE_CENTS = 5               # A5: TAKE resting at entry+5
 OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box
 OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
-OPEN_BAIL_R_S = 10.0              # determined maker unfilled R -> crossfire
+# OPEN_BAIL_R_S retired (P26 §3.2): evacuations cross IMMEDIATELY — the
+# determined-maker grace was tonight's 31/20/33 slide. TAKE alone rests.
 
 # ---------------------------------------------------------------------------
 # Safe defaults in force (A3 / Chunk 0.3)
@@ -125,6 +126,25 @@ THIN_BOOK_MIN_DEPTH = 5  # visible contracts below this = thin book -> back off 
 # bar — R1/R2 stand; only LEAN/CLEAR are earned.
 # ---------------------------------------------------------------------------
 CELL_WIDTH_CENTS = 5              # DREW-DEFAULT: 35-39, 40-44, ... 95-99
+
+# ---------------------------------------------------------------------------
+# P26 "EVERY WHY IS A PROOF" — one brain, loaded or explained (§1), the
+# proof law (§2), and P25's OPEN fixes merged (§3).
+# ---------------------------------------------------------------------------
+# §1.1: boot provisions the delta table — load from disk, else BUILD
+# (delta_builder's own path, A1-A5 gated, hot-load on PASS). Env-off for
+# air-gapped runs; tests disable via conftest.
+TABLE_AUTOBUILD = os.environ.get("TABLE_AUTOBUILD", "true").lower() == "true"
+# §3.3: OPEN yields to F — entries T-15→T-8 only, flat by T-6. The SELF_NET
+# storm class (n=21, F locked out of 1830) dies by schedule.
+OPEN_ENTRY_CUTOFF = 480           # no OPEN entries once secs_left <= this
+OPEN_FLAT_BY = 360                # OPEN flat by T-6 (YIELD_TO_F, crossfire)
+# §3.4: geometry gate — determined trigger tightens to entry−drop (floored
+# at the band), and entry requires risk <= TAKE+1 or pass OPEN_BAD_GEOMETRY.
+OPEN_DETERMINED_DROP = 6
+# §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
+# with negative margin means the receipts argue against the lane: it sits.
+OPEN_PROBE_MAX_N = 20
 TIER_BUFFER = {TIER_LEAN: 0.03, TIER_CLEAR: 0.05}   # DREW-DEFAULT bar over BE
 # §3.3: the bar math must never demand the impossible, only the honest —
 # bars cap below 1.0 (a 97¢ hold-cell LEAN bar lands at the cap, .98).

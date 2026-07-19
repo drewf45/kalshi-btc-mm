@@ -47,7 +47,9 @@ def _book_entry(gateway, ledger, surface, custodian, anchor,
     r = gateway.submit(Order(lane=lane, event=EVENT, market=TICKER,
                              side="yes", action="buy", price_cents=price,
                              count=1, size_tier=config.TIER_PROBE,
-                             purpose="ENTRY"), _book(yes=price, no=100 - price - 1))
+                             purpose="ENTRY",
+                             why=f"{lane} tier{price} · surv~price"),
+                       _book(yes=price, no=100 - price - 1))
     booker.sweep([{"fill_id": "f-e", "order_id": r.order_id,
                    "yes_price_dollars": f"{price / 100:.4f}", "count": 1}],
                  now=1000.0)

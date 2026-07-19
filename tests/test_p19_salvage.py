@@ -169,7 +169,8 @@ def test_anchor_computed_at_fill_booking(engine, table, monkeypatch):
     monkeypatch.setattr(venue, "parse_fill", lambda r, s: (97.0, 0, 1))
     entry = Order(lane="F", event=EVENT, market=TICKER, side="yes",
                   action="buy", price_cents=97, count=1,
-                  size_tier=config.TIER_PROBE, purpose="ENTRY", band=(95, 99))
+                  size_tier=config.TIER_PROBE, purpose="ENTRY", band=(95, 99),
+                  why="F tier97 · surv~price")
     r = engine.gateway.submit(entry, make_book(yes=97, no=2))
     engine.fills.sweep([{"fill_id": "a1", "order_id": r.order_id, "count": 1}])
     pos = engine.custodian.positions[f"{TICKER}:F"]

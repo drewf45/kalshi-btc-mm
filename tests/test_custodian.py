@@ -173,7 +173,7 @@ def test_spot_is_safe_geometries():
 # ── baton, kill, attribution (unchanged laws) ─────────────────────────────
 def test_baton_lifecycle_cancel_then_cut(custodian, gateway):
     b = make_book()
-    r = gateway.submit(Order(lane="D", event="EV1", market="M1", side="yes", action="buy",
+    r = gateway.submit(Order(lane="D", event="EV1", market="M1", side="yes", action="buy", why="d-table verdict yes@61¢ · reserved",
                              price_cents=61, count=1, size_tier=config.TIER_PROBE,
                              purpose="ENTRY"), b)
     gateway.on_fill(r.order_id)
@@ -206,7 +206,7 @@ def test_baton_gone_exit_is_terminal_not_fatal(custodian):
 
 def test_cut_attributes_to_opening_lane(custodian, gateway, ledger):
     b = make_book()
-    r = gateway.submit(Order(lane="P", event="EV1", market="M1", side="yes", action="buy",
+    r = gateway.submit(Order(lane="P", event="EV1", market="M1", side="yes", action="buy", why="P fade yes · displ +4.0c x2 spot-flat",
                              price_cents=50, count=1, size_tier=config.TIER_PROBE,
                              purpose="ENTRY"), b)
     gateway.on_fill(r.order_id)
@@ -221,7 +221,7 @@ def test_cut_attributes_to_opening_lane(custodian, gateway, ledger):
 
 def test_kill_semantics_entries_only(custodian, gateway):
     b = make_book()
-    r = gateway.submit(Order(lane="D", event="EV1", market="M1", side="yes", action="buy",
+    r = gateway.submit(Order(lane="D", event="EV1", market="M1", side="yes", action="buy", why="d-table verdict yes@61¢ · reserved",
                              price_cents=61, count=1, size_tier=config.TIER_PROBE,
                              purpose="ENTRY"), b)
     gateway.on_fill(r.order_id)
@@ -229,7 +229,7 @@ def test_kill_semantics_entries_only(custodian, gateway):
     custodian.kill_lane("D")
     from relay_engine.errors import WallRejection
     with pytest.raises(WallRejection) as e:
-        gateway.submit(Order(lane="D", event="EV2", market="M2", side="yes", action="buy",
+        gateway.submit(Order(lane="D", event="EV2", market="M2", side="yes", action="buy", why="d-table verdict yes@61¢ · reserved",
                              price_cents=61, count=1, size_tier=config.TIER_PROBE,
                              purpose="ENTRY"), b)
     assert e.value.wall == "ENTRIES_HALTED"

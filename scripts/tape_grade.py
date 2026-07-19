@@ -496,17 +496,18 @@ def check_zero_pair_entries(db, since):
 
 
 def check_open_exits_intentional(db, since):
-    """A5: OPEN exits are EXACTLY take/determined/curfew — zero wiggle
-    exits. Tape-level: every reason=open row names one of the three.
-    Code-level: FLIP cut-params keep ONLY the catastrophic backstop (the
-    −11¢/−12¢ round-trip class is dead)."""
+    """A5: OPEN exits are EXACTLY take/determined/yield (P26 §3.3 renamed
+    curfew to the T-6 YIELD_TO_F) — zero wiggle exits. Tape-level: every
+    reason=open row names one of the three. Code-level: FLIP cut-params
+    keep ONLY the catastrophic backstop."""
     rows = db.execute(
         "SELECT detail FROM surface_rows WHERE lane='FLIP' AND"
         " state='PROPOSED' AND detail LIKE '%reason=open %' AND ts>?",
         (since,)).fetchall()
     bad = sum(1 for (d,) in rows
               if not any(tok in d for tok in
-                         ("open take", "open determined", "open curfew")))
+                         ("open take", "open determined", "open curfew",
+                          "open yield")))
     try:
         from relay_engine.lane_flip import flip_cut_params
         p = flip_cut_params()
@@ -630,6 +631,85 @@ CHECKS_P21 = [
 ]
 
 
+# ── P26 "EVERY WHY IS A PROOF" — expected tape ─────────────────────────────
+def check_no_unproven_entries(db, since):
+    """the wall stands: every PROPOSED ENTRY row carries a why (the proof),
+    and the REJECT_UNPROVEN_WHY wall exists in source."""
+    rows = db.execute(
+        "SELECT detail FROM surface_rows WHERE state='PROPOSED' AND"
+        " detail LIKE '%ENTRY%' AND ts>?", (since,)).fetchall()
+    bad = sum(1 for (d,) in rows if "why=" not in d)
+    try:
+        import inspect
+
+        from relay_engine import gateway as _g
+        walled = "REJECT_UNPROVEN_WHY" in inspect.getsource(_g.Gateway)
+    except Exception:
+        walled = False
+    return bad == 0 and walled, (f"{bad} whyless of {len(rows)} entries; "
+                                 f"wall={'up' if walled else 'MISSING'}")
+
+
+def check_one_open_story_per_window(db, since):
+    """§3.1: max ONE OPEN entry per market-window — consumed-on-any-exit."""
+    rows = db.execute(
+        "SELECT market, window_id, COUNT(*) FROM surface_rows WHERE"
+        " state='PROPOSED' AND detail LIKE '%OPEN grain%' AND ts>?"
+        " GROUP BY market, window_id HAVING COUNT(*) > 1",
+        (since,)).fetchall()
+    return len(rows) == 0, f"{len(rows)} window(s) with >1 OPEN entry"
+
+
+def check_no_evacuation_maker_waits(db, since):
+    """§3.2: evacuations CROSS — zero determined/yield rows riding a passive
+    EXIT (the `maker unfilled 10s` slide class is dead)."""
+    n = _one(db, "SELECT COUNT(*) FROM surface_rows WHERE state='PROPOSED'"
+                 " AND (detail LIKE '%open determined%EXIT%' OR"
+                 " detail LIKE '%maker unfilled%') AND ts>?", (since,))
+    rows = db.execute(
+        "SELECT detail FROM surface_rows WHERE state='PROPOSED' AND"
+        " detail LIKE '%reason=open determined%' AND ts>?",
+        (since,)).fetchall()
+    bad = sum(1 for (d,) in rows if " EXIT " in d)
+    return (n + bad) == 0, f"{n + bad} evacuation maker-wait(s)"
+
+
+def check_open_whys_carry_receipts(db, since):
+    """§2: every OPEN why prints margin|PROBE and geometry=v2."""
+    rows = db.execute(
+        "SELECT detail FROM surface_rows WHERE lane='FLIP' AND"
+        " state='PROPOSED' AND detail LIKE '%OPEN grain%' AND ts>?",
+        (since,)).fetchall()
+    bad = sum(1 for (d,) in rows
+              if not (("margin" in d or "PROBE" in d)
+                      and "geometry=v2" in d))
+    return bad == 0, f"{bad} receiptless of {len(rows)} OPEN whys"
+
+
+def check_brain_explained(db, since):
+    """§1: loaded or explained — the boot pages the verdict, the hourly
+    line carries brain:, UNPROVEN passes tag themselves (code-level)."""
+    try:
+        import inspect
+
+        from relay_engine import shadow_runner as _sr
+        src = inspect.getsource(_sr)
+        ok = ("🧠 TABLE" in src and "brain=" in src
+              and "UNPROVEN pass — brain absent" in src)
+    except Exception:
+        ok = False
+    return ok, "boot verdict + hourly brain + UNPROVEN tags in source"
+
+
+CHECKS_P26 = [
+    ("zero UNPROVEN entries: the wall stands (§2)", check_no_unproven_entries),
+    ("one OPEN story per window (§3.1)", check_one_open_story_per_window),
+    ("zero evacuation maker-waits (§3.2)", check_no_evacuation_maker_waits),
+    ("OPEN whys carry receipts: margin|PROBE + geometry=v2 (§2)", check_open_whys_carry_receipts),
+    ("the brain is loaded or explained (§1)", check_brain_explained),
+]
+
+
 CHECKS_P24 = [
     ("every F/H8 entry carries anchor: table|price (§1.1)", check_entries_carry_anchor),
     ("anchor misses name their cause (§1.2)", check_anchor_misses_named),
@@ -666,7 +746,8 @@ def main() -> int:
                           ("P19 let it run", CHECKS_P19),
                           ("P21 the doctrine engine", CHECKS_P21),
                           ("P22 the cell scoreboard", CHECKS_P22),
-                          ("P24 shield, fees, reversal", CHECKS_P24)):
+                          ("P24 shield, fees, reversal", CHECKS_P24),
+                          ("P26 every why is a proof", CHECKS_P26)):
         results = grade(db, hours, checks=checks)
         print(f"DEPLOY GRADE ({label} expected tape, last {hours:.0f}h):")
         fails = 0

@@ -39,7 +39,8 @@ def test_cell_row_on_round_trip(gateway, ledger, surface):
     e = gateway.submit(Order(lane="FLIP", event=EVENT, market=TICKER,
                              side="yes", action="buy", price_cents=48,
                              count=1, size_tier=config.TIER_PROBE,
-                             purpose="ENTRY", why="OPEN grain yesx2"), book)
+                             purpose="ENTRY",
+                             why="OPEN grain yesx2 · join 48c · PROBE n=0"), book)
     booker.sweep([{"fill_id": "f-e", "order_id": e.order_id,
                    "yes_price_dollars": "0.4800", "count": 1}], now=1000.0)
     x = gateway.submit(Order(lane="FLIP", event=EVENT, market=TICKER,

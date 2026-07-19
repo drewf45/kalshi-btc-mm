@@ -91,6 +91,10 @@ CHECKS = [
         "tests/test_p24_shield_fees_reversal.py",
         "tests/test_p19_salvage.py",
     ]),
+    ("every why is a proof: one brain, the wall, OPEN's fixes (P26)", [
+        "tests/test_p26_proof_law.py",
+        "tests/test_p21_doctrine.py",
+    ]),
 ]
 
 

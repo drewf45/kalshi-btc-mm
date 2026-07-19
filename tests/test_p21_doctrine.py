@@ -64,7 +64,9 @@ def test_wall_refuses_self_net_entry(gateway, ledger, surface):
     r = gateway.submit(Order(lane="FLIP", event=EVENT, market=TICKER,
                              side="yes", action="buy", price_cents=48,
                              count=1, size_tier=config.TIER_PROBE,
-                             purpose="ENTRY"), book)
+                             purpose="ENTRY",
+                             why="OPEN grain yesx2 · join 48c · PROBE n=0"),
+                       book)
     gateway.on_fill(r.order_id, count=1)   # the account now holds +1 yes
     # ANY lane's opposite-side ENTRY buy is refused — the venue nets across
     # our lanes whether we like it or not (account scope, not lane scope).
@@ -72,7 +74,8 @@ def test_wall_refuses_self_net_entry(gateway, ledger, surface):
         gateway.submit(Order(lane="D", event=EVENT, market=TICKER,
                              side="no", action="buy", price_cents=49,
                              count=1, size_tier=config.TIER_PROBE,
-                             purpose="ENTRY"), book)
+                             purpose="ENTRY",
+                             why="d-table verdict no@49¢ · reserved"), book)
     assert ei.value.wall == "REJECT_SELF_NET"
     # custodian-routed exits pass: netting IS an exit's job
     gateway.submit(Order(lane="FLIP", event=EVENT, market=TICKER,
@@ -89,7 +92,9 @@ def test_netting_belt_books_exit_of_held_side(gateway, ledger, surface):
     r = gateway.submit(Order(lane="FLIP", event=EVENT, market=TICKER,
                              side="yes", action="buy", price_cents=48,
                              count=1, size_tier=config.TIER_PROBE,
-                             purpose="ENTRY"), book)
+                             purpose="ENTRY",
+                             why="OPEN grain yesx2 · join 48c · PROBE n=0"),
+                       book)
     booker.sweep([{"fill_id": "fb-e", "order_id": r.order_id,
                    "yes_price_dollars": "0.4800", "count": 1}], now=1000.0)
     assert gateway.positions[(EVENT, TICKER, "FLIP")] == 1
@@ -130,39 +135,35 @@ def test_grain_reads_streak_from_window_outcomes(ledger):
 
 # ── A5: THE PATIENT HOLD — no stop, no scratch, no time-box in the band ────
 def test_patient_hold_ignores_wiggles(flip, gateway):
-    """The −11¢ (10:30) and −12¢ (11:17) round-trips were OPEN-intent
-    positions killed by fast-intent stops — inside the undetermined band a
-    12¢ wiggle proposes NOTHING beyond the resting take."""
+    """P26 §3.4 TIGHTENED the patient hold's geometry: the hold ignores
+    wiggles INSIDE max(band floor, entry−6) — a 5¢ wiggle proposes NOTHING
+    beyond the resting take. (P21's −12¢ tolerance was the leak: risk must
+    fit the take, so the determined trigger is entry−6 now.)"""
     _open_position(flip, gateway, side="yes", entry=48)
     props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49), secs_left=780))
     assert [p.reason for p in props] == [f"open take entry+{config.OPEN_TAKE_CENTS}"]
     flip.on_submitted(props[0], "OID-T", CLOSE - 780)
-    # mark drops entry−12 but stays inside [35,65]: the hold HOLDS
+    # mark wiggles to entry−5 (>= trigger 42): the hold HOLDS
     for secs in (770, 760, 750):
-        assert flip.evaluate(TICKER, _ctx(_book(yes=36, no=61),
+        assert flip.evaluate(TICKER, _ctx(_book(yes=43, no=54),
                                           secs_left=secs)) == []
 
 
 def test_determined_against_band_exit(flip, gateway):
-    """Exit two of three: the book LEAVES the undetermined band against us →
-    salvage-style out (maker at the join, crossfire after R unfilled)."""
+    """Exit two of three, P26 §3.2/§3.4: mark below the v2 trigger
+    (max(band floor, entry−6)) → the evacuation CROSSES IMMEDIATELY — the
+    maker-grace slide (tonight's 31/20/33 fills on ~35 triggers) is dead."""
     _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    # yes mark 30 < 35: determined against us — maker out at the join
-    props = flip.evaluate(TICKER, _ctx(_book(yes=30, no=68), secs_left=770))
+    # yes mark 41 < trigger 42: determined against us — crossfire NOW
+    props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770))
     assert len(props) == 1
     p = props[0]
-    assert (p.purpose, p.action, p.price_cents) == ("EXIT", "sell", 30)
+    assert (p.purpose, p.action, p.price_cents) == ("CUT", "sell", 41)
+    assert p.crossfire
     assert "open determined-against" in p.reason
-    flip.on_submitted(p, "OID-M", CLOSE - 770)
-    # unfilled after OPEN_BAIL_R_S → crossfire CUT
-    props2 = flip.evaluate(
-        TICKER, _ctx(_book(yes=29, no=69),
-                     secs_left=770 - config.OPEN_BAIL_R_S - 1))
-    assert len(props2) == 1
-    assert props2[0].purpose == "CUT" and props2[0].crossfire
-    assert "open determined crossfire" in props2[0].reason
+    assert "evacuate now" in p.reason
 
 
 def test_determined_against_needle_collapse_sustained(flip, gateway):
@@ -174,31 +175,34 @@ def test_determined_against_needle_collapse_sustained(flip, gateway):
     collapse = Needle(side="no", d_before=10.0, d_after=80.0,
                       delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
                       fair_cents=30.0, t_remaining=700.0)
-    # poll 1: counted, not yet determined (mark still in band)
-    assert flip.evaluate(TICKER, _ctx(_book(yes=40, no=58), secs_left=770,
+    # poll 1: counted, not yet determined (mark above the v2 trigger)
+    assert flip.evaluate(TICKER, _ctx(_book(yes=44, no=54), secs_left=770,
                                       spotlead=collapse)) == []
     # flicker clears the count
-    assert flip.evaluate(TICKER, _ctx(_book(yes=40, no=58),
+    assert flip.evaluate(TICKER, _ctx(_book(yes=44, no=54),
                                       secs_left=768)) == []
-    assert flip.evaluate(TICKER, _ctx(_book(yes=40, no=58), secs_left=766,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=44, no=54), secs_left=766,
                                       spotlead=collapse)) == []
-    # two SUSTAINED polls → maker out
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=58), secs_left=764,
+    # two SUSTAINED polls → evacuate NOW (P26 §3.2: crossfire, no maker)
+    props = flip.evaluate(TICKER, _ctx(_book(yes=44, no=54), secs_left=764,
                                        spotlead=collapse))
     assert len(props) == 1
+    assert props[0].purpose == "CUT" and props[0].crossfire
     assert "ΔP-collapse" in props[0].reason
 
 
-def test_open_curfew_flattens(flip, gateway):
-    """Exit three of three: CURFEW — nothing survives the T-curfew handoff."""
+def test_open_yield_flattens(flip, gateway):
+    """Exit three of three, P26 §3.3: YIELD — OPEN is flat by T-6
+    (YIELD_TO_F, crossfire); F owns the endgame floor and the SELF_NET
+    storm class dies by schedule. (Was CURFEW at T-4 pre-P26.)"""
     _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     props = flip.evaluate(TICKER, _ctx(_book(yes=47, no=50),
-                                       secs_left=FLIP_CURFEW - 1))
+                                       secs_left=config.OPEN_FLAT_BY - 1))
     assert len(props) == 1
     assert props[0].purpose == "CUT" and props[0].crossfire
-    assert "open curfew" in props[0].reason
+    assert "open yield to F" in props[0].reason
 
 
 def test_open_exit_realizes_no_scratch_count(flip, gateway):
@@ -229,7 +233,8 @@ def test_confirmed_needle_suppresses_open_entry(flip):
 def test_registry_parses_all_knowns():
     entries = semantics.parse_registry()
     # 16 at P21 + the score (P22) + fee truth and the anchor shield (P24)
-    assert len(entries) == 19
+    # + the proof law (P26 — Drew's "law #17", twentieth in sequence)
+    assert len(entries) == 20
     for e in entries:
         assert e["law"] and e["code"] and e["tape"], e["answer"]
 

@@ -47,6 +47,7 @@ def test_cancel_tristate_shadow_resting_is_canceled(gateway):
     r = gateway.submit(Order(lane="F", event=EVENT, market=TICKER, side="yes",
                              action="buy", price_cents=97, count=1,
                              size_tier=config.TIER_PROBE, purpose="ENTRY",
+                             why="F tier97 · surv~price",
                              band=(95, 99)), make_book(yes=97, no=2))
     assert gateway.cancel_tristate(r.order_id) == "CANCELED"
 
@@ -166,7 +167,8 @@ def test_exit_booking_ends_custody_of_flat_position(engine, monkeypatch):
     monkeypatch.setattr(venue, "parse_fill", lambda r, s: (46.0, 0, 1))
     entry = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
                   action="buy", price_cents=46, count=1,
-                  size_tier=config.TIER_PROBE, purpose="ENTRY", band=(1, 49))
+                  size_tier=config.TIER_PROBE, purpose="ENTRY", band=(1, 49),
+                  why="OPEN grain nox2 · join 46c · PROBE n=0 · geometry=v2")
     r = engine.gateway.submit(entry, make_book(yes=40, no=46))
     engine.fills.sweep([{"fill_id": "e1", "order_id": r.order_id, "count": 1}])
     assert f"{TICKER}:FLIP" in engine.custodian.positions

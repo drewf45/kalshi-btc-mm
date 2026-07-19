@@ -136,7 +136,11 @@ class LaneP:
             lane="P", event=market.rsplit("-", 1)[0], market=market,
             side=fade_side, action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
-            band=(1, P_FADE_MAX_CENTS)), "FADE"
+            band=(1, P_FADE_MAX_CENTS),
+            # P26 §2: the fade's proof — a book displacement the spot never
+            # made, confirmed N frames, printed as arithmetic.
+            why=(f"P fade {fade_side} · displ {displacement * 100:+.1f}c "
+                 f"x{P_CONFIRM_FRAMES} spot-flat · join {join}c")), "FADE"
 
 
 def p_cut_params() -> CutParams:

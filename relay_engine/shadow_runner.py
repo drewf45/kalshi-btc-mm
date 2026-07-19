@@ -214,6 +214,8 @@ class ShadowEngine:
         # retry-x3-over-15s law, paced across cycles so the loop never blocks)
         self._av_fail_streak = 0
         self._av_last_attempt_ts = 0.0
+        # P26 §1.2: UNPROVEN tagged once per (market, window) while unloaded
+        self._unproven_tagged = set()
         # P10 §2/§3: book-truth machinery
         self.quarantined = {}       # market -> until_close_ts (A5 poison ceiling)
         self.poison_episodes = {}   # market -> episodes this window
@@ -472,6 +474,21 @@ class ShadowEngine:
                 laned.seeded.pop(order.market, None)
                 self.lanes[3].exit_posted.discard(order.market)
 
+    def page_once(self, key: str, msg: str) -> bool:
+        """P26 §3.5: a deploy-scoped page — sent once per ledger lifetime
+        (restarts re-run boot; the phone should not hear it twice)."""
+        if self.ledger.get_state(key):
+            return False
+        self.ledger.set_state(key, "1")
+        self.telegram.alert(msg)
+        return True
+
+    def _table_build_page(self, msg: str) -> None:
+        """§1.1: the builder's verdict, tagged for the phone."""
+        bad = "FAILED" in msg or "ERROR" in msg
+        tag = "⛔ TABLE: FAILED — proven lanes mute" if bad else "🧠 TABLE"
+        self.telegram.alert(f"{tag}\n{msg[:600]}")
+
     def boot(self, auth_line=None):
         if config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0:
             # Paper bankroll so budget walls exercise realistically (paper only).
@@ -500,11 +517,40 @@ class ShadowEngine:
         # settle sweep retries stuck windows) and mark evidence holes.
         self.econ.restore_open_brackets_on_boot()
         self.gap_restart_scan()
-        # P19 §2.5: the promotion, paged once per boot
-        self.telegram.alert(
+        # P19 §2.5: the promotion — P26 §3.5 fold: paged ONCE per DEPLOY
+        # (ledger-keyed dedup; the 6:22 restart double-page was cosmetic,
+        # the ledger held).
+        self.page_once(
+            "page_salvage_promoted",
             f"👑 custodian promoted: Lane F salvage armed "
             f"(K={config.SALVAGE_K_POINTS:.0f} S={config.SALVAGE_S_CENTS:.0f} "
             f"R={config.SALVAGE_R_S:.0f} floor={config.SALVAGE_T_FLOOR_S:.0f}s)")
+        # P26 §1 — ONE BRAIN, LOADED OR EXPLAINED: boot provisions the delta
+        # table. Load from disk (manifest+SHA gated); else BUILD via
+        # delta_builder's own A1-A5-gated path and hot-load on PASS. The
+        # boot page carries the verdict either way; while unloaded the
+        # proven lanes stay evidence-born mute but the SILENCE IS EXPLAINED
+        # (hourly `brain:` field + UNPROVEN tags).
+        from . import delta
+        delta.set_alert_fn(self.telegram.alert)
+        if delta.load():
+            st = delta.table_status()
+            self.telegram.alert(
+                f"🧠 TABLE: loaded · cells={len(delta._TABLE)} · "
+                f"{st.get('detail', '')}")
+        elif config.TABLE_AUTOBUILD:
+            from . import delta_builder
+            self.telegram.alert(
+                f"🧠 TABLE: building (~10 min; 180d Coinbase pull) — "
+                f"disk load refused: {delta.refusal_reason() or 'absent'}. "
+                f"Proven lanes mute until PASS, and saying so.")
+            delta_builder.start_background_build(
+                notify_fn=self._table_build_page)
+        else:
+            self.telegram.alert(
+                f"⛔ TABLE: absent and autobuild disabled "
+                f"({delta.refusal_reason() or 'no table on disk'}) — proven "
+                f"lanes mute; the brain line will say so hourly.")
         # Tape 0718: the deployed worker booted with DB=relay_shadow.db (no
         # RELAY_DB_PATH) — an EPHEMERAL database. Halt persistence, booking
         # dedup, and every autopsy depend on the disk surviving a redeploy.
@@ -808,7 +854,7 @@ class ShadowEngine:
             # P18 §4.1: shared eyes, not orders — the spot-lead signal
             # computes ONCE per cycle here; FLIP·HUNT consumes it as trigger,
             # F/H8 record it as a why-tag field, P yields the floor.
-            from . import spotlead as _sl
+            from . import delta as _delta, spotlead as _sl
             from .lanes import infer_close_ts_from_ticker as _infer
             sl = None
             if spot is not None:
@@ -818,6 +864,16 @@ class ShadowEngine:
                 if strike is not None and close_for is not None:
                     anchor = self.hunt_anchor.setdefault(market, spot)
                     sl = _sl.needle(anchor, spot, strike, close_for - now)
+            # P26 §1.2: a mute organ must say it's mute (R5, applied to the
+            # brain) — while the table is unloaded, each window's proven-lane
+            # silence tags itself ONCE as UNPROVEN, never a shrug.
+            if (spot is not None and not _delta.is_loaded()
+                    and (market, window) not in self._unproven_tagged):
+                self._unproven_tagged.add((market, window))
+                self.surface.write_row(
+                    "FLIP", market, window, "WATCHING", transport=transport,
+                    detail="UNPROVEN pass — brain absent "
+                           f"({_delta.refusal_reason() or 'table not loaded'})")
             # P21 A3: the herd's compass — OUR settled windows, last-K streak.
             from . import grain as _grain
             ctx = {
@@ -932,6 +988,7 @@ class ShadowEngine:
         window = self._window_of.pop(market, None)
         if window is None:
             return
+        self._unproven_tagged.discard((market, window))  # P26 §1.2 prune
         self.surface.finalize_window(market, window)
         from . import failures
         n = self.ledger.db.execute(
@@ -1293,6 +1350,7 @@ async def run():
                 last_full_day = now_et.date()
                 engine.telegram.alert(pack)  # the 9AM full pack, on the phone
             else:
+                from . import delta as _delta   # P26 §1.2: brain on the line
                 engine.telegram.alert(
                     f"📗 hourly: book={engine.ledger.book_cents()}c "
                     f"windows={engine.windows_seen} "
@@ -1304,6 +1362,7 @@ async def run():
                     f"rejects={sum(engine.gateway.reject_counts.values())} "
                     f"venue_rejects={engine.gateway.venue_rejects} "
                     f"listener={engine.listener_status()} "
+                    f"brain={'ok' if _delta.is_loaded() else 'absent'} "
                     f"book✓ {engine.book_checks_total} "
                     f"fetch_fail={getattr(engine.feed, 'failed_fetches', 0)} "
                     f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")

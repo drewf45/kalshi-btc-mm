@@ -255,7 +255,8 @@ def test_flip_round_trip_reconstructible_from_surface_rows(gateway, ledger, surf
     book = flip_book(yes=48, no=49)
     entry = lane_flip.Order(lane="FLIP", event="EV", market=TICKER, side="yes",
                             action="buy", price_cents=48, count=1,
-                            size_tier=config.TIER_PROBE, purpose="ENTRY")
+                            size_tier=config.TIER_PROBE, purpose="ENTRY",
+                            why="OPEN grain yesx2 · join 48c · PROBE n=0 · geometry=v2")
     r = gateway.submit(entry, book)
     booker.sweep([{"fill_id": "fb-e", "order_id": r.order_id,
                    "yes_price_dollars": "0.4800", "count": 1}], now=1000.0)

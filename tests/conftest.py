@@ -10,6 +10,14 @@ from relay_engine.surface import Surface  # noqa: E402
 from relay_engine.gateway import Gateway  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_table_autobuild(monkeypatch):
+    # P26 §1.1: boot provisions the delta table (network build). Tests never
+    # fetch — the provisioning paths are exercised with mocked builders.
+    from relay_engine import config
+    monkeypatch.setattr(config, "TABLE_AUTOBUILD", False)
+
+
 @pytest.fixture
 def ledger():
     led = Ledger(":memory:")

@@ -160,6 +160,20 @@ re-runs every TAPE line here forever (registry tests never retire).
 - CODE: `relay_engine/fills.py:160`
 - TAPE: `anchor misses name their cause (§1.2)`
 
+### 20. Every why is a proof
+- LAW: every ENTRY's why contains a computable edge from a named source,
+  or the lane passes (Drew, ruling, 0718 night — the order's law #17,
+  twentieth in this registry's sequence). HUNT prints its needle
+  casefile; F/H8 print tier + table survival vs the price paid (the
+  non-reversal proof, salvage at its back); D prints its table verdict;
+  P prints its displacement arithmetic; OPEN prints its OWN cell margin
+  or explicit PROBE while its cells fill. The gateway rejects anything
+  else: REJECT_UNPROVEN_WHY. No lane, present or future, trades on
+  vibes — and the brain that powers the proofs is loaded at boot or its
+  absence is explained on every line (P26 §1/§2).
+- CODE: `relay_engine/gateway.py:515`
+- TAPE: `zero UNPROVEN entries: the wall stands (§2)`
+
 ## QUESTION (articulated ignorance — collectors named, running)
 
 - **Lane margins** — which lanes clear fees at what hit-rate? Collector:

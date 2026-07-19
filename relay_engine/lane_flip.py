@@ -189,9 +189,15 @@ class FlipWindow:
     hunts: Dict[str, dict] = field(default_factory=dict)  # side -> position state
     hunt_count: int = 0
     # P21 A4/A5 OPEN state: side -> {entry, fill_ts, take_oid, take_proposed,
-    # collapse_polls, det_ts, done}. The patient hold lives here.
+    # collapse_polls, done}. The patient hold lives here.
     opens: Dict[str, dict] = field(default_factory=dict)
     open_no_grain_logged: bool = False   # OPEN_NO_GRAIN tags ONCE per window
+    # P26 §3.1: ONE SHOT PER WINDOW — set on ANY OPEN exit (take, determined,
+    # yield — the Adversary: takes too), cleared ONLY at rollover (the
+    # note_exit pop was the located loophole). Re-proposals tag themselves.
+    open_consumed: bool = False
+    open_consumed_logged: bool = False
+    open_geometry_logged: bool = False   # OPEN_BAD_GEOMETRY tags once
 
 
 class LaneFlip:
@@ -279,10 +285,13 @@ class LaneFlip:
                 w.scratches += 1
             return
         # P21 A5: an OPEN exit realizes against ITS entry. NO scratch count —
-        # the patient hold has no scratches, only TAKE / DETERMINED / CURFEW.
+        # the patient hold has no scratches, only TAKE / DETERMINED / YIELD.
         o = w.opens.pop(side, None)
         if o is not None:
             w.window_realized += exit_price_cents - o["entry"]
+            # P26 §3.1: ANY OPEN exit consumes the window's one shot — the
+            # pop above no longer re-opens the door (the located loophole).
+            w.open_consumed = True
             return
         entry_px = w.fills.get(side)
         if entry_px is not None and len(w.fills) < 2:
@@ -391,14 +400,23 @@ class LaneFlip:
             return proposals
 
         # P21 A4 — LANE OPEN (PAIR retired 0718: the venue nets one
-        # account's sides, so the pair-bundle was a fiction — the 10:45 and
-        # 11:30 WINDOW_ECON_DIVERGENCE pages were its ghost). Setup: BOTH
+        # account's sides, so the pair-bundle was a fiction). Setup: BOTH
         # sides inside the open band AND the grain runs >= OPEN_MIN_GRAIN.
-        # Entry: maker join the GRAIN side, one lot, <= OPEN_MAX_ENTRY_CENTS.
-        # Band without grain -> pass, tagged OPEN_NO_GRAIN (Drew: "if the
-        # last three markets have been down and it's 49/49, you buy no").
+        # P26 §2/§3 tightened the lane that leaked: entries T-15→T-8 only
+        # (§3.3), ONE shot per window (§3.1), risk geometry proven (§3.4),
+        # and the PROOF LAW — OPEN fires on its OWN scoreboard margin >= 0,
+        # or in explicit PROBE mode while its cells fill. The lane argues
+        # from its receipts or sits.
         if w.opens or w.posted or w.fills:
             return proposals               # one open position/post at a time
+        if w.open_consumed:
+            if not w.open_consumed_logged:
+                w.open_consumed_logged = True
+                log.info("OPEN_WINDOW_CONSUMED %s — one story per window; "
+                         "re-propose refused until rollover", market)
+            return proposals               # §3.1: one shot per window
+        if secs <= config.OPEN_ENTRY_CUTOFF:
+            return proposals               # §3.3: OPEN's window is T-15→T-8
         if self._net(market, event) != 0:
             return proposals               # R1 WALL: one position at a time
         lo_b, hi_b = config.OPEN_BAND
@@ -416,13 +434,39 @@ class LaneFlip:
         join = yes_bid if side == "yes" else no_bid
         if join > config.OPEN_MAX_ENTRY_CENTS:
             return proposals               # the herd's side is already paid up
+        # §3.4 GEOMETRY GATE: risk to the determined trigger must not exceed
+        # the take + 1 — a trade whose bail is bigger than its win passes.
+        det_trigger = max(config.OPEN_UNDETERMINED_BAND[0],
+                          join - config.OPEN_DETERMINED_DROP)
+        risk = join - det_trigger
+        if risk > config.OPEN_TAKE_CENTS + 1:
+            if not w.open_geometry_logged:
+                w.open_geometry_logged = True
+                log.info("OPEN_BAD_GEOMETRY %s — risk %dc > take+1 %dc",
+                         market, risk, config.OPEN_TAKE_CENTS + 1)
+            return proposals
+        # §2 THE PROOF: the cell's own receipts (Wilson LB − breakeven), or
+        # explicit PROBE while the cells fill (one-lot, one-shot, geometry
+        # already gated above).
+        from . import scoring
+        s = scoring.score(self.gateway.ledger, "OPEN",
+                          scoring.price_cell(join))
+        if s["margin"] >= 0:
+            proof = f"margin {s['margin']:+.2f} (n={s['n']})"
+        elif s["n"] < config.OPEN_PROBE_MAX_N:
+            proof = f"PROBE n={s['n']} margin {s['margin']:+.2f}"
+        else:
+            log.info("OPEN_CELL_NEGATIVE %s — margin %.2f at n=%d: the "
+                     "receipts argue against the lane; it sits", market,
+                     s["margin"], s["n"])
+            return proposals
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=config.OPEN_BAND, rest_fp=book.best_fp(side),
             why=f"OPEN grain {side}x{g['length']} · join {join}c · "
-                f"band y{yes_bid}/n{no_bid}"))
+                f"band y{yes_bid}/n{no_bid} · {proof} · geometry=v2"))
         return proposals
 
     # ── P18 THE DETECTIVE: hunt entry (§2) + the two jobs (§3) ─────────────
@@ -532,20 +576,20 @@ class LaneFlip:
                     reason="hunt breakeven reprice (mark<=entry)"))
         return props
 
-    # ── P21 A5 THE PATIENT HOLD: exits are EXACTLY three ───────────────────
+    # ── P21 A5 THE PATIENT HOLD · P26 §3 the evacuation fork ───────────────
     def _open_custody(self, w: FlipWindow, market: str, event: str, book,
                       ctx: dict, secs: float, now: float) -> List[Order]:
-        """While the book stays inside the undetermined band there is NO
-        stop, NO scratch, NO time-box — the position is a bet on the RESOLVE,
-        and wiggles are the product working. SOURCE: the −11¢ (10:30) and
-        −12¢ (11:17) round-trips were OPEN-intent positions killed by
-        fast-intent stops — the last of their kind. Exits:
+        """Inside the undetermined band there is NO stop, NO scratch, NO
+        time-box — wiggles inside the geometry are the product working.
+        Exits are EXACTLY three, and the executor FORKS BY INTENT (P26
+        §3.2: TAKE rests as a maker; evacuations CROSS at best NOW — the
+        `maker unfilled 10s` slide cost the 31/20/33 fills on ~35 triggers):
           TAKE       — entry+OPEN_TAKE_CENTS, resting from the fill
-          DETERMINED-AGAINST — the book leaves the band against us, or a
-                       ΔP-collapse >= OPEN_DETERMINED_K_POINTS sustained
-                       (2 polls, flicker-proof) → salvage-style out: maker
-                       at the join, crossfire after OPEN_BAIL_R_S unfilled
-          CURFEW     — flatten at T-curfew (the handoff to F, HUNT's law)"""
+          DETERMINED-AGAINST — mark below max(band floor, entry−drop)
+                       (§3.4 geometry v2), or ΔP-collapse >= K sustained
+                       2 polls → crossfire IMMEDIATELY
+          YIELD      — flat by T-OPEN_FLAT_BY (§3.3 YIELD_TO_F: F's floor
+                       is F's; the SELF_NET storm class dies by schedule)"""
         props: List[Order] = []
         lo_u, _hi_u = config.OPEN_UNDETERMINED_BAND
         sl = ctx.get("spotlead")
@@ -553,64 +597,51 @@ class LaneFlip:
             if o.get("done"):
                 continue
             mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
-            # TAKE — posted the instant the entry books
+            # TAKE — posted the instant the entry books (the maker intent)
             if o["take_oid"] is None and not o.get("take_proposed"):
                 o["take_proposed"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=o["entry"] + config.OPEN_TAKE_CENTS,
-                    count=o["count"], size_tier=config.TIER_PROBE, purpose="EXIT",
+                    count=o["count"], size_tier=config.TIER_PROBE,
+                    purpose="EXIT",
                     reason=f"open take entry+{config.OPEN_TAKE_CENTS}"))
                 continue
-            # CURFEW — the third exit; nothing survives the handoff
-            if secs <= FLIP_CURFEW:
+            # YIELD — §3.3: flat by T-6; F owns the endgame floor
+            if secs <= config.OPEN_FLAT_BY:
                 self._cancel_resting(o)
                 o["done"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
                     price_cents=mark if mark is not None else o["entry"],
-                    count=o["count"], size_tier=config.TIER_PROBE, purpose="CUT",
-                    crossfire=True,
-                    reason="open curfew flat (T-curfew handoff to F)"))
+                    count=o["count"], size_tier=config.TIER_PROBE,
+                    purpose="CUT", crossfire=True,
+                    reason="open yield to F (YIELD_TO_F flat by T-6)"))
                 continue
-            # DETERMINED-AGAINST stage 2: maker resting — the R-second clock
-            if o["det_ts"] is not None:
-                if now - o["det_ts"] >= config.OPEN_BAIL_R_S:
-                    self._cancel_resting(o)
-                    o["done"] = True
-                    props.append(Order(
-                        lane="FLIP", event=event, market=market, side=side,
-                        action="sell",
-                        price_cents=mark if mark is not None else o["entry"],
-                        count=o["count"], size_tier=config.TIER_PROBE, purpose="CUT",
-                        crossfire=True,
-                        reason=f"open determined crossfire "
-                               f"(maker unfilled {int(config.OPEN_BAIL_R_S)}s)"))
-                continue
-            # DETERMINED-AGAINST stage 1: has the market decided against us?
-            # Band exit is immediate (the band IS the definition of
-            # undetermined); ΔP-collapse needs 2 sustained polls.
+            # DETERMINED-AGAINST — §3.4 v2 trigger; §3.2 evacuate NOW
+            det_trigger = max(lo_u, o["entry"] - config.OPEN_DETERMINED_DROP)
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
             o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
             determined = None
-            if mark is not None and mark < lo_u:
-                determined = (f"open determined-against: {side} {mark}c "
-                              f"left band {lo_u}-{_hi_u}")
+            if mark is not None and mark < det_trigger:
+                determined = (f"open determined-against: {side} {mark}c < "
+                              f"trigger {det_trigger}c (geometry=v2)")
             elif o["collapse_polls"] >= 2:
                 determined = (f"open determined-against: ΔP-collapse "
                               f"{sl.delta_p:.0f}pts sustained")
             if determined:
                 self._cancel_resting(o)
-                px = mark if mark is not None else max(1, o["entry"] - 1)
-                o["det_ts"] = now
+                o["done"] = True
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell", price_cents=px, count=o["count"],
-                    size_tier=config.TIER_PROBE, purpose="EXIT",
-                    reason=f"{determined} · maker out"))
+                    action="sell",
+                    price_cents=mark if mark is not None else max(1, o["entry"] - 1),
+                    count=o["count"], size_tier=config.TIER_PROBE,
+                    purpose="CUT", crossfire=True,
+                    reason=f"{determined} · evacuate now"))
         return props
 
     def _cancel_resting(self, o: dict) -> None:

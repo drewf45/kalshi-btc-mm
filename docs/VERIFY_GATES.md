@@ -1052,6 +1052,58 @@ Suite at this commit: **374 passed**; preflight **20/20**.
   the consumer, not by bleeding) · salvage-K COLLECTING (every position now
   contributes) · win-audit SATURDAY.
 
+## WO-2026-07-18-RELAY-P26 COMBINED FINAL — "EVERY WHY IS A PROOF"
+
+Suite at this commit: **390 passed**; preflight **21/21**.
+
+- **Root cause VERIFIED at source, and worse**: `delta._lookup` returns None
+  unloaded (delta.py:189-190) and the builder + A1-A5 gates + hot-load
+  (delta_builder.py) were NEVER provisioned by the engine — no call to
+  `delta.load()` or `start_background_build` anywhere in the runner; only
+  lane_fh8 consulted `is_loaded`. One unloaded table gagged HUNT, H8's dual
+  gate, and table-grade salvage anchors while grain-only OPEN did all the
+  trading and all the leaking.
+- **§1 one brain, loaded or explained**: boot provisions the table — disk
+  load (manifest+SHA gated) or delta_builder's own A1-A5-gated background
+  build with hot-load on PASS (`TABLE_AUTOBUILD`, env-off for air-gapped
+  runs; tests disable in conftest). The boot page carries the verdict
+  (🧠 loaded · cells · built / 🧠 building / ⛔ FAILED — proven lanes
+  mute); the hourly line gains `brain: ok|absent`; while unloaded, every
+  window's proven-lane silence tags itself ONCE (`UNPROVEN pass — brain
+  absent`) — R5 applied to the brain itself. §1.3: a (d,t) cell miss WITH
+  a loaded table logs the pair (once each, capped) — grid gaps become
+  Saturday data.
+- **§2 THE PROOF LAW** (registry law #20 — Drew's "law #17"):
+  `REJECT_UNPROVEN_WHY` in the wall chain after SELF_NET — per-lane proof
+  fields (F/H8: tier+surv · D: table verdict · P: displ · FLIP: HUNT
+  casefile or OPEN margin|PROBE); unregistered lanes reject outright.
+  F/H8 gain the NON-REVERSAL proof: table survival at (d,t) must beat the
+  price paid or the lane passes (`TABLE_NON_REVERSAL`), why-stamped
+  `surv0.97≥0.95` — or `surv~price` tagged when the table is absent.
+  P's fade now prints its displacement arithmetic. OPEN fires on its OWN
+  cell margin ≥ 0, or PROBE while cells fill (n < 20) — a mature negative
+  cell SITS (`OPEN_CELL_NEGATIVE`): the scoreboard as entry gate, its
+  destiny. ~30 test fixtures gained proof whys — the law is furniture now.
+- **§3 P25 merged verbatim**: 3.1 `open_consumed` on ANY OPEN exit (takes
+  too — the won-window re-bet dies), cleared only at rollover; re-proposals
+  tag `OPEN_WINDOW_CONSUMED`. 3.2 the evacuation fork: TAKE rests; 
+  DETERMINED/YIELD cross at best NOW (the maker stage deleted;
+  OPEN_BAIL_R_S retired) — evacuation fills land ≤2¢ from trigger by
+  construction. 3.3 schedule: entries T-15→T-8 (`OPEN_ENTRY_CUTOFF=480`),
+  flat by T-6 (`OPEN_FLAT_BY=360`, reason YIELD_TO_F) — the SELF_NET storm
+  class dies by schedule; FLIP_CURFEW=240 remains HUNT's. 3.4 geometry v2:
+  determined trigger = max(band floor, entry−6); entry risk ≤ TAKE+1 or
+  `OPEN_BAD_GEOMETRY` (P21's −12¢ wiggle-tolerance test overturned with
+  citation — the patient hold now holds within entry−6). 3.5 folds:
+  `page_once` ledger-keyed dedup (the 6:22 restart double-page; 👑 now
+  once per deploy) · OPEN whys stamped `geometry=v2` · bench stays Drew's
+  one-word lever.
+- **§5**: CHECKS_P26 (zero unproven entries, one OPEN story/window, zero
+  evacuation maker-waits, receipts on OPEN whys, brain explained) — ninth
+  graded suite; registry at 20 KNOWNs, all bound; P21's open-exit tape
+  check now admits "open yield"; boot PROFILE speaks the schedule, the
+  gate, and the proof law.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
