@@ -22,15 +22,15 @@ incomplete):
 HARD RAIL: no Kelly/cash/rate-halt change; HUNT's scalper cut unchanged;
 the swing ENTRY gate untouched — EXIT doctrine only.
 
-AMENDED by WO-FLIP-GEOMETRY-COHERENCE (Option B SCALP, build 43): the
-loss-side patience below is OVERTURNED. Once the take became the 5c nickel
-(build 42), a patient ride to the catastrophe floor (20) made the trade
-structurally negative (risk 24 to win 5). Option B adds a TIGHT scalp stop
-(entry − OPEN_SCALP_STOP_CENTS, 2-poll sustained, ANY time) so a loser banks
-the small loss — the coherent 1:1 trade. The catastrophe (20) and band floor
-(35) survive as deeper/post-patience backstops; SPOT-decided and the take are
-unchanged. The three loss-side-hold tests below are rewritten to the scalp
-reality."""
+SUPERSEDED on the loss side by WO-FLIP-LIQUIDITY-HOLD (build 45): the FLIP
+lane is reconceived as LIQUIDITY PROVISION — a low mark after a buy is
+ILLIQUIDITY (the pile-in), not a loss. Build-43's brief SCALP stop is
+RETIRED; the position HOLDS through the dip as the resting liquidity
+provider, and only a CONFIRMED collapse (SPOT-decided sustained, or the
+catastrophe floor 20) cuts. The band-floor price cut is retired too; an
+unreverted loser is cleared by the T-10 endgame handoff. The loss-side tests
+below are rewritten to the liquidity-hold reality; the take, SPOT, and
+catastrophe tests stand."""
 
 import pytest
 
@@ -94,22 +94,18 @@ def _cuts(props):
     return [p for p in props if p.purpose == "CUT"]
 
 
-# ── Part D, test 1: the dip below the stop CUTS (Option B: bank the loss) ──
-def test_44_entry_dip_below_stop_cuts_scalp(flip, gateway, ledger):
-    """OVERTURNED by WO-FLIP-GEOMETRY-COHERENCE (Option B): a 44¢ entry
-    dipping to 34¢ (below the scalp stop 38 = entry−6) no longer HOLDS — the
-    coherent scalp banks the small loss on 2 sustained polls. The tight stop
-    is what makes the 5¢ take a coherent trade (build-40 held the dip only
-    because a +20 take needed room; the nickel does not)."""
+# ── Part D, test 1: the dip is ILLIQUIDITY — the position HOLDS ────────────
+def test_44_entry_dip_is_illiquidity_holds(flip, gateway, ledger):
+    """OVERTURNED by WO-FLIP-LIQUIDITY-HOLD (build 45): a low mark after a
+    FLIP buy is ILLIQUIDITY (the opening pile-in), not a loss. The build-43
+    scalp stop that sold into it is GONE — a 44¢ entry dipping to 34¢ HOLDS
+    as the resting liquidity provider, waiting for the reversion to lift its
+    take. Only a confirmed collapse (spot/catastrophe) cuts."""
     o = _entry(flip, gateway, ledger, entry=44)
-    # poll 1 below the stop holds — the noise-guard (could be a wick)
-    assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
-                                            secs_left=770))) == []
-    # poll 2 sustained: the decline is real → the SCALP stop cuts
-    cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
-                                            secs_left=769)))
-    assert len(cuts) == 1 and "SCALP stop" in cuts[0].reason
-    assert o.get("done")
+    for secs in (770, 769, 768, 760, 740):
+        assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+                                                secs_left=secs))) == []
+    assert not o.get("done")
 
 
 # ── Part D, test 2: spot decides → CUT on spot, any time ───────────────────
@@ -145,39 +141,37 @@ def test_swing_to_take_still_fires(flip, gateway, ledger):
     assert flip.windows[TICKER].window_realized == 20
 
 
-# ── Part D, test 6: the cut REASON names the decision, not a naked ride ────
+# ── Part D, test 6: the cut REASON names a real decision, not illiquidity ──
 def test_cut_reason_names_the_decision(flip, gateway, ledger):
-    """Inside patience the cut names the DECISION — SPOT decided, the SCALP
-    stop (the tight bail), or the CATASTROPHE backstop — never a naked ride
-    to the bottom. (Option B added the scalp stop as the primary loss cut.)"""
+    """The only cuts in the passive hold name a real DECISION — SPOT decided
+    or the CATASTROPHE backstop — never a band-floor touch and never the
+    retired scalp stop. An illiquidity dip (34¢) is HELD."""
     _entry(flip, gateway, ledger, entry=44)
-    # one poll below the stop holds (noise-guard); a SUSTAINED dip is a
-    # SCALP decision, named as such — not a band-floor touch, not a ride
+    # a dip to the old band floor is illiquidity now → HOLD
     assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                             secs_left=770))) == []
-    c = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+    # a true collapse to the catastrophe floor names the catastrophe
+    c = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=20, no=55),
                                          secs_left=769)))
-    assert len(c) == 1 and "SCALP stop" in c[0].reason
-    assert "band floor" not in c[0].reason
+    assert len(c) == 1 and "CATASTROPHE" in c[0].reason
+    assert "band floor" not in c[0].reason and "SCALP" not in c[0].reason
 
 
-# ── the band-floor cut survives as a post-patience backstop ────────────────
-def test_band_floor_cut_only_after_patience(flip, gateway, ledger):
-    """The band-floor 'the swing did not come' cut survives as a POST-patience
-    backstop — reachable for the cheapest entries, where the scalp stop
-    (entry−6) sits BELOW the band floor (35). A 39¢ entry's scalp stop is 33,
-    so a 34¢ mark is inside the 6¢ tolerance: it HOLDS inside patience and
-    cuts via the band floor only AFTER patience (Option B left this intact)."""
-    o = _entry(flip, gateway, ledger, entry=39)
-    # 34c is above the 33c scalp stop → inside patience it HOLDS, any polls
-    for secs in (770, 769, 768):
-        assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
-                                                secs_left=secs))) == []
-    # past patience: the swing didn't come → band-floor cut
+# ── the unreverted loser clears at the T-10 handoff, not a price floor ─────
+def test_unreverted_loser_clears_at_t10_not_a_price_floor(flip, gateway, ledger):
+    """The band-floor 'the swing did not come' price cut is RETIRED (WO-45): a
+    low mark is illiquidity, held through the window. An unreverted loser is
+    not stopped on price — it is cleared by the T-10 endgame handoff (the
+    primary loss exit now), never ridden to settlement."""
+    o = _entry(flip, gateway, ledger, entry=44)
+    # even past patience, a low in-band mark HOLDS (no band-floor cut)
     o["fill_ts"] = CLOSE - 1100
+    assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+                                            secs_left=760))) == []
+    # at T-10, the unreverted loser is cleared by the handoff
     cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
-                                            secs_left=760)))
-    assert len(cuts) == 1 and "AFTER patience" in cuts[0].reason
+                                            secs_left=config.OPEN_FLAT_BY - 1)))
+    assert len(cuts) == 1 and "T-10 handoff" in cuts[0].reason
 
 
 # ── HARD RAIL ──────────────────────────────────────────────────────────────

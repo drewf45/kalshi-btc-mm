@@ -1814,6 +1814,70 @@ the risk denominator; the 44¢ churn is bounded to ~6 not 24; within-tolerance
 holds). Suite 577 · preflight 23/23. **The halt stays in place until Drew
 resets it** — this build is banked, not deployed.
 
+## WO-FLIP-LIQUIDITY-HOLD — post and wait, don't react (build 45)
+
+**BANKED — halt stays until Drew resets it.** Drew's reconception of the FLIP
+lane: a low price after a FLIP buy is **ILLIQUIDITY** (the opening pile-in,
+nobody buying your side yet), **NOT a losing position**. The job is to buy the
+inventory the panic is dumping, POST the take (entry+5, already resting), and
+HOLD as the liquidity provider until the reversion lifts it — managing only
+the endgame if unfilled. This replaces the reactive exit (the build-43 scalp
+stop, which fired during the exact early illiquidity the model must hold
+through).
+
+**Read-rule findings:**
+- The resting take is already built (`_open_custody`, TRUE at source) — that
+  IS the "post entry+5 and wait" mechanic (§1). Confirmed the only early exit.
+- The reactive stop to remove: the build-43 scalp stop (entry−6, any-time)
+  and the post-patience band-floor cut (TRUE at source) — both sold inventory
+  during illiquidity (§2).
+- **Cross-cutting consequence the WO did not name (reported):** the build-43
+  risk/reward geometry gate was *grounded on the scalp stop* as its "real
+  bail." Removing the stop un-grounds the gate — an honest risk-to-catastrophe
+  check would close the lane (24>6), contra the hold-through-illiquidity
+  thesis. So the gate is retired too: the liquidity model's entry filter is
+  band membership, and the empirical reversion rate (§4) is the real gate.
+  (This follows the standing coherence doctrine — never leave a gate
+  validating a bail that no longer fires.)
+
+**What shipped (the NOW-piece):**
+- **Removed** the reactive loss-side stops from `_open_custody`: the scalp
+  stop and the band-floor early cut. The constant `OPEN_SCALP_STOP_CENTS` and
+  the `scalp_polls` tracking are gone.
+- **Removed** the risk/reward geometry gate (un-grounded by the stop removal).
+- **Kept** the collapse backstop (Adversary-mandated §2.3): SPOT-decided
+  sustained (2 polls) and the CATASTROPHE floor (20) still cut even in the
+  passive hold — a real move, not illiquidity noise.
+- **Kept** the resting take (the exit), the hold-to-settle, and the T-10
+  handoff — now the **primary loss-side endgame exit** for an unreverted
+  position. Custody machinery (uncovered-flatten, self-net, partial-defer)
+  UNCHANGED (§7).
+
+**§4 empirical gate**: the reversion / resting-take fill rate is UNPROVEN.
+Run at `FLIP_SIZE_CAP=1`; Instrument 1's take-fill rate is the gate before any
+size increase — proven, not trusted on faith.
+
+**§5 F-covers-FLIP — BANKED, NOT BUILT (hard martingale constraint)**: F
+sizes to its OWN edge, ALWAYS; F may NEVER size up *because FLIP lost*
+("scale up to recover the miss" is martingale). Not shipped until F-sizing is
+provably independent of FLIP P&L. Guarded by test:
+`test_f_covers_flip_not_built_no_martingale_hook` (no FLIP P&L read in F).
+
+**Overturned test-laws (with citations)**: the build-40/43 loss-side price-cut
+tests are re-anchored to the liquidity-hold reality — a low mark now HOLDS
+(illiquidity), and the retained backstops (catastrophe/spot) or the T-10
+handoff carry the cut. Rewritten across `test_flip_exit_doctrine`,
+`test_bleed_diagnosis`, `test_p21_doctrine`, `test_p26_proof_law`,
+`test_flip_cheap_live`, `test_flip_thesis1`, `test_flip_count2` (custody
+machinery intact — only the *trigger* moved), and `test_aplayer` (the
+P&L-independence property still holds, re-anchored to the catastrophe floor).
+The build-43 scalp acceptance suite (`test_flip_geometry_coherence`) is
+superseded and replaced by `test_flip_liquidity_hold` (12 acceptance tests:
+take rests; illiquidity dips held; catastrophe/spot backstops cut; one-poll
+flicker held; T-10 endgame; entries admitted; take-fill measured; scalp
+retired; F not built). Suite 580 · preflight 23/23. **Halt stays in place
+until Drew resets it** — banked, not deployed.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

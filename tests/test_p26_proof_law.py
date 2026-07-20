@@ -159,22 +159,25 @@ def test_consumed_on_determined_too(flip, gateway):
 
 
 # ── §3.2/§3.4: evacuations cross NOW, within the geometry ──────────────────
-def test_evacuation_crosses_at_trigger_price(flip, gateway):
-    """The fill lands <=2¢ from the trigger: mark 41 vs trigger 42 — the
-    crossfire cut prices AT the mark, not a maker-grace slide to 31."""
+def test_evacuation_crosses_at_the_mark(flip, gateway):
+    """A determined-against evacuation prices AT the mark, not a maker-grace
+    slide to 31. WO-FLIP-LIQUIDITY-HOLD retired the price-floor triggers (a
+    low mark is illiquidity, held); the determined-against that fires in the
+    hold is a CONFIRMED spot collapse, and it crosses at the mark."""
+    from relay_engine.spotlead import Needle
     _open_position(flip, gateway, entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    # P-FLIP-THESIS-1 §2: this law is about the CROSSFIRE PRICE — age the
-    # fill past the patience floor so the post-window cut fires
-    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
-    # A-PLAYER B5: the trigger is the band floor (P&L-blind)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=770))
+    sl = Needle(side="no", d_before=10.0, d_after=90.0,
+                delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
+                fair_cents=0.0, t_remaining=700.0)
+    flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=771, spotlead=sl))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770,
+                                       spotlead=sl))
     assert len(props) == 1
     p = props[0]
-    trigger = config.OPEN_UNDETERMINED_BAND[0]
     assert p.purpose == "CUT" and p.crossfire
-    assert abs(p.price_cents - trigger) <= 2
+    assert p.price_cents == 41           # prices AT the mark, no slide
 
 
 def test_t10_handoff_replaces_yield_to_f(flip, gateway):
@@ -200,15 +203,16 @@ def test_open_entry_schedule(flip):
     assert len(props) == 1
 
 
-def test_bad_geometry_passes(flip, monkeypatch):
-    """§3.4, RESHAPED by WO-FLIP-GEOMETRY-COHERENCE (Option B): the gate now
-    validates the REAL trade — risk (the scalp stop, the price a loser
-    actually exits at) <= take+1. Coherent config (stop 6, take 5) admits the
-    whole 39-49c thesis band; an incoherent stop WIDER than take+1 is rejected
-    as OPEN_BAD_GEOMETRY. The gate enforces coherence, never admits risk>win."""
-    monkeypatch.setattr(config, "OPEN_SCALP_STOP_CENTS", 12)   # risk 12 > take+1 6
-    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2)) == []
-    assert flip.windows[TICKER].open_geometry_logged
+def test_no_geometry_gate_admits_the_band(flip):
+    """§3.4 RETIRED by WO-FLIP-LIQUIDITY-HOLD (build 45): the risk/reward
+    geometry gate is gone. A low mark is illiquidity to hold through, not a
+    loss to bail from, so there is no pre-trade risk/reward rejection — the
+    entry filter is band membership, and the reversion rate (Instrument 1) is
+    the empirical gate. An in-band thesis entry is ADMITTED, never tagged
+    OPEN_BAD_GEOMETRY."""
+    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    assert [p for p in props if p.purpose == "ENTRY"]
+    assert not flip.windows[TICKER].open_geometry_logged
 
 
 # ── §2: OPEN's margin — P27 §2(b): prints always, gates never ──────────────

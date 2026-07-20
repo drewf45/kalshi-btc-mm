@@ -200,23 +200,27 @@ def test_t10_handoff_flat_hands_off_nothing(flip):
 
 
 def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
-    """Adversary (a): the hold-to-settle is NOT exempt from the
-    determined floor — a deep reversal still cuts; never a ride to zero."""
+    """Adversary (a): the hold-to-settle is NOT exempt from the collapse
+    backstop — a held winner that genuinely COLLAPSES still cuts, never a
+    ride to zero. WO-FLIP-LIQUIDITY-HOLD retired the price-floor cut (a
+    shallow dip is illiquidity, held even on a hold); the catastrophe
+    backstop (20c) and a sustained spot collapse remain armed on the hold."""
     o = _open_position(flip, gateway, ledger)
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=599))  # convert
+    flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=599))  # convert to hold
     assert o["hold"] is True
-    # inside the patience floor the reversal is still noise (custodian's
-    # catastrophic backstop guards the gap); past it, the cut fires
+    # a shallow reversal (34c) is illiquidity — held even on the hold
     assert [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
                                                   secs_left=580))
             if p.purpose == "CUT"] == []
-    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
+    # a genuine collapse to the catastrophe floor still cuts — never zero
+    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=480))
             if p.purpose == "CUT"]
     assert len(cuts) == 1 and "determined-against" in cuts[0].reason
+    assert "CATASTROPHE" in cuts[0].reason
 
 
 def test_f_agrees_conversion_pre_t10(flip, gateway, ledger, caplog):
@@ -300,17 +304,20 @@ def test_no_new_scalp_entry_at_or_after_t10(flip):
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 
-def test_post_window_genuine_decision_cuts_hard(flip, gateway, ledger):
-    """§5: still against after the window, mark genuinely through trigger →
-    the cut fires, loss bounded. Patience is upside-only."""
+def test_post_window_genuine_collapse_cuts_hard(flip, gateway, ledger):
+    """§5, AMENDED by WO-FLIP-LIQUIDITY-HOLD: a genuine COLLAPSE is still cut,
+    loss bounded — the passive hold holds illiquidity, never a true collapse.
+    The price-floor trigger is retired; the catastrophe backstop (20c, P&L-
+    blind) is the remaining price cut and it fires any time."""
     o = _open_position(flip, gateway, ledger)
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
     o["fill_ts"] = CLOSE - 1100                          # window long over
-    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
+    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=700))
             if p.purpose == "CUT"]
     assert len(cuts) == 1
     assert "determined-against" in cuts[0].reason
+    assert "CATASTROPHE" in cuts[0].reason
     assert cuts[0].count == 1 and cuts[0].crossfire      # bounded, NOW

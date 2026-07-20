@@ -171,19 +171,20 @@ def test_hold_conversion_logs_swing_arrived(flip, gateway, ledger):
 
 
 # ── §3 INSTRUMENT 2: the salvage-floor audit ───────────────────────────────
-def test_loser_cut_at_the_floor_logs_ok_true(flip, gateway, ledger):
-    """§4: the non-swinger cuts at the band floor (~entry−(39−35)=−5c at a
-    39c entry, the −15c region at a 49c entry) — FLIP_LOSER_CUT ok=true,
-    NOT a −39c ride."""
+def test_loser_cleared_at_endgame_logs_ok_true(flip, gateway, ledger):
+    """§4, AMENDED by WO-FLIP-LIQUIDITY-HOLD: the band-floor price cut is
+    retired (a low mark is illiquidity, held). An unreverted loser is cleared
+    by the T-10 endgame handoff at the mark (~entry−5 at a 39c entry) —
+    FLIP_LOSER_CUT ok=true, NOT a −39c ride to settlement."""
     o = _cheap_entry(flip, gateway, ledger)
     p1 = flip.evaluate(TICKER, _ctx(_book(yes=39), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    o["fill_ts"] = CLOSE - 1100                      # patience elapsed
+    # at the T-10 endgame the unreverted loser is cleared at the mark
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
-                                                  secs_left=700))
+                                                  secs_left=config.OPEN_FLAT_BY - 1))
             if p.purpose == "CUT"]
-    assert len(cuts) == 1 and cuts[0].price_cents == 34   # the floor cut
+    assert len(cuts) == 1 and cuts[0].price_cents == 34   # cleared at the mark
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 1, "PROBE")
     flip.note_exit(TICKER, "yes", 34, CLOSE - 699, count=1)
     swing = _rows(ledger, "FLIP_SWING")[0]

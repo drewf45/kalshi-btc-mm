@@ -153,24 +153,28 @@ def test_patient_hold_ignores_wiggles(flip, gateway):
                                           secs_left=secs)) == []
 
 
-def test_determined_against_band_exit(flip, gateway):
-    """Exit two of three, P26 §3.2/§3.4: mark below the v2 trigger
-    (max(band floor, entry−6)) → the evacuation CROSSES IMMEDIATELY — the
-    maker-grace slide (tonight's 31/20/33 fills on ~35 triggers) is dead."""
+def test_determined_against_spot_evacuation(flip, gateway):
+    """Exit two of three, P26 §3.2: a determined-against evacuation CROSSES
+    IMMEDIATELY at the mark — the maker-grace slide (31/20/33 fills) is dead.
+    WO-FLIP-LIQUIDITY-HOLD retired the price-floor triggers (illiquidity is
+    held); the determined-against that fires in the hold is a CONFIRMED SPOT
+    collapse (sustained 2 polls), which still crosses at the mark now."""
     _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    # P-FLIP-THESIS-1 §2: the patience floor gates the cut — this law-test
-    # exercises the POST-window decision, so the fill ages past the floor
-    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
-    # A-PLAYER B5: the trigger is the BAND FLOOR (35c, P&L-blind) — the
-    # basis-anchored entry-6 trigger is retired; mark 34 < 35 cuts
-    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=770))
+    # spot decides against the held side, sustained 2 polls → evacuate
+    sl = Needle(side="no", d_before=10.0, d_after=90.0,
+                delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
+                fair_cents=0.0, t_remaining=700.0)
+    flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=771, spotlead=sl))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=770,
+                                       spotlead=sl))
     assert len(props) == 1
     p = props[0]
     assert (p.purpose, p.action, p.price_cents) == ("CUT", "sell", 34)
     assert p.crossfire
     assert "open determined-against" in p.reason
+    assert "SPOT decided" in p.reason
     assert "evacuate now" in p.reason
 
 

@@ -184,23 +184,17 @@ def test_bleed3_replay_cuts_via_spot_not_a_price_ride(flip, gateway,
     assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
 
 
-def test_in_band_dip_below_stop_cuts_scalp(flip, gateway, ledger):
-    """OVERTURNED by WO-FLIP-GEOMETRY-COHERENCE (Option B): the loss-side
-    patience is gone. A dip WITHIN the 6c tolerance (44 > stop 42) still
-    holds; a SUSTAINED break below the scalp stop (34 < 42) banks the small
-    loss on 2 polls — the tight bail that makes the nickel take coherent."""
-    o = _open_pos(flip, gateway, ledger)                    # entry 48, stop 42
-    # within tolerance: holds through many polls
-    for secs in range(780, 760, -5):
-        p = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=secs))
+def test_in_band_dip_is_illiquidity_holds(flip, gateway, ledger):
+    """OVERTURNED by WO-FLIP-LIQUIDITY-HOLD (build 45): the loss-side reactive
+    stops are GONE. A low mark is ILLIQUIDITY (the pile-in), held through as
+    the resting liquidity provider — even a deep in-band dip (34c) does NOT
+    cut on price. Only a confirmed collapse (spot/catastrophe) or the T-10
+    endgame acts."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 48
+    for secs in range(780, 700, -5):        # many polls, deep in-band dip
+        p = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=secs))
         assert [x for x in p if x.purpose == "CUT"] == []
-    assert not o.get("done")
-    # a sustained break below the stop → SCALP cut on the 2nd poll
-    flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=755))          # poll 1
-    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=34),
-                                                  secs_left=754))
-            if x.purpose == "CUT"]
-    assert len(cuts) == 1 and "SCALP stop" in cuts[0].reason
+    assert not o.get("done")                # held through the illiquidity
 
 
 def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):

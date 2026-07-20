@@ -166,13 +166,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "rode 201430 to the floor; at 1-lot = entry+"
                  f"{config.OPEN_TAKE_MIN}¢, fee-safe; cut unchanged "
                  "(WO-FLIP-GOAL-TAKE)")
-    lines.append(f"  FLIP GEOMETRY: coherent — entry band, take, and risk-to-"
-                 f"real-bail form ONE trade; a loser cuts at the SCALP stop "
-                 f"(entry−{config.OPEN_SCALP_STOP_CENTS}¢, 2-poll, any time — "
-                 "patience-to-catastrophe OFF on the loss side), so the gate "
-                 f"enforces risk {config.OPEN_SCALP_STOP_CENTS}¢ ≤ take+1 vs "
-                 "the real bail; catastrophe/band floor are deeper backstops "
-                 "(WO-FLIP-GEOMETRY-COHERENCE)")
+    lines.append(f"  FLIP LIQUIDITY-HOLD: low price = illiquidity, not loss — "
+                 f"resting take entry+{config.OPEN_TAKE_MIN}¢ holds through the "
+                 "pile-in (no reactive scalp/band stop); collapse backstop "
+                 "stays (SPOT-decided sustained / catastrophe "
+                 f"{config.OPEN_CATASTROPHE_FLOOR}¢, a real move not noise); "
+                 "endgame T-10 handoff is the primary loss exit; reversion / "
+                 "resting-take fill rate measured (Instrument 1) before size "
+                 "(WO-FLIP-LIQUIDITY-HOLD)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "
