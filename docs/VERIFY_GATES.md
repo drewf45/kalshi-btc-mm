@@ -1627,6 +1627,42 @@ gate should filter, so it rubber-stamped falling knives; the constant
   matters more now that F carries more weight (Adversary c) — still
   Drew's open ruling. Suite 536 · preflight 23/23.
 
+## WO-FLIP-EXIT-DOCTRINE — the cut is about the decision, not the price (build 40)
+
+**BANKED — not for immediate deploy** (built, lens-certified, ready when
+Drew opens a window). Drew watched FLIP self-exit almost immediately on
+nearly every entry (201215: yes@44¢ → cut 35¢ same window, −11¢). Not a
+bug — a DOCTRINE GAP: a scalper's stop bolted onto a position trade. Root
+(read-rule TRUE at lane_flip.py:1109): `floor_polls >= 2` (~2s) bypassed
+the 5-min patience, and the band floor (35¢) was doing two jobs — marking
+where swings happen AND where the cut fires — 9¢ below a 44¢ entry, inside
+the swing.
+
+**Atomic three-change commit (all together or a known bleed reopens):**
+- **Change 1 — separate the floors**: `OPEN_CATASTROPHE_FLOOR=20` (fixed,
+  P&L-blind, not basis-anchored — the Engineer's flag) becomes the only
+  price cut; the band floor (35¢) stays for swing semantics. A cheap entry
+  breathes through its swing; the price backstop lives below it.
+- **Change 2 — spot+time primary**: the ΔP-collapse (SPOT decided) leads
+  and cuts on 2 sustained polls ANY time; the band-floor price cut is
+  demoted. The T-10 handoff (time decided) already leads above.
+- **Change 3 — real patience**: the ~2s floor-poll bypass is deleted; an
+  in-band/near-band dip inside patience is HELD, however long. Only the
+  catastrophe floor and a sustained spot collapse act inside patience; the
+  ordinary band-floor cut ("the swing did not come") fires only AFTER full
+  patience.
+- **Overturned test-laws (with citations)**: WO-BLEED-3's floor-poll
+  bypass replay now cuts via SPOT not price; the ΔP leg's patience-gate
+  removed (it's primary); the in-band dip holds through patience.
+- **HARD RAIL held**: no Kelly/cash/rate-halt change; HUNT's scalper cut
+  unchanged (HUNT is correctly a scalper); the swing ENTRY gate untouched
+  (EXIT doctrine only). The lower floor is safe only at the 1-lot FLIP cap
+  (WO-SWING-GATE-EVENT §4.2) — re-evaluate when FLIP sizes up (CEO).
+- **Part D**: 7 acceptance tests, all pass together (dip holds; spot cuts
+  any time; ride-to-catastrophe cuts bounded; take still fires; cut reason
+  names the decision; band-floor cut only post-patience). Suite 544 ·
+  preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

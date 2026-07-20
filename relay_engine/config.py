@@ -98,6 +98,14 @@ OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
 OPEN_TAKE_CENTS = 20
 OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box
 OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
+# WO-FLIP-EXIT-DOCTRINE (build 40): determined-against is a statement about
+# the MARKET'S DECISION (spot moved / time ran out), NOT the contract's
+# price. The band floor (35c) marks where SWINGS happen — a cheap entry is
+# bought to oscillate there, so the price cut must live BELOW the swing, at
+# a genuine catastrophe. A FIXED low price (P&L-blind, not basis-anchored —
+# two positions with the same book state get the same decision) is the ONLY
+# price backstop that acts inside patience; spot+time are the primary cut.
+OPEN_CATASTROPHE_FLOOR = 20        # DREW-DEFAULT: fixed price backstop, well below the swing band
 # OPEN_BAIL_R_S retired (P26 §3.2): evacuations cross IMMEDIATELY — the
 # determined-maker grace was tonight's 31/20/33 slide. TAKE alone rests.
 

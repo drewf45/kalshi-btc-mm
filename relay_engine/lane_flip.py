@@ -1083,38 +1083,38 @@ class LaneFlip:
                 # held to settlement — no scalp take, no yield; the
                 # determined-against floor below still guards it
                 pass
-            # DETERMINED-AGAINST — §3.2 evacuate NOW. A-PLAYER B5: the
-            # trigger is P&L-BLIND — the UNDETERMINED BAND FLOOR (the
-            # book saying the swing is gone) + the table's ΔP-collapse,
-            # never the position's entry basis (a basis-anchored trigger
-            # is the human moving the bar; two positions with identical
-            # book/table/time state get the SAME decision, up or down).
-            det_trigger = lo_u
+            # DETERMINED-AGAINST — WO-FLIP-EXIT-DOCTRINE: the cut is about
+            # the MARKET'S DECISION, not the contract's price. Precedence:
+            #   (1) SPOT decided against — the position trader's real exit;
+            #       sustained 2 polls (no flicker), acts ANY time (Change 2)
+            #   (2) CATASTROPHE floor — a FIXED low price (P&L-blind), well
+            #       below the swing band; the only price backstop that acts
+            #       inside patience (Change 1)
+            #   (3) the ordinary band-floor price cut — "the swing did not
+            #       come" — fires ONLY after full patience (Change 3: the
+            #       floor_polls ~2s bypass that stopped cheap entries out of
+            #       their own swing is GONE)
+            # (Time-decided is the T-10 handoff above; it already leads.)
+            det_trigger = lo_u                       # band floor 35: swing semantics
+            catastrophe = config.OPEN_CATASTROPHE_FLOOR
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
             o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
-            through_floor = mark is not None and mark < det_trigger
-            o["floor_polls"] = (o.get("floor_polls", 0) + 1
-                                if through_floor else 0)
             patience_over = now - o["fill_ts"] >= config.OPEN_PATIENCE_S
             determined = None
-            # WO-BLEED-3 (Instrument 2's −25c finding): a book SUSTAINED
-            # through the band floor is a DECISION, not noise — the
-            # patience floor was built for 1-2c in-band dips (which B5's
-            # trigger already ignores), and gating the through-floor cut
-            # behind it let a collapse ride 10c past the floor before the
-            # cut could fire. Two sustained polls cut it NOW, any minute;
-            # a one-frame flicker still holds. The ΔP-collapse leg (a spot
-            # signal that CAN flicker early) stays patience-gated.
-            if through_floor and (patience_over or o["floor_polls"] >= 2):
-                determined = (f"open determined-against: {side} {mark}c < "
-                              f"trigger {det_trigger}c (band floor, "
-                              "P&L-blind"
-                              + ("" if patience_over
-                                 else ", sustained — WO-BLEED-3") + ")")
-            elif o["collapse_polls"] >= 2 and patience_over:
-                determined = (f"open determined-against: ΔP-collapse "
-                              f"{sl.delta_p:.0f}pts sustained")
+            if o["collapse_polls"] >= 2:
+                determined = (f"open determined-against: SPOT decided — "
+                              f"ΔP-collapse {sl.delta_p:.0f}pts sustained "
+                              "(the market decided, any time)")
+            elif mark is not None and mark <= catastrophe:
+                determined = (f"open determined-against: CATASTROPHE floor "
+                              f"{side} {mark}c <= {catastrophe}c (fixed, "
+                              "P&L-blind — the only price backstop)")
+            elif (patience_over and mark is not None
+                  and mark < det_trigger):
+                determined = (f"open determined-against: band floor {side} "
+                              f"{mark}c < {det_trigger}c AFTER patience — "
+                              "the swing did not come")
             if determined:
                 self._cancel_resting(o)
                 o["done"] = True

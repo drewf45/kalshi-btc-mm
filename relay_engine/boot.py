@@ -123,6 +123,12 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "even across partial-fill timing; exits fire only on "
                  "booked-net; UNCOVERED self-heals then FATALs "
                  "(P-FLIP-COUNT-2)")
+    lines.append(f"  FLIP EXIT: determined-against is SPOT+TIME, not price — "
+                 f"hold through in-band dips for full "
+                 f"{config.OPEN_PATIENCE_S // 60}min patience; the "
+                 f"CATASTROPHE floor ({config.OPEN_CATASTROPHE_FLOOR}¢ "
+                 "fixed, P&L-blind) is the only price backstop "
+                 "(WO-FLIP-EXIT-DOCTRINE)")
     lines.append(f"  FLIP THESIS: buy cheap into ~50/50, patient hold "
                  f"({config.OPEN_PATIENCE_S // 60}min floor, no reflexive "
                  f"cut), scalp ~{config.OPEN_TAKE_CENTS}¢ into the swing OR "

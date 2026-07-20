@@ -78,34 +78,30 @@ def test_first_minute_dip_is_noise_not_a_decision(flip, gateway, ledger):
     assert o.get("done") is not True                     # the position HOLDS
 
 
-def test_collapse_counts_pre_window_but_fires_only_after(flip, gateway,
-                                                         ledger):
-    """The sustained ΔP-collapse keeps counting through the patience window
-    and fires the moment the window ends — patience never blinds the
-    loss-term, it only un-hair-triggers it."""
+def test_spot_collapse_cuts_any_time_two_polls(flip, gateway, ledger):
+    """WO-FLIP-EXIT-DOCTRINE Change 2 OVERTURNED the patience-gate on the
+    ΔP leg: SPOT deciding against is the market's decision — the position
+    trader's real exit — so it cuts on 2 sustained polls at ANY time
+    (inside patience too). A one-frame flicker still holds (2 polls)."""
     o = _open_position(flip, gateway, ledger)
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)             # the take rests
+
     class SL:
         side = "no"
         delta_p = config.OPEN_DETERMINED_K_POINTS + 5
         fair_cents = 0          # hunt-entry gate B fails: no hunt fires
+    # WELL inside patience (fill ~790, now 700 = 90s << 300s)
     ctx_collapse = _ctx(_book(yes=44), secs_left=700)
     ctx_collapse["spotlead"] = SL()
-    assert flip.evaluate(TICKER, ctx_collapse) == []     # poll 1: counted
+    assert flip.evaluate(TICKER, ctx_collapse) == []     # poll 1: one flicker holds
+    assert o["collapse_polls"] == 1
     ctx_collapse2 = _ctx(_book(yes=44), secs_left=699)
     ctx_collapse2["spotlead"] = SL()
-    assert [p for p in flip.evaluate(TICKER, ctx_collapse2)
-            if p.purpose == "CUT"] == []                 # pre-window: HOLDS
-    assert o["collapse_polls"] >= 2
-    # the window ends; the very next collapse poll cuts
-    o["fill_ts"] = CLOSE - 1100                          # patience elapsed
-    ctx_collapse3 = _ctx(_book(yes=44), secs_left=698)
-    ctx_collapse3["spotlead"] = SL()
-    cuts = [p for p in flip.evaluate(TICKER, ctx_collapse3)
+    cuts = [p for p in flip.evaluate(TICKER, ctx_collapse2)
             if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "collapse" in cuts[0].reason
+    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason  # 2 polls, cut inside patience
 
 
 # ── §3.5/§4 stage 3: the T-10 handoff + F coordination ─────────────────────

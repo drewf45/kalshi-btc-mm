@@ -159,50 +159,71 @@ def _open_pos(flip, gateway, ledger, entry=48):
     return flip.windows[TICKER].opens["yes"]
 
 
-def test_sustained_through_floor_cuts_in_minute_one(flip, gateway, ledger):
-    """Instrument 2's −25c finding, fixed: a book SUSTAINED through the
-    band floor (2 polls) cuts NOW — inside the patience window — at ~the
-    floor, instead of riding the collapse out and cutting at the bottom."""
-    _open_pos(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=770))
-    assert [p for p in p1 if p.purpose == "CUT"] == []      # poll 1: flicker
-    p2 = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=769))
-    cuts = [p for p in p2 if p.purpose == "CUT"]
-    assert len(cuts) == 1 and cuts[0].price_cents == 34     # AT the floor
-    assert "sustained — WO-BLEED-3" in cuts[0].reason
-    # the loss lands inside the floor expectation: Instrument 2 says ok
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 34, CLOSE - 768, count=1)
-    audit = [json.loads(d) for (d,) in ledger.db.execute(
-        "SELECT detail FROM surface_rows WHERE state='FLIP_LOSER_CUT'"
-    ).fetchall()][0]
-    assert audit["ok"] is True and audit["loss_cents"] == 14
-
-
-def test_one_frame_flicker_still_holds(flip, gateway, ledger):
-    """The anti-churn law stands: ONE poll through the floor then back
-    in-band is noise — no cut, the floor-poll counter resets."""
+def test_bleed3_replay_cuts_via_spot_not_the_floor_bypass(flip, gateway,
+                                                         ledger):
+    """WO-FLIP-EXIT-DOCTRINE OVERTURNED WO-BLEED-3's floor-poll bypass: an
+    in-band dip through the band floor (34c > catastrophe 20c) inside
+    patience now HOLDS — a cheap entry breathes through its swing. The
+    3-lot collapse still CUTS, but now via the SPOT signal (the market
+    decided), not a 2-poll price bypass (the regression Change 3 must
+    keep cutting, by the new path)."""
     o = _open_pos(flip, gateway, ledger)
-    flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=770))   # flicker
-    p2 = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=769))
-    assert [p for p in p2 if p.purpose == "CUT"] == []
-    assert o["floor_polls"] == 0                                # reset
-    p3 = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=768))
-    assert [p for p in p3 if p.purpose == "CUT"] == []          # count anew
-
-
-def test_dp_collapse_leg_still_patience_gated(flip, gateway, ledger):
-    """The ΔP leg (a spot signal that CAN flicker early) keeps the
-    patience gate — only the BOOK through the floor is exempt."""
-    o = _open_pos(flip, gateway, ledger)
+    # the book dips through the band floor, no spot decision → HOLD
+    for secs in (770, 769, 768):
+        p = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=secs))
+        assert [x for x in p if x.purpose == "CUT"] == []
+    assert not o.get("done")                                # held its swing
+    # NOW spot decides against (the real collapse) → cuts via spot, any time
     sl = Needle(side="no", d_before=10.0, d_after=80.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
                 fair_cents=0.0, t_remaining=700.0)
-    for secs in (770, 769, 768):
-        props = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=secs,
-                                           sl=sl))
-        assert [p for p in props if p.purpose == "CUT"] == []
-    assert o["collapse_polls"] >= 2         # counted, gated — not fired
+    flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=767, sl=sl))  # poll 1
+    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=34),
+                                                  secs_left=766, sl=sl))
+            if x.purpose == "CUT"]
+    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
+
+
+def test_in_band_dip_holds_through_patience(flip, gateway, ledger):
+    """Change 3: an in-band or near-band price dip inside patience is
+    HELD, however long — the floor-poll ~2s bypass that stopped cheap
+    entries out of their own swing is gone. Only the catastrophe floor
+    (20c) and a spot decision may act inside patience."""
+    o = _open_pos(flip, gateway, ledger)
+    for secs in range(780, 700, -5):                # many polls, all in-band
+        p = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=secs))
+        assert [x for x in p if x.purpose == "CUT"] == []
+    assert not o.get("done")                        # never cut on price alone
+
+
+def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):
+    """Change 2 OVERTURNED the patience-gate on the ΔP leg: SPOT deciding
+    against is the position trader's real exit — it cuts on 2 sustained
+    polls ANY time (inside patience too), a one-frame flicker still holds."""
+    _open_pos(flip, gateway, ledger)
+    sl = Needle(side="no", d_before=10.0, d_after=80.0,
+                delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
+                fair_cents=0.0, t_remaining=700.0)
+    # inside patience (fill at 790, now 770 = 20s elapsed << 300s)
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=770, sl=sl))
+    assert [x for x in p1 if x.purpose == "CUT"] == []      # poll 1: not yet
+    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=44),
+                                                  secs_left=769, sl=sl))
+            if x.purpose == "CUT"]
+    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason  # 2 polls, cut
+
+
+def test_catastrophe_floor_is_the_only_price_backstop_in_patience(flip,
+                                                                  gateway,
+                                                                  ledger):
+    """Change 1: a ride all the way to the fixed catastrophe floor (20c)
+    cuts even inside patience — the bounded backstop below the swing."""
+    _open_pos(flip, gateway, ledger)
+    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=20),
+                                                  secs_left=770))
+            if x.purpose == "CUT"]
+    assert len(cuts) == 1 and "CATASTROPHE floor" in cuts[0].reason
+    assert cuts[0].price_cents == 20
 
 
 # ── §3: the ruling's data line (no F behavior change) ──────────────────────
