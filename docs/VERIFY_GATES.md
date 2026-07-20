@@ -1481,6 +1481,38 @@ rate-halt is the backstop; the live proof MEASURES instead of guessing.
   Instruments 1+2), cash-integrity B1/B2 untouched, rate-halt B3
   untouched (asserted in-test). Suite 501 · preflight 23/23.
 
+## WO-BLEED-DIAGNOSIS — the two live bleeds (build 35, one commit; §3 RESERVED)
+
+The rate-halt diagnosis working as designed: OPEN swing PRINTED (+20/+12,
+keep), Instrument 2 flagged the floor slip on the FIRST bad loser, the
+halt bounded the damage. Two bleeds fixed, one ruling surfaced with data.
+
+- **Bleed 1 — HUNT averaging down (read-rule TRUE: the 20→13→8 tape;
+  `join >= pend["last_cost"]` only checked frame-to-frame pauses)**: one
+  direction per window (locked at the first hunt's submit); re-entry at
+  or below the prior HUNT entry refused (Adversary: <=), logged
+  HUNT_REFUSE_LOWER once per window (Engineer: compared to the prior
+  ENTRY price, never the mark — an above-prior re-displacement is a
+  recovering needle and stays legal); one HUNT loss sits the window out.
+  OPEN untouched (tested: posts after a hunt loss). Fewer re-entries =
+  fewer FLIP-COUNT-2 race windows (§2.3 verified at the test level; any
+  live UNCOVERED that remains is the partial-fill race, not this).
+- **Bleed 3 — the −25¢ floor slip (Instrument 2's measurement)**: root
+  cause was the PATIENCE GATE holding the through-floor cut during a
+  collapse and firing at the bottom. Fixed: a book SUSTAINED through the
+  band floor (2 polls) is a DECISION and cuts NOW, any minute; a
+  one-frame flicker holds (counter resets); the ΔP-collapse leg (a spot
+  signal that can flicker early) stays patience-gated. The cut lands AT
+  the floor (loss 14¢ on a 48¢ entry — Instrument 2 audits ok=true).
+  EV note: at the restored floor the §1 break-even stays ~55%.
+- **§3 F passthrough — RESERVED to Drew, no F code**: pack gains
+  `F TAIL (§3 ruling data): markets · wins avg · tails avg ·
+  decided-against rate (passthrough breaks even ~95%+ win-rate)` from
+  settled per-market F P&L — the ruling decides from this number, not
+  from one −93.5¢. If B: `salvage_enabled` for F, shadow-first.
+- **HARD RAIL held**: OPEN swing gate, Kelly, cash-integrity, rate-halt
+  untouched. Suite 511 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

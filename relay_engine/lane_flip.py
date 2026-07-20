@@ -197,6 +197,14 @@ class FlipWindow:
     # P-FLIP-THESIS-1 §1 (Scientist: LOG-ONLY until measured): continuity —
     # does the prior window's settlement direction predict this entry side?
     continuity_logged: bool = False
+    # WO-BLEED-1: HUNT never averages down — the 20→13→8 "converging" chase
+    # was each level re-entering as a fresh event. One direction per
+    # window; re-entry only ABOVE the prior entry; one loss sits the
+    # window out. OPEN is untouched.
+    hunt_dir: Optional[str] = None
+    hunt_last_entry: Optional[int] = None
+    hunt_lost: bool = False
+    hunt_refuse_logged: bool = False
     trips: int = 0
     scratches: int = 0
     window_realized: int = 0
@@ -453,6 +461,8 @@ class LaneFlip:
             w.window_realized += realized
             if realized < 0:
                 w.scratches += 1
+                # WO-BLEED-1 §2.2: one HUNT loss ends the window's hunting
+                w.hunt_lost = True
             hunt["count"] -= sold
             if hunt["count"] <= 0:
                 w.hunts.pop(side, None)
@@ -730,10 +740,36 @@ class LaneFlip:
             w.hunt_pending = None
             return []
         side = sl.side                     # always WITH spot, never against
+        # WO-BLEED-1 §2.2: one HUNT loss in the window sits the rest out —
+        # the "so many of so many" doctrine applied intra-window.
+        if w.hunt_lost:
+            w.hunt_pending = None
+            return []
         if side in w.hunts or side in w.posted or side in w.fills:
             return []                      # one open hunt/leg per side
         join = book.best_yes_bid() if side == "yes" else book.best_no_bid()
         if join is None:
+            return []
+        # WO-BLEED-1 §2.1: HUNT never averages down. One direction per
+        # window; a re-entry at OR BELOW the prior HUNT entry (Adversary:
+        # <=, never <) is a collapsing market, not a fresh opportunity —
+        # "converging" meant "the book paused," not "the needle recovered."
+        if w.hunt_dir is not None and side != w.hunt_dir:
+            w.hunt_pending = None
+            if not w.hunt_refuse_logged:
+                w.hunt_refuse_logged = True
+                log.info("HUNT_REFUSE_LOWER %s %s: direction locked to %s "
+                         "this window (no flip-flop)", market, side,
+                         w.hunt_dir)
+            return []
+        if (w.hunt_last_entry is not None
+                and join <= w.hunt_last_entry):
+            w.hunt_pending = None
+            if not w.hunt_refuse_logged:
+                w.hunt_refuse_logged = True
+                log.info("HUNT_REFUSE_LOWER %s %s: this %dc <= prior %dc — "
+                         "no averaging down; sit out (WO-BLEED-1)",
+                         market, side, join, w.hunt_last_entry)
             return []
         gap = sl.fair_cents - join
         if gap < config.HUNT_GAP_CENTS:                 # gate B
@@ -930,22 +966,28 @@ class LaneFlip:
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
             o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
+            through_floor = mark is not None and mark < det_trigger
+            o["floor_polls"] = (o.get("floor_polls", 0) + 1
+                                if through_floor else 0)
+            patience_over = now - o["fill_ts"] >= config.OPEN_PATIENCE_S
             determined = None
-            if mark is not None and mark < det_trigger:
+            # WO-BLEED-3 (Instrument 2's −25c finding): a book SUSTAINED
+            # through the band floor is a DECISION, not noise — the
+            # patience floor was built for 1-2c in-band dips (which B5's
+            # trigger already ignores), and gating the through-floor cut
+            # behind it let a collapse ride 10c past the floor before the
+            # cut could fire. Two sustained polls cut it NOW, any minute;
+            # a one-frame flicker still holds. The ΔP-collapse leg (a spot
+            # signal that CAN flicker early) stays patience-gated.
+            if through_floor and (patience_over or o["floor_polls"] >= 2):
                 determined = (f"open determined-against: {side} {mark}c < "
                               f"trigger {det_trigger}c (band floor, "
-                              "P&L-blind)")
-            elif o["collapse_polls"] >= 2:
+                              "P&L-blind"
+                              + ("" if patience_over
+                                 else ", sustained — WO-BLEED-3") + ")")
+            elif o["collapse_polls"] >= 2 and patience_over:
                 determined = (f"open determined-against: ΔP-collapse "
                               f"{sl.delta_p:.0f}pts sustained")
-            # P-FLIP-THESIS-1 §2 — THE PATIENCE FLOOR (anti-churn): the cut
-            # may only fire after the assessment window, measured from FIRST
-            # FILL (Engineer: never from proposal; the merge keeps the first
-            # fill's ts). A pre-window flinch is noise and holds; a sustained
-            # collapse keeps counting and fires the moment the window ends.
-            # Post-window the cut stays HARD — anti-ride-to-zero.
-            if determined and now - o["fill_ts"] < config.OPEN_PATIENCE_S:
-                determined = None
             if determined:
                 self._cancel_resting(o)
                 o["done"] = True
@@ -1198,6 +1240,11 @@ class LaneFlip:
                     else "PAIR")   # PAIR retired (P21 A4) — legacy tag only
             w.posted[order.side] = {"oid": order_id, "price": order.price_cents,
                                     "ts": now, "mode": mode}
+            if mode == "HUNT":
+                # WO-BLEED-1: the window's direction locks at the first
+                # hunt; re-entries must beat this price (no averaging down)
+                w.hunt_dir = order.side
+                w.hunt_last_entry = order.price_cents
         elif order.purpose == "EXIT":
             # FLIP-COUNT-1 §2.3: the COUNT registers beside the oid — the
             # uncovered-leg invariant compares sizes, not existence.

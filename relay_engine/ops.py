@@ -373,6 +373,26 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
             lines.append("FLIP SWING (24h): no concluded cheap entries yet")
     except Exception as e:
         lines.append(f"FLIP SWING: unavailable ({e})")
+    # WO-BLEED-DIAGNOSIS §3: the data for Drew's F passthrough ruling —
+    # break-even at +3-5c wins vs -93.5c tails is ~95%+; rule A-vs-B from
+    # THIS number, never from one bad print.
+    try:
+        rows = ledger.db.execute(
+            "SELECT market, SUM(pnl_cents) FROM settlements WHERE lane='F'"
+            " AND divergent=0 GROUP BY market").fetchall()
+        if rows:
+            wins = [p for (_, p) in rows if p >= 0]
+            tails = [p for (_, p) in rows if p < 0]
+            avg_w = sum(wins) / len(wins) if wins else 0.0
+            avg_t = sum(tails) / len(tails) if tails else 0.0
+            lines.append(
+                f"F TAIL (§3 ruling data): markets {len(rows)} · wins "
+                f"{len(wins)} avg {avg_w:+.1f}c · tails {len(tails)} avg "
+                f"{avg_t:+.1f}c · decided-against rate "
+                f"{len(tails) / len(rows):.1%} (passthrough breaks even "
+                "~95%+ win-rate)")
+    except Exception as e:
+        lines.append(f"F TAIL: unavailable ({e})")
     # DIAG-1 §3: THE DAILY ANSWERS — every morning answers "why didn't we
     # trade" before it's asked. Permanent section.
     try:

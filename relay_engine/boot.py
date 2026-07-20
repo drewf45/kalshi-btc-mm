@@ -130,6 +130,10 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "down); T-10 book-aware handoff — winners left to F at "
                  "basis, losers cleared; determined-against cuts a genuine "
                  "loser post-window (P-FLIP-THESIS-1)")
+    lines.append("  FLIP HUNT: one direction/window, no averaging down "
+                 "(HUNT_REFUSE_LOWER); one loss/window sits out; "
+                 "through-floor collapse cuts on 2 sustained polls, any "
+                 "minute (WO-BLEED-1/3)")
     lines.append(f"  FLIP CHEAP-LIVE: cheap entry to {config.OPEN_BAND[0]}¢ "
                  f"(two-sided p_cross gate ≥{config.OPEN_SWING_MIN_P:.2f}); "
                  "swing + loser-cut logged (FLIP_SWING / FLIP_LOSER_CUT); "
