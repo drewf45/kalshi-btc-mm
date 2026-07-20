@@ -198,9 +198,13 @@ def test_two_fills_no_exit_between_merges_clean(flip, gateway, ledger):
     assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 0
 
 
-# ── §3.3 UNCOVERED self-heals, then FATALs ─────────────────────────────────
+# ── §3.3 UNCOVERED self-heals ──────────────────────────────────────────────
 def test_uncovered_pages_and_heals_covered_next_cycle(flip, gateway, ledger,
                                                       funnel):
+    """WO-UNCOVERED-FLATTEN AMENDED FLIP-COUNT-2 §3.3: the first detection
+    RECONCILES against broker truth — the stale ×1 take (the self-net
+    artifact) is cancelled, so the heal covers the WHOLE booked leg (2),
+    not just the gap it measured against an order that never confirmed."""
     w = flip._window(TICKER, CLOSE)
     w.fills["no"] = 48
     w.first_fill_ts = CLOSE - 790
@@ -211,31 +215,54 @@ def test_uncovered_pages_and_heals_covered_next_cycle(flip, gateway, ledger,
     ledger.record_fill(TICKER, "FLIP", "no", "ENTRY", 48, 2, "PROBE")
     flip.evaluate(TICKER, _ctx(_book(), secs_left=700))
     assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 1    # the page stays loud
-    assert w.opens["no"]["count"] == 1                 # the gap, covered...
+    assert w.opens["no"]["count"] == 2                 # WHOLE leg, reconciled
     assert w.opens["no"]["entry"] == 48                # ...at booked entry
+    assert "no" not in w.takes_posted                  # stale take cancelled
     p2 = flip.evaluate(TICKER, _ctx(_book(), secs_left=699))
     heals = [p for p in p2 if p.purpose == "EXIT" and p.side == "no"]
-    assert len(heals) == 1 and heals[0].count == 1     # covered next cycle
+    assert len(heals) == 1 and heals[0].count == 2     # covers the whole leg
     assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 1    # once, not a loop
 
 
-def test_uncovered_after_heal_is_fatal(flip, gateway, ledger):
-    """Adversary (c): cover once; a leg still uncovered after its heal is
-    an integrity fault, not a retry."""
+def test_uncovered_flattens_before_it_fatals(flip, gateway, ledger, funnel):
+    """WO-UNCOVERED-FLATTEN §2.4 OVERTURNED the old heal-once-then-FATAL:
+    a leg that can neither cover nor confirm escalates heal → reconcile+
+    retry → FLATTEN at market (never bare, never FATAL with an open naked
+    leg), and only a flatten that itself fails to register is the FATAL."""
     w = flip._window(TICKER, CLOSE)
     w.fills["no"] = 48
     w.first_fill_ts = CLOSE - 790
     w.trips = 1
-    w.takes_posted["no"] = "OID-T1"
-    w.take_counts["no"] = 1
     gateway.positions[(EVENT, TICKER, "FLIP")] = -2
     ledger.record_fill(TICKER, "FLIP", "no", "ENTRY", 48, 2, "PROBE")
-    flip.evaluate(TICKER, _ctx(_book(), secs_left=700))   # page + heal
-    del w.opens["no"]                                  # sabotage the heal
-    w.take_counts["no"] = 1                            # still covered=1<2
+
+    def _sabotage(w):
+        # every cycle: the heal's cover never confirms (drop the revived
+        # record before it can register a resting take) — the escalation
+        # must still reach FLATTEN, never ride bare
+        w.opens.pop("no", None)
+        w.hunts.pop("no", None)
+
+    # the escalation crosses grace → reconcile → retry → FLATTEN, one
+    # stage per cycle; drive it until the flatten order appears
+    flats = []
+    for i, s in enumerate((700, 699, 698, 697, 696)):
+        p = flip.evaluate(TICKER, _ctx(_book(no=45), secs_left=s))
+        flats = [x for x in p if x.purpose == "CUT"
+                 and "FLIP_UNCOVERED_FLATTENED" in (x.reason or "")]
+        if flats:
+            break
+        _sabotage(w)
+    assert len(flats) == 1 and flats[0].crossfire       # market close NOW
+    assert flats[0].count == 2 and flats[0].side == "no"
+    assert _rows(ledger, "FLIP_UNCOVERED_FLATTENED") == 1
+    assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 1     # paged once, not a loop
+    # the flatten never registered a close (sabotaged) → NOW it may FATAL,
+    # with the close already attempted (§2.4: never FATAL on an untried leg)
+    _sabotage(w)
     with pytest.raises(FatalIntegrityError,
                        match="FLIP_UNCOVERED_UNHEALABLE"):
-        flip.evaluate(TICKER, _ctx(_book(), secs_left=699))
+        flip.evaluate(TICKER, _ctx(_book(no=45), secs_left=695))
 
 
 # ── §3.1 Adversary (b): the stuck partial fails toward a known state ───────

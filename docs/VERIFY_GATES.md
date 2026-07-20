@@ -1513,6 +1513,44 @@ halt bounded the damage. Two bleeds fixed, one ruling surfaced with data.
 - **HARD RAIL held**: OPEN swing gate, Kelly, cash-integrity, rate-halt
   untouched. Suite 511 · preflight 23/23.
 
+## WO-UNCOVERED-FLATTEN — the naked leg Drew watched (build 36, one commit)
+
+Drew watched an uncovered FLIP leg ride 45→70→settlement doing nothing
+(192145, −$0.45). Root cause (read-rule TRUE): `_heal_uncovered` added
+the side to `uncovered_healed` on INTENT — reviving the record created
+the intent to cover but guaranteed no resting exit ORDER landed; every
+cover self-net-rejected into the void (the WALL_STORM n=21), the engine
+believed it healed, and the leg rode bare.
+
+- **§2.1 heal ≠ healed until CONFIRMED**: `covered` counts only confirmed
+  resting exits (take_oid / takes_posted / flatten_oids); a leg clears
+  only when `held ≤ covered`. `heal_grace` gives a cover attempt up to
+  FLIP_HEAL_GRACE_CYCLES (2) to confirm (a determined CUT books via
+  async fill; a maker take rests); a confirmed cover raises `covered` and
+  resets the clock.
+- **§2.2 self-net reconcile**: past grace, `_reconcile_side` clamps every
+  custody record to the booked ledger (a phantom gap — broker says
+  smaller — dies here, nothing to cover) and cancels every conflicting
+  resting FLIP sell (the stale-order artifact behind the self-net storm)
+  so a fresh cover can land; then ONE retry.
+- **§2.3 cover-or-flatten deadline**: cover still unconfirmed after
+  reconcile + retry → FLATTEN at market NOW (crossfire, booked-net
+  clamped per the Engineer so it can't re-self-net), FLIP_UNCOVERED_
+  FLATTENED paged — a bounded loss beats an unbounded ride.
+- **§2.4 flatten-before-fatal**: the flatten confirming (on_submitted →
+  flatten_oids) holds the FATAL off; FLIP_UNCOVERED_UNHEALABLE fires only
+  when the flatten itself never registers a close — never FATAL with a
+  naked untried leg.
+- **Escalation**: one stage per cycle (detect+reconcile+heal → retry →
+  flatten → fatal); `heal_attempts` drives it, a booked exit resets the
+  clock (a reopened leg deserves fresh grace).
+- **Overturned test-law (with citation)**: FLIP-COUNT-2 §3.3's
+  heal-once-then-FATAL became flatten-first; the pages-and-heals test now
+  covers the WHOLE reconciled leg (the stale ×1 take is cancelled).
+- **HARD RAIL held**: cover/heal path only — Kelly, cash-integrity,
+  rate-halt, HUNT (BLEED-1), OPEN-swing gate untouched (asserted
+  in-test). Suite 518 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

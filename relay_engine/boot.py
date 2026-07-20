@@ -130,6 +130,10 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "down); T-10 book-aware handoff — winners left to F at "
                  "basis, losers cleared; determined-against cuts a genuine "
                  "loser post-window (P-FLIP-THESIS-1)")
+    lines.append("  FLIP UNCOVERED: legs cover-or-flatten within one cycle "
+                 "— healed only on a CONFIRMED resting exit; self-net "
+                 "reconciles against broker truth; never ride bare "
+                 "(WO-UNCOVERED-FLATTEN)")
     lines.append("  FLIP HUNT: one direction/window, no averaging down "
                  "(HUNT_REFUSE_LOWER); one loss/window sits out; "
                  "through-floor collapse cuts on 2 sustained polls, any "

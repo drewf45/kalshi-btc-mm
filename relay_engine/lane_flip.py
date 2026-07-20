@@ -80,6 +80,13 @@ FLIP_SCRATCH_SITOUT = 3     # DREW-DEFAULT: sit the window out at N scratches
 # position proceeds at its booked size (fail toward a known state, loud).
 # Custody mechanism, not a trading threshold.
 FLIP_STUCK_PARTIAL_POLLS = 3
+# WO-UNCOVERED-FLATTEN: a cover attempt gets this many cycles to CONFIRM a
+# resting exit (a determined CUT books via async fill; a maker take rests
+# next cycle). Past it, a leg still uncovered while its cover keeps
+# proposing-and-rejecting (the 192145 self-net void) is escalated:
+# reconcile → retry → FLATTEN → FATAL, one stage per cycle. Custody
+# mechanism, not a trading threshold.
+FLIP_HEAL_GRACE_CYCLES = 2
 
 
 # ── pure signal helpers — byte-identical to flip_mode.py:284-347 ───────────
@@ -194,6 +201,16 @@ class FlipWindow:
     # a closed record, never falls to the legacy w.fills path.
     late_fills: Dict[str, dict] = field(default_factory=dict)
     uncovered_healed: set = field(default_factory=set)  # §3.3 cover-once guard
+    # WO-UNCOVERED-FLATTEN: an uncovered leg is not HEALED until a resting
+    # exit CONFIRMS in the book (the 192145 leg rode 45→70→settle because
+    # the heal marked intent done while every cover self-net-rejected into
+    # the void). heal_attempts: side -> escalation stage (0 heal proposed,
+    # 1 reconcile+retry, 2 flatten fired). flatten_oids: side -> (oid, n)
+    # of a CONFIRMED flatten crossing to close.
+    heal_attempts: Dict[str, int] = field(default_factory=dict)
+    heal_grace: Dict[str, int] = field(default_factory=dict)
+    heal_covered: Dict[str, int] = field(default_factory=dict)
+    flatten_oids: Dict[str, tuple] = field(default_factory=dict)
     # P-FLIP-THESIS-1 §1 (Scientist: LOG-ONLY until measured): continuity —
     # does the prior window's settlement direction predict this entry side?
     continuity_logged: bool = False
@@ -452,6 +469,19 @@ class LaneFlip:
         if w is None:
             return
         n = max(1, count)
+        # WO-UNCOVERED-FLATTEN: a booked exit CHANGES custody — the heal
+        # clock resets (a reopened leg deserves fresh grace, a partial
+        # close is progress). The flatten's pending-close claim retires as
+        # it lands.
+        w.heal_attempts.pop(side, None)
+        w.heal_grace.pop(side, None)
+        w.heal_covered.pop(side, None)
+        if side in w.flatten_oids:
+            oid, remaining = w.flatten_oids[side]
+            if remaining - n <= 0:
+                w.flatten_oids.pop(side, None)
+            else:
+                w.flatten_oids[side] = (oid, remaining - n)
         # P18: a hunt exit realizes against ITS entry and leaves the pair
         # slots untouched — the two modes never share accounting state.
         hunt = w.hunts.get(side)
@@ -544,6 +574,10 @@ class LaneFlip:
         net = self._net(market, event)
         for side, entry_px in list(w.fills.items()):
             held = (net > 0 and side == "yes") or (net < 0 and side == "no")
+            # WO-UNCOVERED-FLATTEN: a custody bucket (incl. a healed
+            # record) owns the side's exit — rung-A never double-covers
+            if side in w.opens or side in w.hunts:
+                continue
             if held and side not in w.takes_posted and len(w.fills) < 2:
                 q = entry_px + FLIP_X
                 # FLIP-COUNT-1 §2.2: the take sells the BOOKED held size,
@@ -570,9 +604,10 @@ class LaneFlip:
         proposals.extend(self._open_custody(w, market, event, book, ctx,
                                             secs, now))
 
-        # 1.7) FLIP-COUNT-1 §2.3 — FAIL-LOUD invariant: every booked-held
-        # contract is covered by a resting or this-cycle-proposed exit.
-        self._check_uncovered(w, market, proposals)
+        # 1.7) FLIP-COUNT-1 §2.3 + WO-UNCOVERED-FLATTEN: every booked-held
+        # contract is covered by a CONFIRMED resting exit, this cycle's
+        # proposal, or a flatten — never bare, never a ride to settlement.
+        self._check_uncovered(w, market, proposals, book=book, event=event)
 
         # 2) ENTRIES — curfew, trips, sit-out, R1-flat, the OPEN setup
         past_curfew = secs <= FLIP_CURFEW
@@ -1003,24 +1038,33 @@ class LaneFlip:
         return props
 
     def _check_uncovered(self, w: FlipWindow, market: str,
-                         proposals: List[Order]) -> None:
-        """FLIP-COUNT-1 §2.3 + FLIP-COUNT-2 §3.3: if the booked ledger holds
-        more FLIP contracts on a side than the resting exits cover — and no
-        exit is being proposed this cycle — the tape gets a
-        FLIP_UNCOVERED_LEG row, the phone gets a page, AND the leg is
-        COVERED: a position-aware custody record opens for the gap so the
-        normal exit path handles it next cycle (an alarm that names an
-        uncomputed loss-term is only half the job). Cover-once guard
-        (Adversary c): a leg that is STILL uncovered after its heal is an
-        integrity fault — FATAL loud, not a retry loop."""
+                         proposals: List[Order], book=None,
+                         event: str = None) -> None:
+        """FLIP-COUNT-1 §2.3 + WO-UNCOVERED-FLATTEN: COVER OR FLATTEN,
+        NEVER BARE. A leg is not healed until a resting exit CONFIRMS in
+        the book against the booked-held count (the 192145 leg rode
+        45→70→settle because the old heal marked its INTENT healed while
+        every cover self-net-rejected into the void). The escalation, one
+        stage per cycle:
+          detect  → page + reconcile custody vs broker + revive the record
+          stage 0 → the cover proposed; if it CONFIRMS (take_oid) → healed
+          stage 1 → cover failed to land: §2.2 self-net reconcile (cancel
+                    conflicting resting sells, clamp counts to booked) +
+                    ONE retry
+          stage 2 → still bare: FLATTEN at market NOW, crossfire, clamped
+                    to booked-net (Engineer) — a bounded loss beats an
+                    unbounded ride
+          after   → a flatten that itself fails is the only FATAL, and it
+                    fires with the close already attempted (§2.4: never
+                    FATAL with a naked leg still open and untried)."""
         from . import failures
         proposing = {p.side for p in proposals
                      if p.action == "sell" and p.purpose in ("EXIT", "CUT")}
         for side in ("yes", "no"):
-            if side in proposing:
-                continue
             held = self._booked_held(market, side)
             if held is None or held <= 0:
+                w.heal_attempts.pop(side, None)
+                w.heal_covered.pop(side, None)
                 continue
             covered = 0
             provenance = []
@@ -1035,47 +1079,165 @@ class LaneFlip:
             if side in w.takes_posted:
                 covered += w.take_counts.get(side, 1)
                 provenance.append(f"fills:{w.fills.get(side)}")
+            if side in w.flatten_oids:
+                covered += w.flatten_oids[side][1]   # a crossing close
             if held <= covered:
+                # CONFIRMED resting exit(s) against the booked count —
+                # only now is the side healed (§2.1: never on intent).
+                w.heal_attempts.pop(side, None)
+                w.heal_grace.pop(side, None)
+                w.heal_covered.pop(side, None)
                 continue
             # P-FLIP-THESIS-1: a HOLD-TO-SETTLE deliberately rests no exit
-            # — its loss-term lives in the determined floor + custodian
-            # backstop, not a resting take. Never a leak, never a page.
             if ((h is not None and h.get("hold"))
                     or (o is not None and o.get("hold"))):
                 continue
-            # a live (not-done) record with its take pending proposal will
-            # cover on the next cycle — that is the normal path, not a leak
+            # a freshly-revived/live record awaiting its FIRST propose
+            # cycle is not yet a failed attempt — the take proposes next
             if ((h is not None and not h.get("done")
                  and not h.get("take_proposed"))
                     or (o is not None and not o.get("done")
                         and not o.get("take_proposed"))):
                 continue
-            if side not in w.uncovered_paged:
-                w.uncovered_paged.add(side)
+            # WO-UNCOVERED-FLATTEN: a leg is healed only when a resting
+            # exit CONFIRMS (covered rises). heal_grace gives a cover
+            # attempt up to GRACE cycles to confirm (async CUT fills, maker
+            # rests); a confirmed cover raises `covered` → progress reset.
+            # heal_attempts drives the escalation once grace is spent — the
+            # self-net void that proposes-and-rejects forever crosses grace
+            # and escalates reconcile → retry → FLATTEN → FATAL.
+            prev_cov = w.heal_covered.get(side)
+            w.heal_covered[side] = covered
+            if prev_cov is not None and covered > prev_cov:
+                w.heal_attempts.pop(side, None)   # progress — reset
+                w.heal_grace.pop(side, None)
+            gap = held - covered
+            esc = w.heal_attempts.get(side, 0)
+            if esc == 0 and side in proposing:
+                g = w.heal_grace.get(side, 0) + 1
+                w.heal_grace[side] = g
+                if g <= FLIP_HEAL_GRACE_CYCLES:
+                    continue     # a cover is in flight; let it confirm
+            w.heal_grace.pop(side, None)
+            if esc == 0:
+                # §2.1 detect + reconcile + revive: page ONCE, reconcile
+                # against broker truth (cancel the unconfirmable stale
+                # sells), heal the WHOLE remaining leg as a once-proposing
+                # opens record
+                if side not in w.uncovered_paged:
+                    w.uncovered_paged.add(side)
+                    failures.fail(
+                        "FLIP_UNCOVERED_LEG",
+                        f"{market} {side}: held {held} > covered {covered}",
+                        fatal=False, alert=True, market=market, side=side,
+                        held=held, covered=covered,
+                        buckets=";".join(provenance) or "none")
+                self._reconcile_side(w, market, side)
+                still = self._booked_held(market, side)
+                if still is None or still <= 0:
+                    # §2.2 phantom gap: broker says nothing to cover
+                    w.heal_attempts.pop(side, None)
+                    w.heal_covered.pop(side, None)
+                    continue
+                self._heal_uncovered(w, market, side, still)
+                w.heal_attempts[side] = 1
+            elif esc == 1:
+                # §2.2 the ONE retry: reconcile again, re-propose fresh
+                self._reconcile_side(w, market, side)
+                for bucket in (w.hunts, w.opens):
+                    rec = bucket.get(side)
+                    if rec is not None and rec["count"] > 0:
+                        rec["done"] = False
+                        rec["take_proposed"] = False
+                        rec["take_oid"] = None
+                w.heal_attempts[side] = 2
+            elif esc == 2:
+                # §2.3 THE DEADLINE: cover unconfirmed after reconcile +
+                # retry — FLATTEN at market NOW, booked-net clamped
+                # (Engineer), never bare
+                mark = (book.best_yes_bid() if side == "yes"
+                        else book.best_no_bid()) if book is not None else None
+                if mark is None:
+                    continue    # no book truth this cycle; retry the flatten
+                n = self._exit_count(market, side, gap)
+                if n <= 0:
+                    w.heal_attempts.pop(side, None)
+                    w.heal_covered.pop(side, None)
+                    continue
+                for bucket in (w.hunts, w.opens):
+                    rec = bucket.get(side)
+                    if rec is not None:
+                        rec["done"] = True
+                ev = event or market.rsplit("-", 1)[0]
+                proposals.append(Order(
+                    lane="FLIP", event=ev, market=market, side=side,
+                    action="sell", price_cents=mark, count=n,
+                    size_tier=config.TIER_PROBE, purpose="CUT",
+                    crossfire=True,
+                    reason="FLIP_UNCOVERED_FLATTENED: cover unconfirmed "
+                           "after reconcile+retry — never bare"))
                 failures.fail(
-                    "FLIP_UNCOVERED_LEG",
-                    f"{market} {side}: held {held} > covered {covered}",
+                    "FLIP_UNCOVERED_FLATTENED",
+                    f"{market} {side}: x{n} flattened at {mark}c — cover "
+                    "could not be confirmed after reconcile+retry; a "
+                    "bounded loss now beats an unbounded ride",
                     fatal=False, alert=True, market=market, side=side,
-                    held=held, covered=covered,
-                    buckets=";".join(provenance) or "none")
-                self._heal_uncovered(w, market, side, held - covered)
-            elif side in w.uncovered_healed:
+                    count=n, price=mark)
+                w.heal_attempts[side] = 3
+            else:
+                # §2.4 the flatten itself never registered a close — a leg
+                # that can neither cover nor close is a true integrity
+                # fault; stop with the close already attempted, never
+                # FATAL with a naked untried leg.
                 failures.fail(
                     "FLIP_UNCOVERED_UNHEALABLE",
                     f"{market} {side}: held {held} > covered {covered} "
-                    "AFTER a self-heal — a leg that cannot be covered is "
-                    "an integrity fault, not a retry",
+                    "after reconcile, retry, AND a flatten attempt — a leg "
+                    "that can neither cover nor close is an integrity "
+                    "fault; stopping with it loudly flagged",
                     fatal=True, market=market, side=side,
                     held=held, covered=covered)
+
+    def _reconcile_side(self, w: FlipWindow, market: str, side: str) -> None:
+        """§2.2 SELF-NET RECONCILE: the venue refusing the cover means the
+        custody count and broker truth disagree. Clamp every record on the
+        side to the booked ledger (a phantom gap dies here — broker says
+        smaller, nothing to cover) and cancel EVERY conflicting resting
+        FLIP sell on the side (the stale-order artifact behind the
+        self-net storm) so the fresh cover can land."""
+        booked = self._booked_held(market, side)
+        for bucket in (w.hunts, w.opens):
+            rec = bucket.get(side)
+            if rec is None:
+                continue
+            if booked is not None and rec["count"] > booked:
+                log.warning("FLIP_SELFNET_RECONCILE %s %s: custody count "
+                            "%d -> booked %d (phantom gap corrected)",
+                            market, side, rec["count"], booked)
+                rec["count"] = booked
+                if booked <= 0:
+                    bucket.pop(side, None)
+                    continue
+            if rec.get("take_oid") is not None and self.gateway is not None:
+                self.gateway.cancel(rec["take_oid"])
+                rec["take_oid"] = None
+        stale = w.takes_posted.pop(side, None)
+        w.take_counts.pop(side, None)
+        if stale is not None and self.gateway is not None:
+            self.gateway.cancel(stale)
+        if self.gateway is not None:
+            for oid, o in list(getattr(self.gateway, "resting", {}).items()):
+                if (o.lane == "FLIP" and o.market == market
+                        and o.side == side and o.action == "sell"):
+                    self.gateway.cancel(oid)
 
     def _heal_uncovered(self, w: FlipWindow, market: str, side: str,
                         gap: int) -> None:
         """§3.3: cover the uncovered — revive the closed record (its own
         entry price keeps realization honest) or open a fresh one at the
-        ledger's booked entry, sized to the gap. The normal exit machinery
-        (take / determined / yield, all booked-net clamped) owns it from
-        the next cycle."""
-        w.uncovered_healed.add(side)
+        ledger's booked entry, sized to the gap. WO-UNCOVERED-FLATTEN:
+        this is INTENT only — the side is healed when the exit CONFIRMS,
+        never here."""
         w.late_fills.pop(side, None)          # absorbed into the healed leg
         for bucket in (w.hunts, w.opens):
             rec = bucket.get(side)
@@ -1263,6 +1425,12 @@ class LaneFlip:
                 pos = self.custodian.positions.get(f"{order.market}:FLIP")
                 if pos is not None:
                     pos.resting_exit_id = order_id
+        elif (order.purpose == "CUT"
+              and "FLIP_UNCOVERED_FLATTENED" in (order.reason or "")):
+            # WO-UNCOVERED-FLATTEN: the flatten CONFIRMED with the venue —
+            # it counts as cover-pending-close; the FATAL never fires while
+            # a confirmed close is crossing.
+            w.flatten_oids[order.side] = (order_id, order.count)
 
     def pair_grace_expired(self, market: str, now: float) -> Optional[str]:
         """After the grace, the un-filled opposite entry is dropped (its order id
