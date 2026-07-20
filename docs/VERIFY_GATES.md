@@ -1935,6 +1935,49 @@ historical +$3.14 awaits the live divergent tape to pin via the three queries
 in the report; E1 makes every future divergence self-pinning from the next
 window forward.
 
+## WO-FLIP-IMMEDIATE-ENTRY + DAILY-PACK-FILL-ECON (build 47)
+
+**Part A — the bug (ships and triggers the build):** FLIP structurally could
+not enter. Read-rule TRUE at `lane_flip.py`: the entry gate rejected on
+`grain is None or length < OPEN_MIN_GRAIN` and returned no proposals — the
+transcript's repeated `OPEN_NO_GRAIN … waiting IS the setup`. That grain-wait
+is the exact belief the liquidity-hold capstone overturned; while F traded,
+FLIP sat out every window.
+- **Fix:** the grain-wait is retired. FLIP now enters the opening IMBALANCE
+  immediately — the entry side is the **cheap side of the band** (the lower
+  bid, the pile-in-abandoned side), not `grain["direction"]`. Grain, if
+  present, only informs the `why`. A true 50/50 (equal bids) skips (no
+  imbalance); the cheap side above `OPEN_MAX_ENTRY_CENTS` skips (paid up).
+- **Trend-guard (Adversary-mandatory) — already in force:** `needle_active`
+  (HUNT seniority, `delta_p >= HUNT_NEEDLE_POINTS = 5`) returns *before* the
+  entry gate on ANY live spot trend — **stricter** than the WO's "decisive
+  trend (≥15) against the cheap side" — so removing the grain gate does not
+  remove trend protection. FLIP never buys into a market that's genuinely
+  running.
+- Band, max-entry, the swing gate (the Instrument-1 measured-rate gate,
+  permissive while calibrating), the resting-take exit, liquidity-hold, and
+  the catastrophe backstop are all UNCHANGED. Overturned test-laws (grain
+  gates / posts-grain-side) re-anchored to imbalance across test_lane_flip,
+  test_p15, test_p26, test_flip_thesis1.
+
+**Part B — the fill-economics pack (banked, rides along, read-only):** now
+that the book is honest (E1) and FLIP enters, the take-vs-fee question gets
+DATA. `ops.fill_economics(ledger)` adds a daily-pack section and
+`flip_fill_rate_hourly` a compact hourly line, per lane (FLIP, F, HUNT):
+avg entry/exit price, gross spread, fees, **net after fees**, and the
+**maker/taker split derived from `fee_cents`** (maker = 0-fee, taker > 0¢ —
+no schema change, the fee column already carries the truth) — the sharp
+answer to "is the +5 nickel eaten by taker fees?" Plus FLIP's **resting-take
+fill (reversion) rate** (from the FLIP_SWING instrument) and its distribution
+**by realized take distance** — the "post-here-to-fill" curve that turns
+"+5 vs +7 vs +10" into a number. All read-only off the honest fills table; it
+informs the take ruling, Drew still rules the number.
+
+**HARD RAIL:** Part A touches ONLY the FLIP entry gate; Part B is read-only.
+No Kelly/cash/rate-halt/F/geometry change. Ships at `FLIP_SIZE_CAP=1`; the
+fill-rate gate still governs size. 6 immediate-entry test rewrites + 6 new
+fill-economics tests. Suite 593 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

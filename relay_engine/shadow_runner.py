@@ -23,7 +23,7 @@ from .gateway import Gateway
 from .errors import WallRejection
 from .lanes import build_registry
 from .ledger import CashProtocol, Ledger
-from .ops import Recorder, Telegram, daily_pack
+from .ops import Recorder, Telegram, daily_pack, flip_fill_rate_hourly
 from .surface import PASS, PROPOSED, Surface
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -1680,7 +1680,8 @@ async def run():
                     f"brain={'ok' if _delta.is_loaded() else 'absent'} "
                     f"book✓ {engine.book_checks_total} "
                     f"fetch_fail={getattr(engine.feed, 'failed_fetches', 0)} "
-                    f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]}")
+                    f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]} "
+                    + flip_fill_rate_hourly(engine.ledger))
 
     # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
     async def listener_task():

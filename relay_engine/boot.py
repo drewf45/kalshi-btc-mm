@@ -166,6 +166,12 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "rode 201430 to the floor; at 1-lot = entry+"
                  f"{config.OPEN_TAKE_MIN}¢, fee-safe; cut unchanged "
                  "(WO-FLIP-GOAL-TAKE)")
+    lines.append("  FLIP ENTRY: opening-imbalance IMMEDIATE — buy the cheap "
+                 "side (lower bid, the pile-in-abandoned side) the instant "
+                 "it's in-band; grain no longer gates (only informs); "
+                 "trend-guarded by HUNT seniority (any live needle yields); "
+                 "empirical gate is the resting-take fill rate "
+                 "(WO-FLIP-IMMEDIATE-ENTRY)")
     lines.append(f"  FLIP LIQUIDITY-HOLD: low price = illiquidity, not loss — "
                  f"resting take entry+{config.OPEN_TAKE_MIN}¢ holds through the "
                  "pile-in (no reactive scalp/band stop); collapse backstop "

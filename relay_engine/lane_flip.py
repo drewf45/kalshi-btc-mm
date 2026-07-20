@@ -670,17 +670,32 @@ class LaneFlip:
         if not (yes_bid is not None and no_bid is not None
                 and lo_b <= yes_bid <= hi_b and lo_b <= no_bid <= hi_b):
             return proposals               # setup absent: not a 49/49 book
+        # WO-FLIP-IMMEDIATE-ENTRY (build 47): the grain-wait is RETIRED. The
+        # liquidity-hold capstone overturned "waiting IS the setup" — FLIP
+        # buys the opening IMBALANCE the instant it is cheap; it does not wait
+        # for a grain streak to confirm (grain=None returned no proposals
+        # window after window and structurally blocked the lane while F
+        # traded). The entry side is the CHEAP side of the band — the lower
+        # bid, the side the pile-in abandoned; grain, if present, only INFORMS
+        # the why, it no longer gates. The TREND-GUARD is already in force
+        # above: needle_active (HUNT seniority, delta_p >= HUNT_NEEDLE_POINTS)
+        # returns before this gate on ANY live spot trend — stricter than the
+        # WO's "decisive trend against the cheap side" — so FLIP never buys
+        # into a market that is genuinely running. The empirical gate stays the
+        # measured swing/fill rate (Instrument 1) below and the resting-take
+        # fill rate after entry; PROOF stays measured, only the entry opens.
         g = ctx.get("grain")
-        if g is None or g.get("length", 0) < config.OPEN_MIN_GRAIN:
+        if yes_bid == no_bid:
             if not w.open_no_grain_logged:
                 w.open_no_grain_logged = True
-                log.info("OPEN_NO_GRAIN %s — open-band book without grain "
-                         "(grain=%s); waiting IS the setup", market, g)
-            return proposals               # herd has no screen -> no trade
-        side = g["direction"]
+                log.info("OPEN_NO_IMBALANCE %s — band book but sides equal "
+                         "(y%dc/n%dc): no cheap side to provide against",
+                         market, yes_bid, no_bid)
+            return proposals               # true 50/50: no imbalance to buy
+        side = "yes" if yes_bid < no_bid else "no"   # the cheap (abandoned) side
         join = yes_bid if side == "yes" else no_bid
         if join > config.OPEN_MAX_ENTRY_CENTS:
-            return proposals               # the herd's side is already paid up
+            return proposals               # the cheap side is already paid up
         # WO-FLIP-LIQUIDITY-HOLD (build 45): the risk/reward GEOMETRY GATE is
         # GONE. Build 43 grounded it on the scalp stop as the "real bail" —
         # but the liquidity-hold model REMOVES that stop: a low mark after a
@@ -726,15 +741,18 @@ class LaneFlip:
         # it votes on entry side only after the data shows edge; the
         # Adversary: it may never override a determined cut)
         self._log_continuity(w, market, side)
+        grain_note = (f"grain~{g.get('direction')}x{g.get('length')} informs"
+                      if g else "grain~none")
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=config.OPEN_BAND, rest_fp=book.best_fp(side),
-            why=f"OPEN grain {side}x{g['length']} · join {join}c · "
-                f"band y{yes_bid}/n{no_bid} · {proof} · "
+            why=f"OPEN imbalance {side}@{join}c cheap (spread "
+                f"{abs(yes_bid - no_bid)}c) · band y{yes_bid}/n{no_bid} · "
+                f"{proof} · "
                 + (swing["why"] if swing is not None else "swing~untabled")
-                + " · geometry=v2"))
+                + f" · {grain_note}"))
         return proposals
 
     @staticmethod

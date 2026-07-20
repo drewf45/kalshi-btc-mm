@@ -82,43 +82,48 @@ def test_scratch_reason_triggers():
 
 
 # ── P21 A4: Lane OPEN entry mechanics (PAIR retired) ───────────────────────
-def test_open_posts_grain_side_only(flip):
-    """P21 A4 OVERTURNED pair-posting (the venue nets one account's sides):
-    an open-band book posts ONE lot on the GRAIN side, why-stamped."""
+def test_open_posts_cheap_side_of_the_imbalance(flip):
+    """WO-FLIP-IMMEDIATE-ENTRY (build 47): an open-band book posts ONE lot on
+    the CHEAP side (the lower bid — the pile-in-abandoned side), NOT the grain
+    side. yes 48 < no 49 -> buy YES@48; grain only informs the why."""
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
                                       grain=GRAIN_NO3))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("no", 49, "ENTRY")]
+        [("yes", 48, "ENTRY")]
     assert props[0].lane == "FLIP" and props[0].count == 1
-    assert "OPEN grain nox3" in props[0].why
+    assert "OPEN imbalance yes@48c" in props[0].why
     assert "band y48/n49" in props[0].why
 
 
-def test_open_no_grain_passes(flip):
-    """A4: band without grain -> pass, tagged OPEN_NO_GRAIN (Drew: 'if the
-    last three markets have been down and it's 49/49, you buy no' — no
-    streak, no side, no trade)."""
+def test_open_no_grain_still_enters(flip):
+    """WO-FLIP-IMMEDIATE-ENTRY OVERTURNED 'no grain -> no trade': the grain
+    wait is retired (the liquidity capstone). A band book with weak grain OR
+    no grain at all ENTERS the cheap side immediately — the imbalance IS the
+    setup, not a grain streak."""
+    # weak grain (length < OPEN_MIN_GRAIN) no longer blocks
     w_ctx = ctx(flip_book(yes=48, no=49),
                 grain={"direction": "no", "length": 1, "k": 4})
-    assert flip.evaluate(TICKER, w_ctx) == []
-    assert flip.windows[TICKER].open_no_grain_logged
-    # and with NO grain at all (empty screen)
+    assert [(p.side, p.purpose) for p in flip.evaluate(TICKER, w_ctx)] == \
+        [("yes", "ENTRY")]
+    # and with NO grain at all (empty screen): still enters the cheap side
     flip.windows.clear()
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49))) == []
+    assert [(p.side, p.purpose) for p in
+            flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49)))] == \
+        [("yes", "ENTRY")]
 
 
 def test_open_band_required(flip):
-    """A4: the setup is BOTH sides inside the open band — a determined book
-    (yes 40) is not a 49/49 book, grain or no grain."""
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=40, no=55),
+    """A4: the setup is BOTH sides inside the open band — an out-of-band book
+    (yes 30, below the band floor) is not a setup, imbalance or not."""
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=30, no=65),
                                      grain=GRAIN_NO3)) == []
 
 
-def test_open_grain_side_paid_up_passes(flip):
-    """A4: grain side join above OPEN_MAX_ENTRY_CENTS -> the herd's side is
-    already paid up; pass."""
+def test_open_cheap_side_paid_up_passes(flip):
+    """A4: the CHEAP side's join above OPEN_MAX_ENTRY_CENTS -> both sides are
+    paid up, no cheap entry; pass. (yes 50 is the cheap side but > 49.)"""
     assert config.OPEN_MAX_ENTRY_CENTS == 49
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=45, no=52),
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=50, no=52),
                                      grain=GRAIN_NO3)) == []
 
 
@@ -128,7 +133,7 @@ def test_open_curfew_and_no_entry_phase(flip):
     # P-FLIP-THESIS-1 §3.5: the scalp window is T-15→T-10 (was T-8)
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
                                       secs_left=650, grain=GRAIN_NO3))
-    assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
+    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     flip.windows.clear()
     # past the T-10 cutoff nothing posts; window over posts nothing
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
@@ -187,13 +192,14 @@ def test_reentry_is_open_gated(flip, gateway):
     not the tape's last four ticks)."""
     w = flip._window(TICKER, CLOSE)
     w.trips = 1
-    # flat but no grain -> wait (was: OFI disagreement -> wait)
-    # P-FLIP-THESIS-1 §3.5: re-entry times sit inside T-15→T-10 now
+    # WO-FLIP-IMMEDIATE-ENTRY: re-entry opens on band + imbalance, no grain
+    # needed. Too early is gated by the entry cutoff, not a grain wait.
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                     secs_left=650)) == []
+                                     secs_left=200)) == []      # past T-10 cutoff
+    # inside the window: re-entry buys the cheap side (yes 48 < no 49)
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                      secs_left=645, grain=GRAIN_NO3))
-    assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
+                                      secs_left=645))
+    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 
 def test_stop_streak_reports_never_kills(flip, gateway):

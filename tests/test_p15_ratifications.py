@@ -45,16 +45,18 @@ def test_one_sided_book_posts_nothing(engine):
     assert props == []
 
 
-def test_pair_formable_posts_both(engine):
-    """P21 A4 OVERTURNED Ruling 2's pair-posting (the venue nets one
-    account's sides — a pair-bundle was a fiction): the same two-way book
-    now posts ONE lot on the grain side, and NOTHING without grain."""
+def test_pair_formable_posts_the_cheap_side(engine):
+    """WO-FLIP-IMMEDIATE-ENTRY (build 47) OVERTURNED grain-gating: a two-way
+    band book posts ONE lot on the CHEAP side (the lower bid) immediately, no
+    grain needed. yes 46 < no 48 -> buy YES@46; grain, if present, only
+    informs — the side stays the cheap side."""
     ctx = flip_ctx(engine, flip_book(46, 48))
-    assert engine.flip.evaluate(TICKER, ctx) == []   # band without grain
+    assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
+        == [("yes", "ENTRY")]                        # yes 46 < no 48 -> cheap
     engine.flip.windows.clear()
-    ctx["grain"] = {"direction": "no", "length": 2, "k": 4}
-    props = engine.flip.evaluate(TICKER, ctx)
-    assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
+    ctx["grain"] = {"direction": "no", "length": 2, "k": 4}   # informs only
+    assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
+        == [("yes", "ENTRY")]                        # still the cheap side
 
 
 def test_combined_over_line_posts_nothing(engine):

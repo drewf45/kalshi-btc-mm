@@ -184,6 +184,94 @@ LANES_LIVE = ("F", "H8", "FLIP", "D", "P")
 LANES_PENDING = ()  # every lane that exists trades (R1); empty until a new lane is designed
 
 
+def fill_economics(ledger, lanes=("FLIP", "F", "HUNT")) -> list:
+    """WO-DAILY-PACK-FILL-ECON (build 47): read-only fill economics per lane —
+    what we paid to enter, what we sold at, the gross spread, fees, the NET
+    after fees, and the MAKER/TAKER split (maker = 0-fee, taker > 0¢: the fee
+    drag that eats the nickel). Plus FLIP's resting-take fill (reversion) rate
+    and its distribution by realized take distance. All from the honest fills
+    table + the FLIP_SWING instrument; no trading change. Turns 'is +5 the
+    right nickel or is it 7' into a number instead of a feeling."""
+    import json as _json
+    out = ["FILL ECONOMICS (honest fills; maker = 0-fee, taker > 0¢):"]
+    for lane in lanes:
+        e_val, e_cnt, e_n = ledger.db.execute(
+            "SELECT COALESCE(SUM(price_cents*count),0), COALESCE(SUM(count),0),"
+            " COUNT(*) FROM fills WHERE lane=? AND action='ENTRY'",
+            (lane,)).fetchone()
+        x_val, x_cnt, x_n = ledger.db.execute(
+            "SELECT COALESCE(SUM(price_cents*count),0), COALESCE(SUM(count),0),"
+            " COUNT(*) FROM fills WHERE lane=? AND action IN "
+            "('EXIT','CUSTODIAN_EXIT')", (lane,)).fetchone()
+        tot_fee, tot_cnt, maker_cnt = ledger.db.execute(
+            "SELECT COALESCE(SUM(fee_cents),0), COALESCE(SUM(count),0),"
+            " COALESCE(SUM(CASE WHEN fee_cents=0 THEN count ELSE 0 END),0)"
+            " FROM fills WHERE lane=?", (lane,)).fetchone()
+        if e_n == 0 and x_n == 0:
+            out.append(f"  [{lane}] no fills yet")
+            continue
+        avg_e = e_val / e_cnt if e_cnt else 0.0
+        avg_x = x_val / x_cnt if x_cnt else 0.0
+        spread = (avg_x - avg_e) if (e_cnt and x_cnt) else None
+        fee_pc = tot_fee / tot_cnt if tot_cnt else 0.0
+        maker_pct = 100.0 * maker_cnt / tot_cnt if tot_cnt else 0.0
+        net = (spread - fee_pc) if spread is not None else None
+        out.append(
+            f"  [{lane}] entry~{avg_e:.1f}c exit~{avg_x:.1f}c spread~"
+            f"{('%+.1f' % spread) if spread is not None else 'na'}c | fees "
+            f"{tot_fee}c ({fee_pc:.2f}c/ct · maker {maker_pct:.0f}%) | net~"
+            f"{('%+.1f' % net) if net is not None else 'na'}c/ct | {x_n} exits"
+            f"/{e_n} entries")
+    # FLIP's resting-take fill (reversion) rate + its by-distance distribution
+    rows = ledger.db.execute(
+        "SELECT detail FROM surface_rows WHERE state='FLIP_SWING'"
+        " ORDER BY id DESC LIMIT 500").fetchall()
+    took = tot = 0
+    by_dist: dict = {}
+    for (d,) in rows:
+        try:
+            r = _json.loads(d)
+        except Exception:
+            continue
+        tot += 1
+        if r.get("took_swing"):
+            took += 1
+            k = int(round(r.get("gross_cents", 0)))
+            by_dist[k] = by_dist.get(k, 0) + 1
+    if tot:
+        rate = 100.0 * took / tot
+        out.append(f"  [FLIP fill-rate] resting take lifted {took}/{tot} = "
+                   f"{rate:.0f}% — the reversion gate; size only once it "
+                   "clears fees")
+        if by_dist:
+            dist_str = " ".join(f"+{k}c:{v}" for k, v in sorted(by_dist.items()))
+            out.append(f"  [FLIP take-distance] filled by realized spread: "
+                       f"{dist_str} (the post-here-to-fill curve)")
+    return out
+
+
+def flip_fill_rate_hourly(ledger) -> str:
+    """WO-DAILY-PACK-FILL-ECON: the compact hourly line — FLIP's take fill
+    rate and maker %, the two numbers that say whether the lane is working."""
+    took, tot = 0, 0
+    import json as _json
+    for (d,) in ledger.db.execute(
+            "SELECT detail FROM surface_rows WHERE state='FLIP_SWING'"
+            " ORDER BY id DESC LIMIT 200").fetchall():
+        try:
+            tot += 1
+            if _json.loads(d).get("took_swing"):
+                took += 1
+        except Exception:
+            tot -= 1
+    tot_cnt, maker_cnt = ledger.db.execute(
+        "SELECT COALESCE(SUM(count),0), COALESCE(SUM(CASE WHEN fee_cents=0 "
+        "THEN count ELSE 0 END),0) FROM fills WHERE lane='FLIP'").fetchone()
+    fr = f"{100.0 * took / tot:.0f}%({took}/{tot})" if tot else "na"
+    mk = f"{100.0 * maker_cnt / tot_cnt:.0f}%" if tot_cnt else "na"
+    return f"flip_fill={fr} flip_maker={mk}"
+
+
 def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[int] = None,
                foreign_fills: int = 0, econ=None) -> str:
     """The daily pack: EPOCH 2 header, the worst-day bound, live-vs-pending
@@ -487,4 +575,9 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(semantics.drift_section(ledger))
     except Exception as e:
         lines.append(f"DOCTRINE: registry unavailable ({e})")
+    # WO-DAILY-PACK-FILL-ECON (build 47): the fill-economics section — read-only
+    try:
+        lines.extend(fill_economics(ledger))
+    except Exception as e:
+        lines.append(f"FILL ECONOMICS: unavailable ({e})")
     return "\n".join(lines)

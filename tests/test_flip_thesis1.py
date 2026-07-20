@@ -274,7 +274,8 @@ def test_scalp_take_rests_at_the_goal_bounded_move(flip, gateway, ledger):
     entry+5 at the 1-lot cap (54¢), banked reliably. The reachable nickel is
     the win convergence actually gives; the +20 was the SOMETIMES."""
     take_cents = LaneFlip._take_cents(1)           # 5 at the 1-lot cap
-    props = flip.evaluate(TICKER, _ctx(_book(yes=49), secs_left=800,
+    # yes 49 < no 50 -> yes is the cheap side (WO-FLIP-IMMEDIATE-ENTRY buys it)
+    props = flip.evaluate(TICKER, _ctx(_book(yes=49, no=50), secs_left=800,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 49, 1, "PROBE")
