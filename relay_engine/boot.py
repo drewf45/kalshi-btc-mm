@@ -138,10 +138,15 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(HUNT_REFUSE_LOWER); one loss/window sits out; "
                  "through-floor collapse cuts on 2 sustained polls, any "
                  "minute (WO-BLEED-1/3)")
-    lines.append(f"  FLIP CHEAP-LIVE: cheap entry to {config.OPEN_BAND[0]}¢ "
-                 f"(two-sided p_cross gate ≥{config.OPEN_SWING_MIN_P:.2f}); "
-                 "swing + loser-cut logged (FLIP_SWING / FLIP_LOSER_CUT); "
-                 "one lot until measured (WO-FLIP-CHEAP-LIVE)")
+    lines.append(f"  FLIP CHEAP-LIVE: cheap entry to {config.OPEN_BAND[0]}¢; "
+                 "swing + loser-cut logged (FLIP_SWING / FLIP_LOSER_CUT) "
+                 "(WO-FLIP-CHEAP-LIVE)")
+    lines.append("  FLIP SWING GATE: measures Instrument 1's MEASURED "
+                 "took_swing rate per band (the strike-touch proxy asked "
+                 "the wrong event, ~0.89 always); §2 two-barrier price "
+                 "model shadow-compared; FLIP capped "
+                 f"{config.FLIP_SIZE_CAP}-lot until it tracks measurement "
+                 "(WO-SWING-GATE-EVENT)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

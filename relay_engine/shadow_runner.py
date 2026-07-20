@@ -454,6 +454,13 @@ class ShadowEngine:
                          proposal.price_cents, depth)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
         proposal.count = max(1, dec.contracts)
+        # WO-SWING-GATE-EVENT §4.2 (DREW-RULED 2026-07-20): FLIP's swing
+        # gate measured the wrong event and rubber-stamped falling knives —
+        # cap FLIP entries at 1 lot until the gate tracks measured
+        # took_swing. F is untouched (its survival gate is correct). This
+        # bounds the 3-lot bleed while Instrument 1 keeps calibrating.
+        if proposal.lane == "FLIP":
+            proposal.count = min(proposal.count, config.FLIP_SIZE_CAP)
         # WO-VERIFY-LOSSTERM-1 B4 (pure logging): when Kelly is the term
         # that zeroed a favorite, say so BY NAME once per (market, price) —
         # "0 @98c" must be self-explaining arithmetic, never a mystery bug.

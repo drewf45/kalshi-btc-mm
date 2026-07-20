@@ -218,22 +218,33 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
     eng = object.__new__(ShadowEngine)
     eng.ledger = ledger
     eng.telegram = type("T", (), {"alert": staticmethod(lambda m: None)})()
+    # WO-SWING-GATE-EVENT §4.2: FLIP is capped to 1 lot while its swing
+    # gate is miscalibrated — the tier still computes and stamps (reporting
+    # unchanged), but the count is bounded. The full-Kelly FORMULA is
+    # verified on an UNCAPPED lane (F) below.
     prop = Order(lane="FLIP", event=EVENT, market=TICKER, side="yes",
                  action="buy", price_cents=48, count=1,
                  size_tier=config.TIER_PROBE, purpose="ENTRY",
                  why="OPEN grain yesx2 · join 48c")
     eng._score_and_size(prop, _book(yes=48, no=49))
     assert prop.size_tier == config.TIER_CLEAR   # earned, stamped, reported
-    assert prop.count == config.NET_RISK_CROSS_LANE_CAP  # kelly under the wall
-    # a virgin cell: PROBE stamp, SAME full-Kelly size — the ladder
-    # reports, it does not govern (zero tier changes still earned honestly)
+    assert prop.count == config.FLIP_SIZE_CAP    # §4.2: FLIP capped to 1
+    # the uncapped Kelly formula (F): min(kelly, depth, risk cap) still 3
+    fprop = Order(lane="F", event=EVENT, market=TICKER, side="yes",
+                  action="buy", price_cents=48, count=1,
+                  size_tier=config.TIER_PROBE, purpose="ENTRY",
+                  why="F tier48 · surv~price")
+    eng._score_and_size(fprop, _book(yes=48, no=49))
+    assert fprop.count == config.NET_RISK_CROSS_LANE_CAP  # kelly under the wall
+    # a virgin cell: PROBE stamp, FLIP still capped to 1 (ladder reports,
+    # never governs; §4.2 caps the lane, not the formula)
     prop2 = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
                   action="buy", price_cents=44, count=1,
                   size_tier=config.TIER_PROBE, purpose="ENTRY",
                   why="OPEN grain nox2 · join 44c")
     eng._score_and_size(prop2, _book(yes=48, no=44))
     assert prop2.size_tier == config.TIER_PROBE
-    assert prop2.count == config.NET_RISK_CROSS_LANE_CAP
+    assert prop2.count == config.FLIP_SIZE_CAP
 
 
 def test_no_static_probe_sizing_paths_remain():

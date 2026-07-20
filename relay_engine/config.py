@@ -199,6 +199,17 @@ OPEN_SWING_MIN_P = 0.55
 # most this slip before FLIP_LOSER_CUT flags ok=False (the EV inverts if
 # losers ride past the floor — the early warning the rate-halt can't give).
 FLIP_FLOOR_SLIP_CENTS = 5
+# WO-SWING-GATE-EVENT (build 39): the old gate measured P(spot crosses the
+# strike) — trivially ~0.89 for every cheap entry, because a cheap side is
+# cheap PRECISELY when spot sits near the strike (tiny d). It measured the
+# wrong event and rubber-stamped falling knives. The fix gates on the
+# MEASURED took_swing rate (Instrument 1) for the entry's price band once
+# enough outcomes exist; below that it is permissive but the 1-lot cap
+# bounds the risk (DREW-RULED 2026-07-20). §2's two-barrier price model
+# rides along as a SHADOW comparison, calibrated against the measured rate
+# before it may ever drive the decision.
+OPEN_SWING_MIN_SAMPLES = 20       # Adversary (a): don't gate on a thin sample
+FLIP_SIZE_CAP = 1                 # DREW-RULED: 1-lot cap while miscalibrated
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20

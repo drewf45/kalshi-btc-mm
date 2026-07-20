@@ -373,6 +373,31 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
             lines.append("FLIP SWING (24h): no concluded cheap entries yet")
     except Exception as e:
         lines.append(f"FLIP SWING: unavailable ({e})")
+    # WO-SWING-GATE-EVENT §3: the gate's calibration — the OLD strike-touch
+    # proxy (constant ~0.89 = the bug) vs Instrument 1's measured
+    # took_swing, and §2's shadow two-barrier prediction. When the shadow
+    # tracks the measured rate, the two-barrier gate has earned the wheel.
+    try:
+        rows = [json.loads(d) for (d,) in ledger.db.execute(
+            "SELECT detail FROM surface_rows WHERE state='SWING_GATE_COMPARE'"
+            " AND ts>?", (time.time() - 86400,)).fetchall()]
+        if rows:
+            def _avg(key):
+                vals = [r[key] for r in rows if r.get(key) is not None]
+                return sum(vals) / len(vals) if vals else None
+
+            def _fmt(v):
+                return f"{v:.2f}" if v is not None else "na"
+            proxy = _avg("old_proxy_p")
+            meas = _avg("measured_rate")
+            pu, pd = _avg("shadow_p_up"), _avg("shadow_p_down")
+            lines.append(
+                f"SWING GATE CAL (24h, n={len(rows)}): old-proxy "
+                f"{_fmt(proxy)} (the bug: ~const) · measured took_swing "
+                f"{_fmt(meas)} · shadow p_up {_fmt(pu)}/p_down {_fmt(pd)} "
+                "— shadow drives live only once it tracks measured")
+    except Exception as e:
+        lines.append(f"SWING GATE CAL: unavailable ({e})")
     # WO-BLEED-DIAGNOSIS §3: the data for Drew's F passthrough ruling —
     # break-even at +3-5c wins vs -93.5c tails is ~95%+; rule A-vs-B from
     # THIS number, never from one bad print.

@@ -1590,6 +1590,43 @@ durable stop with no operator key and a status light lying green.
   unchanged; only orientation auto-heals; no Kelly change. Suite 527 ·
   preflight 23/23.
 
+## WO-SWING-GATE-EVENT — the gate measured the wrong thing (build 39)
+
+At 3 lots the FLIP bleed became visible: every OPEN cheap entry showed
+`swing p=0.89` and lost anyway (200945 −35¢, 201045 −50¢). Root cause
+(read-rule TRUE at lane_flip.py:756): `_swing_gate` computed
+`p_cross(|spot−strike|, t)` = P(BTC twitches to a strike already under
+its nose) — trivially ~high near 50/50 — NOT P(the contract swings +20¢).
+The input distance is structurally tiny for exactly the cheap entries the
+gate should filter, so it rubber-stamped falling knives; the constant
+0.89 across bands is the symptom.
+
+- **§4.1 (LIVE) gate on the MEASURED event**: the gate now tests
+  Instrument 1's rolling `took_swing` rate for the entry's price band
+  (`_measured_swing_rate`); ok = rate ≥ OPEN_SWING_MIN_P once
+  n ≥ OPEN_SWING_MIN_SAMPLES (20). Below that it is permissive
+  (calibrating) and the 1-lot cap bounds the risk — measurement over a
+  structurally-wrong model.
+- **§4.2 (DREW-RULED 2026-07-20: 1-lot cap, keep trading)**: FLIP entries
+  cap at FLIP_SIZE_CAP=1 in `_score_and_size` until the gate tracks
+  measurement; F untouched (its survival gate is correct). Bounds the
+  3-lot bleed while Instrument 1 keeps accumulating.
+- **§2 (SHADOW) the two-barrier price model**: `_shadow_two_barrier` +
+  `delta.distance_for_p` translate each CONTRACT-PRICE barrier (join+20
+  take, band-floor cut) into the spot move that reprices the contract
+  that far (the same table the book prices with, inverted — Engineer);
+  p_up vs p_down. Logged per entry (SWING_GATE_COMPARE), drives NOTHING
+  until it tracks Instrument 1 (Adversary b: shadow-compare first).
+- **§3 calibration**: the daily pack prints old-proxy (~const = the bug)
+  vs measured took_swing vs shadow p_up/p_down — the shadow earns the
+  wheel only when it tracks measured. Every prior `swing p=0.89` on the
+  tape is meaningless (Adversary d) — the old proxy rides on as the
+  `old_proxy_p` shadow so the bug stays visible, quantified.
+- **HARD RAIL held**: only the swing gate's event definition + FLIP size
+  cap; no Kelly/cash/rate-halt/F change (asserted). F-passthrough A/B
+  matters more now that F carries more weight (Adversary c) — still
+  Drew's open ruling. Suite 536 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

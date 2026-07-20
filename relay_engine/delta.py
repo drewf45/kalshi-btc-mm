@@ -224,6 +224,33 @@ def p_cross(distance_usd: float, secs_remaining: float,
     return cell["p_cross"] if cell else None
 
 
+def distance_for_p(target_p: float, secs_remaining: float,
+                   session: str = "ALL") -> Optional[float]:
+    """WO-SWING-GATE-EVENT §2: invert the table — the distance at which
+    P(cross)=target_p in the time left. p_cross falls monotonically with
+    distance (farther = less likely to touch), so scan the $5 grid for the
+    first cell whose p_cross drops at/below the target and interpolate.
+    Used to translate a CONTRACT-PRICE barrier (an implied probability)
+    into the spot move that reprices the contract that far. None when the
+    table is absent or the target lies outside the grid's range."""
+    if not _LOADED or secs_remaining <= 0:
+        return None
+    prev_d, prev_p = None, None
+    d = 50
+    while d <= 2000:
+        p = p_cross(d, secs_remaining, session)
+        if p is not None:
+            if p <= target_p:
+                if prev_d is None or prev_p is None or prev_p == p:
+                    return float(d)
+                # linear interpolation between the bracketing grid cells
+                frac = (prev_p - target_p) / (prev_p - p)
+                return prev_d + frac * (d - prev_d)
+            prev_d, prev_p = d, p
+        d += DISTANCE_STEP
+    return None
+
+
 def wilson_ub(distance_usd: float, secs_remaining: float,
               session: str = "ALL") -> Optional[float]:
     """Wilson upper bound on P(cross), computed with effective_n."""

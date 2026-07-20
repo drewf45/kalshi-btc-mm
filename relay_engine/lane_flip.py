@@ -699,14 +699,15 @@ class LaneFlip:
         # answers both legs (Engineer: same p_cross, apples-to-apples).
         # Table/spot absent -> permissive (live-proof wants data; the
         # UNPROVEN tagging already narrates the blindness).
-        swing = self._swing_gate(ctx, now)
+        swing = self._swing_gate(ctx, now, join, side, market)
         if swing is not None and not swing["ok"]:
             if not w.open_no_grain_logged:   # reuse the once-per-window mute
                 w.open_no_grain_logged = True
-                log.info("OPEN_SWING_REFUSED %s — p_swing %.2f < %.2f "
-                         "(d=%.0f t=%.0f): losing-cheap, not oversold-cheap",
-                         market, swing["p"], config.OPEN_SWING_MIN_P,
-                         swing["d"], swing["t"])
+                log.info("OPEN_SWING_REFUSED %s — %s (measured took_swing "
+                         "%.2f n=%d; shadow p_up=%s p_down=%s): "
+                         "losing-cheap, not oversold-cheap", market,
+                         swing["reason"], swing["p"], swing["n"],
+                         swing.get("p_up"), swing.get("p_down"))
             return proposals
         # P27 §2(b) OVERTURNED the margin GATE: entry proceeds on band +
         # grain + geometry + one-shot (the doctrine); the cell's margin
@@ -728,37 +729,128 @@ class LaneFlip:
             band=config.OPEN_BAND, rest_fp=book.best_fp(side),
             why=f"OPEN grain {side}x{g['length']} · join {join}c · "
                 f"band y{yes_bid}/n{no_bid} · {proof} · "
-                + (f"swing p={swing['p']:.2f}" if swing is not None
-                   else "swing~untabled")
+                + (swing["why"] if swing is not None else "swing~untabled")
                 + " · geometry=v2"))
         return proposals
 
-    def _swing_gate(self, ctx: dict, now: float) -> Optional[dict]:
-        """WO-FLIP-CHEAP-LIVE §2.2: the swing leg from the delta table —
-        p_cross(|spot−strike|, t_rem) = P(the 50/50 swing arrives). None
-        when the table/spot/strike is absent (permissive; tagged on the
-        why). ok = p >= OPEN_SWING_MIN_P (> 0.5 ⇒ two-sided by the
-        no-touch bound on every cut-first path)."""
-        from . import delta, spotlead as _sl
-        if not delta.is_loaded():
-            return None
-        spot = ctx.get("spot")
+    def _measured_swing_rate(self, band_cell: int):
+        """WO-SWING-GATE-EVENT §4.1: Instrument 1's ground truth — the
+        rolling took_swing rate for this entry's price band (FLIP_SWING
+        rows). Returns (rate, n) or (None, 0) when the surface is absent.
+        This is the MEASURED event the gate should test, not the
+        strike-touch proxy that rubber-stamped every cheap entry."""
+        from . import scoring
+        ledger = getattr(self.gateway, "ledger", None) if self.gateway else None
+        if ledger is None:
+            return None, 0
+        try:
+            rows = ledger.db.execute(
+                "SELECT detail FROM surface_rows WHERE state='FLIP_SWING'"
+                " ORDER BY id DESC LIMIT 200").fetchall()
+        except Exception:
+            return None, 0
+        took, n = 0, 0
+        for (d,) in rows:
+            try:
+                r = json.loads(d)
+            except Exception:
+                continue
+            if scoring.price_cell(int(r.get("entry_price", -1))) != band_cell:
+                continue
+            n += 1
+            if r.get("took_swing"):
+                took += 1
+        return (took / n if n else None), n
+
+    def _shadow_two_barrier(self, ctx: dict, join: int, t_rem: float):
+        """WO-SWING-GATE-EVENT §2 (SHADOW — logged, never live yet): the
+        RIGHT event — P(contract reaches join+TAKE before the band-floor
+        cut), computed by translating each CONTRACT-PRICE barrier into the
+        spot move that reprices the contract that far (the same table the
+        book prices with, inverted — Engineer). p_up = P(reach the take),
+        p_down = P(reach the cut); a genuine two-barrier gate. Rides beside
+        the measured gate for calibration; drives nothing until it tracks
+        Instrument 1. Returns (p_up, p_down) or (None, None)."""
+        from . import delta
+        if not delta.is_loaded() or t_rem <= 0:
+            return None, None
+        take_px = min(99, join + config.OPEN_TAKE_CENTS)
+        cut_px = max(1, config.OPEN_UNDETERMINED_BAND[0])   # band floor
+        # each price is an implied probability; find the distance that
+        # prices the contract there, then the spot move from here to it
+        d0 = delta.distance_for_p(join / 100.0, t_rem)
+        d_up = delta.distance_for_p(take_px / 100.0, t_rem)
+        d_down = delta.distance_for_p(cut_px / 100.0, t_rem)
+        if d0 is None or d_up is None or d_down is None:
+            return None, None
+        p_up = delta.p_cross(abs(d0 - d_up), t_rem)
+        p_down = delta.p_cross(abs(d0 - d_down), t_rem)
+        return p_up, p_down
+
+    def _swing_gate(self, ctx: dict, now: float, join: int,
+                    side: str, market: str) -> Optional[dict]:
+        """WO-SWING-GATE-EVENT: the old gate measured P(spot crosses the
+        strike) = p_cross(|spot−strike|, t) — trivially ~0.89 for every
+        cheap entry (a cheap side is cheap BECAUSE spot sits near the
+        strike, so d is tiny), so it rubber-stamped falling knives. The
+        LIVE gate now tests Instrument 1's MEASURED took_swing rate for
+        the entry's price band; below OPEN_SWING_MIN_SAMPLES it is
+        permissive (the 1-lot cap bounds the risk while data accrues). §2's
+        two-barrier price model + the retired strike-touch proxy ride along
+        as SHADOW fields for calibration. None only when spot/time is
+        absent (permissive, tagged)."""
+        from . import delta, scoring, spotlead as _sl
         close_ts = ctx.get("close_ts")
-        if spot is None or close_ts is None:
-            return None
-        strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
-                                 ctx.get("boundary_hi"))
-        if strike is None:
+        if close_ts is None:
             return None
         t_rem = close_ts - now
         if t_rem <= 0:
             return None
-        d = abs(spot - strike)
-        p = delta.p_cross(d, t_rem)
-        if p is None:
-            return None
-        return {"ok": p >= config.OPEN_SWING_MIN_P, "p": p, "d": d,
-                "t": t_rem}
+        band = scoring.price_cell(join)
+        rate, n = self._measured_swing_rate(band)
+        p_up, p_down = self._shadow_two_barrier(ctx, join, t_rem)
+        # the retired strike-touch proxy, kept as a SHADOW to quantify the
+        # bug (constant ~0.89 across bands is the symptom)
+        proxy = None
+        spot = ctx.get("spot")
+        if spot is not None and delta.is_loaded():
+            strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
+                                     ctx.get("boundary_hi"))
+            if strike is not None:
+                proxy = delta.p_cross(abs(spot - strike), t_rem)
+        # LIVE decision: the measured rate is ground truth once it exists
+        calibrated = rate is not None and n >= config.OPEN_SWING_MIN_SAMPLES
+        if calibrated:
+            ok = rate >= config.OPEN_SWING_MIN_P
+            reason = (f"measured took_swing {rate:.2f} "
+                      f"{'>=' if ok else '<'} {config.OPEN_SWING_MIN_P} "
+                      f"(n={n}, band {band}-{band + 4}c)")
+        else:
+            ok = True   # calibrating: permissive, bounded by the 1-lot cap
+            reason = (f"calibrating (n={n}<{config.OPEN_SWING_MIN_SAMPLES}); "
+                      "1-lot cap bounds the risk")
+        # a compare row per entry — predicted vs measured, for §3 calibration
+        surface = getattr(self.custodian, "surface", None) \
+            if self.custodian is not None else None
+        if surface is not None:
+            try:
+                surface.write_row(
+                    "FLIP", market, f"w-{market}", "SWING_GATE_COMPARE",
+                    detail=json.dumps({
+                        "band": band, "join": join,
+                        "measured_rate": rate, "n": n,
+                        "shadow_p_up": p_up, "shadow_p_down": p_down,
+                        "old_proxy_p": proxy}))
+            except Exception:
+                pass
+        p_up_s = f"{p_up:.2f}" if p_up is not None else "na"
+        p_down_s = f"{p_down:.2f}" if p_down is not None else "na"
+        why = (f"swing measured={rate:.2f}n{n}" if calibrated
+               else f"swing calibrating n{n}") + \
+              f" · shadow p_up={p_up_s}/p_down={p_down_s}"
+        return {"ok": ok, "p": rate if rate is not None else 0.0, "n": n,
+                "reason": reason, "p_up": p_up, "p_down": p_down,
+                "proxy": proxy, "why": why}
 
     # ── P18 THE DETECTIVE: hunt entry (§2) + the two jobs (§3) ─────────────
     def _hunt_entry(self, w: FlipWindow, market: str, event: str, book,

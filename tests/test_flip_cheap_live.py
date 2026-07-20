@@ -71,7 +71,10 @@ def test_band_admits_39c_cheap_side(flip):
                                        grain=GRAIN_YES2))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 39, "ENTRY")]
-    assert "swing~untabled" in props[0].why
+    # WO-SWING-GATE-EVENT: with no measured history the gate is CALIBRATING
+    # (permissive; the 1-lot cap bounds the risk), never the retired
+    # strike-touch proxy
+    assert "swing calibrating" in props[0].why
 
 
 def test_old_band_floor_would_have_excluded_it():
@@ -79,40 +82,54 @@ def test_old_band_floor_would_have_excluded_it():
     assert 39 < 44 <= 56
 
 
-# ── §2.2: the two-sided swing gate ─────────────────────────────────────────
-def test_swing_gate_buys_when_table_favors_the_take(flip, monkeypatch):
-    monkeypatch.setattr(delta, "is_loaded", lambda: True)
-    monkeypatch.setattr(delta, "p_cross", lambda d, t, session="ALL": 0.72)
+# ── WO-SWING-GATE-EVENT: the gate tests MEASURED took_swing, not the
+# strike-touch proxy (which asked "will BTC twitch to the strike" — ~0.89
+# for every cheap entry, a rubber stamp for falling knives) ────────────────
+def _seed_swing_rows(ledger, surface, band_entry, took, total):
+    """Instrument 1 history in the entry's price band."""
+    for i in range(total):
+        surface.write_row(
+            "FLIP", f"M{i}", f"w{i}", "FLIP_SWING",
+            detail=json.dumps({"entry_price": band_entry,
+                               "took_swing": i < took, "gross_cents": 20}))
+
+
+def test_swing_gate_buys_when_measured_rate_clears(flip, gateway, ledger,
+                                                   surface):
+    """≥20 outcomes with a high measured took_swing rate → the gate passes
+    on the MEASURED event (the real bet), not the strike-touch proxy."""
+    _seed_swing_rows(ledger, surface, 39, took=16, total=20)   # 0.80
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
                                        spot=STRIKE - 120))
     assert len(props) == 1
-    assert "swing p=0.72" in props[0].why           # the gate value narrates
+    assert "swing measured=0.80n20" in props[0].why
 
 
-def test_swing_gate_refuses_the_losing_cheap_side(flip, monkeypatch,
-                                                  caplog):
-    """39c where the cut is more likely than the take (p_swing below the
-    floor) → NO buy — losing-cheap, not oversold-cheap. The knife guard."""
+def test_swing_gate_refuses_when_measured_rate_low(flip, gateway, ledger,
+                                                   surface, caplog):
+    """≥20 outcomes with a LOW measured took_swing rate (the falling-knife
+    band) → NO buy. This is the discrimination the constant-0.89 proxy
+    never had."""
     import logging
-    monkeypatch.setattr(delta, "is_loaded", lambda: True)
-    monkeypatch.setattr(delta, "p_cross", lambda d, t, session="ALL": 0.40)
+    _seed_swing_rows(ledger, surface, 39, took=8, total=20)    # 0.40 < 0.55
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
         props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
                                            spot=STRIKE - 120))
     assert props == []
-    assert any("OPEN_SWING_REFUSED" in r.message for r in caplog.records)
+    assert any("OPEN_SWING_REFUSED" in r.message and "measured"
+               in r.message for r in caplog.records)
 
 
-def test_swing_gate_threshold_is_two_sided(flip, monkeypatch):
-    """OPEN_SWING_MIN_P > 0.5 — at exactly the floor the buy proceeds;
-    just under, it refuses (p > 0.5 ⇒ P(reach take) > P(reach cut) by the
-    no-touch bound; same p_cross cell for both legs)."""
-    assert config.OPEN_SWING_MIN_P > 0.5
-    monkeypatch.setattr(delta, "is_loaded", lambda: True)
-    monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": config.OPEN_SWING_MIN_P)
-    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
-                                      spot=STRIKE - 120)) != []
+def test_swing_gate_permissive_below_sample_floor(flip, gateway, ledger,
+                                                  surface):
+    """Adversary (a): below OPEN_SWING_MIN_SAMPLES the gate does NOT trust
+    a thin sample — it stays permissive (the 1-lot cap bounds the risk)
+    and tags itself calibrating."""
+    _seed_swing_rows(ledger, surface, 39, took=0, total=5)     # thin, all-loss
+    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
+                                       spot=STRIKE - 120))
+    assert len(props) == 1                                     # permissive
+    assert "swing calibrating n5" in props[0].why
 
 
 # ── §3 INSTRUMENT 1: the swing-outcome log ─────────────────────────────────
