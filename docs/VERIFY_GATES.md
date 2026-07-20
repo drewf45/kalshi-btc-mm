@@ -1663,6 +1663,50 @@ the swing.
   names the decision; band-floor cut only post-patience). Suite 544 ·
   preflight 23/23.
 
+## WO-FLIP-SIDE-ORIENT — the book must invert to the held side (build 41)
+
+**BANKED — not for immediate deploy** (built, mirror-proven, ready when
+Drew opens a window). FLIP is two-directional (it buys YES or NO), so its
+exit geometry must be oriented to the HELD side: a NO@46 and a YES@46 have
+to receive mathematically identical treatment. F is untouched — F needs
+only who-wins-at-settlement, so one direction is CORRECT for F.
+
+**READ-RULE FINDING (honest, reported to Drew): the WO's core premise is
+FALSE at source for the LIVE path.** The claim — that the exit geometry is
+YES-scale and treats NO asymmetrically — does not hold when read at source.
+The custody exit already computed `mark = best_yes_bid()` for YES and
+`best_no_bid()` for NO (the HELD-side bid), and every threshold (band floor
+35, catastrophe 20, entry, take) is compared against THAT mark. So the live
+geometry was already side-symmetric **by construction** — the mirror test
+(NO@X ≡ YES@X) passes on the pre-existing exit code. This is verified, not
+asserted: `test_exit_geometry_mirror_no_equals_yes` sweeps 15 held prices
+and the two sides' decisions are byte-identical at every tick.
+
+**What this WO actually delivers:**
+- **Formalizes the symmetry**: a canonical `LaneFlip.held_price(side, book)`
+  accessor (the bid for the held side) now names the value the exit path
+  already read, and the two custody marks (`_hunt_custody`, `_open_custody`)
+  route through it — so no raw-YES value can ever leak into FLIP exit math.
+- **Fixes the ONE genuine orientation bug** (Part C.3, read-rule TRUE at the
+  old `_shadow_two_barrier`): the §2 SHADOW two-barrier mapped a NO
+  contract's price straight into P(cross), but the table's p_cross =
+  P(spot crosses strike) = P(YES wins), so a NO's implied P(cross) is the
+  COMPLEMENT (1 − price/100). A NO@46 was read as P(cross)=0.46 when its
+  real implied value is 0.54. The shadow now takes a `side` arg and looks
+  up the complement for NO. It drives NOTHING live (logged for calibration
+  until it tracks Instrument 1) — but the sign is now correct.
+- **The mirror test is the permanent CI gate** (Part D): NO@X ≡ YES@X
+  identical exit decisions — swept inside patience, post-patience (band
+  floor), and at the T-10 handoff; catastrophe fires at 20¢ on either side;
+  a climb to 66¢ is held (not cut) on either side; a mirrored ΔP-collapse
+  cuts both. Plus the shadow-sign proof (NO queries the complement) and the
+  point-symmetric-table mirror (NO@44 ≡ YES@44 p_up/p_down).
+- **HARD RAIL held**: FLIP exit + swing-gate geometry ONLY. F stays
+  one-directional (`test_f_stays_one_directional`: no `held_price` /
+  `_shadow_two_barrier` in `lane_fh8`). No Kelly/cash/rate-halt change; the
+  take (20¢), catastrophe (20¢), band (35/65), and FLIP_X unchanged. Ships
+  at the 1-lot cap. Suite 556 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

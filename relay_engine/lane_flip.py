@@ -733,6 +733,19 @@ class LaneFlip:
                 + " · geometry=v2"))
         return proposals
 
+    @staticmethod
+    def held_price(side: str, book):
+        """WO-FLIP-SIDE-ORIENT: THE canonical FLIP price — the bid for the
+        HELD side (the held contract's own price, which rises when the held
+        side wins). Every FLIP exit quantity (entry, take, band floor,
+        catastrophe, cut) is expressed against THIS, so a NO@46 and a
+        YES@46 receive mathematically identical treatment relative to their
+        own scale — the geometry is symmetric by construction. (F stays
+        one-directional; only FLIP looks both ways.) The exit path already
+        read the held-side bid; this names it so no raw-YES value ever
+        leaks into FLIP exit math."""
+        return book.best_yes_bid() if side == "yes" else book.best_no_bid()
+
     def _measured_swing_rate(self, band_cell: int):
         """WO-SWING-GATE-EVENT §4.1: Instrument 1's ground truth — the
         rolling took_swing rate for this entry's price band (FLIP_SWING
@@ -762,25 +775,34 @@ class LaneFlip:
                 took += 1
         return (took / n if n else None), n
 
-    def _shadow_two_barrier(self, ctx: dict, join: int, t_rem: float):
-        """WO-SWING-GATE-EVENT §2 (SHADOW — logged, never live yet): the
-        RIGHT event — P(contract reaches join+TAKE before the band-floor
-        cut), computed by translating each CONTRACT-PRICE barrier into the
-        spot move that reprices the contract that far (the same table the
-        book prices with, inverted — Engineer). p_up = P(reach the take),
-        p_down = P(reach the cut); a genuine two-barrier gate. Rides beside
-        the measured gate for calibration; drives nothing until it tracks
-        Instrument 1. Returns (p_up, p_down) or (None, None)."""
+    def _shadow_two_barrier(self, ctx: dict, join: int, t_rem: float,
+                            side: str):
+        """WO-SWING-GATE-EVENT §2 (SHADOW — logged, never live yet), now
+        SIDE-ORIENTED (WO-FLIP-SIDE-ORIENT §C.3): P(held contract reaches
+        join+TAKE before the band-floor cut), each CONTRACT-PRICE barrier
+        translated into the spot move that reprices the HELD contract that
+        far. THE SIGN THE GATE MUST CARRY: the table's p_cross = P(spot
+        crosses the strike) = P(YES wins), so a YES contract's price IS
+        p_cross but a NO contract's price is its COMPLEMENT (P(NO wins) =
+        1 − p_cross). The retired code used join/100 for both sides — a
+        NO@46 was mapped to P(cross)=0.46 when its real implied P(cross)
+        is 0.54. Fixed: NO looks up the complement, so a NO position and
+        its YES mirror get symmetric p_up/p_down. Drives nothing until it
+        tracks Instrument 1. Returns (p_up, p_down) or (None, None)."""
         from . import delta
         if not delta.is_loaded() or t_rem <= 0:
             return None, None
         take_px = min(99, join + config.OPEN_TAKE_CENTS)
         cut_px = max(1, config.OPEN_UNDETERMINED_BAND[0])   # band floor
-        # each price is an implied probability; find the distance that
-        # prices the contract there, then the spot move from here to it
-        d0 = delta.distance_for_p(join / 100.0, t_rem)
-        d_up = delta.distance_for_p(take_px / 100.0, t_rem)
-        d_down = delta.distance_for_p(cut_px / 100.0, t_rem)
+
+        def _dist(held_px):
+            # held-side WIN probability = held price / 100; the table
+            # prices in P(YES wins) = p_cross, so NO's target is the
+            # complement (the side sign, Part C.3)
+            p_hold = held_px / 100.0
+            p_cross_target = p_hold if side == "yes" else 1.0 - p_hold
+            return delta.distance_for_p(p_cross_target, t_rem)
+        d0, d_up, d_down = _dist(join), _dist(take_px), _dist(cut_px)
         if d0 is None or d_up is None or d_down is None:
             return None, None
         p_up = delta.p_cross(abs(d0 - d_up), t_rem)
@@ -808,7 +830,7 @@ class LaneFlip:
             return None
         band = scoring.price_cell(join)
         rate, n = self._measured_swing_rate(band)
-        p_up, p_down = self._shadow_two_barrier(ctx, join, t_rem)
+        p_up, p_down = self._shadow_two_barrier(ctx, join, t_rem, side)
         # the retired strike-touch proxy, kept as a SHADOW to quantify the
         # bug (constant ~0.89 across bands is the symptom)
         proxy = None
@@ -939,7 +961,7 @@ class LaneFlip:
             # remainder cancels loudly). The 191030 race dies here.
             if self._defer_or_cancel_partial(h, market, side):
                 continue
-            mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
+            mark = self.held_price(side, book)   # WO-FLIP-SIDE-ORIENT: canonical held-side price
             # JOB A: the take, posted the instant the entry fills.
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
             if h["take_oid"] is None and not h.get("take_proposed"):
@@ -1025,7 +1047,7 @@ class LaneFlip:
             # entry is fully booked (bounded; then cancel the remainder)
             if self._defer_or_cancel_partial(o, market, side):
                 continue
-            mark = book.best_yes_bid() if side == "yes" else book.best_no_bid()
+            mark = self.held_price(side, book)   # WO-FLIP-SIDE-ORIENT: canonical held-side price
             # TAKE — posted the instant the entry books (the maker intent).
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
             if o["take_oid"] is None and not o.get("take_proposed"):

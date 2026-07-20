@@ -153,6 +153,12 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "model shadow-compared; FLIP capped "
                  f"{config.FLIP_SIZE_CAP}-lot until it tracks measurement "
                  "(WO-SWING-GATE-EVENT)")
+    lines.append("  FLIP SIDE-ORIENT: exit geometry fully side-relative — "
+                 "held-side price (bid for the held contract) is canonical, "
+                 "so NO@X and YES@X get mirror-identical decisions (CI gate); "
+                 "the §2 shadow carries the held-side sign (NO's implied "
+                 "P(cross) is the complement); F stays one-directional "
+                 "(WO-FLIP-SIDE-ORIENT)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

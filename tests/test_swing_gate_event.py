@@ -120,7 +120,7 @@ def test_shadow_two_barrier_computes_price_barriers(flip, monkeypatch):
                         lambda d, t, session="ALL": max(0.0, 1.0 - d / 400.0))
     monkeypatch.setattr(delta, "distance_for_p",
                         lambda p, t, session="ALL": (1.0 - p) * 400.0)
-    p_up, p_down = flip._shadow_two_barrier(_ctx(_book()), 44, 700.0)
+    p_up, p_down = flip._shadow_two_barrier(_ctx(_book()), 44, 700.0, "yes")
     assert p_up is not None and p_down is not None
     # reaching +20 (a big reprice) is LESS likely than reaching the nearer
     # cut — the discrimination the strike-touch proxy never had
