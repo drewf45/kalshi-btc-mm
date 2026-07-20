@@ -112,7 +112,23 @@ OPEN_TAKE_CENTS = 20
 WINDOW_BOOK_GOAL_CENTS = 5          # DREW-RULED: per-window book profit target (bank the nickel now)
 OPEN_TAKE_MIN = 5                   # DREW-DEFAULT: reachable floor, fee-safe (>2c, nets ~+3c)
 OPEN_TAKE_MAX = 20                  # DREW-DEFAULT: ceiling = today's fixed take
-OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box
+# WO-FLIP-GEOMETRY-COHERENCE (build 43, DREW-RULED 2026-07-20 — Option B,
+# SCALP): the geometry gate exposed that build-40 patience (a loser rides to
+# the catastrophe floor 20) and build-42's 5c nickel take describe DIFFERENT
+# trades — a 44c entry risked 24c (to the real bail at 20) to win 5c, which is
+# structurally negative and IS the churn that tripped the rate-halt. Option B
+# makes the four numbers ONE trade: keep the small take, add a matching TIGHT
+# down-stop so the real bail sits ~1:1 with the win. A loser now exits at
+# entry − OPEN_SCALP_STOP_CENTS (2-poll sustained, ANY time — patience-to-
+# catastrophe is OFF on the loss side), so risk = OPEN_SCALP_STOP_CENTS, and
+# the gate's honest rule (risk <= take+1) passes the whole 39-49c thesis band
+# by construction. Build-40 removed the tight stop only because a +20 take
+# needed room; the 5c take does not, so the tight stop is coherent again. The
+# catastrophe floor (20) and post-patience band floor (35) remain as deeper
+# backstops; the take, hold-to-settle, and T-10 handoff (the winner side) are
+# UNCHANGED. HARD RAIL: no Kelly/cash/rate-halt/F change.
+OPEN_SCALP_STOP_CENTS = 6          # DREW-RULED (Option B): tight down-stop distance; real bail = entry-6, risk 6 <= take+1
+OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box (band floor now a post-patience backstop)
 OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
 # WO-FLIP-EXIT-DOCTRINE (build 40): determined-against is a statement about
 # the MARKET'S DECISION (spot moved / time ran out), NOT the contract's

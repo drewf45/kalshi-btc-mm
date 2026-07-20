@@ -201,12 +201,12 @@ def test_open_entry_schedule(flip):
 
 
 def test_bad_geometry_passes(flip, monkeypatch):
-    """§3.4: risk beyond take+1 -> pass, tagged (knob-shifted to force).
-    P-FLIP-THESIS-1 §3 (take 5 -> 20): at the ruled take the in-band risk
-    (max 14c) can never exceed take+1 — the gate is dormant arithmetic,
-    kept as law; both knobs shift here to exercise the mechanism."""
-    monkeypatch.setattr(config, "OPEN_TAKE_CENTS", 5)
-    monkeypatch.setattr(config, "OPEN_DETERMINED_DROP", 9)
+    """§3.4, RESHAPED by WO-FLIP-GEOMETRY-COHERENCE (Option B): the gate now
+    validates the REAL trade — risk (the scalp stop, the price a loser
+    actually exits at) <= take+1. Coherent config (stop 6, take 5) admits the
+    whole 39-49c thesis band; an incoherent stop WIDER than take+1 is rejected
+    as OPEN_BAD_GEOMETRY. The gate enforces coherence, never admits risk>win."""
+    monkeypatch.setattr(config, "OPEN_SCALP_STOP_CENTS", 12)   # risk 12 > take+1 6
     assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2)) == []
     assert flip.windows[TICKER].open_geometry_logged
 

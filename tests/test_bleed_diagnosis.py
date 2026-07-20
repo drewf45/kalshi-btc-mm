@@ -159,41 +159,48 @@ def _open_pos(flip, gateway, ledger, entry=48):
     return flip.windows[TICKER].opens["yes"]
 
 
-def test_bleed3_replay_cuts_via_spot_not_the_floor_bypass(flip, gateway,
-                                                         ledger):
-    """WO-FLIP-EXIT-DOCTRINE OVERTURNED WO-BLEED-3's floor-poll bypass: an
-    in-band dip through the band floor (34c > catastrophe 20c) inside
-    patience now HOLDS — a cheap entry breathes through its swing. The
-    3-lot collapse still CUTS, but now via the SPOT signal (the market
-    decided), not a 2-poll price bypass (the regression Change 3 must
-    keep cutting, by the new path)."""
-    o = _open_pos(flip, gateway, ledger)
-    # the book dips through the band floor, no spot decision → HOLD
+def test_bleed3_replay_cuts_via_spot_not_a_price_ride(flip, gateway,
+                                                      ledger):
+    """AMENDED by WO-FLIP-GEOMETRY-COHERENCE (Option B): a loser never rides
+    to the bottom — it cuts at the SCALP stop (price, entry−6) or on the SPOT
+    decision, whichever comes first. Here the mark stays WITHIN the 6c
+    tolerance (44 > stop 42 for a 48c entry) so price holds; spot decides
+    against → the SPOT cut fires, any time (the WO-BLEED-3 regression stays
+    cut, by the spot path)."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 48, stop 42
+    # within tolerance, no spot: holds (does NOT ride)
     for secs in (770, 769, 768):
-        p = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=secs))
+        p = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=secs))
         assert [x for x in p if x.purpose == "CUT"] == []
-    assert not o.get("done")                                # held its swing
-    # NOW spot decides against (the real collapse) → cuts via spot, any time
+    assert not o.get("done")
+    # spot decides against → cuts via spot on 2 sustained polls, any time
     sl = Needle(side="no", d_before=10.0, d_after=80.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
                 fair_cents=0.0, t_remaining=700.0)
-    flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=767, sl=sl))  # poll 1
-    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=34),
+    flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=767, sl=sl))  # poll 1
+    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=44),
                                                   secs_left=766, sl=sl))
             if x.purpose == "CUT"]
     assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
 
 
-def test_in_band_dip_holds_through_patience(flip, gateway, ledger):
-    """Change 3: an in-band or near-band price dip inside patience is
-    HELD, however long — the floor-poll ~2s bypass that stopped cheap
-    entries out of their own swing is gone. Only the catastrophe floor
-    (20c) and a spot decision may act inside patience."""
-    o = _open_pos(flip, gateway, ledger)
-    for secs in range(780, 700, -5):                # many polls, all in-band
-        p = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=secs))
+def test_in_band_dip_below_stop_cuts_scalp(flip, gateway, ledger):
+    """OVERTURNED by WO-FLIP-GEOMETRY-COHERENCE (Option B): the loss-side
+    patience is gone. A dip WITHIN the 6c tolerance (44 > stop 42) still
+    holds; a SUSTAINED break below the scalp stop (34 < 42) banks the small
+    loss on 2 polls — the tight bail that makes the nickel take coherent."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 48, stop 42
+    # within tolerance: holds through many polls
+    for secs in range(780, 760, -5):
+        p = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=secs))
         assert [x for x in p if x.purpose == "CUT"] == []
-    assert not o.get("done")                        # never cut on price alone
+    assert not o.get("done")
+    # a sustained break below the stop → SCALP cut on the 2nd poll
+    flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=755))          # poll 1
+    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=34),
+                                                  secs_left=754))
+            if x.purpose == "CUT"]
+    assert len(cuts) == 1 and "SCALP stop" in cuts[0].reason
 
 
 def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):

@@ -365,8 +365,8 @@ class LaneFlip:
             w.opens[side] = {"entry": lf["entry"], "fill_ts": now,
                              "count": n, "take_oid": None,
                              "take_proposed": False, "collapse_polls": 0,
-                             "det_ts": None, "entry_oid": None,
-                             "defer_polls": 0}
+                             "scalp_polls": 0, "det_ts": None,
+                             "entry_oid": None, "defer_polls": 0}
         log.warning("FLIP_LATE_FILL_REOPEN %s %s x%d @ %dc — late leg gets "
                     "a position-aware exit", market, side, n, lf["entry"])
 
@@ -446,7 +446,8 @@ class LaneFlip:
             w.opens[side] = {"entry": price_cents, "fill_ts": now,
                              "count": max(1, count),
                              "take_oid": None, "take_proposed": False,
-                             "collapse_polls": 0, "det_ts": None,
+                             "collapse_polls": 0, "scalp_polls": 0,
+                             "det_ts": None,
                              "entry_oid": entry_oid, "defer_polls": 0}
             return
         w.fills[side] = price_cents
@@ -680,17 +681,26 @@ class LaneFlip:
         join = yes_bid if side == "yes" else no_bid
         if join > config.OPEN_MAX_ENTRY_CENTS:
             return proposals               # the herd's side is already paid up
-        # §3.4 GEOMETRY GATE: risk to the determined trigger must not exceed
-        # the take + 1 — a trade whose bail is bigger than its win passes.
-        # A-PLAYER B5: the trigger is the band floor (P&L-blind), so the
-        # entry-time risk is join − floor.
-        det_trigger = config.OPEN_UNDETERMINED_BAND[0]
-        risk = join - det_trigger
-        if risk > config.OPEN_TAKE_CENTS + 1:
+        # §3.4 GEOMETRY GATE: risk to the REAL bail must not exceed the take
+        # + 1 — a trade whose bail is bigger than its win passes.
+        # WO-FLIP-GEOMETRY-COHERENCE (build 43, Option B): both sides of this
+        # check were stale. The take is the goal-bounded _take_cents (not the
+        # retired OPEN_TAKE_CENTS 20), and the REAL bail is the tight scalp
+        # stop the position now actually exits at (entry − OPEN_SCALP_STOP_CENTS),
+        # NOT the band floor 35 (post-patience backstop) nor the catastrophe
+        # floor 20 (deep backstop). With the tight stop, risk is a constant
+        # OPEN_SCALP_STOP_CENTS, so the whole 39-49c thesis band passes an
+        # honest risk<=take+1 — the gate now enforces a coherent trade instead
+        # of admitting risk-24-win-5 churn.
+        take_now = self._take_cents(1)
+        real_bail = join - config.OPEN_SCALP_STOP_CENTS
+        risk = join - real_bail                       # = OPEN_SCALP_STOP_CENTS
+        if risk > take_now + 1:
             if not w.open_geometry_logged:
                 w.open_geometry_logged = True
-                log.info("OPEN_BAD_GEOMETRY %s — risk %dc > take+1 %dc",
-                         market, risk, config.OPEN_TAKE_CENTS + 1)
+                log.info("OPEN_BAD_GEOMETRY %s — risk %dc (bail %dc) > "
+                         "take+1 %dc (take %dc)", market, risk, real_bail,
+                         take_now + 1, take_now)
             return proposals
         # WO-FLIP-CHEAP-LIVE §2.2 — THE TWO-SIDED SWING GATE: buy the
         # cheap side only when the table says the swing to the take is
@@ -1141,33 +1151,44 @@ class LaneFlip:
                 # held to settlement — no scalp take, no yield; the
                 # determined-against floor below still guards it
                 pass
-            # DETERMINED-AGAINST — WO-FLIP-EXIT-DOCTRINE: the cut is about
-            # the MARKET'S DECISION, not the contract's price. Precedence:
-            #   (1) SPOT decided against — the position trader's real exit;
-            #       sustained 2 polls (no flicker), acts ANY time (Change 2)
-            #   (2) CATASTROPHE floor — a FIXED low price (P&L-blind), well
-            #       below the swing band; the only price backstop that acts
-            #       inside patience (Change 1)
-            #   (3) the ordinary band-floor price cut — "the swing did not
-            #       come" — fires ONLY after full patience (Change 3: the
-            #       floor_polls ~2s bypass that stopped cheap entries out of
-            #       their own swing is GONE)
+            # DETERMINED-AGAINST — WO-FLIP-GEOMETRY-COHERENCE (build 43,
+            # Option B SCALP) reshaped the loss side: the 5c take needs a
+            # matching TIGHT stop for the trade to cohere, so a loser now
+            # exits at entry − OPEN_SCALP_STOP_CENTS (2-poll sustained, ANY
+            # time) — patience-to-catastrophe is OFF on the loss side. The
+            # winner side (the take, hold-to-settle, T-10 handoff above) is
+            # UNCHANGED. Precedence:
+            #   (1) SPOT decided against — sustained 2 polls, ANY time
+            #   (2) SCALP stop — mark <= entry − stop, sustained 2 polls
+            #       (the noise-guard: a real 6c decline, not a wick), ANY
+            #       time; the real bail the geometry gate is sized against
+            #   (3) CATASTROPHE floor (20) — the deep P&L-blind backstop,
+            #       now rarely reached (the scalp stop fires first)
+            #   (4) the band-floor price cut (35) — a post-patience backstop
             # (Time-decided is the T-10 handoff above; it already leads.)
-            det_trigger = lo_u                       # band floor 35: swing semantics
+            det_trigger = lo_u                       # band floor 35: post-patience backstop
             catastrophe = config.OPEN_CATASTROPHE_FLOOR
+            scalp_stop = o["entry"] - config.OPEN_SCALP_STOP_CENTS
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
             o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
+            scalp_hit = mark is not None and mark <= scalp_stop
+            o["scalp_polls"] = o.get("scalp_polls", 0) + 1 if scalp_hit else 0
             patience_over = now - o["fill_ts"] >= config.OPEN_PATIENCE_S
             determined = None
             if o["collapse_polls"] >= 2:
                 determined = (f"open determined-against: SPOT decided — "
                               f"ΔP-collapse {sl.delta_p:.0f}pts sustained "
                               "(the market decided, any time)")
+            elif o["scalp_polls"] >= 2:
+                determined = (f"open determined-against: SCALP stop {side} "
+                              f"{mark}c <= entry−{config.OPEN_SCALP_STOP_CENTS}"
+                              f" ({scalp_stop}c) sustained — bank the small "
+                              "loss (the tight 1:1 bail, any time)")
             elif mark is not None and mark <= catastrophe:
                 determined = (f"open determined-against: CATASTROPHE floor "
                               f"{side} {mark}c <= {catastrophe}c (fixed, "
-                              "P&L-blind — the only price backstop)")
+                              "P&L-blind — the deep backstop)")
             elif (patience_over and mark is not None
                   and mark < det_trigger):
                 determined = (f"open determined-against: band floor {side} "
@@ -1418,7 +1439,8 @@ class LaneFlip:
         w.opens[side] = {"entry": entry if entry is not None else 50,
                          "fill_ts": 0.0, "count": gap, "take_oid": None,
                          "take_proposed": False, "collapse_polls": 0,
-                         "det_ts": None, "entry_oid": None, "defer_polls": 0}
+                         "scalp_polls": 0, "det_ts": None, "entry_oid": None,
+                         "defer_polls": 0}
         log.warning("FLIP_UNCOVERED self-heal %s %s: opened fresh record "
                     "x%d @ %sc (booked entry)", market, side, gap, entry)
 

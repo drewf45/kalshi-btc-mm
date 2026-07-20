@@ -1760,6 +1760,60 @@ acceptance tests (the clamp; 44→49 core; orientation mirror; size-shrink;
 recompute-on-fill; cut-unchanged; instrument; fee floor). Suite 568 ·
 preflight 23/23.
 
+## WO-FLIP-GEOMETRY-COHERENCE — make the four numbers agree (build 43)
+
+**BANKED — halt stays until Drew resets it.** The rate-halt (2-of-4) fired and
+its lens pass started as a one-liner (WO-GEOMETRY-GATE-STALE: the entry
+geometry gate checks the retired +20 take). Read-rule at source found the
+gate was stale on **BOTH** sides, and underneath, the four FLIP numbers did
+not describe one trade.
+
+**The finding (both sides stale + the structural root):**
+- Gate stale on the TAKE (`lane_flip.py`): checked `risk > OPEN_TAKE_CENTS(20)+1`,
+  but the real take is the goal-bounded `_take_cents` = 5.
+- Gate stale on the RISK: computed `risk = join − band_floor(35)`, but the
+  **bail audit** (driving a losing position down, no spot signal) proved a
+  loser rides to the **catastrophe floor (20)** inside patience, not the band
+  floor. A 44¢ entry's honest risk was `44 − 20 = 24¢`, not 9¢.
+- **Structural root**: WO-FLIP-EXIT-DOCTRINE (build 40, patience → ride to 20)
+  and WO-FLIP-GOAL-TAKE (build 42, 5¢ nickel) describe **different trades** —
+  risk 24 to win 5 is structurally negative, and that IS the churn that
+  tripped the halt. No constant-swap fixes it: a fix to the take side alone
+  closes the lane (only join≤41 passes, rejecting the 44–49¢ thesis); a fix to
+  both sides honestly rejects everything. The gate correctly reported the
+  GEOMETRY ITSELF was incoherent.
+
+**DREW-RULED Option B (SCALP), via AskUserQuestion:** keep the small take, add
+a matching **tight stop** so the four numbers form one ~1:1 trade.
+- New `OPEN_SCALP_STOP_CENTS = 6`: a loser exits at `entry − 6` (2-poll
+  sustained, ANY time), added as the primary loss-side cut in `_open_custody`
+  (`scalp_polls`). **Patience-to-catastrophe is OFF on the loss side** —
+  build-40 removed the tight stop only because a +20 take needed room; the 5¢
+  take does not, so the tight stop is coherent again.
+- The geometry gate validates `risk (= join − real_bail = OPEN_SCALP_STOP_CENTS)
+  ≤ take+1`, so the whole 39–49¢ thesis band passes by construction (6 ≤ 6).
+  The gate now enforces a coherent trade instead of admitting risk-24-win-5
+  churn; log prints the real take and real bail.
+- The catastrophe floor (20) and band floor (35) survive as deeper /
+  post-patience backstops; the take, hold-to-settle, and T-10 handoff (the
+  **winner side**) are UNCHANGED.
+
+**Overturned test-laws (with citations)**: the build-40 loss-side-hold tests
+are rewritten to the scalp reality — `test_44_entry_dips_to_34_holds` →
+`..._dip_below_stop_cuts_scalp`; `test_cut_reason_names_the_decision` and
+`test_band_floor_cut_only_after_patience` (now an entry-39 backstop case) in
+the exit-doctrine suite; the two bleed-diagnosis in-band-hold tests →
+scalp-cut / spot-cut; `test_bad_geometry_passes` now forces incoherence via
+the scalp stop (the real risk lever), not the inert `OPEN_TAKE_CENTS`.
+
+**HARD RAIL held**: only the NUMBERS changed to make the geometry coherent —
+the gate CHECK was never loosened to admit risk>win. No Kelly/cash/rate-halt/F
+change (`test_f_untouched`: no scalp geometry in `lane_fh8`). **Part D**: 9
+coherence tests (thesis band passes; incoherent stop rejects; real bail matches
+the risk denominator; the 44¢ churn is bounded to ~6 not 24; within-tolerance
+holds). Suite 577 · preflight 23/23. **The halt stays in place until Drew
+resets it** — this build is banked, not deployed.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

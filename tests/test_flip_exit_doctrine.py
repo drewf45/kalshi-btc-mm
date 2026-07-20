@@ -20,7 +20,17 @@ incomplete):
      the catastrophe floor and a sustained spot collapse act inside it.
 
 HARD RAIL: no Kelly/cash/rate-halt change; HUNT's scalper cut unchanged;
-the swing ENTRY gate untouched — EXIT doctrine only."""
+the swing ENTRY gate untouched — EXIT doctrine only.
+
+AMENDED by WO-FLIP-GEOMETRY-COHERENCE (Option B SCALP, build 43): the
+loss-side patience below is OVERTURNED. Once the take became the 5c nickel
+(build 42), a patient ride to the catastrophe floor (20) made the trade
+structurally negative (risk 24 to win 5). Option B adds a TIGHT scalp stop
+(entry − OPEN_SCALP_STOP_CENTS, 2-poll sustained, ANY time) so a loser banks
+the small loss — the coherent 1:1 trade. The catastrophe (20) and band floor
+(35) survive as deeper/post-patience backstops; SPOT-decided and the take are
+unchanged. The three loss-side-hold tests below are rewritten to the scalp
+reality."""
 
 import pytest
 
@@ -84,15 +94,22 @@ def _cuts(props):
     return [p for p in props if p.purpose == "CUT"]
 
 
-# ── Part D, test 1: the dip HOLDS — the swing has room ─────────────────────
-def test_44_entry_dips_to_34_holds(flip, gateway, ledger):
-    """44¢ entry dips to 34¢ within 1 min, spot near strike → HOLDS. This
-    is the 201215 −11¢ nightmare, cured: the cheap side breathes."""
+# ── Part D, test 1: the dip below the stop CUTS (Option B: bank the loss) ──
+def test_44_entry_dip_below_stop_cuts_scalp(flip, gateway, ledger):
+    """OVERTURNED by WO-FLIP-GEOMETRY-COHERENCE (Option B): a 44¢ entry
+    dipping to 34¢ (below the scalp stop 38 = entry−6) no longer HOLDS — the
+    coherent scalp banks the small loss on 2 sustained polls. The tight stop
+    is what makes the 5¢ take a coherent trade (build-40 held the dip only
+    because a +20 take needed room; the nickel does not)."""
     o = _entry(flip, gateway, ledger, entry=44)
-    for secs in (770, 769, 768, 760, 740):
-        assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
-                                                secs_left=secs))) == []
-    assert not o.get("done")
+    # poll 1 below the stop holds — the noise-guard (could be a wick)
+    assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+                                            secs_left=770))) == []
+    # poll 2 sustained: the decline is real → the SCALP stop cuts
+    cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+                                            secs_left=769)))
+    assert len(cuts) == 1 and "SCALP stop" in cuts[0].reason
+    assert o.get("done")
 
 
 # ── Part D, test 2: spot decides → CUT on spot, any time ───────────────────
@@ -128,30 +145,35 @@ def test_swing_to_take_still_fires(flip, gateway, ledger):
     assert flip.windows[TICKER].window_realized == 20
 
 
-# ── Part D, test 6: the cut REASON names the decision, not a band touch ────
+# ── Part D, test 6: the cut REASON names the decision, not a naked ride ────
 def test_cut_reason_names_the_decision(flip, gateway, ledger):
-    """Inside patience the only cut reasons are SPOT decided or CATASTROPHE
-    — never 'price touched band floor inside patience'."""
+    """Inside patience the cut names the DECISION — SPOT decided, the SCALP
+    stop (the tight bail), or the CATASTROPHE backstop — never a naked ride
+    to the bottom. (Option B added the scalp stop as the primary loss cut.)"""
     _entry(flip, gateway, ledger, entry=44)
-    # a band-floor dip inside patience produces NO cut (so no band-floor
-    # reason can appear inside patience)
-    p = flip.evaluate(TICKER, _ctx(_book(yes=34, no=55), secs_left=770))
-    assert _cuts(p) == []
-    # the catastrophe cut names the catastrophe, not the band floor
-    c = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=20, no=55),
-                                         secs_left=769)))
-    assert "band floor" not in c[0].reason and "CATASTROPHE" in c[0].reason
-
-
-# ── the ordinary band-floor cut survives, but ONLY after patience ──────────
-def test_band_floor_cut_only_after_patience(flip, gateway, ledger):
-    """Change 3: the band-floor 'the swing did not come' cut is legitimate
-    — but only after the FULL patience window, never a 2s bypass."""
-    o = _entry(flip, gateway, ledger, entry=44)
-    # inside patience: 34c holds
+    # one poll below the stop holds (noise-guard); a SUSTAINED dip is a
+    # SCALP decision, named as such — not a band-floor touch, not a ride
     assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                             secs_left=770))) == []
-    # past patience: the same dip is now a decision (the swing didn't come)
+    c = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+                                         secs_left=769)))
+    assert len(c) == 1 and "SCALP stop" in c[0].reason
+    assert "band floor" not in c[0].reason
+
+
+# ── the band-floor cut survives as a post-patience backstop ────────────────
+def test_band_floor_cut_only_after_patience(flip, gateway, ledger):
+    """The band-floor 'the swing did not come' cut survives as a POST-patience
+    backstop — reachable for the cheapest entries, where the scalp stop
+    (entry−6) sits BELOW the band floor (35). A 39¢ entry's scalp stop is 33,
+    so a 34¢ mark is inside the 6¢ tolerance: it HOLDS inside patience and
+    cuts via the band floor only AFTER patience (Option B left this intact)."""
+    o = _entry(flip, gateway, ledger, entry=39)
+    # 34c is above the 33c scalp stop → inside patience it HOLDS, any polls
+    for secs in (770, 769, 768):
+        assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
+                                                secs_left=secs))) == []
+    # past patience: the swing didn't come → band-floor cut
     o["fill_ts"] = CLOSE - 1100
     cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                             secs_left=760)))
