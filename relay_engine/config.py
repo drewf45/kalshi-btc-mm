@@ -112,6 +112,14 @@ OPEN_TAKE_CENTS = 20
 WINDOW_BOOK_GOAL_CENTS = 5          # DREW-RULED: per-window book profit target (bank the nickel now)
 OPEN_TAKE_MIN = 5                   # DREW-DEFAULT: reachable floor, fee-safe (>2c, nets ~+3c)
 OPEN_TAKE_MAX = 20                  # DREW-DEFAULT: ceiling = today's fixed take
+# WO-MAKER-REST-BACK (build 48): a maker BUY entry is re-priced at placement to
+# rest PASSIVELY at the live book (at/inside the held-side bid, strictly below
+# the derived ask) — never a post_only order at a crossing price. FLIP rests
+# this cushion BELOW the cheap bid (its liquidity doctrine: sit under the
+# pile-in and get hit as it falls); F just joins the bid. A rest-back that
+# would breach the lane band SKIPS the window (a maker who can't rest in-band
+# waits, never chases). Deliberate taker crossing stays CUT-only.
+FLIP_REST_BACK_CENTS = 2           # DREW-DEFAULT: FLIP rests this far below the cheap bid
 # WO-FLIP-LIQUIDITY-HOLD (build 45, DREW-RULED 2026-07-20): the FLIP lane is
 # reconceived as LIQUIDITY PROVISION, not scalp-or-cut. A low price after a
 # FLIP buy is ILLIQUIDITY (the opening pile-in, no buyers on your side yet),

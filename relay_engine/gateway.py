@@ -269,6 +269,18 @@ class Gateway:
                         (e.wall, fp_key, now_mono + self.WALL_BACKOFF_S)
                     self._note_wall_reject(order, e.wall, now_mono)
                 raise
+            # WO-MAKER-REST-BACK (build 48): AFTER the taker-entry wall (so a
+            # lane pricing an entry THROUGH the ask still rejects loudly), a
+            # maker BUY entry is re-priced to rest PASSIVELY at the live book —
+            # never a post_only order at a crossing price. LIVE placement only
+            # (the post-only-cross is a live-venue reject; shadow has no venue).
+            if (config.live_submit_enabled()
+                    and order.purpose == "ENTRY" and order.action == "buy"
+                    and not order.crossfire and book is not None):
+                rested = self._rest_back_price(order, book)   # may raise REST_BACK_SKIP
+                if rested != order.price_cents:
+                    order.price_cents = rested
+                    order.rest_fp = None   # the fp was the decision-time touch; re-derive
 
         # Rate governor: entries need a token; risk reduction is always allowed
         # (it may overdraw the bucket, loudly).
@@ -484,6 +496,36 @@ class Gateway:
                 "WRONG_WAY",
                 f"{order.action} improvement {order.improve_from}->{order.price_cents} "
                 f"(expected sign {expected:+d})")
+
+    def _rest_back_price(self, order: Order, book: OrderBook) -> int:
+        """WO-MAKER-REST-BACK (build 48): the maker BUY entry price that rests
+        PASSIVELY at the live book — at/inside the held-side bid and STRICTLY
+        below the derived ask, so a fast book can never turn it into a
+        post_only-into-a-cross. FLIP rests an extra cushion below the cheap
+        side (its liquidity doctrine: sit under the pile-in, get hit as it
+        falls). Raises REST_BACK_SKIP if resting in-band is impossible — a
+        maker who can't get a passive fill at an acceptable price WAITS for the
+        next window, never chases into the cross."""
+        held_bid = (book.best_yes_bid() if order.side == "yes"
+                    else book.best_no_bid())
+        opp_bid = (book.best_no_bid() if order.side == "yes"
+                   else book.best_yes_bid())
+        ask = (100 - opp_bid) if opp_bid is not None else None
+        rest = order.price_cents
+        if held_bid is not None:
+            rest = min(rest, held_bid)          # never above the current bid
+        if ask is not None:
+            rest = min(rest, ask - 1)           # strictly below the ask: never crosses
+        if order.lane == "FLIP":
+            rest -= config.FLIP_REST_BACK_CENTS  # the liquidity cushion below the pile-in
+        band_lo = order.band[0] if order.band else 1
+        if rest < band_lo:
+            raise WallRejection(
+                "REST_BACK_SKIP",
+                f"{order.lane} {order.market} {order.side}: rest-back {rest}c "
+                f"below band floor {band_lo}c — a maker who can't rest in-band "
+                "waits, never chases into the cross")
+        return max(1, rest)
 
     def _wall_taker_entry(self, order: Order, book: OrderBook) -> None:
         """REJECT_TAKER_ENTRY (P2/P3): an entry may never take. Crossfire on an

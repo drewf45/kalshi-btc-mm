@@ -1978,6 +1978,41 @@ No Kelly/cash/rate-halt/F/geometry change. Ships at `FLIP_SIZE_CAP=1`; the
 fill-rate gate still governs size. 6 immediate-entry test rewrites + 6 new
 fill-economics tests. Suite 593 · preflight 23/23.
 
+## WO-MAKER-REST-BACK — stop posting into the cross (build 48, overnight)
+
+**The last fix before the overnight run.** F (and now FLIP) kept getting
+`VENUE_REJECTED "post only cross"`: a maker BUY posted at a price the fast book
+had already crossed, and `post_only=True` made Kalshi reject it. Read-rule
+TRUE: `venue.py:774` documents the exact behavior; `gateway._wall_taker_entry`
+(gateway.py:502) allows an entry to rest AT the derived ask (`price ≤ ask`,
+touch-joining), and the venue's post_only then rejects the exact-cross.
+
+**The fix — rest back, or cross deliberately (never post_only into a cross):**
+- At **LIVE placement**, a maker BUY entry is re-priced by `_rest_back_price`
+  to rest **at/inside the held-side bid, strictly below the derived ask**
+  (`min(intended, held_bid, ask−1)`) — it can never turn into a
+  post_only-into-a-cross. It runs **after** the taker-entry wall, so a lane
+  pricing an entry *through* the ask still rejects loudly (the wall stays);
+  rest-back only cushions the legitimate at-touch entry the fast book crossed.
+- **FLIP** rests an extra `FLIP_REST_BACK_CENTS` (=2, DREW-DEFAULT) **below**
+  the cheap bid — not a patch but its liquidity doctrine (sit under the
+  pile-in, get hit as it falls).
+- A rest-back that would breach the lane band **SKIPS** the window
+  (`REST_BACK_SKIP` — a maker who can't rest in-band waits, never chases).
+- **Deliberate taker crossing stays CUT-only** (`post_only=False`, crossfire) —
+  unchanged. Entries never become takers; the `REJECT_TAKER_ENTRY` wall stays.
+- **Live-only:** the post-only-cross is a live-venue reject; shadow has no
+  venue, so shadow prices are untouched (no test churn, honest scoping).
+
+**HARD RAIL:** only maker ENTRY pricing at live placement changes. No
+Kelly/cash/rate-halt/strategy/CUT change. Ships at `FLIP_SIZE_CAP=1`. 10
+acceptance tests (F joins the bid; FLIP cushions below; strictly-below-ask on
+a crossed book; band-breach skips; live applies / shadow doesn't; through-price
+still rejects; CUT still crosses). Suite 603 · preflight 23/23. **This is the
+last build before the overnight untouched run** — watch the maker/taker split
+(build-47 pack): entries should show as MAKER (0-fee), only CUTs as TAKER, and
+"post only cross" → ~0.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

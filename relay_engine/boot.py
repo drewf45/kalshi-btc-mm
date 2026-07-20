@@ -234,6 +234,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"book-vs-venue gap >{config.RECON_AUDIT_FLOOR_CENTS}¢ with 0 "
                  "pending is recorded — the phantom names its source "
                  "(WO-INFRA-HARDENING)")
+    lines.append("EXECUTION REST-BACK: maker BUY entries re-price at LIVE "
+                 "placement to rest at/inside the held-side bid, strictly "
+                 "below the derived ask — never post_only into a cross; FLIP "
+                 f"rests {config.FLIP_REST_BACK_CENTS}¢ below the cheap side "
+                 "(its liquidity doctrine); a rest-back that breaches the lane "
+                 "band SKIPS (waits, never chases); deliberate taker only on "
+                 "CUT (WO-MAKER-REST-BACK)")
     # P21 B1: the boot cites the doctrine — one page says what the machine
     # believes, why, and what would change its mind. Cited, and verified
     # present (a missing registry is worth a loud boot line, never a crash).
