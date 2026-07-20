@@ -147,20 +147,56 @@ class Surface:
         for lane, fills in per_lane.items():
             pnl = 0
             custodied = False
+            # WO-INFRA-HARDENING E1 — the settlement SOURCE tracer (the code's
+            # long-standing "E1 traces the source" TODO): every booked cent is
+            # attributed to the fill + outcome that produced it, and net_held
+            # catches an unmatched leg (exits exceeding entries — a phantom
+            # over-exit), so a book-vs-exchange divergence NAMES its source
+            # instead of being eyeballed three dollars later.
+            contribs: List[dict] = []
+            net_held = {"yes": 0, "no": 0}
             for side, action, price_cents, count in fills:
                 yes_price = to_yes_terms(side, price_cents)
                 side_payoff = (100 if settled_yes else 0) if side == "yes" else (0 if settled_yes else 100)
                 side_basis = yes_price if side == "yes" else 100 - yes_price
                 if action == "ENTRY":
                     # Long the entered side at its basis; collects the side's payoff.
-                    pnl += (side_payoff - side_basis) * count
+                    c = (side_payoff - side_basis) * count
+                    net_held[side] += count
                 elif action in ("EXIT", "CUSTODIAN_EXIT"):
                     # An exit realizes the sale price and forgoes the side's payoff —
                     # symmetric to entry, opposite sign (win/loss path symmetry).
                     if action == "CUSTODIAN_EXIT":
                         custodied = True
-                    pnl += (side_basis - side_payoff) * count
+                    c = (side_basis - side_payoff) * count
+                    net_held[side] -= count
+                else:
+                    c = 0
+                pnl += c
+                contribs.append({"side": side, "action": action,
+                                 "price": price_cents, "count": count,
+                                 "contribution_cents": c})
             self.ledger.record_settlement(market, lane, pnl, detail=f"window={window_id}")
+            # E1: the provenance row — pnl, the exchange outcome, the per-fill
+            # breakdown, the running book AFTER this settlement books, and the
+            # unmatched-leg flag. This is what "traces the source" reads.
+            unmatched = net_held["yes"] < 0 or net_held["no"] < 0
+            self.write_row(lane, market, window_id, "SETTLE_AUDIT",
+                           transport=transport,
+                           detail=json.dumps({
+                               "pnl_cents": pnl, "settled_yes": settled_yes,
+                               "net_held": net_held, "unmatched": unmatched,
+                               "book_after_cents": self.ledger.book_cents(),
+                               "fills": contribs}))
+            if unmatched:
+                from . import failures
+                failures.fail(
+                    "SETTLE_UNMATCHED_LEG",
+                    f"{market}/{lane}: exits exceed entries (net_held="
+                    f"{net_held}) — settlement booked on an unmatched leg; the "
+                    "E1 SETTLE_AUDIT row carries the provenance",
+                    alert=False, market=market, lane=lane, pnl_cents=pnl,
+                    net_held=json.dumps(net_held))
             state = CUSTODIED_SETTLED if custodied else SETTLED
             self.write_row(lane, market, window_id, state, transport=transport,
                            detail=json.dumps({"pnl_cents": pnl, "fills": len(fills)}))

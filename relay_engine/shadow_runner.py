@@ -779,10 +779,29 @@ class ShadowEngine:
         val, src = self.account_value(now)
         if val is None or src != "venue":
             return "UNREADABLE"
+        # WO-INFRA-HARDENING E1 — the reconcile-side source trail: when the
+        # book disagrees with the venue and there is NOTHING pending to explain
+        # it (no unsettled fills, no resting orders), that is the phantom
+        # signature. Record it durably (alert=False — the cash protocol below
+        # still owns the page/halt) so the divergence is timestamped against
+        # the SETTLE_AUDIT trail instead of eyeballed later.
+        unsettled = self.ledger.unsettled_fill_count()
+        resting = len(self.gateway.resting)
+        book = self.ledger.book_cents()
+        if (unsettled == 0 and resting == 0
+                and abs(book - val) > config.RECON_AUDIT_FLOOR_CENTS):
+            from . import failures
+            failures.fail(
+                "RECON_BOOK_VENUE_DELTA",
+                f"book {book}c vs venue {val}c delta {book - val:+d}c with 0 "
+                "unsettled / 0 resting — an unexplained divergence; the E1 "
+                "SETTLE_AUDIT trail names which settlement moved the book",
+                alert=False, book_cents=book, venue_cents=val,
+                delta_cents=book - val)
         return self.cash.reconcile(
             venue_balance_cents=val,
-            in_flight_orders=len(self.gateway.resting),
-            unsettled_fills=self.ledger.unsettled_fill_count(),
+            in_flight_orders=resting,
+            unsettled_fills=unsettled,
             now=now)
 
     def listener_status(self) -> str:

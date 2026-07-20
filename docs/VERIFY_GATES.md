@@ -1878,6 +1878,63 @@ flicker held; T-10 endgame; entries admitted; take-fill measured; scalp
 retired; F not built). Suite 580 · preflight 23/23. **Halt stays in place
 until Drew resets it** — banked, not deployed.
 
+## WO-INFRA-HARDENING — make the body match the brain (build 46)
+
+**Execution-hardening phase. Doctrine frozen; execution only.** The app
+($34.68 / $0 positions) vs the book ($37.67) showed a ~$3 phantom surplus.
+
+**Read-rule audit OVERTURNED the WO's central diagnosis (reported to Drew):**
+- **P&L is already booked from confirmed fills, NOT window-econ.** `book_cents`
+  = `Σcash_movements + Σsettlements(divergent=0)` (ledger.py:198); the sole
+  P&L writer is `surface.settle_market → record_settlement` (surface.py:163),
+  computed by walking the confirmed fills table. The window-econ number never
+  writes to the book — it is a check that, on divergence, **quarantines and
+  re-books at fills-truth** (ledger.py:222). INFRA-1's "re-source P&L" is a
+  no-op against already-correct code.
+- **Settlement is exchange-gated:** it fires only after `close_ts+10` and only
+  when `venue.get_settlement_result` returns the exchange's own `mkt["result"]`
+  (venue.py:817) — outcome is exchange-truth, not a spot guess. Arithmetic is
+  correct for held and exited legs; `record_settlement` marks `settled=1` (no
+  re-settle double-book).
+- **A reconcile already exists** (INFRA-3 largely built): boot reconcile +
+  60s standing reconcile against exchange balance/positions (reconcile.py,
+  shadow_runner.py:775), pending-aware, halting via the cash protocol.
+- **Genuinely true:** the maker price is fixed at DECISION time and submitted
+  unchanged — no reprice at placement (INFRA-2, a real but separate gap); and
+  transport is REST-1s (INFRA-4/WebSocket, a separate large build unbuildable
+  in-sandbox).
+
+**Conclusion:** the phantom is a runtime/data condition, not a code defect the
+repo can point to — most plausibly a settlement double-counted across a
+restart, a wrong-market outcome on a stacked ticker, or an unmatched leg.
+Pinning the exact +$3.14 needs the live `settlements`/`cash_movements` tape.
+
+**DREW-RULED: hunt the source + build the tracer ("both").** Shipped **E1 —
+the settlement source tracer** the code's own quarantine comment long named
+("stopgap until E1 traces the source"):
+- Every settlement writes a **SETTLE_AUDIT** provenance row — booked pnl, the
+  exchange outcome, the per-fill contribution breakdown, `net_held` per side,
+  and the running book **after** it books (surface.py). An **unmatched leg**
+  (exits exceeding entries — a phantom over-exit) is flagged and written as a
+  durable `SETTLE_UNMATCHED_LEG` row (alert=False).
+- The reconcile records **RECON_BOOK_VENUE_DELTA** when the book disagrees
+  with the venue and NOTHING is pending (0 unsettled, 0 resting,
+  `|delta| > RECON_AUDIT_FLOOR_CENTS`) — the exact phantom signature —
+  timestamped against the SETTLE_AUDIT trail (shadow_runner.py).
+
+**Pure instrumentation** — no strategy/geometry/Kelly/cash/halt change; the
+booked P&L is unchanged (`test_e1_does_not_change_the_booked_pnl`). 7 acceptance
+tests (provenance sums to pnl; exited-leg matched; unmatched-leg flagged;
+phantom-signature recorded; pending-explained gap stays silent). Suite 587 ·
+preflight 23/23.
+
+**Deferred (Drew's call, per the WO's own Part E sequencing):** INFRA-2
+(placement-time live-book pricing — confirmed gap, separate build) and INFRA-4
+(WebSocket transport — unbuildable/untestable without live Kalshi WS). The
+historical +$3.14 awaits the live divergent tape to pin via the three queries
+in the report; E1 makes every future divergence self-pinning from the next
+window forward.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

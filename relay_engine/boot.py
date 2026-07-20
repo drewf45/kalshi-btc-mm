@@ -220,6 +220,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "pending prompt persist across boot (P-CASH-FATAL-1); "
                  "deny outranks boot baseline; /clear_cash_fatal is the "
                  "only key")
+    lines.append("EXECUTION E1: P&L books from CONFIRMED fills + exchange "
+                 "outcome only (window-econ is a check that self-heals to "
+                 "fills-truth, never a source); every settlement writes a "
+                 "SETTLE_AUDIT provenance row (per-fill contributions, "
+                 "outcome, book-after, unmatched-leg flag) and an unexplained "
+                 f"book-vs-venue gap >{config.RECON_AUDIT_FLOOR_CENTS}¢ with 0 "
+                 "pending is recorded — the phantom names its source "
+                 "(WO-INFRA-HARDENING)")
     # P21 B1: the boot cites the doctrine — one page says what the machine
     # believes, why, and what would change its mind. Cited, and verified
     # present (a missing registry is worth a loud boot line, never a crash).

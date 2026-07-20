@@ -149,6 +149,11 @@ AT_RISK_CAP_MULT = 3  # DREW-DEFAULT: $-at-risk per settlement event = 3x one-lo
 AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS
 LANE_D_FLOOR_CENTS = 60  # DREW-DEFAULT: Lane D band floor, pending Chunk 2 data (50c vs 60c open)
 DEPTH_FRACTION = 0.25  # DREW-DEFAULT: per-level size <= 25% of visible depth
+# WO-INFRA-HARDENING E1: a book-vs-venue gap wider than this, with 0 unsettled
+# fills and 0 resting orders, is an unexplained divergence (the phantom
+# signature) and is recorded to the E1 trail. Book and venue both round once,
+# so with nothing pending they match exactly — a whole-cent gap is real.
+RECON_AUDIT_FLOOR_CENTS = 2  # DREW-DEFAULT: E1 records an unexplained book/venue gap above this
 
 # ---------------------------------------------------------------------------
 # Walls (C.3 / BUILD_SEQUENCE 3.2)
