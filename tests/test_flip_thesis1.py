@@ -263,10 +263,13 @@ def test_continuity_silent_with_no_prior_window(flip, gateway, ledger,
 
 
 # ── §3 stage 2: the retune — ~20¢ scalp target, T-10 entry cutoff ──────────
-def test_scalp_take_rests_at_entry_plus_20(flip, gateway, ledger):
-    """§5: entry 49¢, the market swings — the take rests at ~entry+20
-    (69¢), not the retired +5 nibble that fees ate."""
-    assert config.OPEN_TAKE_CENTS == 20            # DREW-RULED §3
+def test_scalp_take_rests_at_the_goal_bounded_move(flip, gateway, ledger):
+    """§5, OVERTURNED by WO-FLIP-GOAL-TAKE (build 42): the +20 swing this
+    test once required was priced to a rare event (201430 rode it to the
+    floor, −27¢), so the take now floats to the reachable convergence move —
+    entry+5 at the 1-lot cap (54¢), banked reliably. The reachable nickel is
+    the win convergence actually gives; the +20 was the SOMETIMES."""
+    take_cents = LaneFlip._take_cents(1)           # 5 at the 1-lot cap
     props = flip.evaluate(TICKER, _ctx(_book(yes=49), secs_left=800,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
@@ -275,12 +278,13 @@ def test_scalp_take_rests_at_entry_plus_20(flip, gateway, ledger):
     take = next(p for p in flip.evaluate(TICKER, _ctx(_book(yes=49),
                                                       secs_left=780))
                 if p.purpose == "EXIT")
-    assert take.price_cents == 69 and take.action == "sell"
-    # the swing arrives: the fill books the 20c capture
+    assert take.price_cents == 49 + take_cents and take.action == "sell"
+    # the reachable move arrives: the fill books the goal-bounded capture
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 69, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 69, CLOSE - 500)
-    assert flip.windows[TICKER].window_realized == 20
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 49 + take_cents, 1,
+                       "PROBE")
+    flip.note_exit(TICKER, "yes", 49 + take_cents, CLOSE - 500)
+    assert flip.windows[TICKER].window_realized == take_cents
 
 
 def test_no_new_scalp_entry_at_or_after_t10(flip):

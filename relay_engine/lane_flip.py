@@ -47,6 +47,7 @@ of the retired law; the docstrings carry the citations.
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -746,6 +747,32 @@ class LaneFlip:
         leaks into FLIP exit math."""
         return book.best_yes_bid() if side == "yes" else book.best_no_bid()
 
+    @staticmethod
+    def _take_cents(contracts: int) -> int:
+        """WO-FLIP-GOAL-TAKE: the goal-bounded take in cents — the reliable
+        convergence move, not a rare +20. The per-window book goal divided by
+        the contracts held, clamped to a fee-safe floor and today's ceiling:
+            take = clamp(ceil(BOOK_GOAL / held), OPEN_TAKE_MIN, OPEN_TAKE_MAX)
+        At 1 lot this is the goal itself (bank the nickel); as size grows the
+        per-contract take shrinks toward the floor and volume carries the goal
+        (CAPSTONE Part B). The floor clears the ~2c round-trip taker fee with
+        margin, so the take is always net-positive — never sub-fee."""
+        n = max(1, int(contracts))
+        goal_per_contract = math.ceil(config.WINDOW_BOOK_GOAL_CENTS / n)
+        return max(config.OPEN_TAKE_MIN,
+                   min(config.OPEN_TAKE_MAX, goal_per_contract))
+
+    def _take_target(self, market: str, side: str, rec_count: int) -> int:
+        """The goal-bounded take for a held position — sized to the BOOKED
+        held count (Engineer's flag: the take math must match reality, not the
+        memory count), falling back to the record count only when the ledger
+        holds no truth (unit paths). Recomputes on every proposal, so a
+        second same-side fill (which cancels the resting take and re-proposes)
+        lands a fresh goal-bounded target at the new size."""
+        booked = self._booked_held(market, side)
+        contracts = booked if (booked is not None and booked > 0) else rec_count
+        return self._take_cents(contracts)
+
     def _measured_swing_rate(self, band_cell: int):
         """WO-SWING-GATE-EVENT §4.1: Instrument 1's ground truth — the
         rolling took_swing rate for this entry's price band (FLIP_SWING
@@ -792,7 +819,10 @@ class LaneFlip:
         from . import delta
         if not delta.is_loaded() or t_rem <= 0:
             return None, None
-        take_px = min(99, join + config.OPEN_TAKE_CENTS)
+        # WO-FLIP-GOAL-TAKE: the barrier is the ACTUAL take the fresh entry
+        # rests (goal-bounded at a 1-lot probe), so the shadow measures
+        # reachability of the reachable take, not the retired +20.
+        take_px = min(99, join + self._take_cents(1))
         cut_px = max(1, config.OPEN_UNDETERMINED_BAND[0])   # band floor
 
         def _dist(held_px):
@@ -1031,7 +1061,8 @@ class LaneFlip:
         Exits are EXACTLY three, and the executor FORKS BY INTENT (P26
         §3.2: TAKE rests as a maker; evacuations CROSS at best NOW — the
         `maker unfilled 10s` slide cost the 31/20/33 fills on ~35 triggers):
-          TAKE       — entry+OPEN_TAKE_CENTS, resting from the fill
+          TAKE       — entry + goal-bounded take (WO-FLIP-GOAL-TAKE:
+                       clamp(book-goal/held, MIN, MAX)), resting from the fill
           DETERMINED-AGAINST — mark below max(band floor, entry−drop)
                        (§3.4 geometry v2), or ΔP-collapse >= K sustained
                        2 polls → crossfire IMMEDIATELY
@@ -1050,19 +1081,24 @@ class LaneFlip:
             mark = self.held_price(side, book)   # WO-FLIP-SIDE-ORIENT: canonical held-side price
             # TAKE — posted the instant the entry books (the maker intent).
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
+            # WO-FLIP-GOAL-TAKE: priced to the goal-bounded convergence move
+            # (entry + clamp(book-goal / held, MIN, MAX)) — a reachable
+            # nickel, not a rare +20 that leaves the position riding to the
+            # floor. Held-side entry (orientation-correct, build 41).
             if o["take_oid"] is None and not o.get("take_proposed"):
                 n = self._exit_count(market, side, o["count"])
                 if n <= 0:
                     o["done"] = True
                     continue
                 o["take_proposed"] = True
+                take_cents = self._take_target(market, side, o["count"])
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
                     action="sell",
-                    price_cents=o["entry"] + config.OPEN_TAKE_CENTS,
+                    price_cents=min(99, o["entry"] + take_cents),
                     count=n, size_tier=config.TIER_PROBE,
                     purpose="EXIT",
-                    reason=f"open take entry+{config.OPEN_TAKE_CENTS}"))
+                    reason=f"open take entry+{take_cents} (goal-bounded)"))
                 continue
             # P-FLIP-THESIS-1 §4 — HOLD-INSTEAD-OF-SCALP: at the patience
             # assessment, a side deciding in FLIP's favor hard enough that
@@ -1427,7 +1463,11 @@ class LaneFlip:
         if surface is None:
             return
         gross = exit_px - entry
-        took = exit_px >= entry + config.OPEN_TAKE_CENTS - 1
+        # WO-FLIP-GOAL-TAKE: "took" now means the REACHABLE take fired — the
+        # exit made at least the goal-bounded floor move (OPEN_TAKE_MIN), not
+        # the retired +20. This is the instrument §4 wants: with a reachable
+        # target the took-rate rises sharply where the +20 rarely printed.
+        took = exit_px >= entry + config.OPEN_TAKE_MIN - 1
         detail = {"market": market, "entry_price": entry,
                   "took_swing": bool(took), "exit_price": exit_px,
                   "gross_cents": gross, "salvaged": gross < 0,

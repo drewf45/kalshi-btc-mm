@@ -96,6 +96,22 @@ OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
 # (spot's reachable move in time left) is routed to measurement before it
 # replaces the constant.
 OPEN_TAKE_CENTS = 20
+# WO-FLIP-GOAL-TAKE (build 42, DREW-RULED 2026-07-20): the FLIP resting take
+# is no longer the fixed +20 swing (201430: yes@44 rode to the 20c floor,
+# -27c — the +20 take was priced to a rare event, so the position never took
+# and lived long enough to ride down). The take floats to the reliable
+# convergence move, bounded to Drew's per-book goal:
+#   goal_per_contract = ceil(WINDOW_BOOK_GOAL_CENTS / booked-held)
+#   take_cents        = clamp(goal_per_contract, OPEN_TAKE_MIN, OPEN_TAKE_MAX)
+# At the 1-lot cap this is entry+5 (bank the nickel); as FLIP sizes up the
+# per-contract take shrinks toward MIN and volume carries the goal (CAPSTONE
+# Part B: 4 contracts x 5c = 20c clears the same book goal as one +20). MIN
+# clears the ~2c round-trip taker fee with margin (5c nets ~+3c). OPEN_TAKE_CENTS
+# stays the entry-geometry reward ceiling and cell-scoreboard notional (§6:
+# TAKE-only; the cut and entry gate are unchanged).
+WINDOW_BOOK_GOAL_CENTS = 5          # DREW-RULED: per-window book profit target (bank the nickel now)
+OPEN_TAKE_MIN = 5                   # DREW-DEFAULT: reachable floor, fee-safe (>2c, nets ~+3c)
+OPEN_TAKE_MAX = 20                  # DREW-DEFAULT: ceiling = today's fixed take
 OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box
 OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
 # WO-FLIP-EXIT-DOCTRINE (build 40): determined-against is a statement about

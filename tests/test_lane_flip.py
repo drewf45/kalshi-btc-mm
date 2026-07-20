@@ -138,8 +138,11 @@ def test_open_curfew_and_no_entry_phase(flip):
 
 
 def test_open_take_posted_after_fill(flip, gateway):
-    """A5 exit one of three: the TAKE rests at entry+OPEN_TAKE_CENTS the
-    cycle after the fill books (pre-P21 this was the pair take entry+4)."""
+    """A5 exit one of three: the TAKE rests at entry + the goal-bounded take
+    the cycle after the fill books (WO-FLIP-GOAL-TAKE overturned the fixed
+    entry+OPEN_TAKE_CENTS — at the 1-lot cap this is entry+5, the reachable
+    nickel; pre-P21 it was the pair take entry+4)."""
+    from relay_engine.lane_flip import LaneFlip
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
                                       grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-Y", CLOSE - 800)
@@ -152,7 +155,7 @@ def test_open_take_posted_after_fill(flip, gateway):
     takes = [p for p in props2 if p.purpose == "EXIT"]
     assert len(takes) == 1
     assert (takes[0].side, takes[0].price_cents, takes[0].action) == \
-        ("yes", 48 + config.OPEN_TAKE_CENTS, "sell")
+        ("yes", 48 + LaneFlip._take_cents(1), "sell")
     assert "open take" in takes[0].reason
 
 

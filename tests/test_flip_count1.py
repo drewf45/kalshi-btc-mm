@@ -82,7 +82,9 @@ def test_second_open_fill_merges_and_take_sells_two(flip, gateway, ledger):
     props3 = flip.evaluate(TICKER, ctx(flip_book(), secs_left=760))
     take2 = next(p for p in props3 if p.purpose == "EXIT")
     assert take2.count == 2                      # the whole bucket flips
-    assert take2.price_cents == 49 + config.OPEN_TAKE_CENTS
+    # WO-FLIP-GOAL-TAKE: the re-proposed take is goal-bounded at the MERGED
+    # booked size (2 lots), never the retired fixed +20
+    assert take2.price_cents == 49 + LaneFlip._take_cents(2)
     assert _uncovered_rows(ledger) == []         # covered every cycle
 
 

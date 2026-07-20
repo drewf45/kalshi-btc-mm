@@ -1707,6 +1707,59 @@ and the two sides' decisions are byte-identical at every tick.
   take (20¢), catastrophe (20¢), band (35/65), and FLIP_X unchanged. Ships
   at the 1-lot cap. Suite 556 · preflight 23/23.
 
+## WO-FLIP-GOAL-TAKE — bank the nickel, don't wait for the swing (build 42)
+
+**BANKED — not for immediate deploy** (built, tested, ready when Drew opens a
+window). 201430 caught live: bought YES@44¢, rode to the 20¢ catastrophe
+floor, −27¢, FLIP_FLOOR_BREACH firing. The build-41 side-orientation fix was
+IN and did not stop it — proving the other half: the take was priced to a
+rare +20 swing (64¢ from a 44¢ entry) that almost never fires, so nearly
+every FLIP position lived long enough to drift down and ride to the floor.
+Reward required the rare event; loss ran to the common one.
+
+**Read-rule finding (reported to Drew): the WO's line citation is
+imprecise.** The WO cited `lane_flip.py:795` as "the fixed `join +
+OPEN_TAKE_CENTS` take." At source that line is the **shadow** two-barrier's
+take *barrier* (calibration only — drives nothing live). The **live resting
+take that actually rested at 64¢ on 201430 and never fired** is in
+`_open_custody` (`o["entry"] + OPEN_TAKE_CENTS`). The fix's primary target is
+the live take; the shadow barrier and the took-detection were routed through
+the same helper for consistency.
+
+**The fix (DREW-RULED 2026-07-20 via AskUserQuestion — `WINDOW_BOOK_GOAL_CENTS
+= 5`, "bank the nickel NOW"):** the resting take floats to the reliable
+convergence move, bounded to the per-book goal:
+- `take_cents = clamp(ceil(WINDOW_BOOK_GOAL_CENTS / booked-held), OPEN_TAKE_MIN,
+  OPEN_TAKE_MAX)`, added as `LaneFlip._take_cents` / `_take_target`.
+- New constants (all DREW-ruled/defaulted): `WINDOW_BOOK_GOAL_CENTS=5`,
+  `OPEN_TAKE_MIN=5` (fee-safe: clears the ~2¢ round-trip taker fee, nets ~+3¢),
+  `OPEN_TAKE_MAX=20` (= today's fixed take).
+- **At the 1-lot cap the take rests at entry+5** — a move convergence gives
+  all day — so the position EXITS on a win instead of riding to the floor.
+  As FLIP sizes up, the per-contract take shrinks toward MIN and volume
+  carries the goal (4 contracts × 5¢ = 20¢ clears the same book goal as one
+  +20). Sized to **booked-held** (Engineer's flag), recomputed on a second
+  fill (the merge cancels and re-proposes at the new size).
+- **Instrument 1 aligned**: `_log_swing_outcome`'s `took_swing` now measures
+  the reachable target (`OPEN_TAKE_MIN`), so the measured hit-rate rises where
+  the +20 bar rarely printed (§4 SCIENTIST — the reachable take is measurable).
+- **Overturned test-laws (with citations)**: `test_scalp_take_rests_at_entry_
+  plus_20` → `..._at_the_goal_bounded_move` (the +20 was the rare event that
+  rode to the floor); `test_open_take_posted_after_fill`,
+  `test_patient_hold_ignores_wiggles`, and the FLIP-COUNT-1 merge take all
+  re-anchored to the goal-bounded price.
+
+**HARD RAIL held**: TAKE only. The cut (spot-decided, catastrophe floor,
+patience) is UNCHANGED — a non-converging loser still cuts by the exit
+doctrine (test proves it). The entry geometry gate and cell scoreboard keep
+`OPEN_TAKE_CENTS=20` as the notional reward ceiling (a deliberate scope
+boundary — flag for a future WO if Drew wants entry admission re-tuned to the
+goal-bounded reward). HUNT's scalper take (`HUNT_TAKE_CENTS`) untouched. No
+Kelly/cash/rate-halt/F change. Ships at `FLIP_SIZE_CAP=1`. **Part D**: 12
+acceptance tests (the clamp; 44→49 core; orientation mirror; size-shrink;
+recompute-on-fill; cut-unchanged; instrument; fee floor). Suite 568 ·
+preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

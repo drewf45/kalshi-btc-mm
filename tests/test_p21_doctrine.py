@@ -139,9 +139,13 @@ def test_patient_hold_ignores_wiggles(flip, gateway):
     wiggles INSIDE max(band floor, entry−6) — a 5¢ wiggle proposes NOTHING
     beyond the resting take. (P21's −12¢ tolerance was the leak: risk must
     fit the take, so the determined trigger is entry−6 now.)"""
+    from relay_engine.lane_flip import LaneFlip
     _open_position(flip, gateway, side="yes", entry=48)
     props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49), secs_left=780))
-    assert [p.reason for p in props] == [f"open take entry+{config.OPEN_TAKE_CENTS}"]
+    # WO-FLIP-GOAL-TAKE overturned the fixed +20: the resting take is now the
+    # goal-bounded convergence move (entry+5 at the 1-lot cap)
+    assert [p.reason for p in props] == \
+        [f"open take entry+{LaneFlip._take_cents(1)} (goal-bounded)"]
     flip.on_submitted(props[0], "OID-T", CLOSE - 780)
     # mark wiggles to entry−5 (>= trigger 42): the hold HOLDS
     for secs in (770, 760, 750):

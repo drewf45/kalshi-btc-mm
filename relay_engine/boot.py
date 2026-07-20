@@ -159,6 +159,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "the §2 shadow carries the held-side sign (NO's implied "
                  "P(cross) is the complement); F stays one-directional "
                  "(WO-FLIP-SIDE-ORIENT)")
+    lines.append(f"  FLIP GOAL-TAKE: take is goal-bounded — entry + "
+                 f"clamp(book-goal {config.WINDOW_BOOK_GOAL_CENTS}¢ ÷ held, "
+                 f"MIN {config.OPEN_TAKE_MIN}¢, MAX {config.OPEN_TAKE_MAX}¢) — "
+                 "bank the reliable convergence move, not a rare +20 that "
+                 "rode 201430 to the floor; at 1-lot = entry+"
+                 f"{config.OPEN_TAKE_MIN}¢, fee-safe; cut unchanged "
+                 "(WO-FLIP-GOAL-TAKE)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "
