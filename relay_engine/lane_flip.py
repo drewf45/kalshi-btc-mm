@@ -1117,6 +1117,15 @@ class LaneFlip:
                 g = w.heal_grace.get(side, 0) + 1
                 w.heal_grace[side] = g
                 if g <= FLIP_HEAL_GRACE_CYCLES:
+                    # WO-HALT-ORPHAN §2A: the TRANSIENT (a cover in flight
+                    # this cycle) is INFO, never a page — the page is
+                    # reserved for a leg that fails grace (below). Firing
+                    # on the transient trained the eye to skip the ONE
+                    # real naked leg.
+                    if g == 1:
+                        log.info("FLIP_UNCOVERED transient %s %s: held %d > "
+                                 "covered %d, cover in flight — grace",
+                                 market, side, held, covered)
                     continue     # a cover is in flight; let it confirm
             w.heal_grace.pop(side, None)
             if esc == 0:

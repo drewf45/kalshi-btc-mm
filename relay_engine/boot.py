@@ -171,6 +171,10 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  SIZING: FULL KELLY — min(kelly, depth); the Wilson "
                  "ladder reports (scoreboard, pages, custody scaling) and "
                  "never votes (P27 §1); /scoreboard on demand")
+    lines.append("HALTS: rate persists (/reset_halt key); orientation "
+                 "auto-heals on a fresh recheck; /reset_halt clears ALL "
+                 "entry-halt reasons (cash-fatal keeps its own key); status "
+                 "reads the gateway set (WO-HALT-ORPHAN)")
     lines.append(f"GOVERNOR: halt-only — walls stop bugs, custody stops "
                  f"losses, the {config.RATE_HALT_LOSSES}-of-"
                  f"{config.RATE_HALT_WINDOW} rate halt stops bad runs "

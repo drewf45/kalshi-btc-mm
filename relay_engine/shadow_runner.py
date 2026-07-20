@@ -233,11 +233,21 @@ class ShadowEngine:
         self.book_checks_total = 0  # §3.4: the `book✓ n` heartbeat
         self._divergence_pending = {}  # market -> True after one diverged check
         self._wall_log_counts = {}     # §4.3: (lane, market, wall) -> count
+        # WO-HALT-ORPHAN §2B: a lane/side/price that failed the BUDGET wall
+        # this window is not re-proposed — the wall decision can't change
+        # within a window (book is byte-identical until a confirmed
+        # movement), so 21 retries were pure spam. Keys (market, lane,
+        # side, price); cleared at rollover.
+        self._budget_rejected = set()
         self.feed.on_poison = self.note_poison_episode
         self.gateway.alert_fn = self.telegram.alert  # WALL_STORM page path
         # P13 §3: orientation sentinels + §4 sit-out page wiring
         self.divergence_watches = {}   # market -> {until, strikes}
         self._orientation_checked = False
+        # WO-HALT-ORPHAN §1.3: the market that tripped ORIENTATION_DIVERGENCE
+        # — re-checked with a FRESH record each cycle; a passing recheck
+        # auto-resumes (a transient staleness halt self-heals, no key).
+        self._orientation_halt_market = None
         self.windows_seen = 0          # P17 §6.1: the show-up counter
         # P18: the displacement-event anchor per market — ONE hunt per event;
         # re-anchored on each hunt submit (a new hunt needs a NEW needle).
@@ -290,6 +300,8 @@ class ShadowEngine:
         self._divergence_pending.pop(ticker, None)
         self._size_zero_logged = {k for k in self._size_zero_logged
                                   if k[0] != ticker}
+        self._budget_rejected = {k for k in self._budget_rejected
+                                 if k[0] != ticker}   # §2B: per-window reset
         self.feed.resync_needed.discard(ticker)
         # P15 Fix A: settled window — gross exposure for the market is over
         for key in [k for k in self.gateway.gross_open if k[1] == ticker]:
@@ -925,9 +937,35 @@ class ShadowEngine:
 
     def process_divergence_watches(self, client, now=None) -> None:
         """§3: 30s post-entry watch — ours vs the venue market record >3¢
-        for 3 consecutive checks → entries halt + page."""
-        from . import failures, venue
+        for 3 consecutive checks → entries halt + page.
+
+        WO-HALT-ORPHAN §2C: a strike counts ONLY against a FRESH record
+        (re-pulled, age-stamped) — a stale discovery record can no longer
+        cast a strike (the 7¢ movement-lag false halt: ours y23 vs a stale
+        y30). §1.3: a live ORIENTATION_DIVERGENCE halt auto-recovers the
+        moment a fresh recheck of the halting market reads clean — a
+        transient staleness halt self-heals; /reset_halt is the backstop,
+        not the only door."""
+        from . import failures
         now = time.time() if now is None else now
+        # §1.3 AUTO-RECOVER: a live orientation halt re-checks itself with a
+        # FRESH record; a clean fresh read resumes entries (no key needed).
+        if ("ORIENTATION_DIVERGENCE" in self.gateway.entries_halted_reasons
+                and self._orientation_halt_market is not None):
+            mkt = self._orientation_halt_market
+            book = self.feed.books.get(mkt)
+            ours = book.best_yes_bid() if book is not None else None
+            fresh = self._fresh_record_touches(mkt)
+            fbid = fresh[0] if fresh is not None else None
+            if ours is not None and fbid is not None and abs(ours - fbid) <= 3:
+                self.gateway.resume_entries("ORIENTATION_DIVERGENCE")
+                self._orientation_halt_market = None
+                self.telegram.alert(
+                    f"✅ ORIENTATION recovered {mkt}: fresh record y{fbid}¢ "
+                    f"agrees with ours y{ours}¢ (≤3¢) — entries re-enabled "
+                    "automatically (WO-HALT-ORPHAN §1.3)")
+                log.warning("ORIENTATION_DIVERGENCE auto-cleared on %s: "
+                            "fresh y%s vs ours y%s", mkt, fbid, ours)
         for market, w in list(self.divergence_watches.items()):
             if now > w["until"]:
                 del self.divergence_watches[market]
@@ -936,26 +974,25 @@ class ShadowEngine:
             ours = book.best_yes_bid() if book is not None else None
             if ours is None:
                 continue
-            try:
-                rec_obj = venue.get_market(client, market)
-            except Exception:
-                continue
-            try:
-                from decimal import Decimal
-                rec = int(Decimal(str(rec_obj.get("yes_bid_dollars"))) * 100)
-            except Exception:
+            # §2C: the strike is cast by a FRESH record, never a stale one.
+            fresh = self._fresh_record_touches(market)
+            rec = fresh[0] if fresh is not None else None
+            if rec is None:
                 continue
             if abs(ours - rec) > 3:
                 w["strikes"] += 1
                 if w["strikes"] >= 3:
                     del self.divergence_watches[market]
                     self.gateway.halt_entries("ORIENTATION_DIVERGENCE")
+                    self._orientation_halt_market = market
                     self.telegram.alert(
                         f"⛔ ORIENTATION_DIVERGENCE {market}: ours y{ours}¢ vs "
-                        f"venue record y{rec}¢ >3¢ x3 — entries HALTED")
+                        f"FRESH record y{rec}¢ >3¢ x3 — entries HALTED "
+                        "(auto-recovers on a clean fresh recheck)")
                     failures.fail("ORIENTATION_DIVERGENCE",
-                                  f"{market}: ours {ours}¢ vs record {rec}¢ "
-                                  f"diverged 3 consecutive checks post-entry",
+                                  f"{market}: ours {ours}¢ vs FRESH record "
+                                  f"{rec}¢ diverged 3 consecutive checks "
+                                  f"post-entry",
                                   market=market, ours=ours, record=rec,
                                   alert=False)
             else:
@@ -1155,11 +1192,22 @@ class ShadowEngine:
                     # next proposal, no grace. Exits/cuts are never resized.
                     if proposal.purpose == "ENTRY":
                         self._score_and_size(proposal, book)
+                    # WO-HALT-ORPHAN §2B: an ENTRY the budget wall already
+                    # refused this window is not re-submitted — the wall
+                    # can't change within a window (byte-identical book).
+                    br_key = (market, lane.name, proposal.side,
+                              proposal.price_cents)
+                    if (proposal.purpose == "ENTRY"
+                            and br_key in self._budget_rejected):
+                        continue
                     try:
                         result = self.gateway.submit(proposal, book)
                     except WallRejection as e:
                         self.gateway.reject_counts[e.wall] = \
                             self.gateway.reject_counts.get(e.wall, 0) + 1
+                        # §2B: one budget rejection per lane/side/price/window
+                        if e.wall in ("BUDGET", "DOLLAR_RISK", "NET_RISK"):
+                            self._budget_rejected.add(br_key)
                         # P10 §4.3: log the first + every 10th (the 01:25 log
                         # was 60 identical lines); the count keeps fidelity.
                         k = (lane.name, market, e.wall)

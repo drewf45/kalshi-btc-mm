@@ -302,19 +302,38 @@ class WindowEcon:
 
     def reset_halt(self, confirmed_by: str = "telegram") -> str:
         """Drew's word alone. Re-enables ENTRIES only — it cannot place, amend,
-        or cancel anything (single-gateway law)."""
-        if not self.halted():
+        or cancel anything (single-gateway law).
+
+        WO-HALT-ORPHAN §1.1/§1.2: the TRUE halt state is the gateway's
+        reason SET, not the rate DB flag alone — a status that reads only
+        self.halted() lied "no halt active" while ORIENTATION_DIVERGENCE
+        froze the desk. The key now clears the whole set (except reasons
+        with their own key: cash-fatal/prompt clear via /clear_cash_fatal,
+        DEGRADE_LADDER auto-resumes on WS_LIVE) and reports which reasons
+        lifted."""
+        from .ledger import CASH_FATAL_REASON, CASH_PROMPT_REASON
+        keep = (CASH_FATAL_REASON, CASH_PROMPT_REASON, "DEGRADE_LADDER")
+        halted_reasons = self.gateway.entries_halted_reasons
+        clearable = [r for r in halted_reasons if r not in keep]
+        if not self.halted() and not clearable:
             return "no halt active"
+        # rate-halt DB flag: cleared only when the rate reason is present
         self.ledger.set_state(HALT_KEY, "0")
         self._set_streak(0)
         self.ledger.set_state(STRIKES_KEY, "[]")
         self.ledger.set_state(OUTCOMES_KEY, "[]")   # B3: the window restarts clean
-        self.gateway.resume_entries(HALT_REASON)
+        cleared = self.gateway.resume_entries_all(keep=keep)
         self.surface.write_row("ECON", "ENGINE", f"halt-{int(time.time())}",
-                               "HALT_RESET", detail=f"confirmed_by={confirmed_by}")
+                               "HALT_RESET",
+                               detail=f"confirmed_by={confirmed_by} "
+                                      f"cleared={','.join(cleared) or 'none'}")
         book = self.ledger.book_cents()
-        return (f"halt cleared — entries re-enabled · book ${book / 100:.2f} · "
-                f"next window considered on the next cycle")
+        names = ", ".join(cleared) or "none"
+        held = ", ".join(sorted(r for r in halted_reasons if r in keep))
+        held_s = f" · still held (own key): {held}" if held else ""
+        return (f"halt cleared ({names}) — entries re-enabled · "
+                f"book ${book / 100:.2f}{held_s} · next window considered "
+                f"on the next cycle")
 
     # ── §2.4: the pack lines ───────────────────────────────────────────
     def pack_lines(self) -> list:

@@ -1551,6 +1551,45 @@ believed it healed, and the leg rode bare.
   rate-halt, HUNT (BLEED-1), OPEN-swing gate untouched (asserted
   in-test). Suite 518 · preflight 23/23.
 
+## WO-HALT-ORPHAN + OVERNIGHT NOISE (build 38, one commit)
+
+Drew found the engine frozen at $35.94 for 25+ min: `/reset_halt` said
+"no halt active" while every proposal was WALL_REJECT[ENTRIES_HALTED]
+ORIENTATION_DIVERGENCE. Root cause (read-rule TRUE): two halt producers
+(rate + orientation) share one gateway reason SET, but `reset_halt`
+cleared only `HALT_REASON` and its guard read only the rate DB flag — a
+durable stop with no operator key and a status light lying green.
+
+- **§1.1 the key clears ALL reasons**: `gateway.resume_entries_all(keep=)`
+  clears the whole `entries_halted_reasons` set except reasons with their
+  own lifecycle (cash-fatal/prompt → /clear_cash_fatal; DEGRADE_LADDER →
+  auto-resumes on WS_LIVE — the Engineer's persistent-reasons guard).
+- **§1.2 the status tells the truth**: `reset_halt`'s guard reads the
+  gateway SET, not `self.halted()` alone — an orientation-only halt no
+  longer reports "no halt active"; the reply names the reasons cleared
+  and any still held by their own key.
+- **§1.3 orientation auto-heals**: a live ORIENTATION_DIVERGENCE stamps
+  its market; `process_divergence_watches` re-pulls a FRESH record each
+  cycle and `resume_entries("ORIENTATION_DIVERGENCE")` the moment it
+  reads clean (≤3¢) — a transient staleness halt self-heals; /reset_halt
+  is the backstop. A real inversion keeps failing the fresh recheck and
+  stays halted (Adversary).
+- **§2C fresh-record strike**: a strike counts only against a re-pulled
+  FRESH record (`_fresh_record_touches`) — a stale discovery record can
+  no longer cast a strike (the 7¢ movement-lag false halt).
+- **§2A page the real leg, not its transient**: FLIP_UNCOVERED_LEG pages
+  only post-grace (a cover that failed to confirm — the FLATTEN
+  escalation); the in-flight transient logs at INFO. (Already post-grace
+  after WO-UNCOVERED-FLATTEN; made explicit.)
+- **§2B budget reject once/window**: a lane/side/price the BUDGET (or
+  NET_RISK/DOLLAR_RISK) wall refused is not re-submitted that window —
+  the byte-identical book can't change the wall's verdict; 21 retries →
+  1. Cleared at rollover.
+- **HARD RAIL held**: rate-halt still persists across boot and needs
+  /reset_halt (restore_halt_on_boot unchanged, asserted); cash-integrity
+  unchanged; only orientation auto-heals; no Kelly change. Suite 527 ·
+  preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

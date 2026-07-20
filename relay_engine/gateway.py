@@ -397,6 +397,21 @@ class Gateway:
     def resume_entries(self, reason: str) -> None:
         self.entries_halted_reasons.discard(reason)
 
+    def resume_entries_all(self, keep=()) -> list:
+        """WO-HALT-ORPHAN §1.1: Drew's key clears EVERY entry-halt reason,
+        not just the rate one (the orphaned ORIENTATION_DIVERGENCE had no
+        key and no auto-clear — it froze the desk until a redeploy).
+        `keep` protects reasons with their OWN lifecycle/key
+        (cash-fatal/prompt clear via /clear_cash_fatal; DEGRADE_LADDER
+        auto-resumes on WS_LIVE) — the Engineer's persistent-reasons
+        guard. Returns the reasons actually cleared, sorted."""
+        keep = set(keep)
+        cleared = sorted(r for r in self.entries_halted_reasons
+                         if r not in keep)
+        self.entries_halted_reasons = {r for r in self.entries_halted_reasons
+                                       if r in keep}
+        return cleared
+
     # ------------------------------------------------------------------
     # Walls, in canon order
     # ------------------------------------------------------------------

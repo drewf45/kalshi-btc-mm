@@ -212,13 +212,17 @@ def test_settlement_cross_check_flags_suspect(engine):
 
 
 def test_divergence_watch_halts_after_three_strikes(engine, monkeypatch):
-    from relay_engine import venue
+    """WO-HALT-ORPHAN §2C: the strike is cast by a FRESH record (re-pulled),
+    never a stale one — a movement-lag stale record can no longer force a
+    false halt. Here the fresh record still diverges 7¢, so 3 strikes halt
+    (and §1.3: the halt stamps its market for auto-recovery)."""
     engine.feed.handle_frame(json.dumps(
         {"type": "orderbook_snapshot",
          "msg": {"market_ticker": TICKER, "yes": [[45, 10]], "no": [[30, 10]]}}),
         now=1000.0)
-    monkeypatch.setattr(venue, "get_market",
-                        lambda c, t: {"yes_bid_dollars": "0.52"})  # 7c apart
+    # a FRESH record 7c apart (yes_bid 52 vs ours 45) casts the strike
+    monkeypatch.setattr(engine, "_fresh_record_touches",
+                        lambda market: (52, 55))
     engine._on_fill_booked(entry_order(), "ENTRY", 46, 1, 1000.0, 0)
     assert TICKER in engine.divergence_watches
     for i in range(3):
@@ -226,6 +230,7 @@ def test_divergence_watch_halts_after_three_strikes(engine, monkeypatch):
     assert "ORIENTATION_DIVERGENCE" in engine.gateway.entries_halted_reasons
     assert any("ORIENTATION_DIVERGENCE" in m for m in engine.telegram_sent)
     assert TICKER not in engine.divergence_watches
+    assert engine._orientation_halt_market == TICKER   # §1.3 stamped
 
 
 # ── tape-0718 hygiene: foreign dedup + ephemeral-DB warning ────────────────
