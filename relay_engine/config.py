@@ -87,9 +87,30 @@ GRAIN_K = 4                       # last-K window outcomes feed the streak
 # widens DOWN — the edge is the cheap side, admitted to ~39c. Upper bound
 # kept per the ruling (a tight-spread 39/59 book stays refused by the
 # 56c complement bound; only wide/uncertain books admit the 39c side).
-OPEN_BAND = (39, 56)              # setup: BOTH sides in the open band
+OPEN_BAND = (39, 56)              # legacy setup band (retired as an entry gate build 49; kept for reference)
 OPEN_MIN_GRAIN = 2                # streak >= 2 or pass (OPEN_NO_GRAIN)
-OPEN_MAX_ENTRY_CENTS = 49         # maker join grain-side <= this
+# WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49, DREW-DEFAULT): FLIP is the market's
+# LIQUIDITY PROVIDER — it buys the cheap side of EVERY biased open and sells it
+# back to the forced hedgers at the MIDDLE. The old "both sides in OPEN_BAND"
+# gate rejected biased opens (the expensive side out of band) — backwards, it
+# waited for a balanced book. Now the entry filter is only the CHEAP side being
+# BUYABLE: OPEN_ENTRY_FLOOR <= cheap_bid <= OPEN_MAX_ENTRY_CENTS, plus the
+# true-50/50 skip and the HUNT/needle trend-guard. (The cheap side is always
+# <= 50 by book coherence, so the max just admits the near-coinflip cheap side.)
+OPEN_ENTRY_FLOOR = 25            # DREW-DEFAULT: cheap-side lower bound — buy cheap, not near-worthless/decided
+OPEN_MAX_ENTRY_CENTS = 50         # DREW-DEFAULT (was 49): admit the near-coinflip cheap side too
+# The take rests toward the MIDDLE, scaled by entry depth: take = clamp(
+# MIDDLE_TARGET, entry+MIN, 99). Buy 39 -> rest 52 (+13, a dime); buy 49 ->
+# rest 54 (+5, the fee-safe floor). The cheaper the entry, the bigger the
+# gouge — the middle is where the hedgers are forced to transact.
+OPEN_MIDDLE_TARGET = 52          # DREW-DEFAULT: the take target — the 50/50 middle, one tick above
+# B3 the active late-window walk-down: a position that does not fill at the
+# middle is walked DOWN toward scratch as the clock runs (from OPEN_WALK_START_S
+# down to OPEN_FLAT_BY = T-10), re-posting the maker take lower, so it exits
+# gracefully near scratch late and is NEVER caught holding into a catastrophic
+# bell dump. Late-window only — the early hold is protected by the build-48
+# catastrophe-illiquidity guards; this is not a reactive early cut.
+OPEN_WALK_START_S = 780          # DREW-DEFAULT: secs-remaining where the take-walk begins (full middle above here, stepping to scratch by T-10)
 # P-FLIP-THESIS-1 §3 (DREW-RULED 2026-07-19, was 5): the scalp target is
 # the ~20c swing, not a 5c nibble — the nibble couldn't outrun fees+tails
 # (2c taker fee ate 40% of the old edge). A delta-table-derived target

@@ -666,10 +666,17 @@ class LaneFlip:
             return proposals               # §3.3: OPEN's window is T-15→T-8
         if self._net(market, event) != 0:
             return proposals               # R1 WALL: one position at a time
-        lo_b, hi_b = config.OPEN_BAND
-        if not (yes_bid is not None and no_bid is not None
-                and lo_b <= yes_bid <= hi_b and lo_b <= no_bid <= hi_b):
-            return proposals               # setup absent: not a 49/49 book
+        # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the "both sides in
+        # OPEN_BAND" gate is RETIRED — it rejected biased opens (the expensive
+        # side out of band) and made FLIP wait for a balanced book, backwards.
+        # FLIP is the LIQUIDITY PROVIDER: it buys the cheap side of EVERY
+        # biased open. The only entry filter now is the CHEAP side being
+        # BUYABLE (OPEN_ENTRY_FLOOR..OPEN_MAX_ENTRY), plus the true-50/50 skip
+        # (no cheap side) and the needle trend-guard above (never buy a market
+        # genuinely running). Two-sided book required (need both bids to find
+        # the cheap side).
+        if yes_bid is None or no_bid is None:
+            return proposals               # no two-sided book: no cheap side
         # WO-FLIP-IMMEDIATE-ENTRY (build 47): the grain-wait is RETIRED. The
         # liquidity-hold capstone overturned "waiting IS the setup" — FLIP
         # buys the opening IMBALANCE the instant it is cheap; it does not wait
@@ -694,8 +701,14 @@ class LaneFlip:
             return proposals               # true 50/50: no imbalance to buy
         side = "yes" if yes_bid < no_bid else "no"   # the cheap (abandoned) side
         join = yes_bid if side == "yes" else no_bid
-        if join > config.OPEN_MAX_ENTRY_CENTS:
-            return proposals               # the cheap side is already paid up
+        if not (config.OPEN_ENTRY_FLOOR <= join <= config.OPEN_MAX_ENTRY_CENTS):
+            if not w.open_geometry_logged:
+                w.open_geometry_logged = True
+                log.info("OPEN_CHEAP_OUT_OF_RANGE %s — cheap %s %dc outside "
+                         "buyable [%d,%d]: too paid-up or too near-worthless",
+                         market, side, join, config.OPEN_ENTRY_FLOOR,
+                         config.OPEN_MAX_ENTRY_CENTS)
+            return proposals               # cheap side not buyable this window
         # WO-FLIP-LIQUIDITY-HOLD (build 45): the risk/reward GEOMETRY GATE is
         # GONE. Build 43 grounded it on the scalp stop as the "real bail" —
         # but the liquidity-hold model REMOVES that stop: a low mark after a
@@ -747,13 +760,25 @@ class LaneFlip:
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
-            band=config.OPEN_BAND, rest_fp=book.best_fp(side),
-            why=f"OPEN imbalance {side}@{join}c cheap (spread "
-                f"{abs(yes_bid - no_bid)}c) · band y{yes_bid}/n{no_bid} · "
-                f"{proof} · "
+            band=(config.OPEN_ENTRY_FLOOR, config.OPEN_MAX_ENTRY_CENTS),
+            rest_fp=book.best_fp(side),
+            why=f"OPEN liquidity {side}@{join}c cheap (spread "
+                f"{abs(yes_bid - no_bid)}c) · book y{yes_bid}/n{no_bid} · "
+                f"rest→middle {config.OPEN_MIDDLE_TARGET}c · {proof} · "
                 + (swing["why"] if swing is not None else "swing~untabled")
                 + f" · {grain_note}"))
         return proposals
+
+    @staticmethod
+    def _take_price(entry: int) -> int:
+        """WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49) — the resting take,
+        toward the MIDDLE scaled by entry depth: the 50/50 middle where the
+        hedgers are forced to transact, floored fee-safe at entry+MIN so a
+        near-middle entry still clears fees, capped at the 99c tick. The
+        cheaper the entry, the bigger the gouge (buy 39 → rest 52 = +13; buy
+        49 → rest 54 = +5)."""
+        return min(99, max(config.OPEN_MIDDLE_TARGET,
+                           entry + config.OPEN_TAKE_MIN))
 
     @staticmethod
     def held_price(side: str, book):
@@ -1101,24 +1126,25 @@ class LaneFlip:
             mark = self.held_price(side, book)   # WO-FLIP-SIDE-ORIENT: canonical held-side price
             # TAKE — posted the instant the entry books (the maker intent).
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
-            # WO-FLIP-GOAL-TAKE: priced to the goal-bounded convergence move
-            # (entry + clamp(book-goal / held, MIN, MAX)) — a reachable
-            # nickel, not a rare +20 that leaves the position riding to the
-            # floor. Held-side entry (orientation-correct, build 41).
+            # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the take rests toward
+            # the MIDDLE scaled by entry depth (_take_price) — buy cheap, sell
+            # to the forced hedgers at the 50/50; the cheaper the entry, the
+            # bigger the gouge. Held-side price (orientation-correct, build 41).
             if o["take_oid"] is None and not o.get("take_proposed"):
                 n = self._exit_count(market, side, o["count"])
                 if n <= 0:
                     o["done"] = True
                     continue
                 o["take_proposed"] = True
-                take_cents = self._take_target(market, side, o["count"])
+                take_px = self._take_price(o["entry"])
+                o["take_px"] = take_px          # B3 walks this down late
                 props.append(Order(
                     lane="FLIP", event=event, market=market, side=side,
-                    action="sell",
-                    price_cents=min(99, o["entry"] + take_cents),
+                    action="sell", price_cents=take_px,
                     count=n, size_tier=config.TIER_PROBE,
                     purpose="EXIT",
-                    reason=f"open take entry+{take_cents} (goal-bounded)"))
+                    reason=f"open take → middle {take_px}c "
+                           f"(entry {o['entry']}, gouge +{take_px - o['entry']})"))
                 continue
             # P-FLIP-THESIS-1 §4 — HOLD-INSTEAD-OF-SCALP: at the patience
             # assessment, a side deciding in FLIP's favor hard enough that
@@ -1220,6 +1246,37 @@ class LaneFlip:
                         count=n, size_tier=config.TIER_PROBE,
                         purpose="CUT", crossfire=True,
                         reason=f"{determined} · evacuate now"))
+            elif (not o.get("hold") and o.get("take_px") is not None
+                  and past_opening
+                  and config.OPEN_FLAT_BY < secs <= config.OPEN_WALK_START_S):
+                # WO-FLIP-EVERY-MARKET-LIQUIDITY B3 (build 49) — the ACTIVE
+                # late-window walk-down. No cut is determined and no reversion
+                # has lifted the middle-take; as the clock runs toward T-10,
+                # step the resting MAKER take DOWN from the middle toward
+                # scratch (linear over [WALK_START, FLAT_BY]), re-posting lower,
+                # so a non-reverting position exits gracefully near breakeven
+                # late — NEVER ridden unfilled into a catastrophic bell dump.
+                # Never below scratch (the T-10 handoff owns a loser). LATE
+                # window only — the early hold is protected by the catastrophe-
+                # illiquidity guards above; this is not a reactive early cut.
+                span = config.OPEN_WALK_START_S - config.OPEN_FLAT_BY
+                frac = max(0.0, min(1.0, (secs - config.OPEN_FLAT_BY) / span))
+                full = self._take_price(o["entry"])
+                stepped = max(o["entry"],
+                              int(round(o["entry"] + frac * (full - o["entry"]))))
+                if stepped < o["take_px"]:
+                    self._cancel_resting(o)
+                    n = self._exit_count(market, side, o["count"])
+                    if n > 0:
+                        o["take_px"] = stepped
+                        o["take_proposed"] = True
+                        props.append(Order(
+                            lane="FLIP", event=event, market=market, side=side,
+                            action="sell", price_cents=stepped, count=n,
+                            size_tier=config.TIER_PROBE, purpose="EXIT",
+                            reason=f"open walk-down → {stepped}c "
+                                   f"(T-{int(secs)}s: middle→scratch, "
+                                   f"entry {o['entry']})"))
         return props
 
     def _check_uncovered(self, w: FlipWindow, market: str,

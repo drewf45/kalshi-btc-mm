@@ -105,23 +105,28 @@ def test_take_cents_clamps_min_and_max(monkeypatch):
 
 # ── §4 core test: the +5 convergence takes where +20 rode to the floor ─────
 def test_44_entry_takes_at_49_not_64(flip):
-    """The 201430 shape, cured: a 44¢ entry rests its take at 49¢ (+5, the
-    reachable nickel), NOT 64¢ (+20, the rare swing that left it riding to
-    the floor). This is the whole fix."""
+    """The 201430 shape, cured: a 44¢ entry never rests its take at 64¢ (+20,
+    the rare swing that left it riding to the floor). WO-FLIP-EVERY-MARKET-
+    LIQUIDITY (build 49) SUPERSEDED the goal-bounded +5 on the LIVE path with
+    the MIDDLE-target: a cheap 44¢ entry rests at the 52¢ middle (+8 gouge)
+    where the hedgers are forced to transact — the goal-bounded helper still
+    floors it fee-safe at entry+5. Either way the take is REACHABLE, never the
+    rare +20 that rode to the floor."""
     exits = _take_prop(flip, "yes", 44, 44)
     assert len(exits) == 1
-    assert exits[0].price_cents == 49          # entry 44 + goal-bounded 5
-    assert "goal-bounded" in exits[0].reason
+    assert exits[0].price_cents == LaneFlip._take_price(44) == 52   # the middle
+    assert "middle" in exits[0].reason
     # the retired behavior would have rested at 64 — prove we left that
     assert exits[0].price_cents != 44 + config.OPEN_TAKE_CENTS
 
 
 def test_take_is_orientation_correct_no_mirrors_yes(flip):
-    """The goal-bounded take is entry-relative, so a NO@44 rests its take at
-    the SAME +5 as a YES@44 — build 41's mirror survives the new take."""
+    """The middle-target take is entry-relative, so a NO@44 rests its take at
+    the SAME 52¢ middle as a YES@44 — build 41's mirror survives the build-49
+    middle-target take."""
     y = _take_prop(flip, "yes", 44, 44)[0]
     n = _take_prop(flip, "no", 44, 44)[0]
-    assert y.price_cents == n.price_cents == 49
+    assert y.price_cents == n.price_cents == 52
 
 
 def test_take_never_exceeds_99(flip):
@@ -151,16 +156,19 @@ def test_take_target_falls_back_to_rec_count_without_ledger(flip, monkeypatch):
 
 
 def test_second_fill_recomputes_the_take(flip, gateway, ledger, monkeypatch):
-    """Engineer's flag: a second same-side fill cancels the resting take and
-    re-proposes — the new take is goal-bounded at the NEW size."""
+    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the LIVE take
+    is now the MIDDLE-target (entry-relative), NOT the size-scaled goal-bound —
+    so a second same-side fill re-proposes at the SAME 52¢ middle. The take
+    rests where the hedgers transact, independent of booked size; the size-
+    scaling survives only in the _take_target helper (test_take_shrinks_...)."""
     monkeypatch.setattr(config, "WINDOW_BOOK_GOAL_CENTS", 20)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 44, 1, "PROBE")
     first = _take_prop(flip, "yes", 44, 44, count=1)
-    assert first[0].price_cents == 44 + 20              # 1 lot → +20
-    # a second contract books; booked-held is now 2
+    assert first[0].price_cents == 52                   # the middle, 1 lot
+    # a second contract books; booked-held is now 2 — still the middle
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 44, 1, "PROBE")
     second = _take_prop(flip, "yes", 44, 44, count=2)
-    assert second[0].price_cents == 44 + 10             # 2 lots → ceil(20/2)
+    assert second[0].price_cents == 52                  # size-independent middle
 
 
 # ── §4: the CUT is UNCHANGED — a non-converging loser still cuts ────────────

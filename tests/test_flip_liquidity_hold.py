@@ -83,8 +83,12 @@ def w_side_ctx(flip, b, now, secs, sl):
     return (w, TICKER, EVENT, b, _ctx(b, secs, sl=sl), secs, now)
 
 
-# ── §1/§2.1: the resting take is the exit — post entry+5 and wait ──────────
+# ── §1/§2.1: the resting take is the exit — post the middle and wait ───────
 def test_the_take_rests_at_entry_plus_five(flip):
+    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the resting
+    take is the MIDDLE-target (52¢ from a 44¢ entry, +8 gouge) — the hedgers'
+    forced-transaction price — floored fee-safe at entry+5. Still one resting
+    exit, still held-side; the anchor moved from the nickel to the middle."""
     o, now = _pos(flip, entry=44)
     o["take_proposed"] = False           # let the take propose
     o["take_oid"] = None
@@ -92,7 +96,7 @@ def test_the_take_rests_at_entry_plus_five(flip):
     props = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
     exits = [p for p in props if p.purpose == "EXIT"]
     assert len(exits) == 1
-    assert exits[0].price_cents == 44 + LaneFlip._take_cents(1)   # 49, held-side
+    assert exits[0].price_cents == LaneFlip._take_price(44) == 52   # the middle
 
 
 # ── §2.2: a low mark is ILLIQUIDITY — the position HOLDS ───────────────────

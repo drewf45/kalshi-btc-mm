@@ -39,9 +39,18 @@ def flip_ctx(engine, book, secs_left=800):
 
 # ── RULING 2: pair-formable or nothing ─────────────────────────────────────
 def test_one_sided_book_posts_nothing(engine):
-    """The 00:14 shape: no@34 postable, yes@66 not — pre-P15 a lone leg
-    posted; now: NOTHING."""
+    """AMENDED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the both-sides-in-
+    band suppression is retired, so a two-bid biased book (yes 66 / no 34) now
+    ENTERS the cheap side (no@34, buyable). What still posts NOTHING is a
+    GENUINELY one-sided book — a lone bid with the other side EMPTY — because
+    there is no cheap side to price against (need both bids)."""
+    # two-bid biased book: the cheap side is now the setup, it ENTERS
     props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(66, 34)))
+    assert [(p.side, p.price_cents, p.purpose) for p in props] == \
+        [("no", 34, "ENTRY")]
+    # a genuinely one-sided book (no@34 only, yes side empty): NOTHING
+    engine.flip.windows.clear()
+    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(None, 34)))
     assert props == []
 
 

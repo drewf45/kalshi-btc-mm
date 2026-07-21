@@ -2057,6 +2057,70 @@ preflight 23/23. **The last build before the overnight untouched run** — FLIP
 finally holds through the pile-in, so the night measures the reversion instead
 of the dump. Watch: catastrophe-at-2min → ~0, `flip_fill` rising.
 
+## WO-FLIP-EVERY-MARKET-LIQUIDITY — be the liquidity, every window (build 49)
+
+**The thesis, completed.** FLIP is the market's LIQUIDITY PROVIDER: buy the
+cheap side of EVERY biased open, hold, and sell back to the forced hedgers at
+the MIDDLE. Three atomic parts, shipped together (B3 is load-bearing and new).
+
+**B1 — ENTER EVERY MARKET.** The "both sides in `OPEN_BAND`" gate is RETIRED
+(`lane_flip.py:669`): it rejected biased opens (the expensive side out of band)
+and made FLIP wait for a balanced book — backwards for a liquidity provider. The
+only entry filter now is the CHEAP side being BUYABLE
+(`OPEN_ENTRY_FLOOR..OPEN_MAX_ENTRY` = [25,50]¢), the **true-50/50 skip** (equal
+bids → no cheap side to provide against), the **two-sided-book requirement**
+(need both bids to find the cheap side), and the pre-existing **needle
+trend-guard** (HUNT seniority returns before this gate on any live spot trend —
+FLIP never buys a market genuinely running). Book coherence
+(`yes_bid + no_bid ≤ 101`) guarantees the cheap side is always ≤ 50, so the
+raised `OPEN_MAX_ENTRY_CENTS=50` admits every coherent biased open; the surviving
+range gate is the FLOOR (a near-worthless cheap side < 25 is a falling knife,
+skipped).
+
+**B2 — REST TOWARD THE MIDDLE, SCALED BY ENTRY DEPTH.** The resting take is
+`_take_price(entry) = clamp(OPEN_MIDDLE_TARGET=52, entry+OPEN_TAKE_MIN=5, 99)`
+(`lane_flip.py:772`). The 50/50 middle is where hedgers are forced to transact;
+the cheaper the entry, the bigger the gouge — buy 39 → rest 52 (+13); buy 44 →
+rest 52 (+8); buy 49 → rest 54 (+5, fee-floored). This is entry-relative and
+size-independent (the goal-bounded size-scaling survives only in the
+`_take_target` helper, which no longer drives the live post).
+
+**B3 — ACTIVE LATE-WINDOW WALK-DOWN (load-bearing, new).** A position whose
+middle take never fills must NOT ride unfilled into a catastrophic bell dump. As
+the clock runs from `OPEN_WALK_START_S=780` down to `OPEN_FLAT_BY=600`, the
+resting MAKER take steps DOWN from the middle toward scratch — `stepped =
+max(entry, round(entry + frac·(middle−entry)))`, `frac = (secs−FLAT_BY)/span` —
+re-posting lower each step (`lane_flip.py:1249`, a new `elif` after the
+determined-cut block). It is gated `past_opening` (age ≥ `OPEN_OPENING_WINDOW_S`
+= 90s) so it is **late-window management, never a reactive early cut**: a fresh
+position inside the opening-illiquidity window is HELD by the catastrophe guards
+(build 48). The walk **floors at scratch** (entry) — a genuine loser below
+breakeven is the T-10 handoff's to clear (`secs ≤ FLAT_BY`), never sold below
+cost by the walk.
+
+**Genuine interactions found & fixed (not just overturns).** (a) The walk-down
+cancels-then-re-posts the take; a test that never submitted the re-post left the
+leg looking uncovered across cycles → `_check_uncovered` escalated to a FLATTEN.
+(b) A fresh SPOT-collapse poll got a walk-down EXIT that broke a `== []` cut
+assertion. Both are resolved by the `past_opening` gate (the walk only fires for
+positions clearly past reversion) — the fresh-position test now holds, and the
+collapse test isolates the CUT it actually asserts (the coexisting walk-down
+maker re-post is not a cut; the position still holds).
+
+**HARD RAIL:** no Kelly / cash / rate-halt / F change; catastrophe-illiquidity
+guards (build 48) intact; `FLIP_SIZE_CAP == 1`. New constants DREW-DEFAULT:
+`OPEN_MIDDLE_TARGET=52`, `OPEN_MAX_ENTRY_CENTS=50` (was 49), `OPEN_ENTRY_FLOOR=25`,
+`OPEN_WALK_START_S=780`. 11 overturned test-laws re-anchored (middle-target take
+prices ×6; every-market entry breadth ×4 — yes=30 enters, cheap no@34 enters,
+floor-skip replaces the now-unreachable ceiling-skip, two-bid biased book enters
+where the genuinely one-sided book still posts nothing; the P26 why-string
+"imbalance"→"liquidity") + a new acceptance file `test_flip_every_market.py` (14
+tests: B1 breadth & skips, B2 middle-target scaling, B3 walk-marches-to-scratch,
+floors-at-scratch, dormant-when-fresh, dormant-outside-window). Suite 619 ·
+preflight 23/23. Watch live: FLIP entering biased opens (not just balanced
+books), resting takes clustering at ~52¢, and late unfilled positions walking to
+scratch instead of dumping at the bell.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

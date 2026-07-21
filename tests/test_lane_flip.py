@@ -91,8 +91,8 @@ def test_open_posts_cheap_side_of_the_imbalance(flip):
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 48, "ENTRY")]
     assert props[0].lane == "FLIP" and props[0].count == 1
-    assert "OPEN imbalance yes@48c" in props[0].why
-    assert "band y48/n49" in props[0].why
+    assert "OPEN liquidity yes@48c" in props[0].why
+    assert "book y48/n49" in props[0].why
 
 
 def test_open_no_grain_still_enters(flip):
@@ -113,17 +113,27 @@ def test_open_no_grain_still_enters(flip):
 
 
 def test_open_band_required(flip):
-    """A4: the setup is BOTH sides inside the open band — an out-of-band book
-    (yes 30, below the band floor) is not a setup, imbalance or not."""
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=30, no=65),
-                                     grain=GRAIN_NO3)) == []
+    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the 'both sides
+    inside the open band' gate is RETIRED — it rejected biased opens and made
+    FLIP wait for a balanced book. FLIP is the liquidity provider now: a biased
+    open (yes 30 / no 65) ENTERS the cheap side (yes@30, inside the buyable
+    range [25,50]) — the imbalance IS the setup."""
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=30, no=65),
+                                      grain=GRAIN_NO3))
+    assert [(p.side, p.price_cents, p.purpose) for p in props] == \
+        [("yes", 30, "ENTRY")]
 
 
 def test_open_cheap_side_paid_up_passes(flip):
-    """A4: the CHEAP side's join above OPEN_MAX_ENTRY_CENTS -> both sides are
-    paid up, no cheap entry; pass. (yes 50 is the cheap side but > 49.)"""
-    assert config.OPEN_MAX_ENTRY_CENTS == 49
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=50, no=52),
+    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): with
+    OPEN_MAX_ENTRY_CENTS relaxed to 50 and book coherence (yes_bid+no_bid<=101)
+    guaranteeing the cheap side <= 50, the 'paid up' CEILING skip is now
+    unreachable — every coherent biased open is buyable. The remaining range
+    gate is the FLOOR: a near-worthless cheap side (yes 20, below
+    OPEN_ENTRY_FLOOR 25) is skipped."""
+    assert config.OPEN_MAX_ENTRY_CENTS == 50
+    assert config.OPEN_ENTRY_FLOOR == 25
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=20, no=79),
                                      grain=GRAIN_NO3)) == []
 
 

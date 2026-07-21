@@ -95,7 +95,11 @@ def test_spot_collapse_cuts_any_time_two_polls(flip, gateway, ledger):
     # WELL inside patience (fill ~790, now 700 = 90s << 300s)
     ctx_collapse = _ctx(_book(yes=44), secs_left=700)
     ctx_collapse["spotlead"] = SL()
-    assert flip.evaluate(TICKER, ctx_collapse) == []     # poll 1: one flicker holds
+    # poll 1: one flicker does NOT cut (needs 2 polls). The B3 late-window
+    # walk-down (build 49) may independently re-post the resting MAKER take
+    # lower — that is not a cut; the position still HOLDS.
+    cuts1 = [p for p in flip.evaluate(TICKER, ctx_collapse) if p.purpose == "CUT"]
+    assert cuts1 == []
     assert o["collapse_polls"] == 1
     ctx_collapse2 = _ctx(_book(yes=44), secs_left=699)
     ctx_collapse2["spotlead"] = SL()

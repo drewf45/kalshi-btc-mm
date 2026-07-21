@@ -223,7 +223,8 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
     # virgin cell: enters, margin printed as info
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
     assert len(props) == 1
-    assert "margin" in props[0].why and "imbalance" in props[0].why
+    # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the why now reads "liquidity"
+    assert "margin" in props[0].why and "liquidity" in props[0].why
     # a mature NEGATIVE cell: STILL enters — the margin prints (info)
     flip.windows.clear()
     for i in range(config.OPEN_PROBE_MAX_N):

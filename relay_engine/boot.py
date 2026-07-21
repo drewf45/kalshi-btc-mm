@@ -187,6 +187,17 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "or spot-decided; a thin-book low bid on a fresh cheap entry "
                  "is illiquidity, HELD (no more 2-minute dump) "
                  "(WO-FLIP-CATASTROPHE-ILLIQUIDITY)")
+    lines.append(f"  FLIP EVERY-MARKET: the liquidity provider — enters EVERY "
+                 f"market's cheap side (both-in-band gate RETIRED; filter is "
+                 f"buyable [{config.OPEN_ENTRY_FLOOR},{config.OPEN_MAX_ENTRY_CENTS}"
+                 f"]¢ + true-50/50 skip + trend-guard), rests toward the "
+                 f"{config.OPEN_MIDDLE_TARGET}¢ MIDDLE scaled by entry depth "
+                 f"(clamp(middle, entry+{config.OPEN_TAKE_MIN}, 99): cheaper "
+                 f"entry = bigger gouge), and ACTIVELY WALKS the exit down late "
+                 f"(WALK_START {config.OPEN_WALK_START_S}s → FLAT_BY "
+                 f"{config.OPEN_FLAT_BY}s: an unfilled middle take steps toward "
+                 "scratch, re-posting — never a catastrophic bell dump, never "
+                 "below scratch) (WO-FLIP-EVERY-MARKET-LIQUIDITY)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "
