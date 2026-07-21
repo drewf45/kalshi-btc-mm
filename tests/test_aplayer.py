@@ -200,9 +200,14 @@ def test_exit_decision_is_provably_independent_of_pnl(ledger, gateway,
         for mark in (48, 20):                          # identical states
             b = OrderBook(market=mkt)
             b.apply_snapshot({mark: 10}, {40: 10}, ts=1.0)
-            props = flip.evaluate(mkt, {"book": b, "now": CLOSE - 700 - (48 - mark),
-                                        "close_ts": CLOSE, "spot": None,
-                                        "grain": None, "spotlead": None})
+            ctx = {"book": b, "now": CLOSE - 700 - (48 - mark),
+                   "close_ts": CLOSE, "spot": None,
+                   "grain": None, "spotlead": None}
+            # WO-FLIP-CATASTROPHE-ILLIQUIDITY: the catastrophe floor is a REAL
+            # move — sustained 2 polls (fill_ts CLOSE-1100 is past the opening
+            # window; depth 10 is real). Poll twice; the 2nd is the decision.
+            flip.evaluate(mkt, ctx)
+            props = flip.evaluate(mkt, ctx)
             decisions.setdefault(name, []).append(
                 bool([p for p in props if p.purpose == "CUT"]))
     # same table/time state -> same decision, up or down: hold at 48, cut at

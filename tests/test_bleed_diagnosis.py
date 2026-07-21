@@ -217,9 +217,13 @@ def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):
 def test_catastrophe_floor_is_the_only_price_backstop_in_patience(flip,
                                                                   gateway,
                                                                   ledger):
-    """Change 1: a ride all the way to the fixed catastrophe floor (20c)
-    cuts even inside patience — the bounded backstop below the swing."""
-    _open_pos(flip, gateway, ledger)
+    """Change 1, AMENDED by WO-FLIP-CATASTROPHE-ILLIQUIDITY: a GENUINE ride to
+    the fixed catastrophe floor (20c) — real depth, past the opening window,
+    sustained 2 polls — cuts inside patience (the bounded backstop below the
+    swing). A fresh thin-book low is illiquidity now, held."""
+    o = _open_pos(flip, gateway, ledger)
+    o["fill_ts"] = CLOSE - 900                          # past the opening window
+    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=771))  # poll 1: sustain
     cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=770))
             if x.purpose == "CUT"]

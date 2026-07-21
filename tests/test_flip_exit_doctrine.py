@@ -123,7 +123,9 @@ def test_spot_decision_cuts_any_time(flip, gateway, ledger):
 
 # ── Part D, test 3: rides to the catastrophe floor → CUT (bounded) ─────────
 def test_ride_to_catastrophe_floor_cuts(flip, gateway, ledger):
-    _entry(flip, gateway, ledger, entry=44)
+    o = _entry(flip, gateway, ledger, entry=44)
+    o["fill_ts"] = CLOSE - 1100                        # past the opening window
+    flip.evaluate(TICKER, _ctx(_book(yes=20, no=55), secs_left=771))  # poll 1
     cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=20, no=55),
                                             secs_left=770)))
     assert len(cuts) == 1 and "CATASTROPHE floor" in cuts[0].reason
@@ -146,13 +148,16 @@ def test_cut_reason_names_the_decision(flip, gateway, ledger):
     """The only cuts in the passive hold name a real DECISION — SPOT decided
     or the CATASTROPHE backstop — never a band-floor touch and never the
     retired scalp stop. An illiquidity dip (34¢) is HELD."""
-    _entry(flip, gateway, ledger, entry=44)
+    o = _entry(flip, gateway, ledger, entry=44)
     # a dip to the old band floor is illiquidity now → HOLD
     assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                             secs_left=770))) == []
-    # a true collapse to the catastrophe floor names the catastrophe
+    # a GENUINE collapse (past the opening window, sustained) names the
+    # catastrophe — not a band-floor touch, not the retired scalp stop
+    o["fill_ts"] = CLOSE - 1100                        # past the opening window
+    flip.evaluate(TICKER, _ctx(_book(yes=20, no=55), secs_left=769))  # poll 1
     c = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=20, no=55),
-                                         secs_left=769)))
+                                         secs_left=768)))
     assert len(c) == 1 and "CATASTROPHE" in c[0].reason
     assert "band floor" not in c[0].reason and "SCALP" not in c[0].reason
 

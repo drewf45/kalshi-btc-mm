@@ -2013,6 +2013,50 @@ last build before the overnight untouched run** — watch the maker/taker split
 (build-47 pack): entries should show as MAKER (0-fee), only CUTs as TAKER, and
 "post only cross" → ~0.
 
+## WO-FLIP-CATASTROPHE-ILLIQUIDITY — the 2-minute dump (build 48, last of the night)
+
+**The last fix before the overnight run.** Drew observed ALL FLIP positions
+exiting catastrophic within ~2 minutes. A full cold read pinned the cause:
+the catastrophe floor was firing on **illiquidity** and dumping inventory at
+the bottom — the exact anti-thesis.
+
+**Read-rule TRUE at source** (`lane_flip.py:1189`): the catastrophe price
+branch (`elif mark <= catastrophe`) fired on a **single poll** of the held-side
+bid — no sustain, no depth, no time guard. On a fresh cheap entry into a thin
+opening book, the held-side bid sits ~19-20¢ because there are no buyers *yet*
+(the opening pile-in = the illiquidity the thesis holds through), and the
+branch market-dumped it. The spot-decided branch (line 1185, sustained 2 polls)
+was correctly guarded; the price branch had neither.
+
+**The fix — the price floor must tell illiquidity from collapse.** The
+catastrophe PRICE branch now fires only on a REAL low:
+1. **Sustain ≥2 polls** (`catastrophe_polls`, mirroring `collapse_polls`) — no
+   single-poll dump.
+2. **Real depth** on the held side (`book.visible_depth(side, mark) ≥
+   OPEN_CATASTROPHE_MIN_DEPTH`, =3) — a 1-lot thin quote is book emptiness, held.
+3. **Past the opening-illiquidity window** (`now − fill_ts ≥
+   OPEN_OPENING_WINDOW_S`, =90s) — a fresh entry's low bid is the setup, not a
+   verdict.
+
+The **spot-decided branch is UNCHANGED** — a genuine sustained move still cuts
+any time, on SPOT, not on waiting for the price floor. The price floor is the
+deep backstop *with guards*; a real, deep, sustained low past the opening
+window still cuts (the backstop remains).
+
+**Full-engine cold read (Part C):** `_check_uncovered` cleared — it correctly
+treats a resting take / custody bucket as cover (not the dumper); `scratch_reason`
+is retired doc; no other live bug. The only fix is the catastrophe price branch.
+
+**HARD RAIL:** only the catastrophe price-branch trigger changes. Spot-decided
+cut, T-10 handoff, goal-take, uncovered-flatten, rest-back, Kelly, cash,
+rate-halt, F — all unchanged. `FLIP_SIZE_CAP=1`. 11 overturned test-laws
+re-anchored to the guarded backstop (aged past the opening window + sustained
+2 polls; depth already present) + 3 new tests (fresh sub-20¢ thin dip HELD;
+thin-depth HELD past the window; real-deep-sustained CUTS). Suite 604 ·
+preflight 23/23. **The last build before the overnight untouched run** — FLIP
+finally holds through the pile-in, so the night measures the reversion instead
+of the dump. Watch: catastrophe-at-2min → ~0, `flip_fill` rising.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

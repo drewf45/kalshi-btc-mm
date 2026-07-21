@@ -216,6 +216,8 @@ def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
                                                   secs_left=580))
             if p.purpose == "CUT"] == []
     # a genuine collapse to the catastrophe floor still cuts — never zero
+    # (sustained 2 polls; the held position is long past the opening window)
+    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=481))  # poll 1: sustain
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=480))
             if p.purpose == "CUT"]
@@ -315,6 +317,7 @@ def test_post_window_genuine_collapse_cuts_hard(flip, gateway, ledger):
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
     o["fill_ts"] = CLOSE - 1100                          # window long over
+    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=701))  # poll 1: sustain
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=700))
             if p.purpose == "CUT"]

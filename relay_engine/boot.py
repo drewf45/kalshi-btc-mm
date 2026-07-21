@@ -180,6 +180,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "endgame T-10 handoff is the primary loss exit; reversion / "
                  "resting-take fill rate measured (Instrument 1) before size "
                  "(WO-FLIP-LIQUIDITY-HOLD)")
+    lines.append(f"  FLIP CATASTROPHE: the price floor cuts only on a REAL "
+                 f"move — sustained 2 polls + real held-side depth "
+                 f"(≥{config.OPEN_CATASTROPHE_MIN_DEPTH}) + past the "
+                 f"{config.OPEN_OPENING_WINDOW_S}s opening-illiquidity window, "
+                 "or spot-decided; a thin-book low bid on a fresh cheap entry "
+                 "is illiquidity, HELD (no more 2-minute dump) "
+                 "(WO-FLIP-CATASTROPHE-ILLIQUIDITY)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

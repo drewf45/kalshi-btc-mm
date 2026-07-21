@@ -147,14 +147,29 @@ def test_mirror_holds_t10_handoff(flip):
 
 # ── the catastrophe floor is P&L-blind and side-blind ──────────────────────
 def test_catastrophe_fires_both_sides(flip):
-    """A held price at/under the fixed 20¢ catastrophe floor cuts on EITHER
-    side, at the held mark, naming the catastrophe — not a YES-scale price."""
+    """A GENUINE catastrophe — real depth, past the opening window, sustained
+    2 polls — cuts on EITHER side, at the held mark, symmetric. (WO-FLIP-
+    CATASTROPHE-ILLIQUIDITY guards the price floor against thin-book
+    illiquidity; the deep backstop stays, and stays side-symmetric.)"""
     for side in ("yes", "no"):
-        props = _open_props(flip, side, 20)
-        cuts = [p for p in props if p.purpose == "CUT"]
-        assert len(cuts) == 1
-        assert "CATASTROPHE" in cuts[0].reason
+        w = flip._window(TICKER, CLOSE)
+        w.opens.clear()
+        w.hunts.clear()
+        w.fills.clear()
+        now = CLOSE - 700
+        w.opens[side] = {"entry": 44,
+                         "fill_ts": now - (config.OPEN_OPENING_WINDOW_S + 30),
+                         "count": 1, "take_oid": None, "take_proposed": True,
+                         "collapse_polls": 0, "catastrophe_polls": 0,
+                         "det_ts": None, "entry_oid": None, "defer_polls": 0}
+        b = _mirror_book(side, 20)
+        ctx = _ctx(b, secs_left=700)
+        flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)      # poll 1
+        cuts = [p for p in flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)
+                if p.purpose == "CUT"]
+        assert len(cuts) == 1 and "CATASTROPHE" in cuts[0].reason
         assert cuts[0].price_cents == config.OPEN_CATASTROPHE_FLOOR == 20
+        flip.windows.clear()
 
 
 def test_no_climbs_to_66_takes_not_cuts(flip):

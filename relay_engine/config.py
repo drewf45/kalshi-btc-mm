@@ -146,6 +146,18 @@ OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
 # two positions with the same book state get the same decision) is the ONLY
 # price backstop that acts inside patience; spot+time are the primary cut.
 OPEN_CATASTROPHE_FLOOR = 20        # DREW-DEFAULT: fixed price backstop, well below the swing band
+# WO-FLIP-CATASTROPHE-ILLIQUIDITY (build 48): the catastrophe PRICE floor was
+# firing on a SINGLE poll of a thin-book low bid — a fresh cheap entry's
+# held-side bid sits ~19-20c because there are no buyers YET (the opening
+# pile-in = the illiquidity the thesis holds through), and it was dumping the
+# inventory at the bottom, the exact anti-thesis. The price branch now fires
+# only on a REAL collapse: (a) sustained >= 2 polls (no single-poll dump),
+# (b) real depth on the held side (not a 1-lot thin quote), and (c) past the
+# opening-illiquidity window (a fresh entry's low bid is the setup, not a
+# verdict). A genuine sustained move is caught by the spot-decided branch
+# regardless — the price floor is the deep backstop WITH guards.
+OPEN_OPENING_WINDOW_S = 90         # DREW-DEFAULT: the opening pile-in; catastrophe price-floor is gated off until held past this
+OPEN_CATASTROPHE_MIN_DEPTH = 3     # DREW-DEFAULT: real held-side bid depth for a catastrophe low to count (not a 1-lot thin quote)
 # OPEN_BAIL_R_S retired (P26 §3.2): evacuations cross IMMEDIATELY — the
 # determined-maker grace was tonight's 31/20/33 slide. TAKE alone rests.
 

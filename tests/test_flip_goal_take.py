@@ -165,16 +165,19 @@ def test_second_fill_recomputes_the_take(flip, gateway, ledger, monkeypatch):
 
 # ── §4: the CUT is UNCHANGED — a non-converging loser still cuts ────────────
 def test_non_converging_loser_still_cut(flip):
-    """HARD RAIL: this WO touches only the TAKE. A held price at the fixed
-    catastrophe floor still cuts — the exit doctrine is untouched."""
+    """HARD RAIL: this WO touches only the TAKE. A GENUINE catastrophe (real
+    depth, past the opening window, sustained 2 polls) still cuts — the exit
+    doctrine is untouched."""
     w = flip._window(TICKER, CLOSE)
     w.opens.clear()
     now = CLOSE - 700
-    w.opens["yes"] = {"entry": 44, "fill_ts": now - 10, "count": 1,
-                      "take_oid": None, "take_proposed": True,
-                      "collapse_polls": 0, "det_ts": None,
-                      "entry_oid": None, "defer_polls": 0}
+    w.opens["yes"] = {"entry": 44,
+                      "fill_ts": now - (config.OPEN_OPENING_WINDOW_S + 30),
+                      "count": 1, "take_oid": None, "take_proposed": True,
+                      "collapse_polls": 0, "catastrophe_polls": 0,
+                      "det_ts": None, "entry_oid": None, "defer_polls": 0}
     book = _mirror_book("yes", 20)
+    flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)   # poll 1
     props = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)
     cuts = [p for p in props if p.purpose == "CUT"]
     assert len(cuts) == 1 and "CATASTROPHE" in cuts[0].reason

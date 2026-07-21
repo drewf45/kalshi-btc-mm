@@ -364,7 +364,7 @@ class LaneFlip:
         else:
             w.opens[side] = {"entry": lf["entry"], "fill_ts": now,
                              "count": n, "take_oid": None,
-                             "take_proposed": False, "collapse_polls": 0,
+                             "take_proposed": False, "collapse_polls": 0, "catastrophe_polls": 0,
                              "det_ts": None,
                              "entry_oid": None, "defer_polls": 0}
         log.warning("FLIP_LATE_FILL_REOPEN %s %s x%d @ %dc — late leg gets "
@@ -446,7 +446,7 @@ class LaneFlip:
             w.opens[side] = {"entry": price_cents, "fill_ts": now,
                              "count": max(1, count),
                              "take_oid": None, "take_proposed": False,
-                             "collapse_polls": 0,
+                             "collapse_polls": 0, "catastrophe_polls": 0,
                              "det_ts": None,
                              "entry_oid": entry_oid, "defer_polls": 0}
             return
@@ -1181,15 +1181,33 @@ class LaneFlip:
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
             o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
+            # WO-FLIP-CATASTROPHE-ILLIQUIDITY (build 48): the catastrophe PRICE
+            # floor must tell a THIN-BOOK low bid (illiquidity — the opening
+            # pile-in, HELD) from a GENUINE collapse. A fresh cheap entry's
+            # held-side bid sits low because there are no buyers YET; the
+            # single-poll price cut was reading that emptiness as collapse and
+            # dumping at the bottom (the 2-minute catastrophic exit). It now
+            # fires only when the low is (a) REAL — depth on the held side, not
+            # a 1-lot thin quote; (b) PAST the opening-illiquidity window (a
+            # fresh entry's low bid is the setup); and (c) SUSTAINED >= 2 polls.
+            # A real move is caught by the spot-decided branch regardless.
+            held_depth = book.visible_depth(side, mark) if mark is not None else 0
+            past_opening = now - o["fill_ts"] >= config.OPEN_OPENING_WINDOW_S
+            cat_hit = (mark is not None and mark <= catastrophe
+                       and held_depth >= config.OPEN_CATASTROPHE_MIN_DEPTH
+                       and past_opening)
+            o["catastrophe_polls"] = \
+                o.get("catastrophe_polls", 0) + 1 if cat_hit else 0
             determined = None
             if o["collapse_polls"] >= 2:
                 determined = (f"open determined-against: SPOT decided — "
                               f"ΔP-collapse {sl.delta_p:.0f}pts sustained "
                               "(a real move, not illiquidity — cut in the hold)")
-            elif mark is not None and mark <= catastrophe:
+            elif o["catastrophe_polls"] >= 2:
                 determined = (f"open determined-against: CATASTROPHE floor "
-                              f"{side} {mark}c <= {catastrophe}c (fixed, "
-                              "P&L-blind — the collapse backstop the hold keeps)")
+                              f"{side} {mark}c <= {catastrophe}c — a REAL "
+                              f"sustained low (depth {held_depth}, past the "
+                              "opening window), not thin-book illiquidity")
             if determined:
                 self._cancel_resting(o)
                 o["done"] = True
@@ -1434,7 +1452,7 @@ class LaneFlip:
             entry = row[0] if row else None
         w.opens[side] = {"entry": entry if entry is not None else 50,
                          "fill_ts": 0.0, "count": gap, "take_oid": None,
-                         "take_proposed": False, "collapse_polls": 0,
+                         "take_proposed": False, "collapse_polls": 0, "catastrophe_polls": 0,
                          "det_ts": None, "entry_oid": None,
                          "defer_polls": 0}
         log.warning("FLIP_UNCOVERED self-heal %s %s: opened fresh record "

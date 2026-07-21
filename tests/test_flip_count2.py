@@ -91,13 +91,18 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     assert r.order_id not in gateway.resting
     w = flip.windows[TICKER]
     assert w.opens["yes"]["count"] == 2 and "yes" not in w.fills
+    # WO-FLIP-CATASTROPHE-ILLIQUIDITY: age past the opening window so the
+    # catastrophe backstop (this race-test's trigger) can fire; it needs depth
+    # + 2 sustained polls now.
+    w.opens["yes"]["fill_ts"] = CLOSE - 1100
     # the take posts at FULL size (custody order: take first), then the
     # catastrophe evacuation fires — also at full size
     p_take = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=778))
     take = next(p for p in p_take if p.purpose == "EXIT")
     assert take.count == 2                             # never a 1-lot split
     flip.on_submitted(take, "OID-T", CLOSE - 778)
-    p_exit = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=777))
+    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=777))   # poll 1: sustain
+    p_exit = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=776))
     cuts = [p for p in p_exit if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].count == 2       # ONE covered action
     assert "determined-against" in cuts[0].reason
@@ -120,14 +125,17 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)  # fake oid: gate off
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
+    # WO-FLIP-CATASTROPHE-ILLIQUIDITY: age past the opening window so the
+    # catastrophe backstop (this race-test's trigger) can fire; it needs depth
+    # + 2 sustained polls now.
+    flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
     # take posts on the 1-lot leg, then the catastrophe cut fires -> done=
     # True, CUT x1 in flight (the pre-merge exit — the race's first half).
-    # (WO-FLIP-LIQUIDITY-HOLD: the catastrophe floor 20 is the retained
-    # determined-against trigger; the band-floor cut is gone.)
     p_take = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=781))
     flip.on_submitted(next(p for p in p_take if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 781)
-    p_cut = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=780))
+    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=780))    # poll 1: sustain
+    p_cut = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=779))
     cut = next(p for p in p_cut if p.purpose == "CUT")
     assert cut.count == 1
     w = flip.windows[TICKER]

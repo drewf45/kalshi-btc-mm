@@ -109,12 +109,44 @@ def test_illiquidity_dips_are_held(flip):
         assert not o.get("done")
 
 
-# ── §2.3: a CONFIRMED collapse still cuts even in the passive hold ─────────
-def test_catastrophe_backstop_still_cuts(flip):
-    """A genuine collapse to the catastrophe floor (20) is a real move, not
-    illiquidity — it cuts even in the passive hold, on the first poll."""
-    o, now = _pos(flip, entry=44)
-    b = _book(yes=20, no=55)
+# ── build 48: a fresh thin-book sub-20c dip is ILLIQUIDITY — HELD ──────────
+def test_fresh_catastrophe_low_is_illiquidity_held(flip):
+    """WO-FLIP-CATASTROPHE-ILLIQUIDITY: a fresh cheap entry whose held-side
+    bid dips to 19c in the opening window (no buyers yet) is illiquidity, not
+    collapse — the price floor is gated off during the opening window, so it
+    HOLDS (today it dumped at market within 2 minutes). Only spot decides
+    here."""
+    o, now = _pos(flip, entry=42, gap=10)          # fresh: held 10s
+    b = _book(yes=19, no=55)                        # sub-catastrophe bid, real depth
+    flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1
+    p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2
+    assert [x for x in p2 if x.purpose == "CUT"] == []
+    assert not o.get("done")
+
+
+# ── build 48: a thin-book low past the window is STILL illiquidity — held ──
+def test_thin_book_low_is_held_even_past_the_opening_window(flip):
+    """The depth guard: even past the opening window and sustained, a 1-lot
+    thin quote at 19c is book emptiness, not a real low — it is HELD. Only a
+    low with REAL depth on the held side counts as a catastrophe."""
+    o, now = _pos(flip, entry=44, gap=config.OPEN_OPENING_WINDOW_S + 30)
+    b = OrderBook(market=TICKER)
+    b.apply_snapshot({19: 1}, {55: 10}, ts=1.0)    # held-side bid: 1-lot thin
+    ctx = _ctx(b, secs_left=700)
+    flip._open_custody(flip.windows[TICKER], TICKER, EVENT, b, ctx, 700, now)
+    p2 = flip._open_custody(flip.windows[TICKER], TICKER, EVENT, b, ctx, 700, now)
+    assert [x for x in p2 if x.purpose == "CUT"] == []
+    assert not o.get("done")
+
+
+# ── §2.3: a GENUINE collapse (real, deep, sustained, past opening) cuts ────
+def test_catastrophe_backstop_still_cuts_when_real(flip):
+    """The deep backstop remains: a REAL low — depth on the held side, held
+    PAST the opening window, sustained 2 polls — still cuts. Only the
+    thin-book / opening-window / single-poll dump is retired."""
+    o, now = _pos(flip, entry=44, gap=config.OPEN_OPENING_WINDOW_S + 30)
+    b = _book(yes=20, no=55)                        # depth 10 >= min
+    flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1: sustain
     cuts = [p for p in flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
             if p.purpose == "CUT"]
     assert len(cuts) == 1 and "CATASTROPHE" in cuts[0].reason
