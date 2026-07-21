@@ -87,12 +87,13 @@ def test_spot_collapse_cuts_any_time_two_polls(flip, gateway, ledger):
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)             # the take rests
+    o["fill_ts"] = CLOSE - 960     # build 50: past FLIP_NO_SELL_S, still inside patience
 
     class SL:
         side = "no"
         delta_p = config.OPEN_DETERMINED_K_POINTS + 5
         fair_cents = 0          # hunt-entry gate B fails: no hunt fires
-    # WELL inside patience (fill ~790, now 700 = 90s << 300s)
+    # past the hard-hold, still inside patience (age ~260 << 300s)
     ctx_collapse = _ctx(_book(yes=44), secs_left=700)
     ctx_collapse["spotlead"] = SL()
     # poll 1: one flicker does NOT cut (needs 2 polls). The B3 late-window
@@ -183,15 +184,17 @@ def test_t10_handoff_winner_left_to_f_not_sold(flip, gateway, ledger,
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
     with caplog.at_level(logging.WARNING, logger="relay.lane_flip"):
-        props = flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=599))
+        props = flip.evaluate(TICKER, _ctx(_book(yes=61),
+                                           secs_left=config.FLIP_DECISION_S - 1))
     assert props == []                                 # nothing SOLD
     assert o["hold"] is True
     assert any("FLIP_HOLD_TO_SETTLE" in r.message
-               and "T-10-handoff-winner" in r.message
+               and "decision-winner-to-F" in r.message
                for r in caplog.records)
     assert flip.held(TICKER) == {"yes": {"count": 1, "basis": 48}}
     # the hold is deliberate: cycles pass, zero UNCOVERED pages
-    flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=598))
+    flip.evaluate(TICKER, _ctx(_book(yes=61),
+                               secs_left=config.FLIP_DECISION_S - 2))
     assert ledger.db.execute(
         "SELECT COUNT(*) FROM failures WHERE why_tag='FLIP_UNCOVERED_LEG'"
     ).fetchone()[0] == 0
@@ -213,17 +216,18 @@ def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    flip.evaluate(TICKER, _ctx(_book(yes=61), secs_left=599))  # convert to hold
+    flip.evaluate(TICKER, _ctx(_book(yes=61),
+                               secs_left=config.FLIP_DECISION_S - 1))  # convert to hold
     assert o["hold"] is True
     # a shallow reversal (34c) is illiquidity — held even on the hold
     assert [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
-                                                  secs_left=580))
+                                                  secs_left=230))
             if p.purpose == "CUT"] == []
     # a genuine collapse to the catastrophe floor still cuts — never zero
     # (sustained 2 polls; the held position is long past the opening window)
-    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=481))  # poll 1: sustain
+    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=210))  # poll 1: sustain
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
-                                                  secs_left=480))
+                                                  secs_left=209))
             if p.purpose == "CUT"]
     assert len(cuts) == 1 and "determined-against" in cuts[0].reason
     assert "CATASTROPHE" in cuts[0].reason

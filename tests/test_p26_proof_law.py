@@ -165,9 +165,10 @@ def test_evacuation_crosses_at_the_mark(flip, gateway):
     low mark is illiquidity, held); the determined-against that fires in the
     hold is a CONFIRMED spot collapse, and it crosses at the mark."""
     from relay_engine.spotlead import Needle
-    _open_position(flip, gateway, entry=48)
+    w = _open_position(flip, gateway, entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
+    w.opens["yes"]["fill_ts"] = CLOSE - 1030   # build 50: past the 4-min hard hold
     sl = Needle(side="no", d_before=10.0, d_after=90.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
                 fair_cents=0.0, t_remaining=700.0)
@@ -188,9 +189,9 @@ def test_t10_handoff_replaces_yield_to_f(flip, gateway):
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     props = flip.evaluate(TICKER, _ctx(_book(yes=47, no=50),
-                                       secs_left=config.OPEN_FLAT_BY - 1))
+                                       secs_left=config.FLIP_DECISION_S - 1))
     assert len(props) == 1 and props[0].crossfire
-    assert "open T-10 handoff" in props[0].reason
+    assert "open decision point" in props[0].reason
 
 
 def test_open_entry_schedule(flip):

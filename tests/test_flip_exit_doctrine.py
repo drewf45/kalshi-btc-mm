@@ -110,7 +110,12 @@ def test_44_entry_dip_is_illiquidity_holds(flip, gateway, ledger):
 
 # ── Part D, test 2: spot decides → CUT on spot, any time ───────────────────
 def test_spot_decision_cuts_any_time(flip, gateway, ledger):
+    """WO-BOTH-LANES-MARKET-TRUE (build 50) narrowed 'any time' to 'after the
+    4-min hard no-sell': the opening pile-in is held, then F's ΔP proof rules
+    the sell. Past the hard-hold (inside patience still), a sustained spot
+    collapse cuts on 2 polls."""
     o = _entry(flip, gateway, ledger, entry=44)
+    o["fill_ts"] = CLOSE - 1050        # past FLIP_NO_SELL_S (age ~280), inside patience
     sl = Needle(side="no", d_before=10.0, d_after=90.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
                 fair_cents=0.0, t_remaining=700.0)
@@ -173,10 +178,11 @@ def test_unreverted_loser_clears_at_t10_not_a_price_floor(flip, gateway, ledger)
     o["fill_ts"] = CLOSE - 1100
     assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                             secs_left=760))) == []
-    # at T-10, the unreverted loser is cleared by the handoff
+    # at the decision point (build 50: moved from T-10 to FLIP_DECISION_S), the
+    # unreverted loser is cleared by the endgame handoff
     cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
-                                            secs_left=config.OPEN_FLAT_BY - 1)))
-    assert len(cuts) == 1 and "T-10 handoff" in cuts[0].reason
+                                            secs_left=config.FLIP_DECISION_S - 1)))
+    assert len(cuts) == 1 and "decision point" in cuts[0].reason
 
 
 # ── HARD RAIL ──────────────────────────────────────────────────────────────

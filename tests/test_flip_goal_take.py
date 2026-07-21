@@ -180,7 +180,7 @@ def test_non_converging_loser_still_cut(flip):
     w.opens.clear()
     now = CLOSE - 700
     w.opens["yes"] = {"entry": 44,
-                      "fill_ts": now - (config.OPEN_OPENING_WINDOW_S + 30),
+                      "fill_ts": now - (config.FLIP_NO_SELL_S + 30),
                       "count": 1, "take_oid": None, "take_proposed": True,
                       "collapse_polls": 0, "catastrophe_polls": 0,
                       "det_ts": None, "entry_oid": None, "defer_polls": 0}

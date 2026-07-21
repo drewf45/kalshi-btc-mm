@@ -198,6 +198,21 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"{config.OPEN_FLAT_BY}s: an unfilled middle take steps toward "
                  "scratch, re-posting — never a catastrophic bell dump, never "
                  "below scratch) (WO-FLIP-EVERY-MARKET-LIQUIDITY)")
+    lines.append(f"  FLIP TIME-AWARE: {config.FLIP_NO_SELL_S}s HARD NO-SELL "
+                 "from entry — the opening pile-in is NOISE (spot-decided cut "
+                 "AND catastrophe floor both suppressed; only a middle-take "
+                 "FILL exits); then F's ΔP proof re-arms and the walk-down "
+                 "clears inventory toward the DECISION at secs_left<="
+                 f"{config.FLIP_DECISION_S} (~minute 11, MOVED from the T-10 "
+                 f"600s handoff): a winner is left to F to ride at FLIP's "
+                 "basis, a loser is sold — never caught unfilled at the bell "
+                 "(WO-BOTH-LANES-MARKET-TRUE)")
+    lines.append(f"  F SALVAGE (build 50): a favorite that slips >="
+                 f"{config.F_SALVAGE_SLIP_POINTS}pts from entry has lost its "
+                 "confidence — an IMMEDIATE table-free price salvage recovers "
+                 "(~−40) instead of riding to the −90 backstop; one attempt, "
+                 "no re-entry (single-entry wall). F entry rest-back stands "
+                 "(build 48, lane-agnostic) (WO-BOTH-LANES-MARKET-TRUE)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

@@ -1160,16 +1160,24 @@ class LaneFlip:
                     self._convert_to_hold(o, market, side, mark, "F-agrees",
                                           now=now)
                     continue
-            # §3.5 T-10 BOOK-AWARE HANDOFF (replaces the blind YIELD_TO_F
-            # flat): per position, never reflexive. Winner (mark at/above
-            # basis) -> LEFT TO F as hold-to-settle at FLIP's cheap basis;
-            # loser -> SOLD now, never dumped into the settlement zone.
-            if secs <= config.OPEN_FLAT_BY and not o.get("hold"):
+            # WO-BOTH-LANES-MARKET-TRUE (build 50) — THE DECISION POINT, F's
+            # inventory-aware endgame. The handoff moved from T-10 (600s) to
+            # FLIP_DECISION_S (~minute 11): FLIP now WORKS its exit down through
+            # the middle window to clear its inventory — the goal is ZERO FLIP
+            # inventory left by here. Whatever remains, F rules (inventory-aware
+            # via the shared inventory, §4): a WINNER (mark at/above basis) is
+            # LEFT TO F as hold-to-settle at FLIP's cheap basis — F rides it to
+            # settlement, standing down instead of re-buying high; a LOSER is
+            # SOLD now, never dumped into the settlement zone. Per position,
+            # never reflexive. (A sustained spot-decided collapse already ruled
+            # the sell earlier — that IS F's ΔP/table proof; this is the clean
+            # end-of-window sweep for anything unfilled and undetermined.)
+            if secs <= config.FLIP_DECISION_S and not o.get("hold"):
                 if mark is None:
                     continue    # no book truth: never a BLIND flat; retry
                 if mark >= o["entry"]:
                     self._convert_to_hold(o, market, side, mark,
-                                          "T-10-handoff-winner", now=now)
+                                          "decision-winner-to-F", now=now)
                     continue
                 self._cancel_resting(o)
                 o["done"] = True
@@ -1180,8 +1188,8 @@ class LaneFlip:
                         action="sell", price_cents=mark, count=n,
                         size_tier=config.TIER_PROBE,
                         purpose="CUT", crossfire=True,
-                        reason="open T-10 handoff: clear loser before "
-                               "F's window"))
+                        reason="open decision point: clear loser before "
+                               "the bell (F's endgame)"))
                 continue
             if o.get("hold"):
                 # held to settlement — no scalp take, no yield; the
@@ -1203,6 +1211,21 @@ class LaneFlip:
             # The loss-side ENDGAME exit is the T-10 handoff above (now the
             # PRIMARY loss exit): an unreverted loser is cleared before F's
             # window, never ridden to settlement.
+            # WO-BOTH-LANES-MARKET-TRUE (build 50) — THE 4-MINUTE HARD NO-SELL.
+            # The opening pile-in is NOISE: the book has not reconciled to BTC
+            # yet (~2 min), so an adverse spot move in the first FLIP_NO_SELL_S
+            # from entry is EXPECTED, not a decision. NOTHING sells in the hold
+            # — the spot-decided cut AND the catastrophe price floor are BOTH
+            # suppressed; the only exit is the resting middle-take getting
+            # FILLED. The 1-lot cap and a cheap (<=50) entry bound the loss
+            # through the hold (12:46: a 24pt first-minute pile-in cut FLIP at
+            # −17c — this is the fix). Polls RESET so the post-hold 2-poll
+            # sustain starts fresh: the pile-in never counts toward a real cut.
+            age = now - o["fill_ts"]
+            if age < config.FLIP_NO_SELL_S:
+                o["collapse_polls"] = 0
+                o["catastrophe_polls"] = 0
+                continue
             catastrophe = config.OPEN_CATASTROPHE_FLOOR
             collapse = (sl is not None and sl.side != side
                         and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
@@ -1218,7 +1241,7 @@ class LaneFlip:
             # fresh entry's low bid is the setup); and (c) SUSTAINED >= 2 polls.
             # A real move is caught by the spot-decided branch regardless.
             held_depth = book.visible_depth(side, mark) if mark is not None else 0
-            past_opening = now - o["fill_ts"] >= config.OPEN_OPENING_WINDOW_S
+            past_opening = age >= config.OPEN_OPENING_WINDOW_S
             cat_hit = (mark is not None and mark <= catastrophe
                        and held_depth >= config.OPEN_CATASTROPHE_MIN_DEPTH
                        and past_opening)
@@ -1247,20 +1270,24 @@ class LaneFlip:
                         purpose="CUT", crossfire=True,
                         reason=f"{determined} · evacuate now"))
             elif (not o.get("hold") and o.get("take_px") is not None
-                  and past_opening
-                  and config.OPEN_FLAT_BY < secs <= config.OPEN_WALK_START_S):
-                # WO-FLIP-EVERY-MARKET-LIQUIDITY B3 (build 49) — the ACTIVE
-                # late-window walk-down. No cut is determined and no reversion
-                # has lifted the middle-take; as the clock runs toward T-10,
-                # step the resting MAKER take DOWN from the middle toward
-                # scratch (linear over [WALK_START, FLAT_BY]), re-posting lower,
-                # so a non-reverting position exits gracefully near breakeven
-                # late — NEVER ridden unfilled into a catastrophic bell dump.
-                # Never below scratch (the T-10 handoff owns a loser). LATE
-                # window only — the early hold is protected by the catastrophe-
-                # illiquidity guards above; this is not a reactive early cut.
-                span = config.OPEN_WALK_START_S - config.OPEN_FLAT_BY
-                frac = max(0.0, min(1.0, (secs - config.OPEN_FLAT_BY) / span))
+                  and config.FLIP_DECISION_S < secs <= config.OPEN_WALK_START_S):
+                # WO-BOTH-LANES-MARKET-TRUE (build 50) — the TIME-AWARE walk-
+                # down (was B3's [WALK_START, FLAT_BY]; now re-based on the
+                # DECISION point). After the hard-hold, an unfilled position is
+                # walked DOWN from the middle toward scratch over [DECISION_S,
+                # WALK_START] to CLEAR FLIP's inventory by the decision point —
+                # the scalp-out goal is ZERO inventory left by ~minute 11.
+                # Linear: full middle up at WALK_START, scratch at DECISION_S.
+                # Distance-to-middle and time both ride the frac — a deep-cheap
+                # (far-from-middle) position near the decision walks near
+                # scratch; a near-middle one barely moves (its middle-take is
+                # close to filling). Never below scratch — a genuine loser is
+                # the decision handoff's to clear. The hard-hold above (the
+                # early `continue`) guarantees this is never a reactive early
+                # cut: it only runs once the pile-in window has passed.
+                span = config.OPEN_WALK_START_S - config.FLIP_DECISION_S
+                frac = max(0.0, min(1.0,
+                                    (secs - config.FLIP_DECISION_S) / span))
                 full = self._take_price(o["entry"])
                 stepped = max(o["entry"],
                               int(round(o["entry"] + frac * (full - o["entry"]))))

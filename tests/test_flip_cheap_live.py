@@ -163,7 +163,8 @@ def test_hold_conversion_logs_swing_arrived(flip, gateway, ledger):
     p1 = flip.evaluate(TICKER, _ctx(_book(yes=39), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    flip.evaluate(TICKER, _ctx(_book(yes=52), secs_left=599))   # T-10 winner
+    flip.evaluate(TICKER, _ctx(_book(yes=52),
+                               secs_left=config.FLIP_DECISION_S - 1))  # decision winner
     assert o["hold"] is True
     rows = _rows(ledger, "FLIP_SWING")
     assert len(rows) == 1
@@ -180,9 +181,10 @@ def test_loser_cleared_at_endgame_logs_ok_true(flip, gateway, ledger):
     p1 = flip.evaluate(TICKER, _ctx(_book(yes=39), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    # at the T-10 endgame the unreverted loser is cleared at the mark
+    # at the endgame decision (build 50: moved from T-10 to FLIP_DECISION_S) the
+    # unreverted loser is cleared at the mark
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
-                                                  secs_left=config.OPEN_FLAT_BY - 1))
+                                                  secs_left=config.FLIP_DECISION_S - 1))
             if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].price_cents == 34   # cleared at the mark
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 1, "PROBE")

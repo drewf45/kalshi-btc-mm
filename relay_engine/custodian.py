@@ -384,6 +384,24 @@ class Custodian:
                                  crossfire=True)
                 return "SALVAGE_CROSSFIRE"
             return None
+        # WO-BOTH-LANES-MARKET-TRUE (build 50) — F's PRICE SALVAGE, the
+        # catastrophic-tail bound. TABLE-FREE and SPOT-BLIND-PROOF: it runs
+        # BEFORE the anchor/spot guards below, because the exact favorite that
+        # rode to the −90 backstop (the −$2.77 3-lot dump) was the one with no
+        # table cell / no spot to prove the collapse. A favorite that has
+        # slipped >= F_SALVAGE_SLIP_POINTS from its entry has lost the high
+        # confidence that bought it — a 95c favorite never slips 40pts on noise,
+        # that is a decisive reversal — so recover now (~−40) instead of riding
+        # to −90. IMMEDIATE crossfire (the slip IS the decision, no maker wait).
+        # One attempt (salvage_attempted latches); NO re-entry (Wall 3 single-
+        # entry keeps the ticker out of lane F for the rest of the window).
+        if (pos.lane == "F" and not pos.salvage_attempted
+                and mark <= pos.entry_price_cents
+                            - config.F_SALVAGE_SLIP_POINTS):
+            pos.salvage_attempted = True
+            pos.salvage_fired = "SALVAGE_SLIP"
+            self.execute_cut(pos, mark, book, "SALVAGE_SLIP", crossfire=True)
+            return "SALVAGE_SLIP"
         if pos.salvage_attempted or pos.p_entry is None:
             # one attempt per position; no anchor = disabled — SAID (SALV-1)
             self._note_salvage_gag(

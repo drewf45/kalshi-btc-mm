@@ -168,6 +168,7 @@ def test_bleed3_replay_cuts_via_spot_not_a_price_ride(flip, gateway,
     against → the SPOT cut fires, any time (the WO-BLEED-3 regression stays
     cut, by the spot path)."""
     o = _open_pos(flip, gateway, ledger)                    # entry 48, stop 42
+    o["fill_ts"] = CLOSE - 1030        # past FLIP_NO_SELL_S (build 50), inside patience
     # within tolerance, no spot: holds (does NOT ride)
     for secs in (770, 769, 768):
         p = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=secs))
@@ -198,14 +199,16 @@ def test_in_band_dip_is_illiquidity_holds(flip, gateway, ledger):
 
 
 def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):
-    """Change 2 OVERTURNED the patience-gate on the ΔP leg: SPOT deciding
-    against is the position trader's real exit — it cuts on 2 sustained
-    polls ANY time (inside patience too), a one-frame flicker still holds."""
-    _open_pos(flip, gateway, ledger)
+    """Change 2 OVERTURNED the patience-gate on the ΔP leg; WO-BOTH-LANES-
+    MARKET-TRUE (build 50) then narrowed 'any time' to 'after the 4-min hard
+    no-sell' — the opening pile-in is held, then F's ΔP proof is the real exit,
+    cutting on 2 sustained polls (a one-frame flicker still holds)."""
+    o = _open_pos(flip, gateway, ledger)
+    o["fill_ts"] = CLOSE - 1030        # past FLIP_NO_SELL_S, inside patience
     sl = Needle(side="no", d_before=10.0, d_after=80.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
                 fair_cents=0.0, t_remaining=700.0)
-    # inside patience (fill at 790, now 770 = 20s elapsed << 300s)
+    # past the hard-hold, still inside patience (age ~260 << 300s)
     p1 = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=770, sl=sl))
     assert [x for x in p1 if x.purpose == "CUT"] == []      # poll 1: not yet
     cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=44),
@@ -222,7 +225,7 @@ def test_catastrophe_floor_is_the_only_price_backstop_in_patience(flip,
     sustained 2 polls — cuts inside patience (the bounded backstop below the
     swing). A fresh thin-book low is illiquidity now, held."""
     o = _open_pos(flip, gateway, ledger)
-    o["fill_ts"] = CLOSE - 900                          # past the opening window
+    o["fill_ts"] = CLOSE - 1030      # past FLIP_NO_SELL_S (build 50) + opening window, inside patience
     flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=771))  # poll 1: sustain
     cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=770))

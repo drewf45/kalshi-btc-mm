@@ -72,6 +72,15 @@ SALVAGE_K_POINTS = 15.0    # needle collapse: p_held − p_entry <= −K, 2 tick
 SALVAGE_S_CENTS = 10.0     # AND fair_held < entry − S
 SALVAGE_R_S = 10.0         # maker attempt unfilled for R -> crossfire at best
 SALVAGE_T_FLOOR_S = 15.0   # never salvage inside the floor (endgame is F's)
+# WO-BOTH-LANES-MARKET-TRUE (build 50) — F's PRICE salvage, the catastrophic-
+# tail bound. The needle-collapse salvage above needs a spot + a table cell; a
+# TABLE-BLIND favorite that slips hard has no proof and rides to the −90
+# catastrophic backstop (the −$2.77 3-lot dump). This is the raw, table-free
+# floor: a favorite that slips >= this many points from its entry has lost the
+# high confidence that bought it (a 95c favorite never slips 40pts on noise —
+# that is a decisive reversal), so recover ~−40 instead of riding to −90. One
+# attempt per position; NO re-entry after (the last minute is a coin-flip).
+F_SALVAGE_SLIP_POINTS = 40  # DREW-DEFAULT: price slip from entry that rules the salvage-cut
 # SALV-1 §2.3 (Adversary): flap guard — logged gag TRANSITIONS per position
 # per window cap here; the settlement summary still counts every tick.
 SALVAGE_GAG_MAX_TRANSITIONS = 12
@@ -260,6 +269,28 @@ OPEN_DETERMINED_DROP = 6
 # the window, on a real decision — and then it fires HARD (anti-ride-to-zero:
 # patience is upside-only).
 OPEN_PATIENCE_S = 300
+
+# WO-BOTH-LANES-MARKET-TRUE (build 50) — the doctrine made TIME-AWARE.
+# FLIP is a market maker holding through the opening pile-in with F-like
+# conviction, then working the exit down to clear its inventory by the
+# absolute-last decision point; F is the inventory-aware endgame authority
+# (rides winners to settlement, its ΔP/table proof rules the sell of a loser).
+#   0 → NO_SELL_S from entry:  HARD NO-SELL. The opening pile-in is noise, not
+#       a decision — the book has not reconciled to BTC yet. NOTHING sells
+#       (spot-decided cut AND catastrophe price cut both suppressed); the only
+#       exit is the resting middle-take getting FILLED. 1-lot cap + a cheap
+#       (<=50) entry bound the max loss through the hold.
+#   NO_SELL_S → DECISION_S: ACTIVE MANAGEMENT. F's proof re-arms (a sustained
+#       spot-decided collapse cuts); an unfilled position is walked DOWN toward
+#       scratch (the B3 walk-down, re-based on DECISION_S) — the goal is to
+#       scalp the win and leave ZERO FLIP inventory by the decision point.
+#   secs_left <= DECISION_S (~minute 11 of 15): THE DECISION — a winner is left
+#       to F as hold-to-settle at FLIP's cheap basis (F rides it); a loser is
+#       sold. Never caught holding unfilled into the bell.
+# NO_SELL_S (secs since entry) and DECISION_S (secs remaining) are the SAME
+# number by construction — the two faces of the one 4-minute conviction window.
+FLIP_NO_SELL_S = 240             # DREW-DEFAULT: hard no-sell horizon from entry (secs since fill)
+FLIP_DECISION_S = 240            # DREW-DEFAULT: the endgame decision point (secs remaining, ~minute 11)
 
 # ---------------------------------------------------------------------------
 # A-PLAYER doctrine (banked 2026-07-19): the machine runs untouched

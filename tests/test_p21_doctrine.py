@@ -161,9 +161,10 @@ def test_determined_against_spot_evacuation(flip, gateway):
     WO-FLIP-LIQUIDITY-HOLD retired the price-floor triggers (illiquidity is
     held); the determined-against that fires in the hold is a CONFIRMED SPOT
     collapse (sustained 2 polls), which still crosses at the mark now."""
-    _open_position(flip, gateway, side="yes", entry=48)
+    w = _open_position(flip, gateway, side="yes", entry=48)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
+    w.opens["yes"]["fill_ts"] = CLOSE - 1030   # build 50: past the 4-min hard hold
     # spot decides against the held side, sustained 2 polls → evacuate
     sl = Needle(side="no", d_before=10.0, d_after=90.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
@@ -215,10 +216,10 @@ def test_t10_handoff_clears_the_loser(flip, gateway):
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     props = flip.evaluate(TICKER, _ctx(_book(yes=47, no=50),
-                                       secs_left=config.OPEN_FLAT_BY - 1))
+                                       secs_left=config.FLIP_DECISION_S - 1))
     assert len(props) == 1
     assert props[0].purpose == "CUT" and props[0].crossfire
-    assert "open T-10 handoff" in props[0].reason
+    assert "open decision point" in props[0].reason
     assert props[0].price_cents == 47                 # sold at the mark, now
 
 

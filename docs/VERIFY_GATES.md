@@ -2121,6 +2121,71 @@ preflight 23/23. Watch live: FLIP entering biased opens (not just balanced
 books), resting takes clustering at ~52¢, and late unfilled positions walking to
 scratch instead of dumping at the bell.
 
+## WO-BOTH-LANES-MARKET-TRUE — the doctrine made time-aware (build 50)
+
+**One doctrine, both lanes:** hold through noise, act only on confirmed real
+moves, time-aware, recover — never panic. Five days live, up; this is the build
+where the safety became TIME-AWARE.
+
+**Read-rule at source (all premises TRUE except 2E):**
+- **2A time-blind cut** — TRUE. The spot-decided cut (`lane_flip.py`, the
+  `determined` block) fired on `collapse_polls>=2` with **no** `secs_since_entry`
+  guard — the 12:46 first-minute stop-out path. Catastrophe had only the 90s
+  `past_opening` guard.
+- **2D F rides to ~−90** — TRUE. F's needle salvage (`_salvage_tick`) needs a
+  spot + a table cell; **BLIND or table-gap → it disables** and only the
+  `catastrophic_loss_cents=90` backstop remains. `OpenPosition.entry_price_cents`
+  exists, so a raw price stop is buildable.
+- **2E F entry post-only-cross** — **already SHIPPED (build 48).** WO-MAKER-
+  REST-BACK's call site (`gateway.py:277`) is **lane-agnostic**, and F's
+  `to_order` already carries `band=(95,99)`; `test_maker_rest_back::
+  test_rest_back_joins_the_bid_for_F` already proves an F entry rests at the
+  bid. No code change — reported honestly, re-asserted in the new acceptance.
+
+**A — the 4-minute hard no-sell** (`lane_flip.py`, the exit loop). `age = now −
+fill_ts`; while `age < FLIP_NO_SELL_S(240)` the position **`continue`s** with
+`collapse_polls`/`catastrophe_polls` reset — NOTHING sells (spot cut AND
+catastrophe floor both suppressed), the only exit is a FILL of the resting
+middle-take. The opening pile-in is noise; a cheap (<=50) entry + the 1-lot cap
+bound the loss through the hold. Polls reset so a pile-in never counts toward the
+post-hold 2-poll sustain.
+
+**B/C — time-aware management + the decision point.** The handoff/decision moved
+from **T-10 (`OPEN_FLAT_BY`=600 s-left)** to **`FLIP_DECISION_S`=240 s-left
+(~minute 11 of the 15-min window)** — *this is the one Drew-locked constant this
+WO overrides, flagged here and in the boot tape for veto from the tape.* Drew's
+ruling: FLIP's job is to SCALP THE WIN and leave **zero inventory by minute 11**;
+whatever remains, **F is the inventory-aware authority** — a WINNER (mark >=
+basis) is left to F as hold-to-settle at FLIP's cheap basis (F rides it, stands
+down via the shared inventory), a LOSER is sold. F's ΔP/table proof *is* the
+"confirmed real move" that rules an earlier sell (the spot-decided cut). The
+walk-down is re-based on `[FLIP_DECISION_S, WALK_START]` and gated by the same
+hard-hold — it steps an unfilled take toward scratch to clear inventory by the
+decision, never below scratch.
+
+**D — F's 40-point price salvage** (`custodian.py::_salvage_tick`). A new
+**table-free, spot-blind-proof** floor placed BEFORE the anchor/spot guards: when
+`mark <= entry_price_cents − F_SALVAGE_SLIP_POINTS(40)`, F cuts IMMEDIATELY
+(crossfire) — recover ~−40 instead of riding to −90 (the −$2.77 3-lot dump). One
+attempt (`salvage_attempted`); **no re-entry** is already guaranteed by Wall 3
+(single-entry keeps the ticker — both sides — out of lane F for the window).
+Gated to lane F. A slip < 40pt stays the gentler needle salvage's zone.
+
+**HARD RAIL:** `FLIP_SIZE_CAP=1`; catastrophe-illiquidity guards (build 48)
+intact; no Kelly / cash / rate-halt / deny-fatal change; F's hold-to-settle
+unchanged except the 40pt salvage. New constants DREW-DEFAULT: `FLIP_NO_SELL_S=
+FLIP_DECISION_S=240`, `F_SALVAGE_SLIP_POINTS=40`. 21 overturned test-laws re-
+anchored (cut tests aged past the 240s hard-hold; T-10 handoff asserts moved to
+`FLIP_DECISION_S`; the p24 95→40 needle test moved to a 35pt slide since a
+≥40pt slip now preempts with the immediate price salvage) + new acceptance
+`test_flip_both_lanes.py` (13 tests: hard-hold holds a first-minute collapse &
+re-arms after; catastrophe suppressed in-hold; decision winner→F / loser→sold;
+walk extends past the old T-10; F 40pt slip salvages immediately table-blind, a
+35pt slip does not, one attempt; F rest-back + band-skip). Suite 632 · preflight
+23/23. **Watch live:** a FLIP position HELD through a first-minute adverse move
+(not the 12:46 −17c cut) then filled/walked; an F favorite salvaged at ~−40 on a
+40pt slip (not the −$2.77 dump); F rejects → 0; both lanes printing.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

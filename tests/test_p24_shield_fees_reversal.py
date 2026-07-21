@@ -138,9 +138,13 @@ def test_1715_replay_price_anchor_salvages_the_slide(gateway, ledger,
             close_ts_of=lambda m: CLOSE, now=now, balance_usd=100.0,
             spot=STRIKE - 90, boundaries={TICKER: (None, STRIKE)})
 
-    tick(CLOSE - 400, yes_bid=40)     # strike 1 (sustained, not a knife)
+    # a 35pt survival collapse (95→60, above the build-50 40pt price floor) is
+    # the NEEDLE salvage's zone: maker-first at the held bid. (A deeper slide
+    # ≥40pt now hits the build-50 immediate price salvage instead — covered in
+    # test_flip_both_lanes.)
+    tick(CLOSE - 400, yes_bid=60)     # strike 1 (sustained, not a knife)
     assert pos.salvage_oid is None
-    tick(CLOSE - 399, yes_bid=40)     # strike 2 -> TRIGGER, mid-slide
+    tick(CLOSE - 399, yes_bid=60)     # strike 2 -> TRIGGER, mid-slide
     assert pos.salvage_attempted is True and pos.salvage_oid is not None
     order = gateway.order_index[pos.salvage_oid]
     assert order.purpose == "EXIT" and order.price_cents >= 40

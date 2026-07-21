@@ -158,7 +158,7 @@ def test_catastrophe_fires_both_sides(flip):
         w.fills.clear()
         now = CLOSE - 700
         w.opens[side] = {"entry": 44,
-                         "fill_ts": now - (config.OPEN_OPENING_WINDOW_S + 30),
+                         "fill_ts": now - (config.FLIP_NO_SELL_S + 30),
                          "count": 1, "take_oid": None, "take_proposed": True,
                          "collapse_polls": 0, "catastrophe_polls": 0,
                          "det_ts": None, "entry_oid": None, "defer_polls": 0}
@@ -195,8 +195,9 @@ def test_spot_collapse_cuts_both_sides_mirrored(flip):
         w = flip._window(TICKER, CLOSE)
         w.opens.clear()
         now = CLOSE - 700
-        w.opens[side] = {"entry": 44, "fill_ts": now - 10, "count": 1,
-                         "take_oid": None, "take_proposed": True,
+        w.opens[side] = {"entry": 44,
+                         "fill_ts": now - (config.FLIP_NO_SELL_S + 30),
+                         "count": 1, "take_oid": None, "take_proposed": True,
                          "collapse_polls": 0, "det_ts": None,
                          "entry_oid": None, "defer_polls": 0}
         book = _mirror_book(side, 44)

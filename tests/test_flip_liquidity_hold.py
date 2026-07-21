@@ -148,7 +148,7 @@ def test_catastrophe_backstop_still_cuts_when_real(flip):
     """The deep backstop remains: a REAL low — depth on the held side, held
     PAST the opening window, sustained 2 polls — still cuts. Only the
     thin-book / opening-window / single-poll dump is retired."""
-    o, now = _pos(flip, entry=44, gap=config.OPEN_OPENING_WINDOW_S + 30)
+    o, now = _pos(flip, entry=44, gap=config.FLIP_NO_SELL_S + 30)
     b = _book(yes=20, no=55)                        # depth 10 >= min
     flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1: sustain
     cuts = [p for p in flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
@@ -160,7 +160,7 @@ def test_catastrophe_backstop_still_cuts_when_real(flip):
 def test_spot_collapse_still_cuts_sustained(flip):
     """Spot deciding against the held side (sustained 2 polls) cuts in the
     hold — the market ran away hard, distinguished from noise by the sustain."""
-    o, now = _pos(flip, entry=44)
+    o, now = _pos(flip, entry=44, gap=config.FLIP_NO_SELL_S + 30)
     sl = Needle(side="no", d_before=10.0, d_after=90.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
                 fair_cents=0.0, t_remaining=700.0)
@@ -187,13 +187,14 @@ def test_illiquidity_dip_is_not_a_spot_flicker(flip):
 # ── §2.4: the endgame T-10 handoff is the PRIMARY loss exit ────────────────
 def test_unreverted_loser_cleared_at_t10(flip):
     """An unreverted loser is not stopped on price — it is cleared at the
-    T-10 endgame handoff, at the mark, never ridden to settlement."""
-    o, now = _pos(flip, entry=44, secs=config.OPEN_FLAT_BY - 1)
+    endgame decision handoff (build 50: moved from T-10 to FLIP_DECISION_S), at
+    the mark, never ridden to settlement."""
+    o, now = _pos(flip, entry=44, secs=config.FLIP_DECISION_S - 1)
     b = _book(yes=34, no=55)
     cuts = [p for p in flip._open_custody(*w_side_ctx(flip, b, now,
-                                                     config.OPEN_FLAT_BY - 1, None))
+                                                     config.FLIP_DECISION_S - 1, None))
             if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "T-10 handoff" in cuts[0].reason
+    assert len(cuts) == 1 and "decision point" in cuts[0].reason
     assert cuts[0].price_cents == 34
 
 
