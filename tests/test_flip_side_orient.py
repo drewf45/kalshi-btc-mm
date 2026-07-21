@@ -38,7 +38,7 @@ EVENT = TICKER.rsplit("-", 1)[0]
 CLOSE = 1_000_000.0
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -206,7 +206,7 @@ def test_spot_collapse_cuts_both_sides_mirrored(flip):
         props = flip._open_custody(w, TICKER, EVENT, book, ctx, 700, now)
         out[side] = _norm(props, side)
     assert out["yes"] == out["no"]
-    assert out["yes"] and "SPOT decided" in out["yes"][0][4]
+    assert out["yes"] and "spot-decided" in out["yes"][0][4]
 
 
 # ── the SHADOW two-barrier — the one genuine orientation bug, fixed ─────────

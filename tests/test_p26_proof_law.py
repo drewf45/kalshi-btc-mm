@@ -18,7 +18,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -122,7 +122,7 @@ def test_fh8_nonreversal_gate_and_tag(monkeypatch):
 
 
 # ── §3.1: one shot per window (consumed on ANY exit, takes too) ────────────
-def _open_position(flip, gateway, entry=48):
+def _open_position(flip, gateway, entry=40):
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
     assert len(props) == 1
     flip.on_submitted(props[0], "OID-E", CLOSE - 800)
@@ -165,7 +165,7 @@ def test_evacuation_crosses_at_the_mark(flip, gateway):
     low mark is illiquidity, held); the determined-against that fires in the
     hold is a CONFIRMED spot collapse, and it crosses at the mark."""
     from relay_engine.spotlead import Needle
-    w = _open_position(flip, gateway, entry=48)
+    w = _open_position(flip, gateway, entry=40)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     w.opens["yes"]["fill_ts"] = CLOSE - 1030   # build 50: past the 4-min hard hold
@@ -177,8 +177,9 @@ def test_evacuation_crosses_at_the_mark(flip, gateway):
                                        spotlead=sl))
     assert len(props) == 1
     p = props[0]
-    assert p.purpose == "CUT" and p.crossfire
-    assert p.price_cents == 41           # prices AT the mark, no slide
+    # build 52 Finding 1: walks to scratch (maker), no market-dump
+    assert p.purpose == "EXIT" and not p.crossfire
+    assert p.price_cents == 40 and "spot-decided" in p.reason
 
 
 def test_t10_handoff_replaces_yield_to_f(flip, gateway):
@@ -188,7 +189,7 @@ def test_t10_handoff_replaces_yield_to_f(flip, gateway):
     _open_position(flip, gateway)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=47, no=50),
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=50),
                                        secs_left=config.FLIP_DECISION_S - 1))
     assert len(props) == 1 and props[0].crossfire
     assert "open decision point" in props[0].reason
@@ -234,7 +235,7 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
     # a mature NEGATIVE cell: STILL enters — the margin prints (info)
     flip.windows.clear()
     for i in range(config.OPEN_PROBE_MAX_N):
-        ledger.record_cell_outcome("OPEN", 48, won=False, pnl_cents=-5,
+        ledger.record_cell_outcome("OPEN", 40, won=False, pnl_cents=-5,
                                    fees_cents=0, market=f"L{i}", kind="trip")
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
     assert len(props) == 1 and "info" in props[0].why
@@ -242,7 +243,7 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
     ledger.db.execute("DELETE FROM cell_outcomes")
     ledger.db.commit()
     for i in range(60):
-        ledger.record_cell_outcome("OPEN", 48, won=True, pnl_cents=5,
+        ledger.record_cell_outcome("OPEN", 40, won=True, pnl_cents=5,
                                    fees_cents=0, market=f"W{i}", kind="trip")
     flip.windows.clear()
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))

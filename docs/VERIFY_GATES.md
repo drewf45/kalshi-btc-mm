@@ -2250,6 +2250,70 @@ secs-into + reason; a FLIP entry REFUSED for secs-into>90 (`OPEN_PAST_OPENING`);
 the daily pack firing with the fill-rate-by-price curve; the last two losers
 pulled, each with full why + what-happened.
 
+## WO-FULL-COLD-AUDIT — the FLIP exit machine, fixed as a cluster (build 52)
+
+**Stop the whack-a-mole.** One cold read of the whole FLIP path found the root:
+two exits fighting, the violent one winning. Shipped the core cluster (Findings
+1+3+4) together; deferred the one-clock refactor (2); corrected the swing-gate
+misread (5) and added telemetry; F untouched (6).
+
+**Read-rule at source (verified; two divergences reported honestly):**
+- **Finding 1 (root)** — TRUE. The `if determined:` (SPOT_DECIDED, `crossfire=
+  True` at mark) sat *before* the `elif` walk-down, so the market-dump pre-empted
+  the gentle exit; `OPEN_DETERMINED_K_POINTS=15`. **My divergence:** the
+  catastrophic-loss generator is K=15 firing on *drift*, not that crossfire is
+  the wrong tool (in a genuine collapse a maker walk-down rides down unfilled —
+  worse). Drew ruled: raise K **and** route SPOT_DECIDED through the walk-down
+  (acceptance #1: zero market-dump on SPOT_DECIDED). Both done.
+- **Finding 4** — TRUE. `OPEN_MAX_ENTRY_CENTS=50` (one correction: a 50c entry
+  gouges +5 fee-floored, not +2, but the near-coinflip point stands).
+- **Finding 5** — largely FALSE. The swing gate is **live-but-permissive below
+  `OPEN_SWING_MIN_SAMPLES=20`**, not dead; the tape's `0.89` is the explicitly-
+  labeled retired shadow proxy. Accepted; added a telemetry line instead of a
+  rework.
+
+**Finding 1 (ROOT):** raised `OPEN_DETERMINED_K_POINTS` **15 → 40** (a real
+decision, not drift). The exit block is now split by severity (`lane_flip.py`):
+`if catastrophe_polls>=2` → crossfire out (genuinely gone, unchanged); `elif
+collapse_polls>=2` → **route through the walk-down** — a MAKER exit at scratch
+(entry, never below cost, `crossfire=False`), no market-dump; `elif` the
+time-based walk-down. Losses route through the gentle exit; only the deep
+backstop crossfires.
+
+**Finding 3 (GATE):** the volatility skip. `OPEN_TREND_SKIP_USD=200` — if the
+opening BTC-spot has already run >= this one-directionally across the observed
+ticks (>=2), OPEN skips its reversion entry (logs `OPEN_TREND_SKIP` with the
+reading; the reading rides every open's `entry_meta` for calibration). **F is
+byte-identical** (criterion #5), so the "skip BOTH lanes" is delivered as the
+OPEN-half now; extending it to F is a follow-up (it would touch F). HUNT
+(momentum) is left to ride trends.
+
+**Finding 4 (ENTRY):** `OPEN_MAX_ENTRY_CENTS` **50 → 42** — only real-gouge
+entries (42c → +10 to the 52 middle); the near-coinflip top of the band is cut.
+
+**Finding 5 (MEASURE):** a per-window `swing pass/block n=… p=… p_up=… p_down=…`
+line, so the sample-floor decision is made from data. Gates nothing today (the
+permissive gate rides); it will gate SIZE, never entry, when proven (Adversary).
+
+**Finding 2 (DEFERRED — its own build):** unifying the FLIP lifecycle to one
+clock (secs-into-window) is a load-bearing refactor; per Drew's cadence law it
+is a Saturday work order, not bundled with three tape-verified fixes (keeps the
+build auditable). Written up for follow-up.
+
+**HARD RAIL:** F unchanged (byte-identical — the swing-gate/p22 F-sizing tests
+were kept on their original books); sizing-with-book unchanged; `FLIP_SIZE_CAP=
+1`; rate-halt, cash + deny-fatal, catastrophe-illiquidity guards, reset intact;
+no Kelly change. New/changed constants: `OPEN_DETERMINED_K_POINTS=40`,
+`OPEN_MAX_ENTRY_CENTS=42`, `OPEN_TREND_SKIP_USD=200`. ~60 overturned test-laws
+re-anchored (SPOT_DECIDED CUT→maker-walk-to-scratch; entry cheap side moved into
+[25,42]) + new acceptance `test_full_cold_audit.py` (9 tests: K is a real
+decision; sub-K drift does not cut; a decision walks to scratch never crossfire;
+catastrophe still crossfires; trending open skips; calm open enters; entry
+ceiling 42; the money-line telemetry). Suite 651 · preflight 23/23. **Watch
+live:** zero market-dump exits on a SPOT_DECIDED (every loss shows the walk-down
+path); `OPEN_TREND_SKIP` events with the volatility reading; no FLIP entries
+above 42c; the `swing …` telemetry line every window.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

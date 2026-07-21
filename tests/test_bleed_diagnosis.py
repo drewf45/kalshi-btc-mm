@@ -34,7 +34,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -141,14 +141,14 @@ def test_one_hunt_loss_sits_the_window_out_open_unaffected(flip, gateway,
     assert flip.windows[TICKER].hunt_lost is True
     assert _hunt_at(flip, 45, 700) == []      # higher, same side — still out
     # build 51: OPEN enters in the opening 90s; hunt_lost never gates it
-    open_props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49),
+    open_props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49),
                                             secs_left=850,
                                             grain=GRAIN_YES2))
     assert [(p.side, p.purpose) for p in open_props] == [("yes", "ENTRY")]
 
 
 # ── BLEED 3: the floor stops slipping ──────────────────────────────────────
-def _open_pos(flip, gateway, ledger, entry=48):
+def _open_pos(flip, gateway, ledger, entry=40):
     props = flip.evaluate(TICKER, _ctx(_book(yes=entry), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
@@ -180,10 +180,10 @@ def test_bleed3_replay_cuts_via_spot_not_a_price_ride(flip, gateway,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
                 fair_cents=0.0, t_remaining=700.0)
     flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=767, sl=sl))  # poll 1
-    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=44),
-                                                  secs_left=766, sl=sl))
-            if x.purpose == "CUT"]
-    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
+    props = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=766, sl=sl))
+    assert [x for x in props if x.purpose == "CUT"] == []   # build 52: no dump
+    exits = [x for x in props if x.purpose == "EXIT"]
+    assert len(exits) == 1 and exits[0].price_cents == 40 and "spot-decided" in exits[0].reason
 
 
 def test_in_band_dip_is_illiquidity_holds(flip, gateway, ledger):
@@ -212,10 +212,10 @@ def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):
     # past the hard-hold, still inside patience (age ~260 << 300s)
     p1 = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=770, sl=sl))
     assert [x for x in p1 if x.purpose == "CUT"] == []      # poll 1: not yet
-    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=44),
-                                                  secs_left=769, sl=sl))
-            if x.purpose == "CUT"]
-    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason  # 2 polls, cut
+    props = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=769, sl=sl))
+    assert [x for x in props if x.purpose == "CUT"] == []   # build 52: no dump
+    exits = [x for x in props if x.purpose == "EXIT"]
+    assert len(exits) == 1 and exits[0].price_cents == 40 and "spot-decided" in exits[0].reason
 
 
 def test_catastrophe_floor_is_the_only_price_backstop_in_patience(flip,

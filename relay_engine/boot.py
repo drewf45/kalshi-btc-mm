@@ -225,6 +225,17 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "the tape; the daily pack fires EVERY day (hour>=9 ET, restart-"
                  "safe) with at-a-glance 24h + fill-rate-by-posted-price, the "
                  "money curve (WO-INSTRUMENTATION-AND-FLIP-TIMING)")
+    lines.append(f"  FLIP EXIT-CLUSTER (build 52): the SPOT_DECIDED exit no "
+                 f"longer market-DUMPS — a real decision (ΔP>="
+                 f"{config.OPEN_DETERMINED_K_POINTS:.0f}pts, raised from 15 "
+                 "drift) routes through the WALK-DOWN, a maker to scratch, "
+                 "never a crossfire at the depressed bid; the CATASTROPHE deep "
+                 "backstop keeps its crossfire (genuinely gone). A hard-"
+                 f"trending open (>=${config.OPEN_TREND_SKIP_USD:.0f} spot run) "
+                 f"SKIPS OPEN; entry ceiling tightened to "
+                 f"{config.OPEN_MAX_ENTRY_CENTS}c (real-gouge only). Swing-gate "
+                 "telemetry logged every window. F byte-identical "
+                 "(WO-FULL-COLD-AUDIT)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

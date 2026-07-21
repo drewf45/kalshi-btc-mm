@@ -26,7 +26,7 @@ CLOSE = 1_000_000.0
 GRAIN = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49, yq=10, nq=10):
+def _book(yes=40, no=49, yq=10, nq=10):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: yq} if yes is not None else {},
                      {no: nq} if no is not None else {}, ts=1.0)
@@ -100,18 +100,18 @@ def test_c_still_requires_a_two_sided_cheap_side(flip):
 def _run_trade(flip, ledger, entry_spot=66_400, exit_spot=66_455):
     """Enter at the open (spot known), fill, post the take, then book a
     take-fill exit — returns after the FLIP_SWING record is written."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49), secs_left=850,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
                                        spot=entry_spot, grain=GRAIN))
     flip.on_submitted(props[0], "E1", CLOSE - 850)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 48, CLOSE - 848)
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 40, CLOSE - 848)
     # a custody poll posts the take (middle 53 for a 48c entry) and stamps the
     # exit observation (spot/book)
-    flip.evaluate(TICKER, _ctx(_book(yes=53, no=45), secs_left=790,
+    flip.evaluate(TICKER, _ctx(_book(yes=52, no=45), secs_left=790,
                                spot=exit_spot))
     # the take fills at its posted price → note_exit writes the record
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 53, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 53, CLOSE - 700, count=1)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 52, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 52, CLOSE - 700, count=1)
 
 
 def test_a_swing_record_is_the_full_data_point(flip, ledger):
@@ -121,8 +121,8 @@ def test_a_swing_record_is_the_full_data_point(flip, ledger):
     _run_trade(flip, ledger, entry_spot=66_400, exit_spot=66_455)
     r = _swing_row(ledger)
     # the money
-    assert r["entry_price"] == 48 and r["exit_price"] == 53
-    assert r["gross_cents"] == 5
+    assert r["entry_price"] == 40 and r["exit_price"] == 52
+    assert r["gross_cents"] == 12
     # spot prices — the BTC move, reconstructable (not just the delta)
     assert r["entry_spot"] == 66_400 and r["exit_spot"] == 66_455
     # precise window timing — the ≤90s-vs-mid distinction
@@ -131,19 +131,19 @@ def test_a_swing_record_is_the_full_data_point(flip, ledger):
     # the exact exit reason tag — no silent exit
     assert r["exit_reason"] == "TAKE_FILL"
     # book state both ends + the posted gouge level
-    assert r["entry_spread"] == 1 and r["entry_cheap_bid"] == 48
+    assert r["entry_spread"] == 9 and r["entry_cheap_bid"] == 40
     assert r["entry_depth"] == [10, 10]
-    assert r["posted_take"] == 53              # _take_price(48) = max(52, 48+5)
+    assert r["posted_take"] == 52              # _take_price(40) = the 52 middle
 
 
 def test_a_entry_why_carries_spot_timing_and_book(flip):
     """The Telegram-readable entry line carries spot, secs-into, and book —
     enough to read the trade live."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49), secs_left=850,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
                                        spot=66_412, grain=GRAIN))
     why = props[0].why
     assert "spot 66,412" in why and "into 50s" in why
-    assert "book y48/n49" in why and "depth 10/10" in why
+    assert "book y40/n49" in why and "depth 10/10" in why
 
 
 def test_a_walk_down_exit_is_tagged(flip, ledger):

@@ -25,7 +25,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -52,7 +52,7 @@ def flip(gateway, ledger, surface):
                                                  ladder=DegradeLadder()))
 
 
-def _open_position(flip, gateway, ledger, side="yes", entry=48,
+def _open_position(flip, gateway, ledger, side="yes", entry=40,
                    fill_secs_left=790):
     """An OPEN custody position via the real path: proposal, submit-marker,
     booked fill."""
@@ -104,9 +104,14 @@ def test_spot_collapse_cuts_any_time_two_polls(flip, gateway, ledger):
     assert o["collapse_polls"] == 1
     ctx_collapse2 = _ctx(_book(yes=44), secs_left=699)
     ctx_collapse2["spotlead"] = SL()
-    cuts = [p for p in flip.evaluate(TICKER, ctx_collapse2)
-            if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason  # 2 polls, cut inside patience
+    props = flip.evaluate(TICKER, ctx_collapse2)
+    # WO-FULL-COLD-AUDIT Finding 1 (build 52): 2 sustained polls no longer
+    # crossfire-DUMP — the decision routes through the walk-down, a MAKER exit
+    # at scratch (entry 40, never below cost, no market-dump).
+    assert [p for p in props if p.purpose == "CUT"] == []
+    exits = [p for p in props if p.purpose == "EXIT"]
+    assert len(exits) == 1 and exits[0].price_cents == 40
+    assert "spot-decided" in exits[0].reason and not exits[0].crossfire
 
 
 # ── §3.5/§4 stage 3: the T-10 handoff + F coordination ─────────────────────
@@ -191,7 +196,7 @@ def test_t10_handoff_winner_left_to_f_not_sold(flip, gateway, ledger,
     assert any("FLIP_HOLD_TO_SETTLE" in r.message
                and "decision-winner-to-F" in r.message
                for r in caplog.records)
-    assert flip.held(TICKER) == {"yes": {"count": 1, "basis": 48}}
+    assert flip.held(TICKER) == {"yes": {"count": 1, "basis": 40}}
     # the hold is deliberate: cycles pass, zero UNCOVERED pages
     flip.evaluate(TICKER, _ctx(_book(yes=61),
                                secs_left=config.FLIP_DECISION_S - 2))
@@ -283,23 +288,23 @@ def test_scalp_take_rests_at_the_goal_bounded_move(flip, gateway, ledger):
     floor, −27¢), so the take now floats to the reachable convergence move —
     entry+5 at the 1-lot cap (54¢), banked reliably. The reachable nickel is
     the win convergence actually gives; the +20 was the SOMETIMES."""
-    take_cents = LaneFlip._take_cents(1)           # 5 at the 1-lot cap
-    # yes 49 < no 50 -> yes is the cheap side (WO-FLIP-IMMEDIATE-ENTRY buys it)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=49, no=50), secs_left=850,
+    # build 49+: the live take is the MIDDLE-target (_take_price); a 40c cheap
+    # entry rests at the 52 middle (build 52 Finding 4 tightened entry to <=42)
+    take_px = LaneFlip._take_price(40)             # the 52 middle
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=50), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 49, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 49, CLOSE - 790)
-    take = next(p for p in flip.evaluate(TICKER, _ctx(_book(yes=49),
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 40, CLOSE - 790)
+    take = next(p for p in flip.evaluate(TICKER, _ctx(_book(yes=40),
                                                       secs_left=780))
                 if p.purpose == "EXIT")
-    assert take.price_cents == 49 + take_cents and take.action == "sell"
-    # the reachable move arrives: the fill books the goal-bounded capture
+    assert take.price_cents == take_px and take.action == "sell"
+    # the reachable move arrives: the fill books the middle-target capture
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 49 + take_cents, 1,
-                       "PROBE")
-    flip.note_exit(TICKER, "yes", 49 + take_cents, CLOSE - 500)
-    assert flip.windows[TICKER].window_realized == take_cents
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", take_px, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", take_px, CLOSE - 500)
+    assert flip.windows[TICKER].window_realized == take_px - 40
 
 
 def test_no_new_scalp_entry_at_or_after_t10(flip):

@@ -120,8 +120,10 @@ def test_a_same_collapse_cuts_once_past_the_hard_hold(flip):
     _custody(flip, w, b, 560, now, sl=_SL())            # poll 1
     now2 = CLOSE - 559
     w.opens["yes"]["fill_ts"] = now2 - (config.FLIP_NO_SELL_S + 20)
-    cuts = _cuts(_custody(flip, w, b, 559, now2, sl=_SL()))
-    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
+    props = _custody(flip, w, b, 559, now2, sl=_SL())
+    assert _cuts(props) == []                              # build 52: no dump
+    exits = [p for p in props if p.purpose == "EXIT"]
+    assert len(exits) == 1 and exits[0].price_cents == 44 and "spot-decided" in exits[0].reason
 
 
 def test_a_catastrophe_floor_suppressed_in_the_hard_hold(flip):

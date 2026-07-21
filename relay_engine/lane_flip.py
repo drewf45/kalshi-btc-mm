@@ -244,6 +244,8 @@ class FlipWindow:
     open_consumed_logged: bool = False
     open_geometry_logged: bool = False   # OPEN_BAD_GEOMETRY tags once
     open_past_opening_logged: bool = False  # OPEN_PAST_OPENING tags once (build 51)
+    open_trend_logged: bool = False      # OPEN_TREND_SKIP tags once (build 52)
+    open_swing_logged: bool = False      # swing telemetry line once (build 52)
     # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): the entry data point,
     # stashed at the entry proposal and copied onto the position at note_fill —
     # so the FLIP_SWING forensic record can reconstruct the whole trade.
@@ -703,6 +705,24 @@ class LaneFlip:
         # the cheap side).
         if yes_bid is None or no_bid is None:
             return proposals               # no two-sided book: no cheap side
+        # WO-FULL-COLD-AUDIT Finding 3 (build 52) — THE VOLATILITY SKIP. A
+        # hard-trending open (the opening BTC-spot already run one-directionally
+        # by >= OPEN_TREND_SKIP_USD across the observed ticks) gives OPEN's
+        # reversion thesis no edge — the pile-in it trades against never comes
+        # back (the un-winnable trending market, the other half of every big-loss
+        # day). OPEN skips; HUNT (momentum) and F (byte-identical, criterion #5)
+        # are untouched. The reading is logged on every open (skip AND enter) so
+        # the conservative threshold calibrates from data, never a guess.
+        _ticks = [t for t in w.spot_ticks if t is not None]
+        trend_usd = (_ticks[-1] - _ticks[0]) if len(_ticks) >= 2 else 0.0
+        if len(_ticks) >= 2 and abs(trend_usd) >= config.OPEN_TREND_SKIP_USD:
+            if not w.open_trend_logged:
+                w.open_trend_logged = True
+                log.info("OPEN_TREND_SKIP %s — opening spot ran %+.0f$ over %d "
+                         "ticks >= %.0f$: hard-trending open, no reversion edge "
+                         "(OPEN skips; HUNT/F unaffected)", market, trend_usd,
+                         len(_ticks), config.OPEN_TREND_SKIP_USD)
+            return proposals
         # WO-FLIP-IMMEDIATE-ENTRY (build 47): the grain-wait is RETIRED. The
         # liquidity-hold capstone overturned "waiting IS the setup" — FLIP
         # buys the opening IMBALANCE the instant it is cheap; it does not wait
@@ -758,6 +778,21 @@ class LaneFlip:
         # Table/spot absent -> permissive (live-proof wants data; the
         # UNPROVEN tagging already narrates the blindness).
         swing = self._swing_gate(ctx, now, join, side, market)
+        # WO-FULL-COLD-AUDIT Finding 5 (build 52) — the swing-gate TELEMETRY.
+        # The gate is live-but-permissive below OPEN_SWING_MIN_SAMPLES (NOT dead;
+        # the 0.89 on the tape is the retired strike-touch SHADOW proxy). This
+        # line makes its state legible every window — measured rate, sample n,
+        # the shadow two-barrier p_up/p_down, pass/block — so the sample-floor
+        # decision is made from data, not another argument. (Gates SIZE later,
+        # never entry, per the Adversary; today it only reports + the permissive
+        # gate rides.)
+        if swing is not None and not w.open_swing_logged:
+            w.open_swing_logged = True
+            log.info("swing %s n=%d p=%.2f p_up=%s p_down=%s -> %s",
+                     "block" if not swing["ok"] else "pass",
+                     swing.get("n", 0), swing.get("p", 0.0),
+                     swing.get("p_up"), swing.get("p_down"),
+                     market)
         if swing is not None and not swing["ok"]:
             if not w.open_no_grain_logged:   # reuse the once-per-window mute
                 w.open_no_grain_logged = True
@@ -791,7 +826,8 @@ class LaneFlip:
         w.entry_meta[side] = {
             "spot": spot, "secs_into": round(secs_into, 1),
             "spread": abs(yes_bid - no_bid), "cheap_bid": join,
-            "yes_depth": y_depth, "no_depth": n_depth}
+            "yes_depth": y_depth, "no_depth": n_depth,
+            "open_trend_usd": round(trend_usd, 1)}   # build 52: the calibration reading
         spot_s = f"{spot:,.0f}" if spot is not None else "na"
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
@@ -1301,21 +1337,24 @@ class LaneFlip:
                        and past_opening)
             o["catastrophe_polls"] = \
                 o.get("catastrophe_polls", 0) + 1 if cat_hit else 0
-            determined = None
-            if o["collapse_polls"] >= 2:
-                determined = (f"open determined-against: SPOT decided — "
-                              f"ΔP-collapse {sl.delta_p:.0f}pts sustained "
-                              "(a real move, not illiquidity — cut in the hold)")
-            elif o["catastrophe_polls"] >= 2:
-                determined = (f"open determined-against: CATASTROPHE floor "
-                              f"{side} {mark}c <= {catastrophe}c — a REAL "
-                              f"sustained low (depth {held_depth}, past the "
-                              "opening window), not thin-book illiquidity")
-            if determined:
+            # WO-FULL-COLD-AUDIT Finding 1 (build 52) — the ROOT FIX. Two exits
+            # used to target the same decided-against state and the VIOLENT one
+            # always won: the SPOT_DECIDED cut crossfire-DUMPED at the depressed
+            # bid, pre-empting the gentle walk-down — the catastrophic-loss
+            # generator (a −$1 where a −5c walk-down belonged). Now they are
+            # SEPARATED by severity:
+            #   CATASTROPHE (mark <= 20, real depth, past opening, sustained) —
+            #     the position is GENUINELY GONE; crossfire out before zero.
+            #     This one STAYS violent, correctly (there is nothing to save).
+            #   SPOT_DECIDED (ΔP-collapse >= K, now K=40 a real decision) — no
+            #     longer crossfire-dumps. It routes through the WALK-DOWN:
+            #     accelerate the resting MAKER take to scratch (never below
+            #     cost, never pay the spread into a market-dump). If it does not
+            #     fill at scratch, the decision handoff clears it at the endgame.
+            if o["catastrophe_polls"] >= 2:
                 self._cancel_resting(o)
                 o["done"] = True
-                o["exit_reason"] = ("CATASTROPHE" if o["catastrophe_polls"] >= 2
-                                    else "SPOT_DECIDED")   # build 51 tag
+                o["exit_reason"] = "CATASTROPHE"
                 n = self._exit_count(market, side, o["count"])
                 if n > 0:
                     props.append(Order(
@@ -1324,7 +1363,27 @@ class LaneFlip:
                         price_cents=mark if mark is not None else max(1, o["entry"] - 1),
                         count=n, size_tier=config.TIER_PROBE,
                         purpose="CUT", crossfire=True,
-                        reason=f"{determined} · evacuate now"))
+                        reason=f"open determined-against: CATASTROPHE floor "
+                               f"{side} {mark}c <= {catastrophe}c — genuinely "
+                               f"gone (depth {held_depth}), evacuate now"))
+            elif o["collapse_polls"] >= 2 and not o.get("hold"):
+                # the graceful decision exit — walk to scratch as a MAKER, no
+                # crossfire, no market-dump (Finding 1 acceptance #1).
+                scratch = o["entry"]
+                if o.get("take_px") is None or scratch < o["take_px"]:
+                    self._cancel_resting(o)
+                    n = self._exit_count(market, side, o["count"])
+                    if n > 0:
+                        o["take_px"] = scratch
+                        o["take_proposed"] = True
+                        o["exit_reason"] = "SPOT_DECIDED"
+                        props.append(Order(
+                            lane="FLIP", event=event, market=market, side=side,
+                            action="sell", price_cents=scratch, count=n,
+                            size_tier=config.TIER_PROBE, purpose="EXIT",
+                            reason=f"open spot-decided → walk to scratch "
+                                   f"{scratch}c (ΔP {sl.delta_p:.0f}pts, a real "
+                                   "decision — maker to breakeven, never dumped)"))
             elif (not o.get("hold") and o.get("take_px") is not None
                   and config.FLIP_DECISION_S < secs <= config.OPEN_WALK_START_S):
                 # WO-BOTH-LANES-MARKET-TRUE (build 50) — the TIME-AWARE walk-

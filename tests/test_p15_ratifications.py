@@ -59,7 +59,7 @@ def test_pair_formable_posts_the_cheap_side(engine):
     band book posts ONE lot on the CHEAP side (the lower bid) immediately, no
     grain needed. yes 46 < no 48 -> buy YES@46; grain, if present, only
     informs — the side stays the cheap side."""
-    ctx = flip_ctx(engine, flip_book(46, 48))
+    ctx = flip_ctx(engine, flip_book(40, 48))
     assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
         == [("yes", "ENTRY")]                        # yes 46 < no 48 -> cheap
     engine.flip.windows.clear()
@@ -122,7 +122,7 @@ def pair_fill(engine, side, price):
               price_cents=price, count=1, size_tier=config.TIER_PROBE,
               purpose="ENTRY", band=(1, 49),
               why=f"OPEN grain {side}x2 · join {price}c · PROBE n=0 · geometry=v2")
-    r = engine.gateway.submit(o, flip_book(46, 48))
+    r = engine.gateway.submit(o, flip_book(40, 48))
     engine.gateway.on_fill(r.order_id)
     return r
 
@@ -140,7 +140,7 @@ def test_filled_pair_stays_visible_to_walls(engine):
                   action="buy", price_cents=46, count=1,
                   size_tier=config.TIER_PROBE, purpose="ENTRY", band=(1, 49),
                   why="OPEN grain yesx2 · join 46c · PROBE n=0 · geometry=v2"),
-            flip_book(46, 48))
+            flip_book(40, 48))
     assert e.value.wall == "SINGLE_ENTRY"
     # and the event exposure counts the pair, not zero
     contracts, cents = engine.gateway._event_exposure(EVENT)
@@ -154,7 +154,7 @@ def test_gross_clears_on_exit_fills_and_rollover(engine):
     exit_o = Order(lane="FLIP", event=EVENT, market=TICKER, side="yes",
                    action="sell", price_cents=50, count=1,
                    size_tier=config.TIER_PROBE, purpose="EXIT")
-    r = engine.gateway.submit(exit_o, flip_book(46, 48))
+    r = engine.gateway.submit(exit_o, flip_book(40, 48))
     engine.gateway.on_fill(r.order_id)
     assert engine.gateway.gross_open[key] == 0
     engine.gateway.gross_open[key] = 2               # stale, pretend

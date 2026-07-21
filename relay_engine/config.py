@@ -107,7 +107,12 @@ OPEN_MIN_GRAIN = 2                # streak >= 2 or pass (OPEN_NO_GRAIN)
 # true-50/50 skip and the HUNT/needle trend-guard. (The cheap side is always
 # <= 50 by book coherence, so the max just admits the near-coinflip cheap side.)
 OPEN_ENTRY_FLOOR = 25            # DREW-DEFAULT: cheap-side lower bound — buy cheap, not near-worthless/decided
-OPEN_MAX_ENTRY_CENTS = 50         # DREW-DEFAULT (was 49): admit the near-coinflip cheap side too
+# WO-FULL-COLD-AUDIT Finding 4 (build 52): tightened 50 → 42. A ~50c "cheap"
+# side is a coinflip with only a fee-floored +5 gouge to the 52 middle — a
+# structurally-unclearable entry (the tape's losers). The profitable entries
+# were the CHEAP ones (28-36c → +16/+24 to the middle). The band top now admits
+# only real-gouge entries (42c → +10 to the middle).
+OPEN_MAX_ENTRY_CENTS = 42         # DREW-DEFAULT (build 52, was 50): real-gouge entries only
 # The take rests toward the MIDDLE, scaled by entry depth: take = clamp(
 # MIDDLE_TARGET, entry+MIN, 99). Buy 39 -> rest 52 (+13, a dime); buy 49 ->
 # rest 54 (+5, the fee-safe floor). The cheaper the entry, the bigger the
@@ -167,7 +172,23 @@ FLIP_REST_BACK_CENTS = 2           # DREW-DEFAULT: FLIP rests this far below the
 # before any size increase — run at the 1-lot cap. HARD RAIL: no
 # Kelly/cash/rate-halt/F change; F-covers-FLIP (martingale-adjacent) NOT built.
 OPEN_UNDETERMINED_BAND = (35, 65)  # inside it: NO stop, NO scratch, NO box (band floor retired as an early cut too)
-OPEN_DETERMINED_K_POINTS = 15.0   # ΔP-collapse >= K sustained = math changed
+# WO-FULL-COLD-AUDIT Finding 1 (build 52): raised 15 → 40, a REAL-DECISION
+# threshold. At 15 a 15pt spot move (BTC drifts that in seconds) armed the
+# violent SPOT_DECIDED cut, which crossfire-DUMPED positions at the depressed
+# bid that would otherwise have reverted — the catastrophic-loss generator. At
+# 40 the cut fires only on a genuine decision; and even then it no longer
+# crossfire-dumps (it routes through the walk-down toward scratch, Finding 1).
+OPEN_DETERMINED_K_POINTS = 40.0   # DREW-DEFAULT (build 52, was 15): a real decision, not drift
+# WO-FULL-COLD-AUDIT Finding 3 (build 52): the market-level volatility skip. A
+# hard-trending OPEN (a large one-directional BTC-spot move already visible in
+# the opening ticks) gives FLIP's reversion thesis no edge — the pile-in it
+# trades against never comes back. When the opening spot has already run >= this
+# many DOLLARS one-directionally (>= 2 ticks observed), OPEN skips its reversion
+# entry (HUNT, the momentum mode, and F are unaffected — F is byte-identical per
+# the audit's criterion #5). Conservative by Adversary guard (do not skip normal
+# markets); the trend reading is logged on EVERY open (skip or enter) so the
+# threshold is calibrated from data, not guessed (pairs with Finding 5).
+OPEN_TREND_SKIP_USD = 200.0       # DREW-DEFAULT (build 52): opening $-move that skips OPEN's reversion entry
 # WO-FLIP-EXIT-DOCTRINE (build 40): determined-against is a statement about
 # the MARKET'S DECISION (spot moved / time ran out), NOT the contract's
 # price. The band floor (35c) marks where SWINGS happen — a cheap entry is

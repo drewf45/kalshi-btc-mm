@@ -30,7 +30,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -62,7 +62,7 @@ def _rows(ledger, tag):
         "SELECT COUNT(*) FROM failures WHERE why_tag=?", (tag,)).fetchone()[0]
 
 
-def _open_leg(flip, gateway, ledger, entry=48):
+def _open_leg(flip, gateway, ledger, entry=40):
     """A booked OPEN leg whose take rests — the healthy custody shape."""
     props = flip.evaluate(TICKER, _ctx(_book(yes=entry), grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
@@ -92,7 +92,7 @@ def test_192145_self_net_void_flattens_not_rides(flip, gateway, ledger,
     """The leg Drew watched: the take is PROPOSED every cycle but never
     confirms resting (the self-net void). It must not ride to settlement —
     within a bounded escalation it FLATTENS at market."""
-    _open_leg(flip, gateway, ledger, entry=45)
+    _open_leg(flip, gateway, ledger, entry=40)
     # the take proposes but we NEVER call on_submitted — it rejected into
     # the void, exactly as the live self-net storm did
     flatten = None
@@ -116,7 +116,7 @@ def test_self_net_reconcile_cancels_stale_and_recovers(flip, gateway,
     cancels it; broker confirms the held size; the revived record covers
     the whole leg. No flatten, no bare leg."""
     w = flip._window(TICKER, CLOSE)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
     gateway.positions[(EVENT, TICKER, "FLIP")] = 1
     w.fills["yes"] = 48          # rung-A leg: re-proposes its take, never
     w.first_fill_ts = CLOSE - 790  # confirms (the self-net void)
@@ -150,7 +150,7 @@ def test_phantom_gap_reconciles_to_broker_no_flatten(flip, gateway, ledger):
                       "take_oid": None, "take_proposed": True,
                       "collapse_polls": 0, "det_ts": None,
                       "entry_oid": None, "defer_polls": 0, "done": True}
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 2, "PROBE")
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 2, "PROBE")
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 50, 2, "PROBE")  # held 0
     for s in (780, 779, 778, 777):
         flip.evaluate(TICKER, _ctx(_book(), secs_left=s))
@@ -167,7 +167,7 @@ def test_flatten_clamped_to_booked_net(flip, gateway, ledger):
                       "take_oid": None, "take_proposed": True,
                       "collapse_polls": 0, "det_ts": None,
                       "entry_oid": None, "defer_polls": 0}
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 2, "PROBE")
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 2, "PROBE")
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 50, 1, "PROBE")  # held 1
     flatten = None
     for s in range(780, 772, -1):
@@ -189,7 +189,7 @@ def test_flatten_confirmed_prevents_fatal(flip, gateway, ledger):
                       "take_oid": None, "take_proposed": True,
                       "collapse_polls": 0, "det_ts": None,
                       "entry_oid": None, "defer_polls": 0}
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
     for s in range(780, 772, -1):
         p = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=s))
         flat = next((x for x in p if x.purpose == "CUT" and

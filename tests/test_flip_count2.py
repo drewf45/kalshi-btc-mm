@@ -29,7 +29,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b

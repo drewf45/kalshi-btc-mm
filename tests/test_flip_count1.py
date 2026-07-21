@@ -23,7 +23,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def flip_book(yes=48, no=49, yq=10, nq=10):
+def flip_book(yes=40, no=49, yq=10, nq=10):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: yq}, {no: nq}, ts=1.0)
     return b
@@ -64,8 +64,8 @@ def test_second_open_fill_merges_and_take_sells_two(flip, gateway, ledger):
     props = flip.evaluate(TICKER, ctx(flip_book(), grain=GRAIN_YES2))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 40, CLOSE - 790)
     props2 = flip.evaluate(TICKER, ctx(flip_book(), secs_left=780))
     take1 = next(p for p in props2 if p.purpose == "EXIT")
     assert take1.count == 1                      # one-lot path unchanged
@@ -77,14 +77,14 @@ def test_second_open_fill_merges_and_take_sells_two(flip, gateway, ledger):
     assert "yes" not in w.fills                  # never the legacy rung-A dict
     o = w.opens["yes"]
     assert o["count"] == 2
-    assert o["entry"] == 49                      # (48+50)/2 count-weighted
+    assert o["entry"] == 45                      # (40+50)/2 count-weighted
     assert o["take_oid"] is None and o["take_proposed"] is False
     props3 = flip.evaluate(TICKER, ctx(flip_book(), secs_left=760))
     take2 = next(p for p in props3 if p.purpose == "EXIT")
     assert take2.count == 2                      # the whole bucket flips
     # WO-FLIP-GOAL-TAKE: the re-proposed take is goal-bounded at the MERGED
     # booked size (2 lots), never the retired fixed +20
-    assert take2.price_cents == 49 + LaneFlip._take_cents(2)
+    assert take2.price_cents == LaneFlip._take_price(45)   # middle-target on the merge
     assert _uncovered_rows(ledger) == []         # covered every cycle
 
 
@@ -105,8 +105,8 @@ def test_lean_two_lot_single_fill_exits_full_size(flip, gateway, ledger):
     and the take sells 2 — count rides the fills wiring end to end."""
     props = flip.evaluate(TICKER, ctx(flip_book(), grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 2, "PROBE")
-    flip.note_fill(TICKER, "yes", 48, CLOSE - 790, count=2)
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 2, "PROBE")
+    flip.note_fill(TICKER, "yes", 40, CLOSE - 790, count=2)
     assert flip.windows[TICKER].opens["yes"]["count"] == 2
     props2 = flip.evaluate(TICKER, ctx(flip_book(), secs_left=780))
     take = next(p for p in props2 if p.purpose == "EXIT")
@@ -139,7 +139,7 @@ def test_exit_clamped_to_booked_held(flip, gateway, ledger):
     w.opens["yes"] = {"entry": 48, "fill_ts": CLOSE - 790, "count": 2,
                       "take_oid": None, "take_proposed": False,
                       "collapse_polls": 0, "det_ts": None}
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 2, "PROBE")
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 2, "PROBE")
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 50, 1, "PROBE")
     props = flip.evaluate(TICKER, ctx(flip_book(), secs_left=700))
     take = next(p for p in props if p.purpose == "EXIT")
@@ -153,7 +153,7 @@ def test_exit_count_zero_marks_done_no_order(flip, gateway, ledger):
     w.opens["yes"] = {"entry": 48, "fill_ts": CLOSE - 790, "count": 2,
                       "take_oid": None, "take_proposed": False,
                       "collapse_polls": 0, "det_ts": None}
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 2, "PROBE")
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 2, "PROBE")
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 50, 2, "PROBE")
     props = flip.evaluate(TICKER, ctx(flip_book(), secs_left=700))
     assert [p for p in props if p.purpose == "EXIT"] == []

@@ -151,7 +151,7 @@ def test_exit_fill_concludes_with_summary(gateway, ledger, surface,
     from relay_engine.gateway import Order
     booker = FillBooker(gateway, ledger, surface, custodian=custodian)
     booker.anchor_fn = lambda market, side: (200.0, 500.0, 0.93)
-    b = _book(yes=48, no=49)
+    b = _book(yes=40, no=49)
     r = gateway.submit(Order(lane="F", event=EVENT, market=TICKER,
                              side="yes", action="buy", price_cents=48,
                              count=1, size_tier=config.TIER_PROBE,

@@ -23,7 +23,7 @@ GRAIN_NO3 = {"direction": "no", "length": 3, "k": 4}
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49, yq=10, nq=10):
+def _book(yes=40, no=49, yq=10, nq=10):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: yq} if yes is not None else {},
                      {no: nq} if no is not None else {}, ts=1.0)
@@ -43,7 +43,7 @@ def flip(gateway, ledger, surface):
     return LaneFlip(gateway, custodian=custodian)
 
 
-def _open_position(flip, gateway, side="yes", entry=48, grain_ctx=None):
+def _open_position(flip, gateway, side="yes", entry=40, grain_ctx=None):
     """Drive an OPEN entry to a filled patient hold; returns the window."""
     grain_ctx = grain_ctx or (GRAIN_YES2 if side == "yes" else GRAIN_NO3)
     props = flip.evaluate(TICKER, _ctx(_book(), grain=grain_ctx))
@@ -140,14 +140,14 @@ def test_patient_hold_ignores_wiggles(flip, gateway):
     beyond the resting take. (P21's −12¢ tolerance was the leak: risk must
     fit the take, so the determined trigger is entry−6 now.)"""
     from relay_engine.lane_flip import LaneFlip
-    _open_position(flip, gateway, side="yes", entry=48)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49), secs_left=780))
+    _open_position(flip, gateway, side="yes", entry=40)
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=780))
     # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the resting take is now the
-    # MIDDLE-target (entry 48 → 53c = max(52 middle, entry+5 fee-floor))
-    take_px = LaneFlip._take_price(48)
-    assert take_px == 53
+    # MIDDLE-target (entry 40 → 52c middle, build 52 tightened entry to <=42)
+    take_px = LaneFlip._take_price(40)
+    assert take_px == 52
     assert [p.reason for p in props] == \
-        [f"open take → middle {take_px}c (entry 48, gouge +{take_px - 48})"]
+        [f"open take → middle {take_px}c (entry 40, gouge +{take_px - 40})"]
     flip.on_submitted(props[0], "OID-T", CLOSE - 780)
     # mark wiggles to entry−5 (>= trigger 42): the hold HOLDS
     for secs in (770, 760, 750):
@@ -161,7 +161,7 @@ def test_determined_against_spot_evacuation(flip, gateway):
     WO-FLIP-LIQUIDITY-HOLD retired the price-floor triggers (illiquidity is
     held); the determined-against that fires in the hold is a CONFIRMED SPOT
     collapse (sustained 2 polls), which still crosses at the mark now."""
-    w = _open_position(flip, gateway, side="yes", entry=48)
+    w = _open_position(flip, gateway, side="yes", entry=40)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     w.opens["yes"]["fill_ts"] = CLOSE - 1030   # build 50: past the 4-min hard hold
@@ -172,19 +172,20 @@ def test_determined_against_spot_evacuation(flip, gateway):
     flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=771, spotlead=sl))
     props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=56), secs_left=770,
                                        spotlead=sl))
+    # OVERTURNED by WO-FULL-COLD-AUDIT Finding 1 (build 52): the SPOT-decided
+    # exit no longer crossfire-DUMPS at the mark — it walks to scratch as a
+    # MAKER (never below cost).
     assert len(props) == 1
     p = props[0]
-    assert (p.purpose, p.action, p.price_cents) == ("CUT", "sell", 34)
-    assert p.crossfire
-    assert "open determined-against" in p.reason
-    assert "SPOT decided" in p.reason
-    assert "evacuate now" in p.reason
+    assert (p.purpose, p.action, p.price_cents) == ("EXIT", "sell", 40)
+    assert not p.crossfire
+    assert "spot-decided" in p.reason and "scratch" in p.reason
 
 
 def test_determined_against_needle_collapse_sustained(flip, gateway):
     """ΔP-collapse >= K points against the held side, 2 sustained polls →
     determined; one flicker poll is NOT determination."""
-    _open_position(flip, gateway, side="yes", entry=48)
+    _open_position(flip, gateway, side="yes", entry=40)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     # P-FLIP-THESIS-1 §2: post-patience-window law (the floor is its own test)
@@ -203,33 +204,34 @@ def test_determined_against_needle_collapse_sustained(flip, gateway):
     # two SUSTAINED polls → evacuate NOW (P26 §3.2: crossfire, no maker)
     props = flip.evaluate(TICKER, _ctx(_book(yes=44, no=54), secs_left=764,
                                        spotlead=collapse))
+    # build 52 Finding 1: 2 sustained polls → walk to scratch (maker), not a dump
     assert len(props) == 1
-    assert props[0].purpose == "CUT" and props[0].crossfire
-    assert "ΔP-collapse" in props[0].reason
+    assert props[0].purpose == "EXIT" and not props[0].crossfire
+    assert "spot-decided" in props[0].reason and props[0].price_cents == 40
 
 
 def test_t10_handoff_clears_the_loser(flip, gateway):
     """P-FLIP-THESIS-1 §3.5 OVERTURNED the blind T-6 YIELD_TO_F flat: at
     T-10 the handoff is BOOK-AWARE — a side below basis is SOLD before
     F's window (crossfire), never dumped into the settlement zone."""
-    _open_position(flip, gateway, side="yes", entry=48)
+    _open_position(flip, gateway, side="yes", entry=40)
     take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=47, no=50),
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=50),
                                        secs_left=config.FLIP_DECISION_S - 1))
     assert len(props) == 1
     assert props[0].purpose == "CUT" and props[0].crossfire
     assert "open decision point" in props[0].reason
-    assert props[0].price_cents == 47                 # sold at the mark, now
+    assert props[0].price_cents == 34                 # sold at the mark, now
 
 
 def test_open_exit_realizes_no_scratch_count(flip, gateway):
     """A5: an OPEN exit realizes against its entry and counts NO scratch —
     the patient hold has no scratches, and the sit-out never feeds off it."""
-    w = _open_position(flip, gateway, side="yes", entry=48)
+    w = _open_position(flip, gateway, side="yes", entry=40)
     flip.note_exit(TICKER, "yes", 30, CLOSE - 700)
     assert "yes" not in w.opens
-    assert w.window_realized == -18
+    assert w.window_realized == -10
     assert w.scratches == 0
 
 

@@ -47,7 +47,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -73,7 +73,7 @@ def flip(gateway, ledger, surface):
                                                  ladder=DegradeLadder()))
 
 
-def _entry(flip, gateway, ledger, entry=44):
+def _entry(flip, gateway, ledger, entry=40):
     """A booked OPEN leg with its take resting — the 201215 shape."""
     b = OrderBook(market=TICKER)
     b.apply_snapshot({entry: 10}, {55: 10}, ts=1.0)
@@ -101,7 +101,7 @@ def test_44_entry_dip_is_illiquidity_holds(flip, gateway, ledger):
     scalp stop that sold into it is GONE — a 44¢ entry dipping to 34¢ HOLDS
     as the resting liquidity provider, waiting for the reversion to lift its
     take. Only a confirmed collapse (spot/catastrophe) cuts."""
-    o = _entry(flip, gateway, ledger, entry=44)
+    o = _entry(flip, gateway, ledger, entry=40)
     for secs in (770, 769, 768, 760, 740):
         assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                                 secs_left=secs))) == []
@@ -109,26 +109,32 @@ def test_44_entry_dip_is_illiquidity_holds(flip, gateway, ledger):
 
 
 # ── Part D, test 2: spot decides → CUT on spot, any time ───────────────────
-def test_spot_decision_cuts_any_time(flip, gateway, ledger):
-    """WO-BOTH-LANES-MARKET-TRUE (build 50) narrowed 'any time' to 'after the
-    4-min hard no-sell': the opening pile-in is held, then F's ΔP proof rules
-    the sell. Past the hard-hold (inside patience still), a sustained spot
-    collapse cuts on 2 polls."""
-    o = _entry(flip, gateway, ledger, entry=44)
+def test_spot_decision_walks_to_scratch_not_a_market_dump(flip, gateway, ledger):
+    """OVERTURNED by WO-FULL-COLD-AUDIT Finding 1 (build 52): a SPOT-decided
+    collapse NO LONGER crossfire-DUMPS at the depressed bid (the catastrophic-
+    loss generator). It routes through the walk-down — a MAKER exit at scratch
+    (entry, never below cost, no crossfire). And K is raised to 40, so only a
+    real decision triggers it (not 15pt drift). Past the hard-hold, 2 sustained
+    polls."""
+    o = _entry(flip, gateway, ledger, entry=40)
     o["fill_ts"] = CLOSE - 1050        # past FLIP_NO_SELL_S (age ~280), inside patience
     sl = Needle(side="no", d_before=10.0, d_after=90.0,
                 delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
                 fair_cents=0.0, t_remaining=700.0)
-    flip.evaluate(TICKER, _ctx(_book(yes=44, no=55), secs_left=770, sl=sl))
-    cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=44, no=55),
-                                            secs_left=769, sl=sl)))
-    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
+    flip.evaluate(TICKER, _ctx(_book(yes=38, no=55), secs_left=770, sl=sl))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=38, no=55),
+                                       secs_left=769, sl=sl))
+    assert _cuts(props) == []                          # NO market-dump
+    exits = [p for p in props if p.purpose == "EXIT"]
+    assert len(exits) == 1
+    assert exits[0].price_cents == 40 and not exits[0].crossfire   # scratch, maker
+    assert "spot-decided" in exits[0].reason and "scratch" in exits[0].reason
     assert not o.get("hold")
 
 
 # ── Part D, test 3: rides to the catastrophe floor → CUT (bounded) ─────────
 def test_ride_to_catastrophe_floor_cuts(flip, gateway, ledger):
-    o = _entry(flip, gateway, ledger, entry=44)
+    o = _entry(flip, gateway, ledger, entry=40)
     o["fill_ts"] = CLOSE - 1100                        # past the opening window
     flip.evaluate(TICKER, _ctx(_book(yes=20, no=55), secs_left=771))  # poll 1
     cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=20, no=55),
@@ -139,13 +145,13 @@ def test_ride_to_catastrophe_floor_cuts(flip, gateway, ledger):
 
 # ── Part D, test 5: the swing to 64 → TAKE, exit changes don't touch it ────
 def test_swing_to_take_still_fires(flip, gateway, ledger):
-    """The +20 take is unaffected by the exit-doctrine changes — a 44¢
-    entry's take rests at 64¢ and the fix leaves it intact."""
-    o = _entry(flip, gateway, ledger, entry=44)
-    assert o["take_oid"] == "OID-T1"       # the take rested at 44+20=64
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 64, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 64, CLOSE - 700, count=1)
-    assert flip.windows[TICKER].window_realized == 20
+    """The middle take is unaffected by the exit-doctrine changes — a 40¢
+    entry's take rests at the 52¢ middle and the fix leaves it intact."""
+    o = _entry(flip, gateway, ledger, entry=40)
+    assert o["take_oid"] == "OID-T1"       # the take rested at the 52 middle
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 52, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 52, CLOSE - 700, count=1)
+    assert flip.windows[TICKER].window_realized == 12   # 52 − 40
 
 
 # ── Part D, test 6: the cut REASON names a real decision, not illiquidity ──
@@ -153,7 +159,7 @@ def test_cut_reason_names_the_decision(flip, gateway, ledger):
     """The only cuts in the passive hold name a real DECISION — SPOT decided
     or the CATASTROPHE backstop — never a band-floor touch and never the
     retired scalp stop. An illiquidity dip (34¢) is HELD."""
-    o = _entry(flip, gateway, ledger, entry=44)
+    o = _entry(flip, gateway, ledger, entry=40)
     # a dip to the old band floor is illiquidity now → HOLD
     assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),
                                             secs_left=770))) == []
@@ -173,7 +179,7 @@ def test_unreverted_loser_clears_at_t10_not_a_price_floor(flip, gateway, ledger)
     low mark is illiquidity, held through the window. An unreverted loser is
     not stopped on price — it is cleared by the T-10 endgame handoff (the
     primary loss exit now), never ridden to settlement."""
-    o = _entry(flip, gateway, ledger, entry=44)
+    o = _entry(flip, gateway, ledger, entry=40)
     # even past patience, a low in-band mark HOLDS (no band-floor cut)
     o["fill_ts"] = CLOSE - 1100
     assert _cuts(flip.evaluate(TICKER, _ctx(_book(yes=34, no=55),

@@ -34,7 +34,7 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=48, no=49):
+def _book(yes=40, no=49):
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -166,9 +166,12 @@ def test_spot_collapse_still_cuts_sustained(flip):
                 fair_cents=0.0, t_remaining=700.0)
     b = _book(yes=40, no=55)
     flip._open_custody(*w_side_ctx(flip, b, now, 700, sl))           # poll 1
-    cuts = [p for p in flip._open_custody(*w_side_ctx(flip, b, now, 700, sl))
-            if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "SPOT decided" in cuts[0].reason
+    props = flip._open_custody(*w_side_ctx(flip, b, now, 700, sl))
+    # build 52 Finding 1: spot-decided walks to scratch (maker), never dumps
+    assert [p for p in props if p.purpose == "CUT"] == []
+    exits = [p for p in props if p.purpose == "EXIT"]
+    assert len(exits) == 1 and exits[0].price_cents == 44
+    assert "spot-decided" in exits[0].reason and not exits[0].crossfire
 
 
 def test_illiquidity_dip_is_not_a_spot_flicker(flip):
@@ -203,7 +206,7 @@ def test_thesis_entries_admitted_no_geometry_gate(flip):
     """The risk/reward geometry gate is gone — the entry filter is band
     membership (buy the cheap pile-in). The 44-49c thesis range is admitted;
     the lane trades so the reversion rate can be measured."""
-    for join in (40, 44, 48, 49):
+    for join in (28, 34, 40, 42):     # build 52: real-gouge range [25,42]
         no = min(55, 100 - join)
         props = flip.evaluate(TICKER, _ctx(_book(yes=join, no=no),
                                            grain=GRAIN_YES2))

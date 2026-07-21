@@ -74,7 +74,7 @@ def test_flip_takes_lead_its_proposal_list(gateway, ledger, surface):
     close = 1_000_000.0
     b = OrderBook(market=TICKER)
     # P21 A4: entries are Lane OPEN now — open-band book + grain streak
-    b.apply_snapshot({48: 20}, {49: 20}, ts=1.0)
+    b.apply_snapshot({40: 20}, {49: 20}, ts=1.0)
     ctx = {"book": b, "close_ts": close, "now": close - 850,
            "grain": {"direction": "yes", "length": 2, "k": 4}}
     props = flip.evaluate(TICKER, ctx)
