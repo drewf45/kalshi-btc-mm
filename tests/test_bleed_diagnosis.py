@@ -46,7 +46,7 @@ def _needle(side="no", fair=90.0):
                   fair_cents=fair, t_remaining=700.0)
 
 
-def _ctx(book, secs_left=800, sl=None, grain=None):
+def _ctx(book, secs_left=850, sl=None, grain=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": None, "grain": grain, "spotlead": sl}
 
@@ -140,15 +140,16 @@ def test_one_hunt_loss_sits_the_window_out_open_unaffected(flip, gateway,
     flip.note_exit(TICKER, "no", 28, CLOSE - 780, count=1)   # -2c: a loss
     assert flip.windows[TICKER].hunt_lost is True
     assert _hunt_at(flip, 45, 700) == []      # higher, same side — still out
+    # build 51: OPEN enters in the opening 90s; hunt_lost never gates it
     open_props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=49),
-                                            secs_left=650,
+                                            secs_left=850,
                                             grain=GRAIN_YES2))
     assert [(p.side, p.purpose) for p in open_props] == [("yes", "ENTRY")]
 
 
 # ── BLEED 3: the floor stops slipping ──────────────────────────────────────
 def _open_pos(flip, gateway, ledger, entry=48):
-    props = flip.evaluate(TICKER, _ctx(_book(yes=entry), secs_left=800,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=entry), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")

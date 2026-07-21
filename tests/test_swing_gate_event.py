@@ -41,7 +41,7 @@ def _book(yes=39, no=55):
     return b
 
 
-def _ctx(book, secs_left=800, grain=None, spot=STRIKE - 120):
+def _ctx(book, secs_left=850, grain=None, spot=STRIKE - 120):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": spot, "grain": grain, "spotlead": None,
             "boundary_lo": None, "boundary_hi": STRIKE}

@@ -53,7 +53,7 @@ def _book(yes=48, no=49):
     return b
 
 
-def _ctx(book, secs_left=800, grain=None, sl=None):
+def _ctx(book, secs_left=850, grain=None, sl=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": None, "grain": grain, "spotlead": sl}
 
@@ -77,7 +77,7 @@ def _entry(flip, gateway, ledger, entry=44):
     """A booked OPEN leg with its take resting — the 201215 shape."""
     b = OrderBook(market=TICKER)
     b.apply_snapshot({entry: 10}, {55: 10}, ts=1.0)
-    ctx = {"book": b, "now": CLOSE - 800, "close_ts": CLOSE, "spot": None,
+    ctx = {"book": b, "now": CLOSE - 850, "close_ts": CLOSE, "spot": None,
            "grain": GRAIN_YES2, "spotlead": None}
     props = flip.evaluate(TICKER, ctx)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)

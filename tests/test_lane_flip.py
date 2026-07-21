@@ -33,7 +33,7 @@ def flip_book(yes=40, no=45, yq=10, nq=10):
     return b
 
 
-def ctx(book, secs_left=800, spot=None, grain=None, spotlead=None):
+def ctx(book, secs_left=850, spot=None, grain=None, spotlead=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": spot, "grain": grain, "spotlead": spotlead}
 
@@ -138,11 +138,12 @@ def test_open_cheap_side_paid_up_passes(flip):
 
 
 def test_open_curfew_and_no_entry_phase(flip):
-    """P21 retired the PAIR-era first-5-minutes entry phase — waiting IS the
-    setup, so an open-band + grain book posts mid-window. The curfew stands."""
-    # P-FLIP-THESIS-1 §3.5: the scalp window is T-15→T-10 (was T-8)
+    """OVERTURNED by WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): entry is
+    the opening 90s only — an open-band book posts at the OPEN (secs_into 50),
+    never mid-window. The late curfew stands."""
+    # build 51: the entry window is T-15 → the first 90s (was mid-window)
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                      secs_left=650, grain=GRAIN_NO3))
+                                      secs_left=850, grain=GRAIN_NO3))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     flip.windows.clear()
     # past the T-10 cutoff nothing posts; window over posts nothing
@@ -206,9 +207,9 @@ def test_reentry_is_open_gated(flip, gateway):
     # needed. Too early is gated by the entry cutoff, not a grain wait.
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
                                      secs_left=200)) == []      # past T-10 cutoff
-    # inside the window: re-entry buys the cheap side (yes 48 < no 49)
+    # inside the opening 90s (build 51): re-entry buys the cheap side (yes 48 < no 49)
     props = flip.evaluate(TICKER, ctx(flip_book(yes=48, no=49),
-                                      secs_left=645))
+                                      secs_left=850))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 

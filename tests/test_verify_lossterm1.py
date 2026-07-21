@@ -102,7 +102,7 @@ def _flip_book(yes=48, no=49):
     return b
 
 
-def _flip_ctx(book, secs_left=800, grain=None):
+def _flip_ctx(book, secs_left=850, grain=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": None, "grain": grain, "spotlead": None}
 

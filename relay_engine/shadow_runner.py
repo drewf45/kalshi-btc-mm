@@ -1661,9 +1661,15 @@ async def run():
                               econ=engine.econ)
             print(pack, flush=True)
             now_et = datetime.now(ZoneInfo("America/New_York"))
-            if now_et.hour == 9 and last_full_day != now_et.date():
+            # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): the full pack must
+            # fire EVERY day — the old `hour == 9` was a 1-hour window a deploy
+            # or restart after 9am missed entirely (why it didn't fire today).
+            # `hour >= 9`, once per calendar day, on the first hourly tick at or
+            # after 9am ET: a post-9am restart still delivers the day's pack.
+            # It reads the DB (post-reconcile truth), never a deploy grade.
+            if now_et.hour >= 9 and last_full_day != now_et.date():
                 last_full_day = now_et.date()
-                engine.telegram.alert(pack)  # the 9AM full pack, on the phone
+                engine.telegram.alert(pack)  # the daily full pack, on the phone
             else:
                 from . import delta as _delta   # P26 §1.2: brain on the line
                 engine.telegram.alert(

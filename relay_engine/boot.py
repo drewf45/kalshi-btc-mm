@@ -213,6 +213,18 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(~−40) instead of riding to the −90 backstop; one attempt, "
                  "no re-entry (single-entry wall). F entry rest-back stands "
                  "(build 48, lane-agnostic) (WO-BOTH-LANES-MARKET-TRUE)")
+    from .lane_flip import FLIP_WINDOW_SEC as _FWS
+    lines.append(f"  FLIP OPENING-ONLY (build 51): entry HARD-CUT at "
+                 f"{config.OPEN_OPENING_WINDOW_S}s into the window (secs_into = "
+                 f"{_FWS}−secs_left) — FLIP buys the opening pile-in or SKIPS; "
+                 "no mid-market entry (the proven −15/−16 fix). Then the 4-min "
+                 "hard-hold + active exit stand unchanged")
+    lines.append("  INSTRUMENTATION (build 51): every FLIP conclusion writes "
+                 "the COMPLETE data point — entry/exit spot + price + spread + "
+                 "secs-into + reason tag + book depth both ends — to the DB and "
+                 "the tape; the daily pack fires EVERY day (hour>=9 ET, restart-"
+                 "safe) with at-a-glance 24h + fill-rate-by-posted-price, the "
+                 "money curve (WO-INSTRUMENTATION-AND-FLIP-TIMING)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

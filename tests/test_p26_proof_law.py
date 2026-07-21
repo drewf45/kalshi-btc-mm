@@ -24,7 +24,7 @@ def _book(yes=48, no=49):
     return b
 
 
-def _ctx(book, secs_left=800, grain=None, spotlead=None):
+def _ctx(book, secs_left=850, grain=None, spotlead=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": None, "grain": grain, "spotlead": spotlead}
 
@@ -195,13 +195,18 @@ def test_t10_handoff_replaces_yield_to_f(flip, gateway):
 
 
 def test_open_entry_schedule(flip):
-    """§3.3: entries T-15→T-8 only — at T-7 the window is F's."""
-    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
-                                      secs_left=config.OPEN_ENTRY_CUTOFF - 1)
-                         ) == []
+    """OVERTURNED by WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): entries only
+    in the first OPEN_OPENING_WINDOW_S (90s) of the window — the opening pile-in
+    is the setup. Past 90s into the window, no entry (the −15/−16 mid-market
+    class is retired)."""
+    # inside the first 90s (secs_into 50): enters
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
-                                       secs_left=config.OPEN_ENTRY_CUTOFF + 5))
+                                       secs_left=850))
     assert len(props) == 1
+    # past the 90s opening window (100s in): refused
+    flip.windows.clear()
+    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
+                                      secs_left=800)) == []
 
 
 def test_no_geometry_gate_admits_the_band(flip):

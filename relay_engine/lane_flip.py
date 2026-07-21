@@ -243,6 +243,11 @@ class FlipWindow:
     open_consumed: bool = False
     open_consumed_logged: bool = False
     open_geometry_logged: bool = False   # OPEN_BAD_GEOMETRY tags once
+    open_past_opening_logged: bool = False  # OPEN_PAST_OPENING tags once (build 51)
+    # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): the entry data point,
+    # stashed at the entry proposal and copied onto the position at note_fill —
+    # so the FLIP_SWING forensic record can reconstruct the whole trade.
+    entry_meta: Dict[str, dict] = field(default_factory=dict)  # side -> {spot, secs_into, book}
 
 
 class LaneFlip:
@@ -448,7 +453,9 @@ class LaneFlip:
                              "take_oid": None, "take_proposed": False,
                              "collapse_polls": 0, "catastrophe_polls": 0,
                              "det_ts": None,
-                             "entry_oid": entry_oid, "defer_polls": 0}
+                             "entry_oid": entry_oid, "defer_polls": 0,
+                             # build 51: the entry data point (Part A)
+                             "entry_meta": w.entry_meta.pop(side, None)}
             return
         w.fills[side] = price_cents
         if w.first_fill_ts is None:
@@ -516,7 +523,7 @@ class LaneFlip:
                 # unknowable until the position is flat)
                 self._log_swing_outcome(market, o["entry"],
                                         exit_price_cents, now,
-                                        o.get("fill_ts", now))
+                                        o.get("fill_ts", now), o=o)
                 self._promote_late_fill(w, market, side, now)
             # P26 §3.1: ANY OPEN exit consumes the window's one shot — the
             # pop above no longer re-opens the door (the located loophole).
@@ -664,6 +671,25 @@ class LaneFlip:
             return proposals               # §3.1: one shot per window
         if secs <= config.OPEN_ENTRY_CUTOFF:
             return proposals               # §3.3: OPEN's window is T-15→T-8
+        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — THE 90-SECOND ENTRY
+        # CUTOFF, the proven bug fix. The tape showed it timestamp by timestamp:
+        # FLIP entering in the first breath of the window (<=OPEN_OPENING_WINDOW_S
+        # into it) WINS — it buys the opening pile-in cheap, holds, and sells to
+        # the middle (the +16/+23 gouges). FLIP entering MID-MARKET gets NUTTED
+        # (the −15/−16 catastrophics): by then the pile-in is over and there is
+        # no reversion to be the other side of. So entry is HARD-CUT at the
+        # opening window: enter as early as possible, and if we have missed the
+        # open, SKIP — never wander in halfway. (secs_into, not secs_left: a
+        # sign error would invert it — see test_entry_cutoff_uses_secs_into.)
+        secs_into = FLIP_WINDOW_SEC - secs
+        if secs_into > config.OPEN_OPENING_WINDOW_S:
+            if not w.open_past_opening_logged:
+                w.open_past_opening_logged = True
+                log.info("OPEN_PAST_OPENING %s — %.0fs into window > %ds "
+                         "cutoff: the pile-in is over, no mid-market entry "
+                         "(the −15/−16 class is retired)", market, secs_into,
+                         config.OPEN_OPENING_WINDOW_S)
+            return proposals
         if self._net(market, event) != 0:
             return proposals               # R1 WALL: one position at a time
         # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the "both sides in
@@ -756,14 +782,26 @@ class LaneFlip:
         self._log_continuity(w, market, side)
         grain_note = (f"grain~{g.get('direction')}x{g.get('length')} informs"
                       if g else "grain~none")
+        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the ENTRY data point.
+        # Stash the full opening state now (spot, secs-into, book) keyed by
+        # side; note_fill copies it onto the position so the FLIP_SWING
+        # forensic record can reconstruct the whole trade after the fact.
+        spot = ctx.get("spot")
+        y_depth, n_depth = book.total_bid_depth("yes"), book.total_bid_depth("no")
+        w.entry_meta[side] = {
+            "spot": spot, "secs_into": round(secs_into, 1),
+            "spread": abs(yes_bid - no_bid), "cheap_bid": join,
+            "yes_depth": y_depth, "no_depth": n_depth}
+        spot_s = f"{spot:,.0f}" if spot is not None else "na"
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=(config.OPEN_ENTRY_FLOOR, config.OPEN_MAX_ENTRY_CENTS),
             rest_fp=book.best_fp(side),
-            why=f"OPEN liquidity {side}@{join}c cheap (spread "
-                f"{abs(yes_bid - no_bid)}c) · book y{yes_bid}/n{no_bid} · "
+            why=f"OPEN liquidity {side}@{join}c cheap (spot {spot_s}, into "
+                f"{int(secs_into)}s, book y{yes_bid}/n{no_bid} sprd"
+                f"{abs(yes_bid - no_bid)} depth {y_depth}/{n_depth}) "
                 f"rest→middle {config.OPEN_MIDDLE_TARGET}c · {proof} · "
                 + (swing["why"] if swing is not None else "swing~untabled")
                 + f" · {grain_note}"))
@@ -1124,6 +1162,21 @@ class LaneFlip:
             if self._defer_or_cancel_partial(o, market, side):
                 continue
             mark = self.held_price(side, book)   # WO-FLIP-SIDE-ORIENT: canonical held-side price
+            # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the running EXIT
+            # observation: the latest book/spot/timing, stamped every poll so
+            # whenever the position concludes the FLIP_SWING record has the true
+            # exit state. exit_reason starts TAKE_FILL (the resting take's own
+            # fill) and each active exit path below overrides it.
+            yb2, nb2 = book.best_yes_bid(), book.best_no_bid()
+            o["exit_obs"] = {
+                "spot": ctx.get("spot"),
+                "secs_into": round(FLIP_WINDOW_SEC - secs, 1),
+                "mark": mark,
+                "spread": (abs(yb2 - nb2) if yb2 is not None and nb2 is not None
+                           else None),
+                "yes_depth": book.total_bid_depth("yes"),
+                "no_depth": book.total_bid_depth("no")}
+            o.setdefault("exit_reason", "TAKE_FILL")
             # TAKE — posted the instant the entry books (the maker intent).
             # FLIP-COUNT-1: sized to min(memory, booked-held), never more.
             # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the take rests toward
@@ -1181,6 +1234,7 @@ class LaneFlip:
                     continue
                 self._cancel_resting(o)
                 o["done"] = True
+                o["exit_reason"] = "HANDOFF_LOSER"     # build 51 tag
                 n = self._exit_count(market, side, o["count"])
                 if n > 0:
                     props.append(Order(
@@ -1260,6 +1314,8 @@ class LaneFlip:
             if determined:
                 self._cancel_resting(o)
                 o["done"] = True
+                o["exit_reason"] = ("CATASTROPHE" if o["catastrophe_polls"] >= 2
+                                    else "SPOT_DECIDED")   # build 51 tag
                 n = self._exit_count(market, side, o["count"])
                 if n > 0:
                     props.append(Order(
@@ -1297,6 +1353,7 @@ class LaneFlip:
                     if n > 0:
                         o["take_px"] = stepped
                         o["take_proposed"] = True
+                        o["exit_reason"] = "WALK_DOWN"      # build 51 tag
                         props.append(Order(
                             lane="FLIP", event=event, market=market, side=side,
                             action="sell", price_cents=stepped, count=n,
@@ -1570,7 +1627,8 @@ class LaneFlip:
 
     def _log_swing_outcome(self, market: str, entry: int, exit_px: int,
                            now: float, fill_ts: float,
-                           held_to_settle: bool = False) -> None:
+                           held_to_settle: bool = False,
+                           o: Optional[dict] = None) -> None:
         """WO-FLIP-CHEAP-LIVE §3 INSTRUMENT 1+2: every cheap OPEN entry
         logs its conclusion — after 20-30 rows this IS the measured swing
         rate (the 80% stops being a guess). Losers additionally audit the
@@ -1588,11 +1646,34 @@ class LaneFlip:
         # the retired +20. This is the instrument §4 wants: with a reachable
         # target the took-rate rises sharply where the +20 rarely printed.
         took = exit_px >= entry + config.OPEN_TAKE_MIN - 1
+        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the COMPLETE per-trade
+        # data point: entry/exit spot PRICES (not just delta), captured spread,
+        # precise window-timing (secs-into at entry AND exit — the ≤90s-vs-mid
+        # distinction), the exact exit reason tag, and book state both ends. So
+        # a 25-hour run is fully reconstructable and any loss is diagnosable.
+        em = (o or {}).get("entry_meta") or {}
+        xo = (o or {}).get("exit_obs") or {}
+        reason = "HANDOFF_WINNER" if held_to_settle else (o or {}).get(
+            "exit_reason", "TAKE_FILL")
         detail = {"market": market, "entry_price": entry,
                   "took_swing": bool(took), "exit_price": exit_px,
                   "gross_cents": gross, "salvaged": gross < 0,
                   "secs_to_swing": round(max(0.0, now - fill_ts), 1),
-                  "held_to_settle": held_to_settle}
+                  "held_to_settle": held_to_settle,
+                  "exit_reason": reason,
+                  # spot prices — the BTC move, reconstructable
+                  "entry_spot": em.get("spot"), "exit_spot": xo.get("spot"),
+                  # window timing — the everything distinction
+                  "entry_secs_into": em.get("secs_into"),
+                  "exit_secs_into": xo.get("secs_into"),
+                  # book state both ends — illiquidity vs real-move, after the fact
+                  "entry_spread": em.get("spread"), "exit_spread": xo.get("spread"),
+                  "entry_depth": [em.get("yes_depth"), em.get("no_depth")],
+                  "exit_depth": [xo.get("yes_depth"), xo.get("no_depth")],
+                  "entry_cheap_bid": em.get("cheap_bid"),
+                  # the posted gouge level (the middle target) — the x-axis of
+                  # the fill-rate-by-price curve (Part B); filled == TAKE_FILL
+                  "posted_take": self._take_price(entry)}
         try:
             surface.write_row("FLIP", market, f"w-{market}", "FLIP_SWING",
                               detail=json.dumps(detail))
@@ -1644,7 +1725,7 @@ class LaneFlip:
             self._log_swing_outcome(market, o["entry"], int(mark),
                                     now if now is not None else time.time(),
                                     o.get("fill_ts", 0.0),
-                                    held_to_settle=True)
+                                    held_to_settle=True, o=o)
 
     def held(self, market: str) -> Dict[str, dict]:
         """§4 THE SHARED INVENTORY: side -> {count, basis} of live FLIP

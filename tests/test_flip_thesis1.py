@@ -31,7 +31,7 @@ def _book(yes=48, no=49):
     return b
 
 
-def _ctx(book, secs_left=800, grain=None):
+def _ctx(book, secs_left=850, grain=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
             "spot": None, "grain": grain, "spotlead": None}
 
@@ -56,7 +56,7 @@ def _open_position(flip, gateway, ledger, side="yes", entry=48,
                    fill_secs_left=790):
     """An OPEN custody position via the real path: proposal, submit-marker,
     booked fill."""
-    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=800,
+    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", side, "ENTRY", entry, 1, "PROBE")
@@ -257,7 +257,7 @@ def test_continuity_logs_agreement_and_never_votes(flip, gateway, ledger,
     import logging
     ledger.record_outcome("KXBTC15M-PRIOR-T99", False)     # prior went NO
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
-        props = flip.evaluate(TICKER, _ctx(_book(), secs_left=800,
+        props = flip.evaluate(TICKER, _ctx(_book(), secs_left=850,
                                            grain=GRAIN_YES2))
         flip.evaluate(TICKER, _ctx(_book(), secs_left=799,
                                    grain=GRAIN_YES2))      # once per window
@@ -272,7 +272,7 @@ def test_continuity_silent_with_no_prior_window(flip, gateway, ledger,
                                                 caplog):
     import logging
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
-        flip.evaluate(TICKER, _ctx(_book(), secs_left=800, grain=GRAIN_YES2))
+        flip.evaluate(TICKER, _ctx(_book(), secs_left=850, grain=GRAIN_YES2))
     assert not any("OPEN_CONTINUITY" in r.message for r in caplog.records)
 
 
@@ -285,7 +285,7 @@ def test_scalp_take_rests_at_the_goal_bounded_move(flip, gateway, ledger):
     the win convergence actually gives; the +20 was the SOMETIMES."""
     take_cents = LaneFlip._take_cents(1)           # 5 at the 1-lot cap
     # yes 49 < no 50 -> yes is the cheap side (WO-FLIP-IMMEDIATE-ENTRY buys it)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=49, no=50), secs_left=800,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=49, no=50), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 49, 1, "PROBE")
@@ -310,7 +310,9 @@ def test_no_new_scalp_entry_at_or_after_t10(flip):
                                       grain=GRAIN_YES2)) == []
     assert flip.evaluate(TICKER, _ctx(_book(), secs_left=550,
                                       grain=GRAIN_YES2)) == []
-    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=601,
+    # build 51: entry only in the opening 90s (secs_into 50 here); 601 (299s
+    # into the window) is now past the opening cutoff too
+    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=850,
                                        grain=GRAIN_YES2))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 

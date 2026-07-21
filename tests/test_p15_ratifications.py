@@ -32,7 +32,7 @@ def flip_book(yes, no):
     return b
 
 
-def flip_ctx(engine, book, secs_left=800):
+def flip_ctx(engine, book, secs_left=850):
     close = 1_000_000.0
     return {"book": book, "now": close - secs_left, "close_ts": close}
 

@@ -272,6 +272,39 @@ def flip_fill_rate_hourly(ledger) -> str:
     return f"flip_fill={fr} flip_maker={mk}"
 
 
+def flip_fill_rate_by_price(ledger, limit: int = 500) -> str:
+    """WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — THE MONEY CURVE.
+    Of the takes posted at each gouge level (the posted middle-target price),
+    what % FILLED (exit_reason TAKE_FILL) vs walked-down / cut / handed off.
+    This is how the broker sees how much each side of the middle is worth: if
+    posting at 52 fills 40% and posting at 50 fills 70%, the curve rules the
+    optimal gouge. Every concluded take is a data point here (post-reconcile
+    surface truth). Bucketed by posted_take price, most-populated first."""
+    import json as _json
+    buckets = {}   # posted_take -> [filled, total]
+    for (d,) in ledger.db.execute(
+            "SELECT detail FROM surface_rows WHERE state='FLIP_SWING'"
+            " ORDER BY id DESC LIMIT ?", (limit,)).fetchall():
+        try:
+            row = _json.loads(d)
+        except Exception:
+            continue
+        px = row.get("posted_take")
+        if px is None:
+            continue
+        b = buckets.setdefault(int(px), [0, 0])
+        b[1] += 1
+        if row.get("exit_reason") == "TAKE_FILL":
+            b[0] += 1
+    if not buckets:
+        return "FILL-RATE BY POSTED PRICE (24h): no concluded takes yet"
+    parts = []
+    for px in sorted(buckets):
+        filled, tot = buckets[px]
+        parts.append(f"{px}c:{100.0 * filled / tot:.0f}%({filled}/{tot})")
+    return "FILL-RATE BY POSTED PRICE (24h): " + " · ".join(parts)
+
+
 def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[int] = None,
                foreign_fills: int = 0, econ=None) -> str:
     """The daily pack: EPOCH 2 header, the worst-day bound, live-vs-pending
@@ -461,6 +494,12 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
             lines.append("FLIP SWING (24h): no concluded cheap entries yet")
     except Exception as e:
         lines.append(f"FLIP SWING: unavailable ({e})")
+    # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — THE MONEY CURVE: of the
+    # takes posted at each gouge level, what % filled. How much each side is worth.
+    try:
+        lines.append(flip_fill_rate_by_price(ledger))
+    except Exception as e:
+        lines.append(f"FILL-RATE BY POSTED PRICE: unavailable ({e})")
     # WO-SWING-GATE-EVENT §3: the gate's calibration — the OLD strike-touch
     # proxy (constant ~0.89 = the bug) vs Instrument 1's measured
     # took_swing, and §2's shadow two-barrier prediction. When the shadow

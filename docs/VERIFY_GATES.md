@@ -2186,6 +2186,70 @@ walk extends past the old T-10; F 40pt slip salvages immediately table-blind, a
 (not the 12:46 −17c cut) then filled/walked; an F favorite salvaged at ~−40 on a
 40pt slip (not the −$2.77 dump); F rejects → 0; both lanes printing.
 
+## WO-INSTRUMENTATION-AND-FLIP-TIMING — every place a data point (build 51)
+
+**Before a 25-hour run:** fix the one proven bug (FLIP entry timing) and light
+every instrument so the run produces a dataset, not just a P&L number.
+
+**Read-rule at source (all premises TRUE):**
+- **Part A — tags went silent:** TRUE. `_log_swing_outcome` (the per-trade
+  record) carried entry/exit px, gross, timing-to-swing — but NOT entry/exit
+  SPOT prices, spread, secs-into, exit reason, or book state.
+- **Part B — pack exists, didn't fire:** TRUE. `daily_pack()` (ops.py:275) is
+  called by `pack_task` (shadow_runner.py). The full pack was gated on
+  `now_et.hour == 9` — a **1-hour window** a deploy/restart after 9am missed
+  entirely (the real cause; NOT a deploy-grade gate).
+- **Part C — no early entry cutoff:** TRUE. The entry gate (`lane_flip.py:665`)
+  only checked the LATE boundary (`secs <= OPEN_ENTRY_CUTOFF`); `FLIP_WINDOW_SEC
+  =900` and `OPEN_OPENING_WINDOW_S=90` both exist to reuse.
+
+**A — rich per-trade tagging.** Entry state is stashed at the proposal
+(`w.entry_meta[side]` = spot, secs-into, spread, cheap-bid, depth) and copied
+onto the position at `note_fill`; every custody poll stamps the running exit
+observation (`o["exit_obs"]`), and each active exit path tags `o["exit_reason"]`
+(TAKE_FILL / WALK_DOWN / SPOT_DECIDED / CATASTROPHE / HANDOFF_LOSER /
+HANDOFF_WINNER). `_log_swing_outcome` writes the COMPLETE FLIP_SWING record:
+entry/exit spot PRICES, captured spread, secs-into at entry AND exit (the
+≤90s-vs-mid distinction), the exact reason tag, book depth both ends, and the
+posted gouge level. The entry `why` (the Telegram-readable line) now carries
+`spot`, `into Ns`, and `book y../n.. sprd.. depth ../..`.
+
+**B — the daily pack.** Trigger robustified: `now_et.hour >= 9`, once per
+calendar day — a post-9am restart still delivers the day's pack (reads DB
+post-reconcile truth, never a deploy grade). Added the **money curve**,
+`flip_fill_rate_by_price` (ops.py): of the takes posted at each gouge level,
+what % FILLED (exit_reason TAKE_FILL) vs walked/cut — bucketed by posted price,
+surfaced in the pack. The at-a-glance 24h views (`fill_economics`,
+`flip_fill_rate_hourly`, FLIP SWING) already ship in the pack.
+
+**C — the 90-second entry cutoff (the proven fix).** `secs_into =
+FLIP_WINDOW_SEC − secs`; if `secs_into > OPEN_OPENING_WINDOW_S(90)` FLIP does
+not enter (logs `OPEN_PAST_OPENING`). The tape proved it: FLIP wins buying the
+opening pile-in (≤90s, the +16/+23 gouges) and loses wandering in mid-market
+(the −15/−16 catastrophics — no pile-in left, no reversion). The two-sided +
+real-cheap-side + trend-guard requirements stay (Adversary guard a: never fire
+into a one-sided book). The safety-net doctrine — fire on the first valid
+opening book, never wait for a "misplacement" — is the existing immediate-entry
+(build 47/49) now bounded to the opening window. **Note (for veto):** the
+opening-window floor (25) and true-50/50 skip are retained per the mandatory
+Adversary "real cheap side" guard; Part A's data will show if any skip class
+should relax — as Drew ruled ("data decides skip classes; no volatility
+sit-out").
+
+**HARD RAIL:** F unchanged; sizing-with-book unchanged; `FLIP_SIZE_CAP=1`;
+rate-halt, cash + deny-fatal, catastrophe-illiquidity guards, reset intact; no
+Kelly change. New/reused constants: FLIP entry cutoff = `OPEN_OPENING_WINDOW_S`
+(90, reused); pack `hour>=9` ungated. 61 overturned test-laws re-anchored (entry
+drives moved from `secs_left=800`/mid-window into the opening 90s) + new
+acceptance `test_instrumentation_flip_timing.py` (10 tests: cutoff enters ≤90s /
+refuses >90s / uses secs-into not secs-left / needs a two-sided cheap side; the
+FLIP_SWING record carries the full data point; entry why carries spot+timing+
+book; walk-down tagged; the fill-rate-by-price curve + pack inclusion). Suite
+642 · preflight 23/23. **Watch live:** an ENTRY/EXIT line carrying spot prices +
+secs-into + reason; a FLIP entry REFUSED for secs-into>90 (`OPEN_PAST_OPENING`);
+the daily pack firing with the fill-rate-by-price curve; the last two losers
+pulled, each with full why + what-happened.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
