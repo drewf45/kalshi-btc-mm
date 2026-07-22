@@ -197,6 +197,15 @@ OPEN_TREND_SKIP_USD = 200.0       # DREW-DEFAULT (build 52): opening $-move that
 # two positions with the same book state get the same decision) is the ONLY
 # price backstop that acts inside patience; spot+time are the primary cut.
 OPEN_CATASTROPHE_FLOOR = 20        # DREW-DEFAULT: fixed price backstop, well below the swing band
+# WO-2026-07-21-FLIP-SELECTION A1 (build 53): the price floor is RELATIVE to
+# entry — max(OPEN_CATASTROPHE_FLOOR, entry − OPEN_SALVAGE_BUDGET_C). An ABSOLUTE
+# 20c floor under a VARIABLE entry (25-42) meant a 42c entry risked 22c and a 29c
+# entry 9c — an undeclared size-by-entry-price, and it deferred the cut until the
+# price was worse (the hold that guarantees a worse exit). The budget is the EV
+# table's OWN assumption (2c band-floor expectation + 5c slip, rounded up) — it
+# MUST equal that assumption or the EV table stays inverted (FLIP_FLOOR_BREACH).
+# The relative floor exits as a MAKER; only the absolute 20c floor crossfires.
+OPEN_SALVAGE_BUDGET_C = 8          # DREW-DEFAULT (build 53): max bounded loss = the EV table's 2c+5c assumption, rounded
 # WO-FLIP-CATASTROPHE-ILLIQUIDITY (build 48): the catastrophe PRICE floor was
 # firing on a SINGLE poll of a thin-book low bid — a fresh cheap entry's
 # held-side bid sits ~19-20c because there are no buyers YET (the opening

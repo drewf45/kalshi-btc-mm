@@ -823,21 +823,37 @@ class LaneFlip:
         # forensic record can reconstruct the whole trade after the fact.
         spot = ctx.get("spot")
         y_depth, n_depth = book.total_bid_depth("yes"), book.total_bid_depth("no")
+        # WO-2026-07-21-FLIP-SELECTION A3 (build 53): the DEPTH RATIO — held-side
+        # depth ÷ other-side depth. On the tape the winner bought the cheap side
+        # WITH depth behind it (1.40×); both losers bought the thin abandoned
+        # side (0.59-0.60×). Recorded here as the most promising unexploited
+        # signal — but it GATES ON NOTHING (n=3; a hypothesis to rule on at
+        # n>=20, NEVER a live gate until then).
+        held_d = y_depth if side == "yes" else n_depth
+        other_d = n_depth if side == "yes" else y_depth
+        depth_ratio = round(held_d / other_d, 2) if other_d else None
         w.entry_meta[side] = {
             "spot": spot, "secs_into": round(secs_into, 1),
             "spread": abs(yes_bid - no_bid), "cheap_bid": join,
             "yes_depth": y_depth, "no_depth": n_depth,
-            "open_trend_usd": round(trend_usd, 1)}   # build 52: the calibration reading
+            "open_trend_usd": round(trend_usd, 1),   # build 52: calibration reading
+            "depth_ratio": depth_ratio}              # build 53 A3: RECORD-ONLY, no gate
         spot_s = f"{spot:,.0f}" if spot is not None else "na"
+        dr_s = f"{depth_ratio:.2f}x" if depth_ratio is not None else "na"
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=(config.OPEN_ENTRY_FLOOR, config.OPEN_MAX_ENTRY_CENTS),
             rest_fp=book.best_fp(side),
+            # A2 (build 53): trend_usd printed on EVERY entry (enter AND skip),
+            # so the OPEN_TREND_SKIP_USD threshold is set from the observed
+            # distribution on Saturday — not guessed. A3: depth_ratio printed
+            # for the same reason (record-only).
             why=f"OPEN liquidity {side}@{join}c cheap (spot {spot_s}, into "
                 f"{int(secs_into)}s, book y{yes_bid}/n{no_bid} sprd"
-                f"{abs(yes_bid - no_bid)} depth {y_depth}/{n_depth}) "
+                f"{abs(yes_bid - no_bid)} depth {y_depth}/{n_depth} "
+                f"ratio {dr_s} trend ${trend_usd:+.0f}) "
                 f"rest→middle {config.OPEN_MIDDLE_TARGET}c · {proof} · "
                 + (swing["why"] if swing is not None else "swing~untabled")
                 + f" · {grain_note}"))
@@ -1006,13 +1022,24 @@ class LaneFlip:
             if self.custodian is not None else None
         if surface is not None:
             try:
+                # A3 (build 53): the depth ratio rides the compare row too, so
+                # the hypothesis (cheap-side-with-depth wins) can be ruled on
+                # from the same n the swing gate accrues. RECORD-ONLY, no gate.
+                _bk = ctx.get("book")
+                _dr = None
+                if _bk is not None:
+                    _hd = (_bk.total_bid_depth("yes") if side == "yes"
+                           else _bk.total_bid_depth("no"))
+                    _od = (_bk.total_bid_depth("no") if side == "yes"
+                           else _bk.total_bid_depth("yes"))
+                    _dr = round(_hd / _od, 2) if _od else None
                 surface.write_row(
                     "FLIP", market, f"w-{market}", "SWING_GATE_COMPARE",
                     detail=json.dumps({
                         "band": band, "join": join,
                         "measured_rate": rate, "n": n,
                         "shadow_p_up": p_up, "shadow_p_down": p_down,
-                        "old_proxy_p": proxy}))
+                        "old_proxy_p": proxy, "depth_ratio": _dr}))
             except Exception:
                 pass
         p_up_s = f"{p_up:.2f}" if p_up is not None else "na"
@@ -1332,7 +1359,14 @@ class LaneFlip:
             # A real move is caught by the spot-decided branch regardless.
             held_depth = book.visible_depth(side, mark) if mark is not None else 0
             past_opening = age >= config.OPEN_OPENING_WINDOW_S
-            cat_hit = (mark is not None and mark <= catastrophe
+            # WO-2026-07-21-FLIP-SELECTION A1 (build 53): the floor is RELATIVE
+            # to entry, bounded below by the absolute 20c. Every FLIP loss is now
+            # capped at OPEN_SALVAGE_BUDGET_C instead of riding to the absolute
+            # 20c (a 22c loss on a 42c entry). The trigger fires earlier — at
+            # entry−budget — so the loss is bounded, not deferred-then-worse.
+            salvage_floor = max(config.OPEN_CATASTROPHE_FLOOR,
+                                o["entry"] - config.OPEN_SALVAGE_BUDGET_C)
+            cat_hit = (mark is not None and mark <= salvage_floor
                        and held_depth >= config.OPEN_CATASTROPHE_MIN_DEPTH
                        and past_opening)
             o["catastrophe_polls"] = \
@@ -1354,18 +1388,35 @@ class LaneFlip:
             if o["catastrophe_polls"] >= 2:
                 self._cancel_resting(o)
                 o["done"] = True
-                o["exit_reason"] = "CATASTROPHE"
                 n = self._exit_count(market, side, o["count"])
-                if n > 0:
+                if n > 0 and mark is not None and mark <= catastrophe:
+                    # the ABSOLUTE 20c floor — genuinely gone; crossfire out
+                    # before zero (unchanged; this one is correctly violent).
+                    o["exit_reason"] = "CATASTROPHE"
                     props.append(Order(
                         lane="FLIP", event=event, market=market, side=side,
-                        action="sell",
-                        price_cents=mark if mark is not None else max(1, o["entry"] - 1),
+                        action="sell", price_cents=mark,
                         count=n, size_tier=config.TIER_PROBE,
                         purpose="CUT", crossfire=True,
                         reason=f"open determined-against: CATASTROPHE floor "
                                f"{side} {mark}c <= {catastrophe}c — genuinely "
                                f"gone (depth {held_depth}), evacuate now"))
+                elif n > 0:
+                    # the RELATIVE salvage floor (entry−budget, > 20) — a bounded
+                    # ~budget loss, exited as a MAKER (fee-saved), never a
+                    # crossfire market-dump. A5-legal (a DETERMINED-class exit,
+                    # not a CATASTROPHE). Posts at the floor so the loss is
+                    # capped; if the falling book never lifts it, the decision
+                    # handoff clears it at the endgame.
+                    o["exit_reason"] = "SALVAGE_FLOOR"
+                    props.append(Order(
+                        lane="FLIP", event=event, market=market, side=side,
+                        action="sell", price_cents=salvage_floor, count=n,
+                        size_tier=config.TIER_PROBE, purpose="EXIT",
+                        reason=f"open salvage floor → {salvage_floor}c (entry "
+                               f"{o['entry']}, budget "
+                               f"{config.OPEN_SALVAGE_BUDGET_C}c — maker, bounded "
+                               "loss, no dump)"))
             elif o["collapse_polls"] >= 2 and not o.get("hold"):
                 # the graceful decision exit — walk to scratch as a MAKER, no
                 # crossfire, no market-dump (Finding 1 acceptance #1).
@@ -1520,10 +1571,21 @@ class LaneFlip:
                 # opens record
                 if side not in w.uncovered_paged:
                     w.uncovered_paged.add(side)
+                    # WO-2026-07-21-FLIP-SELECTION A4 (build 53): a cover INTENT
+                    # exists (the take proposed but its oid has not confirmed) —
+                    # with FLIP_SIZE_CAP=1 this is the routine post-fill state,
+                    # and paging it on EVERY entry trained the eye to scroll past
+                    # the ONE real naked leg (it is how A5 got missed for 24h).
+                    # Demote to INFO here; the RECONCILE still runs and the
+                    # ESCALATION below (retry → FLATTEN) carries the real page if
+                    # the cover genuinely never confirms.
+                    intent = ((o is not None and o.get("take_proposed"))
+                              or (h is not None and h.get("take_proposed")))
                     failures.fail(
                         "FLIP_UNCOVERED_LEG",
-                        f"{market} {side}: held {held} > covered {covered}",
-                        fatal=False, alert=True, market=market, side=side,
+                        f"{market} {side}: held {held} > covered {covered}"
+                        + (" (cover proposed, awaiting confirm)" if intent else ""),
+                        fatal=False, alert=not intent, market=market, side=side,
                         held=held, covered=covered,
                         buckets=";".join(provenance) or "none")
                 self._reconcile_side(w, market, side)

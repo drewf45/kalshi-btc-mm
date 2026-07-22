@@ -236,6 +236,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"{config.OPEN_MAX_ENTRY_CENTS}c (real-gouge only). Swing-gate "
                  "telemetry logged every window. F byte-identical "
                  "(WO-FULL-COLD-AUDIT)")
+    lines.append(f"  FLIP SELECTION (build 53): the price floor is RELATIVE — "
+                 f"max(20c, entry−{config.OPEN_SALVAGE_BUDGET_C}c) — so every "
+                 "loss is bounded at the EV table's own budget (was an absolute "
+                 "20c under a 25-42c entry = an undeclared size-by-price); the "
+                 "relative floor exits as a MAKER (A5-legal), only the absolute "
+                 "20c crossfires. Every OPEN entry prints trend_usd + depth_"
+                 "ratio (record-only, calibrate Saturday); the routine "
+                 "cover-pending leg no longer pages (WO-2026-07-21-FLIP-SELECTION)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

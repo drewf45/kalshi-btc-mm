@@ -2314,6 +2314,72 @@ live:** zero market-dump exits on a SPOT_DECIDED (every loss shows the walk-down
 path); `OPEN_TREND_SKIP` events with the volatility reading; no FLIP entries
 above 42c; the `swing …` telemetry line every window.
 
+## WO-2026-07-21-FLIP-SELECTION — the tape-derived Part A (build 53)
+
+**The tape's arithmetic (7:09–9:15 PM 0721, 9 windows):** F +30c · FLIP −11c ·
+net +$0.19. The build-52 cluster WORKED (worst loss 18c vs the −$1.40 class);
+this is a **selection** problem, not a bleed. Part A ships the weekday-legal
+subset (observed bugs + instrumentation); Part B (margin-gate SUPPRESS, per-lane
+rate halt, threshold calibration, the 17c reconciler gap) is **Saturday-class,
+held for Drew's ruling — NOT built here.**
+
+**Read-rule at source (all TRUE):**
+- **A1** — the engine graded itself out of doctrine: 2/3 FLIP trades exited via
+  CATASTROPHE (A5-forbidden for OPEN), and `FLIP_FLOOR_BREACH` fired ("loser cut
+  17c past the 2c band-floor expectation"). `OPEN_CATASTROPHE_FLOOR=20` is
+  ABSOLUTE (config.py:199) while entries are 25-42 — an undeclared size-by-entry-
+  price, and the hold *defers* the cut until the price is worse.
+- **A2** — zero `OPEN_TREND_SKIP` in 9 windows: a $200/60s move at 66k is a
+  once-a-month event, so the gate structurally cannot fire; `trend_usd` was
+  logged only on skip.
+- **A4** — `FLIP_UNCOVERED_LEG` pages on 100% of entries (`held 1 > covered 0`,
+  the routine 1-lot post-fill state) — a warning that always fires is how A5 got
+  scrolled past.
+
+**A1 — the catastrophe floor is RELATIVE to entry.** `salvage_floor = max(
+OPEN_CATASTROPHE_FLOOR, entry − OPEN_SALVAGE_BUDGET_C)`, new
+`OPEN_SALVAGE_BUDGET_C=8` (the EV table's own 2c band-floor + 5c slip, rounded —
+pinned to that assumption or the table re-inverts). Every FLIP loss is now
+bounded at ~8c instead of riding to the absolute 20c (a 22c loss on a 42c
+entry). The relative-floor exit is a **MAKER** (`crossfire=False`, tagged
+`SALVAGE_FLOOR`, A5-legal — a DETERMINED-class exit, not a CATASTROPHE); **only
+the absolute 20c floor** (genuinely gone) keeps its crossfire. All build-48
+guards intact (depth ≥ min, `past_opening`, sustained ≥ 2).
+
+**A2 — `trend_usd` on every OPEN entry line** (enter AND skip), so
+`OPEN_TREND_SKIP_USD` is set from the observed distribution on Saturday, not
+guessed. **The threshold is NOT changed in this build** (no distribution yet).
+
+**A3 — `depth_ratio` (held ÷ other) recorded** on the FLIP entry row and the
+`SWING_GATE_COMPARE` row — the tape's most promising unexploited signal (winner
+1.40×, both losers 0.59-0.60×). **It GATES ON NOTHING** (n=3; a hypothesis to
+rule on at n ≥ 20, never a live gate — the comment says so in the code, per the
+Adversary).
+
+**A4 — the routine cover-pending leg no longer pages.** `FLIP_UNCOVERED_LEG` at
+`esc==0` is demoted to non-alert **when a cover intent exists** (the take
+proposed, its oid not yet confirmed — the routine 1-lot state); the RECONCILE
+still runs and the genuine self-net void still escalates to a paged FLATTEN. The
+always-on warning that masked A5 is silenced without losing the real protection.
+
+**HARD RAIL:** F byte-identical (Part A touches only OPEN's floor + entry
+telemetry + one uncovered-page level); no Kelly / cash / rate-halt change;
+`FLIP_SIZE_CAP=1`; catastrophe-illiquidity guards intact. New constant:
+`OPEN_SALVAGE_BUDGET_C=8`. 1 build-52 acceptance re-anchored (a mark that now
+hits the relative floor before SPOT_DECIDED) + new acceptance (A1 relative-floor
+maker; A1 absolute-floor crossfire; A2 trend on the line; A3 depth_ratio record-
+only). Suite 655 · preflight 23/23. **Watch tomorrow's tape (acceptance):** zero
+A5 lines; zero `FLIP_FLOOR_BREACH`; any FLIP loss ≤ ~8c + fee; `trend_usd` and
+`depth_ratio` on every entry; `FLIP_UNCOVERED_LEG` no longer on every entry; F
+byte-identical.
+
+**Deferred to Saturday (Part B — Drew's ruling):** B1 margin gate as SUPPRESS
+(shadow/record-only when margin<0, promote at n≥20 — dissolves the bootstrap);
+B2 per-lane rate halt (FLIP's losses must not halt F); B3 calibrate
+`OPEN_TREND_SKIP_USD` from A2's data; B4 explain the 17c `WINDOW_ECON_DIVERGENCE`
+before any sizing. Standing ceiling unchanged: the treasury waterfall asymmetry
+(wins scraped 35%, losses booked 100%) remains the #1 pre-scaling fix.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

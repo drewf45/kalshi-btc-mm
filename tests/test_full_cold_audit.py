@@ -102,7 +102,9 @@ def test_f1_decision_walks_to_scratch_never_crossfire(flip):
     """A genuine decision (>= K) routes through the walk-down: a MAKER exit at
     scratch (entry), never a crossfire market-dump at the depressed bid."""
     w, now = _held(flip, entry=40, age=config.FLIP_NO_SELL_S + 40)
-    b = _book(yes=30, no=55)                          # mark 30, decided against
+    # mark 35 is ABOVE the A1 salvage floor (entry−8=32), so this isolates the
+    # SPOT_DECIDED path (a deeper mark would hit the relative floor first)
+    b = _book(yes=35, no=55)                          # mark 35, decided against
     sl = _SL(config.OPEN_DETERMINED_K_POINTS + 5)     # 45pts: a real decision
     _custody(flip, w, b, now, sl=sl)                  # poll 1
     props = _custody(flip, w, b, now, sl=sl)          # poll 2 -> confirmed
@@ -171,3 +173,52 @@ def test_f5_swing_telemetry_line_logged(flip, caplog):
                  if r.message.startswith("swing ")), None)
     assert line is not None
     assert "n=" in line and "p_up=" in line and "p_down=" in line
+
+
+# ── build 53 (WO-2026-07-21-FLIP-SELECTION) — the tape-derived Part A ────────
+def test_a1_salvage_floor_is_relative_and_a_maker(flip):
+    """A1: the price floor is RELATIVE to entry (entry−budget), and the
+    relative-floor exit is a MAKER (fee-saved), never a crossfire dump —
+    bounding every loss at OPEN_SALVAGE_BUDGET_C instead of riding to 20c."""
+    assert config.OPEN_SALVAGE_BUDGET_C == 8
+    w, now = _held(flip, entry=40, age=config.FLIP_NO_SELL_S + 40)
+    b = _book(yes=32, no=55)                     # at the relative floor (40−8), depth 10
+    _custody(flip, w, b, now)                    # poll 1
+    props = _custody(flip, w, b, now)            # poll 2 -> confirmed
+    assert [p for p in props if p.purpose == "CUT"] == []      # NO crossfire
+    exits = [p for p in props if p.purpose == "EXIT"]
+    assert len(exits) == 1
+    assert exits[0].price_cents == 32 and not exits[0].crossfire  # bounded 8c, maker
+    assert "salvage floor" in exits[0].reason
+
+
+def test_a1_absolute_floor_still_crossfires(flip):
+    """A1: only the ABSOLUTE 20c floor (genuinely gone) keeps its crossfire."""
+    w, now = _held(flip, entry=26, age=config.FLIP_NO_SELL_S + 40)
+    b = _book(yes=20, no=55)                      # mark <= 20 absolute
+    _custody(flip, w, b, now)
+    cuts = [p for p in _custody(flip, w, b, now) if p.purpose == "CUT"]
+    assert len(cuts) == 1 and cuts[0].crossfire and "CATASTROPHE" in cuts[0].reason
+
+
+def test_a2_trend_usd_printed_on_enter(flip):
+    """A2: trend_usd on EVERY OPEN entry line (enter, not only skip) — so the
+    threshold is set from the observed distribution, not guessed."""
+    w = flip._window(TICKER, CLOSE)
+    w.spot_ticks = [66_000.0, 66_040.0]          # a $40 opening drift
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
+                                       spot=66_040.0, grain=GRAIN))
+    assert "trend $+40" in props[0].why
+
+
+def test_a3_depth_ratio_recorded_not_gated(flip):
+    """A3: depth_ratio (held ÷ other) on the entry row — RECORD-ONLY, gating on
+    nothing (n=3; a hypothesis, not a finding)."""
+    b = _book(yes=40, no=49, yq=14, nq=10)       # cheap yes depth 14 / other 10 = 1.4
+    props = flip.evaluate(TICKER, _ctx(b, secs_left=850, grain=GRAIN))
+    assert "ratio 1.40x" in props[0].why
+    # a thin abandoned side (the tape's losers) reads < 1.0, and still ENTERS
+    flip.windows.clear()
+    b2 = _book(yes=40, no=49, yq=6, nq=10)        # cheap yes depth 6 / other 10 = 0.6
+    props2 = flip.evaluate(TICKER, _ctx(b2, secs_left=850, grain=GRAIN))
+    assert "ratio 0.60x" in props2[0].why and props2[0].purpose == "ENTRY"
