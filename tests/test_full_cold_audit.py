@@ -99,106 +99,121 @@ def test_f1_sub_k_drift_does_not_cut(flip):
 
 
 def test_f1_decision_walks_to_scratch_never_crossfire(flip):
-    """A genuine decision (>= K) routes through the walk-down: a MAKER exit at
-    scratch (entry), never a crossfire market-dump at the depressed bid."""
-    w, now = _held(flip, entry=40, age=config.FLIP_NO_SELL_S + 40)
-    # mark 35 is ABOVE the A1 salvage floor (entry−8=32), so this isolates the
-    # SPOT_DECIDED path (a deeper mark would hit the relative floor first)
-    b = _book(yes=35, no=55)                          # mark 35, decided against
-    sl = _SL(config.OPEN_DETERMINED_K_POINTS + 5)     # 45pts: a real decision
-    _custody(flip, w, b, now, sl=sl)                  # poll 1
-    props = _custody(flip, w, b, now, sl=sl)          # poll 2 -> confirmed
+    """WO-2026-07-22-E re-anchor: the walk-to-scratch is RETIRED — an adverse
+    move on the favored side now trips the MOMENTUM STOP. It exits MAKER-first
+    (rest at entry−OPEN_MOMENTUM_STOP_C), never a crossfire market-dump — and
+    only after 2 sustained polls (a first-poll blip does not fire)."""
+    w, now = _held(flip, entry=40, age=100)
+    b = _book(yes=30, no=55)                          # mark 30 == entry−10, AT the stop
+    props1 = _custody(flip, w, b, now)                # poll 1 -> armed, not fired
+    assert props1 == []                               # a single poll does not exit
+    props = _custody(flip, w, b, now)                 # poll 2 -> sustained, fires
     assert [p for p in props if p.purpose == "CUT"] == []   # NO market-dump
     exits = [p for p in props if p.purpose == "EXIT"]
     assert len(exits) == 1
-    assert exits[0].price_cents == 40 and not exits[0].crossfire  # scratch, maker
-    assert "spot-decided" in exits[0].reason and "scratch" in exits[0].reason
+    assert exits[0].price_cents == 30 and not exits[0].crossfire  # at the stop, maker
+    assert "momentum stop" in exits[0].reason and "maker" in exits[0].reason
 
 
 def test_f1_catastrophe_still_crossfires(flip):
-    """The DEEP backstop is unchanged — a genuinely-gone position (mark<=20,
-    real depth, past the opening, sustained) still crossfires out before zero."""
-    w, now = _held(flip, entry=40, age=config.FLIP_NO_SELL_S + 40)
-    b = _book(yes=20, no=55)                          # at the catastrophe floor
+    """WO-2026-07-22-E re-anchor: a book already THROUGH the momentum stop
+    (mark below entry−10, sustained) crossfires out at top of book rather than
+    resting a maker nobody will hit — the deep-adverse path still crossfires."""
+    w, now = _held(flip, entry=40, age=100)
+    b = _book(yes=20, no=55)                          # mark 20 < stop 30: book through us
     _custody(flip, w, b, now)                         # poll 1
     cuts = [p for p in _custody(flip, w, b, now) if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].crossfire
-    assert "CATASTROPHE" in cuts[0].reason
+    assert cuts[0].price_cents == 20 and "momentum stop" in cuts[0].reason
 
 
 # ── Finding 3: the GATE — a hard-trending open skips OPEN's reversion entry ──
-def test_f3_hard_trending_open_skips(flip):
-    """The opening BTC-spot already run >= OPEN_TREND_SKIP_USD one-directionally
-    → OPEN skips (no reversion edge)."""
+def test_f3_hard_trending_open_enters_trend_logged_not_a_skip(flip):
+    """WO-2026-07-22-E: the volatility trend-SKIP is RETIRED. A hard one-
+    directional open no longer skips — a trend AGREES with the favored side
+    (that IS the thesis); trend_usd is LOGGED on the why and gates nothing."""
     w = flip._window(TICKER, CLOSE)
     w.spot_ticks = [66_000.0, 66_000.0 + config.OPEN_TREND_SKIP_USD + 20]
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
                                        spot=66_000.0 + config.OPEN_TREND_SKIP_USD + 20,
                                        grain=GRAIN))
-    assert props == []
+    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
+    assert "trend $" in props[0].why and "logged" in props[0].why
 
 
 def test_f3_calm_open_enters(flip):
-    """A calm open (small spot move) still enters the cheap side."""
+    """WO-2026-07-22-E re-anchor: FLIP buys the FAVORED (higher-priced) side.
+    A calm open with a favored side in-band [50,70] enters that side."""
     w = flip._window(TICKER, CLOSE)
     w.spot_ticks = [66_000.0, 66_010.0]              # a $10 wiggle
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
                                        spot=66_010.0, grain=GRAIN))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 
 # ── Finding 4: the ENTRY — real-gouge only ──────────────────────────────────
-def test_f4_entry_ceiling_is_42(flip):
-    assert config.OPEN_MAX_ENTRY_CENTS == 42
+def test_f4_entry_band_is_favored_50_to_70(flip):
+    # WO-2026-07-22-E: the cheap-side ceiling (42) is retired from the entry
+    # path; the favored-side band is [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C].
+    assert config.OPEN_ENTRY_MIN_C == 50 and config.OPEN_ENTRY_MAX_C == 70
 
 
 def test_f4_real_gouge_enters_coinflip_skips(flip):
-    # 42c cheap side (a real +10 gouge to the 52 middle): enters
-    assert flip.evaluate(TICKER, _ctx(_book(yes=42, no=55), secs_left=850,
+    # WO-2026-07-22-E re-anchor: the entry filter is the FAVORED side being
+    # in-band [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C].
+    # favored no@60 (in [50,70], real demand to sell the +20 into): enters
+    assert flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=850,
                                       grain=GRAIN))
-    # 45c cheap side (a ~coinflip, no real gouge): skips
+    # favored no@72 (>70 — the move already fully priced, no gouge left): skips
     flip.windows.clear()
-    assert flip.evaluate(TICKER, _ctx(_book(yes=45, no=54), secs_left=850,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=28, no=72), secs_left=850,
                                       grain=GRAIN)) == []
 
 
 # ── Finding 5: MEASURE — the swing-gate telemetry line, every window ─────────
-def test_f5_swing_telemetry_line_logged(flip, caplog):
-    """The gate is live-but-permissive; the telemetry line makes its state
-    legible so the sample-floor decision is data, not argument."""
-    with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
-        flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
-                                   spot=66_000.0, grain=GRAIN))
-    line = next((r.message for r in caplog.records
-                 if r.message.startswith("swing ")), None)
-    assert line is not None
-    assert "n=" in line and "p_up=" in line and "p_down=" in line
+def test_f5_swing_telemetry_line_logged(flip):
+    """WO-2026-07-22-E re-anchor: the swing gate is RETIRED as an entry gate,
+    so its telemetry line is gone. Its spirit — make the confirms legible so
+    the sample-floor decision is data, not argument — survives as the
+    LOGGED-NOT-GATED confirms on every entry `why` (depth ratio + trend
+    agreement, gating on nothing until the tape earns them a gate)."""
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
+                                       spot=66_000.0, grain=GRAIN))
+    why = props[0].why
+    assert "confirms logged-not-gated" in why
+    assert "ratio" in why and "trend $" in why and "depth" in why
 
 
 # ── build 53 (WO-2026-07-21-FLIP-SELECTION) — the tape-derived Part A ────────
 def test_a1_salvage_floor_is_relative_and_a_maker(flip):
-    """A1: the price floor is RELATIVE to entry (entry−budget), and the
-    relative-floor exit is a MAKER (fee-saved), never a crossfire dump —
-    bounding every loss at OPEN_SALVAGE_BUDGET_C instead of riding to 20c."""
-    assert config.OPEN_SALVAGE_BUDGET_C == 8
-    w, now = _held(flip, entry=40, age=config.FLIP_NO_SELL_S + 40)
-    b = _book(yes=32, no=55)                     # at the relative floor (40−8), depth 10
+    """WO-2026-07-22-E re-anchor: the relative SALVAGE floor is RETIRED and
+    REPLACED by the MOMENTUM STOP. The loss floor is still RELATIVE to entry
+    (entry − OPEN_MOMENTUM_STOP_C — a 60c entry stops at 50, a 40c entry at 30),
+    bounding every loss at 10c, and it still exits MAKER-first (rest at the
+    stop), never a crossfire dump."""
+    assert config.OPEN_MOMENTUM_STOP_C == 10
+    w, now = _held(flip, entry=60, age=100, take_px=80)
+    b = _book(yes=50, no=45)                     # mark 50 == entry−10, the relative floor
     _custody(flip, w, b, now)                    # poll 1
     props = _custody(flip, w, b, now)            # poll 2 -> confirmed
     assert [p for p in props if p.purpose == "CUT"] == []      # NO crossfire
     exits = [p for p in props if p.purpose == "EXIT"]
     assert len(exits) == 1
-    assert exits[0].price_cents == 32 and not exits[0].crossfire  # bounded 8c, maker
-    assert "salvage floor" in exits[0].reason
+    assert exits[0].price_cents == 50 and not exits[0].crossfire  # bounded 10c, maker
+    assert "momentum stop" in exits[0].reason
 
 
 def test_a1_absolute_floor_still_crossfires(flip):
-    """A1: only the ABSOLUTE 20c floor (genuinely gone) keeps its crossfire."""
-    w, now = _held(flip, entry=26, age=config.FLIP_NO_SELL_S + 40)
-    b = _book(yes=20, no=55)                      # mark <= 20 absolute
-    _custody(flip, w, b, now)
+    """WO-2026-07-22-E re-anchor: the absolute floor survives ONLY as the
+    DEAD-FLOOR backstop for a curfew winner LEFT TO F (o['hold']). A held
+    winner gone worthless (mark<=OPEN_CATASTROPHE_FLOOR, real depth, 2 polls)
+    is evacuated by crossfire, never ridden to zero on the theory F has it."""
+    w, now = _held(flip, entry=40, age=100)
+    w.opens["yes"]["hold"] = True                 # a curfew winner handed to F
+    b = _book(yes=20, no=55, yq=10)               # mark 20 <= dead floor, real depth
+    _custody(flip, w, b, now)                     # poll 1
     cuts = [p for p in _custody(flip, w, b, now) if p.purpose == "CUT"]
-    assert len(cuts) == 1 and cuts[0].crossfire and "CATASTROPHE" in cuts[0].reason
+    assert len(cuts) == 1 and cuts[0].crossfire and "dead-floor" in cuts[0].reason
 
 
 def test_a2_trend_usd_printed_on_enter(flip):
@@ -206,7 +221,7 @@ def test_a2_trend_usd_printed_on_enter(flip):
     threshold is set from the observed distribution, not guessed."""
     w = flip._window(TICKER, CLOSE)
     w.spot_ticks = [66_000.0, 66_040.0]          # a $40 opening drift
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49), secs_left=850,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
                                        spot=66_040.0, grain=GRAIN))
     assert "trend $+40" in props[0].why
 
@@ -214,11 +229,12 @@ def test_a2_trend_usd_printed_on_enter(flip):
 def test_a3_depth_ratio_recorded_not_gated(flip):
     """A3: depth_ratio (held ÷ other) on the entry row — RECORD-ONLY, gating on
     nothing (n=3; a hypothesis, not a finding)."""
-    b = _book(yes=40, no=49, yq=14, nq=10)       # cheap yes depth 14 / other 10 = 1.4
+    # WO-2026-07-22-E re-anchor: depth_ratio = FAVORED-side depth ÷ other side.
+    b = _book(yes=60, no=40, yq=14, nq=10)       # favored yes depth 14 / other 10 = 1.4
     props = flip.evaluate(TICKER, _ctx(b, secs_left=850, grain=GRAIN))
     assert "ratio 1.40x" in props[0].why
-    # a thin abandoned side (the tape's losers) reads < 1.0, and still ENTERS
+    # a thin favored side (little depth behind us) reads < 1.0, and still ENTERS
     flip.windows.clear()
-    b2 = _book(yes=40, no=49, yq=6, nq=10)        # cheap yes depth 6 / other 10 = 0.6
+    b2 = _book(yes=60, no=40, yq=6, nq=10)        # favored yes depth 6 / other 10 = 0.6
     props2 = flip.evaluate(TICKER, _ctx(b2, secs_left=850, grain=GRAIN))
     assert "ratio 0.60x" in props2[0].why and props2[0].purpose == "ENTRY"

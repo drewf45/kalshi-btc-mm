@@ -705,171 +705,98 @@ class LaneFlip:
         # genuinely running). Two-sided book required (need both bids to find
         # the cheap side).
         if yes_bid is None or no_bid is None:
-            return proposals               # no two-sided book: no cheap side
-        # WO-FULL-COLD-AUDIT Finding 3 (build 52) — THE VOLATILITY SKIP. A
-        # hard-trending open (the opening BTC-spot already run one-directionally
-        # by >= OPEN_TREND_SKIP_USD across the observed ticks) gives OPEN's
-        # reversion thesis no edge — the pile-in it trades against never comes
-        # back (the un-winnable trending market, the other half of every big-loss
-        # day). OPEN skips; HUNT (momentum) and F (byte-identical, criterion #5)
-        # are untouched. The reading is logged on every open (skip AND enter) so
-        # the conservative threshold calibrates from data, never a guess.
+            return proposals               # no two-sided book: no favored side
+        # WO-2026-07-22-E — FLIP THE SIDE. We built the machine backwards: it
+        # acquired the ABANDONED cheap side and rested a take on the side nobody
+        # wants (flip_fill=38%). Market making acquires inventory on the side
+        # with DEMAND — the FAVORED (higher-priced) side, the market's own read
+        # of direction — and sells the +20 INTO the pile-in of buyers. The
+        # cheap-side swing gate and the volatility trend-SKIP are RETIRED (they
+        # were cheap-side-reversion constructs); the only entry filter is the
+        # favored side being in-band [MIN,MAX]. trend_usd/depth_ratio are LOGGED
+        # on every entry but GATE ON NOTHING yet — one change, maximally
+        # attributable; the confirms earn a gate from data, not from n=7.
         _ticks = [t for t in w.spot_ticks if t is not None]
         trend_usd = (_ticks[-1] - _ticks[0]) if len(_ticks) >= 2 else 0.0
-        if len(_ticks) >= 2 and abs(trend_usd) >= config.OPEN_TREND_SKIP_USD:
-            if not w.open_trend_logged:
-                w.open_trend_logged = True
-                log.info("OPEN_TREND_SKIP %s — opening spot ran %+.0f$ over %d "
-                         "ticks >= %.0f$: hard-trending open, no reversion edge "
-                         "(OPEN skips; HUNT/F unaffected)", market, trend_usd,
-                         len(_ticks), config.OPEN_TREND_SKIP_USD)
-            return proposals
-        # WO-FLIP-IMMEDIATE-ENTRY (build 47): the grain-wait is RETIRED. The
-        # liquidity-hold capstone overturned "waiting IS the setup" — FLIP
-        # buys the opening IMBALANCE the instant it is cheap; it does not wait
-        # for a grain streak to confirm (grain=None returned no proposals
-        # window after window and structurally blocked the lane while F
-        # traded). The entry side is the CHEAP side of the band — the lower
-        # bid, the side the pile-in abandoned; grain, if present, only INFORMS
-        # the why, it no longer gates. The TREND-GUARD is already in force
-        # above: needle_active (HUNT seniority, delta_p >= HUNT_NEEDLE_POINTS)
-        # returns before this gate on ANY live spot trend — stricter than the
-        # WO's "decisive trend against the cheap side" — so FLIP never buys
-        # into a market that is genuinely running. The empirical gate stays the
-        # measured swing/fill rate (Instrument 1) below and the resting-take
-        # fill rate after entry; PROOF stays measured, only the entry opens.
         g = ctx.get("grain")
         if yes_bid == no_bid:
             if not w.open_no_grain_logged:
                 w.open_no_grain_logged = True
                 log.info("OPEN_NO_IMBALANCE %s — band book but sides equal "
-                         "(y%dc/n%dc): no cheap side to provide against",
+                         "(y%dc/n%dc): no favored side to buy",
                          market, yes_bid, no_bid)
-            return proposals               # true 50/50: no imbalance to buy
-        side = "yes" if yes_bid < no_bid else "no"   # the cheap (abandoned) side
+            return proposals               # true 50/50: no favored side
+        side = "yes" if yes_bid > no_bid else "no"   # the FAVORED (demanded) side
         join = yes_bid if side == "yes" else no_bid
-        if not (config.OPEN_ENTRY_FLOOR <= join <= config.OPEN_MAX_ENTRY_CENTS):
+        if not (config.OPEN_ENTRY_MIN_C <= join <= config.OPEN_ENTRY_MAX_C):
             if not w.open_geometry_logged:
                 w.open_geometry_logged = True
-                log.info("OPEN_CHEAP_OUT_OF_RANGE %s — cheap %s %dc outside "
-                         "buyable [%d,%d]: too paid-up or too near-worthless",
-                         market, side, join, config.OPEN_ENTRY_FLOOR,
-                         config.OPEN_MAX_ENTRY_CENTS)
-            return proposals               # cheap side not buyable this window
-        # WO-FLIP-LIQUIDITY-HOLD (build 45): the risk/reward GEOMETRY GATE is
-        # GONE. Build 43 grounded it on the scalp stop as the "real bail" —
-        # but the liquidity-hold model REMOVES that stop: a low mark after a
-        # FLIP buy is ILLIQUIDITY (the opening pile-in, no buyers on your side
-        # yet), not a loss to bail from. The position holds through it as the
-        # resting liquidity provider, so there is no pre-trade risk/reward
-        # rejection to make. The ENTRY filter is band membership (buy the
-        # cheap pile-in, above); the EMPIRICAL gate is the resting-take fill
-        # (reversion) rate, measured by Instrument 1 at the 1-lot cap (§4) and
-        # proven before any size increase. (Removing this gate un-grounds the
-        # build-43 coherence check honestly: with no scalp stop there is no
-        # bail to size risk against — an honest risk-to-catastrophe check
-        # would just close the lane, contra the hold-through-illiquidity
-        # thesis.)
-        # WO-FLIP-CHEAP-LIVE §2.2 — THE TWO-SIDED SWING GATE: buy the
-        # cheap side only when the table says the swing to the take is
-        # more likely than the cut firing first. p_cross(d_strike, t) =
-        # P(spot touches the strike within the window) — the take REQUIRES
-        # the touch, every cut-first path is a no-touch path, so one cell
-        # answers both legs (Engineer: same p_cross, apples-to-apples).
-        # Table/spot absent -> permissive (live-proof wants data; the
-        # UNPROVEN tagging already narrates the blindness).
-        swing = self._swing_gate(ctx, now, join, side, market)
-        # WO-FULL-COLD-AUDIT Finding 5 (build 52) — the swing-gate TELEMETRY.
-        # The gate is live-but-permissive below OPEN_SWING_MIN_SAMPLES (NOT dead;
-        # the 0.89 on the tape is the retired strike-touch SHADOW proxy). This
-        # line makes its state legible every window — measured rate, sample n,
-        # the shadow two-barrier p_up/p_down, pass/block — so the sample-floor
-        # decision is made from data, not another argument. (Gates SIZE later,
-        # never entry, per the Adversary; today it only reports + the permissive
-        # gate rides.)
-        if swing is not None and not w.open_swing_logged:
-            w.open_swing_logged = True
-            log.info("swing %s n=%d p=%.2f p_up=%s p_down=%s -> %s",
-                     "block" if not swing["ok"] else "pass",
-                     swing.get("n", 0), swing.get("p", 0.0),
-                     swing.get("p_up"), swing.get("p_down"),
-                     market)
-        if swing is not None and not swing["ok"]:
-            if not w.open_no_grain_logged:   # reuse the once-per-window mute
-                w.open_no_grain_logged = True
-                log.info("OPEN_SWING_REFUSED %s — %s (measured took_swing "
-                         "%.2f n=%d; shadow p_up=%s p_down=%s): "
-                         "losing-cheap, not oversold-cheap", market,
-                         swing["reason"], swing["p"], swing["n"],
-                         swing.get("p_up"), swing.get("p_down"))
-            return proposals
-        # P27 §2(b) OVERTURNED the margin GATE: entry proceeds on band +
-        # grain + geometry + one-shot (the doctrine); the cell's margin
-        # PRINTS on the why either way — the scoreboard informs daily,
-        # governs never. (OPEN_CELL_NEGATIVE's sit died with the ruling.)
+                log.info("OPEN_FAVORED_OUT_OF_RANGE %s — favored %s %dc outside "
+                         "buyable [%d,%d]: below fair value (the old bug) or the "
+                         "move already fully priced", market, side, join,
+                         config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C)
+            return proposals               # favored side not buyable this window
+        # P27 §2(b): entry proceeds on band + one-shot (the doctrine); the
+        # cell's margin PRINTS on the why either way — the scoreboard informs
+        # daily, governs never.
         from . import scoring
         s = scoring.score(self.gateway.ledger, "OPEN",
                           scoring.price_cell(join))
         proof = (f"margin {s['margin']:+.2f} (n={s['n']}"
                  + (", info)" if s["margin"] < 0 else ")"))
-        # P-FLIP-THESIS-1 §1 — THE CONTINUITY SIGNAL, LOG-ONLY (Scientist:
-        # it votes on entry side only after the data shows edge; the
-        # Adversary: it may never override a determined cut)
+        # P-FLIP-THESIS-1 §1 — THE CONTINUITY SIGNAL, LOG-ONLY.
         self._log_continuity(w, market, side)
         grain_note = (f"grain~{g.get('direction')}x{g.get('length')} informs"
                       if g else "grain~none")
-        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the ENTRY data point.
-        # Stash the full opening state now (spot, secs-into, book) keyed by
-        # side; note_fill copies it onto the position so the FLIP_SWING
-        # forensic record can reconstruct the whole trade after the fact.
+        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the ENTRY data point,
+        # stashed for note_fill to copy onto the position (the FLIP_SWING record).
         spot = ctx.get("spot")
         y_depth, n_depth = book.total_bid_depth("yes"), book.total_bid_depth("no")
-        # WO-2026-07-21-FLIP-SELECTION A3 (build 53): the DEPTH RATIO — held-side
-        # depth ÷ other-side depth. On the tape the winner bought the cheap side
-        # WITH depth behind it (1.40×); both losers bought the thin abandoned
-        # side (0.59-0.60×). Recorded here as the most promising unexploited
-        # signal — but it GATES ON NOTHING (n=3; a hypothesis to rule on at
-        # n>=20, NEVER a live gate until then).
+        # WO-2026-07-22-E §3 — the confirms, LOGGED NOT GATED. depth_ratio =
+        # held-side depth ÷ other-side (>=1 = demand behind us); trend agreement
+        # = does BTC's opening move point at the favored side. Neither gates yet
+        # (one change, maximally attributable); tomorrow's tape earns them a gate.
         held_d = y_depth if side == "yes" else n_depth
         other_d = n_depth if side == "yes" else y_depth
         depth_ratio = round(held_d / other_d, 2) if other_d else None
+        agree = ("trend~flat" if trend_usd == 0
+                 else "agree" if ((trend_usd > 0) == (side == "yes"))
+                 else "disagree")
         w.entry_meta[side] = {
             "spot": spot, "secs_into": round(secs_into, 1),
             "spread": abs(yes_bid - no_bid), "cheap_bid": join,
             "yes_depth": y_depth, "no_depth": n_depth,
-            "open_trend_usd": round(trend_usd, 1),   # build 52: calibration reading
-            "depth_ratio": depth_ratio}              # build 53 A3: RECORD-ONLY, no gate
+            "open_trend_usd": round(trend_usd, 1),
+            "depth_ratio": depth_ratio}
         spot_s = f"{spot:,.0f}" if spot is not None else "na"
         dr_s = f"{depth_ratio:.2f}x" if depth_ratio is not None else "na"
+        target = self._take_price(join)
         proposals.append(Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
-            band=(config.OPEN_ENTRY_FLOOR, config.OPEN_MAX_ENTRY_CENTS),
+            band=(config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C),
             rest_fp=book.best_fp(side),
-            # A2 (build 53): trend_usd printed on EVERY entry (enter AND skip),
-            # so the OPEN_TREND_SKIP_USD threshold is set from the observed
-            # distribution on Saturday — not guessed. A3: depth_ratio printed
-            # for the same reason (record-only).
-            why=f"OPEN liquidity {side}@{join}c cheap (spot {spot_s}, into "
+            # WO-2026-07-22-E: the favored side, the +20 target, the −10 stop,
+            # and the confirms (ratio, trend agreement) — all on one line so
+            # tomorrow's tape can attribute which component carried the trade.
+            why=f"OPEN50 favored {side}@{join}c (spot {spot_s}, into "
                 f"{int(secs_into)}s, book y{yes_bid}/n{no_bid} sprd"
                 f"{abs(yes_bid - no_bid)} depth {y_depth}/{n_depth} "
-                f"ratio {dr_s} trend ${trend_usd:+.0f}) "
-                f"rest→middle {config.OPEN_MIDDLE_TARGET}c · {proof} · "
-                + (swing["why"] if swing is not None else "swing~untabled")
-                + f" · {grain_note}"))
+                f"ratio {dr_s} trend ${trend_usd:+.0f} {agree}·logged) "
+                f"target {target}c (+{target - join}, cap 90) · stop "
+                f"{join - config.OPEN_MOMENTUM_STOP_C}c · {proof} · "
+                f"confirms logged-not-gated · {grain_note}"))
         return proposals
 
     @staticmethod
     def _take_price(entry: int) -> int:
-        """WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49) — the resting take,
-        toward the MIDDLE scaled by entry depth: the 50/50 middle where the
-        hedgers are forced to transact, floored fee-safe at entry+MIN so a
-        near-middle entry still clears fees, capped at the 99c tick. The
-        cheaper the entry, the bigger the gouge (buy 39 → rest 52 = +13; buy
-        49 → rest 54 = +5)."""
-        return min(99, max(config.OPEN_MIDDLE_TARGET,
-                           entry + config.OPEN_TAKE_MIN))
+        """WO-2026-07-22-E — the resting take is now entry + OPEN_GOUGE_C (the
+        +20 sold INTO the pile-in of buyers), capped at 90c to stay out of the
+        illiquid tail. On the favored side (50-70) that rests at 70-90 — the
+        exit fill is where the money is, and it fills into demand, not against
+        an abandoned side (the flip_fill fix, §2)."""
+        return min(90, entry + config.OPEN_GOUGE_C)
 
     @staticmethod
     def held_price(side: str, book):
@@ -1217,7 +1144,6 @@ class LaneFlip:
           YIELD      — flat by T-OPEN_FLAT_BY (§3.3 YIELD_TO_F: F's floor
                        is F's; the SELF_NET storm class dies by schedule)"""
         props: List[Order] = []
-        sl = ctx.get("spotlead")
         for side, o in list(w.opens.items()):
             if o.get("done"):
                 continue
@@ -1263,20 +1189,11 @@ class LaneFlip:
                     reason=f"open take → middle {take_px}c "
                            f"(entry {o['entry']}, gouge +{take_px - o['entry']})"))
                 continue
-            # P-FLIP-THESIS-1 §4 — HOLD-INSTEAD-OF-SCALP: at the patience
-            # assessment, a side deciding in FLIP's favor hard enough that
-            # F would be buying it (mark through F's band floor) converts —
-            # never sell the scalp and re-buy high; the 49c basis IS the
-            # settlement position. Determined-against stays armed on the
-            # hold (Engineer: a hold-to-settle is not exempt).
-            if (not o.get("hold")
-                    and now - o["fill_ts"] >= config.OPEN_PATIENCE_S
-                    and mark is not None):
-                from .lane_fh8 import COST_BAND_LO_INT
-                if mark >= COST_BAND_LO_INT:
-                    self._convert_to_hold(o, market, side, mark, "F-agrees",
-                                          now=now)
-                    continue
+            # WO-2026-07-22-E: the F-agrees PATIENCE hold-conversion is RETIRED.
+            # It converted a rising favorite into a hold-to-settle — but the new
+            # thesis SELLS the +20 into the pile-in (the resting take above), it
+            # does not hold a riser and forgo the gouge. The only winner-to-F
+            # handoff left is the endgame curfew below (unchanged).
             # WO-BOTH-LANES-MARKET-TRUE (build 50) — THE DECISION POINT, F's
             # inventory-aware endgame. The handoff moved from T-10 (600s) to
             # FLIP_DECISION_S (~minute 11): FLIP now WORKS its exit down through
@@ -1309,169 +1226,62 @@ class LaneFlip:
                         reason="open decision point: clear loser before "
                                "the bell (F's endgame)"))
                 continue
+            # WO-2026-07-22-E — THE MOMENTUM STOP (replaces the hold + salvage +
+            # catastrophe + spot-decided walk + walk-down stack). On the FAVORED
+            # side an adverse move means the thesis is ALREADY WRONG — there is
+            # nothing to wait for, so there is NO hold. A 60c contract with real
+            # depth is far less noisy than a 30c tail, so a tight stop is legible
+            # here where it was fiction on the cheap side. Stop at entry −
+            # OPEN_MOMENTUM_STOP_C, sustained 2 polls (never a single print),
+            # exited MAKER-FIRST: rest at the stop; only if the book has already
+            # gone THROUGH the stop (mark below it) does the resting sell fill by
+            # crossing at the top of book — never a gratuitous market-dump.
             if o.get("hold"):
-                # held to settlement — no scalp take, no yield; the
-                # determined-against floor below still guards it
-                pass
-            # DETERMINED-AGAINST — WO-FLIP-LIQUIDITY-HOLD (build 45): a low
-            # mark after a FLIP buy is ILLIQUIDITY (the opening pile-in, no
-            # buyers on your side yet), NOT a loss. The position HOLDS through
-            # it as the resting liquidity provider — the take above waits for
-            # the reversion. So the reactive early stops are GONE: the build-43
-            # scalp stop (entry−6) and the post-patience band floor both sold
-            # inventory during the exact illiquidity you must hold through.
-            # What REMAINS is the collapse backstop (Adversary-mandated §2.3):
-            # a CONFIRMED collapse is a real move, not illiquidity noise, and
-            # still cuts even in the passive hold —
-            #   (1) SPOT decided against — sustained 2 polls (the market ran
-            #       away hard), ANY time
-            #   (3) CATASTROPHE floor (20) — the deep P&L-blind backstop
-            # The loss-side ENDGAME exit is the T-10 handoff above (now the
-            # PRIMARY loss exit): an unreverted loser is cleared before F's
-            # window, never ridden to settlement.
-            # WO-BOTH-LANES-MARKET-TRUE (build 50) — THE 4-MINUTE HARD NO-SELL.
-            # The opening pile-in is NOISE: the book has not reconciled to BTC
-            # yet (~2 min), so an adverse spot move in the first FLIP_NO_SELL_S
-            # from entry is EXPECTED, not a decision. NOTHING sells in the hold
-            # — the spot-decided cut AND the catastrophe price floor are BOTH
-            # suppressed; the only exit is the resting middle-take getting
-            # FILLED. The 1-lot cap and a cheap (<=50) entry bound the loss
-            # through the hold (12:46: a 24pt first-minute pile-in cut FLIP at
-            # −17c — this is the fix). Polls RESET so the post-hold 2-poll
-            # sustain starts fresh: the pile-in never counts toward a real cut.
-            age = now - o["fill_ts"]
-            if age < config.FLIP_NO_SELL_S:
-                o["collapse_polls"] = 0
-                o["catastrophe_polls"] = 0
+                # a curfew winner left to F — the scalp stop stands down, but
+                # the DEAD-FLOOR BACKSTOP still evacuates a genuinely worthless
+                # contract (never ride to zero on the theory that F has it).
+                dead = config.OPEN_CATASTROPHE_FLOOR
+                depth = book.visible_depth(side, mark) if mark is not None else 0
+                o["catastrophe_polls"] = (
+                    o.get("catastrophe_polls", 0) + 1
+                    if (mark is not None and mark <= dead
+                        and depth >= config.OPEN_CATASTROPHE_MIN_DEPTH) else 0)
+                if o["catastrophe_polls"] >= 2 and mark is not None:
+                    self._cancel_resting(o)
+                    o["done"] = True
+                    n = self._exit_count(market, side, o["count"])
+                    if n > 0:
+                        o["exit_reason"] = "DEAD_FLOOR"
+                        props.append(Order(
+                            lane="FLIP", event=event, market=market, side=side,
+                            action="sell", price_cents=mark, count=n,
+                            size_tier=config.TIER_PROBE, purpose="CUT",
+                            crossfire=True,
+                            reason=f"open dead-floor backstop {side} {mark}c <= "
+                                   f"{dead}c (depth {depth}) — a held winner "
+                                   "gone worthless, evacuate, never ride to zero"))
                 continue
-            catastrophe = config.OPEN_CATASTROPHE_FLOOR
-            collapse = (sl is not None and sl.side != side
-                        and sl.delta_p >= config.OPEN_DETERMINED_K_POINTS)
-            o["collapse_polls"] = o["collapse_polls"] + 1 if collapse else 0
-            # WO-FLIP-CATASTROPHE-ILLIQUIDITY (build 48): the catastrophe PRICE
-            # floor must tell a THIN-BOOK low bid (illiquidity — the opening
-            # pile-in, HELD) from a GENUINE collapse. A fresh cheap entry's
-            # held-side bid sits low because there are no buyers YET; the
-            # single-poll price cut was reading that emptiness as collapse and
-            # dumping at the bottom (the 2-minute catastrophic exit). It now
-            # fires only when the low is (a) REAL — depth on the held side, not
-            # a 1-lot thin quote; (b) PAST the opening-illiquidity window (a
-            # fresh entry's low bid is the setup); and (c) SUSTAINED >= 2 polls.
-            # A real move is caught by the spot-decided branch regardless.
-            held_depth = book.visible_depth(side, mark) if mark is not None else 0
-            past_opening = age >= config.OPEN_OPENING_WINDOW_S
-            # WO-2026-07-21-FLIP-SELECTION A1 (build 53): the floor is RELATIVE
-            # to entry, bounded below by the absolute 20c. Every FLIP loss is now
-            # capped at OPEN_SALVAGE_BUDGET_C instead of riding to the absolute
-            # 20c (a 22c loss on a 42c entry). The trigger fires earlier — at
-            # entry−budget — so the loss is bounded, not deferred-then-worse.
-            salvage_floor = max(config.OPEN_CATASTROPHE_FLOOR,
-                                o["entry"] - config.OPEN_SALVAGE_BUDGET_C)
-            cat_hit = (mark is not None and mark <= salvage_floor
-                       and held_depth >= config.OPEN_CATASTROPHE_MIN_DEPTH
-                       and past_opening)
-            o["catastrophe_polls"] = \
-                o.get("catastrophe_polls", 0) + 1 if cat_hit else 0
-            # WO-FULL-COLD-AUDIT Finding 1 (build 52) — the ROOT FIX. Two exits
-            # used to target the same decided-against state and the VIOLENT one
-            # always won: the SPOT_DECIDED cut crossfire-DUMPED at the depressed
-            # bid, pre-empting the gentle walk-down — the catastrophic-loss
-            # generator (a −$1 where a −5c walk-down belonged). Now they are
-            # SEPARATED by severity:
-            #   CATASTROPHE (mark <= 20, real depth, past opening, sustained) —
-            #     the position is GENUINELY GONE; crossfire out before zero.
-            #     This one STAYS violent, correctly (there is nothing to save).
-            #   SPOT_DECIDED (ΔP-collapse >= K, now K=40 a real decision) — no
-            #     longer crossfire-dumps. It routes through the WALK-DOWN:
-            #     accelerate the resting MAKER take to scratch (never below
-            #     cost, never pay the spread into a market-dump). If it does not
-            #     fill at scratch, the decision handoff clears it at the endgame.
-            if o["catastrophe_polls"] >= 2:
+            stop_px = o["entry"] - config.OPEN_MOMENTUM_STOP_C
+            o["stop_polls"] = (o.get("stop_polls", 0) + 1
+                               if (mark is not None and mark <= stop_px) else 0)
+            if o["stop_polls"] >= 2:
                 self._cancel_resting(o)
                 o["done"] = True
                 n = self._exit_count(market, side, o["count"])
-                if n > 0 and mark is not None and mark <= catastrophe:
-                    # the ABSOLUTE 20c floor — genuinely gone; crossfire out
-                    # before zero (unchanged; this one is correctly violent).
-                    o["exit_reason"] = "CATASTROPHE"
+                if n > 0:
+                    crossed = mark < stop_px            # book already through us
+                    o["exit_reason"] = "MOMENTUM_STOP"
                     props.append(Order(
                         lane="FLIP", event=event, market=market, side=side,
-                        action="sell", price_cents=mark,
-                        count=n, size_tier=config.TIER_PROBE,
-                        purpose="CUT", crossfire=True,
-                        reason=f"open determined-against: CATASTROPHE floor "
-                               f"{side} {mark}c <= {catastrophe}c — genuinely "
-                               f"gone (depth {held_depth}), evacuate now"))
-                elif n > 0:
-                    # the RELATIVE salvage floor (entry−budget, > 20) — a bounded
-                    # ~budget loss, exited as a MAKER (fee-saved), never a
-                    # crossfire market-dump. A5-legal (a DETERMINED-class exit,
-                    # not a CATASTROPHE). Posts at the floor so the loss is
-                    # capped; if the falling book never lifts it, the decision
-                    # handoff clears it at the endgame.
-                    o["exit_reason"] = "SALVAGE_FLOOR"
-                    props.append(Order(
-                        lane="FLIP", event=event, market=market, side=side,
-                        action="sell", price_cents=salvage_floor, count=n,
-                        size_tier=config.TIER_PROBE, purpose="EXIT",
-                        reason=f"open salvage floor → {salvage_floor}c (entry "
-                               f"{o['entry']}, budget "
-                               f"{config.OPEN_SALVAGE_BUDGET_C}c — maker, bounded "
-                               "loss, no dump)"))
-            elif o["collapse_polls"] >= 2 and not o.get("hold"):
-                # the graceful decision exit — walk to scratch as a MAKER, no
-                # crossfire, no market-dump (Finding 1 acceptance #1).
-                scratch = o["entry"]
-                if o.get("take_px") is None or scratch < o["take_px"]:
-                    self._cancel_resting(o)
-                    n = self._exit_count(market, side, o["count"])
-                    if n > 0:
-                        o["take_px"] = scratch
-                        o["take_proposed"] = True
-                        o["exit_reason"] = "SPOT_DECIDED"
-                        props.append(Order(
-                            lane="FLIP", event=event, market=market, side=side,
-                            action="sell", price_cents=scratch, count=n,
-                            size_tier=config.TIER_PROBE, purpose="EXIT",
-                            reason=f"open spot-decided → walk to scratch "
-                                   f"{scratch}c (ΔP {sl.delta_p:.0f}pts, a real "
-                                   "decision — maker to breakeven, never dumped)"))
-            elif (not o.get("hold") and o.get("take_px") is not None
-                  and config.FLIP_DECISION_S < secs <= config.OPEN_WALK_START_S):
-                # WO-BOTH-LANES-MARKET-TRUE (build 50) — the TIME-AWARE walk-
-                # down (was B3's [WALK_START, FLAT_BY]; now re-based on the
-                # DECISION point). After the hard-hold, an unfilled position is
-                # walked DOWN from the middle toward scratch over [DECISION_S,
-                # WALK_START] to CLEAR FLIP's inventory by the decision point —
-                # the scalp-out goal is ZERO inventory left by ~minute 11.
-                # Linear: full middle up at WALK_START, scratch at DECISION_S.
-                # Distance-to-middle and time both ride the frac — a deep-cheap
-                # (far-from-middle) position near the decision walks near
-                # scratch; a near-middle one barely moves (its middle-take is
-                # close to filling). Never below scratch — a genuine loser is
-                # the decision handoff's to clear. The hard-hold above (the
-                # early `continue`) guarantees this is never a reactive early
-                # cut: it only runs once the pile-in window has passed.
-                span = config.OPEN_WALK_START_S - config.FLIP_DECISION_S
-                frac = max(0.0, min(1.0,
-                                    (secs - config.FLIP_DECISION_S) / span))
-                full = self._take_price(o["entry"])
-                stepped = max(o["entry"],
-                              int(round(o["entry"] + frac * (full - o["entry"]))))
-                if stepped < o["take_px"]:
-                    self._cancel_resting(o)
-                    n = self._exit_count(market, side, o["count"])
-                    if n > 0:
-                        o["take_px"] = stepped
-                        o["take_proposed"] = True
-                        o["exit_reason"] = "WALK_DOWN"      # build 51 tag
-                        props.append(Order(
-                            lane="FLIP", event=event, market=market, side=side,
-                            action="sell", price_cents=stepped, count=n,
-                            size_tier=config.TIER_PROBE, purpose="EXIT",
-                            reason=f"open walk-down → {stepped}c "
-                                   f"(T-{int(secs)}s: middle→scratch, "
-                                   f"entry {o['entry']})"))
+                        action="sell",
+                        price_cents=(mark if crossed else stop_px), count=n,
+                        size_tier=config.TIER_PROBE,
+                        purpose=("CUT" if crossed else "EXIT"),
+                        crossfire=crossed,
+                        reason=f"open momentum stop → {stop_px}c (entry "
+                               f"{o['entry']}, −{config.OPEN_MOMENTUM_STOP_C}, "
+                               f"2-poll{' — book through, cross' if crossed else ' — maker'}"
+                               ": favored side moved against, thesis wrong, no hold)"))
         return props
 
     def _check_uncovered(self, w: FlipWindow, market: str,
@@ -1843,15 +1653,13 @@ class LaneFlip:
         except Exception:
             return   # the instrument never blocks custody accounting
         if gross < 0:
-            # WO-2026-07-21-B Finding 2 (build 54): the breach test must police
-            # the budget the engine ACTUALLY operates under. The old expectation
-            # (entry − band-floor 35) computed 1c for a 36c entry, so a perfectly-
-            # bounded 8c salvage (A1's OPEN_SALVAGE_BUDGET_C) tripped the alarm on
-            # CORRECT behaviour — the exact "pin the budget to one source" risk
-            # A1 flagged, drifted immediately. Pin the expectation to the salvage
-            # budget so FLOOR_BREACH means a cut past the DECLARED budget.
-            floor_expected = max(entry - config.OPEN_UNDETERMINED_BAND[0],
-                                 config.OPEN_SALVAGE_BUDGET_C)
+            # WO-2026-07-22-E acceptance #5: the breach test now polices the
+            # MOMENTUM STOP — the declared max loss is OPEN_MOMENTUM_STOP_C
+            # (entry−10), plus slip. Any FLIP loss beyond that means the stop is
+            # FICTION (it did not fire, or fired late into a market-dump) — the
+            # kill condition. It pages LOUD so the lane can be halted; with the
+            # per-lane rate halt (Stage 0.1) a FLIP breach never touches F.
+            floor_expected = config.OPEN_MOMENTUM_STOP_C
             loss = -gross
             ok = loss <= floor_expected + config.FLIP_FLOOR_SLIP_CENTS
             try:
@@ -1867,10 +1675,10 @@ class LaneFlip:
                 from . import failures
                 failures.fail(
                     "FLIP_FLOOR_BREACH",
-                    f"{market}: loser cut {loss}c past the declared budget "
+                    f"{market}: loser cut {loss}c past the momentum-stop budget "
                     f"{floor_expected}c (+{config.FLIP_FLOOR_SLIP_CENTS}c slip) "
-                    f"— the {config.OPEN_SALVAGE_BUDGET_C}c salvage assumption is "
-                    "BREAKING; the EV table inverts if losers ride",
+                    f"— the entry−{config.OPEN_MOMENTUM_STOP_C}c stop is FICTION "
+                    "(kill condition #1): it did not fire or dumped into a fall",
                     fatal=False, alert=True, market=market, entry=entry,
                     cut_price=exit_px, loss=loss)
 

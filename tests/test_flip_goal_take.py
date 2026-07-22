@@ -103,36 +103,36 @@ def test_take_cents_clamps_min_and_max(monkeypatch):
         assert config.OPEN_TAKE_MIN <= LaneFlip._take_cents(n) <= config.OPEN_TAKE_MAX
 
 
-# ── §4 core test: the +5 convergence takes where +20 rode to the floor ─────
-def test_44_entry_takes_at_49_not_64(flip):
-    """The 201430 shape, cured: a 44¢ entry never rests its take at 64¢ (+20,
-    the rare swing that left it riding to the floor). WO-FLIP-EVERY-MARKET-
-    LIQUIDITY (build 49) SUPERSEDED the goal-bounded +5 on the LIVE path with
-    the MIDDLE-target: a cheap 44¢ entry rests at the 52¢ middle (+8 gouge)
-    where the hedgers are forced to transact — the goal-bounded helper still
-    floors it fee-safe at entry+5. Either way the take is REACHABLE, never the
-    rare +20 that rode to the floor."""
-    exits = _take_prop(flip, "yes", 44, 44)
+# ── §4 core test: buy the favored side, rest the +20 into the pile-in ──────
+def test_60_entry_takes_at_80(flip):
+    """WO-2026-07-22-E — buy the FAVORED side and sell the +20 INTO the
+    pile-in of buyers. A favored 60¢ entry rests its take at 80¢ (entry +
+    OPEN_GOUGE_C), the reachable exit that fills into demand — never the
+    retired middle-target (52) that rested on the abandoned side nobody
+    wanted (flip_fill=38%)."""
+    exits = _take_prop(flip, "yes", 60, 60)
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(44) == 52   # the middle
-    assert "middle" in exits[0].reason
-    # the retired behavior would have rested at 64 — prove we left that
-    assert exits[0].price_cents != 44 + config.OPEN_TAKE_CENTS
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 80
+    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 20
+    assert "open take" in exits[0].reason
+    # not the retired middle-target
+    assert exits[0].price_cents != config.OPEN_MIDDLE_TARGET
 
 
 def test_take_is_orientation_correct_no_mirrors_yes(flip):
-    """The middle-target take is entry-relative, so a NO@44 rests its take at
-    the SAME 52¢ middle as a YES@44 — build 41's mirror survives the build-49
-    middle-target take."""
-    y = _take_prop(flip, "yes", 44, 44)[0]
-    n = _take_prop(flip, "no", 44, 44)[0]
-    assert y.price_cents == n.price_cents == 52
+    """The +20 take is entry-relative, so a NO@60 rests its take at the SAME
+    80¢ as a YES@60 — build 41's mirror survives the buy-the-favored-side
+    doctrine (WO-2026-07-22-E)."""
+    y = _take_prop(flip, "yes", 60, 60)[0]
+    n = _take_prop(flip, "no", 60, 60)[0]
+    assert y.price_cents == n.price_cents == 80
 
 
-def test_take_never_exceeds_99(flip):
-    """A near-ceiling entry never proposes a take above the 99¢ tick."""
-    exits = _take_prop(flip, "yes", 97, 97)
-    assert exits[0].price_cents == min(99, 97 + LaneFlip._take_cents(1))
+def test_take_caps_at_90(flip):
+    """WO-2026-07-22-E — the take caps at 90¢ to stay out of the illiquid
+    tail: a near-ceiling entry never proposes a take above the 90¢ cap."""
+    exits = _take_prop(flip, "yes", 75, 75)
+    assert exits[0].price_cents == LaneFlip._take_price(75) == 90
 
 
 # ── §4: at simulated size the per-contract take shrinks, volume carries ─────
@@ -156,40 +156,41 @@ def test_take_target_falls_back_to_rec_count_without_ledger(flip, monkeypatch):
 
 
 def test_second_fill_recomputes_the_take(flip, gateway, ledger, monkeypatch):
-    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the LIVE take
-    is now the MIDDLE-target (entry-relative), NOT the size-scaled goal-bound —
-    so a second same-side fill re-proposes at the SAME 52¢ middle. The take
-    rests where the hedgers transact, independent of booked size; the size-
-    scaling survives only in the _take_target helper (test_take_shrinks_...)."""
+    """WO-2026-07-22-E: the LIVE take is now entry + OPEN_GOUGE_C (cap 90),
+    entry-relative and INDEPENDENT of booked size — so a second same-side
+    fill re-proposes at the SAME 80¢ take. The size-scaling survives only in
+    the _take_target helper (test_take_shrinks_...)."""
     monkeypatch.setattr(config, "WINDOW_BOOK_GOAL_CENTS", 20)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 44, 1, "PROBE")
-    first = _take_prop(flip, "yes", 44, 44, count=1)
-    assert first[0].price_cents == 52                   # the middle, 1 lot
-    # a second contract books; booked-held is now 2 — still the middle
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 44, 1, "PROBE")
-    second = _take_prop(flip, "yes", 44, 44, count=2)
-    assert second[0].price_cents == 52                  # size-independent middle
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
+    first = _take_prop(flip, "yes", 60, 60, count=1)
+    assert first[0].price_cents == 80                   # entry+20, 1 lot
+    # a second contract books; booked-held is now 2 — still entry+20
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
+    second = _take_prop(flip, "yes", 60, 60, count=2)
+    assert second[0].price_cents == 80                  # size-independent
 
 
-# ── §4: the CUT is UNCHANGED — a non-converging loser still cuts ────────────
+# ── §4: a non-converging loser still cuts — now via the MOMENTUM STOP ───────
 def test_non_converging_loser_still_cut(flip):
-    """HARD RAIL: this WO touches only the TAKE. A GENUINE catastrophe (real
-    depth, past the opening window, sustained 2 polls) still cuts — the exit
-    doctrine is untouched."""
+    """HARD RAIL: a non-converging loser still CUTS — the exit doctrine is
+    intact, now via the MOMENTUM STOP (WO-2026-07-22-E, replacing the retired
+    catastrophe/salvage/walk stack). A favored 60¢ entry whose mark falls to
+    entry−10 and stays there is exited: a first poll does NOT fire, two
+    sustained polls do. The book is already through the stop → it crosses."""
     w = flip._window(TICKER, CLOSE)
     w.opens.clear()
     now = CLOSE - 700
-    w.opens["yes"] = {"entry": 44,
-                      "fill_ts": now - (config.FLIP_NO_SELL_S + 30),
+    w.opens["yes"] = {"entry": 60, "fill_ts": now - 100,
                       "count": 1, "take_oid": None, "take_proposed": True,
                       "collapse_polls": 0, "catastrophe_polls": 0,
                       "det_ts": None, "entry_oid": None, "defer_polls": 0}
-    book = _mirror_book("yes", 20)
-    flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)   # poll 1
+    book = _mirror_book("yes", 40)          # mark 40 < stop 50: book through us
+    p1 = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)
+    assert [p for p in p1 if p.purpose in ("CUT", "EXIT")] == []   # 1 poll: armed
     props = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)
     cuts = [p for p in props if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "CATASTROPHE" in cuts[0].reason
-    assert cuts[0].price_cents == config.OPEN_CATASTROPHE_FLOOR == 20
+    assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
+    assert cuts[0].price_cents == 40 and cuts[0].crossfire is True
 
 
 # ── §4: Instrument 1 — took_swing now measures the reachable take ───────────

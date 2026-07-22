@@ -122,8 +122,10 @@ def test_fh8_nonreversal_gate_and_tag(monkeypatch):
 
 
 # ── §3.1: one shot per window (consumed on ANY exit, takes too) ────────────
-def _open_position(flip, gateway, entry=40):
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+def _open_position(flip, gateway, entry=60):
+    # WO-2026-07-22-E: FLIP buys the FAVORED (higher-priced) side in [50,70].
+    # A favored yes@60 book enters; note_fill anchors the position at 60.
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
     assert len(props) == 1
     flip.on_submitted(props[0], "OID-E", CLOSE - 800)
     gateway.positions[(EVENT, TICKER, "FLIP")] = 1
@@ -136,50 +138,47 @@ def test_consumed_on_take_blocks_the_rebet(flip, gateway):
     the take exit sets open_consumed and re-proposals refuse until
     rollover (the note_exit pop was the located loophole)."""
     w = _open_position(flip, gateway)
-    flip.note_exit(TICKER, "yes", 53, CLOSE - 700)   # the take FILLS
+    flip.note_exit(TICKER, "yes", 80, CLOSE - 700)   # the take FILLS (entry+20)
     assert w.open_consumed
     gateway.positions[(EVENT, TICKER, "FLIP")] = 0
-    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=690,
+    # a fresh in-band favored book, still inside the opening window (secs_into
+    # 60): it WOULD enter but for the consumed flag — so this proves consumed
+    # blocks, not the band or the clock (no tautology).
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=840,
                                        grain=GRAIN_YES2))
     assert props == []
     assert w.open_consumed_logged
     # rollover clears: a NEW window gets its one shot
     flip.windows.clear()
-    props2 = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
     assert len(props2) == 1
 
 
 def test_consumed_on_determined_too(flip, gateway):
     w = _open_position(flip, gateway)
-    flip.note_exit(TICKER, "yes", 41, CLOSE - 700)   # evacuation books
+    flip.note_exit(TICKER, "yes", 50, CLOSE - 700)   # momentum-stop cut books
     assert w.open_consumed
     gateway.positions[(EVENT, TICKER, "FLIP")] = 0
-    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=690,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=840,
                                       grain=GRAIN_YES2)) == []
 
 
 # ── §3.2/§3.4: evacuations cross NOW, within the geometry ──────────────────
 def test_evacuation_crosses_at_the_mark(flip, gateway):
-    """A determined-against evacuation prices AT the mark, not a maker-grace
-    slide to 31. WO-FLIP-LIQUIDITY-HOLD retired the price-floor triggers (a
-    low mark is illiquidity, held); the determined-against that fires in the
-    hold is a CONFIRMED spot collapse, and it crosses at the mark."""
-    from relay_engine.spotlead import Needle
-    w = _open_position(flip, gateway, entry=40)
-    take = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))[0]
+    """SPOT_DECIDED is RETIRED. WO-2026-07-22-E: the MOMENTUM STOP prices AT
+    the mark when the book is already THROUGH the stop (mark < entry−10) — a
+    CUT that crossfires, not a maker-grace slide to 31. (When mark still sits
+    at the stop it rests maker-first; here the book has gone through us.)"""
+    _open_position(flip, gateway, entry=60)          # favored yes@60, stop 50
+    take = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    w.opens["yes"]["fill_ts"] = CLOSE - 1030   # build 50: past the 4-min hard hold
-    sl = Needle(side="no", d_before=10.0, d_after=90.0,
-                delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
-                fair_cents=0.0, t_remaining=700.0)
-    flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=771, spotlead=sl))
-    props = flip.evaluate(TICKER, _ctx(_book(yes=41, no=56), secs_left=770,
-                                       spotlead=sl))
+    # book collapses THROUGH the stop (mark 44 < stop 50), sustained 2 polls
+    flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=771))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=770))
     assert len(props) == 1
     p = props[0]
-    # build 52 Finding 1: walks to scratch (maker), no market-dump
-    assert p.purpose == "EXIT" and not p.crossfire
-    assert p.price_cents == 40 and "spot-decided" in p.reason
+    assert p.purpose == "CUT" and p.crossfire
+    assert p.price_cents == 44 and "momentum stop" in p.reason
 
 
 def test_t10_handoff_replaces_yield_to_f(flip, gateway):
@@ -200,13 +199,13 @@ def test_open_entry_schedule(flip):
     in the first OPEN_OPENING_WINDOW_S (90s) of the window — the opening pile-in
     is the setup. Past 90s into the window, no entry (the −15/−16 mid-market
     class is retired)."""
-    # inside the first 90s (secs_into 50): enters
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
+    # inside the first 90s (secs_into 50): enters — favored yes@60 in band
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2,
                                        secs_left=850))
     assert len(props) == 1
     # past the 90s opening window (100s in): refused
     flip.windows.clear()
-    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2,
                                       secs_left=800)) == []
 
 
@@ -217,7 +216,8 @@ def test_no_geometry_gate_admits_the_band(flip):
     entry filter is band membership, and the reversion rate (Instrument 1) is
     the empirical gate. An in-band thesis entry is ADMITTED, never tagged
     OPEN_BAD_GEOMETRY."""
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    # WO-2026-07-22-E: the favored band is [50,70]; a favored yes@60 is admitted
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
     assert [p for p in props if p.purpose == "ENTRY"]
     assert not flip.windows[TICKER].open_geometry_logged
 
@@ -227,26 +227,27 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
     """P27 §2(b) OVERTURNED the margin gate (and OPEN_CELL_NEGATIVE's
     sit): entry proceeds on band + grain + geometry + one-shot; the cell
     margin prints on the why either way — informs daily, governs never."""
-    # virgin cell: enters, margin printed as info
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    # WO-2026-07-22-E: FLIP buys the favored yes@60 (cell 60); the margin cell
+    # that prints on the why is scoring.price_cell(60) = 60, so we populate 60.
+    # virgin cell: enters, margin printed on the new favored-side why
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
     assert len(props) == 1
-    # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the why now reads "liquidity"
-    assert "margin" in props[0].why and "liquidity" in props[0].why
+    assert "margin" in props[0].why and "favored yes" in props[0].why
     # a mature NEGATIVE cell: STILL enters — the margin prints (info)
     flip.windows.clear()
     for i in range(config.OPEN_PROBE_MAX_N):
-        ledger.record_cell_outcome("OPEN", 40, won=False, pnl_cents=-5,
+        ledger.record_cell_outcome("OPEN", 60, won=False, pnl_cents=-5,
                                    fees_cents=0, market=f"L{i}", kind="trip")
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
     assert len(props) == 1 and "info" in props[0].why
     # a mature POSITIVE cell: enters with the positive margin printed
     ledger.db.execute("DELETE FROM cell_outcomes")
     ledger.db.commit()
     for i in range(60):
-        ledger.record_cell_outcome("OPEN", 40, won=True, pnl_cents=5,
+        ledger.record_cell_outcome("OPEN", 60, won=True, pnl_cents=5,
                                    fees_cents=0, market=f"W{i}", kind="trip")
     flip.windows.clear()
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
     assert len(props) == 1 and "margin +" in props[0].why
 
 

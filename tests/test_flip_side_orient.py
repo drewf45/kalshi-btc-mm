@@ -145,12 +145,13 @@ def test_mirror_holds_t10_handoff(flip):
         assert yes == no, f"T-10 handoff mirror BROKEN at {mark}"
 
 
-# ── the catastrophe floor is P&L-blind and side-blind ──────────────────────
-def test_catastrophe_fires_both_sides(flip):
-    """A GENUINE catastrophe — real depth, past the opening window, sustained
-    2 polls — cuts on EITHER side, at the held mark, symmetric. (WO-FLIP-
-    CATASTROPHE-ILLIQUIDITY guards the price floor against thin-book
-    illiquidity; the deep backstop stays, and stays side-symmetric.)"""
+# ── the momentum stop is P&L-blind and side-blind ──────────────────────────
+def test_momentum_stop_fires_both_sides(flip):
+    """WO-2026-07-22-E: the momentum stop (entry − OPEN_MOMENTUM_STOP_C,
+    sustained 2 polls) fires on EITHER held side, at the held-side mark,
+    symmetric. Here the book is THROUGH the stop (mark below it), so both sides
+    cross out — CUT, crossfire — at their own held mark. The exit is oriented to
+    the held side, so a YES and its NO mirror get byte-identical decisions."""
     for side in ("yes", "no"):
         w = flip._window(TICKER, CLOSE)
         w.opens.clear()
@@ -162,13 +163,14 @@ def test_catastrophe_fires_both_sides(flip):
                          "count": 1, "take_oid": None, "take_proposed": True,
                          "collapse_polls": 0, "catastrophe_polls": 0,
                          "det_ts": None, "entry_oid": None, "defer_polls": 0}
-        b = _mirror_book(side, 20)
+        b = _mirror_book(side, 20)              # 20 < entry−10 (34): book through
         ctx = _ctx(b, secs_left=700)
         flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)      # poll 1
         cuts = [p for p in flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)
                 if p.purpose == "CUT"]
-        assert len(cuts) == 1 and "CATASTROPHE" in cuts[0].reason
-        assert cuts[0].price_cents == config.OPEN_CATASTROPHE_FLOOR == 20
+        assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
+        assert cuts[0].price_cents == 20 and cuts[0].crossfire
+        assert w.opens[side].get("exit_reason") == "MOMENTUM_STOP"
         flip.windows.clear()
 
 
@@ -181,17 +183,15 @@ def test_no_climbs_to_66_takes_not_cuts(flip):
         assert [p for p in props if p.purpose == "CUT"] == []
 
 
-# ── the spot decision cuts either held side, mirrored ──────────────────────
-def test_spot_collapse_cuts_both_sides_mirrored(flip):
-    """ΔP-collapse against the held side (the market deciding) cuts on 2
-    sustained polls — and the sign is held-relative: NO's adverse move is
-    spot UP (a YES needle), YES's is spot DOWN (a NO needle)."""
+# ── the momentum stop exits either held side, mirrored ─────────────────────
+def test_momentum_stop_cuts_both_sides_mirrored(flip):
+    """WO-2026-07-22-E: the momentum stop is held-relative and mirror-exact. An
+    adverse move to entry − OPEN_MOMENTUM_STOP_C, sustained 2 polls, exits — and
+    NO@stop and YES@stop, each on its own mirror book, produce BYTE-IDENTICAL
+    decisions. Here the mark sits AT the stop (book not through), so both rest
+    maker-first (EXIT, no crossfire) at the same held-side price."""
     out = {}
     for side in ("yes", "no"):
-        against = "yes" if side == "no" else "no"
-        sl = Needle(side=against, d_before=10.0, d_after=90.0,
-                    delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
-                    fair_cents=0.0, t_remaining=700.0)
         w = flip._window(TICKER, CLOSE)
         w.opens.clear()
         now = CLOSE - 700
@@ -200,13 +200,21 @@ def test_spot_collapse_cuts_both_sides_mirrored(flip):
                          "count": 1, "take_oid": None, "take_proposed": True,
                          "collapse_polls": 0, "det_ts": None,
                          "entry_oid": None, "defer_polls": 0}
-        book = _mirror_book(side, 44)
-        ctx = _ctx(book, secs_left=700, sl=sl)
+        book = _mirror_book(side, 34)          # 34 == entry−10: at the stop line
+        ctx = _ctx(book, secs_left=700)
         flip._open_custody(w, TICKER, EVENT, book, ctx, 700, now)  # poll 1
         props = flip._open_custody(w, TICKER, EVENT, book, ctx, 700, now)
-        out[side] = _norm(props, side)
+        # the momentum-stop reason carries NO side token (it is the same fixed
+        # English on both sides), so the RAW proposal is byte-identical for a
+        # YES and its NO mirror — comparing raw is the strongest mirror proof
+        # here (and _norm's whole-word erasure would mangle the phrase 'no
+        # hold' on the NO side, a false asymmetry).
+        out[side] = [(p.purpose, p.action, p.price_cents, p.count,
+                      p.crossfire, p.reason) for p in props]
     assert out["yes"] == out["no"]
-    assert out["yes"] and "spot-decided" in out["yes"][0][4]
+    assert out["yes"] and out["yes"][0][0] == "EXIT"
+    assert not out["yes"][0][4]                       # maker-first: no crossfire
+    assert out["yes"][0][2] == 34 and "momentum stop" in out["yes"][0][5]
 
 
 # ── the SHADOW two-barrier — the one genuine orientation bug, fixed ─────────

@@ -29,7 +29,9 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=40, no=49):
+def _book(yes=60, no=40):
+    # WO-2026-07-22-E: FLIP buys the FAVORED (higher-priced) side in [50,70];
+    # the default book is favored-yes@60 so the entry path enters yes.
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -65,7 +67,7 @@ def _rows(ledger, tag):
 def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
                                                               ledger):
     """2-lot OPEN entry; the venue fills it as two 1-lot records with the
-    determined-against condition arriving between them. Pre-fix: two
+    adverse (momentum-stop) condition arriving between them. Pre-fix: two
     single-lot exits + UNCOVERED page. Now: the exit DEFERS while the
     entry is partially filled (§3.1), the second half merges, and the
     position leaves as ONE covered 2-lot action. ZERO pages."""
@@ -79,9 +81,9 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
     assert r.order_id in gateway.resting               # the partial, live
-    # the book collapses to CATASTROPHE territory BETWEEN the two halves
-    # (WO-FLIP-LIQUIDITY-HOLD retired the band-floor cut; the catastrophe
-    # backstop is the retained P&L-blind determined-against used here)
+    # the book moves ADVERSELY to momentum-stop territory (mark 20 <= entry−10)
+    # BETWEEN the two halves; §3.1 still DEFERS every exit while the entry is
+    # partially filled (the exit acts only on a fully-booked position).
     p_mid = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=780))
     assert [p for p in p_mid if p.purpose in ("EXIT", "CUT")] == []  # §3.1 defers
     # venue fill record 2 of 2: entry fully booked, merge lands
@@ -91,12 +93,11 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     assert r.order_id not in gateway.resting
     w = flip.windows[TICKER]
     assert w.opens["yes"]["count"] == 2 and "yes" not in w.fills
-    # WO-FLIP-CATASTROPHE-ILLIQUIDITY: age past the opening window so the
-    # catastrophe backstop (this race-test's trigger) can fire; it needs depth
-    # + 2 sustained polls now.
-    w.opens["yes"]["fill_ts"] = CLOSE - 1100
+    # WO-2026-07-22-E: the MOMENTUM STOP (entry−10, 2 sustained polls,
+    # maker-first) is this race-test's exit trigger — armed from the first
+    # poll, no opening-window gate.
     # the take posts at FULL size (custody order: take first), then the
-    # catastrophe evacuation fires — also at full size
+    # momentum-stop evacuation fires — also at full size
     p_take = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=778))
     take = next(p for p in p_take if p.purpose == "EXIT")
     assert take.count == 2                             # never a 1-lot split
@@ -105,7 +106,7 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     p_exit = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=776))
     cuts = [p for p in p_exit if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].count == 2       # ONE covered action
-    assert "determined-against" in cuts[0].reason
+    assert "momentum stop" in cuts[0].reason
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 2, "PROBE")
     flip.note_exit(TICKER, "yes", 34, CLOSE - 776, count=2)
     assert w.window_realized == -28                    # bound loss, together
@@ -125,11 +126,10 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)  # fake oid: gate off
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
-    # WO-FLIP-CATASTROPHE-ILLIQUIDITY: age past the opening window so the
-    # catastrophe backstop (this race-test's trigger) can fire; it needs depth
-    # + 2 sustained polls now.
+    # WO-2026-07-22-E: the MOMENTUM STOP (entry−10, 2 sustained polls) is this
+    # race-test's exit trigger; the mark 20 <= entry−10 sustains it.
     flip.windows[TICKER].opens["yes"]["fill_ts"] = CLOSE - 1100
-    # take posts on the 1-lot leg, then the catastrophe cut fires -> done=
+    # take posts on the 1-lot leg, then the momentum-stop cut fires -> done=
     # True, CUT x1 in flight (the pre-merge exit — the race's first half).
     p_take = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=781))
     flip.on_submitted(next(p for p in p_take if p.purpose == "EXIT"),

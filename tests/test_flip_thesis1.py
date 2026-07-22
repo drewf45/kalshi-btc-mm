@@ -52,11 +52,12 @@ def flip(gateway, ledger, surface):
                                                  ladder=DegradeLadder()))
 
 
-def _open_position(flip, gateway, ledger, side="yes", entry=40,
+def _open_position(flip, gateway, ledger, side="yes", entry=60,
                    fill_secs_left=790):
     """An OPEN custody position via the real path: proposal, submit-marker,
-    booked fill."""
-    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=850,
+    booked fill. build 57: FLIP buys the FAVORED (higher-priced) side in the
+    band [50,70]; the canonical entry is favored yes @ 60 (stop 50, take 80)."""
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", side, "ENTRY", entry, 1, "PROBE")
@@ -66,52 +67,51 @@ def _open_position(flip, gateway, ledger, side="yes", entry=40,
 
 # ── §2 stage 1: THE PATIENCE FLOOR ─────────────────────────────────────────
 def test_first_minute_dip_is_noise_not_a_decision(flip, gateway, ledger):
-    """§5: a fresh entry dips through the determined trigger in minute 1 →
-    NO cut. The 48→41-nine-seconds-later −9¢ evacuate is dead."""
-    o = _open_position(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(yes=41), secs_left=780))
+    """build 57: the 240s no-sell hold is RETIRED — the momentum stop is
+    armed from the first poll, suppressed by no hold. But a SINGLE adverse
+    print is noise: a first-minute mark <= entry−10 for ONE poll does NOT
+    exit; it takes 2 sustained polls (the 48→41 hair-trigger stays dead)."""
+    o = _open_position(flip, gateway, ledger)            # favored yes @ 60
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=55), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)             # the scalp take rests
-    # 60 seconds after the fill, mark 41 < trigger 42 — still NOISE
-    p2 = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=730))
-    assert [p for p in p2 if p.purpose == "CUT"] == []
+    # one poll through the stop (mark 45 <= entry−10 = 50) — NOISE, no exit
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=45), secs_left=730))
+    assert [p for p in p2 if p.purpose in ("CUT", "EXIT")] == []
+    assert o["stop_polls"] == 1
     assert o.get("done") is not True                     # the position HOLDS
+    # a SECOND sustained poll DOES exit — the 2-poll momentum stop
+    flip.evaluate(TICKER, _ctx(_book(yes=45), secs_left=729))
+    assert o.get("done") is True
 
 
 def test_spot_collapse_cuts_any_time_two_polls(flip, gateway, ledger):
-    """WO-FLIP-EXIT-DOCTRINE Change 2 OVERTURNED the patience-gate on the
-    ΔP leg: SPOT deciding against is the market's decision — the position
-    trader's real exit — so it cuts on 2 sustained polls at ANY time
-    (inside patience too). A one-frame flicker still holds (2 polls)."""
-    o = _open_position(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
+    """build 57: SPOT_DECIDED is RETIRED, replaced by the MOMENTUM STOP. An
+    adverse move against the favored side exits on 2 SUSTAINED polls at ANY
+    time; a one-frame flicker (a single poll, or a poll that recovers) does
+    NOT — the counter resets on any mark back above entry−10. When the book
+    is already through the stop the exit crosses at the mark (crossfire)."""
+    o = _open_position(flip, gateway, ledger)            # favored yes @ 60
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=60), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)             # the take rests
-    o["fill_ts"] = CLOSE - 960     # build 50: past FLIP_NO_SELL_S, still inside patience
-
-    class SL:
-        side = "no"
-        delta_p = config.OPEN_DETERMINED_K_POINTS + 5
-        fair_cents = 0          # hunt-entry gate B fails: no hunt fires
-    # past the hard-hold, still inside patience (age ~260 << 300s)
-    ctx_collapse = _ctx(_book(yes=44), secs_left=700)
-    ctx_collapse["spotlead"] = SL()
-    # poll 1: one flicker does NOT cut (needs 2 polls). The B3 late-window
-    # walk-down (build 49) may independently re-post the resting MAKER take
-    # lower — that is not a cut; the position still HOLDS.
-    cuts1 = [p for p in flip.evaluate(TICKER, ctx_collapse) if p.purpose == "CUT"]
+    # stop = entry−10 = 50; poll 1 through the stop is a flicker — no cut
+    cuts1 = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=48),
+                                                   secs_left=760))
+             if p.purpose == "CUT"]
     assert cuts1 == []
-    assert o["collapse_polls"] == 1
-    ctx_collapse2 = _ctx(_book(yes=44), secs_left=699)
-    ctx_collapse2["spotlead"] = SL()
-    props = flip.evaluate(TICKER, ctx_collapse2)
-    # WO-FULL-COLD-AUDIT Finding 1 (build 52): 2 sustained polls no longer
-    # crossfire-DUMP — the decision routes through the walk-down, a MAKER exit
-    # at scratch (entry 40, never below cost, no market-dump).
-    assert [p for p in props if p.purpose == "CUT"] == []
-    exits = [p for p in props if p.purpose == "EXIT"]
-    assert len(exits) == 1 and exits[0].price_cents == 40
-    assert "spot-decided" in exits[0].reason and not exits[0].crossfire
+    assert o["stop_polls"] == 1
+    # a recovery back above the stop RESETS the counter — the flicker holds
+    flip.evaluate(TICKER, _ctx(_book(yes=55), secs_left=740))
+    assert o["stop_polls"] == 0
+    # now 2 sustained polls through the stop → cut, crossfire at the mark
+    flip.evaluate(TICKER, _ctx(_book(yes=48), secs_left=720))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=48), secs_left=700))
+    cuts = [p for p in props if p.purpose == "CUT"]
+    assert len(cuts) == 1 and cuts[0].crossfire
+    assert cuts[0].price_cents == 48       # book through us: cross at the mark
+    assert "momentum stop" in cuts[0].reason
+    assert o["exit_reason"] == "MOMENTUM_STOP"
 
 
 # ── §3.5/§4 stage 3: the T-10 handoff + F coordination ─────────────────────
@@ -184,7 +184,7 @@ def test_t10_handoff_winner_left_to_f_not_sold(flip, gateway, ledger,
     FLIP's basis; the shared inventory still shows the side so F stands
     down; no UNCOVERED page for the deliberate hold."""
     import logging
-    o = _open_position(flip, gateway, ledger)          # yes @ 48
+    o = _open_position(flip, gateway, ledger)          # favored yes @ 60
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
@@ -196,7 +196,7 @@ def test_t10_handoff_winner_left_to_f_not_sold(flip, gateway, ledger,
     assert any("FLIP_HOLD_TO_SETTLE" in r.message
                and "decision-winner-to-F" in r.message
                for r in caplog.records)
-    assert flip.held(TICKER) == {"yes": {"count": 1, "basis": 40}}
+    assert flip.held(TICKER) == {"yes": {"count": 1, "basis": 60}}
     # the hold is deliberate: cycles pass, zero UNCOVERED pages
     flip.evaluate(TICKER, _ctx(_book(yes=61),
                                secs_left=config.FLIP_DECISION_S - 2))
@@ -212,12 +212,12 @@ def test_t10_handoff_flat_hands_off_nothing(flip):
 
 
 def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
-    """Adversary (a): the hold-to-settle is NOT exempt from the collapse
+    """Adversary (a): the curfew hold-to-settle is NOT exempt from the
     backstop — a held winner that genuinely COLLAPSES still cuts, never a
-    ride to zero. WO-FLIP-LIQUIDITY-HOLD retired the price-floor cut (a
-    shallow dip is illiquidity, held even on a hold); the catastrophe
-    backstop (20c) and a sustained spot collapse remain armed on the hold."""
-    o = _open_position(flip, gateway, ledger)
+    ride to zero. build 57: the DEAD-FLOOR backstop (mark <= 20c with real
+    depth, 2 polls) is UNCHANGED and stays armed on the hold; a shallow dip
+    is illiquidity, held even on the hold."""
+    o = _open_position(flip, gateway, ledger)            # favored yes @ 60
     p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
@@ -228,29 +228,34 @@ def test_held_winner_that_reverses_is_still_cut(flip, gateway, ledger):
     assert [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
                                                   secs_left=230))
             if p.purpose == "CUT"] == []
-    # a genuine collapse to the catastrophe floor still cuts — never zero
+    # a genuine collapse to the dead floor still cuts — never zero
     # (sustained 2 polls; the held position is long past the opening window)
     flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=210))  # poll 1: sustain
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=209))
             if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "determined-against" in cuts[0].reason
-    assert "CATASTROPHE" in cuts[0].reason
+    assert len(cuts) == 1 and "dead-floor backstop" in cuts[0].reason
+    assert cuts[0].crossfire and o["exit_reason"] == "DEAD_FLOOR"
 
 
 def test_f_agrees_conversion_pre_t10(flip, gateway, ledger, caplog):
-    """§4: post-patience, the mark runs through F's band floor (95¢) with
-    the take unfilled → convert to hold-to-settle, reason F-agrees."""
+    """build 57: the F-agrees patience hold-conversion is RETIRED. The new
+    thesis SELLS the +20 into the pile-in — a rising favorite gets its
+    resting take (entry + OPEN_GOUGE_C, cap 90); it is NOT converted to a
+    hold-to-settle before the curfew. No 'F-agrees' conversion fires pre-T10."""
     import logging
-    o = _open_position(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
-    flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
-                      "OID-T1", CLOSE - 780)
-    o["fill_ts"] = CLOSE - 1100                        # patience elapsed
+    o = _open_position(flip, gateway, ledger)            # favored yes @ 60
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60), secs_left=780))
+    take = next(p for p in props if p.purpose == "EXIT")
+    assert take.price_cents == LaneFlip._take_price(60) == 80   # entry+20
+    flip.on_submitted(take, "OID-T1", CLOSE - 780)
+    # a rising favorite well before the curfew: NO hold conversion — the
+    # resting +20 take is the exit, the position sells the gouge, never holds
     with caplog.at_level(logging.WARNING, logger="relay.lane_flip"):
-        props = flip.evaluate(TICKER, _ctx(_book(yes=95), secs_left=700))
-    assert props == [] and o["hold"] is True
-    assert any("reason=F-agrees" in r.message for r in caplog.records)
+        flip.evaluate(TICKER, _ctx(_book(yes=79), secs_left=700))
+    assert o.get("hold") is not True and o.get("done") is not True
+    assert not any("F-agrees" in r.message for r in caplog.records)
+    assert not any("FLIP_HOLD_TO_SETTLE" in r.message for r in caplog.records)
 
 
 # ── §1 stage 4: continuity — a LOGGED feature, never a vote ────────────────
@@ -262,9 +267,9 @@ def test_continuity_logs_agreement_and_never_votes(flip, gateway, ledger,
     import logging
     ledger.record_outcome("KXBTC15M-PRIOR-T99", False)     # prior went NO
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
-        props = flip.evaluate(TICKER, _ctx(_book(), secs_left=850,
-                                           grain=GRAIN_YES2))
-        flip.evaluate(TICKER, _ctx(_book(), secs_left=799,
+        props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40),
+                                           secs_left=850, grain=GRAIN_YES2))
+        flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=799,
                                    grain=GRAIN_YES2))      # once per window
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     lines = [r.message for r in caplog.records if "OPEN_CONTINUITY" in r.message]
@@ -288,55 +293,54 @@ def test_scalp_take_rests_at_the_goal_bounded_move(flip, gateway, ledger):
     floor, −27¢), so the take now floats to the reachable convergence move —
     entry+5 at the 1-lot cap (54¢), banked reliably. The reachable nickel is
     the win convergence actually gives; the +20 was the SOMETIMES."""
-    # build 49+: the live take is the MIDDLE-target (_take_price); a 40c cheap
-    # entry rests at the 52 middle (build 52 Finding 4 tightened entry to <=42)
-    take_px = LaneFlip._take_price(40)             # the 52 middle
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=50), secs_left=850,
+    # build 57: the take is entry + OPEN_GOUGE_C, capped 90 — a favored yes@60
+    # entry rests its take at 80c, sold INTO the pile-in of buyers.
+    take_px = LaneFlip._take_price(60)             # 80
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 40, CLOSE - 790)
-    take = next(p for p in flip.evaluate(TICKER, _ctx(_book(yes=40),
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 60, CLOSE - 790)
+    take = next(p for p in flip.evaluate(TICKER, _ctx(_book(yes=60),
                                                       secs_left=780))
                 if p.purpose == "EXIT")
     assert take.price_cents == take_px and take.action == "sell"
-    # the reachable move arrives: the fill books the middle-target capture
+    # the reachable move arrives: the fill books the target capture
     flip.on_submitted(take, "OID-T", CLOSE - 780)
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", take_px, 1, "PROBE")
     flip.note_exit(TICKER, "yes", take_px, CLOSE - 500)
-    assert flip.windows[TICKER].window_realized == take_px - 40
+    assert flip.windows[TICKER].window_realized == take_px - 60
 
 
 def test_no_new_scalp_entry_at_or_after_t10(flip):
     """§3.5: FLIP owns T-15→T-10; no fresh scalp inventory once
     secs_left <= 600. F owns the final five minutes."""
     assert config.OPEN_ENTRY_CUTOFF == 600         # DREW-RULED §3.5
-    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=600,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=600,
                                       grain=GRAIN_YES2)) == []
-    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=550,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=550,
                                       grain=GRAIN_YES2)) == []
     # build 51: entry only in the opening 90s (secs_into 50 here); 601 (299s
     # into the window) is now past the opening cutoff too
-    props = flip.evaluate(TICKER, _ctx(_book(), secs_left=850,
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
                                        grain=GRAIN_YES2))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 
 def test_post_window_genuine_collapse_cuts_hard(flip, gateway, ledger):
-    """§5, AMENDED by WO-FLIP-LIQUIDITY-HOLD: a genuine COLLAPSE is still cut,
-    loss bounded — the passive hold holds illiquidity, never a true collapse.
-    The price-floor trigger is retired; the catastrophe backstop (20c, P&L-
-    blind) is the remaining price cut and it fires any time."""
-    o = _open_position(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(), secs_left=780))
+    """build 57: SPOT_DECIDED is RETIRED — the MOMENTUM STOP cuts a genuine
+    collapse, loss bounded. An adverse move through the stop (mark < entry−10),
+    sustained 2 polls, crosses at the mark (crossfire) — no hold to ride."""
+    o = _open_position(flip, gateway, ledger)            # favored yes @ 60
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=60), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    o["fill_ts"] = CLOSE - 1100                          # window long over
+    # book collapses through the stop (20 < entry−10 = 50), sustained 2 polls
     flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=701))  # poll 1: sustain
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
                                                   secs_left=700))
             if p.purpose == "CUT"]
     assert len(cuts) == 1
-    assert "determined-against" in cuts[0].reason
-    assert "CATASTROPHE" in cuts[0].reason
+    assert "momentum stop" in cuts[0].reason
     assert cuts[0].count == 1 and cuts[0].crossfire      # bounded, NOW
+    assert cuts[0].price_cents == 20 and o["exit_reason"] == "MOMENTUM_STOP"

@@ -74,7 +74,7 @@ CHECKS = [
     ]),
     ("the detective: needle equation, two jobs, P yields the floor (P18)", [
         "tests/test_p18_detective.py",
-        "tests/test_p15_ratifications.py::test_pair_formable_posts_the_cheap_side",
+        "tests/test_p15_ratifications.py::test_pair_formable_posts_the_favored_side",
     ]),
     ("salvage, seal, let it run: the custodian earns F (P19)", [
         "tests/test_p19_salvage.py",

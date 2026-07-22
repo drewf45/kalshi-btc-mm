@@ -73,8 +73,9 @@ def test_flip_takes_lead_its_proposal_list(gateway, ledger, surface):
                                                  ladder=DegradeLadder()))
     close = 1_000_000.0
     b = OrderBook(market=TICKER)
-    # P21 A4: entries are Lane OPEN now — open-band book + grain streak
-    b.apply_snapshot({40: 20}, {49: 20}, ts=1.0)
+    # WO-2026-07-22-E: FLIP buys the FAVORED (higher) side in [50,70] —
+    # yes@60 > no@49 -> the favored side is YES.
+    b.apply_snapshot({60: 20}, {49: 20}, ts=1.0)
     ctx = {"book": b, "close_ts": close, "now": close - 850,
            "grain": {"direction": "yes", "length": 2, "k": 4}}
     props = flip.evaluate(TICKER, ctx)

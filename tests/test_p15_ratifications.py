@@ -39,33 +39,34 @@ def flip_ctx(engine, book, secs_left=850):
 
 # ── RULING 2: pair-formable or nothing ─────────────────────────────────────
 def test_one_sided_book_posts_nothing(engine):
-    """AMENDED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the both-sides-in-
-    band suppression is retired, so a two-bid biased book (yes 66 / no 34) now
-    ENTERS the cheap side (no@34, buyable). What still posts NOTHING is a
-    GENUINELY one-sided book — a lone bid with the other side EMPTY — because
-    there is no cheap side to price against (need both bids)."""
-    # two-bid biased book: the cheap side is now the setup, it ENTERS
+    """AMENDED by WO-2026-07-22-E (build 57): FLIP buys the FAVORED (higher-
+    priced) side in [50,70]. A two-bid biased book (yes 66 / no 34) now ENTERS
+    the FAVORED side (yes@66, buyable). What still posts NOTHING is a GENUINELY
+    one-sided book — a lone bid with the other side EMPTY — because there is no
+    favored side to price against (need both bids)."""
+    # two-bid biased book: the favored (higher) side is the setup, it ENTERS
     props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(66, 34)))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("no", 34, "ENTRY")]
+        [("yes", 66, "ENTRY")]
     # a genuinely one-sided book (no@34 only, yes side empty): NOTHING
     engine.flip.windows.clear()
     props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(None, 34)))
     assert props == []
 
 
-def test_pair_formable_posts_the_cheap_side(engine):
-    """WO-FLIP-IMMEDIATE-ENTRY (build 47) OVERTURNED grain-gating: a two-way
-    band book posts ONE lot on the CHEAP side (the lower bid) immediately, no
-    grain needed. yes 46 < no 48 -> buy YES@46; grain, if present, only
-    informs — the side stays the cheap side."""
-    ctx = flip_ctx(engine, flip_book(40, 48))
+def test_pair_formable_posts_the_favored_side(engine):
+    """WO-2026-07-22-E (build 57): FLIP buys the FAVORED (higher-priced) side —
+    the market's own read of direction — and sells the +20 into the pile-in. A
+    two-way band book posts ONE lot on the FAVORED (higher) bid immediately, no
+    grain needed. yes 40 < no 60 -> buy NO@60; grain, if present, only
+    informs — the side stays the favored side."""
+    ctx = flip_ctx(engine, flip_book(40, 60))
     assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
-        == [("yes", "ENTRY")]                        # yes 46 < no 48 -> cheap
+        == [("no", "ENTRY")]                         # no 60 > yes 40 -> favored
     engine.flip.windows.clear()
-    ctx["grain"] = {"direction": "no", "length": 2, "k": 4}   # informs only
+    ctx["grain"] = {"direction": "yes", "length": 2, "k": 4}  # informs only
     assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
-        == [("yes", "ENTRY")]                        # still the cheap side
+        == [("no", "ENTRY")]                         # still the favored side
 
 
 def test_combined_over_line_posts_nothing(engine):

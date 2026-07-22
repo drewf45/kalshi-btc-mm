@@ -2609,6 +2609,68 @@ The Stage 1 lane (50/50 entry + disaster envelope), the recovery-surface backtes
 **the Stage 2→3 treasury-waterfall prerequisite remains absolute: no extra lot
 until wins and losses hit the book on the same footing.**
 
+## WO-2026-07-22-E — FLIP THE SIDE: WE BUILT THE MACHINE BACKWARDS (build 57)
+
+**Classification: design-error correction, not a strategy change → weekday-legal.** The tape said it
+seven times in two days: **1 win in 7, and the one win was the only window where the cheap side had
+depth (1.40×); the inverse of every other trade wins (−93c actual vs +110c inverse).** FLIP was
+running the *inverse* of the strategy its own thesis describes — market making acquires inventory on
+the side with **demand** and sells it to that demand; FLIP was buying the **abandoned** cheap side
+and resting a take on the side nobody wants. **That is why `flip_fill = 38%` — the number nobody
+could account for: we rested the sell against an empty side.** Correcting an inverted implementation,
+observed live, is a bug fix under "let it run unless provably broken." It is provably broken.
+
+**Read-rule at source (all TRUE):**
+- The entry picked the cheap side: `lane_flip.py` `side = "yes" if yes_bid < no_bid else "no"`,
+  band `OPEN_ENTRY_FLOOR (25)..OPEN_MAX_ENTRY_CENTS (42)`. TRUE — the exact inverted line.
+- `_take_price` rested toward the 52c MIDDLE (`max(OPEN_MIDDLE_TARGET, entry+OPEN_TAKE_MIN)`) — a
+  sell on the abandoned side. TRUE (the fill objection, resolved in the build's favour: the favored-
+  side sell rests INTO the pile-in of buyers).
+- The exit ran the cheap-side liquidity-hold stack: a 240s hard-no-sell (`FLIP_NO_SELL_S`), the
+  F-agrees patience hold-conversion, the relative SALVAGE floor, the CATASTROPHE floor, the
+  SPOT_DECIDED walk-to-scratch, the time-based WALK_DOWN. TRUE — all premised on "a low mark is
+  illiquidity, hold through it," which is exactly backwards on the favored side.
+
+**Built — one change, maximally attributable:**
+- **Entry buys the FAVORED (higher-priced) side** — `side = "yes" if yes_bid > no_bid else "no"`,
+  band `OPEN_ENTRY_MIN_C (50) <= join <= OPEN_ENTRY_MAX_C (70)`. **50 is a HARD floor** (the rest-back
+  wall enforces `band_lo`, so no entry ever rests below 50 — the old bug cannot survive in a corner).
+  `trend_usd` and `depth_ratio` are **LOGGED, never gated** (the confirms earn a gate from data, not
+  from n=7): the entry `why` is now `OPEN50 favored {side}@{join}c (… ratio …x trend $… agree·logged)
+  target {t}c (+…, cap 90) · stop {join−10}c · confirms logged-not-gated`.
+- **The cheap-side swing gate and the volatility trend-SKIP are RETIRED** from the entry path (the
+  `_swing_gate` method survives but no longer gates); the only entry filter is favored-side ∈ [50,70].
+- **Target = `entry + OPEN_GOUGE_C` (20), capped 90** — `_take_price = min(90, entry+20)`; the +20
+  sold into the pile-in.
+- **The exit is ONE momentum stop** — `mark <= entry − OPEN_MOMENTUM_STOP_C` (10) for **2 sustained
+  polls**, **NO hold** (an adverse move on the favored side means the thesis is already wrong — a 60c
+  contract with depth is far less noisy than a 30c tail, so a tight stop is legible where it was
+  fiction on the cheap side). **Maker-first:** rest at the stop; cross at mark only if the book has
+  already gone through it. The 240s hold, F-agrees conversion, salvage, catastrophe-split, spot-
+  decided walk, and walk-down are all retired into this one stop.
+- **The endgame CURFEW is unchanged** (winner→F, loser→sold at `FLIP_DECISION_S`); the **DEAD-FLOOR
+  backstop** is kept, now guarding a curfew-held winner that later craters (`<= 20c` with depth, 2
+  polls → crossfire, `DEAD_FLOOR`).
+- **`FLIP_FLOOR_BREACH` now polices the momentum stop** (`floor_expected = OPEN_MOMENTUM_STOP_C`): any
+  FLIP loss beyond 10c+slip pages LOUD — kill condition #1, "the stop is fiction." With the per-lane
+  rate halt (build 56) a FLIP breach never touches F.
+
+**HARD RAIL:** F byte-identical; maker-only enforced at the gateway (entries 50-70 and exits 70-90
+straddle the taker band, so a cross is a tax); 1 lot; one-shot per window; per-lane halt intact.
+This is a Wednesday strategy change against the banked-Saturday law — **Drew's law, Drew's explicit
+ship order, flagged deliberate.** n=7 is a real caveat: this ships at 1 lot with the target and stop
+as DIALS, not laws; the mechanism (Bartlett adverse selection + the inventory argument) is
+independent of the sample, and the flip_fill prediction is the falsifiable test.
+
+**Watch tomorrow (acceptance):** every FLIP entry on the FAVORED side priced 50-70 (zero below 50);
+the entry line states side, price, trend, ratio, agreement (logged-not-gated); zero taker fills on
+entry (`fee 0¢`); no loss beyond ~12c (else `FLIP_FLOOR_BREACH` pages → halt the FLIP lane);
+**`flip_fill` RISES from 38% — the primary success metric and the falsifiable test.** F byte-identical.
+
+**Immediately after (not this build):** the disaster envelope fit from the recovery surface, the
+residual bad-settlement-row quarantine (Drew on Render), the recovery surface from `book_snapshots`,
+and — above everything — the **treasury-waterfall asymmetry**, still the ceiling before any extra lot.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

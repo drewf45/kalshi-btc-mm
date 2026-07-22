@@ -140,99 +140,97 @@ def test_one_hunt_loss_sits_the_window_out_open_unaffected(flip, gateway,
     flip.note_exit(TICKER, "no", 28, CLOSE - 780, count=1)   # -2c: a loss
     assert flip.windows[TICKER].hunt_lost is True
     assert _hunt_at(flip, 45, 700) == []      # higher, same side — still out
-    # build 51: OPEN enters in the opening 90s; hunt_lost never gates it
-    open_props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=49),
+    # build 51: OPEN enters in the opening 90s; hunt_lost never gates it.
+    # WO-2026-07-22-E: OPEN buys the FAVORED side (yes@60, in [50,70]).
+    open_props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40),
                                             secs_left=850,
                                             grain=GRAIN_YES2))
     assert [(p.side, p.purpose) for p in open_props] == [("yes", "ENTRY")]
 
 
 # ── BLEED 3: the floor stops slipping ──────────────────────────────────────
-def _open_pos(flip, gateway, ledger, entry=40):
-    props = flip.evaluate(TICKER, _ctx(_book(yes=entry), secs_left=850,
+def _open_pos(flip, gateway, ledger, entry=60):
+    # WO-2026-07-22-E: a favored-side (yes@entry over no@40) OPEN position; the
+    # take rests at entry+20 and the momentum stop sits at entry−10.
+    props = flip.evaluate(TICKER, _ctx(_book(yes=entry, no=40), secs_left=850,
                                        grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, "yes", entry, CLOSE - 790)
-    p1 = flip.evaluate(TICKER, _ctx(_book(yes=entry), secs_left=780))
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=entry, no=40), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
     return flip.windows[TICKER].opens["yes"]
 
 
-def test_bleed3_replay_cuts_via_spot_not_a_price_ride(flip, gateway,
-                                                      ledger):
-    """AMENDED by WO-FLIP-GEOMETRY-COHERENCE (Option B): a loser never rides
-    to the bottom — it cuts at the SCALP stop (price, entry−6) or on the SPOT
-    decision, whichever comes first. Here the mark stays WITHIN the 6c
-    tolerance (44 > stop 42 for a 48c entry) so price holds; spot decides
-    against → the SPOT cut fires, any time (the WO-BLEED-3 regression stays
-    cut, by the spot path)."""
-    o = _open_pos(flip, gateway, ledger)                    # entry 48, stop 42
-    o["fill_ts"] = CLOSE - 1030        # past FLIP_NO_SELL_S (build 50), inside patience
-    # within tolerance, no spot: holds (does NOT ride)
+def test_bleed3_a_loser_cuts_at_the_momentum_stop_not_a_ride(flip, gateway,
+                                                             ledger):
+    """WO-2026-07-22-E: a loser never rides — the momentum stop (entry−10)
+    cuts it. A mark WITHIN the stop (55 > stop 50 for a 60c entry) holds; a
+    mark sustained AT the stop for 2 polls exits MAKER-FIRST at the stop (the
+    WO-BLEED-3 regression stays cut, now by the stop not a spot-decided ride)."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 60, stop 50
+    # within the stop: holds (does NOT ride or cut)
     for secs in (770, 769, 768):
-        p = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=secs))
-        assert [x for x in p if x.purpose == "CUT"] == []
+        p = flip.evaluate(TICKER, _ctx(_book(yes=55, no=40), secs_left=secs))
+        assert [x for x in p if x.purpose in ("CUT", "EXIT")] == []
     assert not o.get("done")
-    # spot decides against → cuts via spot on 2 sustained polls, any time
-    sl = Needle(side="no", d_before=10.0, d_after=80.0,
-                delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
-                fair_cents=0.0, t_remaining=700.0)
-    flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=767, sl=sl))  # poll 1
-    props = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=766, sl=sl))
-    assert [x for x in props if x.purpose == "CUT"] == []   # build 52: no dump
-    exits = [x for x in props if x.purpose == "EXIT"]
-    assert len(exits) == 1 and exits[0].price_cents == 40 and "spot-decided" in exits[0].reason
+    # sustained AT the stop → 2 polls → momentum stop, maker-first at 50
+    flip.evaluate(TICKER, _ctx(_book(yes=50, no=40), secs_left=767))   # poll 1
+    props = flip.evaluate(TICKER, _ctx(_book(yes=50, no=40), secs_left=766))
+    exits = [x for x in props if x.purpose in ("EXIT", "CUT")]
+    assert len(exits) == 1 and exits[0].price_cents == 50 \
+        and "momentum stop" in exits[0].reason and not exits[0].crossfire
 
 
-def test_in_band_dip_is_illiquidity_holds(flip, gateway, ledger):
-    """OVERTURNED by WO-FLIP-LIQUIDITY-HOLD (build 45): the loss-side reactive
-    stops are GONE. A low mark is ILLIQUIDITY (the pile-in), held through as
-    the resting liquidity provider — even a deep in-band dip (34c) does NOT
-    cut on price. Only a confirmed collapse (spot/catastrophe) or the T-10
-    endgame acts."""
-    o = _open_pos(flip, gateway, ledger)                    # entry 48
-    for secs in range(780, 700, -5):        # many polls, deep in-band dip
-        p = flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=secs))
-        assert [x for x in p if x.purpose == "CUT"] == []
-    assert not o.get("done")                # held through the illiquidity
+def test_favored_dip_through_the_stop_cuts_no_illiquidity_hold(flip, gateway,
+                                                               ledger):
+    """INVERTED from WO-FLIP-LIQUIDITY-HOLD: on the favored side a low mark is
+    NOT illiquidity to hold through — an adverse move is the thesis being
+    WRONG. A shallow dip within the stop holds; a deep dip THROUGH the stop
+    (34 < 50), sustained 2 polls, cuts (the book is already through us → cross)."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 60, stop 50
+    for secs in (780, 779):                 # shallow dip within the stop: holds
+        p = flip.evaluate(TICKER, _ctx(_book(yes=55, no=40), secs_left=secs))
+        assert [x for x in p if x.purpose in ("CUT", "EXIT")] == []
+    assert not o.get("done")
+    flip.evaluate(TICKER, _ctx(_book(yes=34, no=40), secs_left=778))   # poll 1
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=40), secs_left=777))
+    cuts = [x for x in props if x.purpose in ("CUT", "EXIT")]
+    assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
+    assert cuts[0].crossfire and o.get("done")
 
 
-def test_dp_collapse_is_now_primary_any_time(flip, gateway, ledger):
-    """Change 2 OVERTURNED the patience-gate on the ΔP leg; WO-BOTH-LANES-
-    MARKET-TRUE (build 50) then narrowed 'any time' to 'after the 4-min hard
-    no-sell' — the opening pile-in is held, then F's ΔP proof is the real exit,
-    cutting on 2 sustained polls (a one-frame flicker still holds)."""
-    o = _open_pos(flip, gateway, ledger)
-    o["fill_ts"] = CLOSE - 1030        # past FLIP_NO_SELL_S, inside patience
-    sl = Needle(side="no", d_before=10.0, d_after=80.0,
-                delta_p=config.OPEN_DETERMINED_K_POINTS + 3.0,
-                fair_cents=0.0, t_remaining=700.0)
-    # past the hard-hold, still inside patience (age ~260 << 300s)
-    p1 = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=770, sl=sl))
-    assert [x for x in p1 if x.purpose == "CUT"] == []      # poll 1: not yet
-    props = flip.evaluate(TICKER, _ctx(_book(yes=44), secs_left=769, sl=sl))
-    assert [x for x in props if x.purpose == "CUT"] == []   # build 52: no dump
-    exits = [x for x in props if x.purpose == "EXIT"]
-    assert len(exits) == 1 and exits[0].price_cents == 40 and "spot-decided" in exits[0].reason
+def test_momentum_stop_needs_no_spot_and_two_polls_to_fire(flip, gateway,
+                                                           ledger):
+    """The momentum stop needs NO ΔP/spot signal (the spot-decided leg is
+    retired) — an adverse held-side mark alone fires it, and only after 2
+    sustained polls (a one-frame flicker still holds)."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 60, stop 50
+    # one poll through the stop then a recovery: the count resets, no cut
+    flip.evaluate(TICKER, _ctx(_book(yes=48, no=40), secs_left=770))   # poll 1
+    p = flip.evaluate(TICKER, _ctx(_book(yes=55, no=40), secs_left=769))  # recover
+    assert [x for x in p if x.purpose in ("CUT", "EXIT")] == []
+    assert not o.get("done")
+    # two SUSTAINED polls through the stop, no spotlead at all → cut
+    flip.evaluate(TICKER, _ctx(_book(yes=48, no=40), secs_left=768))   # poll 1
+    props = flip.evaluate(TICKER, _ctx(_book(yes=48, no=40), secs_left=767))
+    exits = [x for x in props if x.purpose in ("EXIT", "CUT")]
+    assert len(exits) == 1 and "momentum stop" in exits[0].reason
 
 
-def test_catastrophe_floor_is_the_only_price_backstop_in_patience(flip,
-                                                                  gateway,
-                                                                  ledger):
-    """Change 1, AMENDED by WO-FLIP-CATASTROPHE-ILLIQUIDITY: a GENUINE ride to
-    the fixed catastrophe floor (20c) — real depth, past the opening window,
-    sustained 2 polls — cuts inside patience (the bounded backstop below the
-    swing). A fresh thin-book low is illiquidity now, held."""
-    o = _open_pos(flip, gateway, ledger)
-    o["fill_ts"] = CLOSE - 1030      # past FLIP_NO_SELL_S (build 50) + opening window, inside patience
-    flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=771))  # poll 1: sustain
-    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=20),
+def test_the_momentum_stop_is_the_price_backstop(flip, gateway, ledger):
+    """WO-2026-07-22-E: the fixed 20c CATASTROPHE floor is retired for live
+    positions (the dead-floor now only guards a curfew-HELD winner). The
+    momentum stop IS the price backstop — a book crashed to 20c is far through
+    the stop (50) and crosses out at the mark on 2 sustained polls."""
+    o = _open_pos(flip, gateway, ledger)                    # entry 60, stop 50
+    flip.evaluate(TICKER, _ctx(_book(yes=20, no=40), secs_left=771))  # poll 1
+    cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=20, no=40),
                                                   secs_left=770))
-            if x.purpose == "CUT"]
-    assert len(cuts) == 1 and "CATASTROPHE floor" in cuts[0].reason
-    assert cuts[0].price_cents == 20
+            if x.purpose in ("CUT", "EXIT")]
+    assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
+    assert cuts[0].price_cents == 20 and cuts[0].crossfire
 
 
 # ── §3: the ruling's data line (no F behavior change) ──────────────────────

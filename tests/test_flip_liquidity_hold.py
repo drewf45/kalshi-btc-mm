@@ -83,95 +83,125 @@ def w_side_ctx(flip, b, now, secs, sl):
     return (w, TICKER, EVENT, b, _ctx(b, secs, sl=sl), secs, now)
 
 
-# ── §1/§2.1: the resting take is the exit — post the middle and wait ───────
-def test_the_take_rests_at_entry_plus_five(flip):
-    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the resting
-    take is the MIDDLE-target (52¢ from a 44¢ entry, +8 gouge) — the hedgers'
-    forced-transaction price — floored fee-safe at entry+5. Still one resting
-    exit, still held-side; the anchor moved from the nickel to the middle."""
-    o, now = _pos(flip, entry=44)
+# ── §1/§2.1: the resting take is the exit — post the +20 gouge and wait ────
+def test_the_take_rests_at_entry_plus_gouge(flip):
+    """WO-2026-07-22-E (build 57): the resting take is now entry + OPEN_GOUGE_C
+    (the +20 sold INTO the pile-in of buyers on the FAVORED side), capped at
+    90¢ to stay out of the illiquid tail — a 60¢ favored entry rests its take at
+    80¢. Still one resting exit, still held-side; the anchor moved from the
+    middle to the +20 gouge."""
+    o, now = _pos(flip, entry=60)
     o["take_proposed"] = False           # let the take propose
     o["take_oid"] = None
-    b = _book(yes=44, no=55)
+    b = _book(yes=60, no=40)
     props = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
     exits = [p for p in props if p.purpose == "EXIT"]
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(44) == 52   # the middle
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 80   # entry+20
 
 
-# ── §2.2: a low mark is ILLIQUIDITY — the position HOLDS ───────────────────
-def test_illiquidity_dips_are_held(flip):
-    """The core change: no reactive stop fires during the pile-in. Every
-    in-band low mark (above the catastrophe floor) is HELD — the position
-    waits as the liquidity provider for the reversion to lift its take."""
-    for mark in (40, 38, 36, 30, 25, 22, 21):
-        o, now = _pos(flip, entry=44)
-        b = _book(yes=mark, no=55)
+# ── WO-2026-07-22-E: dips partition at the stop — above held, below exits ──
+def test_dips_above_the_stop_held_below_the_stop_exit(flip):
+    """WO-2026-07-22-E OVERTURNS the 'every dip is held' thesis. On the FAVORED
+    side the momentum stop partitions dips by the stop line (entry −
+    OPEN_MOMENTUM_STOP_C): a mark ABOVE the stop is still held (noise inside the
+    geometry), but a mark AT OR BELOW it — sustained 2 polls — EXITS. There is
+    no liquidity hold: an adverse move means the favored-side thesis is wrong."""
+    entry = 60
+    stop_px = entry - config.OPEN_MOMENTUM_STOP_C      # 50
+    for mark in (58, 55, 51):                          # above the stop: held
+        o, now = _pos(flip, entry=entry)
+        b = _book(yes=mark, no=40)
         flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1
         p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2
-        assert [x for x in p2 if x.purpose == "CUT"] == [], f"mark {mark} cut"
+        assert [x for x in p2 if x.purpose in ("EXIT", "CUT")] == [], \
+            f"mark {mark} above stop exited"
         assert not o.get("done")
+    for mark in (50, 45, 40):                          # at/below the stop: exits
+        o, now = _pos(flip, entry=entry)
+        b = _book(yes=mark, no=40)
+        flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1
+        p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2
+        exd = [x for x in p2 if x.purpose in ("EXIT", "CUT")]
+        assert len(exd) == 1 and o.get("exit_reason") == "MOMENTUM_STOP", \
+            f"mark {mark} at/below stop held"
 
 
-# ── build 48: a fresh thin-book sub-20c dip is ILLIQUIDITY — HELD ──────────
-def test_fresh_catastrophe_low_is_illiquidity_held(flip):
-    """WO-FLIP-CATASTROPHE-ILLIQUIDITY: a fresh cheap entry whose held-side
-    bid dips to 19c in the opening window (no buyers yet) is illiquidity, not
-    collapse — the price floor is gated off during the opening window, so it
-    HOLDS (today it dumped at market within 2 minutes). Only spot decides
-    here."""
-    o, now = _pos(flip, entry=42, gap=10)          # fresh: held 10s
-    b = _book(yes=19, no=55)                        # sub-catastrophe bid, real depth
+# ── WO-2026-07-22-E: the stop is armed from poll 1 — no opening-window grace ─
+def test_fresh_position_stops_no_opening_window_grace(flip):
+    """WO-2026-07-22-E: the momentum stop is armed from the FIRST poll — there
+    is no opening-window 'illiquidity hold' anymore (the retired thesis held a
+    fresh sub-floor dip through the pile-in; today that is the thesis being
+    wrong). A fresh position (held only seconds) whose favored side has fallen
+    THROUGH the stop for 2 polls crosses out at the mark just the same."""
+    o, now = _pos(flip, entry=60, gap=10)              # fresh: held 10s
+    stop_px = 60 - config.OPEN_MOMENTUM_STOP_C          # 50
+    b = _book(yes=stop_px - 5, no=40)                   # 45: book through the stop
     flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1
     p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2
-    assert [x for x in p2 if x.purpose == "CUT"] == []
+    cuts = [x for x in p2 if x.purpose == "CUT"]
+    assert len(cuts) == 1 and cuts[0].price_cents == 45 and cuts[0].crossfire
+    assert o.get("exit_reason") == "MOMENTUM_STOP"
+
+
+# ── WO-2026-07-22-E: the favored side has NO hold — an adverse move exits ──
+def test_favored_side_adverse_move_stops_no_hold(flip):
+    """The core inversion. Build 45's liquidity-hold is RETIRED: on the FAVORED
+    side an adverse move means the thesis is ALREADY WRONG, so there is NO hold.
+    A sustained (2-poll) mark at/below entry − OPEN_MOMENTUM_STOP_C EXITS via the
+    momentum stop — maker-first, resting AT the stop when the book has not gone
+    through it. A single poll does NOT fire (never a lone print)."""
+    o, now = _pos(flip, entry=60, gap=config.OPEN_OPENING_WINDOW_S + 30)
+    stop_px = 60 - config.OPEN_MOMENTUM_STOP_C         # 50
+    b = _book(yes=stop_px, no=55)                       # mark == stop, at the line
+    p1 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))    # poll 1: armed
+    assert [x for x in p1 if x.purpose in ("EXIT", "CUT")] == []
     assert not o.get("done")
+    p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))    # poll 2: fires
+    exits = [x for x in p2 if x.purpose == "EXIT"]
+    assert len(exits) == 1 and exits[0].price_cents == stop_px == 50
+    assert not exits[0].crossfire and "momentum stop" in exits[0].reason
+    assert o.get("exit_reason") == "MOMENTUM_STOP" and o.get("done")
 
 
-# ── build 48: a thin-book low past the window is STILL illiquidity — held ──
-def test_thin_book_low_is_held_even_past_the_opening_window(flip):
-    """The depth guard: even past the opening window and sustained, a 1-lot
-    thin quote at 19c is book emptiness, not a real low — it is HELD. Only a
-    low with REAL depth on the held side counts as a catastrophe."""
-    o, now = _pos(flip, entry=44, gap=config.OPEN_OPENING_WINDOW_S + 30)
-    b = OrderBook(market=TICKER)
-    b.apply_snapshot({19: 1}, {55: 10}, ts=1.0)    # held-side bid: 1-lot thin
-    ctx = _ctx(b, secs_left=700)
-    flip._open_custody(flip.windows[TICKER], TICKER, EVENT, b, ctx, 700, now)
-    p2 = flip._open_custody(flip.windows[TICKER], TICKER, EVENT, b, ctx, 700, now)
-    assert [x for x in p2 if x.purpose == "CUT"] == []
-    assert not o.get("done")
-
-
-# ── §2.3: a GENUINE collapse (real, deep, sustained, past opening) cuts ────
-def test_catastrophe_backstop_still_cuts_when_real(flip):
-    """The deep backstop remains: a REAL low — depth on the held side, held
-    PAST the opening window, sustained 2 polls — still cuts. Only the
-    thin-book / opening-window / single-poll dump is retired."""
-    o, now = _pos(flip, entry=44, gap=config.FLIP_NO_SELL_S + 30)
-    b = _book(yes=20, no=55)                        # depth 10 >= min
-    flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1: sustain
+# ── WO-2026-07-22-E: the momentum stop crosses when the book is through ────
+def test_momentum_stop_crosses_when_book_through(flip):
+    """The evacuation fork: when the book has already gone THROUGH the stop
+    (mark below entry − OPEN_MOMENTUM_STOP_C), the momentum stop crosses at the
+    top of book to get out — CUT, crossfire — rather than rest behind a market
+    that has left. Sustained 2 polls; a single print does not fire."""
+    o, now = _pos(flip, entry=60, gap=config.FLIP_NO_SELL_S + 30)
+    stop_px = 60 - config.OPEN_MOMENTUM_STOP_C         # 50
+    mark = stop_px - 6                                  # 44: book through the stop
+    b = _book(yes=mark, no=55)
+    p1 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))    # poll 1: sustain
+    assert [p for p in p1 if p.purpose == "CUT"] == []
     cuts = [p for p in flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
             if p.purpose == "CUT"]
-    assert len(cuts) == 1 and "CATASTROPHE" in cuts[0].reason
-    assert cuts[0].price_cents == config.OPEN_CATASTROPHE_FLOOR == 20
+    assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
+    assert cuts[0].price_cents == mark == 44 and cuts[0].crossfire
+    assert o.get("exit_reason") == "MOMENTUM_STOP"
 
 
-def test_spot_collapse_still_cuts_sustained(flip):
-    """Spot deciding against the held side (sustained 2 polls) cuts in the
-    hold — the market ran away hard, distinguished from noise by the sustain."""
-    o, now = _pos(flip, entry=44, gap=config.FLIP_NO_SELL_S + 30)
-    sl = Needle(side="no", d_before=10.0, d_after=90.0,
-                delta_p=config.OPEN_DETERMINED_K_POINTS + 5.0,
-                fair_cents=0.0, t_remaining=700.0)
-    b = _book(yes=40, no=55)
-    flip._open_custody(*w_side_ctx(flip, b, now, 700, sl))           # poll 1
-    props = flip._open_custody(*w_side_ctx(flip, b, now, 700, sl))
-    # build 52 Finding 1: spot-decided walks to scratch (maker), never dumps
+def test_momentum_stop_requires_sustain_maker_first(flip):
+    """The stop demands 2 SUSTAINED polls (distinguished from noise by the
+    sustain, as the retired spot-collapse was). An adverse poll followed by a
+    recovery back above the stop RESETS the counter — never a lone print — and
+    only when the mark holds at/below the stop for two polls does it exit,
+    maker-first (resting AT the stop when the book has not gone through)."""
+    o, now = _pos(flip, entry=60, gap=config.FLIP_NO_SELL_S + 30)
+    stop_px = 60 - config.OPEN_MOMENTUM_STOP_C         # 50
+    adverse = _book(yes=stop_px, no=55)                 # mark == stop
+    recover = _book(yes=stop_px + 5, no=55)             # bounced above the stop
+    flip._open_custody(*w_side_ctx(flip, adverse, now, 700, None))   # poll 1: armed
+    flip._open_custody(*w_side_ctx(flip, recover, now, 700, None))   # poll 2: reset
+    assert o.get("stop_polls") == 0 and not o.get("done")
+    flip._open_custody(*w_side_ctx(flip, adverse, now, 700, None))   # poll 3: armed
+    props = flip._open_custody(*w_side_ctx(flip, adverse, now, 700, None))  # poll 4
     assert [p for p in props if p.purpose == "CUT"] == []
     exits = [p for p in props if p.purpose == "EXIT"]
-    assert len(exits) == 1 and exits[0].price_cents == 44
-    assert "spot-decided" in exits[0].reason and not exits[0].crossfire
+    assert len(exits) == 1 and exits[0].price_cents == stop_px == 50
+    assert not exits[0].crossfire and o.get("exit_reason") == "MOMENTUM_STOP"
 
 
 def test_illiquidity_dip_is_not_a_spot_flicker(flip):

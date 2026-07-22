@@ -1,15 +1,15 @@
-"""WO-FLIP-CHEAP-LIVE — prove the swing, live, measured (build 34).
+"""WO-2026-07-22-E "FLIP THE SIDE" (build 57) — re-anchored from the cheap-side
+swing thesis to the FAVORED-side liquidity thesis.
 
-The law under test: (§2.1) the band admits the cheap side to 39¢; (§2.2)
-the two-sided swing gate buys only when the table says the swing to the
-take beats the cut (p_cross(d_strike,t) ≥ OPEN_SWING_MIN_P — the take
-REQUIRES the strike-touch, every cut-first path is a no-touch path, one
-cell answers both legs); (§3) every cheap entry concludes with a
-FLIP_SWING row (the measured swing rate) and every loser audits the
-salvage floor (FLIP_LOSER_CUT ok, FLIP_FLOOR_BREACH on a ride past it —
-the assumption whose failure inverts the EV, flagged on the FIRST
-loser). RAIL: no Kelly/cash-integrity/rate-halt change; one lot until
-Instruments 1 & 2 prove the rate and the floor."""
+The law under test: (§2.1) FLIP buys the FAVORED (higher-priced) side in
+[OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70] — the cheap-side band and the
+two-sided SWING GATE are RETIRED from the entry path; swing is LOG-ONLY now and
+GATES ON NOTHING, so the favored entry fires regardless of the measured rate.
+(§3) every entry still concludes with a FLIP_SWING row (the instrument stands),
+and every loser audits the MOMENTUM-STOP budget (FLIP_LOSER_CUT ok,
+FLIP_FLOOR_BREACH on a loss past OPEN_MOMENTUM_STOP_C+slip — the assumption
+whose failure inverts the EV, flagged on the FIRST loser). RAIL: no
+Kelly/cash-integrity/rate-halt change; one lot."""
 
 import json
 
@@ -28,7 +28,9 @@ STRIKE = 118_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def _book(yes=39, no=55):
+def _book(yes=60, no=40):
+    # WO-2026-07-22-E: the default is a FAVORED-yes book (yes_bid 60 > no_bid 40),
+    # so the favored side is yes@60, inside [50,70].
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: 10}, {no: 10}, ts=1.0)
     return b
@@ -61,32 +63,33 @@ def _rows(ledger, state):
         "SELECT detail FROM surface_rows WHERE state=?", (state,)).fetchall()]
 
 
-# ── §2.1: the band admits the cheap side ───────────────────────────────────
-def test_band_admits_39c_cheap_side(flip):
-    """DREW-RULED (39,56): the 39c side (excluded at the old 44 floor)
-    posts; table absent → the gate is permissive (live-proof wants data),
-    tagged swing~untabled on the why."""
-    assert config.OPEN_BAND == (39, 56)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=39, no=55),
+# ── §2.1: the band admits the FAVORED side ─────────────────────────────────
+def test_band_admits_favored_side(flip):
+    """WO-2026-07-22-E: FLIP buys the FAVORED (higher-priced) side in
+    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A favored no@60 posts as
+    an ENTRY; the confirms (trend/depth) ride the why LOGGED-not-gated."""
+    assert (config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C) == (50, 70)
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=60),
                                        grain=GRAIN_YES2))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("yes", 39, "ENTRY")]
-    # WO-SWING-GATE-EVENT: with no measured history the gate is CALIBRATING
-    # (permissive; the 1-lot cap bounds the risk), never the retired
-    # strike-touch proxy
-    assert "swing calibrating" in props[0].why
+        [("no", 60, "ENTRY")]
+    assert "OPEN50 favored no@60c" in props[0].why
+    assert "confirms logged-not-gated" in props[0].why
 
 
-def test_old_band_floor_would_have_excluded_it():
-    """The read-rule record: 39 < 44 — this entry could not exist before."""
-    assert 39 < 44 <= 56
+def test_favored_out_of_band_skips(flip):
+    """The band is a real gate: a favored side above 70 (over-priced, the move
+    already fully paid for) SKIPS — no entry, no post."""
+    assert flip.evaluate(TICKER, _ctx(_book(yes=80, no=15),
+                                      grain=GRAIN_YES2)) == []
 
 
-# ── WO-SWING-GATE-EVENT: the gate tests MEASURED took_swing, not the
-# strike-touch proxy (which asked "will BTC twitch to the strike" — ~0.89
-# for every cheap entry, a rubber stamp for falling knives) ────────────────
+# ── WO-2026-07-22-E: the SWING GATE is RETIRED as an entry gate. Swing is
+# LOG-ONLY now — it gates on NOTHING. The favored entry fires regardless of
+# the measured took_swing rate; these tests seed the full range (high / low /
+# thin) and prove rate-independence. ────────────────────────────────────────
 def _seed_swing_rows(ledger, surface, band_entry, took, total):
-    """Instrument 1 history in the entry's price band."""
+    """Instrument 1 history in the entry's price band (no longer gates)."""
     for i in range(total):
         surface.write_row(
             "FLIP", f"M{i}", f"w{i}", "FLIP_SWING",
@@ -94,47 +97,50 @@ def _seed_swing_rows(ledger, surface, band_entry, took, total):
                                "took_swing": i < took, "gross_cents": 20}))
 
 
-def test_swing_gate_buys_when_measured_rate_clears(flip, gateway, ledger,
-                                                   surface):
-    """≥20 outcomes with a high measured took_swing rate → the gate passes
-    on the MEASURED event (the real bet), not the strike-touch proxy."""
-    _seed_swing_rows(ledger, surface, 39, took=16, total=20)   # 0.80
+def test_favored_entry_fires_regardless_of_high_swing_rate(flip, gateway,
+                                                           ledger, surface):
+    """A seeded HIGH measured took_swing rate does not gate the entry (the gate
+    is retired): the favored yes@60 still fires, one lot."""
+    _seed_swing_rows(ledger, surface, 60, took=16, total=20)   # 0.80
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
                                        spot=STRIKE - 120))
-    assert len(props) == 1
-    assert "swing measured=0.80n20" in props[0].why
+    assert [(p.side, p.price_cents, p.purpose) for p in props] == \
+        [("yes", 60, "ENTRY")]
 
 
-def test_swing_gate_refuses_when_measured_rate_low(flip, gateway, ledger,
-                                                   surface, caplog):
-    """≥20 outcomes with a LOW measured took_swing rate (the falling-knife
-    band) → NO buy. This is the discrimination the constant-0.89 proxy
-    never had."""
+def test_favored_entry_fires_even_on_low_swing_rate(flip, gateway, ledger,
+                                                    surface, caplog):
+    """The discrimination the old gate did on a LOW measured rate is GONE —
+    swing no longer REFUSES an entry. A seeded low took_swing rate (the old
+    falling-knife refusal) still admits the favored side, and there is NO
+    OPEN_SWING_REFUSED."""
     import logging
-    _seed_swing_rows(ledger, surface, 39, took=8, total=20)    # 0.40 < 0.55
+    _seed_swing_rows(ledger, surface, 60, took=8, total=20)    # 0.40
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
         props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
                                            spot=STRIKE - 120))
-    assert props == []
-    assert any("OPEN_SWING_REFUSED" in r.message and "measured"
-               in r.message for r in caplog.records)
+    assert [(p.side, p.price_cents, p.purpose) for p in props] == \
+        [("yes", 60, "ENTRY")]
+    assert not any("OPEN_SWING_REFUSED" in r.message for r in caplog.records)
 
 
-def test_swing_gate_permissive_below_sample_floor(flip, gateway, ledger,
-                                                  surface):
-    """Adversary (a): below OPEN_SWING_MIN_SAMPLES the gate does NOT trust
-    a thin sample — it stays permissive (the 1-lot cap bounds the risk)
-    and tags itself calibrating."""
-    _seed_swing_rows(ledger, surface, 39, took=0, total=5)     # thin, all-loss
+def test_favored_entry_fires_below_sample_floor(flip, gateway, ledger,
+                                                surface):
+    """A thin swing history no longer factors at all — the gate is retired, not
+    merely permissive-below-floor. The favored side fires on a thin all-loss
+    sample."""
+    _seed_swing_rows(ledger, surface, 60, took=0, total=5)     # thin, all-loss
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
                                        spot=STRIKE - 120))
-    assert len(props) == 1                                     # permissive
-    assert "swing calibrating n5" in props[0].why
+    assert [(p.side, p.price_cents, p.purpose) for p in props] == \
+        [("yes", 60, "ENTRY")]
 
 
 # ── §3 INSTRUMENT 1: the swing-outcome log ─────────────────────────────────
-def _cheap_entry(flip, gateway, ledger, entry=39):
-    props = flip.evaluate(TICKER, _ctx(_book(yes=entry), grain=GRAIN_YES2))
+def _favored_entry(flip, gateway, ledger, entry=60):
+    """A booked favored-yes OPEN leg (yes@entry, favored over no@40)."""
+    props = flip.evaluate(TICKER, _ctx(_book(yes=entry, no=40),
+                                       grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, "yes", entry, CLOSE - 790)
@@ -142,70 +148,73 @@ def _cheap_entry(flip, gateway, ledger, entry=39):
 
 
 def test_swing_win_logs_flip_swing_row(flip, gateway, ledger):
-    """§4: entry 39 swings to 59 — FLIP_SWING took_swing=true, ~+20c."""
-    _cheap_entry(flip, gateway, ledger)
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 59, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 59, CLOSE - 500, count=1)
+    """§4: favored entry 60 swings to 80 (take = entry + OPEN_GOUGE_C, cap 90)
+    — FLIP_SWING took_swing=true, +20c."""
+    _favored_entry(flip, gateway, ledger)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 80, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 80, CLOSE - 500, count=1)
     rows = _rows(ledger, "FLIP_SWING")
     assert len(rows) == 1
     r = rows[0]
     assert r["took_swing"] is True and r["gross_cents"] == 20
-    assert r["entry_price"] == 39 and r["exit_price"] == 59
+    assert r["entry_price"] == 60 and r["exit_price"] == 80
     assert r["salvaged"] is False
     assert r["secs_to_swing"] == pytest.approx(290, abs=1)
     assert _rows(ledger, "FLIP_LOSER_CUT") == []     # winners don't audit
 
 
-def test_hold_conversion_logs_swing_arrived(flip, gateway, ledger):
-    """A T-10 winner handoff IS a swing that arrived — instrumented at the
-    conversion mark, held_to_settle=true."""
-    o = _cheap_entry(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(yes=39), secs_left=780))
+def test_curfew_winner_conversion_logs_swing_arrived(flip, gateway, ledger):
+    """WO-2026-07-22-E: the F-agrees patience hold-conversion is RETIRED. The
+    only winner-to-F handoff left is the CURFEW (unchanged): at
+    secs <= FLIP_DECISION_S a winner (mark >= basis) converts to hold-to-settle
+    — a swing that arrived, instrumented at the conversion mark,
+    held_to_settle=true."""
+    o = _favored_entry(flip, gateway, ledger)
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    flip.evaluate(TICKER, _ctx(_book(yes=52),
+    flip.evaluate(TICKER, _ctx(_book(yes=65, no=35),
                                secs_left=config.FLIP_DECISION_S - 1))  # decision winner
     assert o["hold"] is True
     rows = _rows(ledger, "FLIP_SWING")
     assert len(rows) == 1
-    assert rows[0]["held_to_settle"] is True and rows[0]["exit_price"] == 52
+    assert rows[0]["held_to_settle"] is True and rows[0]["exit_price"] == 65
 
 
 # ── §3 INSTRUMENT 2: the salvage-floor audit ───────────────────────────────
 def test_loser_cleared_at_endgame_logs_ok_true(flip, gateway, ledger):
-    """§4, AMENDED by WO-FLIP-LIQUIDITY-HOLD: the band-floor price cut is
-    retired (a low mark is illiquidity, held). An unreverted loser is cleared
-    by the T-10 endgame handoff at the mark (~entry−5 at a 39c entry) —
-    FLIP_LOSER_CUT ok=true, NOT a −39c ride to settlement."""
-    o = _cheap_entry(flip, gateway, ledger)
-    p1 = flip.evaluate(TICKER, _ctx(_book(yes=39), secs_left=780))
+    """CURFEW (unchanged): an unreverted loser is cleared at the mark by the
+    FLIP_DECISION_S endgame handoff (purpose CUT), never ridden to the bell —
+    FLIP_LOSER_CUT ok=true. A 60c entry cleared at 55c is a bounded −5, well
+    inside the momentum-stop budget the audit now polices."""
+    o = _favored_entry(flip, gateway, ledger)
+    p1 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    # at the endgame decision (build 50: moved from T-10 to FLIP_DECISION_S) the
-    # unreverted loser is cleared at the mark
-    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=34),
+    # at the endgame decision the unreverted loser is cleared at the mark
+    cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=55, no=45),
                                                   secs_left=config.FLIP_DECISION_S - 1))
             if p.purpose == "CUT"]
-    assert len(cuts) == 1 and cuts[0].price_cents == 34   # cleared at the mark
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 34, CLOSE - 699, count=1)
+    assert len(cuts) == 1 and cuts[0].price_cents == 55   # cleared at the mark
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 55, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 55, CLOSE - 699, count=1)
     swing = _rows(ledger, "FLIP_SWING")[0]
     assert swing["took_swing"] is False and swing["salvaged"] is True
     audit = _rows(ledger, "FLIP_LOSER_CUT")[0]
     assert audit["ok"] is True and audit["loss_cents"] == 5
-    # build 54 Finding 2: floor_expected is pinned to the salvage budget floor
-    assert audit["floor_expected"] == max(39 - config.OPEN_UNDETERMINED_BAND[0],
-                                          config.OPEN_SALVAGE_BUDGET_C)
+    # WO-2026-07-22-E: floor_expected is now the MOMENTUM-STOP budget
+    assert audit["floor_expected"] == config.OPEN_MOMENTUM_STOP_C
 
 
 def test_loser_past_the_floor_flags_ok_false_and_pages(flip, gateway,
                                                        ledger, funnel):
-    """§4: a synthetic loser forced past the floor (−30c on a 39c entry) →
-    ok=FALSE + FLIP_FLOOR_BREACH page — the early warning the rate-halt
-    cannot give, on the FIRST loser."""
-    _cheap_entry(flip, gateway, ledger)
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 9, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 9, CLOSE - 400, count=1)
+    """WO-2026-07-22-E: FLIP_FLOOR_BREACH now polices the MOMENTUM STOP. A loser
+    forced past the budget (−30c on a 60c entry, well beyond entry−10=50) →
+    ok=FALSE + FLIP_FLOOR_BREACH page — the stop is fiction (kill condition #1),
+    the early warning the rate-halt cannot give, on the FIRST loser."""
+    _favored_entry(flip, gateway, ledger)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 30, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 30, CLOSE - 400, count=1)
     audit = _rows(ledger, "FLIP_LOSER_CUT")[0]
     assert audit["ok"] is False and audit["loss_cents"] == 30
     assert ledger.db.execute(

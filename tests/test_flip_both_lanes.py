@@ -112,29 +112,30 @@ def test_a_first_minute_spot_collapse_is_held(flip):
     assert not w.opens["yes"].get("done")               # still alive
 
 
-def test_a_same_collapse_cuts_once_past_the_hard_hold(flip):
-    """The hold is TIME-BOUND, not permanent: past FLIP_NO_SELL_S the same
-    sustained spot collapse is F's confirmed proof and cuts on 2 polls."""
-    w, now = _inject(flip, secs=560, age=config.FLIP_NO_SELL_S + 20)
-    b = _book(yes=44, no=55)
-    _custody(flip, w, b, 560, now, sl=_SL())            # poll 1
-    now2 = CLOSE - 559
-    w.opens["yes"]["fill_ts"] = now2 - (config.FLIP_NO_SELL_S + 20)
-    props = _custody(flip, w, b, 559, now2, sl=_SL())
-    assert _cuts(props) == []                              # build 52: no dump
-    exits = [p for p in props if p.purpose == "EXIT"]
-    assert len(exits) == 1 and exits[0].price_cents == 44 and "spot-decided" in exits[0].reason
+def test_a_sustained_adverse_move_cuts_on_two_polls(flip):
+    """REPLACED by WO-2026-07-22-E: the time-bound hard-hold and the spot-decided
+    scratch are retired. On the FAVORED side there is no hold — a sustained
+    adverse move (mark at/below entry−10) cuts on 2 sustained polls, and where
+    the book is through the stop it crosses at the mark."""
+    w, now = _inject(flip, entry=60, secs=560, age=300)
+    b = _book(yes=48, no=55)                             # mark 48 <= entry−10=50
+    _custody(flip, w, b, 560, now)                       # poll 1: arms
+    props = _custody(flip, w, b, 559, CLOSE - 559)       # poll 2: fires
+    exits = [p for p in props if p.purpose in ("EXIT", "CUT")]
+    assert len(exits) == 1 and exits[0].price_cents == 48
+    assert "momentum stop" in exits[0].reason and exits[0].crossfire
 
 
-def test_a_catastrophe_floor_suppressed_in_the_hard_hold(flip):
-    """Even the deep catastrophe price floor (20c) does NOT fire in the hard-
-    hold — a fresh cheap entry's low bid is the opening illiquidity, held."""
-    w, now = _inject(flip, secs=800, age=30)            # fresh
-    b = _book(yes=20, no=55)                            # depth 10, at the floor
-    for secs in (800, 799):                             # sustained, but young
-        now = CLOSE - secs
-        w.opens["yes"]["fill_ts"] = now - 30
-        assert _cuts(_custody(flip, w, b, secs, now)) == []
+def test_a_deep_low_needs_two_polls_never_a_single_dump(flip):
+    """REPLACED by WO-2026-07-22-E: the hard-hold catastrophe suppression is
+    retired (there is no hold on the favored side). But the 'never a single-poll
+    dump' guard survives in the momentum stop — even a deep low bid (20c) does
+    NOT fire on ONE poll; it takes 2 sustained polls before it crosses out."""
+    w, now = _inject(flip, entry=60, secs=800, age=30)
+    b = _book(yes=20, no=55)                             # depth 10, deep low
+    assert _cuts(_custody(flip, w, b, 800, now)) == []   # one poll: no dump
+    cuts = _cuts(_custody(flip, w, b, 799, CLOSE - 799))
+    assert len(cuts) == 1 and cuts[0].price_cents == 20  # 2 polls: crosses out
 
 
 # ── C: THE DECISION POINT (F's inventory-aware endgame) ────────────────────
@@ -158,17 +159,19 @@ def test_c_decision_loser_is_sold(flip):
     assert "decision point" in cuts[0].reason and cuts[0].crossfire
 
 
-def test_c_walk_window_extends_past_the_old_t10(flip):
-    """The active walk-down now runs the whole way to the decision point: a
-    position at secs_left just above FLIP_DECISION_S (well past the old T-10 at
-    600) still steps its take down — FLIP is alive here now."""
-    w, now = _inject(flip, entry=44, secs=config.FLIP_DECISION_S + 30,
-                     age=800, take_px=52)
-    exits = [p for p in _custody(flip, w, _book(yes=44, no=55),
-                                 config.FLIP_DECISION_S + 30, now)
-             if p.purpose == "EXIT"]
-    assert len(exits) == 1 and exits[0].price_cents < 52   # walking toward scratch
-    assert exits[0].price_cents >= 44                      # never below scratch
+def test_c_momentum_stop_active_past_the_old_t10(flip):
+    """REPLACED by WO-2026-07-22-E: the active walk-down is retired. FLIP is
+    still ACTIVELY managed here (well past the old T-10 at 600, just above the
+    decision point): an adverse mark trips the MOMENTUM STOP on 2 sustained
+    polls — the position is not passively riding to the bell."""
+    w, now = _inject(flip, entry=60, secs=config.FLIP_DECISION_S + 30,
+                     age=800, take_px=80)
+    b = _book(yes=48, no=55)                             # mark 48 <= entry−10=50
+    _custody(flip, w, b, config.FLIP_DECISION_S + 30, now)   # poll 1: arms
+    exits = [p for p in _custody(flip, w, b, config.FLIP_DECISION_S + 30, now)
+             if p.purpose in ("EXIT", "CUT")]
+    assert len(exits) == 1 and exits[0].price_cents == 48
+    assert "momentum stop" in exits[0].reason
 
 
 def test_c_config_decision_is_minute_eleven():

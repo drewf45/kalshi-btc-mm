@@ -132,29 +132,33 @@ def test_b2_two_lot_open_lifecycle_zero_uncovered_pages(ledger, surface,
     from relay_engine.lane_flip import LaneFlip
     flip = LaneFlip(gateway, custodian=Custodian(gateway, ledger, surface,
                                                  ladder=DegradeLadder()))
-    props = flip.evaluate(TICKER, _flip_ctx(_flip_book(), grain=GRAIN_YES2))
+    # WO-2026-07-22-E: FLIP buys the FAVORED (higher-bid) side in [50,70]. A
+    # favored yes@60 book enters; the held-side mark (60) stays above the
+    # momentum stop (entry−10=50) all cycle, so the 2-lot lifecycle runs clean.
+    fav = lambda **kw: _flip_book(yes=60, no=40)
+    props = flip.evaluate(TICKER, _flip_ctx(fav(), grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
-    p2 = flip.evaluate(TICKER, _flip_ctx(_flip_book(), secs_left=780))
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 60, CLOSE - 790)
+    p2 = flip.evaluate(TICKER, _flip_ctx(fav(), secs_left=780))
     take1 = next(p for p in p2 if p.purpose == "EXIT")
     flip.on_submitted(take1, "OID-T1", CLOSE - 780)
-    flip.evaluate(TICKER, _flip_ctx(_flip_book(), secs_left=775))  # resting, covered
+    flip.evaluate(TICKER, _flip_ctx(fav(), secs_left=775))  # resting, covered
     # the orphan-maker: the SECOND same-side fill
-    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 48, CLOSE - 770)
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
+    flip.note_fill(TICKER, "yes", 60, CLOSE - 770)
     w = flip.windows[TICKER]
     assert w.opens["yes"]["count"] == 2 and "yes" not in w.fills  # ONE record
-    p3 = flip.evaluate(TICKER, _flip_ctx(_flip_book(), secs_left=760))
+    p3 = flip.evaluate(TICKER, _flip_ctx(fav(), secs_left=760))
     take2 = next(p for p in p3 if p.purpose == "EXIT")
     assert take2.count == 2                                # full-size exit
     flip.on_submitted(take2, "OID-T2", CLOSE - 760)
-    flip.evaluate(TICKER, _flip_ctx(_flip_book(), secs_left=755))
-    # the 2-lot take fills
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 53, 2, "PROBE")
-    flip.note_exit(TICKER, "yes", 53, CLOSE - 750, count=2)
+    flip.evaluate(TICKER, _flip_ctx(fav(), secs_left=755))
+    # the 2-lot take fills (entry 60, exit 65 → +5/lot × 2 = +10)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 65, 2, "PROBE")
+    flip.note_exit(TICKER, "yes", 65, CLOSE - 750, count=2)
     assert w.window_realized == 10 and "yes" not in w.opens
-    flip.evaluate(TICKER, _flip_ctx(_flip_book(), secs_left=740))
+    flip.evaluate(TICKER, _flip_ctx(fav(), secs_left=740))
     assert _uncovered(ledger) == 0                         # ZERO pages, ever
 
 

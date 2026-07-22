@@ -118,6 +118,19 @@ OPEN_MAX_ENTRY_CENTS = 42         # DREW-DEFAULT (build 52, was 50): real-gouge 
 # rest 54 (+5, the fee-safe floor). The cheaper the entry, the bigger the
 # gouge — the middle is where the hedgers are forced to transact.
 OPEN_MIDDLE_TARGET = 52          # DREW-DEFAULT: the take target — the 50/50 middle, one tick above
+# WO-2026-07-22-E — FLIP THE SIDE. The design-error correction (7-for-7 on the
+# live tape): market making acquires inventory on the side that has DEMAND and
+# sells it INTO that demand. FLIP was doing the inverse — buying the ABANDONED
+# cheap side and resting a take on the side nobody wants (that is why
+# flip_fill=38%). FLIP now buys the FAVORED (higher-priced) side and sells the
+# +20 into the pile-in of buyers. 50 is a HARD floor — never buy below fair
+# value, that IS the old bug. trend_usd/depth_ratio are LOGGED, never gated
+# (one change, maximally attributable; the confirms earn their gate from data).
+OPEN_ENTRY_MIN_C = 50            # DREW-DEFAULT: hard fair-value floor — never buy below 50
+OPEN_ENTRY_MAX_C = 70            # DREW-DEFAULT: favored side ran 59-68 at every logged entry
+OPEN_ENTRY_DEADLINE_S = 90       # DREW-DEFAULT: unfilled by here → cancel, never chase (== opening window)
+OPEN_GOUGE_C = 20               # DREW-DEFAULT: target = entry + 20, capped at 90 (out of the illiquid tail)
+OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2-poll sustain, maker-first
 # B3 the active late-window walk-down: a position that does not fill at the
 # middle is walked DOWN toward scratch as the clock runs (from OPEN_WALK_START_S
 # down to OPEN_FLAT_BY = T-10), re-posting the maker take lower, so it exits

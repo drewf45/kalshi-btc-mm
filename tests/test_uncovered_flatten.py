@@ -62,8 +62,10 @@ def _rows(ledger, tag):
         "SELECT COUNT(*) FROM failures WHERE why_tag=?", (tag,)).fetchone()[0]
 
 
-def _open_leg(flip, gateway, ledger, entry=40):
-    """A booked OPEN leg whose take rests — the healthy custody shape."""
+def _open_leg(flip, gateway, ledger, entry=60):
+    """A booked OPEN leg whose take rests — the healthy custody shape. Post
+    WO-2026-07-22-E the entry is the FAVORED (higher) side: yes@entry > no@49,
+    entry in [50,70]."""
     props = flip.evaluate(TICKER, _ctx(_book(yes=entry), grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
@@ -92,7 +94,7 @@ def test_192145_self_net_void_flattens_not_rides(flip, gateway, ledger,
     """The leg Drew watched: the take is PROPOSED every cycle but never
     confirms resting (the self-net void). It must not ride to settlement —
     within a bounded escalation it FLATTENS at market."""
-    _open_leg(flip, gateway, ledger, entry=40)
+    _open_leg(flip, gateway, ledger, entry=60)
     # the take proposes but we NEVER call on_submitted — it rejected into
     # the void, exactly as the live self-net storm did
     flatten = None

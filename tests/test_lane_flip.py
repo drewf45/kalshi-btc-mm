@@ -82,63 +82,66 @@ def test_scratch_reason_triggers():
 
 
 # ── P21 A4: Lane OPEN entry mechanics (PAIR retired) ───────────────────────
-def test_open_posts_cheap_side_of_the_imbalance(flip):
-    """WO-FLIP-IMMEDIATE-ENTRY (build 47): an open-band book posts ONE lot on
-    the CHEAP side (the lower bid — the pile-in-abandoned side), NOT the grain
-    side. yes 48 < no 49 -> buy YES@48; grain only informs the why."""
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+def test_open_posts_favored_side_of_the_imbalance(flip):
+    """WO-2026-07-22-E "FLIP THE SIDE" (build 57): an entry-band book posts ONE
+    lot on the FAVORED side (the HIGHER bid — the side with demand, the market's
+    own read of direction), NOT the abandoned cheap side. yes 60 > no 40 -> buy
+    YES@60 (favored, in band [50,70]); grain only informs the why."""
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                       grain=GRAIN_NO3))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("yes", 40, "ENTRY")]
+        [("yes", 60, "ENTRY")]
     assert props[0].lane == "FLIP" and props[0].count == 1
-    assert "OPEN liquidity yes@40c" in props[0].why
-    assert "book y40/n49" in props[0].why
+    assert "OPEN50 favored yes@60c" in props[0].why
+    assert "book y60/n40" in props[0].why
 
 
 def test_open_no_grain_still_enters(flip):
-    """WO-FLIP-IMMEDIATE-ENTRY OVERTURNED 'no grain -> no trade': the grain
-    wait is retired (the liquidity capstone). A band book with weak grain OR
-    no grain at all ENTERS the cheap side immediately — the imbalance IS the
-    setup, not a grain streak."""
+    """WO-2026-07-22-E OVERTURNED 'no grain -> no trade': grain GATES ON NOTHING
+    now (it is logged in the why, never a wait). An entry-band book with weak
+    grain OR no grain at all ENTERS the favored side immediately — the imbalance
+    IS the setup, not a grain streak."""
     # weak grain (length < OPEN_MIN_GRAIN) no longer blocks
-    w_ctx = ctx(flip_book(yes=40, no=49),
+    w_ctx = ctx(flip_book(yes=60, no=40),
                 grain={"direction": "no", "length": 1, "k": 4})
     assert [(p.side, p.purpose) for p in flip.evaluate(TICKER, w_ctx)] == \
         [("yes", "ENTRY")]
-    # and with NO grain at all (empty screen): still enters the cheap side
+    # and with NO grain at all (empty screen): still enters the favored side
     flip.windows.clear()
     assert [(p.side, p.purpose) for p in
-            flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49)))] == \
+            flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40)))] == \
         [("yes", "ENTRY")]
 
 
 def test_open_band_required(flip):
-    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the 'both sides
-    inside the open band' gate is RETIRED — it rejected biased opens and made
-    FLIP wait for a balanced book. FLIP is the liquidity provider now: a biased
-    open (yes 30 / no 65) ENTERS the cheap side (yes@30, inside the buyable
-    range [25,50]) — the imbalance IS the setup."""
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=30, no=65),
+    """WO-2026-07-22-E (build 57): FLIP buys the FAVORED (higher) side, and the
+    sole entry filter is that favored side sitting inside the buyable band
+    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A biased open whose favored
+    side is in band (yes 65 / no 30) ENTERS the favored side (yes@65); a favored
+    side ABOVE the band (the move already fully priced) SKIPS."""
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=65, no=30),
                                       grain=GRAIN_NO3))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("yes", 30, "ENTRY")]
-
-
-def test_open_cheap_side_paid_up_passes(flip):
-    """OVERTURNED by WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): with
-    OPEN_MAX_ENTRY_CENTS relaxed to 50 and book coherence (yes_bid+no_bid<=101)
-    guaranteeing the cheap side <= 50, the 'paid up' CEILING skip is now
-    unreachable — every coherent biased open is buyable. The remaining range
-    gate is the FLOOR: a near-worthless cheap side (yes 20, below
-    OPEN_ENTRY_FLOOR 25) is skipped."""
-    assert config.OPEN_MAX_ENTRY_CENTS == 42       # build 52 Finding 4: real-gouge only
-    assert config.OPEN_ENTRY_FLOOR == 25
-    # below the floor (near-worthless) skips
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=20, no=79),
-                                     grain=GRAIN_NO3)) == []
-    # build 52: above the tightened ceiling (a ~coinflip, no real gouge) skips
+        [("yes", 65, "ENTRY")]
+    # favored side above the band skips
     flip.windows.clear()
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=45, no=54),
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20),
+                                     grain=GRAIN_NO3)) == []
+
+
+def test_open_favored_out_of_band_passes(flip):
+    """WO-2026-07-22-E (build 57): the entry band is now the FAVORED side inside
+    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A favored side BELOW the
+    floor (below fair value — the old backwards bug) skips; a favored side ABOVE
+    the ceiling (the move already fully priced, the illiquid tail) also skips."""
+    assert config.OPEN_ENTRY_MIN_C == 50
+    assert config.OPEN_ENTRY_MAX_C == 70
+    # favored side below the band (below fair value) skips
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=40),
+                                     grain=GRAIN_NO3)) == []
+    # favored side above the band (already fully priced) skips
+    flip.windows.clear()
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20),
                                      grain=GRAIN_NO3)) == []
 
 
@@ -147,37 +150,36 @@ def test_open_curfew_and_no_entry_phase(flip):
     the opening 90s only — an open-band book posts at the OPEN (secs_into 50),
     never mid-window. The late curfew stands."""
     # build 51: the entry window is T-15 → the first 90s (was mid-window)
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                       secs_left=850, grain=GRAIN_NO3))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     flip.windows.clear()
     # past the T-10 cutoff nothing posts; window over posts nothing
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                      secs_left=200, grain=GRAIN_NO3)) == []
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                      secs_left=50, grain=GRAIN_NO3)) == []
 
 
 def test_open_take_posted_after_fill(flip, gateway):
-    """A5 exit one of three: the TAKE rests at entry + the goal-bounded take
-    the cycle after the fill books (WO-FLIP-GOAL-TAKE overturned the fixed
-    entry+OPEN_TAKE_CENTS — at the 1-lot cap this is entry+5, the reachable
-    nickel; pre-P21 it was the pair take entry+4)."""
+    """Exit one of three: the resting TAKE posts the cycle after the fill books.
+    WO-2026-07-22-E: the take is now entry + OPEN_GOUGE_C capped at 90 (the +20
+    sold INTO the pile-in of buyers) — favored entry 60 -> take 80."""
     from relay_engine.lane_flip import LaneFlip
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                       grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-Y", CLOSE - 800)
     event = TICKER.rsplit("-", 1)[0]
     gateway.positions[(event, TICKER, "FLIP")] = 1
-    flip.note_fill(TICKER, "yes", 40, CLOSE - 790)
+    flip.note_fill(TICKER, "yes", 60, CLOSE - 790)
     assert "yes" in flip.windows[TICKER].opens
-    props2 = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    props2 = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                        secs_left=780))
     takes = [p for p in props2 if p.purpose == "EXIT"]
     assert len(takes) == 1
-    # build 49+: the take rests at the middle-target (_take_price), entry 40 -> 52
+    # WO-2026-07-22-E: the take rests at entry + OPEN_GOUGE_C, entry 60 -> 80
     assert (takes[0].side, takes[0].price_cents, takes[0].action) == \
-        ("yes", LaneFlip._take_price(40), "sell")
+        ("yes", LaneFlip._take_price(60), "sell")
     assert "open take" in takes[0].reason
 
 
@@ -205,16 +207,16 @@ def test_r1_wall_blocks_reentry_when_not_flat(flip, gateway):
 
 def test_reentry_is_open_gated(flip, gateway):
     """P21 A4 OVERTURNED the OFI re-entry gate: a new trip after a completed
-    one opens the same way the first did — band + grain (the herd's screen,
-    not the tape's last four ticks)."""
+    one opens the same way the first did — the herd's screen (band + imbalance),
+    not the tape's last four ticks."""
     w = flip._window(TICKER, CLOSE)
     w.trips = 1
-    # WO-FLIP-IMMEDIATE-ENTRY: re-entry opens on band + imbalance, no grain
-    # needed. Too early is gated by the entry cutoff, not a grain wait.
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    # WO-2026-07-22-E: re-entry opens on band + imbalance, no grain needed.
+    # Too early is gated by the entry cutoff, not a grain wait.
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                      secs_left=200)) == []      # past T-10 cutoff
-    # inside the opening 90s (build 51): re-entry buys the cheap side (yes 48 < no 49)
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=40, no=49),
+    # inside the opening 90s (build 51): re-entry buys the FAVORED side (yes 60 > no 40)
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                       secs_left=850))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 

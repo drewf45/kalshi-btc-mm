@@ -91,22 +91,36 @@ def test_old_strike_touch_proxy_is_constant_across_cheap_entries(flip,
     assert g1["proxy"] == g2["proxy"] == 0.89     # same answer, always
 
 
-# ── §4.1: the LIVE gate tests MEASURED took_swing ──────────────────────────
-def test_measured_low_rate_refuses_the_knife(flip, ledger, surface):
-    _seed(surface, 39, took=7, total=20)          # 0.35 measured — a knife band
-    assert flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2)) == []
-
-
-def test_measured_high_rate_admits_the_swing(flip, ledger, surface):
-    _seed(surface, 39, took=15, total=20)         # 0.75 measured — a real swing
+# ── §4.1: the swing gate is RETIRED from the ENTRY path (WO-2026-07-22-E) ───
+# The measured took_swing rate no longer gates entry — FLIP now buys the
+# FAVORED side (no@55, in band [50,70]) regardless of the rate; the swing
+# computation lives on as a LOG-ONLY method, directly testable below.
+def test_measured_low_rate_no_longer_gates_entry(flip, ledger, surface):
+    """A low measured took_swing rate once REFUSED the knife. The swing gate
+    is now retired from the entry path: the favored side (no@55) STILL enters
+    — swing is log-only, it blocks no entry."""
+    _seed(surface, 55, took=7, total=20)          # 0.35 measured — a knife band
     props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
-    assert len(props) == 1 and "measured=0.75n20" in props[0].why
+    assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
 
 
-def test_thin_sample_stays_permissive(flip, ledger, surface):
-    _seed(surface, 39, took=0, total=10)          # < 20: don't trust it
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
-    assert len(props) == 1 and "calibrating n10" in props[0].why
+def test_swing_gate_method_measures_high_rate(flip, ledger, surface):
+    """The retired ENTRY gate survives as a LOG-ONLY method (Instrument 1):
+    a high measured took_swing rate reads ok with 'measured=0.75n20' on its
+    why. It gates no entry now, but the measurement is preserved and directly
+    testable."""
+    _seed(surface, 55, took=15, total=20)         # 0.75 measured — a real swing
+    g = flip._swing_gate(_ctx(_book()), CLOSE - 800, 55, "no", TICKER)
+    assert g["ok"] and "measured=0.75n20" in g["why"]
+
+
+def test_swing_gate_method_thin_sample_permissive(flip, ledger, surface):
+    """Below OPEN_SWING_MIN_SAMPLES the log-only method stays permissive (ok,
+    'calibrating n10') — the 1-lot cap bounds the risk while data accrues.
+    (It gates no entry anymore; the property is preserved on the method.)"""
+    _seed(surface, 55, took=0, total=10)          # < 20: don't trust it
+    g = flip._swing_gate(_ctx(_book()), CLOSE - 800, 55, "no", TICKER)
+    assert g["ok"] and "calibrating n10" in g["why"]
 
 
 # ── §2: the two-barrier shadow measures the RIGHT event ────────────────────
@@ -166,8 +180,10 @@ def test_flip_capped_to_one_lot_f_untouched():
 
 # ── §3: the calibration pack line + compare rows ───────────────────────────
 def test_compare_row_and_pack_calibration_line(flip, ledger, surface):
-    _seed(surface, 39, took=6, total=20)               # 0.30 measured
-    flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    _seed(surface, 55, took=6, total=20)               # 0.30 measured
+    # the compare row is written by the LOG-ONLY swing-gate method (retired
+    # from the entry path); §3's calibration line reads it in the pack
+    flip._swing_gate(_ctx(_book()), CLOSE - 800, 55, "no", TICKER)
     rows = ledger.db.execute(
         "SELECT detail FROM surface_rows WHERE state='SWING_GATE_COMPARE'"
     ).fetchall()

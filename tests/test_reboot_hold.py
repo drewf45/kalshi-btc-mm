@@ -5,9 +5,10 @@
     False and the 4-minute hold (+ the poll resets) was BYPASSED on every
     reboot. Fix: recover the real fill_ts; if unrecoverable, fail SAFE (fill_ts
     = now → treat as FRESH, full protection), never 0.0, and PAGE.
-  Finding 2: FLOOR_BREACH fired on a correctly-bounded 8c salvage — the alarm's
-    expectation must be pinned to OPEN_SALVAGE_BUDGET_C (A1's budget), and the
-    message must quote the live constant, not a stale "−15c".
+  Finding 2: FLOOR_BREACH fired on a correctly-bounded loss — the alarm's
+    expectation must be pinned to the live stop budget (WO-2026-07-22-E: the
+    momentum stop, OPEN_MOMENTUM_STOP_C), and the message must quote that live
+    constant, not a stale "−15c".
   Finding 3: don't silence the uncovered page — SPLIT it. The routine 1-lot
     cover-pending state is FLIP_UNCOVERED_EXPECTED (debug); the reboot orphan is
     FLIP_ORPHAN_ADOPTED (page, with recovered entry + fill_ts).
@@ -93,28 +94,29 @@ def test_f1_unrecoverable_ts_fails_safe_and_pages(flip, gateway, ledger, funnel)
     assert any("FLIP_ORPHAN_ADOPTED" in a for a in funnel)
 
 
-# ── Finding 2: FLOOR_BREACH no longer fires on a correct salvage ────────────
+# ── Finding 2: FLOOR_BREACH no longer fires on a bounded momentum stop ──────
 def test_f2_bounded_salvage_does_not_trip_floor_breach(flip, ledger, surface,
                                                         funnel):
-    """A perfectly-bounded 8c salvage (exactly OPEN_SALVAGE_BUDGET_C) on a 36c
-    entry is OK — the breach test is pinned to the budget, not entry−35."""
-    flip._log_swing_outcome(TICKER, 36, 28, 1000.0, 900.0)   # exit 28, loss 8
+    """WO-2026-07-22-E: FLOOR_BREACH now polices the MOMENTUM STOP. A
+    perfectly-bounded 10c loss (exactly OPEN_MOMENTUM_STOP_C) on a 36c entry is
+    OK — the breach test is pinned to the entry−10 stop budget, not entry−35."""
+    flip._log_swing_outcome(TICKER, 36, 26, 1000.0, 900.0)   # exit 26, loss 10
     (d,) = ledger.db.execute(
         "SELECT detail FROM surface_rows WHERE state='FLIP_LOSER_CUT'"
         " ORDER BY id DESC LIMIT 1").fetchone()
     row = json.loads(d)
-    assert row["ok"] is True and row["loss_cents"] == 8
-    assert row["floor_expected"] == config.OPEN_SALVAGE_BUDGET_C == 8
+    assert row["ok"] is True and row["loss_cents"] == 10
+    assert row["floor_expected"] == config.OPEN_MOMENTUM_STOP_C == 10
     assert _paged(ledger, "FLIP_FLOOR_BREACH") == 0          # no false positive
 
 
 def test_f2_a_genuine_over_budget_cut_still_breaches(flip, ledger, surface, funnel):
     """The alarm still means something: a cut past budget+slip still fires, and
-    the message quotes the LIVE budget constant (not a stale −15c)."""
-    flip._log_swing_outcome(TICKER, 40, 20, 1000.0, 900.0)   # loss 20 > 8+5
+    the message quotes the LIVE momentum-stop constant (not a stale −15c)."""
+    flip._log_swing_outcome(TICKER, 40, 20, 1000.0, 900.0)   # loss 20 > 10+5
     assert _paged(ledger, "FLIP_FLOOR_BREACH") == 1
     msg = next(a for a in funnel if "FLIP_FLOOR_BREACH" in a)
-    assert f"{config.OPEN_SALVAGE_BUDGET_C}c salvage assumption" in msg
+    assert f"momentum-stop budget {config.OPEN_MOMENTUM_STOP_C}c" in msg
     assert "-15c" not in msg and "−15c" not in msg
 
 

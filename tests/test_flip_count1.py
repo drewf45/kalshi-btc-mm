@@ -23,7 +23,9 @@ CLOSE = 1_000_000.0
 GRAIN_YES2 = {"direction": "yes", "length": 2, "k": 4}
 
 
-def flip_book(yes=40, no=49, yq=10, nq=10):
+def flip_book(yes=60, no=40, yq=10, nq=10):
+    # WO-2026-07-22-E: FLIP buys the FAVORED (higher-priced) side in [50,70];
+    # the default book is favored-yes@60 so the entry path enters yes.
     b = OrderBook(market=TICKER)
     b.apply_snapshot({yes: yq}, {no: nq}, ts=1.0)
     return b
@@ -82,9 +84,9 @@ def test_second_open_fill_merges_and_take_sells_two(flip, gateway, ledger):
     props3 = flip.evaluate(TICKER, ctx(flip_book(), secs_left=760))
     take2 = next(p for p in props3 if p.purpose == "EXIT")
     assert take2.count == 2                      # the whole bucket flips
-    # WO-FLIP-GOAL-TAKE: the re-proposed take is goal-bounded at the MERGED
-    # booked size (2 lots), never the retired fixed +20
-    assert take2.price_cents == LaneFlip._take_price(45)   # middle-target on the merge
+    # WO-2026-07-22-E: the re-proposed take is entry + OPEN_GOUGE_C (cap 90)
+    # on the blended merged entry (45 -> 65), size-independent
+    assert take2.price_cents == LaneFlip._take_price(45)   # entry+20 on the merge
     assert _uncovered_rows(ledger) == []         # covered every cycle
 
 
