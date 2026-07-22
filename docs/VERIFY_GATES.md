@@ -2800,6 +2800,62 @@ fatal → entries halt (zero `/confirm_cash`).**
 Render line showing the rejected order's `purpose`/`post_only`), the pack-to-Telegram sender, and the
 treasury waterfall (accounting, not run-safety — still the ceiling on scaling).
 
+## WO-2026-07-22-J — THE REGIME LANES, PHASE 0 (build 60)
+
+**One coach, N profiles — same mechanism, different eyes.** The full WO fields a roster (a dispatcher
+routing each window to DRIFT / GAP / MISPRICE / FLAT / LATE). This build ships **Phase 0 only** — the
+three changes marked "SHIP IMMEDIATELY. SAFE ALONE. IMPROVES THE CURRENT RUN," one of which closes a
+live capital leak. Phases 1-3 (type-stamp instrumentation, the dispatcher, restoring the GAP/MISPRICE
+profiles from git history, the pre-committed tuning governance) are the next builds — their value only
+lands once the roster exists, so shipping Phase 0 alone is the correct, low-risk move.
+
+**Read-rule at source (all TRUE):**
+- **§0.1** OPEN's entry wall was `self._net(market, event) != 0` (per-MARKET); HUNT's was
+  `side in w.hunts or w.posted or w.fills` (per-SIDE only). **TRUE** — with OPEN holding `no`, HUNT's
+  test for `yes` passed and it entered, and buying YES while holding NO **auto-nets at the exchange**
+  (two fills, two spreads, two fees, zero position). This is the only path here that can execute the
+  worst trade in the system.
+- **§0.2** the entry gate had `depth_ratio < 1.0 → ratio_low` (a live gate). **TRUE.**
+- **§0.3** `_pile_baseline` returned on `sk is not None` alone. **TRUE** — a first qualifying tick with
+  a skew but no spot gave baseline `(sk, None)`, dropping `trend_usd` to 0, so the window read
+  `flat_tape` and skipped for its whole remaining ~120s, never re-selecting once spot arrived.
+
+**Built (Phase 0):**
+- **§0.1 — the ONE entry wall.** Extracted to `_market_entry_blocked(market, event)` (a per-market
+  FLIP-net check), and **every lane calls it** — OPEN at its gate, HUNT before proposing. No lane can
+  define its own exclusion scope anymore. Exclusivity is at the POSITION level (one net per market),
+  not a latched classification — so a lane can still act when its setup appears late.
+- **§0.2 — `ratio_low` retired from the gate.** `depth_ratio` is still computed and printed on the why
+  (`ratio 0.60x`), but it gates nothing: normalized held/other it showed no predictive value (the one
+  winner read 0.71, inside the losers' 0.56-0.85), and a dead gate only costs coverage AND silently
+  shapes every future lane's dataset.
+- **§0.3 — the pile baseline requires a real spot** (`sp is not None`), so a spot-less first tick can
+  never freeze a window into `flat_tape`.
+
+**HARD RAIL:** exposure is unchanged by construction — one net position per market before and after.
+F byte-identical (`lane_fh8`/custodian untouched); maker-only; 1 lot; one-shot; per-lane halt intact.
+New acceptance in `test_pile_gate.py` (the shared wall blocks OPEN entry on a held market; the shared
+wall blocks HUNT's auto-net against a held side; the pile baseline requires a real spot) and the
+depth-ratio tests re-anchored to logged-not-gated. Suite 696 · preflight 23/23.
+
+**Watch (acceptance):** zero windows with two lanes holding a position; zero auto-net events (a buy on
+the side opposite a held position); zero taker fills on entry; no loss beyond the stop+slip; a FLIP
+halt stops neither F nor another lane; **F byte-identical**.
+
+**Roadmap (Phases 1-3, not this build):** Phase 1 — the **type stamp** on every proposal/fill/log
+(load-bearing for the whole ruling), `velocity = skew/secs_into`, counterfactuals on skips, per-lane
+scoreboards. Phase 2 — the **dispatcher** (MISPRICE if hunt_gap≥25; GAP if velocity≥1.0; FLAT/LATE by
+skew; else DRIFT) and the profiles (DRIFT = build 58/59 as-is; GAP = restore-from-git; MISPRICE =
+retune HUNT to +10/−8; FLAT/LATE = log-only). Phase 3 — the **pre-committed tuning rule** (a lane
+that trips its per-lane halt is suppressed, its rows read before one change re-enables it at PROBE;
+twice in a day = suppressed for the day; never tune a trading lane). **Every lane is PROBE** — DRIFT
+n=5, GAP n=1, MISPRICE n=2 — and the recorder decides the thresholds, not a good week.
+
+**Still open (carried):** exit-rejection cascade (one Render line owed), `WINDOW_ECON_DIVERGENCE`
+(self-halting — **no `/confirm_cash` unattended**), the bad-settlement-row quarantine, the
+pack-to-Telegram sender, the widened recorder (trade prints — the biggest data gap), and — above
+everything — the **treasury waterfall asymmetry**, still the ceiling on scaling.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

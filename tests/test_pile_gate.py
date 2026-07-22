@@ -191,11 +191,15 @@ def test_trend_measured_from_the_pile_baseline_not_window_open(flip):
     assert _reason(flip) == "flat_tape"               # trend from baseline = 0
 
 
-def test_ratio_low_skips(flip):
-    # every condition passes except depth: the favored side is THINNER (6 < 10)
+def test_thin_depth_is_logged_not_gated(flip):
+    # WO-2026-07-22-J §0.2: depth_ratio no longer gates — the classifier showed
+    # no predictive value (the one winner read 0.71, inside the losers' range).
+    # A thin favored side (ratio < 1) still ENTERS; the ratio rides on the why.
     _poll(flip, 65, 54, 48, 66_000.0, yd=6, nd=10)
-    _poll(flip, 80, 60, 40, 66_020.0, yd=6, nd=10)
-    assert _reason(flip) == "ratio_low"
+    props = _poll(flip, 80, 60, 40, 66_020.0, yd=6, nd=10)   # ratio 0.60
+    ent = [p for p in props if p.purpose == "ENTRY"]
+    assert len(ent) == 1 and ent[0].price_cents == 60
+    assert "ratio 0.60x" in ent[0].why
 
 
 def test_a_no_favored_side_window_is_no_pile(flip):
@@ -211,3 +215,40 @@ def test_skew_ticks_are_recorded_every_poll(flip):
     _poll(flip, 80, 60, 40, 66_020.0)
     ticks = flip.windows[T].skew_ticks
     assert (65, 6, 66_000.0) in ticks and (80, 20, 66_020.0) in ticks
+
+
+# ── WO-2026-07-22-J Phase 0 ─────────────────────────────────────────────────
+def test_shared_wall_blocks_open_entry_when_market_holds(flip):
+    """§0.1: the ONE per-market entry wall — OPEN does not enter a market that
+    already holds a FLIP net (here a held `no`), even with a formed pile."""
+    flip.gateway.positions[(EV, T, "FLIP")] = -1          # OPEN holds `no`
+    _poll(flip, 65, 54, 48, 66_000.0)
+    props = _poll(flip, 80, 60, 40, 66_020.0)             # a qualifying yes pile
+    assert props == []                                    # the wall (not the gate)
+
+
+def test_shared_wall_blocks_hunt_auto_net_against_a_held_side(flip):
+    """§0.1: HUNT used a per-SIDE wall, so with OPEN holding `no` it bought
+    `yes` — an auto-net at the exchange. Now HUNT passes the same per-market
+    wall and refuses."""
+    from relay_engine.spotlead import Needle
+    flip.gateway.positions[(EV, T, "FLIP")] = -1          # a held `no`
+    w = flip._window(T, CLOSE)
+    b = OrderBook(market=T)
+    b.apply_snapshot({40: 10}, {30: 10}, ts=1.0)
+    sl = Needle(side="yes", d_before=200.0, d_after=20.0,
+                delta_p=config.HUNT_NEEDLE_POINTS + 5, fair_cents=90.0,
+                t_remaining=700.0)
+    assert flip._hunt_entry(w, T, EV, b, sl, 700.0) == []  # no auto-net
+
+
+def test_pile_baseline_requires_a_real_spot_sample(flip):
+    """§0.3: the baseline needs a real spot, not just a skew. A first in-window
+    tick with skew but NO spot must not become the baseline (that fell trend to
+    0 → flat_tape for the window's whole remaining life). The next tick that
+    carries a spot is the baseline, so the pile still selects."""
+    _poll(flip, 65, 54, 48, None)                         # skew 6, NO spot
+    _poll(flip, 72, 54, 48, 66_000.0)                     # skew 6 WITH spot — baseline
+    props = _poll(flip, 85, 60, 40, 66_020.0)             # +$20 from the real baseline
+    ent = [p for p in props if p.purpose == "ENTRY"]
+    assert len(ent) == 1 and "trend $+20 agree" in ent[0].why

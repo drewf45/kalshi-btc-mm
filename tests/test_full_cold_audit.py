@@ -237,24 +237,23 @@ def test_a2_trend_usd_printed_on_enter(flip):
     assert "trend $+40" in props[0].why
 
 
-def test_a3_depth_ratio_gates_below_one(flip):
-    """WO-2026-07-22-F re-anchor (was test_a3_depth_ratio_recorded_not_gated):
-    depth_ratio (FAVORED-side depth ÷ other) is now part of the pile's all-of
-    GATE — an entry requires depth_ratio ≥ 1.0 (real depth behind the favored
-    side). A favored side with depth ≥ the other ENTERS and prints 'ratio
-    1.40x'; a THIN favored side (ratio < 1.0) is now SKIPPED (ratio_low)."""
-    # favored yes depth 14 / other 10 = 1.4 ≥ 1.0: enters, ratio on the line
+def test_a3_depth_ratio_recorded_not_gated(flip):
+    """WO-2026-07-22-J §0.2 re-anchor: depth_ratio is LOGGED, NOT gated — the
+    classifier was retracted (no predictive value: the one winner read 0.71,
+    inside the losers' 0.56-0.85). A favored side with depth prints 'ratio
+    1.40x' and enters; a THIN favored side (ratio 0.60 < 1) STILL enters — the
+    number rides on the tape for the recorder to rule, it gates nothing."""
+    # favored yes depth 14 / other 10 = 1.4: enters, ratio on the line
     flip.evaluate(TICKER, _ctx(_book(yes=54, no=48, yq=14, nq=10),
                                secs_left=835, spot=66_000.0, grain=GRAIN))
     props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40, yq=14, nq=10),
                                        secs_left=820, spot=66_020.0, grain=GRAIN))
     assert "ratio 1.40x" in props[0].why and props[0].purpose == "ENTRY"
-    # a thin favored side (depth 6 / other 10 = 0.6 < 1.0) is now refused
+    # a thin favored side (depth 6 / other 10 = 0.6) is NOT refused — it enters
     flip.windows.clear()
     flip.evaluate(TICKER, _ctx(_book(yes=54, no=48, yq=6, nq=10),
                                secs_left=835, spot=66_000.0, grain=GRAIN))
     props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40, yq=6, nq=10),
                                         secs_left=820, spot=66_020.0, grain=GRAIN))
-    assert props2 == []
-    w = flip.windows[TICKER]
-    assert w.last_skip_reason == "ratio_low" and w.last_skip_vals["ratio"] == 0.6
+    assert [p.purpose for p in props2] == ["ENTRY"]
+    assert "ratio 0.60x" in props2[0].why

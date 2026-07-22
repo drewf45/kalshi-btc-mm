@@ -291,6 +291,15 @@ class LaneFlip:
             return 0
         return self.gateway.positions.get((event, market, "FLIP"), 0)
 
+    def _market_entry_blocked(self, market: str, event: str) -> bool:
+        """WO-2026-07-22-J §0.1 — THE ONE ENTRY WALL. Exclusivity is per-MARKET
+        net position, shared by EVERY lane (the single definition). OPEN gated
+        per-market but HUNT gated only per-SIDE, so with OPEN holding `no`,
+        HUNT's test for `yes` passed and it bought the opposite side — which
+        auto-NETS at the exchange (two fills, two spreads, two fees, zero
+        position). A non-zero FLIP net on this market blocks any lane's entry."""
+        return self._net(market, event) != 0
+
     def _booked_held(self, market: str, side: str) -> Optional[int]:
         """FLIP-COUNT-1 §2.2: the booked ledger's held count for a FLIP
         side — unsettled ENTRY counts minus exit counts. Returns None when
@@ -704,13 +713,13 @@ class LaneFlip:
         # SKIPPED (one OPEN_SKIP line with the last in-window verdict). secs_into,
         # not secs_left (a sign error would invert it).
         secs_into = FLIP_WINDOW_SEC - secs
-        # WO-2026-07-22-G §1.2: a window that already HOLDS a position (ledger
-        # net != 0) is NEVER a "skip" — the R1 one-position wall returns BEFORE
-        # the PILE_END skip log, so a traded window (including a reboot orphan
-        # whose in-memory record is empty) never contaminates the skip dataset
-        # (the run's primary data product). This check MUST stay above the log.
-        if self._net(market, event) != 0:
-            return proposals               # R1 WALL: one position at a time
+        # WO-2026-07-22-G §1.2: a window that already HOLDS a position (net != 0)
+        # is NEVER a "skip" — the shared entry wall (§0.1) returns BEFORE the
+        # PILE_END skip log, so a traded window (including a reboot orphan whose
+        # in-memory record is empty) never contaminates the skip dataset. This
+        # check MUST stay above the log.
+        if self._market_entry_blocked(market, event):
+            return proposals               # the one per-market wall (§0.1)
         if secs_into < config.OPEN_PILE_START_S:
             return proposals               # too early — the pile has not had time
         if secs_into > config.OPEN_PILE_END_S:
@@ -770,8 +779,11 @@ class LaneFlip:
             reason = "trend_disagree"                # spot and book disagree
         elif growth < config.OPEN_SKEW_GROWTH_C:
             reason = "no_growth"                     # static skew, not a stampede
-        elif depth_ratio is not None and depth_ratio < 1.0:
-            reason = "ratio_low"                     # thin behind the favored side
+        # WO-2026-07-22-J §0.2: depth_ratio is LOGGED (in `vals`/the why), NOT
+        # gated. Normalized held/other it showed no predictive value — the one
+        # winner read 0.71, inside the losers' 0.56-0.85 — so the gate only cost
+        # coverage AND silently shaped every lane's dataset. The classifier was
+        # retracted; the number rides on the tape for the recorder to rule.
         if reason is not None:
             w.last_skip_reason, w.last_skip_vals = reason, vals
             return proposals                         # SKIP — the pile disagrees
@@ -819,8 +831,13 @@ class LaneFlip:
         skew. BOTH growth (Δskew) and trend (Δspot) are measured against this one
         baseline (§2.2): a move that finished before the window reads trend 0,
         and a static skew reads growth 0 — neither is mistaken for a live pile."""
+        # WO-2026-07-22-J §0.3: the baseline REQUIRES a real spot too (sp is not
+        # None). A first qualifying tick with a skew but NO spot gave (sk, None)
+        # → trend fell to 0 → the window read flat_tape and skipped for its whole
+        # remaining ~120s, never re-selecting once spot arrived.
         for t_in, sk, sp in w.skew_ticks:
-            if t_in >= config.OPEN_PILE_START_S and sk is not None:
+            if (t_in >= config.OPEN_PILE_START_S and sk is not None
+                    and sp is not None):
                 return sk, sp
         return None, None
 
@@ -1045,6 +1062,12 @@ class LaneFlip:
         # WO-BLEED-1 §2.2: one HUNT loss in the window sits the rest out —
         # the "so many of so many" doctrine applied intra-window.
         if w.hunt_lost:
+            w.hunt_pending = None
+            return []
+        # WO-2026-07-22-J §0.1: the SHARED per-market entry wall — HUNT no longer
+        # enters a market that already holds ANY FLIP net (e.g. an OPEN `no`),
+        # which would auto-net at the exchange. This is the same wall OPEN uses.
+        if self._market_entry_blocked(market, event):
             w.hunt_pending = None
             return []
         if side in w.hunts or side in w.posted or side in w.fills:
