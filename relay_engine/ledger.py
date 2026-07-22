@@ -153,6 +153,10 @@ class Ledger:
         # asyncio.to_thread); safety comes from the single RLock, not sqlite's
         # same-thread check.
         self.lock = threading.RLock()
+        # WO-2026-07-22-K: the on-disk path is remembered so a READ-ONLY export
+        # (the /daily bundle) can open its own `mode=ro` connection to the same
+        # file and never take a write lock on the settle path.
+        self.db_path = db_path or config.DB_PATH
         self.db = _LockedConnection(
             sqlite3.connect(db_path or config.DB_PATH, check_same_thread=False),
             self.lock)

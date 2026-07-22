@@ -37,11 +37,10 @@ def test_monolith_quarantined_and_never_imported():
 
 def test_no_paid_command():
     """/paid is retired. The surface is the accounting pair plus /reset_halt
-    (P8 §2.3 — Drew's key to the two-strike leash; entries only) plus
-    /scoreboard (P22 §5 — read-only, the one commanded addition) plus
-    /clear_cash_fatal (P-CASH-FATAL-1 §4.4 — the only key to a denied
-    delta; a restart is not)."""
+    (P8 §2.3) plus /scoreboard (P22 §5 — read-only) plus /clear_cash_fatal
+    (P-CASH-FATAL-1 §4.4) plus /daily (WO-2026-07-22-K — the read-only day
+    export). Still no order-shaped command."""
     from relay_engine.ops import Telegram
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
-                                 "/scoreboard", "/clear_cash_fatal")
+                                 "/scoreboard", "/clear_cash_fatal", "/daily")
     assert "/paid" not in Telegram.COMMANDS

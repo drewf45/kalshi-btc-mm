@@ -34,7 +34,7 @@ class Telegram:
     # P-CASH-FATAL-1 §4.4: /clear_cash_fatal — the ONLY key to a denied
     # cash delta (a restart is not); symmetric with /reset_halt.
     COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard",
-                "/clear_cash_fatal")
+                "/clear_cash_fatal", "/daily")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
@@ -44,6 +44,10 @@ class Telegram:
         # P22 §5: the scoreboard on demand — wired by the runner to
         # scoring.scoreboard_lines. Read-only by construction.
         self.scoreboard_fn = lambda: "no scoreboard wired"
+        # WO-2026-07-22-K: /daily — the read-only day export. Wired by the runner
+        # to build the .xlsx, send it as a document, and delete it. Takes the raw
+        # command text (for the optional "/daily N" days-back arg).
+        self.daily_fn = lambda text="": "no daily export wired"
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         self._session = None
@@ -84,6 +88,27 @@ class Telegram:
     def alert(self, msg: str) -> None:
         self.send(msg)
 
+    def send_document(self, path: str, caption: str = "") -> bool:
+        """WO-2026-07-22-K: one multipart sendDocument (the /daily bundle). Falls
+        back to a log line when the transport is unwired; never raises."""
+        if not self.wired():
+            log.warning("TELEGRAM(unwired): document %s (%s)", path, caption)
+            return False
+        try:
+            with open(path, "rb") as fh:
+                resp = self._session.post(
+                    f"https://api.telegram.org/bot{self.token}/sendDocument",
+                    data={"chat_id": self.chat_id, "caption": caption[:1024]},
+                    files={"document": (os.path.basename(path), fh)},
+                    timeout=60)
+            if resp.status_code == 200:
+                return True
+            log.warning("[TELEGRAM] sendDocument HTTP %s: %s",
+                        resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.warning("[TELEGRAM] sendDocument error: %s", e)
+        return False
+
     def handle_command(self, text: str) -> str:
         cmd = text.strip().split()[0] if text.strip() else ""
         if cmd == "/confirm_cash":
@@ -95,6 +120,8 @@ class Telegram:
             return self.reset_halt_fn()
         if cmd == "/scoreboard":
             return self.scoreboard_fn()
+        if cmd == "/daily":
+            return self.daily_fn(text)      # read-only export; never trades
         if cmd == "/clear_cash_fatal":
             return self.cash.clear_cash_fatal()
         # Anything else — including anything order-shaped — is refused by design.

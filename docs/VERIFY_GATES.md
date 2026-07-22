@@ -2856,6 +2856,52 @@ n=5, GAP n=1, MISPRICE n=2 — and the recorder decides the thresholds, not a go
 pack-to-Telegram sender, the widened recorder (trade prints — the biggest data gap), and — above
 everything — the **treasury waterfall asymmetry**, still the ceiling on scaling.
 
+## WO-2026-07-22-K — THE DAILY BUNDLE (build 61)
+
+**One command, one file, everything the engine logged, bounded to the day.** `/daily` builds a single
+`.xlsx` and sends it to Telegram as a document — a sheet per logged table plus the computed
+SCOREBOARD, tappable on a phone. **Read-only, off the trading path entirely** — no order code touched.
+
+**Read-rule at source (all TRUE):**
+- The engine writes 13 tables; `surface_rows` (the reasoning ledger — `state` + the free-text
+  `detail`) and `cell_outcomes` (per-trade outcomes) are the two that matter most, and joining them is
+  the daily analysis. `book_snapshots` is ~86k rows/day at 1 frame/s. `booked_fills`/`window_econ`/
+  `failures`/`d_budget_decisions` are created lazily (absent in a fresh DB). `engine_state` is
+  internal. TRUE — the builder introspects the live DB and skips tables that don't exist.
+- The command surface is a whitelist (`ops.py`), grown once before by the read-only `/scoreboard`;
+  `scoreboard_lines` is computed, not a table. TRUE — `/daily` joins the whitelist the same way.
+- The Telegram transport sends text via `sendMessage`; there was no document path. TRUE — added
+  `send_document` (multipart `sendDocument`, unwired-safe).
+
+**Built:**
+- **`/daily`** on the command whitelist → `daily_fn`, wired in the runner to build the workbook to
+  `/tmp`, send it, and delete it (nothing accumulates on the cash-rail disk). `/daily N` pulls N days
+  back; default today (`ts >= local start-of-day`).
+- **`daily_bundle.py`** — a self-contained module. **Read-only by construction**: it opens its own
+  `sqlite3.connect("file:<path>?mode=ro", uri=True)` connection, so it can never take a write lock on
+  the settle path. Sheets: `SCOREBOARD` (the computed lines) · `decisions` (surface_rows) ·
+  `cell_outcomes` · `fills` · `booked_fills` · `settlements` · `window_econ` · `window_outcomes` ·
+  `cash_movements` · `failures` · `boots` · `budget` (d_budget_decisions) · `book_sample`.
+- **`book_sample` decimation (§3)** — one frame every `decimate_s` (default 15) seconds, **plus** every
+  frame within ±`trade_pad_s` (10) of a fill, so the moments that matter keep full resolution
+  (~86k → ~5.7k rows/day). **Size guard:** if the finished file exceeds the 48 MB Telegram-safe limit,
+  `book_sample` is dropped and the smaller workbook is sent with a note — never a silent failure.
+- The xlsx is written with the **stdlib alone** (a zip of OOXML with inline strings) — no third-party
+  dependency (openpyxl/xlsxwriter are not installed and adding one is a deploy risk on the live box).
+
+**HARD RAIL:** read-only export — no trading path touched (`lane_flip`/`gateway`/`lane_fh8`/custodian
+unmodified). F byte-identical. `Ledger` gained one field (`db_path`) so the RO connection can find the
+file. New acceptance `test_daily_bundle.py` (8 tests: one valid xlsx with a sheet per existing table +
+SCOREBOARD; scoped to the day; book_sample decimated AND keeping trade bursts; **read-only leaves the
+DB unchanged and a mode=ro connection rejects writes**; the size guard drops book_sample over the
+limit; dated filename; `/daily` on the whitelist and dispatching; `send_document` unwired falls back to
+a log, never raises). Two command-surface laws re-anchored (the whitelist grew by `/daily`, exactly as
+it did for `/scoreboard`). Suite 704 · preflight 23/23.
+
+**Watch (acceptance):** `/daily` returns one `.xlsx` tappable on the phone; a sheet for every logged
+table plus SCOREBOARD; book_sample decimated + full-res around trades and the file opens on a phone;
+scoped to the day; read-only (cannot lock the settle path); built in `/tmp`, sent, deleted.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

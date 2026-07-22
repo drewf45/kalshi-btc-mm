@@ -198,6 +198,9 @@ class ShadowEngine:
         from . import scoring as _scoring
         self.telegram.scoreboard_fn = (
             lambda: "\n".join(_scoring.scoreboard_lines(self.ledger)))
+        # WO-2026-07-22-K: /daily — the read-only day export (one .xlsx, every
+        # table, bounded to the day). Built in /tmp, sent, deleted.
+        self.telegram.daily_fn = self._build_and_send_daily
         # P22 §1.2: first-boot backfill — today's clips and round-trips are
         # not lost history (guarded + idempotent inside; never boot-fatal)
         try:
@@ -815,6 +818,36 @@ class ShadowEngine:
         if self.task_alive.get("listener", True):
             return "ok" if n == 0 else f"ok({n} restarts)"
         return f"down({n} restarts)"
+
+    def _build_and_send_daily(self, text: str = "") -> str:
+        """WO-2026-07-22-K: build the day's read-only .xlsx bundle in /tmp, send
+        it to Telegram as a document, and delete it. Off the trading path — a
+        `mode=ro` connection to the ledger DB (never locks the settle path).
+        `/daily N` pulls N days back; default today. Never raises."""
+        import os
+        from . import daily_bundle, scoring
+        parts = text.split()
+        days_back = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        fname = daily_bundle.daily_filename(days_back=days_back)
+        out = os.path.join("/tmp", fname)
+        try:
+            sb = scoring.scoreboard_lines(self.ledger)
+            res = daily_bundle.build_daily_workbook(
+                self.ledger.db_path, sb, out, days_back=days_back)
+            size_mb = os.path.getsize(out) / 1e6
+            caption = (f"{fname} — {res['sheets']} sheets, {res['rows']} rows, "
+                       f"{size_mb:.1f}MB{res['note']}")
+            sent = self.telegram.send_document(out, caption)
+            return caption if sent else f"{fname} built ({size_mb:.1f}MB) but " \
+                "the send failed — see the log"
+        except Exception as e:
+            log.warning("[DAILY] export failed: %s", e)
+            return f"daily export failed: {e}"
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
 
     def _salvage_anchor(self, market: str, side: str):
         """P19 §2.1: (d_entry, t_entry, p_entry) at custody registration —

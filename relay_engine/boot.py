@@ -283,6 +283,12 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("  SIZING: FULL KELLY — min(kelly, depth); the Wilson "
                  "ladder reports (scoreboard, pages, custody scaling) and "
                  "never votes (P27 §1); /scoreboard on demand")
+    lines.append("  DAILY BUNDLE (WO-2026-07-22-K): /daily → one .xlsx to "
+                 "Telegram — a sheet per logged table + the computed SCOREBOARD, "
+                 "the reasoning ledger (surface_rows.detail) beside the outcomes "
+                 "(cell_outcomes), book tape decimated + full-res around trades, "
+                 "scoped to the day. READ-ONLY (mode=ro), built in /tmp, sent, "
+                 "deleted — never touches the settle path (/daily N = N days back)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "
