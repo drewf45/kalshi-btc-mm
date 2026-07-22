@@ -151,8 +151,13 @@ def test_one_hunt_loss_sits_the_window_out_open_unaffected(flip, gateway,
     flip.note_exit(TICKER, "no", 28, CLOSE - 780, count=1)   # -2c: a loss
     assert flip.windows[TICKER].hunt_lost is True
     assert _hunt_at(flip, 45, 700) == []      # higher, same side — still out
-    # WO-2026-07-22-F: OPEN enters when the PILE forms in [60,180]s; hunt_lost
-    # never gates it. OPEN buys the FAVORED side (yes@60, in [50,70]).
+    # WO-2026-07-22-F/-G: OPEN enters when the PILE forms in [60,180]s; hunt_lost
+    # never gates it. OPEN buys the FAVORED side (yes@60, in the band). The
+    # earlier HUNT polls seeded spot-less ticks; clear the tick history so the
+    # pile reads a clean baseline (the hunt_lost state, the point here, stands).
+    w = flip.windows[TICKER]
+    w.skew_ticks.clear()
+    w.spot_ticks.clear()
     open_props = _prime_open(flip, grain=GRAIN_YES2)
     assert [(p.side, p.purpose) for p in open_props] == [("yes", "ENTRY")]
 

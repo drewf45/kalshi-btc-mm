@@ -238,8 +238,8 @@ def test_thesis_entries_admitted_no_geometry_gate(flip):
     joins across the band, each with a formed pile (two-poll prime: baseline
     small skew, then a grown skew + agreeing rising trend + favored depth), are
     admitted; the lane trades so the reversion rate can be measured."""
-    for join in (52, 58, 64, 68):     # favored side across the [50,70] band
-        other = join - 20             # skew 20, inside [10,30]
+    for join in (55, 58, 62, 64):     # favored side across the deliberate [55,64] band
+        other = join - 20             # skew 20
         flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
                                    grain=GRAIN_YES2, spot=66000.0))   # baseline
         props = flip.evaluate(TICKER, _ctx(_book(yes=join, no=other),

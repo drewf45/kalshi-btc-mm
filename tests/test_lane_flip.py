@@ -127,17 +127,17 @@ def test_open_no_grain_still_enters(flip):
 def test_open_band_required(flip):
     """WO-2026-07-22-E (build 57): FLIP buys the FAVORED (higher) side, and the
     sole entry filter is that favored side sitting inside the buyable band
-    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A biased open whose favored
-    side is in band (yes 65 / no 30) ENTERS the favored side (yes@65); a favored
-    side ABOVE the band (the move already fully priced) SKIPS.
-    WO-2026-07-22-F: prime the pile; the favored side is @65 (in [50,70]) with a
-    skew (25) inside [10,30] that grew across the window."""
-    flip.evaluate(TICKER, ctx(flip_book(yes=58, no=40), secs_left=835,
+    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [55,64] (WO-...-G: the deliberate
+    band). A biased open whose favored side is in band (yes 64 / no 40) ENTERS
+    the favored side (yes@64); a favored side ABOVE the band SKIPS.
+    WO-2026-07-22-F: prime the pile; the favored side is @64 (in [55,64]) with a
+    skew that grew across the window."""
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=40), secs_left=835,
                               spot=66_000.0, grain=GRAIN_NO3))   # pile baseline
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=65, no=40), secs_left=820,
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=64, no=40), secs_left=820,
                                       spot=66_020.0, grain=GRAIN_NO3))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("yes", 65, "ENTRY")]
+        [("yes", 64, "ENTRY")]
     # favored side above the band skips (in-window, so the band gate is what cuts)
     flip.windows.clear()
     assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20), secs_left=820,
@@ -146,11 +146,11 @@ def test_open_band_required(flip):
 
 def test_open_favored_out_of_band_passes(flip):
     """WO-2026-07-22-E (build 57): the entry band is now the FAVORED side inside
-    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A favored side BELOW the
-    floor (below fair value — the old backwards bug) skips; a favored side ABOVE
-    the ceiling (the move already fully priced, the illiquid tail) also skips."""
-    assert config.OPEN_ENTRY_MIN_C == 50
-    assert config.OPEN_ENTRY_MAX_C == 70
+    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [55,64] (WO-...-G). A favored side
+    BELOW the floor (below fair value — the old backwards bug) skips; a favored
+    side ABOVE the ceiling (the move already fully priced) also skips."""
+    assert config.OPEN_ENTRY_MIN_C == 55
+    assert config.OPEN_ENTRY_MAX_C == 64
     # favored side below the band (below fair value) skips (in-window)
     assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=40), secs_left=820,
                                      grain=GRAIN_NO3)) == []

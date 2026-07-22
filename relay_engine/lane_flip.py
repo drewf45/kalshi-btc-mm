@@ -229,11 +229,12 @@ class FlipWindow:
     done: bool = False
     sitout_paged: bool = False   # P13 §4: the sit-out pages ONCE
     spot_ticks: List[Optional[float]] = field(default_factory=list)
-    # WO-2026-07-22-F "WAIT FOR THE PILE": the book skew (|yes_bid − no_bid|)
-    # sampled every poll like spot — per-window, append-only, (secs_into, skew).
-    # The pile is a skew that GROWS inside the [60,180]s window; growth is the
-    # baseline (first tick past PILE_START) subtracted from the current skew.
-    skew_ticks: List = field(default_factory=list)  # (secs_into, skew|None)
+    # WO-2026-07-22-F "WAIT FOR THE PILE" (+ -G §2.2): the book skew
+    # (|yes_bid − no_bid|) AND the spot sampled every poll — per-window,
+    # append-only, (secs_into, skew|None, spot|None). The pile is a skew that
+    # GROWS inside the [60,180]s window; growth and trend are both measured
+    # against the one baseline (first tick past PILE_START).
+    skew_ticks: List = field(default_factory=list)  # (secs_into, skew|None, spot|None)
     open_skip_logged: bool = False          # OPEN_SKIP tags ONCE per window
     last_skip_reason: Optional[str] = None  # the last in-window all-of failure
     last_skip_vals: Optional[dict] = None
@@ -310,7 +311,11 @@ class LaneFlip:
     def _exit_count(self, market: str, side: str, rec_count: int) -> int:
         """FLIP-COUNT-1 (Adversary): an exit sells min(memory, booked-held),
         clamped >= 0 — the lane must never offer more contracts than the
-        ledger says the account holds."""
+        ledger says the account holds. (WO-2026-07-22-G §1.1: the AGGREGATE
+        cross-cycle invariant — two authorities never sell more than held — is
+        defended where it broke, at the safety FLATTEN, which SUPERSEDES every
+        other sell for the side rather than adding a second one; see
+        `_check_uncovered`.)"""
         booked = self._booked_held(market, side)
         if booked is None:
             return rec_count
@@ -588,10 +593,13 @@ class LaneFlip:
         proposals: List[Order] = []
         yes_bid, no_bid = book.best_yes_bid(), book.best_no_bid()
         # WO-2026-07-22-F: sample the book skew every poll, like spot — the pile
-        # is a skew that GROWS inside the [60,180]s window (§3.2).
+        # is a skew that GROWS inside the [60,180]s window (§3.2). WO-...-G §2.2:
+        # the spot rides along, so trend (Δspot) and growth (Δskew) are both
+        # measured from the SAME pile-window baseline — a move that finished
+        # before the window reads trend 0, never "arrived late".
         _skew = (abs(yes_bid - no_bid)
                  if yes_bid is not None and no_bid is not None else None)
-        w.skew_ticks.append((FLIP_WINDOW_SEC - secs, _skew))
+        w.skew_ticks.append((FLIP_WINDOW_SEC - secs, _skew, ctx.get("spot")))
 
         # 1) TAKE QUOTES for held legs (entry+X, passive EXIT — the one exit
         #    proposal; custodian owns it from registration)
@@ -696,36 +704,29 @@ class LaneFlip:
         # SKIPPED (one OPEN_SKIP line with the last in-window verdict). secs_into,
         # not secs_left (a sign error would invert it).
         secs_into = FLIP_WINDOW_SEC - secs
+        # WO-2026-07-22-G §1.2: a window that already HOLDS a position (ledger
+        # net != 0) is NEVER a "skip" — the R1 one-position wall returns BEFORE
+        # the PILE_END skip log, so a traded window (including a reboot orphan
+        # whose in-memory record is empty) never contaminates the skip dataset
+        # (the run's primary data product). This check MUST stay above the log.
+        if self._net(market, event) != 0:
+            return proposals               # R1 WALL: one position at a time
         if secs_into < config.OPEN_PILE_START_S:
             return proposals               # too early — the pile has not had time
         if secs_into > config.OPEN_PILE_END_S:
             self._log_open_skip(w, market, secs_into)   # the window was skipped
             return proposals
-        if self._net(market, event) != 0:
-            return proposals               # R1 WALL: one position at a time
-        # WO-FLIP-EVERY-MARKET-LIQUIDITY (build 49): the "both sides in
-        # OPEN_BAND" gate is RETIRED — it rejected biased opens (the expensive
-        # side out of band) and made FLIP wait for a balanced book, backwards.
-        # FLIP is the LIQUIDITY PROVIDER: it buys the cheap side of EVERY
-        # biased open. The only entry filter now is the CHEAP side being
-        # BUYABLE (OPEN_ENTRY_FLOOR..OPEN_MAX_ENTRY), plus the true-50/50 skip
-        # (no cheap side) and the needle trend-guard above (never buy a market
-        # genuinely running). Two-sided book required (need both bids to find
-        # the cheap side).
+        # WO-2026-07-22-G §2.3 (comment corrected): a two-sided book is required
+        # to find the favored (higher-priced) side; a true 50/50 book has none.
         if yes_bid is None or no_bid is None:
             return proposals               # no two-sided book: no favored side
-        # WO-2026-07-22-E — FLIP THE SIDE. We built the machine backwards: it
-        # acquired the ABANDONED cheap side and rested a take on the side nobody
-        # wants (flip_fill=38%). Market making acquires inventory on the side
-        # with DEMAND — the FAVORED (higher-priced) side, the market's own read
-        # of direction — and sells the +20 INTO the pile-in of buyers. The
-        # cheap-side swing gate and the volatility trend-SKIP are RETIRED (they
-        # were cheap-side-reversion constructs); the only entry filter is the
-        # favored side being in-band [MIN,MAX]. trend_usd/depth_ratio are LOGGED
-        # on every entry but GATE ON NOTHING yet — one change, maximally
-        # attributable; the confirms earn a gate from data, not from n=7.
-        _ticks = [t for t in w.spot_ticks if t is not None]
-        trend_usd = (_ticks[-1] - _ticks[0]) if len(_ticks) >= 2 else 0.0
+        # WO-2026-07-22-E → -F → -G — FLIP THE SIDE, then WAIT FOR THE PILE.
+        # Entry buys the FAVORED (higher-priced, demanded) side and sells the
+        # +OPEN_GOUGE_C into the pile-in. The gate is NOT "nothing" — it is the
+        # all-of pile gate below: favored side in-band [MIN,MAX], the tape moving
+        # AND agreeing (trend from the pile-window baseline), the skew GROWING
+        # (the stampede in progress), and depth behind the side (ratio_low is a
+        # LIVE gate). Any disagreement SKIPS the window and logs OPEN_SKIP.
         g = ctx.get("grain")
         if yes_bid == no_bid:
             if not w.open_no_grain_logged:
@@ -741,30 +742,32 @@ class LaneFlip:
         held_d = y_depth if side == "yes" else n_depth
         other_d = n_depth if side == "yes" else y_depth
         depth_ratio = round(held_d / other_d, 2) if other_d else None
+        # WO-2026-07-22-F/-G — THE PILE, and THE ALL-OF GATE. skew is the book's
+        # commitment (|yes_bid − no_bid|); growth is how much it has GROWN since
+        # the pile window opened (the stampede-in-progress, the heart of the
+        # order). §2.2: trend AND growth share ONE baseline — the first tick past
+        # PILE_START — so a move that FINISHED before the window (spot flat since
+        # the baseline) reads trend 0 and is correctly refused as flat_tape,
+        # never "arrived late". §2.1: the skew-LEVEL gate is retired (it was the
+        # price band in disguise, band = the deliberate [55,64]); only growth
+        # survives. Every condition must agree, or the window SKIPS.
+        b_skew, b_spot = self._pile_baseline(w)
+        skew = abs(yes_bid - no_bid)
+        growth = skew - b_skew if b_skew is not None else 0
+        trend_usd = (spot - b_spot) if (spot is not None
+                                        and b_spot is not None) else 0.0
         agree = ("trend~flat" if trend_usd == 0
                  else "agree" if ((trend_usd > 0) == (side == "yes"))
                  else "disagree")
-        # WO-2026-07-22-F — THE PILE, and THE ALL-OF GATE (§3.3). skew is the
-        # book's commitment (|yes_bid − no_bid|); growth is how much it has moved
-        # since the pile window opened (the stampede-in-progress, the heart of
-        # the order). Every condition must agree, or the window is SKIPPED and
-        # its reason logged. First failure names the reason.
-        skew = abs(yes_bid - no_bid)
-        base = self._pile_baseline_skew(w)
-        growth = skew - base if base is not None else 0
         vals = {"skew": skew, "growth": growth,
                 "trend": round(trend_usd), "ratio": depth_ratio}
         reason = None
         if not (config.OPEN_ENTRY_MIN_C <= join <= config.OPEN_ENTRY_MAX_C):
-            reason = "price_band"                    # favored side out of [50,70]
+            reason = "price_band"                    # favored side out of [55,64]
         elif abs(trend_usd) < config.OPEN_MIN_TREND_USD:
-            reason = "flat_tape"                     # the tape is not moving
+            reason = "flat_tape"                     # the tape is not moving (from the baseline)
         elif (trend_usd > 0) != (side == "yes"):
             reason = "trend_disagree"                # spot and book disagree
-        elif skew < config.OPEN_MIN_SKEW_C:
-            reason = "skew_low"                      # the pile has not formed
-        elif skew > config.OPEN_MAX_SKEW_C:
-            reason = "skew_high"                     # late — the move is priced
         elif growth < config.OPEN_SKEW_GROWTH_C:
             reason = "no_growth"                     # static skew, not a stampede
         elif depth_ratio is not None and depth_ratio < 1.0:
@@ -810,14 +813,16 @@ class LaneFlip:
         return proposals
 
     @staticmethod
-    def _pile_baseline_skew(w) -> Optional[int]:
-        """WO-2026-07-22-F: the skew when the pile window opened — the first
-        sampled skew at/after OPEN_PILE_START_S. Skew GROWTH is measured against
-        it, so a static skew (a decision that already happened) reads growth 0."""
-        for t_in, sk in w.skew_ticks:
+    def _pile_baseline(w):
+        """WO-2026-07-22-F/-G: the (skew, spot) at the moment the pile window
+        opened — the first tick sampled at/after OPEN_PILE_START_S with a real
+        skew. BOTH growth (Δskew) and trend (Δspot) are measured against this one
+        baseline (§2.2): a move that finished before the window reads trend 0,
+        and a static skew reads growth 0 — neither is mistaken for a live pile."""
+        for t_in, sk, sp in w.skew_ticks:
             if t_in >= config.OPEN_PILE_START_S and sk is not None:
-                return sk
-        return None
+                return sk, sp
+        return None, None
 
     def _log_open_skip(self, w, market: str, secs_into: float) -> None:
         """WO-2026-07-22-F §3.5: a window that reached PILE_END without an entry
@@ -1485,6 +1490,21 @@ class LaneFlip:
                         else book.best_no_bid()) if book is not None else None
                 if mark is None:
                     continue    # no book truth this cycle; retry the flatten
+                # WO-2026-07-22-G §1.1: the flatten is the DEFINITIVE close — it
+                # SUPERSEDES every other FLIP sell already proposed for this side
+                # this cycle (a bail, a stale/self-net take). Removing them first
+                # guarantees the crossfire is the ONE sell, so two authorities can
+                # never sell more than held (the 10:19 −87c short: bail 1 + flatten
+                # 1 against a 1-lot position). Then flatten the full booked-net.
+                superseded = sum(p.count for p in proposals if p.lane == "FLIP"
+                                 and p.side == side and p.action == "sell")
+                if superseded:
+                    proposals[:] = [p for p in proposals if not (
+                        p.lane == "FLIP" and p.side == side
+                        and p.action == "sell")]
+                    log.warning("FLIP_FLATTEN_SUPERSEDES %s %s: dropped %d "
+                                "competing sell(s) — the flatten is the one close",
+                                market, side, superseded)
                 n = self._exit_count(market, side, gap)
                 if n <= 0:
                     w.heal_attempts.pop(side, None)

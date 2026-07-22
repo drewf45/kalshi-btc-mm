@@ -49,12 +49,12 @@ def test_one_sided_book_posts_nothing(engine):
     (need both bids)."""
     # two-bid biased book: prime the pile — baseline poll then the entry poll
     # with the favored (higher) yes grown to 66 and the tape rising with it.
-    engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(60, 52),
+    engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(54, 48),
                                           secs_left=835, spot=66000.0))
-    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(66, 40),
+    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(64, 40),
                                                   secs_left=820, spot=66020.0))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("yes", 66, "ENTRY")]
+        [("yes", 64, "ENTRY")]
     # a genuinely one-sided book (no@34 only, yes side empty), in-window:
     # NOTHING — no favored side to price against (not the clock)
     engine.flip.windows.clear()

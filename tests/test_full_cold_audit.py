@@ -157,10 +157,10 @@ def test_f3_pile_in_window_enters(flip):
 
 
 # ── Finding 4: the ENTRY — real-gouge only ──────────────────────────────────
-def test_f4_entry_band_is_favored_50_to_70(flip):
-    # WO-2026-07-22-E: the cheap-side ceiling (42) is retired from the entry
-    # path; the favored-side band is [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C].
-    assert config.OPEN_ENTRY_MIN_C == 50 and config.OPEN_ENTRY_MAX_C == 70
+def test_f4_entry_band_is_the_deliberate_55_to_64(flip):
+    # WO-2026-07-22-G §2.1: the skew-level gate was the band in disguise
+    # (skew ≡ 2·join−99); the deliberate favored band is [55,64].
+    assert config.OPEN_ENTRY_MIN_C == 55 and config.OPEN_ENTRY_MAX_C == 64
 
 
 def test_f4_real_gouge_enters_coinflip_skips(flip):

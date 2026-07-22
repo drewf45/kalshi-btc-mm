@@ -88,7 +88,7 @@ def test_band_admits_favored_side(flip):
     [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70], once the PILE has formed. A
     favored no@60 (spot FALLING with the no side) posts as an ENTRY through the
     two-poll pile prime; the why now carries the all-of pile verdict."""
-    assert (config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C) == (50, 70)
+    assert (config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C) == (55, 64)
     props = _prime_favored(flip, side="no", join=60)
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("no", 60, "ENTRY")]

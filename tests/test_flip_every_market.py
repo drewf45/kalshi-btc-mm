@@ -89,11 +89,11 @@ def test_b1_biased_open_enters_the_favored_side(flip):
 
 
 def test_b1_enters_the_favored_no_side_too(flip):
-    """Orientation-symmetric: yes 40 / no 66 (skew 26, a falling tape) enters the
-    FAVORED NO side @66."""
-    props = _prime(flip, _book(yes=40, no=66), favored="no")
+    """Orientation-symmetric: yes 40 / no 64 (skew 24, a falling tape) enters the
+    FAVORED NO side @64 (in the deliberate band [55,64])."""
+    props = _prime(flip, _book(yes=40, no=64), favored="no")
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
-        [("no", 66, "ENTRY")]
+        [("no", 64, "ENTRY")]
 
 
 def test_b1_true_50_50_skips(flip):
@@ -117,7 +117,7 @@ def test_b1_two_sided_book_required(flip):
 def test_b1_size_cap_is_one_lot(flip):
     """HARD RAIL: the liquidity is provided one lot at a time."""
     assert config.FLIP_SIZE_CAP == 1
-    props = _prime(flip, _book(yes=45, no=65), favored="no")
+    props = _prime(flip, _book(yes=45, no=60), favored="no")
     assert props and all(p.count == 1 for p in props)
 
 

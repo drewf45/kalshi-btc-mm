@@ -11,15 +11,26 @@ import logging
 
 import pytest
 
-from relay_engine import config
+from relay_engine import config, failures
 from relay_engine.book import OrderBook
 from relay_engine.custodian import Custodian
 from relay_engine.feed import DegradeLadder
+from relay_engine.gateway import Order
 from relay_engine.lane_flip import LaneFlip
 
 T = "KXBTC15M-02JAN251000-T99"
+EV = T.rsplit("-", 1)[0]
 CLOSE = 1_000_000.0
 WIN = 900
+
+
+@pytest.fixture(autouse=True)
+def _funnel(ledger):
+    failures._warn_last.clear()
+    failures.configure(ledger, alert_fn=lambda m: None, run_mode="TEST",
+                       boot_id=1)
+    yield
+    failures._ledger = None
 
 
 @pytest.fixture
@@ -102,14 +113,17 @@ def test_trend_disagree_skips(flip):
     assert _reason(flip) == "trend_disagree"
 
 
-def test_skew_low_skips(flip):
-    _prime_then(flip, 80, 55, 48, 66_020.0)          # skew 7 (<10)
-    assert _reason(flip) == "skew_low"
+def test_below_the_band_skips_price_band(flip):
+    # WO-...-G §2.1: the skew-LEVEL gate is retired; the deliberate band [55,64]
+    # IS the price gate. A favored side at 54 (below 55) → price_band.
+    _prime_then(flip, 80, 54, 46, 66_020.0)
+    assert _reason(flip) == "price_band"
 
 
-def test_skew_high_skips(flip):
-    _prime_then(flip, 80, 68, 33, 66_020.0)          # skew 35 (>30)
-    assert _reason(flip) == "skew_high"
+def test_above_the_band_skips_price_band(flip):
+    # a favored side at 65 (above 64 — the move is fully priced) → price_band
+    _prime_then(flip, 80, 65, 35, 66_020.0)
+    assert _reason(flip) == "price_band"
 
 
 def test_no_growth_skips(flip):
@@ -120,10 +134,61 @@ def test_no_growth_skips(flip):
 
 
 def test_price_band_skips(flip):
-    # favored side at 74 (>70 — the move is fully priced)
+    # favored side at 74 (well above the band — the move is fully priced)
     _poll(flip, 65, 54, 48, 66_000.0)
     _poll(flip, 80, 74, 26, 66_020.0)
     assert _reason(flip) == "price_band"
+
+
+# ── WO-2026-07-22-G ─────────────────────────────────────────────────────────
+def test_flatten_supersedes_a_competing_bail_never_sells_more_than_held(flip,
+                                                                        ledger):
+    """§1.1: two authorities in one cycle can NEVER sell more than booked_held.
+    A 1-lot uncovered leg at the flatten deadline (esc2) with a competing bail
+    already proposed this cycle: the safety flatten SUPERSEDES the bail (drops
+    it) so the crossfire is the ONE sell — the 10:19 −87c short (bail 1 + flatten
+    1 against a 1-lot position) cannot recur."""
+    w = flip._window(T, CLOSE)
+    ledger.record_fill(T, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")   # 1 lot booked
+    w.opens["yes"] = {"entry": 60, "fill_ts": CLOSE - 1100, "count": 1,
+                      "take_oid": None, "take_proposed": True, "done": False,
+                      "collapse_polls": 0, "catastrophe_polls": 0, "det_ts": None,
+                      "entry_oid": None, "defer_polls": 0, "hold": False}
+    w.heal_attempts["yes"] = 2                         # jump to the flatten deadline
+    w.heal_covered["yes"] = 0
+    b = OrderBook(market=T)
+    b.apply_snapshot({44: 10}, {55: 10}, ts=1.0)
+    # the lane's own bail, already proposed this cycle (a crossfire close)
+    bail = Order(lane="FLIP", event=EV, market=T, side="yes", action="sell",
+                 price_cents=44, count=1, size_tier=config.TIER_PROBE,
+                 purpose="CUT", crossfire=True, reason="open momentum stop")
+    proposals = [bail]
+    flip._check_uncovered(w, T, proposals, book=b, event=EV, now=CLOSE - 700)
+    sells = [p for p in proposals if p.lane == "FLIP" and p.side == "yes"
+             and p.action == "sell"]
+    assert sum(p.count for p in sells) <= 1            # never more than held
+    assert bail not in proposals                       # the bail was superseded
+    assert any("FLATTENED" in (p.reason or "") for p in sells)  # by the flatten
+
+
+def test_a_traded_window_never_logs_open_skip(flip, ledger, caplog):
+    """§1.2: a window that already holds a position (net != 0) returns before
+    the PILE_END skip log — the skip dataset is never contaminated by a trade."""
+    ledger.record_fill(T, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")   # net != 0
+    with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
+        _poll(flip, 190, 60, 40, 66_020.0)            # past 180 with a position held
+    assert not any("OPEN_SKIP" in r.message for r in caplog.records)
+
+
+def test_trend_measured_from_the_pile_baseline_not_window_open(flip):
+    """§2.2: a move that FINISHED before the window (spot flat since the pile
+    baseline) reads trend 0 and is refused flat_tape — never 'arrived late',
+    even though a window-open baseline would have counted the earlier run."""
+    _poll(flip, 30, 54, 48, 66_000.0)                 # pre-window: spot low
+    _poll(flip, 65, 54, 48, 66_040.0)                 # baseline (>=60): spot already ran +40
+    props = _poll(flip, 80, 60, 40, 66_040.0)         # entry poll: spot FLAT since baseline
+    assert [p for p in props if p.purpose == "ENTRY"] == []
+    assert _reason(flip) == "flat_tape"               # trend from baseline = 0
 
 
 def test_ratio_low_skips(flip):
@@ -145,4 +210,4 @@ def test_skew_ticks_are_recorded_every_poll(flip):
     _poll(flip, 65, 54, 48, 66_000.0)
     _poll(flip, 80, 60, 40, 66_020.0)
     ticks = flip.windows[T].skew_ticks
-    assert (65, 6) in ticks and (80, 20) in ticks
+    assert (65, 6, 66_000.0) in ticks and (80, 20, 66_020.0) in ticks

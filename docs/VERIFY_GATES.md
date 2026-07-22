@@ -2735,6 +2735,71 @@ crossfire flatten below the stop — needs the Render line showing the rejected 
 explained**); the residual bad-settlement-row quarantine; and — above everything — the **treasury
 waterfall asymmetry**, still the ceiling before any extra lot.
 
+## WO-2026-07-22-G — PRE-FLIGHT: WHAT MUST BE TRUE BEFORE AN UNATTENDED RUN (build 59)
+
+**The minimum set that lets FLIP run unattended.** F alone needs nothing in code (one operational
+rule, below). If FLIP runs, two blockers had to close, plus three bundled fixes that prevent a future
+misread.
+
+### 🚨 Blocker 1.1 — EXIT OWNERSHIP (capital risk)
+`_exit_count` clamps each exit to `min(record, booked_held)` — correct, but PER PROPOSAL. Two closing
+authorities in one cycle (the uncovered-leg flatten and the lane's own bail) both read
+`booked_held=1` and each clamped to 1 → **2 sold against a 1-lot position → an unintended short (the
+10:19 −87c)**, the only path here that can produce an *unbounded* position on a 1-lot lane.
+
+**Fix (safe form of the WO's (a)/(b)):** the safety **FLATTEN SUPERSEDES** — when it fires (esc2), it
+removes every other FLIP sell already proposed for the side this cycle (a bail, a stale take) and
+crosses the full booked-net, so the flatten is the ONE close. This defends the aggregate invariant
+(two authorities never sell more than held) **without** letting a self-net-rejecting maker take starve
+the flatten — the exact naked-leg bug this path exists to close. `FLIP_FLATTEN_SUPERSEDES` logs the
+dropped sells. (A blanket per-cycle `_exit_count` reservation was tried first and rejected: it let a
+rejected take reserve the lot and starve the flatten, reintroducing the ride-to-settlement bug —
+caught by `test_192145_self_net_void`.)
+
+### 🚨 Blocker 1.2 — SKIP LOG FIRED ON TRADED WINDOWS
+The `PILE_END` `OPEN_SKIP` log sat above the `self._net(market, event) != 0` position check, so any
+window that traded still logged `OPEN_SKIP` once past 180s — contaminating the run's primary data
+product (the skip dataset) from the first trade, silently (a reboot orphan whose in-memory record is
+empty is the clearest case). **Fix:** the net-position check now returns BEFORE the skip log. One move.
+
+### Bundle
+- **§2.1 — the skew LEVEL gate is retired (skew GROWTH stays).** On a coherent book `skew ≡ 2·join−99`,
+  so the skew-level gate (∈[10,30]) and the price band were ONE gate; the effective range was 55-64
+  and 50-54/65-70 were unreachable. Made **deliberate**: the band is now `[OPEN_ENTRY_MIN_C 55,
+  OPEN_ENTRY_MAX_C 64]` (never below fair value + a real pile; never above = never late), and
+  `OPEN_MIN_SKEW_C`/`OPEN_MAX_SKEW_C` are gone. Only skew GROWTH — the pile signal — survives.
+- **§2.2 — `trend_usd` is measured from the pile-window baseline, not window-open.** `skew_ticks` now
+  carries `(secs_into, skew, spot)`, and BOTH growth (Δskew) and trend (Δspot) share the one baseline
+  (the first tick past `OPEN_PILE_START_S`). A move that FINISHED before the window now reads trend 0
+  and is refused `flat_tape` — the exact "arrived late" failure the build exists to prevent.
+- **§2.3 — two stale comments corrected** (the cheap-side "buys the CHEAP side / OPEN_ENTRY_FLOOR"
+  block, and the "gates on nothing yet" line above the live `ratio_low` gate) — confidently-wrong
+  comments above correct code are how a "frozen universe" misread happens.
+
+### §3 — THE OPERATIONAL RULE (matters more than any code above)
+`WINDOW_ECON_DIVERGENCE` is inverted (~26c: broker vs fills), and there have been **three
+`/confirm_cash` re-baselines** (−17c → −199c in one night). Each buries an unexplained gap into the
+book **permanently**. **Correct unattended behaviour: let it prompt, let it go fatal, let entries halt
+— never a half-asleep `/confirm_cash`** (L4 book integrity outranks L5 coverage). Investigate in the
+morning by **quarantining the divergent row**, never by confirming it. *(Operational — enforced by
+discipline, not this build. The cash rail already halts on its own; build 55's guards + the
+`cash_diverge_diagnose.py` tool are the morning fix.)*
+
+**HARD RAIL:** F byte-identical (`lane_fh8`/custodian untouched); no Kelly / cash / rate-halt change;
+exit plumbing otherwise unchanged; the per-lane halt (build 56) still keeps a FLIP halt off F. New
+acceptance in `test_pile_gate.py` (flatten supersedes a competing bail — aggregate never exceeds held;
+a traded window never logs `OPEN_SKIP`; trend measured from the pile baseline, not window-open; the
+band edges are `price_band`). Suite 693 · preflight 23/23.
+
+**Watch on the unattended run (acceptance):** two exits in one cycle never sell more than `booked_held`;
+`OPEN_SKIP` never appears for a window that took a position; `trend_usd` and `growth` share one
+baseline; F byte-identical; a FLIP halt does not stop F; **any overnight cash prompt goes UNANSWERED →
+fatal → entries halt (zero `/confirm_cash`).**
+
+**Explicitly NOT required before running (unchanged):** the exit-rejection cascade (still owed one
+Render line showing the rejected order's `purpose`/`post_only`), the pack-to-Telegram sender, and the
+treasury waterfall (accounting, not run-safety — still the ceiling on scaling).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

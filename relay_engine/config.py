@@ -126,8 +126,14 @@ OPEN_MIDDLE_TARGET = 52          # DREW-DEFAULT: the take target — the 50/50 m
 # +20 into the pile-in of buyers. 50 is a HARD floor — never buy below fair
 # value, that IS the old bug. trend_usd/depth_ratio are LOGGED, never gated
 # (one change, maximally attributable; the confirms earn their gate from data).
-OPEN_ENTRY_MIN_C = 50            # DREW-DEFAULT: hard fair-value floor — never buy below 50
-OPEN_ENTRY_MAX_C = 70            # DREW-DEFAULT: favored side ran 59-68 at every logged entry
+# WO-2026-07-22-G §2.1: the band is now the DELIBERATE 55-64. On a coherent book
+# skew ≡ 2·join − 99 (exact on 8/8 tape books), so the retired skew-level gate
+# (∈[10,30]) and the price band were ONE gate — the effective range was 55-64,
+# and 50-54 / 65-70 were unreachable. Made explicit here (never below 55 = never
+# below fair value + a real pile; never above 64 = never late), and the redundant
+# skew-LEVEL gate is retired (skew GROWTH stays — that is the pile signal).
+OPEN_ENTRY_MIN_C = 55            # DREW-DEFAULT (WO-...-G, was 50): the deliberate favored floor
+OPEN_ENTRY_MAX_C = 64            # DREW-DEFAULT (WO-...-G, was 70): above this the move is priced
 OPEN_ENTRY_DEADLINE_S = 90       # DREW-DEFAULT: unfilled by here → cancel, never chase (== opening window)
 OPEN_GOUGE_C = 17               # DREW-DEFAULT (WO-...-F, was 20): target = entry + 17, cap 90 — capture more often (a nearer target exits before the drifting pile exhausts)
 OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2-poll sustain, maker-first
@@ -143,8 +149,9 @@ OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2
 OPEN_PILE_START_S = 60          # DREW: the pile window opens at ~1 minute
 OPEN_PILE_END_S = 180          # DREW: closes at ~3 minutes — after this the move is priced
 OPEN_MIN_TREND_USD = 15        # no entry on a flat tape (two of three losses had trend $0)
-OPEN_MIN_SKEW_C = 10           # below this the pile has not formed
-OPEN_MAX_SKEW_C = 30           # above this we are late (a skew of 41 → lost)
+# WO-2026-07-22-G §2.1: the skew LEVEL gate (OPEN_MIN_SKEW_C/OPEN_MAX_SKEW_C) is
+# RETIRED — it was the price band in disguise (skew ≡ 2·join−99). Only the skew
+# GROWTH survives: the pile is a skew that GROWS in-window, not a static level.
 OPEN_SKEW_GROWTH_C = 5         # the skew must have GROWN this much across the pile window (forming NOW, not static)
 # B3 the active late-window walk-down: a position that does not fill at the
 # middle is walked DOWN toward scratch as the clock runs (from OPEN_WALK_START_S
