@@ -372,6 +372,44 @@ class Ledger:
         return wrote
 
     def record_settlement(self, market: str, lane: str, pnl_cents: int, detail: str = "") -> None:
+        # WO-2026-07-22 Finding (build 55): record_settlement was a bare INSERT
+        # with no idempotency guard (unlike record_outcome's ON CONFLICT) and no
+        # net-vs-gross check — a settle-thread retry or a reboot mid-settle could
+        # DOUBLE-BOOK, and a gross-as-net (or win-as-loss) row inflated the book
+        # ~$1.99 overnight and halted the cash rail for 12 windows. Two guards:
+        #   (1) IDEMPOTENCY: a non-divergent settlement for (market, lane) is
+        #       recorded ONCE (app-level check — settlements legitimately holds
+        #       multiple rows per market, the quarantine re-book among them, so a
+        #       unique index is unsafe; this matches record_outcome's intent).
+        already = self.db.execute(
+            "SELECT COUNT(*) FROM settlements WHERE market=? AND lane=?"
+            " AND divergent=0", (market, lane)).fetchone()[0]
+        if already:
+            log.warning("SETTLE_DUP_IGNORED %s %s: a settlement already booked "
+                        "(pnl was %+dc) — ignoring the double (idempotent)",
+                        market, lane, pnl_cents)
+            return
+        #   (2) NET-VS-GROSS: a binary position's NET settlement is bounded by
+        #       [−cost, count·100 − cost]. A pnl outside that (gross booked as
+        #       net, or a win booked as a loss — both fit the overnight 199c) is
+        #       caught LOUD at the source, not 6 hours later at the halt.
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(price_cents*count),0), COALESCE(SUM(count),0)"
+            " FROM fills WHERE market=? AND lane=? AND action='ENTRY'",
+            (market, lane)).fetchone()
+        cost, cnt = int(row[0]), int(row[1])
+        if cnt > 0:
+            m = config.SETTLE_NOTIONAL_SLIP_C
+            lo, hi = -cost - m, cnt * 100 - cost + m
+            if not (lo <= pnl_cents <= hi):
+                from . import failures
+                failures.fail(
+                    "SETTLE_NOTIONAL_BREACH",
+                    f"{market} {lane}: settlement {pnl_cents:+d}c OUTSIDE the "
+                    f"net bound [{lo},{hi}]c (cost {cost}c, {cnt} lots) — a "
+                    "gross-as-net or win-as-loss booking; the book would inflate",
+                    fatal=False, alert=True, market=market, lane=lane,
+                    pnl_cents=pnl_cents, cost=cost, count=cnt)
         self.db.execute(
             "INSERT INTO settlements (ts, market, lane, pnl_cents, detail) VALUES (?,?,?,?,?)",
             (time.time(), market, lane, pnl_cents, detail),

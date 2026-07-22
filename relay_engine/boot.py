@@ -252,6 +252,16 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "budget (no false alarm on a correct bounded loss); the routine "
                  "1-lot cover-pending is FLIP_UNCOVERED_EXPECTED (debug), the "
                  "orphan pages (WO-2026-07-21-B)")
+    lines.append("  CASH-RAIL SETTLE-GUARD (build 55): record_settlement is "
+                 "IDEMPOTENT (a retry/reboot mid-settle is dropped, SETTLE_DUP_"
+                 "IGNORED — matching record_outcome's ON CONFLICT) and BOUNDED "
+                 "at the source: a pnl outside [-cost, lots*100-cost] (+slip) is "
+                 "a gross-as-net or win-as-loss booking and pages SETTLE_NOTIONAL"
+                 "_BREACH LOUD now, not 6h later at the halt. The overnight halt "
+                 "was the rail refusing to trade on a ~$1.99-inflated book — "
+                 "CORRECT. The fix is QUARANTINE (divergent=1, re-book at fills-"
+                 "truth) never /confirm_cash (that bakes the error in forever) "
+                 "(WO-2026-07-22)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

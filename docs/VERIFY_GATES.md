@@ -2444,6 +2444,91 @@ historical FLIP loss that followed a boot is now suspect data — do not read it
 thesis failure. **Part B of WO-2026-07-21 (margin-gate SUPPRESS, per-lane halt)
 and the treasury-waterfall asymmetry remain the standing Saturday/#1 items.**
 
+## WO-2026-07-22 — THE OVERNIGHT WAS A CASH-RAIL HALT, NOT A GATE PROBLEM (build 55)
+
+**The overnight was CORRECT.** 2:48–5:50 AM the engine sat frozen — 14 orders,
+39% fill, 3660c book, unchanged across 12 elapsed windows. That was not a stall:
+cash-integrity refused to enter on a book it could not reconcile to the venue.
+The book claimed **+$1.83**, the venue said **−$0.16** — a **~$1.99** gap from a
+bad settlement row. "CASH DELTA NEGATIVE −199c — entries HALTED" is the rail
+doing its one job. The overnight data carries **no strategy signal** — nothing
+about the FLIP/F thesis was tested; the engine simply never traded.
+
+**Read-rule at source (all TRUE):**
+- `book_cents()` = `SUM(cash_movements)` + `SUM(settlements.pnl_cents WHERE
+  divergent=0)`. A settlement row booked ~200c too high inflates the book by
+  exactly that much until it is quarantined. TRUE.
+- `reconcile` computes the venue delta **only at quiescence**
+  (`in_flight_orders==0 AND unsettled_fills==0`), so the −199c was a settled,
+  real divergence — not an in-flight artifact. TRUE.
+- `record_settlement` was a **bare INSERT** — no idempotency guard, unlike
+  `record_outcome`'s `ON CONFLICT(market) DO NOTHING`. A retry or a reboot
+  mid-settle could double-book. TRUE (root-cause class).
+- `quarantine_divergent_settlements(market, fills_pnl_cents)` already tags rows
+  `divergent=1` (excluded from `book_cents`) and re-books at fills-truth under
+  lane `"ECON"`. The fix machinery **already exists** — it was never the missing
+  piece. TRUE.
+- `/confirm_cash` **re-baselines** (writes a cash_movement to paper the gap): it
+  would bake the $1.99 error into the book **forever**. `/clear_cash_fatal` only
+  unlocks the door — the next reconcile recomputes the same delta and re-halts
+  (clear→re-halt→fatal loop). TRUE. Neither is the fix.
+
+**Candidate root causes (UNPROVEN here — the live DB decides):** a losing F
+booked as a **win** (~+200c instead of −cost), or a settlement recorded **GROSS
+not NET** (~+194c instead of the net). Both land ~194–200c and both are exactly
+what the new bound catches.
+
+**Root-cause fixes (shipped, code-side):**
+- **Idempotency** — `record_settlement` now skips a duplicate non-divergent
+  `(market, lane)` settlement and logs `SETTLE_DUP_IGNORED`, mirroring
+  `record_outcome`. The quarantine re-book (a different lane) is deliberately
+  **not** blocked.
+- **Net-vs-gross bound, LOUD at the call site** — before insert it computes the
+  position's own cost/lots from ENTRY fills and asserts
+  `pnl ∈ [-cost, lots·100−cost]` (±`SETTLE_NOTIONAL_SLIP_C=6` for fees/rounding).
+  A gross-as-net or win-as-loss booking is outside that bound and pages
+  `SETTLE_NOTIONAL_BREACH` (`alert=True`) **at the moment of the bad write** —
+  not 6 hours later at the halt. The bound is `[-cost, lots·100−cost]`, not
+  `[-cost, +small]`, so a legitimate cheap-FLIP win (entry 30 → +70) passes.
+- **Secondary (deferred, noted):** the halt does not yet short-circuit proposal
+  generation — rejects ran 978→2211 (~1200 wasted propose/deny cycles/hour while
+  halted). It is wasteful, not wrong (nothing traded). Left for a follow-up so
+  this WO stays scoped to the booking guards.
+
+**The rail was NOT weakened.** No change to the delta threshold, the quiescence
+condition, or the halt itself. The guards make a bad *write* impossible to do
+silently; they do not make a divergent *book* tradeable.
+
+**Operational step — Drew's to run on Render (I cannot reach the live DB):** the
+row-level identification and quarantine require the live ledger. Shipped as
+tooling — `scripts/cash_diverge_diagnose.py`:
+- `--db <ledger.db> [--since <epoch>]` lists every settlement with its cost/lots
+  and net-bound and flags each out-of-bound row `<== OUT OF BOUND` by **id +
+  market + lane** — naming the culprit.
+- `--quarantine <MARKET> --correct-pnl <TRUE_CENTS>` calls
+  `quarantine_divergent_settlements` (divergent=1, re-book at fills-truth) and
+  prints the book before→after. **Then, and only then, `/clear_cash_fatal` —
+  NEVER `/confirm_cash`.** Acceptance #1/#2/#3/#6/#7 (offending row named,
+  quarantined-not-rebaselined, delta→0, entries resume, orders increment)
+  complete when that runs against the live book.
+
+**HARD RAIL:** F byte-identical; no Kelly / sizing / rate-halt / cash-threshold
+change. New acceptance `test_cash_settlement_guard.py` (7 tests: settlement is
+idempotent per market·lane and the quarantine re-book is not blocked; gross-as-
+net 200c breaches loud; a below-cost −220c breaches loud; the honest net (+6 win,
+−194 total loss) is silent; a cheap-FLIP +70 win is within bound; quarantine
+drops the inflated book **without** a new cash_movement absorbing the gap — it is
+excluded, not papered over; the forensic tool names the suspect row). Suite 668 ·
+preflight 23/23. **Watch on the live box (acceptance):** run the diagnose tool →
+one row named OUT OF BOUND; quarantine it → book delta → 0, no new cash_movement;
+`/clear_cash_fatal` → entries resume and the order counter increments;
+`SETTLE_NOTIONAL_BREACH` would have paged at the original bad write. **NO
+`/confirm_cash`.**
+
+**Standing items (unchanged):** the halt→proposal short-circuit (secondary,
+above), Part B of WO-2026-07-21 (margin-gate SUPPRESS, per-lane rate halt), and
+the treasury-waterfall asymmetry remain the Saturday/#1 backlog.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

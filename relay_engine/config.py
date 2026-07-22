@@ -331,6 +331,9 @@ FLIP_DECISION_S = 240            # DREW-DEFAULT: the endgame decision point (sec
 # halted (the hourly-confirmation tax killed the overnight book). Above
 # it, the WO-CASH-FATAL-1 genuine-dispute path stands untouched.
 CASH_SILENT_REBASE_CENTS = 5
+# WO-2026-07-22 (build 55): the slip allowed on the net-vs-gross settlement
+# bound before SETTLE_NOTIONAL_BREACH pages — fees/rounding, not a whole leg.
+SETTLE_NOTIONAL_SLIP_C = 6
 # B3 (DREW-DEFAULT): the halt is a RATE — N losing markets of the last M
 # settled traded markets (per-market broker P&L is the unit). One loss
 # NEVER halts; two-in-a-row was never a reliable signal, 2-of-4 is.
