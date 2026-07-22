@@ -131,23 +131,28 @@ def test_f1_catastrophe_still_crossfires(flip):
 def test_f3_hard_trending_open_enters_trend_logged_not_a_skip(flip):
     """WO-2026-07-22-E: the volatility trend-SKIP is RETIRED. A hard one-
     directional open no longer skips — a trend AGREES with the favored side
-    (that IS the thesis); trend_usd is LOGGED on the why and gates nothing."""
-    w = flip._window(TICKER, CLOSE)
-    w.spot_ticks = [66_000.0, 66_000.0 + config.OPEN_TREND_SKIP_USD + 20]
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       spot=66_000.0 + config.OPEN_TREND_SKIP_USD + 20,
-                                       grain=GRAIN))
+    (that IS the thesis); trend_usd is LOGGED on the why. WO-2026-07-22-F: WAIT
+    FOR THE PILE — a baseline poll then the entry poll carrying the big
+    (agreeing) trend."""
+    big = config.OPEN_TREND_SKIP_USD + 20
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66_000.0, grain=GRAIN))          # pile baseline
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                       spot=66_000.0 + big, grain=GRAIN))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
-    assert "trend $" in props[0].why and "logged" in props[0].why
+    assert "trend $" in props[0].why and "agree" in props[0].why
 
 
-def test_f3_calm_open_enters(flip):
-    """WO-2026-07-22-E re-anchor: FLIP buys the FAVORED (higher-priced) side.
-    A calm open with a favored side in-band [50,70] enters that side."""
-    w = flip._window(TICKER, CLOSE)
-    w.spot_ticks = [66_000.0, 66_010.0]              # a $10 wiggle
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       spot=66_010.0, grain=GRAIN))
+def test_f3_pile_in_window_enters(flip):
+    """WO-2026-07-22-F re-anchor (was test_f3_calm_open_enters): the pile gate
+    REQUIRES a moving, agreeing tape — a truly calm open is now REFUSED
+    (flat_tape). A formed pile in-window (favored side in-band [50,70], skew
+    grown, the tape moved ≥ OPEN_MIN_TREND_USD in the favored direction) enters
+    the FAVORED (higher-priced) side."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66_000.0, grain=GRAIN))          # pile baseline
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                       spot=66_020.0, grain=GRAIN))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 
@@ -159,14 +164,16 @@ def test_f4_entry_band_is_favored_50_to_70(flip):
 
 
 def test_f4_real_gouge_enters_coinflip_skips(flip):
-    # WO-2026-07-22-E re-anchor: the entry filter is the FAVORED side being
-    # in-band [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C].
-    # favored no@60 (in [50,70], real demand to sell the +20 into): enters
-    assert flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=850,
-                                      grain=GRAIN))
+    # WO-2026-07-22-E/F re-anchor: the entry filter is the FAVORED side being
+    # in-band [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C], inside a formed pile.
+    # favored no@60 (in [50,70]) with a falling, grown pile: enters
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=60), secs_left=835,
+                               spot=66_020.0, grain=GRAIN))          # pile baseline
+    assert flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=820,
+                                      spot=66_000.0, grain=GRAIN))
     # favored no@72 (>70 — the move already fully priced, no gouge left): skips
     flip.windows.clear()
-    assert flip.evaluate(TICKER, _ctx(_book(yes=28, no=72), secs_left=850,
+    assert flip.evaluate(TICKER, _ctx(_book(yes=28, no=72), secs_left=820,
                                       grain=GRAIN)) == []
 
 
@@ -175,12 +182,15 @@ def test_f5_swing_telemetry_line_logged(flip):
     """WO-2026-07-22-E re-anchor: the swing gate is RETIRED as an entry gate,
     so its telemetry line is gone. Its spirit — make the confirms legible so
     the sample-floor decision is data, not argument — survives as the
-    LOGGED-NOT-GATED confirms on every entry `why` (depth ratio + trend
-    agreement, gating on nothing until the tape earns them a gate)."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       spot=66_000.0, grain=GRAIN))
+    confirms on every entry `why` (depth ratio + trend agreement + the formed
+    pile), now legible as the pile's all-of on the line. WO-2026-07-22-F: prime
+    the pile with two polls."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66_000.0, grain=GRAIN))          # pile baseline
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                       spot=66_020.0, grain=GRAIN))
     why = props[0].why
-    assert "confirms logged-not-gated" in why
+    assert "pile: all-of met" in why
     assert "ratio" in why and "trend $" in why and "depth" in why
 
 
@@ -218,23 +228,33 @@ def test_a1_absolute_floor_still_crossfires(flip):
 
 def test_a2_trend_usd_printed_on_enter(flip):
     """A2: trend_usd on EVERY OPEN entry line (enter, not only skip) — so the
-    threshold is set from the observed distribution, not guessed."""
-    w = flip._window(TICKER, CLOSE)
-    w.spot_ticks = [66_000.0, 66_040.0]          # a $40 opening drift
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
+    threshold is set from the observed distribution, not guessed. WO-2026-07-22-F:
+    the $40 drift is built across the two pile-priming polls (66_000 → 66_040)."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66_000.0, grain=GRAIN))          # pile baseline
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
                                        spot=66_040.0, grain=GRAIN))
     assert "trend $+40" in props[0].why
 
 
-def test_a3_depth_ratio_recorded_not_gated(flip):
-    """A3: depth_ratio (held ÷ other) on the entry row — RECORD-ONLY, gating on
-    nothing (n=3; a hypothesis, not a finding)."""
-    # WO-2026-07-22-E re-anchor: depth_ratio = FAVORED-side depth ÷ other side.
-    b = _book(yes=60, no=40, yq=14, nq=10)       # favored yes depth 14 / other 10 = 1.4
-    props = flip.evaluate(TICKER, _ctx(b, secs_left=850, grain=GRAIN))
-    assert "ratio 1.40x" in props[0].why
-    # a thin favored side (little depth behind us) reads < 1.0, and still ENTERS
+def test_a3_depth_ratio_gates_below_one(flip):
+    """WO-2026-07-22-F re-anchor (was test_a3_depth_ratio_recorded_not_gated):
+    depth_ratio (FAVORED-side depth ÷ other) is now part of the pile's all-of
+    GATE — an entry requires depth_ratio ≥ 1.0 (real depth behind the favored
+    side). A favored side with depth ≥ the other ENTERS and prints 'ratio
+    1.40x'; a THIN favored side (ratio < 1.0) is now SKIPPED (ratio_low)."""
+    # favored yes depth 14 / other 10 = 1.4 ≥ 1.0: enters, ratio on the line
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48, yq=14, nq=10),
+                               secs_left=835, spot=66_000.0, grain=GRAIN))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40, yq=14, nq=10),
+                                       secs_left=820, spot=66_020.0, grain=GRAIN))
+    assert "ratio 1.40x" in props[0].why and props[0].purpose == "ENTRY"
+    # a thin favored side (depth 6 / other 10 = 0.6 < 1.0) is now refused
     flip.windows.clear()
-    b2 = _book(yes=60, no=40, yq=6, nq=10)        # favored yes depth 6 / other 10 = 0.6
-    props2 = flip.evaluate(TICKER, _ctx(b2, secs_left=850, grain=GRAIN))
-    assert "ratio 0.60x" in props2[0].why and props2[0].purpose == "ENTRY"
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48, yq=6, nq=10),
+                               secs_left=835, spot=66_000.0, grain=GRAIN))
+    props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40, yq=6, nq=10),
+                                        secs_left=820, spot=66_020.0, grain=GRAIN))
+    assert props2 == []
+    w = flip.windows[TICKER]
+    assert w.last_skip_reason == "ratio_low" and w.last_skip_vals["ratio"] == 0.6

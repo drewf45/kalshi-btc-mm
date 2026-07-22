@@ -24,9 +24,9 @@ def _book(yes=40, no=49):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None, spotlead=None):
+def _ctx(book, secs_left=850, grain=None, spotlead=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": spotlead}
+            "spot": spot, "grain": grain, "spotlead": spotlead}
 
 
 @pytest.fixture(autouse=True)
@@ -123,9 +123,15 @@ def test_fh8_nonreversal_gate_and_tag(monkeypatch):
 
 # ── §3.1: one shot per window (consumed on ANY exit, takes too) ────────────
 def _open_position(flip, gateway, entry=60):
-    # WO-2026-07-22-E: FLIP buys the FAVORED (higher-priced) side in [50,70].
-    # A favored yes@60 book enters; note_fill anchors the position at 60.
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
+    # WO-2026-07-22-F: FLIP buys the FAVORED (higher-priced) side in [50,70],
+    # but only after the PILE forms. Prime it: a baseline small-skew poll
+    # in-window, then the entry poll with the skew grown (+14) and the tape
+    # risen +20 (trend agrees with yes). props[0] is the favored yes@60 entry;
+    # note_fill anchors the position at 60.
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0, grain=GRAIN_YES2))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                       spot=66020.0, grain=GRAIN_YES2))
     assert len(props) == 1
     flip.on_submitted(props[0], "OID-E", CLOSE - 800)
     gateway.positions[(EVENT, TICKER, "FLIP")] = 1
@@ -138,19 +144,24 @@ def test_consumed_on_take_blocks_the_rebet(flip, gateway):
     the take exit sets open_consumed and re-proposals refuse until
     rollover (the note_exit pop was the located loophole)."""
     w = _open_position(flip, gateway)
-    flip.note_exit(TICKER, "yes", 80, CLOSE - 700)   # the take FILLS (entry+20)
+    flip.note_exit(TICKER, "yes", 77, CLOSE - 700)   # the take FILLS (entry+17)
     assert w.open_consumed
     gateway.positions[(EVENT, TICKER, "FLIP")] = 0
-    # a fresh in-band favored book, still inside the opening window (secs_into
-    # 60): it WOULD enter but for the consumed flag — so this proves consumed
-    # blocks, not the band or the clock (no tautology).
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=840,
-                                       grain=GRAIN_YES2))
+    # a fresh FORMED pile (baseline then grown-skew poll), still inside the pile
+    # window: it WOULD enter but for the consumed flag — so this proves consumed
+    # blocks, not the band, the pile, or the clock (no tautology).
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0, grain=GRAIN_YES2))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                       spot=66020.0, grain=GRAIN_YES2))
     assert props == []
     assert w.open_consumed_logged
-    # rollover clears: a NEW window gets its one shot
+    # rollover clears: a NEW window gets its one shot (re-primed)
     flip.windows.clear()
-    props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0, grain=GRAIN_YES2))
+    props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                        spot=66020.0, grain=GRAIN_YES2))
     assert len(props2) == 1
 
 
@@ -194,19 +205,27 @@ def test_t10_handoff_replaces_yield_to_f(flip, gateway):
     assert "open decision point" in props[0].reason
 
 
-def test_open_entry_schedule(flip):
-    """OVERTURNED by WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): entries only
-    in the first OPEN_OPENING_WINDOW_S (90s) of the window — the opening pile-in
-    is the setup. Past 90s into the window, no entry (the −15/−16 mid-market
-    class is retired)."""
-    # inside the first 90s (secs_into 50): enters — favored yes@60 in band
+def test_open_entry_pile_window(flip):
+    """RE-ANCHORED by WO-2026-07-22-F "wait for the pile" (build 58): entries
+    fire ONLY inside [OPEN_PILE_START_S (60), OPEN_PILE_END_S (180)]. secs_into
+    < 60 is TOO EARLY (the pile has not had time — no entry); a formed pile
+    in-window enters; past 180s the pile never came and the window is SKIPPED
+    (one OPEN_SKIP line)."""
+    # too early — secs_into 50 (secs_left 850), before the pile can form
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2,
+                                      secs_left=850)) == []
+    # in-window with a FORMED pile: baseline then the grown-skew entry poll
+    flip.windows.clear()
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), grain=GRAIN_YES2,
+                               secs_left=835, spot=66000.0))
     props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2,
-                                       secs_left=850))
+                                       secs_left=820, spot=66020.0))
     assert len(props) == 1
-    # past the 90s opening window (100s in): refused
+    # past the pile window (secs_into 200): SKIPPED, no entry, logged once
     flip.windows.clear()
     assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2,
-                                      secs_left=800)) == []
+                                      secs_left=700)) == []
+    assert flip.windows[TICKER].open_skip_logged
 
 
 def test_no_geometry_gate_admits_the_band(flip):
@@ -216,8 +235,12 @@ def test_no_geometry_gate_admits_the_band(flip):
     entry filter is band membership, and the reversion rate (Instrument 1) is
     the empirical gate. An in-band thesis entry is ADMITTED, never tagged
     OPEN_BAD_GEOMETRY."""
-    # WO-2026-07-22-E: the favored band is [50,70]; a favored yes@60 is admitted
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
+    # WO-2026-07-22-F: the favored band is [50,70]; a favored yes@60 with a
+    # formed pile (prime baseline then grown-skew poll) is admitted
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0, grain=GRAIN_YES2))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                       spot=66020.0, grain=GRAIN_YES2))
     assert [p for p in props if p.purpose == "ENTRY"]
     assert not flip.windows[TICKER].open_geometry_logged
 
@@ -229,8 +252,14 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
     margin prints on the why either way — informs daily, governs never."""
     # WO-2026-07-22-E: FLIP buys the favored yes@60 (cell 60); the margin cell
     # that prints on the why is scoring.price_cell(60) = 60, so we populate 60.
+    # WO-2026-07-22-F: each entry needs a formed pile — baseline then grown-skew.
+    def _prime_entry():
+        flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                                   spot=66000.0, grain=GRAIN_YES2))
+        return flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                          spot=66020.0, grain=GRAIN_YES2))
     # virgin cell: enters, margin printed on the new favored-side why
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
+    props = _prime_entry()
     assert len(props) == 1
     assert "margin" in props[0].why and "favored yes" in props[0].why
     # a mature NEGATIVE cell: STILL enters — the margin prints (info)
@@ -238,7 +267,7 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
     for i in range(config.OPEN_PROBE_MAX_N):
         ledger.record_cell_outcome("OPEN", 60, won=False, pnl_cents=-5,
                                    fees_cents=0, market=f"L{i}", kind="trip")
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
+    props = _prime_entry()
     assert len(props) == 1 and "info" in props[0].why
     # a mature POSITIVE cell: enters with the positive margin printed
     ledger.db.execute("DELETE FROM cell_outcomes")
@@ -247,7 +276,7 @@ def test_open_margin_prints_never_gates(flip, gateway, ledger):
         ledger.record_cell_outcome("OPEN", 60, won=True, pnl_cents=5,
                                    fees_cents=0, market=f"W{i}", kind="trip")
     flip.windows.clear()
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_YES2))
+    props = _prime_entry()
     assert len(props) == 1 and "margin +" in props[0].why
 
 

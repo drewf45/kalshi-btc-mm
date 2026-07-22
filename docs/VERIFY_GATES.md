@@ -2671,6 +2671,70 @@ entry (`fee 0¢`); no loss beyond ~12c (else `FLIP_FLOOR_BREACH` pages → halt 
 residual bad-settlement-row quarantine (Drew on Render), the recovery surface from `book_snapshots`,
 and — above everything — the **treasury-waterfall asymmetry**, still the ceiling before any extra lot.
 
+## WO-2026-07-22-F — WAIT FOR THE PILE (build 58)
+
+**Entry-discipline tuning of the favored-side lane — no new lane, no new plumbing.** The tape proved
+FLIP has never once traded its intended setup: every logged entry fired **inside the first 57s**, on
+a book that had either not moved (`trend $0`, two of three losses) or already finished (`skew 41`).
+The engine was entering during the coin-flip and blaming the stop. Drew's rule, captured verbatim:
+*"You wait for the pile. If the pile doesn't happen, the market should've decided — that's OK. But if
+the pile happens, then all of these things should be true."*
+
+**Read-rule at source (all TRUE):**
+- `w.spot_ticks.append(ctx.get("spot"))` is the proven per-poll sampler; `skew_ticks` now mirrors it
+  exactly (append-only, per-window, `(secs_into, skew)`). TRUE.
+- The entry cutoff was `secs_into > OPEN_OPENING_WINDOW_S` (90) — a one-sided "as early as possible"
+  gate, exactly backwards for the favored-side thesis. Replaced by the pile window. TRUE.
+- `OPEN_GOUGE_C = 20` → the take at `entry+20`. Now 17. TRUE.
+- The momentum-stop `crossed` branch (rest at the stop; cross only if the book is already through) is
+  correct and left untouched, per the WO. TRUE.
+
+**Built:**
+- **`skew_ticks`** — the book skew (`|yes_bid − no_bid|`) sampled every poll like spot; **skew growth**
+  = current skew − the first skew sampled at/after `OPEN_PILE_START_S` (the baseline).
+- **The pile window** — entry is evaluated ONLY when `secs_into ∈ [OPEN_PILE_START_S (60),
+  OPEN_PILE_END_S (180)]`. Before it, wait silently; after it, the window was skipped.
+- **The all-of gate** — an entry fires ONLY if every condition agrees, in reason order: favored side
+  ∈ [50,70] (`price_band`), `|trend| ≥ OPEN_MIN_TREND_USD (15)` (`flat_tape`), trend agrees with the
+  side (`trend_disagree`), `skew ∈ [OPEN_MIN_SKEW_C (10), OPEN_MAX_SKEW_C (30)]` (`skew_low`/
+  `skew_high`), `skew growth ≥ OPEN_SKEW_GROWTH_C (5)` (`no_growth` — **the pile itself: a static skew
+  is a decision that already happened; a growing one is a stampede in progress**), and `depth_ratio ≥
+  1` (`ratio_low`). Otherwise the window is SKIPPED.
+- **`OPEN_SKIP`** — a skipped window logs once at window-out: `OPEN_SKIP <market> t=<s>s reason=<...>
+  skew=.. growth=.. trend=$.. ratio=..`. **Skips are the primary data product — they tune the
+  thresholds** (all six are PROBE values shaped by n=3).
+- **Target 20 → 17** — `_take_price = min(90, entry+17)`; a nearer target exits before a *drifting*
+  pile exhausts (the barrier math is only EV-neutral in a driftless walk — the whole point of waiting
+  for the pile is that drift is present). The entry `why` now carries `skew<n>/grew<n>`.
+
+**HARD RAIL:** exit plumbing unchanged (target level + the momentum stop, dead-floor, curfew all
+stand); F byte-identical; maker-only; 1 lot; one-shot; per-lane halt intact. The lane will trade far
+**less** — every logged entry so far is now skipped — and that is the intended cost: *coverage is
+ensemble, caution is lane; the gate tightens and nothing is loosened to chase participation.*
+
+**New acceptance `test_pile_gate.py` (14 tests):** enters when the pile forms; target `entry+17`,
+stop `entry−10`; too-early (<60s) refused; past-window (>180s) skips + logs `OPEN_SKIP` with values;
+each all-of condition isolated (`flat_tape`/`trend_disagree`/`skew_low`/`skew_high`/`no_growth`/
+`price_band`/`ratio_low`); a no-favored-side window is `no_pile`; `skew_ticks` recorded every poll.
+Suite green · preflight 23/23. Extensive FLIP entry re-anchoring (the two-poll pile prime replaces the
+single-evaluate entry across the FLIP test suite).
+
+**To resume the lane:** FLIP is under `RATE_HALT:FLIP` (2 of 4 negative); F is unaffected (per-lane
+halt, build 56). Order: deploy → verify F still trading → `/reset_halt` → confirm the first window
+produces either a qualifying entry or an `OPEN_SKIP` line. **Several skips in a row is the gate
+working, not a failure.**
+
+**Watch tomorrow (acceptance):** zero entries before 60s or after 180s; every skip logs `OPEN_SKIP`
+with a reason and the four values; every entry shows skew, skew-growth, trend, agreement — all
+conditions true; target `entry+17`; **zero entries on `trend $0`**; F byte-identical; a FLIP halt does
+not stop F.
+
+**Still open (not this build):** the exit-rejection cascade (a rejected cover still escalates to a
+crossfire flatten below the stop — needs the Render line showing the rejected order's
+`purpose`/`post_only`); `WINDOW_ECON_DIVERGENCE` back at 18c (**do not run 24h unattended until
+explained**); the residual bad-settlement-row quarantine; and — above everything — the **treasury
+waterfall asymmetry**, still the ceiling before any extra lot.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

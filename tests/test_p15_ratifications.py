@@ -32,25 +32,34 @@ def flip_book(yes, no):
     return b
 
 
-def flip_ctx(engine, book, secs_left=850):
+def flip_ctx(engine, book, secs_left=850, spot=None, grain=None):
     close = 1_000_000.0
-    return {"book": book, "now": close - secs_left, "close_ts": close}
+    return {"book": book, "now": close - secs_left, "close_ts": close,
+            "spot": spot, "grain": grain}
 
 
 # ── RULING 2: pair-formable or nothing ─────────────────────────────────────
 def test_one_sided_book_posts_nothing(engine):
-    """AMENDED by WO-2026-07-22-E (build 57): FLIP buys the FAVORED (higher-
-    priced) side in [50,70]. A two-bid biased book (yes 66 / no 34) now ENTERS
-    the FAVORED side (yes@66, buyable). What still posts NOTHING is a GENUINELY
-    one-sided book — a lone bid with the other side EMPTY — because there is no
-    favored side to price against (need both bids)."""
-    # two-bid biased book: the favored (higher) side is the setup, it ENTERS
-    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(66, 34)))
+    """AMENDED by WO-2026-07-22-E (build 57) + WO-2026-07-22-F (build 58): FLIP
+    buys the FAVORED (higher-priced) side in [50,70], but only once the PILE has
+    formed inside the [60,180]s window. A two-bid biased book whose favored yes
+    grows to 66 (no at 40 keeps the skew in-band) ENTERS the favored side once
+    primed. What still posts NOTHING is a GENUINELY one-sided book — a lone bid
+    with the other side EMPTY — because there is no favored side to price against
+    (need both bids)."""
+    # two-bid biased book: prime the pile — baseline poll then the entry poll
+    # with the favored (higher) yes grown to 66 and the tape rising with it.
+    engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(60, 52),
+                                          secs_left=835, spot=66000.0))
+    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(66, 40),
+                                                  secs_left=820, spot=66020.0))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 66, "ENTRY")]
-    # a genuinely one-sided book (no@34 only, yes side empty): NOTHING
+    # a genuinely one-sided book (no@34 only, yes side empty), in-window:
+    # NOTHING — no favored side to price against (not the clock)
     engine.flip.windows.clear()
-    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(None, 34)))
+    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(None, 34),
+                                                  secs_left=820))
     assert props == []
 
 
@@ -60,12 +69,22 @@ def test_pair_formable_posts_the_favored_side(engine):
     two-way band book posts ONE lot on the FAVORED (higher) bid immediately, no
     grain needed. yes 40 < no 60 -> buy NO@60; grain, if present, only
     informs — the side stays the favored side."""
-    ctx = flip_ctx(engine, flip_book(40, 60))
-    assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
+    # prime a NO-favored pile: baseline poll, then the entry poll with no grown
+    # to 60 and the tape FALLING with it (trend agrees with no).
+    engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(48, 54),
+                                          secs_left=835, spot=66000.0))
+    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(40, 60),
+                                                  secs_left=820, spot=65980.0))
+    assert [(p.side, p.purpose) for p in props] \
         == [("no", "ENTRY")]                         # no 60 > yes 40 -> favored
     engine.flip.windows.clear()
-    ctx["grain"] = {"direction": "yes", "length": 2, "k": 4}  # informs only
-    assert [(p.side, p.purpose) for p in engine.flip.evaluate(TICKER, ctx)] \
+    g = {"direction": "yes", "length": 2, "k": 4}    # informs only
+    engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(48, 54),
+                                          secs_left=835, spot=66000.0, grain=g))
+    props = engine.flip.evaluate(TICKER, flip_ctx(engine, flip_book(40, 60),
+                                                  secs_left=820, spot=65980.0,
+                                                  grain=g))
+    assert [(p.side, p.purpose) for p in props] \
         == [("no", "ENTRY")]                         # still the favored side
 
 

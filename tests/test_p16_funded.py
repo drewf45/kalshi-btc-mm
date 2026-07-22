@@ -56,12 +56,13 @@ def test_profile_block_prints_every_lane():
     assert "PROFILE — bank small wins, every lane, every market:" in tape
     # P21 A4/A5: FLIP's PAIR line retired — the profile now speaks HUNT
     # (fast intent) and OPEN (patient intent) separately.
-    # WO-2026-07-22-E: the thesis line is now "buy the FAVORED side, sell the
-    # +20 into the pile-in, NO hold — one momentum stop; the curfew hands
-    # winners to F" (the cheap-side/patient-hold thesis is superseded).
+    # WO-2026-07-22-E/-F: the thesis line is "buy the FAVORED side, sell into
+    # the pile-in, NO hold — one momentum stop; the curfew hands winners to F";
+    # WO-...-F adds the WAIT-FOR-THE-PILE window gate.
     for token in ("FLIP/HUNT: needle", "FLIP/OPEN: band",
-                  "FLIP THESIS (WO-2026-07-22-E)", "sell the +20 INTO the pile-in",
+                  "FLIP THESIS (WO-2026-07-22-E)", "INTO the pile-in",
                   "endgame curfew hands winners to F", "trend/depth LOGGED, not gated",
+                  "WAIT-FOR-THE-PILE", "No pile = no",
                   "PAIR retired", "F: hold-to-settlement",
                   "H8: delta-gated", "D: cheap entry", "P: displacement fade",
                   "ORPHAN: adopted at boot", "WALLS: gross+net",

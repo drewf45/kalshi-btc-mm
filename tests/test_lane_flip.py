@@ -86,9 +86,13 @@ def test_open_posts_favored_side_of_the_imbalance(flip):
     """WO-2026-07-22-E "FLIP THE SIDE" (build 57): an entry-band book posts ONE
     lot on the FAVORED side (the HIGHER bid — the side with demand, the market's
     own read of direction), NOT the abandoned cheap side. yes 60 > no 40 -> buy
-    YES@60 (favored, in band [50,70]); grain only informs the why."""
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
-                                      grain=GRAIN_NO3))
+    YES@60 (favored, in band [50,70]); grain only informs the why.
+    WO-2026-07-22-F: entry now WAITS FOR THE PILE — a baseline poll in-window
+    (small skew) then the entry poll (skew grown, tape moved) build it."""
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66_000.0, grain=GRAIN_NO3))   # pile baseline
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40), secs_left=820,
+                                      spot=66_020.0, grain=GRAIN_NO3))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 60, "ENTRY")]
     assert props[0].lane == "FLIP" and props[0].count == 1
@@ -101,15 +105,22 @@ def test_open_no_grain_still_enters(flip):
     now (it is logged in the why, never a wait). An entry-band book with weak
     grain OR no grain at all ENTERS the favored side immediately — the imbalance
     IS the setup, not a grain streak."""
-    # weak grain (length < OPEN_MIN_GRAIN) no longer blocks
-    w_ctx = ctx(flip_book(yes=60, no=40),
-                grain={"direction": "no", "length": 1, "k": 4})
+    # weak grain (length < OPEN_MIN_GRAIN) no longer blocks. WO-2026-07-22-F:
+    # prime the pile (baseline poll, then the grown entry poll).
+    weak = {"direction": "no", "length": 1, "k": 4}
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66_000.0, grain=weak))
+    w_ctx = ctx(flip_book(yes=60, no=40), secs_left=820, spot=66_020.0,
+                grain=weak)
     assert [(p.side, p.purpose) for p in flip.evaluate(TICKER, w_ctx)] == \
         [("yes", "ENTRY")]
     # and with NO grain at all (empty screen): still enters the favored side
     flip.windows.clear()
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66_000.0))
     assert [(p.side, p.purpose) for p in
-            flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40)))] == \
+            flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
+                                      secs_left=820, spot=66_020.0))] == \
         [("yes", "ENTRY")]
 
 
@@ -118,14 +129,18 @@ def test_open_band_required(flip):
     sole entry filter is that favored side sitting inside the buyable band
     [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A biased open whose favored
     side is in band (yes 65 / no 30) ENTERS the favored side (yes@65); a favored
-    side ABOVE the band (the move already fully priced) SKIPS."""
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=65, no=30),
-                                      grain=GRAIN_NO3))
+    side ABOVE the band (the move already fully priced) SKIPS.
+    WO-2026-07-22-F: prime the pile; the favored side is @65 (in [50,70]) with a
+    skew (25) inside [10,30] that grew across the window."""
+    flip.evaluate(TICKER, ctx(flip_book(yes=58, no=40), secs_left=835,
+                              spot=66_000.0, grain=GRAIN_NO3))   # pile baseline
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=65, no=40), secs_left=820,
+                                      spot=66_020.0, grain=GRAIN_NO3))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 65, "ENTRY")]
-    # favored side above the band skips
+    # favored side above the band skips (in-window, so the band gate is what cuts)
     flip.windows.clear()
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20),
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20), secs_left=820,
                                      grain=GRAIN_NO3)) == []
 
 
@@ -136,38 +151,54 @@ def test_open_favored_out_of_band_passes(flip):
     the ceiling (the move already fully priced, the illiquid tail) also skips."""
     assert config.OPEN_ENTRY_MIN_C == 50
     assert config.OPEN_ENTRY_MAX_C == 70
-    # favored side below the band (below fair value) skips
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=40),
+    # favored side below the band (below fair value) skips (in-window)
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=48, no=40), secs_left=820,
                                      grain=GRAIN_NO3)) == []
     # favored side above the band (already fully priced) skips
     flip.windows.clear()
-    assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20),
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=75, no=20), secs_left=820,
                                      grain=GRAIN_NO3)) == []
 
 
-def test_open_curfew_and_no_entry_phase(flip):
-    """OVERTURNED by WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51): entry is
-    the opening 90s only — an open-band book posts at the OPEN (secs_into 50),
-    never mid-window. The late curfew stands."""
-    # build 51: the entry window is T-15 → the first 90s (was mid-window)
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
-                                      secs_left=850, grain=GRAIN_NO3))
-    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
-    flip.windows.clear()
-    # past the T-10 cutoff nothing posts; window over posts nothing
+def test_open_pile_window_gate(flip):
+    """RE-ANCHORED by WO-2026-07-22-F "WAIT FOR THE PILE" (build 58): entry is
+    no longer the opening-90s "as early as possible" — it WAITS FOR THE PILE.
+    An entry is evaluated ONLY inside [OPEN_PILE_START_S, OPEN_PILE_END_S] =
+    [60,180]s. Before 60s it is refused (too early — the pile has not had time
+    to form); a formed pile in-window enters; past 180s the window is SKIPPED
+    (OPEN_SKIP logged once). The late curfew/flat phase stands."""
+    # too early: secs_into 50 (< 60) — refused, the pile has not had time
     assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
-                                     secs_left=200, grain=GRAIN_NO3)) == []
+                                     secs_left=850, grain=GRAIN_NO3)) == []
+    # in-window (secs_into 65 then 80) with a formed pile: enters the favored side
+    flip.windows.clear()
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66_000.0, grain=GRAIN_NO3))
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40), secs_left=820,
+                                      spot=66_020.0, grain=GRAIN_NO3))
+    assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
+    # past the pile window (secs_into 200 > 180): the pile never came — SKIP,
+    # and OPEN_SKIP is logged once
+    flip.windows.clear()
+    assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
+                                     secs_left=700, grain=GRAIN_NO3)) == []
+    assert flip.windows[TICKER].open_skip_logged
+    # the late flat phase (secs_left 50 < FLIP_FLAT_AT) posts nothing
+    flip.windows.clear()
     assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
                                      secs_left=50, grain=GRAIN_NO3)) == []
 
 
 def test_open_take_posted_after_fill(flip, gateway):
     """Exit one of three: the resting TAKE posts the cycle after the fill books.
-    WO-2026-07-22-E: the take is now entry + OPEN_GOUGE_C capped at 90 (the +20
-    sold INTO the pile-in of buyers) — favored entry 60 -> take 80."""
+    WO-2026-07-22-E/F: the take is now entry + OPEN_GOUGE_C capped at 90 (the
+    +17 sold INTO the pile-in of buyers) — favored entry 60 -> take 77. The
+    entry is primed with the two-poll pile pattern."""
     from relay_engine.lane_flip import LaneFlip
-    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
-                                      grain=GRAIN_YES2))
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66_000.0, grain=GRAIN_YES2))   # pile baseline
+    props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40), secs_left=820,
+                                      spot=66_020.0, grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-Y", CLOSE - 800)
     event = TICKER.rsplit("-", 1)[0]
     gateway.positions[(event, TICKER, "FLIP")] = 1
@@ -177,7 +208,7 @@ def test_open_take_posted_after_fill(flip, gateway):
                                        secs_left=780))
     takes = [p for p in props2 if p.purpose == "EXIT"]
     assert len(takes) == 1
-    # WO-2026-07-22-E: the take rests at entry + OPEN_GOUGE_C, entry 60 -> 80
+    # WO-2026-07-22-E/F: the take rests at entry + OPEN_GOUGE_C, entry 60 -> 77
     assert (takes[0].side, takes[0].price_cents, takes[0].action) == \
         ("yes", LaneFlip._take_price(60), "sell")
     assert "open take" in takes[0].reason
@@ -211,13 +242,19 @@ def test_reentry_is_open_gated(flip, gateway):
     not the tape's last four ticks."""
     w = flip._window(TICKER, CLOSE)
     w.trips = 1
-    # WO-2026-07-22-E: re-entry opens on band + imbalance, no grain needed.
-    # Too early is gated by the entry cutoff, not a grain wait.
+    # WO-2026-07-22-E/F: re-entry opens on band + imbalance + a formed pile,
+    # no grain needed. Past the cutoff nothing posts.
     assert flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
-                                     secs_left=200)) == []      # past T-10 cutoff
-    # inside the opening 90s (build 51): re-entry buys the FAVORED side (yes 60 > no 40)
+                                     secs_left=200)) == []      # past the cutoff
+    # a fresh window carrying the same completed trip, primed by the two-poll
+    # pile pattern: re-entry buys the FAVORED side (yes 60 > no 40)
+    flip.windows.clear()
+    w = flip._window(TICKER, CLOSE)
+    w.trips = 1
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66_000.0))
     props = flip.evaluate(TICKER, ctx(flip_book(yes=60, no=40),
-                                      secs_left=850))
+                                      secs_left=820, spot=66_020.0))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 

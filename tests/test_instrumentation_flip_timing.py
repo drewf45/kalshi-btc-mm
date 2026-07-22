@@ -60,64 +60,82 @@ def _swing_row(ledger):
     return json.loads(d)
 
 
-# ── C: THE 90-SECOND ENTRY CUTOFF ──────────────────────────────────────────
-def test_c_enters_in_the_opening_window(flip):
-    """FLIP enters buying the opening pile-in — secs_into 50 (<= 90). The
-    FAVORED (higher-priced) side in band [50,70] is what it buys (yes@60)."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       grain=GRAIN))
+def _prime(flip, entry_book, *, s0=66_000.0, s1=66_020.0):
+    """WO-2026-07-22-F two-poll pile prime: a baseline in-window poll (skew 6,
+    secs_into 65) then the entry poll at secs_into 80 whose skew has grown ≥5 and
+    whose tape has moved ≥$15 in the favored (yes) direction. Returns the entry
+    poll's proposals."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835, spot=s0,
+                               grain=GRAIN))
+    return flip.evaluate(TICKER, _ctx(entry_book, secs_left=820, spot=s1,
+                                      grain=GRAIN))
+
+
+# ── C: THE PILE WINDOW [60,180]s ───────────────────────────────────────────
+def test_c_enters_in_the_pile_window(flip):
+    """WO-2026-07-22-F: FLIP enters when THE PILE FORMS — secs_into inside
+    [OPEN_PILE_START_S, OPEN_PILE_END_S], a skew grown ≥5 with an agreeing tape.
+    The FAVORED (higher-priced) side in band [50,70] is what it buys (yes@60)."""
+    props = _prime(flip, _book(yes=60, no=40))
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 
-def test_c_refuses_past_the_opening_window(flip):
-    """Past OPEN_OPENING_WINDOW_S into the window (secs_into 100 > 90), FLIP
-    does NOT enter — the −15/−16 mid-market class is retired."""
-    assert flip.evaluate(TICKER, _ctx(_book(), secs_left=800,
+def test_c_skips_past_the_pile_window(flip):
+    """Past OPEN_PILE_END_S into the window (secs_into 200 > 180) the pile never
+    came — FLIP does NOT enter and the window is SKIPPED (OPEN_SKIP once)."""
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=700,
+                                      grain=GRAIN)) == []
+    assert flip.windows[TICKER].open_skip_logged is True
+
+
+def test_c_window_uses_secs_into_not_secs_left(flip):
+    """ADVERSARY guard (b): the pile window is measured in secs-INTO =
+    FLIP_WINDOW_SEC − secs, NOT secs-left — a sign error would invert it (admit
+    the too-early book, refuse the pile). The SAME favored book: too early
+    (secs_into 50 < 60) refuses, inside [60,180] with a formed pile enters, past
+    the window (secs_into 200 > 180) refuses."""
+    # too early — secs_into 50 (< OPEN_PILE_START_S): refused outright
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
+                                      grain=GRAIN)) == []
+    flip.windows.clear()
+    # inside the window — the formed pile enters
+    assert _prime(flip, _book(yes=60, no=40))
+    flip.windows.clear()
+    # past the window — secs_into 200 (> OPEN_PILE_END_S): refused/skipped
+    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=700,
                                       grain=GRAIN)) == []
 
 
-def test_c_cutoff_uses_secs_into_not_secs_left(flip):
-    """ADVERSARY guard (b): the cutoff is secs-INTO = FLIP_WINDOW_SEC − secs,
-    NOT secs-left — a sign error would invert it (refuse the open, admit
-    mid-market). At the boundary: 90s in enters, 91s in refuses."""
-    boundary = FLIP_WINDOW_SEC - config.OPEN_OPENING_WINDOW_S     # 810 s-left
-    fav = _book(yes=60, no=40)                                    # favored yes@60
-    assert flip.evaluate(TICKER, _ctx(fav, secs_left=boundary,
-                                      grain=GRAIN))                # 90s in: enters
-    flip.windows.clear()
-    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40),
-                                      secs_left=boundary - 1,
-                                      grain=GRAIN)) == []          # 91s in: refused
-    flip.windows.clear()
-    assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40),
-                                      secs_left=FLIP_WINDOW_SEC - 5,
-                                      grain=GRAIN))                # 5s in: enters
-
-
 def test_c_still_requires_a_two_sided_cheap_side(flip):
-    """ADVERSARY guard (a): even in the opening window, FLIP never fires into a
-    one-sided book — no cheap side, skip."""
-    assert flip.evaluate(TICKER, _ctx(_book(yes=48, no=None),
-                                      secs_left=850, grain=GRAIN)) == []
+    """ADVERSARY guard (a): even inside the pile window, FLIP never fires into a
+    one-sided book — no cheap side, skip. The baseline poll forms; the entry
+    poll's one-sided book refuses."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66_000.0, grain=GRAIN))
+    assert flip.evaluate(TICKER, _ctx(_book(yes=48, no=None), secs_left=820,
+                                      spot=66_020.0, grain=GRAIN)) == []
 
 
 # ── A: THE COMPLETE PER-TRADE DATA POINT ───────────────────────────────────
 def _run_trade(flip, ledger, entry_spot=66_400, exit_spot=66_455):
-    """Enter at the open (spot known) on the FAVORED side (yes@60, in band),
-    fill, post the take, then book a take-fill exit — returns after the
-    FLIP_SWING record is written."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
+    """Enter in the PILE WINDOW (spot known) on the FAVORED side (yes@60, in
+    band) via the two-poll prime, fill, post the take, then book a take-fill
+    exit — returns after the FLIP_SWING record is written."""
+    # baseline poll (skew 6, spot low) then the entry poll at secs_into 80
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=entry_spot - 20, grain=GRAIN))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
                                        spot=entry_spot, grain=GRAIN))
-    flip.on_submitted(props[0], "E1", CLOSE - 850)
+    flip.on_submitted(props[0], "E1", CLOSE - 820)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
-    flip.note_fill(TICKER, "yes", 60, CLOSE - 848)
-    # a custody poll posts the take (entry+20 = 80 for a 60c entry) and stamps
+    flip.note_fill(TICKER, "yes", 60, CLOSE - 818)
+    # a custody poll posts the take (entry+17 = 77 for a 60c entry) and stamps
     # the exit observation (spot/book)
     flip.evaluate(TICKER, _ctx(_book(yes=52, no=45), secs_left=790,
                                spot=exit_spot))
     # the take fills at its posted price → note_exit writes the record
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 80, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 80, CLOSE - 700, count=1)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 77, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 77, CLOSE - 700, count=1)
 
 
 def test_a_swing_record_is_the_full_data_point(flip, ledger):
@@ -126,29 +144,28 @@ def test_a_swing_record_is_the_full_data_point(flip, ledger):
     reconstructable after the fact."""
     _run_trade(flip, ledger, entry_spot=66_400, exit_spot=66_455)
     r = _swing_row(ledger)
-    # the money — favored yes@60, take +20 = 80
-    assert r["entry_price"] == 60 and r["exit_price"] == 80
-    assert r["gross_cents"] == 20
+    # the money — favored yes@60, take +17 = 77
+    assert r["entry_price"] == 60 and r["exit_price"] == 77
+    assert r["gross_cents"] == 17
     # spot prices — the BTC move, reconstructable (not just the delta)
     assert r["entry_spot"] == 66_400 and r["exit_spot"] == 66_455
-    # precise window timing — the ≤90s-vs-mid distinction
-    assert r["entry_secs_into"] == 50.0        # 900 − 850
+    # precise window timing — the pile-window entry (secs_into 80) vs the exit
+    assert r["entry_secs_into"] == 80.0        # 900 − 820
     assert r["exit_secs_into"] == 110.0        # 900 − 790
     # the exact exit reason tag — no silent exit
     assert r["exit_reason"] == "TAKE_FILL"
     # book state both ends + the posted gouge level (favored bid recorded)
     assert r["entry_spread"] == 20 and r["entry_cheap_bid"] == 60
     assert r["entry_depth"] == [10, 10]
-    assert r["posted_take"] == 80              # _take_price(60) = entry+20 cap90
+    assert r["posted_take"] == 77              # _take_price(60) = entry+17 cap90
 
 
 def test_a_entry_why_carries_spot_timing_and_book(flip):
     """The Telegram-readable entry line carries spot, secs-into, and book —
     enough to read the trade live."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       spot=66_412, grain=GRAIN))
+    props = _prime(flip, _book(yes=60, no=40), s0=66_392.0, s1=66_412.0)
     why = props[0].why
-    assert "spot 66,412" in why and "into 50s" in why
+    assert "spot 66,412" in why and "into 80s" in why
     assert "book y60/n40" in why and "depth 10/10" in why
 
 

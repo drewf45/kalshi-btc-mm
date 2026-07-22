@@ -36,9 +36,9 @@ def _book(yes=40, no=49):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None):
+def _ctx(book, secs_left=850, grain=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": None}
+            "spot": spot, "grain": grain, "spotlead": None}
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +66,13 @@ def _open_leg(flip, gateway, ledger, entry=60):
     """A booked OPEN leg whose take rests — the healthy custody shape. Post
     WO-2026-07-22-E the entry is the FAVORED (higher) side: yes@entry > no@49,
     entry in [50,70]."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=entry), grain=GRAIN_YES2))
+    # WO-2026-07-22-F "wait for the pile": build the pile with two in-window
+    # polls — a baseline (secs_into~65, small skew, spot low) then the entry poll
+    # (secs_into~80, skew grown >=5, |trend|>=15 agreeing with favored yes, favored
+    # depth >= other). _book(yes=entry) is favored-yes (entry>no=49) in [50,70].
+    flip.evaluate(TICKER, _ctx(_book(yes=52), secs_left=835, spot=66000.0))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=entry), secs_left=820,
+                                       spot=66020.0, grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, "yes", entry, CLOSE - 790)

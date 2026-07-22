@@ -40,9 +40,9 @@ def _book(yes=40, no=49):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None, sl=None):
+def _ctx(book, secs_left=850, grain=None, sl=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": sl}
+            "spot": spot, "grain": grain, "spotlead": sl}
 
 
 @pytest.fixture(autouse=True)
@@ -85,11 +85,11 @@ def w_side_ctx(flip, b, now, secs, sl):
 
 # ── §1/§2.1: the resting take is the exit — post the +20 gouge and wait ────
 def test_the_take_rests_at_entry_plus_gouge(flip):
-    """WO-2026-07-22-E (build 57): the resting take is now entry + OPEN_GOUGE_C
-    (the +20 sold INTO the pile-in of buyers on the FAVORED side), capped at
+    """WO-2026-07-22-F (build 58): the resting take is now entry + OPEN_GOUGE_C
+    (the +17 sold INTO the pile-in of buyers on the FAVORED side), capped at
     90¢ to stay out of the illiquid tail — a 60¢ favored entry rests its take at
-    80¢. Still one resting exit, still held-side; the anchor moved from the
-    middle to the +20 gouge."""
+    77¢. Still one resting exit, still held-side; the anchor moved from the
+    middle to the +17 gouge."""
     o, now = _pos(flip, entry=60)
     o["take_proposed"] = False           # let the take propose
     o["take_oid"] = None
@@ -97,7 +97,7 @@ def test_the_take_rests_at_entry_plus_gouge(flip):
     props = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
     exits = [p for p in props if p.purpose == "EXIT"]
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(60) == 80   # entry+20
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 77   # entry+17
 
 
 # ── WO-2026-07-22-E: dips partition at the stop — above held, below exits ──
@@ -233,13 +233,18 @@ def test_unreverted_loser_cleared_at_t10(flip):
 
 # ── the entry filter is the band — the lane is NOT closed ──────────────────
 def test_thesis_entries_admitted_no_geometry_gate(flip):
-    """The risk/reward geometry gate is gone — the entry filter is band
-    membership (buy the cheap pile-in). The 44-49c thesis range is admitted;
-    the lane trades so the reversion rate can be measured."""
-    for join in (28, 34, 40, 42):     # build 52: real-gouge range [25,42]
-        no = min(55, 100 - join)
-        props = flip.evaluate(TICKER, _ctx(_book(yes=join, no=no),
-                                           grain=GRAIN_YES2))
+    """WO-2026-07-22-F re-anchor: the risk/reward geometry gate is still gone —
+    the entry filter is the PILE gate on the FAVORED side in [50,70]. Favored
+    joins across the band, each with a formed pile (two-poll prime: baseline
+    small skew, then a grown skew + agreeing rising trend + favored depth), are
+    admitted; the lane trades so the reversion rate can be measured."""
+    for join in (52, 58, 64, 68):     # favored side across the [50,70] band
+        other = join - 20             # skew 20, inside [10,30]
+        flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                                   grain=GRAIN_YES2, spot=66000.0))   # baseline
+        props = flip.evaluate(TICKER, _ctx(_book(yes=join, no=other),
+                                           secs_left=820, grain=GRAIN_YES2,
+                                           spot=66020.0))
         assert [p for p in props if p.purpose == "ENTRY"], f"{join} rejected"
         flip.windows.clear()
 

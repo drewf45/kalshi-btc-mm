@@ -146,14 +146,21 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(HUNT_REFUSE_LOWER); one loss/window sits out; "
                  "through-floor collapse cuts on 2 sustained polls, any "
                  "minute (WO-BLEED-1/3)")
-    lines.append(f"  FLIP ENTRY (WO-2026-07-22-E): buys the FAVORED (higher-"
-                 f"priced, demanded) side in the opening {config.OPEN_OPENING_WINDOW_S}s, "
-                 f"band [{config.OPEN_ENTRY_MIN_C},{config.OPEN_ENTRY_MAX_C}]¢ "
-                 "(50 a HARD floor — the rest-back wall enforces it; the old "
-                 "cheap-side [25,42] filter, the swing gate, and the trend-skip "
-                 "are RETIRED from the entry path). One shot/window, maker-only, "
-                 "1 lot; trend_usd + depth_ratio LOGGED on the why, gate on "
-                 "nothing (FLIP_SWING / FLIP_LOSER_CUT still logged)")
+    lines.append(f"  FLIP ENTRY (WO-2026-07-22-E → -F): buys the FAVORED "
+                 f"(higher-priced, demanded) side, band "
+                 f"[{config.OPEN_ENTRY_MIN_C},{config.OPEN_ENTRY_MAX_C}]¢ "
+                 "(50 a HARD floor). The cheap-side filter, swing gate, and "
+                 "trend-skip are RETIRED. One shot/window, maker-only, 1 lot")
+    lines.append(f"  FLIP WAIT-FOR-THE-PILE (WO-2026-07-22-F): entry ONLY in "
+                 f"[{config.OPEN_PILE_START_S},{config.OPEN_PILE_END_S}]s into "
+                 "the window, and ONLY when ALL agree — favored side in-band, "
+                 f"skew∈[{config.OPEN_MIN_SKEW_C},{config.OPEN_MAX_SKEW_C}]¢, skew "
+                 f"GROWN ≥{config.OPEN_SKEW_GROWTH_C}¢ across the window (the "
+                 f"stampede in progress), |trend|≥${config.OPEN_MIN_TREND_USD:.0f}, "
+                 "trend agreeing with the side, depth behind it. No pile = no "
+                 "trade; a skipped window logs OPEN_SKIP with its reason (the "
+                 "primary data product). Every prior entry fired <57s in, before "
+                 "the pile could form — PROBE thresholds, the skip log tunes them")
     lines.append(f"  FLIP EXIT (WO-2026-07-22-E): resting take at entry+"
                  f"{config.OPEN_GOUGE_C}¢ (cap 90) sold INTO the pile-in; ONE "
                  f"momentum stop at entry−{config.OPEN_MOMENTUM_STOP_C}¢, 2-poll "
@@ -174,12 +181,11 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(~−40) instead of riding to the −90 backstop; one attempt, "
                  "no re-entry (single-entry wall). F entry rest-back stands "
                  "(build 48, lane-agnostic) (WO-BOTH-LANES-MARKET-TRUE)")
-    from .lane_flip import FLIP_WINDOW_SEC as _FWS
-    lines.append(f"  FLIP OPENING-ONLY (build 51): entry HARD-CUT at "
-                 f"{config.OPEN_OPENING_WINDOW_S}s into the window (secs_into = "
-                 f"{_FWS}−secs_left) — FLIP buys the opening pile-in or SKIPS; "
-                 "no mid-market entry (the proven −15/−16 fix). Then the 4-min "
-                 "hard-hold + active exit stand unchanged")
+    lines.append(f"  FLIP TIMING (build 51 → WO-...-F): the 90s opening-only "
+                 f"cutoff and the 4-min hard-hold are RETIRED — entry is now the "
+                 f"[{config.OPEN_PILE_START_S},{config.OPEN_PILE_END_S}]s pile "
+                 "window (see WAIT-FOR-THE-PILE above), and the loss exit is the "
+                 "one momentum stop (see FLIP EXIT), no hold")
     lines.append("  INSTRUMENTATION (build 51): every FLIP conclusion writes "
                  "the COMPLETE data point — entry/exit spot + price + spread + "
                  "secs-into + reason tag + book depth both ends — to the DB and "

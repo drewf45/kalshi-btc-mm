@@ -30,9 +30,9 @@ def _book(yes=40, no=49, yq=10, nq=10):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None, spotlead=None):
+def _ctx(book, secs_left=850, grain=None, spotlead=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": spotlead}
+            "spot": spot, "grain": grain, "spotlead": spotlead}
 
 
 @pytest.fixture
@@ -53,7 +53,21 @@ def _open_position(flip, gateway, side="yes", entry=60, grain_ctx=None):
     """Drive an OPEN entry (the FAVORED side) to a filled position; returns
     the window. WO-2026-07-22-E: entry is the favored 60c join."""
     grain_ctx = grain_ctx or (GRAIN_YES2 if side == "yes" else GRAIN_NO3)
-    props = flip.evaluate(TICKER, _ctx(_favored_book(side), grain=grain_ctx))
+    # WO-2026-07-22-F: prime the pile — a baseline small-skew poll in-window,
+    # then the entry poll with the skew grown (+14) and the tape moving in the
+    # favored direction (yes rises, no falls) so the trend agrees.
+    if side == "yes":
+        flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                                   spot=66000.0, grain=grain_ctx))
+        props = flip.evaluate(TICKER, _ctx(_favored_book("yes"),
+                                           secs_left=820, spot=66020.0,
+                                           grain=grain_ctx))
+    else:
+        flip.evaluate(TICKER, _ctx(_book(yes=48, no=54), secs_left=835,
+                                   spot=66000.0, grain=grain_ctx))
+        props = flip.evaluate(TICKER, _ctx(_favored_book("no"),
+                                           secs_left=820, spot=65980.0,
+                                           grain=grain_ctx))
     assert len(props) == 1 and props[0].side == side
     flip.on_submitted(props[0], "OID-E", CLOSE - 800)
     gateway.positions[(EVENT, TICKER, "FLIP")] = 1 if side == "yes" else -1
@@ -149,9 +163,9 @@ def test_patient_hold_ignores_wiggles(flip, gateway):
     from relay_engine.lane_flip import LaneFlip
     _open_position(flip, gateway, side="yes", entry=60)
     props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))
-    # WO-2026-07-22-E: the resting take is entry + OPEN_GOUGE_C (60 → 80c)
+    # WO-2026-07-22-F: the resting take is entry + OPEN_GOUGE_C (17) → 60 → 77c
     take_px = LaneFlip._take_price(60)
-    assert take_px == 80
+    assert take_px == 77
     assert [p.reason for p in props] == \
         [f"open take → middle {take_px}c (entry 60, gouge +{take_px - 60})"]
     flip.on_submitted(props[0], "OID-T", CLOSE - 780)
@@ -240,9 +254,13 @@ def test_confirmed_needle_suppresses_open_entry(flip):
     props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_NO3,
                                        spotlead=needle))
     assert all("OPEN" not in (p.why or "") for p in props)
-    # the same favored book with no needle posts the OPEN entry
+    # the same favored book with no needle, primed into a formed pile, posts
+    # the OPEN entry
     flip.windows.clear()
-    props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), grain=GRAIN_NO3))
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0, grain=GRAIN_NO3))
+    props2 = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                        spot=66020.0, grain=GRAIN_NO3))
     assert len(props2) == 1 and props2[0].why.startswith("OPEN")
 
 

@@ -129,8 +129,23 @@ OPEN_MIDDLE_TARGET = 52          # DREW-DEFAULT: the take target — the 50/50 m
 OPEN_ENTRY_MIN_C = 50            # DREW-DEFAULT: hard fair-value floor — never buy below 50
 OPEN_ENTRY_MAX_C = 70            # DREW-DEFAULT: favored side ran 59-68 at every logged entry
 OPEN_ENTRY_DEADLINE_S = 90       # DREW-DEFAULT: unfilled by here → cancel, never chase (== opening window)
-OPEN_GOUGE_C = 20               # DREW-DEFAULT: target = entry + 20, capped at 90 (out of the illiquid tail)
+OPEN_GOUGE_C = 17               # DREW-DEFAULT (WO-...-F, was 20): target = entry + 17, cap 90 — capture more often (a nearer target exits before the drifting pile exhausts)
 OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2-poll sustain, maker-first
+# WO-2026-07-22-F "WAIT FOR THE PILE": entry-discipline tuning. Every logged
+# entry so far fired inside the first 57s — before the pile window even opens,
+# on a book that had not moved (trend $0) or already finished (skew 41). FLIP
+# now WAITS for the pile: it enters ONLY in [PILE_START, PILE_END]s AND only
+# when ALL conditions agree — the favored side in-band, the skew inside a
+# forming range, the skew GROWING (the stampede in progress, the heart of the
+# order), the tape actually moving, and trend agreeing with the favored side.
+# No pile = no trade; a skipped window is a correct outcome, logged as OPEN_SKIP.
+# These are PROBE thresholds shaped by n=3 — the skip log is what corrects them.
+OPEN_PILE_START_S = 60          # DREW: the pile window opens at ~1 minute
+OPEN_PILE_END_S = 180          # DREW: closes at ~3 minutes — after this the move is priced
+OPEN_MIN_TREND_USD = 15        # no entry on a flat tape (two of three losses had trend $0)
+OPEN_MIN_SKEW_C = 10           # below this the pile has not formed
+OPEN_MAX_SKEW_C = 30           # above this we are late (a skew of 41 → lost)
+OPEN_SKEW_GROWTH_C = 5         # the skew must have GROWN this much across the pile window (forming NOW, not static)
 # B3 the active late-window walk-down: a position that does not fill at the
 # middle is walked DOWN toward scratch as the clock runs (from OPEN_WALK_START_S
 # down to OPEN_FLAT_BY = T-10), re-posting the maker take lower, so it exits

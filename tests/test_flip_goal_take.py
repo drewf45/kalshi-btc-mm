@@ -105,27 +105,27 @@ def test_take_cents_clamps_min_and_max(monkeypatch):
 
 # ── §4 core test: buy the favored side, rest the +20 into the pile-in ──────
 def test_60_entry_takes_at_80(flip):
-    """WO-2026-07-22-E — buy the FAVORED side and sell the +20 INTO the
-    pile-in of buyers. A favored 60¢ entry rests its take at 80¢ (entry +
+    """WO-2026-07-22-F — buy the FAVORED side and sell the +17 INTO the
+    pile-in of buyers. A favored 60¢ entry rests its take at 77¢ (entry +
     OPEN_GOUGE_C), the reachable exit that fills into demand — never the
     retired middle-target (52) that rested on the abandoned side nobody
     wanted (flip_fill=38%)."""
     exits = _take_prop(flip, "yes", 60, 60)
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(60) == 80
-    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 20
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 77
+    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 17
     assert "open take" in exits[0].reason
     # not the retired middle-target
     assert exits[0].price_cents != config.OPEN_MIDDLE_TARGET
 
 
 def test_take_is_orientation_correct_no_mirrors_yes(flip):
-    """The +20 take is entry-relative, so a NO@60 rests its take at the SAME
-    80¢ as a YES@60 — build 41's mirror survives the buy-the-favored-side
-    doctrine (WO-2026-07-22-E)."""
+    """The +17 take is entry-relative, so a NO@60 rests its take at the SAME
+    77¢ as a YES@60 — build 41's mirror survives the buy-the-favored-side
+    doctrine (WO-2026-07-22-F)."""
     y = _take_prop(flip, "yes", 60, 60)[0]
     n = _take_prop(flip, "no", 60, 60)[0]
-    assert y.price_cents == n.price_cents == 80
+    assert y.price_cents == n.price_cents == 77
 
 
 def test_take_caps_at_90(flip):
@@ -156,18 +156,18 @@ def test_take_target_falls_back_to_rec_count_without_ledger(flip, monkeypatch):
 
 
 def test_second_fill_recomputes_the_take(flip, gateway, ledger, monkeypatch):
-    """WO-2026-07-22-E: the LIVE take is now entry + OPEN_GOUGE_C (cap 90),
+    """WO-2026-07-22-F: the LIVE take is now entry + OPEN_GOUGE_C (cap 90),
     entry-relative and INDEPENDENT of booked size — so a second same-side
-    fill re-proposes at the SAME 80¢ take. The size-scaling survives only in
+    fill re-proposes at the SAME 77¢ take. The size-scaling survives only in
     the _take_target helper (test_take_shrinks_...)."""
     monkeypatch.setattr(config, "WINDOW_BOOK_GOAL_CENTS", 20)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     first = _take_prop(flip, "yes", 60, 60, count=1)
-    assert first[0].price_cents == 80                   # entry+20, 1 lot
-    # a second contract books; booked-held is now 2 — still entry+20
+    assert first[0].price_cents == 77                   # entry+17, 1 lot
+    # a second contract books; booked-held is now 2 — still entry+17
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     second = _take_prop(flip, "yes", 60, 60, count=2)
-    assert second[0].price_cents == 80                  # size-independent
+    assert second[0].price_cents == 77                  # size-independent
 
 
 # ── §4: a non-converging loser still cuts — now via the MOMENTUM STOP ───────

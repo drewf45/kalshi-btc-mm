@@ -37,9 +37,20 @@ def _book(yes=60, no=40):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None):
+def _ctx(book, secs_left=850, grain=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": None}
+            "spot": spot, "grain": grain, "spotlead": None}
+
+
+def _prime(flip, grain=None):
+    """WO-2026-07-22-F "wait for the pile": build the pile with two in-window
+    polls — a baseline (secs_into~65, small skew, spot low) then the entry poll
+    (secs_into~80, skew grown +14, trend +20 agreeing, favored depth). Returns
+    the entry proposals (props[0] is yes@60 ENTRY)."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0))                    # baseline skew 6
+    return flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                      spot=66020.0, grain=grain))
 
 
 @pytest.fixture(autouse=True)
@@ -71,7 +82,7 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     single-lot exits + UNCOVERED page. Now: the exit DEFERS while the
     entry is partially filled (§3.1), the second half merges, and the
     position leaves as ONE covered 2-lot action. ZERO pages."""
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     entry = props[0]
     entry.count = 2                                    # the 2-lot intent
     r = gateway.submit(entry, _book())                 # REAL resting order
@@ -122,7 +133,7 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
     FLIP_LATE_FILL_REOPEN opens a fresh position-aware record the moment
     the old leg's accounting concludes. Zero orphan, zero UNCOVERED."""
     import logging
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)  # fake oid: gate off
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790)
@@ -178,7 +189,7 @@ def test_late_fill_promote_clamps_to_booked(flip, gateway, ledger):
 
 # ── regressions: the simple cases stay simple ──────────────────────────────
 def test_single_two_lot_fill_one_record_one_exit(flip, gateway, ledger):
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 2, "PROBE")
     flip.note_fill(TICKER, "yes", 48, CLOSE - 790, count=2)
@@ -190,7 +201,7 @@ def test_single_two_lot_fill_one_record_one_exit(flip, gateway, ledger):
 
 
 def test_two_fills_no_exit_between_merges_clean(flip, gateway, ledger):
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     for _ in range(2):
         ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 48, 1, "PROBE")
@@ -273,7 +284,7 @@ def test_uncovered_flattens_before_it_fatals(flip, gateway, ledger, funnel):
 # ── §3.1 Adversary (b): the stuck partial fails toward a known state ───────
 def test_stuck_partial_defers_then_cancels_loudly(flip, gateway, ledger,
                                                   funnel):
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     entry = props[0]
     entry.count = 2
     r = gateway.submit(entry, _book())

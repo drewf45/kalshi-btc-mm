@@ -100,7 +100,13 @@ def test_measured_low_rate_no_longer_gates_entry(flip, ledger, surface):
     is now retired from the entry path: the favored side (no@55) STILL enters
     — swing is log-only, it blocks no entry."""
     _seed(surface, 55, took=7, total=20)          # 0.35 measured — a knife band
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2))
+    # WO-2026-07-22-F: the favored side is NO (no 55 > yes), so prime the pile
+    # with a FALLING tape (trend agrees with NO): a baseline poll in-window
+    # (small skew, higher spot) then the entry poll (skew grown, spot −20).
+    flip.evaluate(TICKER, _ctx(_book(yes=49, no=55), secs_left=835,
+                               grain=GRAIN_YES2, spot=STRIKE - 100))
+    props = flip.evaluate(TICKER, _ctx(_book(yes=39, no=55), secs_left=820,
+                                       grain=GRAIN_YES2, spot=STRIKE - 120))
     assert [(p.side, p.purpose) for p in props] == [("no", "ENTRY")]
 
 

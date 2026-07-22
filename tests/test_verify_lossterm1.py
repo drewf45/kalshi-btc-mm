@@ -102,9 +102,9 @@ def _flip_book(yes=40, no=49):
     return b
 
 
-def _flip_ctx(book, secs_left=850, grain=None):
+def _flip_ctx(book, secs_left=850, grain=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": None}
+            "spot": spot, "grain": grain, "spotlead": None}
 
 
 @pytest.fixture
@@ -136,7 +136,13 @@ def test_b2_two_lot_open_lifecycle_zero_uncovered_pages(ledger, surface,
     # favored yes@60 book enters; the held-side mark (60) stays above the
     # momentum stop (entry−10=50) all cycle, so the 2-lot lifecycle runs clean.
     fav = lambda **kw: _flip_book(yes=60, no=40)
-    props = flip.evaluate(TICKER, _flip_ctx(fav(), grain=GRAIN_YES2))
+    # WO-2026-07-22-F "wait for the pile": build the pile with two in-window
+    # polls — a baseline (secs_into~65, small skew, spot low) then the entry poll
+    # (secs_into~80, skew grown +14, trend +20 agreeing, favored depth).
+    flip.evaluate(TICKER, _flip_ctx(_flip_book(yes=54, no=48), secs_left=835,
+                                    spot=66000.0))
+    props = flip.evaluate(TICKER, _flip_ctx(fav(), secs_left=820, spot=66020.0,
+                                            grain=GRAIN_YES2))
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 60, CLOSE - 790)

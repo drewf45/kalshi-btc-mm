@@ -72,14 +72,23 @@ def test_flip_takes_lead_its_proposal_list(gateway, ledger, surface):
     flip = LaneFlip(gateway, custodian=Custodian(gateway, ledger, surface,
                                                  ladder=DegradeLadder()))
     close = 1_000_000.0
-    b = OrderBook(market=TICKER)
-    # WO-2026-07-22-E: FLIP buys the FAVORED (higher) side in [50,70] —
-    # yes@60 > no@49 -> the favored side is YES.
-    b.apply_snapshot({60: 20}, {49: 20}, ts=1.0)
-    ctx = {"book": b, "close_ts": close, "now": close - 850,
-           "grain": {"direction": "yes", "length": 2, "k": 4}}
+    grain = {"direction": "yes", "length": 2, "k": 4}
+
+    def _book(yes, no):
+        b = OrderBook(market=TICKER)
+        b.apply_snapshot({yes: 20}, {no: 20}, ts=1.0)
+        return b
+    # WO-2026-07-22-E/F: FLIP buys the FAVORED (higher) side in [50,70] —
+    # yes > no -> the favored side is YES. Entry now WAITS FOR THE PILE, so
+    # prime it: a baseline poll in-window (small skew, spot low), then the
+    # entry poll (skew grown to 20, spot +20 so the tape agrees) → yes@60.
+    flip.evaluate(TICKER, {"book": _book(54, 48), "close_ts": close,
+                           "now": close - 835, "spot": 66_000.0,
+                           "grain": grain})
+    ctx = {"book": _book(60, 40), "close_ts": close, "now": close - 820,
+           "spot": 66_020.0, "grain": grain}
     props = flip.evaluate(TICKER, ctx)
-    flip.on_submitted(props[0], "E1", close - 850)
+    flip.on_submitted(props[0], "E1", close - 820)
     event = TICKER.rsplit("-", 1)[0]
     gateway.positions[(event, TICKER, "FLIP")] = 1
     flip.note_fill(TICKER, props[0].side, props[0].price_cents, close - 790)

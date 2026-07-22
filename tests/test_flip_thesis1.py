@@ -31,9 +31,22 @@ def _book(yes=40, no=49):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None):
+def _ctx(book, secs_left=850, grain=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": None}
+            "spot": spot, "grain": grain, "spotlead": None}
+
+
+def _prime_entry(flip, join=60, grain=GRAIN_YES2):
+    """WO-2026-07-22-F 'wait for the pile' (build 58) two-poll prime: a baseline
+    in-window poll (secs_into~65, small skew) then the entry poll (secs_into~80,
+    skew grown >=5, agreeing trend >=$15, favored depth). Returns the entry
+    poll's proposals — props[0] is the favored yes@join ENTRY (target
+    min(90, join+17), stop join-10)."""
+    other = 100 - join
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0, grain=grain))
+    return flip.evaluate(TICKER, _ctx(_book(yes=join, no=other), secs_left=820,
+                                      spot=66020.0, grain=grain))
 
 
 @pytest.fixture(autouse=True)
@@ -55,10 +68,11 @@ def flip(gateway, ledger, surface):
 def _open_position(flip, gateway, ledger, side="yes", entry=60,
                    fill_secs_left=790):
     """An OPEN custody position via the real path: proposal, submit-marker,
-    booked fill. build 57: FLIP buys the FAVORED (higher-priced) side in the
-    band [50,70]; the canonical entry is favored yes @ 60 (stop 50, take 80)."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       grain=GRAIN_YES2))
+    booked fill. build 58: FLIP buys the FAVORED (higher-priced) side in the
+    band [50,70], but only once the PILE has formed — so the entry now needs the
+    two-poll pile prime; the canonical entry is favored yes @ 60 (stop 50,
+    take 77 = min(90, 60+17))."""
+    props = _prime_entry(flip)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", side, "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, side, entry, CLOSE - fill_secs_left)
@@ -247,7 +261,7 @@ def test_f_agrees_conversion_pre_t10(flip, gateway, ledger, caplog):
     o = _open_position(flip, gateway, ledger)            # favored yes @ 60
     props = flip.evaluate(TICKER, _ctx(_book(yes=60), secs_left=780))
     take = next(p for p in props if p.purpose == "EXIT")
-    assert take.price_cents == LaneFlip._take_price(60) == 80   # entry+20
+    assert take.price_cents == LaneFlip._take_price(60) == 77   # entry+17
     flip.on_submitted(take, "OID-T1", CLOSE - 780)
     # a rising favorite well before the curfew: NO hold conversion — the
     # resting +20 take is the exit, the position sells the gouge, never holds
@@ -267,10 +281,15 @@ def test_continuity_logs_agreement_and_never_votes(flip, gateway, ledger,
     import logging
     ledger.record_outcome("KXBTC15M-PRIOR-T99", False)     # prior went NO
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
-        props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40),
-                                           secs_left=850, grain=GRAIN_YES2))
+        # build 58: the entry fires on the two-poll pile prime; the baseline
+        # poll skips (skew not yet grown), the entry poll proposes and logs
+        # continuity ONCE, and a third in-window poll proves once-per-window.
+        flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                                   spot=66000.0, grain=GRAIN_YES2))   # baseline
+        props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=820,
+                                           spot=66020.0, grain=GRAIN_YES2))
         flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=799,
-                                   grain=GRAIN_YES2))      # once per window
+                                   spot=66040.0, grain=GRAIN_YES2))   # once/window
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     lines = [r.message for r in caplog.records if "OPEN_CONTINUITY" in r.message]
     assert len(lines) == 1
@@ -293,11 +312,11 @@ def test_scalp_take_rests_at_the_goal_bounded_move(flip, gateway, ledger):
     floor, −27¢), so the take now floats to the reachable convergence move —
     entry+5 at the 1-lot cap (54¢), banked reliably. The reachable nickel is
     the win convergence actually gives; the +20 was the SOMETIMES."""
-    # build 57: the take is entry + OPEN_GOUGE_C, capped 90 — a favored yes@60
-    # entry rests its take at 80c, sold INTO the pile-in of buyers.
-    take_px = LaneFlip._take_price(60)             # 80
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       grain=GRAIN_YES2))
+    # build 58: the take is entry + OPEN_GOUGE_C, capped 90 — a favored yes@60
+    # entry rests its take at 77c, sold INTO the pile-in of buyers. The entry
+    # fires on the two-poll pile prime.
+    take_px = LaneFlip._take_price(60)             # 77
+    props = _prime_entry(flip)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 60, CLOSE - 790)
@@ -320,10 +339,11 @@ def test_no_new_scalp_entry_at_or_after_t10(flip):
                                       grain=GRAIN_YES2)) == []
     assert flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=550,
                                       grain=GRAIN_YES2)) == []
-    # build 51: entry only in the opening 90s (secs_into 50 here); 601 (299s
-    # into the window) is now past the opening cutoff too
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=850,
-                                       grain=GRAIN_YES2))
+    # build 58: an entry DOES fire inside the pile window [60,180]s once the
+    # pile has formed (two-poll prime) — a fresh window, clear of the pre-cutoff
+    # polls' skew samples.
+    flip.windows.clear()
+    props = _prime_entry(flip)
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
 
 

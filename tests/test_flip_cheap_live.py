@@ -42,6 +42,25 @@ def _ctx(book, secs_left=850, grain=None, spot=None):
             "boundary_lo": None, "boundary_hi": STRIKE}
 
 
+def _prime_favored(flip, side="yes", join=60, grain=GRAIN_YES2):
+    """WO-2026-07-22-F 'wait for the pile' (build 58) two-poll prime: a baseline
+    in-window poll (small skew) then the entry poll (skew grown >=5, agreeing
+    trend >=$15, favored depth). Returns the entry poll's proposals — props[0]
+    is the favored side@join ENTRY. yes favored → spot RISES; no favored →
+    spot FALLS (trend agrees with the favored side)."""
+    other = 100 - join
+    if side == "yes":
+        flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                                   spot=66000.0, grain=grain))
+        return flip.evaluate(TICKER, _ctx(_book(yes=join, no=other),
+                                          secs_left=820, spot=66020.0,
+                                          grain=grain))
+    flip.evaluate(TICKER, _ctx(_book(yes=48, no=54), secs_left=835,
+                               spot=66000.0, grain=grain))
+    return flip.evaluate(TICKER, _ctx(_book(yes=other, no=join),
+                                      secs_left=820, spot=65980.0, grain=grain))
+
+
 @pytest.fixture(autouse=True)
 def funnel(ledger):
     alerts = []
@@ -65,23 +84,26 @@ def _rows(ledger, state):
 
 # ── §2.1: the band admits the FAVORED side ─────────────────────────────────
 def test_band_admits_favored_side(flip):
-    """WO-2026-07-22-E: FLIP buys the FAVORED (higher-priced) side in
-    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70]. A favored no@60 posts as
-    an ENTRY; the confirms (trend/depth) ride the why LOGGED-not-gated."""
+    """WO-2026-07-22-F: FLIP buys the FAVORED (higher-priced) side in
+    [OPEN_ENTRY_MIN_C, OPEN_ENTRY_MAX_C] = [50,70], once the PILE has formed. A
+    favored no@60 (spot FALLING with the no side) posts as an ENTRY through the
+    two-poll pile prime; the why now carries the all-of pile verdict."""
     assert (config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C) == (50, 70)
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=60),
-                                       grain=GRAIN_YES2))
+    props = _prime_favored(flip, side="no", join=60)
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("no", 60, "ENTRY")]
     assert "OPEN50 favored no@60c" in props[0].why
-    assert "confirms logged-not-gated" in props[0].why
+    assert "pile: all-of met" in props[0].why
 
 
 def test_favored_out_of_band_skips(flip):
-    """The band is a real gate: a favored side above 70 (over-priced, the move
-    already fully paid for) SKIPS — no entry, no post."""
-    assert flip.evaluate(TICKER, _ctx(_book(yes=80, no=15),
-                                      grain=GRAIN_YES2)) == []
+    """The band is a real gate: even inside the pile window a favored side above
+    70 (over-priced, the move already fully paid for) SKIPS on price_band — no
+    entry, no post."""
+    flip.evaluate(TICKER, _ctx(_book(yes=72, no=20), secs_left=835,
+                               spot=66000.0, grain=GRAIN_YES2))    # baseline
+    assert flip.evaluate(TICKER, _ctx(_book(yes=80, no=15), secs_left=820,
+                                      spot=66020.0, grain=GRAIN_YES2)) == []
 
 
 # ── WO-2026-07-22-E: the SWING GATE is RETIRED as an entry gate. Swing is
@@ -102,8 +124,7 @@ def test_favored_entry_fires_regardless_of_high_swing_rate(flip, gateway,
     """A seeded HIGH measured took_swing rate does not gate the entry (the gate
     is retired): the favored yes@60 still fires, one lot."""
     _seed_swing_rows(ledger, surface, 60, took=16, total=20)   # 0.80
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
-                                       spot=STRIKE - 120))
+    props = _prime_favored(flip)
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 60, "ENTRY")]
 
@@ -117,8 +138,7 @@ def test_favored_entry_fires_even_on_low_swing_rate(flip, gateway, ledger,
     import logging
     _seed_swing_rows(ledger, surface, 60, took=8, total=20)    # 0.40
     with caplog.at_level(logging.INFO, logger="relay.lane_flip"):
-        props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
-                                           spot=STRIKE - 120))
+        props = _prime_favored(flip)
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 60, "ENTRY")]
     assert not any("OPEN_SWING_REFUSED" in r.message for r in caplog.records)
@@ -130,17 +150,16 @@ def test_favored_entry_fires_below_sample_floor(flip, gateway, ledger,
     merely permissive-below-floor. The favored side fires on a thin all-loss
     sample."""
     _seed_swing_rows(ledger, surface, 60, took=0, total=5)     # thin, all-loss
-    props = flip.evaluate(TICKER, _ctx(_book(), grain=GRAIN_YES2,
-                                       spot=STRIKE - 120))
+    props = _prime_favored(flip)
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 60, "ENTRY")]
 
 
 # ── §3 INSTRUMENT 1: the swing-outcome log ─────────────────────────────────
 def _favored_entry(flip, gateway, ledger, entry=60):
-    """A booked favored-yes OPEN leg (yes@entry, favored over no@40)."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=entry, no=40),
-                                       grain=GRAIN_YES2))
+    """A booked favored-yes OPEN leg (yes@entry, favored over no) — entered
+    through the two-poll pile prime (build 58)."""
+    props = _prime_favored(flip, join=entry)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, "yes", entry, CLOSE - 790)
@@ -148,8 +167,8 @@ def _favored_entry(flip, gateway, ledger, entry=60):
 
 
 def test_swing_win_logs_flip_swing_row(flip, gateway, ledger):
-    """§4: favored entry 60 swings to 80 (take = entry + OPEN_GOUGE_C, cap 90)
-    — FLIP_SWING took_swing=true, +20c."""
+    """§4: favored entry 60 swings to 80 (a +20 gross over the entry) —
+    FLIP_SWING took_swing=true, +20c."""
     _favored_entry(flip, gateway, ledger)
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 80, 1, "PROBE")
     flip.note_exit(TICKER, "yes", 80, CLOSE - 500, count=1)

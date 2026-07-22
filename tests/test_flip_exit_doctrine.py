@@ -74,13 +74,20 @@ def flip(gateway, ledger, surface):
 
 
 def _entry(flip, gateway, ledger, entry=60):
-    """A booked FAVORED-yes OPEN leg (yes@entry favored over no@40) with its
-    take resting — WO-2026-07-22-E re-anchors the old cheap-yes shape."""
+    """A booked FAVORED-yes OPEN leg (yes@entry favored over no) with its take
+    resting. WO-2026-07-22-F: the entry now WAITS FOR THE PILE — a baseline
+    in-window poll (small skew, spot low) then the entry poll (skew grown ≥5,
+    tape +20 agreeing yes, secs_into ~80) that proposes yes@entry."""
+    base = OrderBook(market=TICKER)
+    base.apply_snapshot({entry - 6: 10}, {entry - 12: 10}, ts=1.0)   # skew 6 baseline
+    flip.evaluate(TICKER, {"book": base, "now": CLOSE - 835,
+                           "close_ts": CLOSE, "spot": 66_000.0,
+                           "grain": GRAIN_YES2, "spotlead": None})
     b = OrderBook(market=TICKER)
-    b.apply_snapshot({entry: 10}, {40: 10}, ts=1.0)
-    ctx = {"book": b, "now": CLOSE - 850, "close_ts": CLOSE, "spot": None,
-           "grain": GRAIN_YES2, "spotlead": None}
-    props = flip.evaluate(TICKER, ctx)
+    b.apply_snapshot({entry: 10}, {entry - 20: 10}, ts=1.0)          # skew 20, favored yes
+    props = flip.evaluate(TICKER, {"book": b, "now": CLOSE - 820,
+                                   "close_ts": CLOSE, "spot": 66_020.0,
+                                   "grain": GRAIN_YES2, "spotlead": None})
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, "yes", entry, CLOSE - 790)
@@ -151,14 +158,14 @@ def test_ride_through_the_stop_crosses_out(flip, gateway, ledger):
 # ── Part D, test 5: the swing to the take → TAKE, exit changes don't touch it ─
 def test_swing_to_take_still_fires(flip, gateway, ledger):
     """The take is unaffected by the exit-doctrine changes — a 60¢ favored
-    entry's take now rests at entry + OPEN_GOUGE_C (=80, cap 90) and a fill there
-    realizes +20."""
+    entry's take now rests at entry + OPEN_GOUGE_C (=77, cap 90) and a fill there
+    realizes +17."""
     o = _entry(flip, gateway, ledger, entry=60)
     assert o["take_oid"] == "OID-T1"       # the take rested
-    assert o["take_px"] == 80              # entry + OPEN_GOUGE_C, cap 90
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 80, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 80, CLOSE - 700, count=1)
-    assert flip.windows[TICKER].window_realized == 20   # 80 − 60
+    assert o["take_px"] == 77              # entry + OPEN_GOUGE_C, cap 90
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 77, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 77, CLOSE - 700, count=1)
+    assert flip.windows[TICKER].window_realized == 17   # 77 − 60
 
 
 # ── Part D, test 6: the cut REASON names the momentum stop ─────────────────

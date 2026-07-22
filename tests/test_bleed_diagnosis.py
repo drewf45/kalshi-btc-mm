@@ -46,9 +46,20 @@ def _needle(side="no", fair=90.0):
                   fair_cents=fair, t_remaining=700.0)
 
 
-def _ctx(book, secs_left=850, sl=None, grain=None):
+def _ctx(book, secs_left=850, sl=None, grain=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": sl}
+            "spot": spot, "grain": grain, "spotlead": sl}
+
+
+def _prime_open(flip, entry=60, grain=None):
+    """WO-2026-07-22-F "wait for the pile": an OPEN entry needs two in-window
+    polls that build the pile — a baseline (secs_into~65, small skew, spot low)
+    then the entry poll (secs_into~80, skew grown >=5, |trend|>=15 agreeing with
+    the favored yes side, favored depth >= other). Returns the entry proposals."""
+    flip.evaluate(TICKER, _ctx(_book(yes=54, no=48), secs_left=835,
+                               spot=66000.0))                    # baseline skew 6
+    return flip.evaluate(TICKER, _ctx(_book(yes=entry, no=40), secs_left=820,
+                                      spot=66020.0, grain=grain))
 
 
 @pytest.fixture(autouse=True)
@@ -140,20 +151,18 @@ def test_one_hunt_loss_sits_the_window_out_open_unaffected(flip, gateway,
     flip.note_exit(TICKER, "no", 28, CLOSE - 780, count=1)   # -2c: a loss
     assert flip.windows[TICKER].hunt_lost is True
     assert _hunt_at(flip, 45, 700) == []      # higher, same side — still out
-    # build 51: OPEN enters in the opening 90s; hunt_lost never gates it.
-    # WO-2026-07-22-E: OPEN buys the FAVORED side (yes@60, in [50,70]).
-    open_props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40),
-                                            secs_left=850,
-                                            grain=GRAIN_YES2))
+    # WO-2026-07-22-F: OPEN enters when the PILE forms in [60,180]s; hunt_lost
+    # never gates it. OPEN buys the FAVORED side (yes@60, in [50,70]).
+    open_props = _prime_open(flip, grain=GRAIN_YES2)
     assert [(p.side, p.purpose) for p in open_props] == [("yes", "ENTRY")]
 
 
 # ── BLEED 3: the floor stops slipping ──────────────────────────────────────
 def _open_pos(flip, gateway, ledger, entry=60):
-    # WO-2026-07-22-E: a favored-side (yes@entry over no@40) OPEN position; the
-    # take rests at entry+20 and the momentum stop sits at entry−10.
-    props = flip.evaluate(TICKER, _ctx(_book(yes=entry, no=40), secs_left=850,
-                                       grain=GRAIN_YES2))
+    # WO-2026-07-22-F: a favored-side (yes@entry over no@40) OPEN position built
+    # through the pile prime; the take rests at entry+17 and the momentum stop
+    # sits at entry−10.
+    props = _prime_open(flip, entry=entry, grain=GRAIN_YES2)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, 1, "PROBE")
     flip.note_fill(TICKER, "yes", entry, CLOSE - 790)

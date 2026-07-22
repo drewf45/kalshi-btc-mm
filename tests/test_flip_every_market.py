@@ -44,9 +44,22 @@ def _book(yes=None, no=None, yq=10, nq=10):
     return b
 
 
-def _ctx(book, secs_left=850, grain=None, sl=None):
+def _ctx(book, secs_left=850, grain=None, sl=None, spot=None):
     return {"book": book, "now": CLOSE - secs_left, "close_ts": CLOSE,
-            "spot": None, "grain": grain, "spotlead": sl}
+            "spot": spot, "grain": grain, "spotlead": sl}
+
+
+def _prime(flip, entry_book, *, favored="yes"):
+    """WO-2026-07-22-F two-poll pile prime: a baseline in-window poll (skew 6,
+    secs_into 65) then the entry poll (secs_into 80) whose skew has grown ≥5 and
+    whose tape has moved ≥$15 in the favored direction (rises for yes, falls for
+    no). Returns the entry poll's proposals."""
+    if favored == "yes":
+        b0, s0, s1 = _book(yes=54, no=48), 66_000.0, 66_020.0   # spot rises → agrees yes
+    else:
+        b0, s0, s1 = _book(yes=48, no=54), 66_020.0, 66_000.0   # spot falls → agrees no
+    flip.evaluate(TICKER, _ctx(b0, secs_left=835, spot=s0))
+    return flip.evaluate(TICKER, _ctx(entry_book, secs_left=820, spot=s1))
 
 
 @pytest.fixture(autouse=True)
@@ -66,17 +79,19 @@ def flip(gateway, ledger, surface):
 
 # ── B1: ENTER EVERY MARKET — buy the FAVORED (demanded) side in-band ────────
 def test_b1_biased_open_enters_the_favored_side(flip):
-    """WO-2026-07-22-E — a biased open (yes 60 / no 35) ENTERS the FAVORED
-    (higher-priced, demanded) side (yes@60): the market's own read of
-    direction, where the buyers are. The imbalance IS the setup."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=35)))
+    """WO-2026-07-22-F — a biased open (yes 60 / no 35, skew 25) whose PILE
+    forms ENTERS the FAVORED (higher-priced, demanded) side (yes@60): the
+    market's own read of direction, where the buyers are. The imbalance IS the
+    setup."""
+    props = _prime(flip, _book(yes=60, no=35))
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("yes", 60, "ENTRY")]
 
 
 def test_b1_enters_the_favored_no_side_too(flip):
-    """Orientation-symmetric: yes 34 / no 66 enters the FAVORED NO side @66."""
-    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=66)))
+    """Orientation-symmetric: yes 40 / no 66 (skew 26, a falling tape) enters the
+    FAVORED NO side @66."""
+    props = _prime(flip, _book(yes=40, no=66), favored="no")
     assert [(p.side, p.price_cents, p.purpose) for p in props] == \
         [("no", 66, "ENTRY")]
 
@@ -102,7 +117,7 @@ def test_b1_two_sided_book_required(flip):
 def test_b1_size_cap_is_one_lot(flip):
     """HARD RAIL: the liquidity is provided one lot at a time."""
     assert config.FLIP_SIZE_CAP == 1
-    props = flip.evaluate(TICKER, _ctx(_book(yes=30, no=65)))
+    props = _prime(flip, _book(yes=45, no=65), favored="no")
     assert props and all(p.count == 1 for p in props)
 
 
@@ -126,15 +141,15 @@ def _take_prop(flip, side, entry, *, secs=700, gap=10, count=1):
     return [p for p in props if p.purpose == "EXIT"]
 
 
-def test_b2_favored_entry_rests_entry_plus_20(flip):
-    """WO-2026-07-22-E — buy 60 -> rest at 80: a +20 gouge sold INTO the
+def test_b2_favored_entry_rests_entry_plus_17(flip):
+    """WO-2026-07-22-F — buy 60 -> rest at 77: a +17 gouge sold INTO the
     pile-in of buyers. The take is entry + OPEN_GOUGE_C, the reachable exit
     that fills into demand."""
     exits = _take_prop(flip, "yes", 60)
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(60) == 80
-    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 20
-    assert "open take" in exits[0].reason and "gouge +20" in exits[0].reason
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 77
+    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 17
+    assert "open take" in exits[0].reason and "gouge +17" in exits[0].reason
 
 
 def test_b2_high_entry_take_caps_at_90(flip):
@@ -148,9 +163,9 @@ def test_b2_high_entry_take_caps_at_90(flip):
 
 def test_b2_take_price_is_the_clamp(flip):
     """The pure geometry: min(90, entry + OPEN_GOUGE_C)."""
-    assert LaneFlip._take_price(60) == 80          # entry+20 governs
-    assert LaneFlip._take_price(50) == 70          # entry+20 at the band floor
-    assert LaneFlip._take_price(70) == 90          # entry+20 = the cap, band top
+    assert LaneFlip._take_price(60) == 77          # entry+17 governs
+    assert LaneFlip._take_price(50) == 67          # entry+17 at the band floor
+    assert LaneFlip._take_price(70) == 87          # entry+17, inside the cap
     assert LaneFlip._take_price(75) == 90          # cap governs above
 
 

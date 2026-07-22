@@ -229,6 +229,14 @@ class FlipWindow:
     done: bool = False
     sitout_paged: bool = False   # P13 §4: the sit-out pages ONCE
     spot_ticks: List[Optional[float]] = field(default_factory=list)
+    # WO-2026-07-22-F "WAIT FOR THE PILE": the book skew (|yes_bid − no_bid|)
+    # sampled every poll like spot — per-window, append-only, (secs_into, skew).
+    # The pile is a skew that GROWS inside the [60,180]s window; growth is the
+    # baseline (first tick past PILE_START) subtracted from the current skew.
+    skew_ticks: List = field(default_factory=list)  # (secs_into, skew|None)
+    open_skip_logged: bool = False          # OPEN_SKIP tags ONCE per window
+    last_skip_reason: Optional[str] = None  # the last in-window all-of failure
+    last_skip_vals: Optional[dict] = None
     # P18 HUNT state: the pending confirm and the open hunt positions.
     hunt_pending: Optional[dict] = None            # {side, confirms, last_cost}
     hunts: Dict[str, dict] = field(default_factory=dict)  # side -> position state
@@ -579,6 +587,11 @@ class LaneFlip:
 
         proposals: List[Order] = []
         yes_bid, no_bid = book.best_yes_bid(), book.best_no_bid()
+        # WO-2026-07-22-F: sample the book skew every poll, like spot — the pile
+        # is a skew that GROWS inside the [60,180]s window (§3.2).
+        _skew = (abs(yes_bid - no_bid)
+                 if yes_bid is not None and no_bid is not None else None)
+        w.skew_ticks.append((FLIP_WINDOW_SEC - secs, _skew))
 
         # 1) TAKE QUOTES for held legs (entry+X, passive EXIT — the one exit
         #    proposal; custodian owns it from registration)
@@ -674,24 +687,19 @@ class LaneFlip:
             return proposals               # §3.1: one shot per window
         if secs <= config.OPEN_ENTRY_CUTOFF:
             return proposals               # §3.3: OPEN's window is T-15→T-8
-        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — THE 90-SECOND ENTRY
-        # CUTOFF, the proven bug fix. The tape showed it timestamp by timestamp:
-        # FLIP entering in the first breath of the window (<=OPEN_OPENING_WINDOW_S
-        # into it) WINS — it buys the opening pile-in cheap, holds, and sells to
-        # the middle (the +16/+23 gouges). FLIP entering MID-MARKET gets NUTTED
-        # (the −15/−16 catastrophics): by then the pile-in is over and there is
-        # no reversion to be the other side of. So entry is HARD-CUT at the
-        # opening window: enter as early as possible, and if we have missed the
-        # open, SKIP — never wander in halfway. (secs_into, not secs_left: a
-        # sign error would invert it — see test_entry_cutoff_uses_secs_into.)
+        # WO-2026-07-22-F "WAIT FOR THE PILE" — THE PILE WINDOW. Every logged
+        # entry fired inside the first 57s, before the pile could form (build 51's
+        # "enter as early as possible" was exactly backwards for the favored-side
+        # thesis: a book at 43s has either not moved or already finished). FLIP
+        # now WAITS: it evaluates ONLY in [PILE_START, PILE_END]s. Before the
+        # window it waits silently; after it, the pile never came — the window is
+        # SKIPPED (one OPEN_SKIP line with the last in-window verdict). secs_into,
+        # not secs_left (a sign error would invert it).
         secs_into = FLIP_WINDOW_SEC - secs
-        if secs_into > config.OPEN_OPENING_WINDOW_S:
-            if not w.open_past_opening_logged:
-                w.open_past_opening_logged = True
-                log.info("OPEN_PAST_OPENING %s — %.0fs into window > %ds "
-                         "cutoff: the pile-in is over, no mid-market entry "
-                         "(the −15/−16 class is retired)", market, secs_into,
-                         config.OPEN_OPENING_WINDOW_S)
+        if secs_into < config.OPEN_PILE_START_S:
+            return proposals               # too early — the pile has not had time
+        if secs_into > config.OPEN_PILE_END_S:
+            self._log_open_skip(w, market, secs_into)   # the window was skipped
             return proposals
         if self._net(market, event) != 0:
             return proposals               # R1 WALL: one position at a time
@@ -728,43 +736,55 @@ class LaneFlip:
             return proposals               # true 50/50: no favored side
         side = "yes" if yes_bid > no_bid else "no"   # the FAVORED (demanded) side
         join = yes_bid if side == "yes" else no_bid
-        if not (config.OPEN_ENTRY_MIN_C <= join <= config.OPEN_ENTRY_MAX_C):
-            if not w.open_geometry_logged:
-                w.open_geometry_logged = True
-                log.info("OPEN_FAVORED_OUT_OF_RANGE %s — favored %s %dc outside "
-                         "buyable [%d,%d]: below fair value (the old bug) or the "
-                         "move already fully priced", market, side, join,
-                         config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C)
-            return proposals               # favored side not buyable this window
-        # P27 §2(b): entry proceeds on band + one-shot (the doctrine); the
-        # cell's margin PRINTS on the why either way — the scoreboard informs
-        # daily, governs never.
-        from . import scoring
-        s = scoring.score(self.gateway.ledger, "OPEN",
-                          scoring.price_cell(join))
-        proof = (f"margin {s['margin']:+.2f} (n={s['n']}"
-                 + (", info)" if s["margin"] < 0 else ")"))
-        # P-FLIP-THESIS-1 §1 — THE CONTINUITY SIGNAL, LOG-ONLY.
-        self._log_continuity(w, market, side)
-        grain_note = (f"grain~{g.get('direction')}x{g.get('length')} informs"
-                      if g else "grain~none")
-        # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the ENTRY data point,
-        # stashed for note_fill to copy onto the position (the FLIP_SWING record).
         spot = ctx.get("spot")
         y_depth, n_depth = book.total_bid_depth("yes"), book.total_bid_depth("no")
-        # WO-2026-07-22-E §3 — the confirms, LOGGED NOT GATED. depth_ratio =
-        # held-side depth ÷ other-side (>=1 = demand behind us); trend agreement
-        # = does BTC's opening move point at the favored side. Neither gates yet
-        # (one change, maximally attributable); tomorrow's tape earns them a gate.
         held_d = y_depth if side == "yes" else n_depth
         other_d = n_depth if side == "yes" else y_depth
         depth_ratio = round(held_d / other_d, 2) if other_d else None
         agree = ("trend~flat" if trend_usd == 0
                  else "agree" if ((trend_usd > 0) == (side == "yes"))
                  else "disagree")
+        # WO-2026-07-22-F — THE PILE, and THE ALL-OF GATE (§3.3). skew is the
+        # book's commitment (|yes_bid − no_bid|); growth is how much it has moved
+        # since the pile window opened (the stampede-in-progress, the heart of
+        # the order). Every condition must agree, or the window is SKIPPED and
+        # its reason logged. First failure names the reason.
+        skew = abs(yes_bid - no_bid)
+        base = self._pile_baseline_skew(w)
+        growth = skew - base if base is not None else 0
+        vals = {"skew": skew, "growth": growth,
+                "trend": round(trend_usd), "ratio": depth_ratio}
+        reason = None
+        if not (config.OPEN_ENTRY_MIN_C <= join <= config.OPEN_ENTRY_MAX_C):
+            reason = "price_band"                    # favored side out of [50,70]
+        elif abs(trend_usd) < config.OPEN_MIN_TREND_USD:
+            reason = "flat_tape"                     # the tape is not moving
+        elif (trend_usd > 0) != (side == "yes"):
+            reason = "trend_disagree"                # spot and book disagree
+        elif skew < config.OPEN_MIN_SKEW_C:
+            reason = "skew_low"                      # the pile has not formed
+        elif skew > config.OPEN_MAX_SKEW_C:
+            reason = "skew_high"                     # late — the move is priced
+        elif growth < config.OPEN_SKEW_GROWTH_C:
+            reason = "no_growth"                     # static skew, not a stampede
+        elif depth_ratio is not None and depth_ratio < 1.0:
+            reason = "ratio_low"                     # thin behind the favored side
+        if reason is not None:
+            w.last_skip_reason, w.last_skip_vals = reason, vals
+            return proposals                         # SKIP — the pile disagrees
+        # ALL SIX AGREE — the pile is forming NOW and every signal points the
+        # same way. Build the entry. The margin PRINTS on the why (P27 §2b).
+        from . import scoring
+        s = scoring.score(self.gateway.ledger, "OPEN",
+                          scoring.price_cell(join))
+        proof = (f"margin {s['margin']:+.2f} (n={s['n']}"
+                 + (", info)" if s["margin"] < 0 else ")"))
+        self._log_continuity(w, market, side)
+        grain_note = (f"grain~{g.get('direction')}x{g.get('length')} informs"
+                      if g else "grain~none")
         w.entry_meta[side] = {
             "spot": spot, "secs_into": round(secs_into, 1),
-            "spread": abs(yes_bid - no_bid), "cheap_bid": join,
+            "spread": skew, "cheap_bid": join,
             "yes_depth": y_depth, "no_depth": n_depth,
             "open_trend_usd": round(trend_usd, 1),
             "depth_ratio": depth_ratio}
@@ -777,17 +797,40 @@ class LaneFlip:
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=(config.OPEN_ENTRY_MIN_C, config.OPEN_ENTRY_MAX_C),
             rest_fp=book.best_fp(side),
-            # WO-2026-07-22-E: the favored side, the +20 target, the −10 stop,
-            # and the confirms (ratio, trend agreement) — all on one line so
-            # tomorrow's tape can attribute which component carried the trade.
+            # WO-2026-07-22-F: the pile fired — the favored side, the skew AND
+            # its in-window growth, the moving/agreeing tape, the +17 target and
+            # −10 stop, all on one line so the tape shows every condition met.
             why=f"OPEN50 favored {side}@{join}c (spot {spot_s}, into "
-                f"{int(secs_into)}s, book y{yes_bid}/n{no_bid} sprd"
-                f"{abs(yes_bid - no_bid)} depth {y_depth}/{n_depth} "
-                f"ratio {dr_s} trend ${trend_usd:+.0f} {agree}·logged) "
+                f"{int(secs_into)}s, book y{yes_bid}/n{no_bid} skew{skew}"
+                f"/grew{growth} depth {y_depth}/{n_depth} "
+                f"ratio {dr_s} trend ${trend_usd:+.0f} {agree}) "
                 f"target {target}c (+{target - join}, cap 90) · stop "
                 f"{join - config.OPEN_MOMENTUM_STOP_C}c · {proof} · "
-                f"confirms logged-not-gated · {grain_note}"))
+                f"pile: all-of met · {grain_note}"))
         return proposals
+
+    @staticmethod
+    def _pile_baseline_skew(w) -> Optional[int]:
+        """WO-2026-07-22-F: the skew when the pile window opened — the first
+        sampled skew at/after OPEN_PILE_START_S. Skew GROWTH is measured against
+        it, so a static skew (a decision that already happened) reads growth 0."""
+        for t_in, sk in w.skew_ticks:
+            if t_in >= config.OPEN_PILE_START_S and sk is not None:
+                return sk
+        return None
+
+    def _log_open_skip(self, w, market: str, secs_into: float) -> None:
+        """WO-2026-07-22-F §3.5: a window that reached PILE_END without an entry
+        was SKIPPED — log it ONCE with the last in-window verdict. Skips are the
+        primary data product of this build; they are what tune the thresholds."""
+        if w.open_skip_logged:
+            return
+        w.open_skip_logged = True
+        r = w.last_skip_reason or "no_pile"
+        v = w.last_skip_vals or {}
+        log.info("OPEN_SKIP %s t=%ds reason=%s skew=%s growth=%s trend=$%s "
+                 "ratio=%s", market, int(secs_into), r, v.get("skew"),
+                 v.get("growth"), v.get("trend"), v.get("ratio"))
 
     @staticmethod
     def _take_price(entry: int) -> int:

@@ -36,6 +36,17 @@ def ctx(book, secs_left=850, spot=None, grain=None, spotlead=None):
             "spot": spot, "grain": grain, "spotlead": spotlead}
 
 
+def _prime(flip, entry=60, grain=None):
+    """WO-2026-07-22-F "wait for the pile": an OPEN entry now needs two in-window
+    polls that build the pile — a baseline poll (secs_into~65, small skew, spot
+    low) then the entry poll (secs_into~80, skew grown >=5, |trend|>=15 agreeing
+    with the favored side, favored depth >= other). Returns the entry proposals."""
+    flip.evaluate(TICKER, ctx(flip_book(yes=54, no=48), secs_left=835,
+                              spot=66000.0))                     # baseline skew 6
+    return flip.evaluate(TICKER, ctx(flip_book(yes=entry, no=40, yq=14, nq=10),
+                                     secs_left=820, spot=66020.0, grain=grain))
+
+
 @pytest.fixture(autouse=True)
 def funnel(ledger):
     alerts = []
@@ -63,7 +74,7 @@ def test_second_open_fill_merges_and_take_sells_two(flip, gateway, ledger):
     """The tape's shape, fixed: fill ×1, take rests ×1, a SECOND same-side
     fill books → ONE custody bucket count=2 @ blended entry, the stale ×1
     take is cancelled, and the re-proposed take sells 2. Never w.fills."""
-    props = flip.evaluate(TICKER, ctx(flip_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     assert [(p.side, p.purpose) for p in props] == [("yes", "ENTRY")]
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
@@ -84,9 +95,9 @@ def test_second_open_fill_merges_and_take_sells_two(flip, gateway, ledger):
     props3 = flip.evaluate(TICKER, ctx(flip_book(), secs_left=760))
     take2 = next(p for p in props3 if p.purpose == "EXIT")
     assert take2.count == 2                      # the whole bucket flips
-    # WO-2026-07-22-E: the re-proposed take is entry + OPEN_GOUGE_C (cap 90)
-    # on the blended merged entry (45 -> 65), size-independent
-    assert take2.price_cents == LaneFlip._take_price(45)   # entry+20 on the merge
+    # WO-2026-07-22-F: the re-proposed take is entry + OPEN_GOUGE_C (cap 90)
+    # on the blended merged entry (45 -> 62), size-independent
+    assert take2.price_cents == LaneFlip._take_price(45)   # entry+17 on the merge
     assert _uncovered_rows(ledger) == []         # covered every cycle
 
 
@@ -105,7 +116,7 @@ def test_second_hunt_fill_merges(flip):
 def test_lean_two_lot_single_fill_exits_full_size(flip, gateway, ledger):
     """A single ×2 fill (the earned-tier shape) opens custody at count=2
     and the take sells 2 — count rides the fills wiring end to end."""
-    props = flip.evaluate(TICKER, ctx(flip_book(), grain=GRAIN_YES2))
+    props = _prime(flip, grain=GRAIN_YES2)
     flip.on_submitted(props[0], "OID-E1", CLOSE - 800)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 2, "PROBE")
     flip.note_fill(TICKER, "yes", 40, CLOSE - 790, count=2)
