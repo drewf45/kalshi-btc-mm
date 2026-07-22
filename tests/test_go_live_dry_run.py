@@ -136,9 +136,11 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
             "SELECT window_pnl_cents, fills_pnl_cents, source, deferred"
             " FROM window_econ WHERE market=?", (TICKER,)).fetchone()
         assert row == (3, 3, "venue", "")      # broker truth == fills truth
-        assert any("📊" in m and "+$0.03" in m and "rate 0/" in m
+        # KAL-50/50 Stage 0.1: the per-lane summary names the lanes settled
+        # (broker window pnl still the honest number) instead of a global rate.
+        assert any("📊" in m and "+$0.03" in m and "lanes F" in m
                    for m in engine.telegram_sent)
-        assert engine.econ.streak == 0
+        assert engine.econ.halted_lanes() == set()   # a win arms nothing
     finally:
         failures._ledger = None
         failures._alert_fn = None

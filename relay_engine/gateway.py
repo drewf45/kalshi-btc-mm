@@ -231,8 +231,13 @@ class Gateway:
                                 f"crossfire on purpose={order.purpose}; CUT only")
 
         if not risk_reducing:
-            if self.entries_halted_reasons:
-                raise WallRejection("ENTRIES_HALTED", ",".join(sorted(self.entries_halted_reasons)))
+            # KAL-50/50 Stage 0.1: the wall is PER-LANE. A rate halt scoped to
+            # one lane ("RATE_HALT:FLIP") blocks only that lane's entries; every
+            # other reason (and a bare "RATE_HALT", the legacy global) blocks all
+            # lanes. FLIP's losing streak must never halt F, the earner.
+            blocking = self.entries_halted_for(order.lane)
+            if blocking:
+                raise WallRejection("ENTRIES_HALTED", ",".join(sorted(blocking)))
             if self.in_backoff(order.market):
                 # P7: a venue-rejected market rests before it is re-asked
                 raise WallRejection("REJECT_BACKOFF",
@@ -402,6 +407,21 @@ class Gateway:
         if self.filled_counts[order_id] >= order.count:
             self.resting.pop(order_id, None)
         return order
+
+    # KAL-50/50 Stage 0.1: reasons of the form "RATE_HALT:<lane>" are lane-
+    # scoped; everything else (LANE_KILL:*, ORIENTATION_DIVERGENCE, cash-fatal,
+    # a bare RATE_HALT) is global and blocks every lane.
+    RATE_HALT_SCOPE_PREFIX = "RATE_HALT:"
+
+    def _reason_blocks_lane(self, reason: str, lane) -> bool:
+        if reason.startswith(self.RATE_HALT_SCOPE_PREFIX):
+            return reason[len(self.RATE_HALT_SCOPE_PREFIX):] == lane
+        return True
+
+    def entries_halted_for(self, lane) -> set:
+        """The subset of active halt reasons that block THIS lane's entries."""
+        return {r for r in self.entries_halted_reasons
+                if self._reason_blocks_lane(r, lane)}
 
     def halt_entries(self, reason: str) -> None:
         self.entries_halted_reasons.add(reason)

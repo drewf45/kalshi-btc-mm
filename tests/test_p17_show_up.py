@@ -53,11 +53,14 @@ def test_late_settlement_marks_receipt_and_retroactive_halt(engine):
         engine.ledger.record_fill(mkt, "F", "yes", "CUSTODIAN_EXIT", 51, 1, "PROBE")
         # settle 20 minutes AFTER close: late by the 300s rule
         engine.settle_traded_market(mkt, settled_yes=False, now=close + 1200)
-    assert engine.econ.halted() is True
+    # KAL-50/50 Stage 0.1: the rate halt is per-lane now — both windows traded
+    # only F, so F's own streak trips (F trades on for no other lane's sake, and
+    # here it is F itself that bled). The retroactive page names the lane.
+    assert engine.econ.halted_lanes() == {"F"}
     late_receipts = [m for m in engine.telegram_sent
                      if "📊" in m and "(settled late — books healed)" in m]
     assert len(late_receipts) == 2
-    assert any(m.startswith("⛔ RATE HALT (retroactive:")
+    assert any(m.startswith("⛔ F RATE HALT (retroactive:")
                for m in engine.telegram_sent)
 
 

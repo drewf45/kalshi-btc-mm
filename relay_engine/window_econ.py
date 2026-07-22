@@ -45,6 +45,18 @@ STREAK_KEY = "two_strike_streak"  # consecutive streak — reporting only (B3)
 STRIKES_KEY = "two_strike_markets"
 OUTCOMES_KEY = "rate_halt_outcomes"   # B3: rolling last-M window outcomes
 HALT_REASON = "RATE_HALT"
+# KAL-50/50 Stage 0.1: the rate halt is now PER-LANE. Each lane keeps its own
+# rolling window of fills-truth outcomes ("rate_halt_outcomes:FLIP") and trips
+# a scoped gateway reason ("RATE_HALT:FLIP") that halts ONLY that lane —
+# FLIP's losing streak no longer halts F, the earner. The account-value
+# window_pnl (broker truth) stays the cash-integrity unit and the summary line;
+# only the HALT DECISION moves to per-lane fills P&L (the sole source that can
+# attribute a window to a lane at all).
+LANES_HALTED_KEY = "rate_halt_lanes"  # JSON list of currently lane-halted lanes
+
+
+def _lane_outcomes_key(lane: str) -> str:
+    return f"{OUTCOMES_KEY}:{lane}"
 
 ECON_SCHEMA = """
 CREATE TABLE IF NOT EXISTS window_econ (
@@ -110,13 +122,23 @@ class WindowEcon:
     def halted(self) -> bool:
         return self.ledger.get_state(HALT_KEY) == "1"
 
+    def halted_lanes(self) -> set:
+        """KAL-50/50 Stage 0.1: lanes currently under their own scoped rate halt."""
+        return set(json.loads(self.ledger.get_state(LANES_HALTED_KEY) or "[]"))
+
     def restore_halt_on_boot(self) -> bool:
-        """P8 §2.3: restarts and redeploys do NOT clear the halt."""
+        """P8 §2.3: restarts and redeploys do NOT clear the halt. Both the
+        legacy global halt and every per-lane scoped halt survive the boot."""
+        restored = False
         if self.halted():
             self.gateway.halt_entries(HALT_REASON)
+            restored = True
+        for lane in sorted(self.halted_lanes()):
+            self.gateway.halt_entries(f"{HALT_REASON}:{lane}")
+            restored = True
+        if restored:
             log.warning("RATE HALT restored from DB — /reset_halt is the only key")
-            return True
-        return False
+        return restored
 
     def restore_open_brackets_on_boot(self) -> int:
         """P17 §1.3: an open bracket (close_value NULL) survives a restart —
@@ -184,7 +206,8 @@ class WindowEcon:
                       fills_pnl_cents: int, lanes_active: str = "",
                       fills_count: int = 0,
                       now: Optional[float] = None, source: str = "paper",
-                      deferred: str = "", late: bool = False) -> Optional[int]:
+                      deferred: str = "", late: bool = False,
+                      per_lane: Optional[dict] = None) -> Optional[int]:
         """After settlement confirmed + fills booked. Returns window_pnl_cents.
         account_value_cents=None = live read failed — the close DEFERS (the
         settlement is already booked once; the bracket completes on the next
@@ -196,7 +219,8 @@ class WindowEcon:
         if account_value_cents is None:
             self.pending_closes[market] = {
                 "bracket": br, "fills_pnl": fills_pnl_cents,
-                "lanes": lanes_active, "fills": fills_count, "t0": now}
+                "lanes": lanes_active, "fills": fills_count, "t0": now,
+                "per_lane": per_lane}
             log.warning("WINDOW_ECON close %s DEFERRED — account value unreadable",
                         market)
             return None
@@ -239,7 +263,8 @@ class WindowEcon:
                                "close": account_value_cents,
                                "pnl": window_pnl, "lanes": lanes_active,
                                "fills": fills_count}))
-        self._apply_streak(market, window_pnl, account_value_cents, late=late)
+        self._apply_streak(market, window_pnl, account_value_cents, late=late,
+                           per_lane=per_lane)
         return window_pnl
 
     def flush_deferred(self, account_value_cents: int, source: str,
@@ -259,13 +284,21 @@ class WindowEcon:
             self.close_bracket(market, account_value_cents, p["fills_pnl"],
                                lanes_active=p["lanes"], fills_count=p["fills"],
                                now=now, source=source,
-                               deferred=f"close+{now - p['t0']:.0f}s")
+                               deferred=f"close+{now - p['t0']:.0f}s",
+                               per_lane=p.get("per_lane"))
             done += 1
         return done
 
     # ── §2: THE RATE HALT (A-PLAYER B3; P17 §2.1: late truths count) ───
     def _apply_streak(self, market: str, window_pnl: int, book_cents: int,
-                      late: bool = False) -> None:
+                      late: bool = False, per_lane: Optional[dict] = None) -> None:
+        # KAL-50/50 Stage 0.1: with per-lane fills P&L available, the halt is
+        # decided PER LANE so one lane's losses never freeze another. The
+        # legacy global path (no attribution) is preserved unchanged below.
+        if per_lane:
+            self._apply_streak_per_lane(market, window_pnl, book_cents,
+                                        per_lane, late)
+            return
         # the rolling window of settled traded markets — per-market BROKER
         # P&L is the unit (Engineer: settled-only; never in-flight marks)
         outcomes = json.loads(self.ledger.get_state(OUTCOMES_KEY) or "[]")
@@ -300,6 +333,46 @@ class WindowEcon:
                           f"markets negative: {named}",
                           outcomes=outcomes, book_cents=book_cents)
 
+    def _apply_streak_per_lane(self, market: str, window_pnl: int,
+                               book_cents: int, per_lane: dict,
+                               late: bool = False) -> None:
+        """KAL-50/50 Stage 0.1: each lane runs its own N-of-M rate halt on its
+        own fills-truth outcomes. A lane that trips halts ONLY itself; the
+        others (F above all) trade on. The per-market broker window_pnl still
+        prints as the honest summary line."""
+        sign = "+" if window_pnl >= 0 else ""
+        late_s = " (settled late — books healed)" if late else ""
+        self.telegram.alert(
+            f"📊 {market} {sign}${window_pnl / 100:.2f} · "
+            f"book ${book_cents / 100:.2f} · "
+            f"lanes {','.join(sorted(per_lane))}{late_s}")
+        halted = self.halted_lanes()
+        for lane in sorted(per_lane):
+            pnl = int(per_lane[lane])
+            key = _lane_outcomes_key(lane)
+            outcomes = json.loads(self.ledger.get_state(key) or "[]")
+            outcomes.append({"market": market, "pnl": pnl})
+            outcomes = outcomes[-config.RATE_HALT_WINDOW:]
+            self.ledger.set_state(key, json.dumps(outcomes))
+            losses = [o for o in outcomes if o["pnl"] < 0]
+            if len(losses) >= config.RATE_HALT_LOSSES and lane not in halted:
+                halted.add(lane)
+                self.ledger.set_state(LANES_HALTED_KEY,
+                                      json.dumps(sorted(halted)))
+                self.gateway.halt_entries(f"{HALT_REASON}:{lane}")
+                named = ", ".join(f"{o['market']} {o['pnl']}c" for o in losses)
+                retro = (f"⛔ {lane} RATE HALT (retroactive: {market} settled "
+                         f"late): " if late else f"⛔ {lane} RATE HALT: ")
+                self.telegram.alert(
+                    f"{retro}{len(losses)} of last {len(outcomes)} {lane} "
+                    f"markets negative — {named} · other lanes trade on · "
+                    f"reply /reset_halt to resume")
+                failures.fail("RATE_HALT",
+                              f"{lane}: {len(losses)} of last {len(outcomes)} "
+                              f"settled {lane} markets negative: {named}",
+                              lane=lane, outcomes=outcomes,
+                              book_cents=book_cents)
+
     def reset_halt(self, confirmed_by: str = "telegram") -> str:
         """Drew's word alone. Re-enables ENTRIES only — it cannot place, amend,
         or cancel anything (single-gateway law).
@@ -315,13 +388,19 @@ class WindowEcon:
         keep = (CASH_FATAL_REASON, CASH_PROMPT_REASON, "DEGRADE_LADDER")
         halted_reasons = self.gateway.entries_halted_reasons
         clearable = [r for r in halted_reasons if r not in keep]
-        if not self.halted() and not clearable:
+        lane_halts = self.halted_lanes()
+        if not self.halted() and not lane_halts and not clearable:
             return "no halt active"
         # rate-halt DB flag: cleared only when the rate reason is present
         self.ledger.set_state(HALT_KEY, "0")
         self._set_streak(0)
         self.ledger.set_state(STRIKES_KEY, "[]")
         self.ledger.set_state(OUTCOMES_KEY, "[]")   # B3: the window restarts clean
+        # KAL-50/50 Stage 0.1: clear every per-lane window too (the scoped
+        # RATE_HALT:<lane> gateway reasons lift with resume_entries_all below).
+        for lane in lane_halts:
+            self.ledger.set_state(_lane_outcomes_key(lane), "[]")
+        self.ledger.set_state(LANES_HALTED_KEY, "[]")
         cleared = self.gateway.resume_entries_all(keep=keep)
         self.surface.write_row("ECON", "ENGINE", f"halt-{int(time.time())}",
                                "HALT_RESET",

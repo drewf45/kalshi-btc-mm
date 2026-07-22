@@ -262,6 +262,16 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "CORRECT. The fix is QUARANTINE (divergent=1, re-book at fills-"
                  "truth) never /confirm_cash (that bakes the error in forever) "
                  "(WO-2026-07-22)")
+    lines.append("  PER-LANE RATE HALT (KAL-50/50 Stage 0.1): the "
+                 f"{config.RATE_HALT_LOSSES}-of-{config.RATE_HALT_WINDOW} rate "
+                 "halt is decided PER LANE on per-lane fills P&L — a lane that "
+                 "trips halts ONLY itself (RATE_HALT:<lane> at the wall) and "
+                 "every other lane trades on. FLIP's losing streak no longer "
+                 "halts F, the earner. The account-value window pnl stays the "
+                 "cash-integrity unit and the summary line; the legacy global "
+                 "halt (no attribution) is preserved for callers without "
+                 "per-lane truth. LANE_KILL / cash-fatal / orientation stops "
+                 "stay global")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

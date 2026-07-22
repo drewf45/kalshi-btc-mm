@@ -699,6 +699,11 @@ class ShadowEngine:
         stops = []
         if self.ledger.get_state(HALT_KEY) == "1":
             stops.append(("two-strike", HALT_REASON in wall))
+        econ = getattr(self, "econ", None)
+        if econ is not None:
+            for lane in sorted(econ.halted_lanes()):
+                stops.append((f"{lane} rate-halt",
+                              f"{HALT_REASON}:{lane}" in wall))
         if self.ledger.get_state(CASH_FATAL_KEY) is not None:
             stops.append(("cash-fatal",
                           self.cash.fatal and CASH_FATAL_REASON in wall))
@@ -1413,7 +1418,7 @@ class ShadowEngine:
         self.econ.close_bracket(
             market, val, fills_pnl,
             lanes_active=",".join(sorted(per_lane)), fills_count=fills_count,
-            now=now, source=src, late=late)
+            now=now, source=src, late=late, per_lane=per_lane)
 
     def settlement_sweep(self, now=None) -> int:
         """Poll settlement for markets with open brackets whose close passed."""

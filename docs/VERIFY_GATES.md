@@ -2529,6 +2529,86 @@ one row named OUT OF BOUND; quarantine it → book delta → 0, no new cash_move
 above), Part B of WO-2026-07-21 (margin-gate SUPPRESS, per-lane rate halt), and
 the treasury-waterfall asymmetry remain the Saturday/#1 backlog.
 
+## KAL — THE 50/50 BUILD, STAGE 0.1 — THE PER-LANE RATE HALT (build 56)
+
+**The master spec (builds 52→58) opens a strategy pivot — buy at 50/50 and sell
+UP, retiring the cheap-side FLIP thesis — explicitly Drew-overridden onto a
+Wednesday against the banked-Saturday law.** It ships in stages, each separately
+attributable on tape. This build is **Stage 0 (Clear the Deck)**, marked "first,
+no exceptions." Its one code deliverable is **0.1 — the per-lane rate halt**, the
+hard prerequisite: *FLIP's losses currently halt F, the only earner.*
+
+**Read-rule at source (all TRUE):**
+- The rate halt lived in `window_econ.py:_apply_streak` — outcomes were a rolling
+  window of **per-market** broker P&L (`window_pnl`, the account-value delta),
+  and on trip it called `self.gateway.halt_entries(HALT_REASON)` — a single
+  **global** gateway reason. TRUE: a FLIP-losing market contributed to a halt
+  that then stopped **all** entries, F included.
+- `gateway.py`'s entry wall (the `if not risk_reducing:` branch) blocked an order
+  whenever `entries_halted_reasons` was non-empty — **lane-blind**, though
+  `order.lane` was right there. TRUE.
+- Per-lane P&L was **already computed** at the settlement call site:
+  `shadow_runner.py` builds `per_lane` (lane→pnl) and does
+  `fills_pnl = sum(per_lane.values())` immediately before `close_bracket`. The
+  attribution the halt needs already existed; it was just thrown away. TRUE.
+- The broker `window_pnl` (account-value delta) **cannot** be attributed to a
+  lane — only fills/settlements carry the lane. TRUE, and it is *why* the
+  per-lane unit must be fills-truth while the broker number stays the
+  cash-integrity unit and the summary line.
+
+**Built (0.1):**
+- **Lane-aware wall.** `gateway.entries_halted_for(lane)` returns the reasons
+  that block a given lane: a reason of the form `RATE_HALT:<lane>` blocks only
+  that lane; a bare `RATE_HALT` (legacy global) and **every** non-rate reason
+  (LANE_KILL:*, ORIENTATION_DIVERGENCE, cash-fatal, DEGRADE_LADDER) block all
+  lanes. The wall now raises `ENTRIES_HALTED` only when `entries_halted_for`
+  is non-empty. LANE_KILL keeps its colon suffix but is untouched (it does not
+  match the `RATE_HALT:` prefix) — no incidental change.
+- **Per-lane halt decision.** `_apply_streak` gains an optional `per_lane`; when
+  present (the live path always provides it) it dispatches to
+  `_apply_streak_per_lane`, which runs the same N-of-M streak **per lane** on
+  `rate_halt_outcomes:<lane>` and, on trip, halts only `RATE_HALT:<lane>` and
+  pages `RATE_HALT` naming the lane ("other lanes trade on"). When `per_lane` is
+  absent the **legacy global path is byte-identical** — every existing
+  direct-`_apply_streak` test still asserts the old global halt.
+- **Persistence + reset.** Lane halts live in `rate_halt_lanes`;
+  `restore_halt_on_boot` re-adds each scoped reason after a redeploy;
+  `reset_halt` clears every lane window and scoped reason (its "no halt active"
+  guard now also sees lane halts). The ops stop-audit reports each lane halt.
+- The threading: `close_bracket(..., per_lane=)`, carried through `pending_closes`
+  and `flush_deferred`, and passed from `settle_traded_market`.
+
+**Stage 0.2 — quarantine the residual bad settlement row — is OPERATIONAL, Drew's
+to run on Render (I cannot reach the live DB).** `/confirm_cash` made the trading
+book honest ($34.61 = venue) but the bad row still sits in `settlements`, so
+lifetime P&L stays inflated; build 55's guards stop the *next* one, not this one.
+The tool shipped in build 55 — `scripts/cash_diverge_diagnose.py --db <db>` to
+name the row, then `--quarantine <MARKET> --correct-pnl <CENTS>` (divergent=1,
+re-book at fills-truth). **NEVER `/confirm_cash`** (doctrine 16). **Stage 0.3 —
+repurpose `OPEN_TREND_SKIP_USD` from a dead skip-gate into the direction signal —
+ships with Stage 1's 50/50 entry**, where the computation becomes the signal;
+touching it alone in Stage 0 would be a dead half-change, so it is deferred to
+that build by design.
+
+**HARD RAIL:** F byte-identical; no Kelly / sizing / cash-threshold / envelope
+change (those are Stage 1). The change is additive at the wall and dispatched at
+`_apply_streak` — the legacy global halt is fully preserved. New acceptance
+`test_per_lane_halt.py` (8 tests: the wall scopes RATE_HALT and leaves F free;
+LANE_KILL/orientation stay global; end-to-end submit lets F through while FLIP is
+blocked; a FLIP streak halts FLIP only with F untouched; F never arms from its
+own wins; the lane halt persists across a boot; reset clears the lane window; the
+legacy global path is unchanged). 3 settlement-path laws re-anchored to the
+per-lane form (p17 retroactive halt is now `RATE_HALT:F`; the go-live receipt
+prints `lanes F` not `rate 0/N`; the stop-audit tolerates a stub without econ).
+Suite 676 · preflight 23/23.
+
+**Watch tomorrow (Stage 0 acceptance):** a FLIP rate halt does NOT stop F (Part 9
+#7); the boot tape states the per-lane rail; the ops pack names any lane halt.
+The Stage 1 lane (50/50 entry + disaster envelope), the recovery-surface backtest
+(Stage 1.5), and Gate A (n≥20, Wilson LB > break-even) are the next rungs — and
+**the Stage 2→3 treasury-waterfall prerequisite remains absolute: no extra lot
+until wins and losses hit the book on the same footing.**
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
