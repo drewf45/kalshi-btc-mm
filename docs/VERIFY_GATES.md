@@ -2380,6 +2380,70 @@ B2 per-lane rate halt (FLIP's losses must not halt F); B3 calibrate
 before any sizing. Standing ceiling unchanged: the treasury waterfall asymmetry
 (wins scraped 35%, losses booked 100%) remains the #1 pre-scaling fix.
 
+## WO-2026-07-21-B — HOT FIX: the reboot bypassed the 4-minute hold (build 54)
+
+**A1 confirmed on tape first** (10:17 PM: `salvage floor → 28c … −8¢ + fee 0¢`
+vs last night's −18c/−16c crossfire — loss cut ~55%, maker, no dump). Then two
+observed bugs.
+
+**Read-rule at source (all TRUE):**
+- **Finding 1 (root)** — the self-heal (`_heal_uncovered`) recovered the entry
+  price from the fills DB but rebuilt the record with **`fill_ts=0.0`**; the
+  hard-hold guard `age = now − fill_ts` then read ~1.78×10⁹ s (**~56 years**), so
+  `age < FLIP_NO_SELL_S` was False and the 4-minute hold — plus the poll resets —
+  was **BYPASSED on every reboot** (fails DANGEROUS: a missing timestamp
+  *maximised* apparent age). Pre-existing since build 53; A1 only made the
+  resulting exit small enough (−8c) to become legible.
+- **Finding 2** — `FLIP_FLOOR_BREACH` fired on a correct 8c salvage:
+  `floor_expected = entry − OPEN_UNDETERMINED_BAND[0]` = 36−35 = 1c, threshold
+  6c, actual 8c → breach. The alarm's expectation and A1's `OPEN_SALVAGE_BUDGET_C`
+  weren't pinned to one source (the exact drift A1 flagged); the message still
+  said "the −15c salvage assumption".
+
+**Finding 1 (fix):** `_heal_uncovered` now selects the fill **timestamp** with the
+price (one extra column) and uses it for `fill_ts`; if unrecoverable it **fails
+SAFE** — `fill_ts = now` (treat the adopted position as FRESH → full 4-minute
+protection), **never 0.0** — and pages. `now` is threaded evaluate →
+`_check_uncovered` → `_heal_uncovered`. The audit item (`_log_swing_outcome`'s
+other `fill_ts` default) is an instrument, not a guard, but its 0.0 default was
+retired to `now` too — the *class* of bug (0.0 on a timestamp) is gone.
+
+**Finding 2 (fix):** `floor_expected = max(entry − OPEN_UNDETERMINED_BAND[0],
+OPEN_SALVAGE_BUDGET_C)` — the breach test now polices the budget the engine
+actually operates under, so a correctly-bounded salvage never trips it and a
+genuine over-budget cut still does. The message quotes the live constant
+(`{OPEN_SALVAGE_BUDGET_C}c`), never a stale "−15c".
+
+**Finding 3 (corrects build-53 A4):** do NOT silence the uncovered page — on the
+10:16 tape it was the true signal that caught the reboot orphan. SPLIT it: the
+**routine 1-lot cover-pending** state (held 1, covered 0, take proposed — the
+`FLIP_SIZE_CAP=1` post-fill look) is `FLIP_UNCOVERED_EXPECTED` at DEBUG, no page;
+a genuine gap still pages `FLIP_UNCOVERED_LEG`; and the reboot orphan (no
+in-memory record) additionally pages **`FLIP_ORPHAN_ADOPTED`** from
+`_heal_uncovered` with the recovered entry + fill_ts. A 1-lot self-net void looks
+routine at first (EXPECTED) and reveals itself by escalating to the paged FLATTEN.
+
+**HARD RAIL:** F byte-identical; no Kelly / cash / rate-halt / sizing change; both
+fixes are minimal + reversible (a one-column query + a fail-safe default + an
+arithmetic pin + a tag split). 4 test-laws re-anchored (the no-record shapes page
+`FLIP_ORPHAN_ADOPTED`; the void's first look is EXPECTED so its page is the
+FLATTEN; the floor_expected is pinned to the budget) + new acceptance
+`test_reboot_hold.py` (6 tests: orphan adopts the real fill_ts; the reboot orphan
+honors the 4-min hold; unrecoverable ts fails safe + pages; a bounded salvage
+does NOT breach; a genuine over-budget cut still does with the live constant; the
+orphan page carries entry + fill_ts). Suite 661 · preflight 23/23. **Watch
+tomorrow (acceptance):** force a reboot with a live FLIP position → adopted with a
+real fill_ts, no exit until 240s after the TRUE fill; `FLIP_ORPHAN_ADOPTED` pages
+with entry + fill_ts; `FLIP_UNCOVERED_EXPECTED` no longer pages on ordinary
+entries; zero `FLIP_FLOOR_BREACH` on exits at/inside the budget; the breach
+message quotes the live constant; F byte-identical.
+
+**Adversary's class item (noted for the audit):** what else fails dangerous on a
+missing default? `0.0`/`None` on a *timestamp* silently maximises age. And any
+historical FLIP loss that followed a boot is now suspect data — do not read it as
+thesis failure. **Part B of WO-2026-07-21 (margin-gate SUPPRESS, per-lane halt)
+and the treasury-waterfall asymmetry remain the standing Saturday/#1 items.**
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -104,7 +104,11 @@ def test_192145_self_net_void_flattens_not_rides(flip, gateway, ledger,
             break
     assert flatten is not None and flatten.crossfire   # market close, NOW
     assert flatten.side == "yes" and flatten.count == 1
-    assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 1     # paged once
+    # WO-2026-07-21-B Finding 3 (build 54): a 1-lot void LOOKS like the routine
+    # cover-pending state at first (held 1 > covered 0, take proposed) → demoted
+    # to FLIP_UNCOVERED_EXPECTED (debug), so it does NOT page at detect. It
+    # reveals itself by ESCALATING — the FLATTEN is the real alarm and it pages.
+    assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 0     # looked routine; the FLATTEN is the page
     assert _rows(ledger, "FLIP_UNCOVERED_FLATTENED") == 1
     assert any("FLIP_UNCOVERED_FLATTENED" in a for a in funnel)
 

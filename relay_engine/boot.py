@@ -244,6 +244,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "20c crossfires. Every OPEN entry prints trend_usd + depth_"
                  "ratio (record-only, calibrate Saturday); the routine "
                  "cover-pending leg no longer pages (WO-2026-07-21-FLIP-SELECTION)")
+    lines.append("  FLIP REBOOT-HOLD (build 54): an adopted (reboot-orphan) "
+                 "position recovers its REAL fill_ts from the DB — the old 0.0 "
+                 "default read as ~56yr old and BYPASSED the 4-min hold every "
+                 "restart; a missing ts fails SAFE (fresh, full hold) and PAGES "
+                 "FLIP_ORPHAN_ADOPTED. FLOOR_BREACH is pinned to the salvage "
+                 "budget (no false alarm on a correct bounded loss); the routine "
+                 "1-lot cover-pending is FLIP_UNCOVERED_EXPECTED (debug), the "
+                 "orphan pages (WO-2026-07-21-B)")
     lines.append("  NARRATION LAW: every ENTRY carries a non-empty why — "
                  "the lanes still print their arithmetic, the wall stopped "
                  "grading it (P27 §2c); brain loaded at boot or explained "

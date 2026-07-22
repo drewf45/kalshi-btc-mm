@@ -193,7 +193,9 @@ def test_loser_cleared_at_endgame_logs_ok_true(flip, gateway, ledger):
     assert swing["took_swing"] is False and swing["salvaged"] is True
     audit = _rows(ledger, "FLIP_LOSER_CUT")[0]
     assert audit["ok"] is True and audit["loss_cents"] == 5
-    assert audit["floor_expected"] == 39 - config.OPEN_UNDETERMINED_BAND[0]
+    # build 54 Finding 2: floor_expected is pinned to the salvage budget floor
+    assert audit["floor_expected"] == max(39 - config.OPEN_UNDETERMINED_BAND[0],
+                                          config.OPEN_SALVAGE_BUDGET_C)
 
 
 def test_loser_past_the_floor_flags_ok_false_and_pages(flip, gateway,

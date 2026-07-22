@@ -618,7 +618,8 @@ class LaneFlip:
         # 1.7) FLIP-COUNT-1 §2.3 + WO-UNCOVERED-FLATTEN: every booked-held
         # contract is covered by a CONFIRMED resting exit, this cycle's
         # proposal, or a flatten — never bare, never a ride to settlement.
-        self._check_uncovered(w, market, proposals, book=book, event=event)
+        self._check_uncovered(w, market, proposals, book=book, event=event,
+                              now=now)
 
         # 2) ENTRIES — curfew, trips, sit-out, R1-flat, the OPEN setup
         past_curfew = secs <= FLIP_CURFEW
@@ -1475,7 +1476,7 @@ class LaneFlip:
 
     def _check_uncovered(self, w: FlipWindow, market: str,
                          proposals: List[Order], book=None,
-                         event: str = None) -> None:
+                         event: str = None, now: float = None) -> None:
         """FLIP-COUNT-1 §2.3 + WO-UNCOVERED-FLATTEN: COVER OR FLATTEN,
         NEVER BARE. A leg is not healed until a resting exit CONFIRMS in
         the book against the booked-held count (the 192145 leg rode
@@ -1571,23 +1572,39 @@ class LaneFlip:
                 # opens record
                 if side not in w.uncovered_paged:
                     w.uncovered_paged.add(side)
-                    # WO-2026-07-21-FLIP-SELECTION A4 (build 53): a cover INTENT
-                    # exists (the take proposed but its oid has not confirmed) —
-                    # with FLIP_SIZE_CAP=1 this is the routine post-fill state,
-                    # and paging it on EVERY entry trained the eye to scroll past
-                    # the ONE real naked leg (it is how A5 got missed for 24h).
-                    # Demote to INFO here; the RECONCILE still runs and the
-                    # ESCALATION below (retry → FLATTEN) carries the real page if
-                    # the cover genuinely never confirms.
-                    intent = ((o is not None and o.get("take_proposed"))
-                              or (h is not None and h.get("take_proposed")))
-                    failures.fail(
-                        "FLIP_UNCOVERED_LEG",
-                        f"{market} {side}: held {held} > covered {covered}"
-                        + (" (cover proposed, awaiting confirm)" if intent else ""),
-                        fatal=False, alert=not intent, market=market, side=side,
-                        held=held, covered=covered,
-                        buckets=";".join(provenance) or "none")
+                    # WO-2026-07-21-B Finding 3 (build 54): SPLIT the tag (this
+                    # corrects build-53 A4 — do NOT silence the orphan; on the
+                    # 10:16 tape the uncovered page was the TRUE signal that
+                    # caught the reboot bug). A cover INTENT (the take proposed,
+                    # its oid not yet confirmed — the routine 1-lot cap=1 state)
+                    # is FLIP_UNCOVERED_EXPECTED at DEBUG, no page. The ORPHAN
+                    # (booked-held with NO in-memory record — the reboot case) is
+                    # paged by _heal_uncovered below, WITH the recovered entry +
+                    # fill_ts, so the tripwire that would have caught Finding 1
+                    # keeps firing.
+                    intent_1lot = (held == 1 and covered == 0 and (
+                        (o is not None and o.get("take_proposed"))
+                        or (h is not None and h.get("take_proposed"))))
+                    if intent_1lot:
+                        # the routine 1-lot cover-pending state (cap=1) — DEBUG,
+                        # no page (build-53 A4's intent, corrected: only the
+                        # ROUTINE case is demoted, never the genuine gap/orphan).
+                        log.info("FLIP_UNCOVERED_EXPECTED %s %s: held 1 > "
+                                 "covered 0 — cover proposed, awaiting confirm "
+                                 "(by design under FLIP_SIZE_CAP=1)",
+                                 market, side)
+                    else:
+                        # a GENUINE uncovered leg (held>1, a partial-cover gap,
+                        # OR a no-record orphan) — the real alarm, PAGE. The
+                        # orphan case ALSO gets FLIP_ORPHAN_ADOPTED (with the
+                        # recovered entry+fill_ts) from _heal_uncovered below.
+                        from . import failures
+                        failures.fail(
+                            "FLIP_UNCOVERED_LEG",
+                            f"{market} {side}: held {held} > covered {covered}",
+                            fatal=False, alert=True, market=market, side=side,
+                            held=held, covered=covered,
+                            buckets=";".join(provenance) or "none")
                 self._reconcile_side(w, market, side)
                 still = self._booked_held(market, side)
                 if still is None or still <= 0:
@@ -1595,7 +1612,7 @@ class LaneFlip:
                     w.heal_attempts.pop(side, None)
                     w.heal_covered.pop(side, None)
                     continue
-                self._heal_uncovered(w, market, side, still)
+                self._heal_uncovered(w, market, side, still, now=now)
                 w.heal_attempts[side] = 1
             elif esc == 1:
                 # §2.2 the ONE retry: reconcile again, re-propose fresh
@@ -1688,37 +1705,62 @@ class LaneFlip:
                     self.gateway.cancel(oid)
 
     def _heal_uncovered(self, w: FlipWindow, market: str, side: str,
-                        gap: int) -> None:
+                        gap: int, now: float = None) -> None:
         """§3.3: cover the uncovered — revive the closed record (its own
         entry price keeps realization honest) or open a fresh one at the
         ledger's booked entry, sized to the gap. WO-UNCOVERED-FLATTEN:
         this is INTENT only — the side is healed when the exit CONFIRMS,
         never here."""
+        now = now if now is not None else time.time()
         w.late_fills.pop(side, None)          # absorbed into the healed leg
         for bucket in (w.hunts, w.opens):
             rec = bucket.get(side)
-            if rec is not None:               # revive the closed record
+            if rec is not None:               # revive the closed record (NOT an orphan)
                 rec.update(done=False, take_proposed=False, take_oid=None,
                            count=gap, defer_polls=0)
                 log.warning("FLIP_UNCOVERED self-heal %s %s: revived closed "
                             "record x%d @ %dc", market, side, gap,
                             rec["entry"])
                 return
+        # THE REBOOT ORPHAN: a broker position with NO in-memory record. Recover
+        # its entry AND its fill timestamp from the fills DB.
         entry = None
+        fill_ts_db = None
         ledger = getattr(self.gateway, "ledger", None) if self.gateway else None
         if ledger is not None:
             row = ledger.db.execute(
-                "SELECT price_cents FROM fills WHERE market=? AND lane='FLIP'"
+                "SELECT price_cents, ts FROM fills WHERE market=? AND lane='FLIP'"
                 " AND side=? AND action='ENTRY' AND settled=0"
                 " ORDER BY id DESC LIMIT 1", (market, side)).fetchone()
-            entry = row[0] if row else None
+            if row:
+                entry, fill_ts_db = row[0], row[1]
+        # WO-2026-07-21-B Finding 1 (build 54) — THE ROOT FIX. The old default
+        # `fill_ts=0.0` made `age = now − 0.0` ≈ 56 YEARS, so the 4-minute hard-
+        # hold guard (age < FLIP_NO_SELL_S) evaluated False and the hold — plus
+        # the collapse/catastrophe poll resets — was BYPASSED on EVERY reboot:
+        # the opening pile-in the hold exists to ride got cut on the first poll.
+        # A missing timestamp must fail SAFE (MORE protection), never zero: if
+        # the true fill_ts is unrecoverable, treat the adopted position as FRESH
+        # (fill_ts=now → full 4 minutes), and PAGE (unknown age is never silent).
+        ts_recovered = fill_ts_db is not None and fill_ts_db > 0
+        fill_ts = fill_ts_db if ts_recovered else now
         w.opens[side] = {"entry": entry if entry is not None else 50,
-                         "fill_ts": 0.0, "count": gap, "take_oid": None,
+                         "fill_ts": fill_ts, "count": gap, "take_oid": None,
                          "take_proposed": False, "collapse_polls": 0, "catastrophe_polls": 0,
                          "det_ts": None, "entry_oid": None,
                          "defer_polls": 0}
-        log.warning("FLIP_UNCOVERED self-heal %s %s: opened fresh record "
-                    "x%d @ %sc (booked entry)", market, side, gap, entry)
+        # Finding 3: the orphan adoption is the tripwire — PAGE with the
+        # recovered entry + fill_ts (fresh-fallback loudly flagged).
+        from . import failures
+        age_s = round(now - fill_ts, 1)
+        failures.fail(
+            "FLIP_ORPHAN_ADOPTED",
+            f"{market} {side}: broker position with NO in-memory record adopted "
+            f"x{gap} @ {entry}c — fill_ts "
+            + (f"RECOVERED (age {age_s}s, 4-min hold honored)" if ts_recovered
+               else "UNRECOVERABLE → fallback=now (treated FRESH, full hold)"),
+            fatal=False, alert=True, market=market, side=side,
+            entry=entry, ts_recovered=ts_recovered, age_s=age_s)
 
     def _log_continuity(self, w: FlipWindow, market: str, side: str) -> None:
         """P-FLIP-THESIS-1 §1: the crowd wants the last regime to continue
@@ -1801,7 +1843,15 @@ class LaneFlip:
         except Exception:
             return   # the instrument never blocks custody accounting
         if gross < 0:
-            floor_expected = entry - config.OPEN_UNDETERMINED_BAND[0]
+            # WO-2026-07-21-B Finding 2 (build 54): the breach test must police
+            # the budget the engine ACTUALLY operates under. The old expectation
+            # (entry − band-floor 35) computed 1c for a 36c entry, so a perfectly-
+            # bounded 8c salvage (A1's OPEN_SALVAGE_BUDGET_C) tripped the alarm on
+            # CORRECT behaviour — the exact "pin the budget to one source" risk
+            # A1 flagged, drifted immediately. Pin the expectation to the salvage
+            # budget so FLOOR_BREACH means a cut past the DECLARED budget.
+            floor_expected = max(entry - config.OPEN_UNDETERMINED_BAND[0],
+                                 config.OPEN_SALVAGE_BUDGET_C)
             loss = -gross
             ok = loss <= floor_expected + config.FLIP_FLOOR_SLIP_CENTS
             try:
@@ -1817,11 +1867,10 @@ class LaneFlip:
                 from . import failures
                 failures.fail(
                     "FLIP_FLOOR_BREACH",
-                    f"{market}: loser cut {loss}c past the band-floor "
-                    f"expectation {floor_expected}c (+"
-                    f"{config.FLIP_FLOOR_SLIP_CENTS}c slip) — the -15c "
-                    "salvage assumption is BREAKING; the EV table inverts "
-                    "if losers ride",
+                    f"{market}: loser cut {loss}c past the declared budget "
+                    f"{floor_expected}c (+{config.FLIP_FLOOR_SLIP_CENTS}c slip) "
+                    f"— the {config.OPEN_SALVAGE_BUDGET_C}c salvage assumption is "
+                    "BREAKING; the EV table inverts if losers ride",
                     fatal=False, alert=True, market=market, entry=entry,
                     cut_price=exit_px, loss=loss)
 
@@ -1843,9 +1892,13 @@ class LaneFlip:
         # (mark at/above basis or through F's band) — instrument it at the
         # conversion mark; the settlement print covers the rest (§1).
         if mark is not None:
-            self._log_swing_outcome(market, o["entry"], int(mark),
-                                    now if now is not None else time.time(),
-                                    o.get("fill_ts", 0.0),
+            _now = now if now is not None else time.time()
+            # WO-2026-07-21-B Finding 1 audit: fail SAFE on a missing fill_ts —
+            # `_now` (secs_to_swing 0), never 0.0 (~56 years). This is an
+            # INSTRUMENT (secs_to_swing), not a guard, but the class of bug
+            # (0.0 default on a timestamp) is retired here too.
+            self._log_swing_outcome(market, o["entry"], int(mark), _now,
+                                    o.get("fill_ts", _now),
                                     held_to_settle=True, o=o)
 
     def held(self, market: str) -> Dict[str, dict]:
