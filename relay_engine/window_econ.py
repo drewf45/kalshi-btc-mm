@@ -253,7 +253,7 @@ class WindowEcon:
                 market, fills_pnl_cents)
             if phantom:
                 self.telegram.alert(
-                    f"🧾 DIVERGENT settlement {market}: {phantom:+d}c "
+                    f"🧾 DIVERGENT settlement {market}: {phantom:+.1f}c "
                     f"quarantined from the book — fills-truth "
                     f"{fills_pnl_cents}c booked instead (E1 traces the source)")
 

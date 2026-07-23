@@ -13,13 +13,19 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 
-def to_yes_terms(side: str, price_cents: int) -> int:
+def to_yes_terms(side: str, price_cents: float) -> float:
     """THE canonical YES-terms conversion. side in {"yes","no"}; returns the
-    equivalent YES price in cents. The only side-conversion function in the tree."""
+    equivalent YES price in cents. The only side-conversion function in the tree.
+
+    WO-2026-07-23-F Part 1: PRECISION-PRESERVING. The venue ticks in 0.1c and
+    fills carry exact half/tenth-cents (fills.price_cents is REAL). The old
+    int()/truncation understated the cost basis and overstated profit on every
+    fractional fill (42% of them, always the same direction). Carry the fraction;
+    the settlement path rounds ONCE at the book (book_cents' rule), never here."""
     if side == "yes":
-        return int(price_cents)
+        return float(price_cents)
     if side == "no":
-        return 100 - int(price_cents)
+        return 100.0 - float(price_cents)
     raise ValueError(f"unknown side: {side!r}")
 
 

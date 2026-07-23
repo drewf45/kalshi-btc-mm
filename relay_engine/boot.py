@@ -378,6 +378,17 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "the /scoreboard DISPLAY shows breakeven_HONEST (the pack proved "
                  "the stale model wrong on 26/29 cells); score()/tier stay stale "
                  "because tier feeds custody cut-scaling — trading byte-identical")
+    lines.append("  TRUNCATION FIX (WO-2026-07-23-F Part 1, build 71): the venue "
+                 "ticks in 0.1c and 42% of fills carry a fraction; to_yes_terms "
+                 "used int(), which truncated the cost basis toward zero — "
+                 "understating cost, OVERSTATING profit, always the same "
+                 "direction. It now carries the fraction (float), record_"
+                 "settlement stores it at full precision, and book_cents rounds "
+                 "ONCE at the sum (its existing rule). Accounting only — no "
+                 "trading change; F byte-identical. Expect F's lifetime P&L to "
+                 "DROP ~100c as the correction lands (that IS the fix, not a "
+                 "regression). Orderbook LEVEL bucketing (book.py:63) is LEFT "
+                 "truncating — a stated depth heuristic, not a settlement number")
     lines.append("EXECUTION E1: P&L books from CONFIRMED fills + exchange "
                  "outcome only (window-econ is a check that self-heals to "
                  "fills-truth, never a source); every settlement writes a "

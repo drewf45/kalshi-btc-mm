@@ -247,7 +247,8 @@ def test_divergent_settlement_quarantined_and_rebooked_at_fills_truth(
         " WHERE market=? ORDER BY id", (TICKER,)).fetchall()
     assert rows[0] == ("F", 103, 1)                   # tagged, excluded
     assert rows[1][0] == "ECON" and rows[1][1] == 4 and rows[1][2] == 0
-    assert any("DIVERGENT settlement" in a and "+99c" in a for a in tg.alerts)
+    # WO-2026-07-23-F Part 1: the quarantine delta now carries the 0.1c precision
+    assert any("DIVERGENT settlement" in a and "+99.0c" in a for a in tg.alerts)
     assert ledger.db.execute(
         "SELECT COUNT(*) FROM failures WHERE why_tag='WINDOW_ECON_DIVERGENCE'"
     ).fetchone()[0] == 1

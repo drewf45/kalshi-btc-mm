@@ -261,10 +261,13 @@ class Ledger:
         book_cents) and re-book the window at fills-truth — never silently
         trust a broker number the fills cannot reproduce (the 99c phantom
         that armed the deny-reboot breach). Returns the cents removed."""
-        booked = int(self.db.execute(
+        # WO-2026-07-23-F Part 1: booked and fills_pnl now carry the venue's 0.1c
+        # fractions, so compare within a sub-cent tolerance — an exact `==` on
+        # floats would spuriously quarantine a settlement that already agrees.
+        booked = float(self.db.execute(
             "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements"
             " WHERE market=? AND divergent=0", (market,)).fetchone()[0])
-        if booked == fills_pnl_cents:
+        if abs(booked - fills_pnl_cents) < 0.5:
             return 0        # settlement already equals fills-truth: no dispute
         self.db.execute("UPDATE settlements SET divergent=1 WHERE market=?",
                         (market,))
@@ -425,7 +428,11 @@ class Ledger:
         self.set_state("cell_backfill_done", "1")
         return wrote
 
-    def record_settlement(self, market: str, lane: str, pnl_cents: int, detail: str = "") -> None:
+    def record_settlement(self, market: str, lane: str, pnl_cents: float, detail: str = "") -> None:
+        # WO-2026-07-23-F Part 1: pnl_cents may carry a fraction (the venue's
+        # 0.1c tick, preserved through to_yes_terms). It is stored at full
+        # precision — SQLite keeps a REAL in the INTEGER-affinity column
+        # losslessly — and book_cents rounds ONCE when it sums, never per-row.
         # WO-2026-07-22 Finding (build 55): record_settlement was a bare INSERT
         # with no idempotency guard (unlike record_outcome's ON CONFLICT) and no
         # net-vs-gross check — a settle-thread retry or a reboot mid-settle could
@@ -440,8 +447,8 @@ class Ledger:
             " AND divergent=0", (market, lane)).fetchone()[0]
         if already:
             log.warning("SETTLE_DUP_IGNORED %s %s: a settlement already booked "
-                        "(pnl was %+dc) — ignoring the double (idempotent)",
-                        market, lane, pnl_cents)
+                        "(pnl was %+.1fc) — ignoring the double (idempotent)",
+                        market, lane, float(pnl_cents))
             return
         #   (2) NET-VS-GROSS: a binary position's NET settlement is bounded by
         #       [−cost, count·100 − cost]. A pnl outside that (gross booked as
@@ -451,7 +458,9 @@ class Ledger:
             "SELECT COALESCE(SUM(price_cents*count),0), COALESCE(SUM(count),0)"
             " FROM fills WHERE market=? AND lane=? AND action='ENTRY'",
             (market, lane)).fetchone()
-        cost, cnt = int(row[0]), int(row[1])
+        # WO-2026-07-23-F Part 1: cost keeps its fraction too (the entry basis is
+        # subpenny), so the net-vs-gross bound stays exact rather than truncating.
+        cost, cnt = float(row[0]), int(row[1])
         if cnt > 0:
             m = config.SETTLE_NOTIONAL_SLIP_C
             lo, hi = -cost - m, cnt * 100 - cost + m
@@ -459,9 +468,10 @@ class Ledger:
                 from . import failures
                 failures.fail(
                     "SETTLE_NOTIONAL_BREACH",
-                    f"{market} {lane}: settlement {pnl_cents:+d}c OUTSIDE the "
-                    f"net bound [{lo},{hi}]c (cost {cost}c, {cnt} lots) — a "
-                    "gross-as-net or win-as-loss booking; the book would inflate",
+                    f"{market} {lane}: settlement {pnl_cents:+.1f}c OUTSIDE the "
+                    f"net bound [{lo:.1f},{hi:.1f}]c (cost {cost:.1f}c, {cnt} "
+                    "lots) — a gross-as-net or win-as-loss booking; the book "
+                    "would inflate",
                     fatal=False, alert=True, market=market, lane=lane,
                     pnl_cents=pnl_cents, cost=cost, count=cnt)
         self.db.execute(

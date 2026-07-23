@@ -3335,6 +3335,37 @@ input fix, but a real-money halt change with a wide test blast radius, its own b
 `NET_RISK_CROSS_LANE_CAP` now the per-lane at-risk walls exist; migrate `SALVAGE_ADJ_MIN_N` to the honest
 value pack-side) — low priority. All deferred with intent, not dropped.
 
+## WO-2026-07-23-F Part 1 — FIX THE TRUNCATION (build 71)
+
+**Ships ALONE and first** — it corrupts the exact settlement numbers the size test would be judged on.
+
+**Read-rule at source (TRUE):** `to_yes_terms` (`book.py:16-23`) used `int()` — `int(97.3)=97`,
+`100-int(97.3)=3` (true 2.7). Called at `surface.py:159` inside the settlement P&L. The venue ticks in
+0.1c and fills carry exact fractions (`fills.price_cents` is REAL; 42% of today's fills fractional), so
+the truncation understated the cost basis and OVERSTATED profit — **always in the same direction**. It
+has exactly one caller (`surface.py:159`), so making it precision-preserving is surgical.
+
+**Built:**
+- `to_yes_terms(side, price_cents: float) -> float` — carries the fraction (`float`, `100.0 - float`),
+  no truncation.
+- `record_settlement(pnl_cents: float)` — accepts the fraction; the net-vs-gross bound keeps `cost` as
+  `float` (the entry basis is subpenny); the `%d` receipts became `%.1f`; the fractional pnl is stored at
+  full precision (SQLite keeps a REAL in the INTEGER-affinity column, the same pattern `fills.price_cents`
+  already uses). `book_cents` sums at full precision and rounds ONCE — unchanged, and now correct.
+- `quarantine_divergent_settlements` compares booked vs fills within a 0.5c tolerance (an exact `==` on
+  floats would spuriously quarantine an agreeing settlement); the DIVERGENT alert prints `%.1f`.
+
+**Stated choice (WO "separately decide"):** the orderbook LEVEL bucketing (`book.py:apply_snapshot/
+apply_delta`, `int(price)`) is **left truncating** — a depth heuristic that merges 97.1/97.3/97.5 into one
+level, deliberately NOT a settlement number. Flagged as an explicit choice, not a side effect.
+
+**Acceptance:** #1 no `int()` on a venue price in the settlement path (only `to_yes_terms`, now float); #2
+settlement P&L carries fractions and `book_cents` rounds once (`test_truncation.py` — a no@97.3 win books
+2.7c not 3, and two of them book 5.4 → round-once); #3 **F's lifetime P&L will drop ~100c and stay
+stable** — the correction landing, not a regression (Adversary's note); #5 **F byte-identical** (accounting
+only, no trading path touched). New `test_truncation.py` (3); `test_cash_fatal1` divergent-alert updated to
+the `.1f` precision. Suite 747 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
