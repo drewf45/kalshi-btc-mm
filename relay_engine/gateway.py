@@ -287,6 +287,20 @@ class Gateway:
                     order.price_cents = rested
                     order.rest_fp = None   # the fp was the decision-time touch; re-derive
 
+        # WO-2026-07-23-C Bug 2: the SELL-SIDE mirror — a maker EXIT that would
+        # post at/through the bid is re-priced to rest above it, so it is never
+        # refused `post only cross` (the reject that failed the cover and
+        # summoned the flatten). This lives OUTSIDE the `not risk_reducing` block
+        # ABOVE because an EXIT *is* risk-reducing — the very orders that needed
+        # it were skipping the entry-only rest-back. Lane F is EXCLUDED: its
+        # custodian salvage posts a maker sell too, and this build must leave F
+        # byte-identical (acceptance #6) — F keeps its maker→crossfire-after-R
+        # salvage escalation untouched. CUTs (crossfire) cross on purpose.
+        if (config.live_submit_enabled() and order.action == "sell"
+                and not order.crossfire and book is not None
+                and order.lane != "F"):
+            order.price_cents = self._rest_forward_price(order, book)
+
         # Rate governor: entries need a token; risk reduction is always allowed
         # (it may overdraw the bucket, loudly).
         if not self.governor.take():
@@ -571,6 +585,38 @@ class Gateway:
                 f"below band floor {band_lo}c — a maker who can't rest in-band "
                 "waits, never chases into the cross")
         return max(1, rest)
+
+    def _rest_forward_price(self, order: Order, book: OrderBook) -> int:
+        """WO-2026-07-23-C Bug 2 — the SELL-SIDE MIRROR of `_rest_back_price`.
+
+        An EXIT is `action="sell"`, `crossfire=False` → posted `post_only=True`.
+        Entries were re-priced to rest passively; exits never were, so a maker
+        sell priced at/through the bid (a stop into a falling book) was refused
+        `post only cross` — which failed the cover, expired the grace, and
+        summoned the custodian flatten that dumped below the stop. The floor
+        (Part 2) bounded the damage; THIS is the cause.
+
+        Same doctrine, opposite sign: the sell rests STRICTLY ABOVE the best bid
+        (never crosses down into it) and at/above the derived ask (passive at the
+        offer). If it cannot rest in-band it raises REST_BACK_SKIP — a maker who
+        can't get a passive fill waits, never posts into a cross."""
+        held_bid = (book.best_yes_bid() if order.side == "yes"
+                    else book.best_no_bid())
+        opp_bid = (book.best_no_bid() if order.side == "yes"
+                   else book.best_yes_bid())
+        ask = (100 - opp_bid) if opp_bid is not None else None
+        rest = order.price_cents
+        if ask is not None:
+            rest = max(rest, ask)               # at/above the derived ask
+        if held_bid is not None:
+            rest = max(rest, held_bid + 1)      # strictly above the bid: never crosses down
+        if order.band is not None and rest > order.band[1]:
+            raise WallRejection(
+                "REST_BACK_SKIP",
+                f"{order.lane} {order.market} {order.side}: rest-forward {rest}c "
+                f"above band ceiling {order.band[1]}c — a maker who can't rest "
+                "in-band waits, never chases into the cross")
+        return min(99, rest)
 
     def _wall_taker_entry(self, order: Order, book: OrderBook) -> None:
         """REJECT_TAKER_ENTRY (P2/P3): an entry may never take. Crossfire on an

@@ -3193,6 +3193,54 @@ pre-existing property (the venue read was global too), benign (the quarantine no
 fills), not the entry-notional phantom this build removes. Flagged for a follow-up (make `window_pnl`
 per-market = `fills_pnl`). New acceptance `test_cold_read_phantom.py` (3). Suite 730 · preflight 23/23.
 
+## WO-2026-07-23-C — FOUR BUGS FROM A COLD READ (build 68)
+
+**Bug 2 — the find — SHIPPED (root cause).** Read-rule TRUE: `gateway.py` rest-back (`:282-284`) is gated
+`purpose=="ENTRY" and action=="buy"`; an EXIT is `action="sell", crossfire=False` → `post_only=True`
+(`:335`) with no re-pricing, and `_rest_back_price` is buy-side only. So a maker exit priced at/through
+the bid (a stop into a falling book) was refused `post only cross` → the cover never confirmed → grace
+expired → the custodian flattened at market below the stop. **The custodian fix and the Part 2 floor were
+both downstream; this is the cause.** Fix: `_rest_forward_price` — the sell-side mirror (rest STRICTLY
+above the bid, at/above the derived ask, or `REST_BACK_SKIP`), wired into `submit` **outside** the `not
+risk_reducing` block (an EXIT *is* risk-reducing — the very orders that needed it were skipping the
+entry-only rest-back). **Lane F EXCLUDED** (acceptance #6): F's custodian salvage posts a maker sell too,
+and this build leaves F byte-identical — F keeps its maker→crossfire-after-R salvage escalation. Honest
+follow-up: F's salvage exhibits the same Bug 2; extending the mirror to F is a separate, F-touching build.
+
+**Bug 1 — SHIPPED, with a read-rule divergence.** The WO's suggested fix (`if w.posted.get(side): return`)
+**already exists** at `lane_flip.py:737` (`if w.opens or w.posted or w.fills: return proposals`), *before*
+the `:761` wall — so "OPEN: none" is FALSE. The real gap: `w.posted` is set only by `on_submitted`, which
+**never runs when a submit raises** — a `VENUE_AMBIGUOUS` reject (`gateway.py:347`) whose order actually
+landed. Neither the intent guard nor `_market_net` (the FILLED map) then knows about the resting order, so
+OPEN re-proposed over it. Fix (the WO's structural Bug 1b): `_market_has_live_order` counts the gateway's
+own resting ENTRY orders; `_market_entry_blocked` now blocks on `net != 0 OR a live resting entry` —
+closing it independent of the intent callback. FLIP-only; F untouched.
+
+**§5 BANKED LAW:** *never gate an action on FILLED state when the action can precede the fill.* Gate on
+INTENT (the order was submitted) and clear it on fill/cancel/reject. `state.traded` (F) and `w.posted`
+(HUNT) were the correct pattern; the order-aware wall extends it to OPEN. Three bugs in three days shared
+this shape (double-sell, exit clamp, OPEN triple-entry).
+
+**Bug 3 — halt on money, not count: DEFERRED (again), per the WO's own gate.** `window_econ.py:316/329`
+still counts negatives. The WO conditions the re-tune on "verify on the next tape that `window_pnl` and
+`fills_pnl` now agree" — a LIVE-tape check not performable from here. Structurally, build 67 made
+`window_pnl` ledger-sourced and the per-lane halt already read fills-truth, so the input is ready; the
+change (sum over `RATE_HALT_WINDOW_N=8` < `-RATE_HALT_DRAWDOWN_C=40`) is a real-money halt-logic change
+with a wide test blast radius, warranting its own build once Drew confirms the tape. Ship #4, held.
+
+**Bug 4 — `ACCOUNT_VALUE_UNREADABLE` ×42: INVESTIGATION, not performable here.** `shadow_runner.py:735`
+`venue.get_balance()` fails; the exact-42 regularity two days running is a pattern (rate limit / timeout /
+endpoint condition), diagnosable only against the live venue this environment can't reach. Lower impact
+post-67 (brackets no longer depend on it) but it still gates `standing_reconcile`, now the only venue
+cross-check — flagged so a silently-stopped reconcile can't hide a real divergence.
+
+**Acceptance:** #1 zero `post only cross` on exits — the mechanism is removed (sell rest-back); #2 zero
+windows with >1 live OPEN entry/side — the order-aware wall enforces it; #3 `FLIP_UNCOVERED_FLATTENED`
+drops toward zero — follows from #1; #6 **F byte-identical** — verified (F excluded from the sell
+rest-back; nothing else touches F). #4/#5 (window/fills agree; halt on money) ride Bug 3, deferred. New
+acceptance `test_maker_rest_back.py` (sell mirror + F exclusion + CUT unchanged) and `test_pile_gate.py`
+(order-aware wall). Suite 737 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

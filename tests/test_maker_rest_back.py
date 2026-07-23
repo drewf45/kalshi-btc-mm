@@ -109,6 +109,57 @@ def test_cut_still_crosses_deliberately(live):
     assert live._placed[0]["post_only"] is False        # crosses on purpose
 
 
+# ── WO-2026-07-23-C Bug 2: the SELL-SIDE mirror (exits rest, never cross) ──
+def _exit(lane, side="yes", price=45, band=None, crossfire=False):
+    return Order(lane=lane, event="EV1", market="M1", side=side, action="sell",
+                 price_cents=price, count=1, size_tier=config.TIER_PROBE,
+                 purpose="EXIT", band=band, crossfire=crossfire,
+                 reason=f"{lane} maker exit")
+
+
+def test_rest_forward_lifts_a_stop_above_the_bid(gateway):
+    # a stop selling yes@41 into a book bid 45 / ask 50 would CROSS (41<=45) —
+    # re-priced to rest at/above the ask (50), strictly above the bid.
+    assert gateway._rest_forward_price(_exit("FLIP", price=41), _book(45, 50)) == 50
+
+
+def test_rest_forward_strictly_above_the_bid_on_a_crossed_book(gateway):
+    # crossed book (bid 96, no_bid 5 -> ask_yes 95): rest strictly above the bid
+    assert gateway._rest_forward_price(_exit("FLIP", price=90), _book(96, 5)) == 97
+
+
+def test_rest_forward_leaves_a_passive_take_alone(gateway):
+    # a take already above the ask (sell yes@77, bid 45, ask 50) stays put
+    assert gateway._rest_forward_price(_exit("FLIP", price=77), _book(45, 50)) == 77
+
+
+def test_live_exit_rests_forward_not_into_the_cross(live):
+    # the bug: a maker EXIT posted post_only at a crossing price → refused. Now
+    # the order's own price is lifted to rest above the bid (at the ask).
+    o = _exit("FLIP", price=41)
+    live.submit(o, _book(45, 50))                         # 41 would cross the 45 bid
+    assert o.price_cents == 50                            # rested up to the ask
+    assert live._placed[0]["post_only"] is True           # still a maker, not refused
+
+
+def test_live_F_salvage_maker_is_NOT_rest_forwarded(live):
+    """Acceptance #6 — F byte-identical: F's custodian salvage posts a maker sell
+    too, and this build must not touch it. The sell rest-back excludes lane F."""
+    o = _exit("F", price=41)
+    live.submit(o, _book(45, 50))
+    assert o.price_cents == 41                            # F's price UNCHANGED
+
+
+def test_cut_still_crosses_not_rest_forwarded(live):
+    # a crossfire CUT (taker, purpose=CUT) is never rest-forwarded — it crosses
+    cut = Order(lane="FLIP", event="EV1", market="M1", side="yes", action="sell",
+                price_cents=34, count=1, size_tier=config.TIER_PROBE,
+                purpose="CUT", crossfire=True, reason="evacuate now")
+    live.submit(cut, _book(40, 55))
+    assert live._placed[0]["post_only"] is False          # crosses on purpose
+    assert cut.price_cents == 34                           # crossfire skips rest-forward
+
+
 # ── HARD RAIL ──────────────────────────────────────────────────────────────
 def test_rails_unchanged():
     assert config.FLIP_REST_BACK_CENTS == 2

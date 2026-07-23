@@ -186,6 +186,24 @@ def test_a_traded_window_never_logs_open_skip(flip, ledger, caplog):
     assert not any("OPEN_SKIP" in r.message for r in caplog.records)
 
 
+# ── WO-2026-07-23-C Bug 1b: the wall counts LIVE RESTING ORDERS, not just fills ──
+def test_entry_wall_blocks_over_a_resting_entry_before_it_fills(flip, gateway):
+    """Bug 1: `_market_net` reads only FILLED positions, so a post_only OPEN
+    maker resting unfilled was invisible and OPEN re-proposed over it (3 lots at
+    one touch). The wall now also counts the gateway's resting ENTRY orders, so a
+    second entry is blocked while the first still rests — no position needed."""
+    assert flip._market_net(T, EV) == 0                    # nothing FILLED yet
+    assert flip._market_entry_blocked(T, EV) is False      # and nothing resting
+    # a live OPEN maker rests (unfilled) on the market
+    o = gateway.submit(Order(
+        lane="FLIP", event=EV, market=T, side="yes", action="buy",
+        price_cents=60, count=1, size_tier=config.TIER_PROBE, purpose="ENTRY",
+        why="OPEN50 favored yes@60c"), OrderBook(market=T))
+    assert o.order_id in gateway.resting
+    assert flip._market_net(T, EV) == 0                    # STILL nothing filled
+    assert flip._market_entry_blocked(T, EV) is True       # but the resting order blocks
+
+
 def test_trend_measured_from_the_pile_baseline_not_window_open(flip):
     """§2.2: a move that FINISHED before the window (spot flat since the pile
     baseline) reads trend 0 and is refused flat_tape — never 'arrived late',

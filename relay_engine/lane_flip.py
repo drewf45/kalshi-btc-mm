@@ -314,13 +314,30 @@ class LaneFlip:
                    in self.gateway.positions.items()
                    if ev == event and mkt == market)
 
+    def _market_has_live_order(self, market: str, event: str) -> bool:
+        """WO-2026-07-23-C Bug 1b — count LIVE RESTING ORDERS, not just filled
+        positions. `_market_net` reads `gateway.positions` (the FILLED map), so a
+        post_only maker that RESTS unfilled is invisible to it — and OPEN's
+        intent guard (`w.posted`, lane_flip:737) is only set by `on_submitted`,
+        which never runs when a submit raises (a VENUE_AMBIGUOUS reject whose
+        order actually landed). Either gap let OPEN re-propose over its own
+        resting entry (3 lots at one touch). Counting the gateway's own resting
+        ENTRY orders closes it structurally, independent of the intent callback."""
+        if self.gateway is None:
+            return False
+        return any(o.market == market and o.purpose == "ENTRY"
+                   for o in self.gateway.resting.values())
+
     def _market_entry_blocked(self, market: str, event: str) -> bool:
-        """WO-...-J §0.1 → -L §2: THE ONE ENTRY WALL, now cross-lane. A non-zero
-        net from ANY lane on this market blocks every FLIP entry (OPEN + HUNT) —
-        so a FLIP lane can never take the side opposite a position F (or another
-        lane) already holds. F evaluates first in registry order (F→FLIP), so its
-        position is visible here before FLIP proposes."""
-        return self._market_net(market, event) != 0
+        """WO-...-J §0.1 → -L §2 → -C Bug 1b: THE ONE ENTRY WALL, now cross-lane
+        AND order-aware. A non-zero net from ANY lane, OR a live resting entry on
+        this market, blocks every FLIP entry (OPEN + HUNT) — so a FLIP lane can
+        never take the side opposite a position F (or another lane) already
+        holds, and never STACKS a second entry over its own resting maker. F
+        evaluates first in registry order (F→FLIP), so its position is visible
+        here before FLIP proposes."""
+        return (self._market_net(market, event) != 0
+                or self._market_has_live_order(market, event))
 
     def _booked_held(self, market: str, side: str) -> Optional[int]:
         """FLIP-COUNT-1 §2.2: the booked ledger's held count for a FLIP
