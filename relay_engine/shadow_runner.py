@@ -737,6 +737,10 @@ class ShadowEngine:
             log.warning("live account value read raised: %s", e)
         if cash is not None:
             self._av_fail_streak = 0
+            # COLD AUDIT build 70 §2: keep the pv component (the summed total
+            # threw it away — the phantom's origin). standing_reconcile reads it
+            # to refuse a reconcile taken across a settlement boundary.
+            self._last_venue_pv_cents = int(round((pv or 0.0) * 100))
             return int(round((cash + (pv or 0.0)) * 100)), "venue"
         self._av_fail_streak += 1
         failures.fail("ACCOUNT_VALUE_UNREADABLE",
@@ -886,6 +890,24 @@ class ShadowEngine:
         unsettled = self.ledger.unsettled_fill_count()
         resting = len(self.gateway.resting)
         book = self.ledger.book_cents()
+        # COLD AUDIT build 70 §2 — THE SOURCE FIX (was: 4 builds patching where
+        # the bad number LANDS). The venue reads cash and pv on different clocks;
+        # a read taken across a settlement boundary is wrong by the position
+        # notional. Refuse to reconcile on it: the venue's pv must agree with the
+        # engine's own open-position notional (`deployed_cents` — already in the
+        # ledger, never called by the cash path until now). This makes it
+        # IMPOSSIBLE to compute the delta on an internally inconsistent read, not
+        # merely unlikely. Deferring is safe — the reconcile retries next cycle
+        # and runs cleanly every flat window (both sides ~0).
+        pv_cents = getattr(self, "_last_venue_pv_cents", 0)
+        deployed = self.ledger.deployed_cents()
+        if abs(pv_cents - deployed) > config.PV_TOLERANCE_C:
+            log.info("RECON_DEFERRED %s: venue pv %dc vs deployed %dc "
+                     "(gap %+dc > %dc) — cash/pv read across a settlement "
+                     "boundary; reconcile waits for a consistent read",
+                     "live", pv_cents, deployed, pv_cents - deployed,
+                     config.PV_TOLERANCE_C)
+            return "DEFERRED"
         if (unsettled == 0 and resting == 0
                 and abs(book - val) > config.RECON_AUDIT_FLOOR_CENTS):
             from . import failures

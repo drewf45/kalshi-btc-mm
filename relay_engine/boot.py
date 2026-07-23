@@ -367,6 +367,17 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "§3, away from fills/settlements); 'ledger' is a valid live "
                  "bracket source, only 'paper' stays forbidden. SIZING already "
                  "read ledger.book_cents() — the phantom never fed F's size")
+    lines.append(f"  COLD AUDIT §2+§3 (build 70): the SOURCE fix for the cash "
+                 "family — the venue reads cash and pv on different clocks, so a "
+                 "read across a settlement boundary is wrong by the position "
+                 "notional (819c/99c/196c/198c — always the position). The cash "
+                 "reconcile now DEFERS unless the venue pv agrees with the "
+                 f"engine's own deployed_cents within {config.PV_TOLERANCE_C}c — "
+                 "it refuses to compute on an inconsistent read instead of "
+                 "patching where the bad number lands (4 builds did that). §3: "
+                 "the /scoreboard DISPLAY shows breakeven_HONEST (the pack proved "
+                 "the stale model wrong on 26/29 cells); score()/tier stay stale "
+                 "because tier feeds custody cut-scaling — trading byte-identical")
     lines.append("EXECUTION E1: P&L books from CONFIRMED fills + exchange "
                  "outcome only (window-econ is a check that self-heals to "
                  "fills-truth, never a source); every settlement writes a "

@@ -182,7 +182,16 @@ _SCOREBOARD_LANES = ("F", "H8", "OPEN", "HUNT", "D", "P")
 def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
     """The margin table, sorted by margin — the offense map, daily, unasked.
     RED margins render as the warning they are (⚠); hold cells note when
-    the salvage adjustment is still pending evidence."""
+    the salvage adjustment is still pending evidence.
+
+    COLD AUDIT build 70 §3: the DISPLAYED break-even and margin are the HONEST
+    ones (`breakeven_honest` — the real stop, the realized-loss fallback), the
+    number a human reads and acts on. The pack proved the stale model wrong on
+    26 of 29 cells; a metric measured-wrong is a live hazard whatever it drives.
+    The `tier` column stays the OPERATIVE tier from `score()`/`breakeven()` —
+    that one is untouched because it feeds custody cut-scaling (`scaled(size_
+    tier)`), and changing it would alter F's cuts (F byte-identical). So the
+    edge you read is honest; the tier you see is exactly what the machine uses."""
     book_cents = ledger.book_cents() if book_cents is None else book_cents
     salvage_n, _ = salvage_recapture_cents(ledger)
     rows = ledger.db.execute(
@@ -190,20 +199,23 @@ def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
         " GROUP BY lane, price_cell").fetchall()
     entries = []
     for lane, cell in rows:
-        s = score(ledger, lane, cell)
+        s = score(ledger, lane, cell)              # tier (custody) — UNTOUCHED
+        be_honest = breakeven_honest(ledger, lane, cell)   # §3: the honest edge
+        margin_honest = s["lb"] - be_honest
         kind = "hold" if lane in HOLD_LANES else "trip"
         mid = cell + config.CELL_WIDTH_CENTS // 2
         lots = size_order(book_cents, mid, 10_000).contracts  # P27: kelly×depth
         pend = (lane in HOLD_LANES and salvage_n < config.SALVAGE_ADJ_MIN_N)
-        entries.append((s["margin"], lane, cell, kind, s, lots, pend))
+        entries.append((margin_honest, lane, cell, kind, s, be_honest, lots,
+                        pend))
     entries.sort(key=lambda e: e[0], reverse=True)
     lines = ["CELL SCOREBOARD          n   W   LB    BE    MARGIN  TIER  lots@book"]
-    for margin, lane, cell, kind, s, lots, pend in entries:
+    for margin, lane, cell, kind, s, be_honest, lots, pend in entries:
         warn = " ⚠" if margin < 0 else ""
         star = "*" if pend else " "
         lines.append(
             f"{lane:<5} {cell_label(cell):<7} ({kind}) "
-            f"{s['n']:>3} {s['wins']:>3}  {s['lb']:.2f}  {s['breakeven']:.2f}{star} "
+            f"{s['n']:>3} {s['wins']:>3}  {s['lb']:.2f}  {be_honest:.2f}{star} "
             f"{margin:+.2f}{warn}  {s['tier']:<5} {lots}")
     covered = {lane for _, lane, *_ in entries}
     for lane in _SCOREBOARD_LANES:

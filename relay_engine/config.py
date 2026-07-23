@@ -293,6 +293,16 @@ DEPTH_FRACTION = 0.25  # DREW-DEFAULT: per-level size <= 25% of visible depth
 # signature) and is recorded to the E1 trail. Book and venue both round once,
 # so with nothing pending they match exactly — a whole-cent gap is real.
 RECON_AUDIT_FLOOR_CENTS = 2  # DREW-DEFAULT: E1 records an unexplained book/venue gap above this
+# COLD AUDIT build 70 §2: the venue returns cash and portfolio_value (pv) on
+# DIFFERENT clocks; summing them across a settlement boundary produces a total
+# wrong by the position notional (819c/99c/196c/198c — always the position). The
+# cash reconcile now DEFERS unless the venue's pv agrees with the engine's own
+# open-position notional (`deployed_cents`) within this tolerance — it refuses to
+# compute on an internally inconsistent read instead of patching where the bad
+# number lands. Honest caveat: pv is mark-to-market and deployed_cents is entry
+# cost, so a large-unrealized open position also defers — safe (skip + retry;
+# the reconcile still runs every flat window, where both are ~0).
+PV_TOLERANCE_C = 20  # DREW-DEFAULT: max venue-pv vs deployed_cents gap to trust the read
 
 # ---------------------------------------------------------------------------
 # Walls (C.3 / BUILD_SEQUENCE 3.2)

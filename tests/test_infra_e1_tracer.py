@@ -123,6 +123,46 @@ def test_recon_records_unexplained_book_venue_gap(engine, monkeypatch):
     assert abs(j["delta_cents"]) > config.RECON_AUDIT_FLOOR_CENTS
 
 
+# ── COLD AUDIT build 70 §2: refuse to reconcile across a settlement boundary ──
+def test_recon_defers_when_venue_pv_disagrees_with_deployed(engine, monkeypatch):
+    """The source fix: the venue reads cash and pv on different clocks. When the
+    venue's pv (a position it still shows) disagrees with the engine's own
+    open-position notional (`deployed_cents`, here 0 — the engine marked it
+    settled), the read straddles a settlement boundary and its total is wrong by
+    the notional. The reconcile REFUSES to compute on it (DEFERRED), rather than
+    passing the bad number to `cash.reconcile`."""
+    from relay_engine import venue
+    monkeypatch.setattr(config, "live_submit_enabled", lambda: True)
+    engine.gateway.venue_client = object()
+    # venue still shows a $0.98 position; the engine holds nothing (deployed 0)
+    monkeypatch.setattr(venue, "get_balance", lambda c: (100.0, 0.98))
+    assert engine.ledger.deployed_cents() == 0
+    result = engine.standing_reconcile(now=2000.0)
+    assert result == "DEFERRED"
+    # and it did NOT record a divergence — we never computed the delta
+    n = engine.ledger.db.execute(
+        "SELECT COUNT(*) FROM failures WHERE why_tag='RECON_BOOK_VENUE_DELTA'"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_recon_runs_when_venue_pv_matches_deployed(engine, monkeypatch):
+    """When the venue's pv agrees with the engine's open-position notional, the
+    read is internally consistent and the pv-check passes through to
+    `cash.reconcile` (stubbed here to isolate the check from cash's own
+    quiescence defer)."""
+    from relay_engine import venue
+    monkeypatch.setattr(config, "live_submit_enabled", lambda: True)
+    engine.gateway.venue_client = object()
+    engine.ledger.record_fill(MKT, "F", "yes", "ENTRY", 98, 1, config.TIER_PROBE)
+    assert engine.ledger.deployed_cents() == 98        # 1 lot × 98c entry
+    monkeypatch.setattr(venue, "get_balance", lambda c: (100.0, 0.98))  # pv 98¢ agrees
+    monkeypatch.setattr(engine.cash, "reconcile",
+                        lambda **kw: "RECONCILED")      # isolate the pv-check
+    result = engine.standing_reconcile(now=2000.0)
+    assert result == "RECONCILED"                      # consistent → passed through
+
+
 def test_recon_silent_when_pending_explains_the_gap(engine, monkeypatch):
     from relay_engine import venue
     monkeypatch.setattr(config, "live_submit_enabled", lambda: True)

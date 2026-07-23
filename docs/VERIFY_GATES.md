@@ -3285,6 +3285,56 @@ fires independently. New acceptance `test_size_test.py` (dials, take geometry, F
 `test_flip_*`/`test_p22`/`test_swing_gate` re-anchored to the +10 take and the 3-lot cap. Suite 741 ·
 preflight 23/23.
 
+## COLD AUDIT §2 + §3 — the unattended-safe pair (build 70)
+
+**§2 — THE BLOCKER, fixed at the source.** Read-rule TRUE: `account_value()` sums venue `cash + pv`
+(`shadow_runner.py:740`) and throws the components away; `standing_reconcile` (`:873`) passes only the
+total to `cash.reconcile`, which differences it against `book_cents()`. The venue moves cash and pv on
+different clocks, so a read across a settlement boundary is wrong by exactly the position notional
+(819c/99c/196c/198c — always the position). The prior guard defers on the ENGINE's settlement clock
+(`unsettled_fills`), not the venue's. **Fix:** preserve the pv component through the read, and DEFER the
+reconcile unless the venue pv agrees with the engine's own open-position notional
+(`ledger.deployed_cents()` — the function was in the ledger the whole time, called only by the portfolio
+cap until now) within `PV_TOLERANCE_C` (20c). This makes it *impossible* to compute the delta on an
+internally inconsistent read (the adversary's test), not merely unlikely — 4 builds moved the bad number
+out of one consumer at a time; this stops it being produced.
+
+- **Honest caveat (reported):** the venue pv is `portfolio_value` — **mark-to-market** — while
+  `deployed_cents` is **entry cost**, so a large-unrealized open position also defers. That is safe: a
+  deferral just skips one 60s cycle and retries, and the reconcile still runs cleanly every flat window
+  (both sides ≈0). Over-deferring never causes a wrong reconcile; it only delays a correct one. The
+  audit's exact `abs(pv − deployed) > tol` check is implemented as specified, with this confound named.
+
+**§3 — the display no longer shows a measured-wrong number.** Read-rule TRUE: two break-even functions
+exist — `breakeven()` (stale band-floor model, feeds `score()` → margin/tier/bars) and
+`breakeven_honest()` (the real stop + realized-loss fallback, build 63). The pack's SCOREBOARD already
+uses the honest one (build 63); the `/scoreboard` TEXT (`scoreboard_lines`) still showed the stale margin
+— the number acted on this morning.
+
+- **Read-rule DIVERGENCE from the audit's fix (surfaced):** the audit said "point `score()` at
+  `breakeven_honest()` — safe because tier doesn't gate size." **Verified FALSE-as-safe:** `score()` →
+  `tier_for` → `pos.size_tier` (`fills.py:214`) → `custodian.scaled(size_tier)` (`:532`, CLEAR×1.30) —
+  the tier drives **custody cut-scaling**, so changing `score()` would alter F's cuts, breaking F
+  byte-identical (a kill condition). The audit checked the *sizing* path (`:448` "never a cap") but not
+  the *custody* path — the same reason `breakeven()` was left untouched in build 63. **So the goal (no
+  wrong number on screen) is met the safe way:** `scoreboard_lines` now DISPLAYS `breakeven_honest` for
+  BE and margin, while `score()` (and thus the tier column, and custody) stays exactly as before. The
+  edge you read is honest; the tier you see is the operative one the machine uses. One display change,
+  zero trading change.
+
+**HARD RAIL:** F byte-identical (`score`/`breakeven`/`SALVAGE_ADJ_MIN_N` untouched; custody scaling
+unchanged); the reconcile only ever defers (never reconciles more aggressively). New acceptance:
+`test_infra_e1_tracer.py` (defers on pv≠deployed, runs on agreement) and `test_p22_scoreboard.py`
+(display honest, `score()` stale). Suite 744 · preflight 23/23.
+
+**Ship list remainder (audit §7), status:** §5 (one lane taxonomy across the tables — `fills.lane` writes
+"FLIP" for OPEN/HUNT, silently emptying join-based traces) — NEXT, additive (a `cell_lane` column on
+`fills`, mirroring the build-65 `requested_count` migration; `fills.lane` must stay "FLIP" for the
+custody/attribution queries that key on it). §4 (halt on money, not events) — now unblocked by §2's
+input fix, but a real-money halt change with a wide test blast radius, its own build. §6 cleanup (retire
+`NET_RISK_CROSS_LANE_CAP` now the per-lane at-risk walls exist; migrate `SALVAGE_ADJ_MIN_N` to the honest
+value pack-side) — low priority. All deferred with intent, not dropped.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

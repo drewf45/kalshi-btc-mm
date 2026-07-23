@@ -285,6 +285,23 @@ def test_scoreboard_renders_sorted_with_warnings(ledger):
     assert o_i < f_i
 
 
+def test_scoreboard_displays_honest_be_while_score_stays_untouched(ledger):
+    """COLD AUDIT build 70 §3: the /scoreboard DISPLAY shows breakeven_honest
+    (the real edge — the number a human reads and acts on), while score() keeps
+    the stale breakeven() UNTOUCHED because it feeds the tier and custody
+    cut-scaling (changing it would alter F's cuts — F byte-identical)."""
+    _bank_wins(ledger, "OPEN", 60, 20, losses=10)     # a populated OPEN cell
+    stale = scoring.breakeven(ledger, "OPEN", 60)
+    honest = scoring.breakeven_honest(ledger, "OPEN", 60)
+    assert round(stale, 2) != round(honest, 2)        # they genuinely differ
+    lines = scoring.scoreboard_lines(ledger, book_cents=10_000)
+    open_line = next(l for l in lines if l.startswith("OPEN") and "60-64" in l)
+    assert f"{honest:.2f}" in open_line               # the DISPLAY is honest
+    assert f"{stale:.2f}" not in open_line            # not the stale trading BE
+    # score() — the tier/custody input — still returns the stale breakeven
+    assert scoring.score(ledger, "OPEN", 60)["breakeven"] == stale
+
+
 def test_scoreboard_command_is_read_only_whitelisted(ledger, cash):
     from relay_engine.ops import Telegram
     tg = Telegram(cash, send_fn=lambda m: None)
