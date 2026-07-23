@@ -188,6 +188,16 @@ class Ledger:
                 "ALTER TABLE settlements ADD COLUMN divergent INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already present
+        # WO-2026-07-23-B §4.1: order-level truth — the requested count/price
+        # beside the filled count/price. "requested vs filled" is the field that
+        # answers whether SIZE TRAVELS (the one unknown scaling F introduces);
+        # it cannot be backtested, only logged. NULL on rows written before this
+        # column existed (and on the rare path with no originating order).
+        for col in ("requested_count INTEGER", "requested_price REAL"):
+            try:
+                self.db.execute(f"ALTER TABLE fills ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass  # column already present
         self.db.commit()
         self.boot_caps: Optional[BootCaps] = None
 
@@ -209,6 +219,39 @@ class Ledger:
         out; B1: summed exact, rounded once)."""
         return int(round(float(self.db.execute(
             "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0])))
+
+    def deployed_cents(self) -> int:
+        """WO-2026-07-23-B Part 1 guard (a): capital currently AT RISK across
+        ALL lanes — the sum, per open (market, lane, side), of held contracts ×
+        their weighted entry price. Held = unsettled ENTRY count − EXIT count;
+        a side net-flat or net-short contributes 0. This is what the 50%-of-book
+        portfolio cap is measured against (F and FLIP can hold different markets
+        at once; nothing else bounds the sum)."""
+        rows = self.db.execute(
+            "SELECT SUM(CASE WHEN action='ENTRY' THEN count ELSE -count END),"
+            " SUM(CASE WHEN action='ENTRY' THEN price_cents*count ELSE 0 END),"
+            " SUM(CASE WHEN action='ENTRY' THEN count ELSE 0 END)"
+            " FROM fills WHERE settled=0 GROUP BY market, lane, side").fetchall()
+        deployed = 0.0
+        for held, entry_notional, entry_count in rows:
+            if held and held > 0 and entry_count:
+                avg_entry = float(entry_notional) / float(entry_count)
+                deployed += held * avg_entry
+        return int(round(deployed))
+
+    @staticmethod
+    def _day_key(now=None) -> str:
+        return time.strftime("%Y%m%d",
+                             time.localtime(time.time() if now is None else now))
+
+    def set_f_tripwire(self, now=None) -> None:
+        """WO-2026-07-23-B Part 1 guard (b): stamp F suppressed for TODAY (local
+        day). Self-clears tomorrow — a new day_key no longer matches."""
+        self.set_state("f_tripwire_day", self._day_key(now))
+
+    def f_suppressed(self, now=None) -> bool:
+        """True while an F per-event tripwire from earlier today still stands."""
+        return self.get_state("f_tripwire_day") == self._day_key(now)
 
     def quarantine_divergent_settlements(self, market: str,
                                          fills_pnl_cents: int) -> int:
@@ -281,12 +324,19 @@ class Ledger:
     # ----- writes -----
     def record_fill(self, market: str, lane: str, side: str, action: str,
                     price_cents: int, count: int, size_tier: str,
-                    fee_cents: int = 0, cell_lane: str = None) -> int:
+                    fee_cents: int = 0, cell_lane: str = None,
+                    requested_count: int = None,
+                    requested_price=None) -> int:
+        # WO-2026-07-23-B §4.1: requested_count/price ride the fill so the pack
+        # can read "did size travel" per order (filled_count IS `count`).
         cur = self.db.execute(
             "INSERT INTO fills (ts, market, lane, side, action, price_cents,"
-            " count, size_tier, fee_cents) VALUES (?,?,?,?,?,?,?,?,?)",
+            " count, size_tier, fee_cents, requested_count, requested_price)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), market, lane, side, action, price_cents, count,
-             size_tier, int(fee_cents)),
+             size_tier, int(fee_cents),
+             None if requested_count is None else int(requested_count),
+             None if requested_price is None else float(requested_price)),
         )
         self.db.commit()
         # P22 §1.1(a): a non-ENTRY booking CLOSES a unit of risk — the

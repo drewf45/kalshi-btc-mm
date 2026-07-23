@@ -441,6 +441,33 @@ class ShadowEngine:
                 live.add(o.lane)
         return ",".join(sorted(live))
 
+    def _f_suppressed_today(self) -> bool:
+        """WO-2026-07-23-B Part 1 guard (b): is F held out for the day by its
+        per-event tripwire? (self-clears at the next local day)."""
+        return self.ledger.f_suppressed()
+
+    def _trip_f_event(self, per_contract_loss_c: float, market: str,
+                      detail: str, now=None) -> None:
+        """Guard (b) producer: an F loss worse than F_EVENT_TRIPWIRE_C/contract
+        suppresses F for the day and PAGES. Called from every F-loss choke point
+        (held-to-settlement and any custodian cut). Idempotent for the day."""
+        if per_contract_loss_c <= config.F_EVENT_TRIPWIRE_C:
+            return
+        already = self.ledger.f_suppressed(now)
+        self.ledger.set_f_tripwire(now)
+        if not already:
+            self.telegram.alert(
+                f"🛑 F EVENT TRIPWIRE: {market} lost "
+                f"{per_contract_loss_c:.0f}c/contract (> "
+                f"{config.F_EVENT_TRIPWIRE_C}c) — F entries SUPPRESSED for the "
+                f"rest of the day. {detail}")
+            from . import failures
+            failures.fail("F_EVENT_TRIPWIRE",
+                          f"{market}: F loss {per_contract_loss_c:.0f}c/contract "
+                          f"> {config.F_EVENT_TRIPWIRE_C}c — F suppressed today",
+                          fatal=False, alert=False, market=market,
+                          per_contract_c=round(per_contract_loss_c, 1))
+
     def _score_and_size(self, proposal, book) -> None:
         """P27 §1 — SIZING = FULL KELLY: contracts = min(kelly, depth); the
         Wilson ladder still scores every cell (tier_for — the REPORTING
@@ -453,8 +480,9 @@ class ShadowEngine:
         tier = scoring.tier_for(self.ledger, lane, proposal.price_cents,
                                 alert_fn=self.telegram.alert)
         depth = book.visible_depth(proposal.side, proposal.price_cents) or 0
-        dec = size_order(self.ledger.book_cents(),
-                         proposal.price_cents, depth)
+        book_c = self.ledger.book_cents()
+        dec = size_order(book_c, proposal.price_cents, depth,
+                         lane=proposal.lane)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
         proposal.count = max(1, dec.contracts)
         # WO-SWING-GATE-EVENT §4.2 (DREW-RULED 2026-07-20): FLIP's swing
@@ -464,6 +492,49 @@ class ShadowEngine:
         # bounds the 3-lot bleed while Instrument 1 keeps calibrating.
         if proposal.lane == "FLIP":
             proposal.count = min(proposal.count, config.FLIP_SIZE_CAP)
+        # WO-2026-07-23-B Part 1 guard (d): F's sizing terms are logged once
+        # per (market, price) — kelly_max, depth_max, notional_max, and which
+        # bound applied — so "is depth ever real" is answered from the tape,
+        # never argued (the reason string carries all three).
+        if proposal.lane == "F":
+            key = (proposal.market, proposal.price_cents)
+            if key not in self._size_zero_logged:
+                self._size_zero_logged.add(key)
+                log.info("F_SIZE %s @%dc book=%dc → %s at_risk_cap=%dc "
+                         "(count=%d)", proposal.market, proposal.price_cents,
+                         book_c, dec.reason,
+                         config.at_risk_cap_cents("F", book_c), proposal.count)
+        # WO-2026-07-23-B Part 1 guard (b): F's per-event tripwire. A single F
+        # loss worse than F_EVENT_TRIPWIRE_C/contract suppresses F entries for
+        # the rest of that day (F's 97% win rate means the rate halt never
+        # protects it). Self-clears the next local day; refuses the entry now.
+        if (proposal.lane == "F" and proposal.action == "buy"
+                and self._f_suppressed_today()):
+            proposal.count = 0
+            key = (proposal.market, "f_tripwire")
+            if key not in self._size_zero_logged:
+                self._size_zero_logged.add(key)
+                log.warning("F_SUPPRESSED %s: an F loss > %dc/contract today "
+                            "tripped the per-event guard — F entries refused "
+                            "until tomorrow", proposal.market,
+                            config.F_EVENT_TRIPWIRE_C)
+        # WO-2026-07-23-B Part 1 guard (a): the PORTFOLIO CAP. Total deployed
+        # notional across ALL lanes may never exceed PORTFOLIO_DEPLOY_PCT of
+        # book. An entry is clamped to the room that remains (0 = refused);
+        # F and FLIP holding different markets can no longer sum past the cap.
+        if proposal.action == "buy" and proposal.count > 0 and book_c > 0:
+            room = int(book_c * config.PORTFOLIO_DEPLOY_PCT) \
+                - self.ledger.deployed_cents()
+            max_by_portfolio = room // max(1, proposal.price_cents)
+            if max_by_portfolio < proposal.count:
+                clamped = max(0, max_by_portfolio)
+                if clamped < proposal.count:
+                    log.warning("PORTFOLIO_CAP %s %s: %d→%d lots — deployed "
+                                "%dc + this would exceed %d%% of book %dc",
+                                proposal.lane, proposal.market, proposal.count,
+                                clamped, self.ledger.deployed_cents(),
+                                int(config.PORTFOLIO_DEPLOY_PCT * 100), book_c)
+                proposal.count = clamped
         # WO-VERIFY-LOSSTERM-1 B4 (pure logging): when Kelly is the term
         # that zeroed a favorite, say so BY NAME once per (market, price) —
         # "0 @98c" must be self-explaining arithmetic, never a mystery bug.
@@ -1420,6 +1491,13 @@ class ShadowEngine:
                 self.ledger.record_cell_outcome(
                     lane, s["entry"], won=won, pnl_cents=pnl, fees_cents=0,
                     market=market, kind="settle", now=now_eff)
+                # WO-2026-07-23-B Part 1 guard (b): an F position that rode to
+                # settlement and LOST paid its full entry per contract — the
+                # unsalvaged loss the tripwire exists to catch (§1.6).
+                if lane == "F" and not won:
+                    self._trip_f_event(float(s["entry"]), market,
+                                       "held to settlement (unsalvaged)",
+                                       now=now_eff)
         per_lane = self.surface.settle_market(market, window,
                                               settled_yes=settled_yes)
         # P19 §2.6: every salvage row gets its settlement COUNTERFACTUAL —

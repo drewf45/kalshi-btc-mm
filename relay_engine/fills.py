@@ -152,7 +152,9 @@ class FillBooker:
                                     order.size_tier, fee_cents=fee_cents,
                                     cell_lane=scoring.cell_lane(
                                         order.lane,
-                                        order.reason or order.why))
+                                        order.reason or order.why),
+                                    requested_count=order.count,
+                                    requested_price=order.price_cents)
             self.gateway.on_fill(oid, count=count)
             self.ledger.db.execute(
                 "INSERT INTO booked_fills (fill_id, ts, order_id, count) VALUES (?,?,?,?)",

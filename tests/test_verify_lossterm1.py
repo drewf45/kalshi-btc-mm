@@ -321,11 +321,15 @@ def test_b4_size_zero_by_kelly_logs_once_and_changes_nothing(tmp_path,
     book = OrderBook(market=TICKER)
     book.apply_snapshot({98: 10}, {1: 10}, ts=1.0)
 
+    # WO-2026-07-23-B Part 1 moved F off the Kelly path (F now sizes by
+    # notional), so the "zeroed by Kelly" demonstration uses H8 — a hold lane
+    # that still sizes via min(kelly, depth, cap). The B4 log behaviour is
+    # unchanged; only the lane exercising it moved.
     def prop(price):
-        return Order(lane="F", event=EVENT, market=TICKER, side="yes",
+        return Order(lane="H8", event=EVENT, market=TICKER, side="yes",
                      action="buy", price_cents=price, count=1,
                      size_tier=config.TIER_PROBE, purpose="ENTRY",
-                     why="F tier98 · surv~price")
+                     why="H8 tier98 · surv~price")
     with caplog.at_level(logging.INFO, logger="relay.shadow"):
         p = prop(98)
         e._score_and_size(p, book)

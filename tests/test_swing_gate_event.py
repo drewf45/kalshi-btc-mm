@@ -165,8 +165,15 @@ def test_flip_capped_to_one_lot_f_untouched():
     class _L:
         def book_cents(self):
             return 5000        # a book big enough for >1 lot
+
+        def deployed_cents(self):
+            return 0           # WO-2026-07-23-B guard (a): nothing deployed
+
+        def f_suppressed(self, now=None):
+            return False       # guard (b): no tripwire today
     eng.ledger = _L()
     eng.telegram = type("T", (), {"alert": staticmethod(lambda m: None)})()
+    eng._size_zero_logged = set()   # WO-2026-07-23-B: F sizing logs (guard d)
     from relay_engine import scoring
     scoring.tier_for = lambda *a, **k: config.TIER_PROBE
     b = _book(yes=48, no=49)
@@ -181,7 +188,9 @@ def test_flip_capped_to_one_lot_f_untouched():
               size_tier=config.TIER_PROBE, purpose="ENTRY",
               why="F tier48 · surv~price")
     eng._score_and_size(f, b)
-    assert f.count > 1                                  # F untouched
+    # WO-2026-07-23-B Part 1: F is NOT FLIP-capped — it self-sizes by notional
+    # (here min(notional, depth) > 1), the opposite of FLIP's 1-lot leash.
+    assert f.count > 1
 
 
 # ── §3: the calibration pack line + compare rows ───────────────────────────

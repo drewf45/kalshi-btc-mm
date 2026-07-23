@@ -50,7 +50,7 @@ class SizeDecision:
 
 
 def size_order(book_cents: int, price_cents: int,
-               visible_depth: int) -> SizeDecision:
+               visible_depth: int, lane: str = None) -> SizeDecision:
     """P27 §1 — SIZING = FULL KELLY; GOVERNORS DIE (Drew's ruling, twice):
     contracts = min(kelly_lots, depth_lots). The tier term is REMOVED from
     the entry path — the Wilson ladder remains as reporting (scoreboard,
@@ -59,7 +59,14 @@ def size_order(book_cents: int, price_cents: int,
 
     RULING 3 (P15, ratified) stands — it is depth doctrine, not a
     governor: a real book with >=1 visible lot admits ONE lot even when
-    the fraction rounds to zero (the 7:58 depth-starvation storms)."""
+    the fraction rounds to zero (the 7:58 depth-starvation storms).
+
+    WO-2026-07-23-B Part 1 — F ALONE self-scales: `lane="F"` sizes to a
+    percentage of book (F_NOTIONAL_PCT), bounded only by REAL depth — NOT by
+    Kelly and NOT by the count cap (the constant that converted F's compound
+    growth into linear growth). Guard (d): kelly_max, depth_max, and
+    notional_max all ride the reason so "is depth ever real" is answered
+    permanently. Every other lane is unchanged."""
     if price_cents <= 0:
         return SizeDecision("-", 0, "no price")
     kelly_budget_cents = book_cents * config.KELLY_FRACTION_CEILING
@@ -67,6 +74,17 @@ def size_order(book_cents: int, price_cents: int,
     depth_max = int(visible_depth * config.DEPTH_FRACTION)
     if visible_depth >= 1:
         depth_max = max(1, depth_max)
+    if lane == "F":
+        # F's dial: notional = pct of book, bounded by depth only. Kelly and
+        # the count cap do NOT bind F (the whole point of the WO). count=1
+        # floor is applied by the caller (_score_and_size), as before.
+        notional_max = int(book_cents * config.F_NOTIONAL_PCT // price_cents)
+        contracts = min(notional_max, depth_max)
+        bound = "notional" if notional_max <= depth_max else "depth"
+        return SizeDecision(
+            "-", contracts,
+            f"F: notional={notional_max} depth={depth_max} "
+            f"(kelly={kelly_max}, cap n/a) → {bound} bound")
     # The kept walls are LAW (P27 §2d): net-risk <=3/event stands, so
     # sizing proposes at most the cap — full Kelly lives UNDER the wall,
     # it does not fight it (a 7-lot proposal dying whole at the wall would

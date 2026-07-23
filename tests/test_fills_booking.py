@@ -150,3 +150,27 @@ def test_live_door_stays_shut_in_shadow(gateway):
     """RUN_MODE=SHADOW: submit never touches a venue client."""
     r = gateway.submit(entry(), make_book())
     assert r.shadow and gateway.venue_client is None and not gateway.live_order_ids
+
+# ── WO-2026-07-23-B §4.1: order-level truth — requested vs filled ──────────
+def test_requested_and_filled_counts_present_on_every_order_row(booker,
+                                                                gateway, ledger):
+    """Acceptance #2: requested_count and filled_count (the fill's `count`) ride
+    every booked row — the field that answers whether SIZE TRAVELS as F scales.
+    A 3-lot request that fills 1 records requested 3, filled 1, at its price."""
+    r = gateway.submit(entry(lane="F", price=61, count=3), make_book())
+    booker.sweep([venue_fill(r.order_id, "f1", yes_price_cents=61, count=1)],
+                 now=1000.0)
+    count, requested_count, requested_price = ledger.db.execute(
+        "SELECT count, requested_count, requested_price FROM fills").fetchone()
+    assert count == 1                       # filled_count
+    assert requested_count == 3             # size did NOT fully travel — logged
+    assert requested_price == 61.0
+
+
+def test_requested_count_defaults_none_on_direct_record_fill(ledger):
+    """A record_fill with no originating order (legacy/manual path) leaves the
+    requested columns NULL — never a fabricated number."""
+    ledger.record_fill("M1", "F", "yes", "ENTRY", 61, 1, config.TIER_PROBE)
+    requested_count, requested_price = ledger.db.execute(
+        "SELECT requested_count, requested_price FROM fills").fetchone()
+    assert requested_count is None and requested_price is None

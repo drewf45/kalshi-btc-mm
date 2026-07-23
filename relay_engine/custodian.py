@@ -362,6 +362,21 @@ class Custodian:
                     "entry": pos.entry_price_cents}))
         except Exception:
             pass
+        # WO-2026-07-23-B Part 1 guard (b): an F position concluding at a loss
+        # worse than F_EVENT_TRIPWIRE_C per contract (a cut that ran past the
+        # wire, or a ride to settlement) suppresses F for the day. The ledger
+        # owns the day-stamp; the sizing path reads it. Salvage keeps most F
+        # losses ~40c (under the wire) — this catches the one that got past it.
+        if (pos.lane == "F" and realized_cents is not None
+                and realized_cents < -config.F_EVENT_TRIPWIRE_C):
+            self.ledger.set_f_tripwire()
+            failures.fail(
+                "F_EVENT_TRIPWIRE",
+                f"{pos.market}: F loss {-realized_cents:.0f}c/contract > "
+                f"{config.F_EVENT_TRIPWIRE_C}c ({exit_trigger}) — F entries "
+                "suppressed for the rest of the day",
+                fatal=False, alert=True, market=pos.market,
+                per_contract_c=round(-realized_cents, 1))
 
     def _salvage_tick(self, pos: OpenPosition, book, mark: int, t_rem: float,
                       now: float, spot, blo, bhi) -> Optional[str]:
@@ -668,7 +683,9 @@ class Custodian:
                     cut_price_cents, fee_cents, transport)
         self.ledger.record_fill(pos.market, pos.lane, pos.side, "CUSTODIAN_EXIT",
                                 cut_price_cents, remaining, pos.size_tier,
-                                fee_cents=fee_cents)
+                                fee_cents=fee_cents,
+                                requested_count=remaining,     # §4.1: cut books whole
+                                requested_price=cut_price_cents)
         # SALV-1 §2.3: the position concludes here — one summary, always
         self.emit_salvage_summary(pos, trigger,
                                   realized_cents=cut_price_cents

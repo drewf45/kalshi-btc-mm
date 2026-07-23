@@ -31,12 +31,15 @@ def test_watch_ladder_drives_shadow_proposal():
     for i in range(12):
         engine.cycle([TICKER], now=start + i * 5)
 
-    # exactly one F proposal, at the touch. P27 §1: full Kelly — 3 lots
-    # (min(kelly=8, depth=12, risk cap=3)); the tier no longer caps at 1.
+    # exactly one F proposal, at the touch. WO-2026-07-23-B Part 1: F self-sizes
+    # by NOTIONAL — on the $100 paper book at 99c the notional is 20 lots, but
+    # depth (50·0.25 = 12) binds it to 12. A live example of guard (d)'s "is
+    # depth ever real": here it is, and it — not the retired count cap of 3 — is
+    # what bounds F.
     f_orders = [o for o in engine.gateway.shadow_orders if o.lane == "F"]
     assert len(f_orders) == 1
     o = f_orders[0]
-    assert (o.lane, o.side, o.price_cents, o.count, o.purpose) == ("F", "yes", 99, 3, "ENTRY")
+    assert (o.lane, o.side, o.price_cents, o.count, o.purpose) == ("F", "yes", 99, 12, "ENTRY")
     payload = engine.gateway._payload(o)
     assert payload["post_only"] is True
 

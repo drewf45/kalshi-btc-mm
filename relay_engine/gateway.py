@@ -495,14 +495,39 @@ class Gateway:
     def _wall_net_risk_and_at_risk(self, order: Order) -> None:
         contracts, cents = self._event_exposure(order.event)
         side_basis = order.price_cents  # side-terms basis = max loss per contract
-        if contracts + order.count > config.NET_RISK_CROSS_LANE_CAP:
+        projected_at_risk = cents + order.count * side_basis
+        projected_count = contracts + order.count
+        book_cents = self.ledger.book_cents()
+        if book_cents <= 0:
+            # boot/test with no book to proportion against — the legacy flat
+            # walls stand (production always carries a book). Unchanged behaviour.
+            if projected_count > config.NET_RISK_CROSS_LANE_CAP:
+                raise WallRejection(
+                    "NET_RISK",
+                    f"event {order.event}: {contracts}+{order.count} > "
+                    f"{config.NET_RISK_CROSS_LANE_CAP}")
+            if projected_at_risk > config.AT_RISK_CAP_CENTS:
+                raise WallRejection(
+                    "DOLLAR_RISK",
+                    f"event {order.event}: {cents}+{order.count * side_basis}c > "
+                    f"{config.AT_RISK_CAP_CENTS}c")
+            return
+        # DREW RULING 2026-07-23: one PER-LANE, BOOK-PROPORTIONAL dollar wall. It
+        # subsumes the retired count cap; we keep BOTH reason names so telemetry
+        # stays comparable — a rejection that would ALSO have tripped the old
+        # count cap tags NET_RISK, otherwise DOLLAR_RISK.
+        cap = config.at_risk_cap_cents(order.lane, book_cents)
+        if projected_at_risk > cap:
+            tag = ("NET_RISK"
+                   if projected_count > config.NET_RISK_CROSS_LANE_CAP
+                   else "DOLLAR_RISK")
+            pct = int(config.AT_RISK_PCT.get(
+                order.lane, config.AT_RISK_PCT_DEFAULT) * 100)
             raise WallRejection(
-                "NET_RISK",
-                f"event {order.event}: {contracts}+{order.count} > {config.NET_RISK_CROSS_LANE_CAP}")
-        if cents + order.count * side_basis > config.AT_RISK_CAP_CENTS:
-            raise WallRejection(
-                "DOLLAR_RISK",
-                f"event {order.event}: {cents}+{order.count * side_basis}c > {config.AT_RISK_CAP_CENTS}c")
+                tag,
+                f"{order.lane} event {order.event}: at-risk {cents}+"
+                f"{order.count * side_basis}c > {cap}c ({pct}% of book "
+                f"{book_cents}c)")
 
     def _wall_wrong_way_tick(self, order: Order) -> None:
         if order.improve_from is None:
@@ -631,10 +656,16 @@ class Gateway:
             failures.fail("BOOT_SEQUENCE_VIOLATION",
                           "boot caps not snapshotted; boot sequence violated",
                           fatal=True)
+        # WO-2026-07-23-B Part 1 (DREW RULING): the per-order budget is the same
+        # fixed-fraction cap that would hold F flat as the book rises. F's ruling
+        # (20% notional) needs a 20% per-order budget; every other lane keeps the
+        # standing 10% floor (their proportions are smaller, so the max is 10%).
+        lane_budget = config.at_risk_cap_cents(order.lane, caps.book_cents)
+        budget = max(caps.order_budget_cents, lane_budget)
         notional = order.price_cents * order.count
-        if notional > caps.order_budget_cents:
+        if notional > budget:
             raise WallRejection(
-                "BUDGET", f"{notional}c > boot budget {caps.order_budget_cents}c")
+                "BUDGET", f"{order.lane} {notional}c > budget {budget}c")
 
     # _wall_sizing_tier DELETED (P27 §1a): the tier ladder no longer votes
     # anywhere on the entry path — sizing is min(kelly, depth), the tier is

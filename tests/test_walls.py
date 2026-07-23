@@ -85,60 +85,64 @@ def test_wrong_way_tick_sell_must_improve_down(gateway):
 
 
 # ---------------------------------------------------------------- net-risk + $-at-risk
-def test_net_risk_cross_lane_cap(gateway):
+def _rebook(ledger, cents):
+    """Re-baseline the book (and the boot caps) to a chosen size, for the
+    proportional-wall math (WO-2026-07-23-B: the caps scale with the book)."""
+    ledger.db.execute("DELETE FROM cash_movements")
+    ledger.db.commit()
+    ledger.baseline(cents, confirmed_by="boot")
+    ledger.snapshot_caps_at_boot()
+
+
+def test_per_lane_proportional_risk_wall(gateway, ledger):
+    """DREW RULING 2026-07-23: the flat cross-lane count cap (<=3) is retired for
+    a PER-LANE, BOOK-PROPORTIONAL dollar wall. On a $41.62 book F's cap is 20%
+    (832c) — 8 lots at 97c — while D's is 2% (83c). F scales with the book; the
+    small lanes stay bounded. The NET_RISK/DOLLAR_RISK reason names are kept so
+    WALL_STORM telemetry stays comparable."""
+    _rebook(ledger, 4162)
     b = make_book()
-    gateway.submit(entry(lane="D", price=61, count=1), b)
-    gateway.submit(entry(lane="P", market="M2", price=30, count=1), b)
-    gateway.submit(entry(lane="H8", market="M3", price=30, count=1), b)
-    # 4th contract on the same settlement event crosses the <=3 cap
+    # F: 8 lots @97 (776c) fit under the 832c (20%) cap; 9 (873c) trip.
+    assert gateway.submit(entry(lane="F", event="EF1", market="MF1",
+                                price=97, count=8), b).shadow
     with pytest.raises(WallRejection) as e:
-        gateway.submit(entry(lane="F", market="M4", price=30, count=1), b)
-    assert e.value.wall == "NET_RISK"
-    # a different settlement event has its own cap
-    assert gateway.submit(entry(lane="F", market="M9", event="EV2", price=61, count=1), b).shadow
+        gateway.submit(entry(lane="F", event="EF2", market="MF2",
+                             price=97, count=9), b)
+    assert e.value.wall in ("NET_RISK", "DOLLAR_RISK")
+    # D's cap is a tenth of F's (2% vs 20%): 1 lot @60 (60c) fits, 2 (120c) trip.
+    assert gateway.submit(entry(lane="D", event="ED1", market="MD1",
+                                price=60, count=1), b).shadow
+    with pytest.raises(WallRejection) as e2:
+        gateway.submit(entry(lane="D", event="ED2", market="MD2",
+                             price=60, count=2), b)
+    assert e2.value.wall in ("NET_RISK", "DOLLAR_RISK")
 
 
-def test_at_risk_cap_trips_independently(gateway, monkeypatch):
-    """At the DREW-DEFAULT constants the count cap fires first (3 lots x 99c max
-    loss == the 297c cap exactly), so lift the count cap to prove the $-at-risk
-    wall enforces on its own."""
-    monkeypatch.setattr(config, "NET_RISK_CROSS_LANE_CAP", 10)
+def test_risk_wall_scales_with_the_book(gateway, ledger):
+    """The CEO lens made a wall: a FIXED cap holds F flat as the book rises. The
+    same 5-lot F order that a $20 book refuses, a $40 book admits — the ceiling
+    grows with the money instead of throttling it."""
     b = make_book()
-    gateway.submit(entry(lane="D", price=99, count=1), b)
-    gateway.submit(entry(lane="P", market="M2", price=99, count=1), b)
-    gateway.submit(entry(lane="H8", market="M3", price=99, count=1), b)  # 297c == cap
-    with pytest.raises(WallRejection) as e:
-        gateway.submit(entry(lane="F", market="M4", price=1, count=1), b)  # 298c > cap
-    assert e.value.wall == "DOLLAR_RISK"
+    _rebook(ledger, 2000)          # $20 → F cap 400c; 5 lots @97 = 485c > 400
+    with pytest.raises(WallRejection):
+        gateway.submit(entry(lane="F", event="EA", market="MA",
+                             price=97, count=5), b)
+    _rebook(ledger, 4000)          # $40 → F cap 800c; the same 485c now fits
+    assert gateway.submit(entry(lane="F", event="EB", market="MB",
+                                price=97, count=5), b).shadow
 
 
-def test_at_risk_cap_exact_boundary(gateway):
+def test_resting_exit_does_not_consume_cap(gateway, ledger):
+    """The gate-4 named case: a resting exit must NOT consume the risk cap."""
+    _rebook(ledger, 4162)
     b = make_book()
-    gateway.submit(entry(lane="D", price=99, count=1), b)
-    gateway.submit(entry(lane="P", market="M2", price=99, count=1), b)
-    assert gateway.submit(entry(lane="H8", market="M3", price=99, count=1), b).shadow  # ==297 OK
-    with pytest.raises(WallRejection):  # anything more breaks a cap
-        gateway.submit(entry(lane="F", market="M4", price=1, count=1), b)
-
-
-def test_resting_exit_does_not_consume_cap(gateway):
-    """The gate-4 named case: a resting exit must NOT consume net-risk cap."""
-    b = make_book()
-    # lane D long 1 on EV1 via a fill
-    r = gateway.submit(entry(lane="D", price=61, count=1), b)
+    r = gateway.submit(entry(lane="D", price=60, count=1), b)
     gateway.on_fill(r.order_id)
-    # park a resting EXIT for that position
     exit_order = Order(lane="D", event="EV1", market="M1", side="yes", action="sell",
                        price_cents=80, count=1, size_tier=config.TIER_PROBE, purpose="EXIT")
     gateway.submit(exit_order, b)
-    # exposure: 1 open position; the resting exit adds nothing.
     contracts, cents = gateway._event_exposure("EV1")
-    assert contracts == 1
-    # two more entries still fit under the <=3 cap (proving the exit isn't counted)
-    gateway.submit(entry(lane="P", market="M2", price=30, count=1), b)
-    gateway.submit(entry(lane="H8", market="M3", price=30, count=1), b)
-    with pytest.raises(WallRejection):
-        gateway.submit(entry(lane="F", market="M4", price=30, count=1), b)
+    assert contracts == 1          # the resting exit adds nothing
 
 
 def test_risk_reducing_orders_exempt_from_walls(gateway):
@@ -166,17 +170,24 @@ def test_band_and_single_entry(gateway):
     assert e.value.wall == "SINGLE_ENTRY"
 
 
-def test_pct_of_book_budget(gateway, ledger):
+def test_per_order_budget_is_lane_aware(gateway, ledger):
+    """WO-2026-07-23-B (DREW RULING): the per-order budget is the same fixed-
+    fraction cap that would hold F flat, so it too is lane-proportional — F's
+    20% clears an order that the retired flat 10% floor would have blocked, while
+    the per-lane RISK wall keeps every other lane bounded (it fires first for a
+    small lane, so the ruling's dollar wall subsumes the old count/budget cap)."""
     b = make_book()
-    # book $100, cap 10% -> 1000c budget; CLEAR tier allows 3 contracts; 3*99=297c fits,
-    # so shrink the budget: rebuild caps on a $2 book
-    ledger.db.execute("DELETE FROM cash_movements")
-    ledger.db.commit()
-    ledger.baseline(200, confirmed_by="boot")
-    ledger.snapshot_caps_at_boot()  # budget = 20c
+    _rebook(ledger, 4162)          # $41.62 — 10% floor = 416c, F's 20% = 832c
+    # F's 776c order (8 lots @97) is OVER the retired 10% floor but under F's 20%
+    # per-order budget — it clears (this is exactly the order F was capped from).
+    assert gateway.submit(entry(lane="F", event="EF", market="MF",
+                                price=97, count=8), b).shadow
+    # the identical 776c notional on a small lane (D, 2%) is refused by the
+    # per-lane dollar wall — the gateway backstop F kept, not lost.
     with pytest.raises(WallRejection) as e:
-        gateway.submit(entry(price=61, count=1), b)
-    assert e.value.wall == "BUDGET"
+        gateway.submit(entry(lane="D", event="EG", market="MG",
+                             price=97, count=8), b)
+    assert e.value.wall in ("NET_RISK", "DOLLAR_RISK")
 
 
 def test_tier_never_walls(gateway):

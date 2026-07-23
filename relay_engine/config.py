@@ -266,7 +266,26 @@ OPEN_CATASTROPHE_MIN_DEPTH = 3     # DREW-DEFAULT: real held-side bid depth for 
 # ---------------------------------------------------------------------------
 ONE_LOT_MAX_LOSS_CENTS = 99  # worst-case loss on a single 1-lot maker entry (price -> 0)
 AT_RISK_CAP_MULT = 3  # DREW-DEFAULT: $-at-risk per settlement event = 3x one-lot max loss
-AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS
+AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap (book==0 fallback)
+
+# WO-2026-07-23-B Part 1 (DREW RULING 2026-07-23): the flat cross-lane risk wall
+# is retired for a PER-LANE, BOOK-PROPORTIONAL dollar wall — keep the gateway
+# guard, don't exempt F. The wall's real job is catching a SIZING BUG, not market
+# risk; a FIXED cap holds F's absolute profit flat as the book rises (compounding
+# → linear). At 97c the old count cap (3) and dollar cap (297c) were the SAME
+# constraint (297/97 ≈ 3.06); a correct dollar wall subsumes the count wall. The
+# NET_RISK / DOLLAR_RISK reason NAMES are kept so WALL_STORM telemetry stays
+# comparable across builds.
+AT_RISK_PCT = {"F": 0.20, "H8": 0.05, "FLIP": 0.05, "D": 0.02, "P": 0.02}
+AT_RISK_PCT_DEFAULT = 0.02        # any unlisted lane (ORPHAN, …) — conservative
+
+
+def at_risk_cap_cents(lane: str, book_cents: int) -> int:
+    """DREW RULING: dollar-at-risk cap per settlement event = the lane's share of
+    the book. Since `_market_entry_blocked` enforces one lane per market, a
+    per-lane cap is a per-event cap in practice; cross-event exposure is bounded
+    by guard (a), the 50%-of-book portfolio cap."""
+    return int(book_cents * AT_RISK_PCT.get(lane, AT_RISK_PCT_DEFAULT))
 LANE_D_FLOOR_CENTS = 60  # DREW-DEFAULT: Lane D band floor, pending Chunk 2 data (50c vs 60c open)
 DEPTH_FRACTION = 0.25  # DREW-DEFAULT: per-level size <= 25% of visible depth
 # WO-INFRA-HARDENING E1: a book-vs-venue gap wider than this, with 0 unsettled
@@ -279,6 +298,22 @@ RECON_AUDIT_FLOOR_CENTS = 2  # DREW-DEFAULT: E1 records an unexplained book/venu
 # Walls (C.3 / BUILD_SEQUENCE 3.2)
 # ---------------------------------------------------------------------------
 NET_RISK_CROSS_LANE_CAP = 3  # net contracts at risk per settlement event, across lanes
+
+# ---------------------------------------------------------------------------
+# WO-2026-07-23-B Part 1 — SCALE F. F earns ~98% of the book's profit and was
+# capped at NET_RISK_CROSS_LANE_CAP=3 (a fixed count, named for risk, that turns
+# compound growth into linear growth as the book rises). F now sizes to a % of
+# book (self-scaling), bounded only by REAL depth — not by Kelly or the count
+# cap. F ALONE takes this path; every other lane keeps min(kelly, depth, cap).
+# ---------------------------------------------------------------------------
+F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.20"))  # DREW DIAL: F size = pct of book / price
+# Guard (a): total deployed capital across ALL lanes never exceeds this % of
+# book (F and FLIP can hold different markets at once; nothing else bounds the sum).
+PORTFOLIO_DEPLOY_PCT = 0.50       # DREW-DEFAULT: sum of open notional <= 50% of book
+# Guard (b): F's rate halt cannot protect it (at 97% wins it never sees 2-of-4
+# negative). A single F loss worse than this per contract SUPPRESSES F for the
+# rest of the day and pages — F's only real guard, the unsalvaged-loss tripwire.
+F_EVENT_TRIPWIRE_C = 60           # DREW-DEFAULT: one F loss > 60c/contract halts F for the day
 
 # ---------------------------------------------------------------------------
 # Sizing (C.3 / Charter §8): tiers move on Wilson lower bounds only.

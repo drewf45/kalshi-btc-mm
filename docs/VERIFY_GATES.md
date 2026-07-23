@@ -3053,6 +3053,60 @@ other than size"); the supersede invariant (§1.1) preserved — the floored fla
 FLIP sells first. New acceptance in `test_uncovered_flatten.py` (rest-then-breach, rest-fills-heals,
 above-floor-crosses-unchanged) + updated supersede test. Suite 715 · preflight 23/23.
 
+## WO-2026-07-23-B §4.1 + Part 1 — REQUESTED-VS-FILLED, THEN SCALE F (build 65)
+
+**§4.1 (ships with Part 1 as its instrument):** every booked fill now carries `requested_count` and
+`requested_price` beside the filled `count`/`price` (ledger columns, migrated with `ALTER TABLE`;
+populated at the fill-booking path from the originating order and at the custodian cut). "Requested vs
+filled" is the field that answers **whether size travels** — the one unknown scaling F introduces, which
+cannot be backtested. NULL on rows written before the column existed or with no originating order (never
+a fabricated number). Acceptance #2 met.
+
+**Part 1 — SCALE F.** F earns ~98% of the book's profit and was capped at 3 contracts.
+
+**Read-rule divergence (reported, ruled):** the WO cited only `sizing.py:74` / `config.py:276`
+(`NET_RISK_CROSS_LANE_CAP=3`). **Verified FALSE-as-complete:** F is *also* hard-capped by the gateway
+`_wall_net_risk_and_at_risk` (NET_RISK count ≤3 **and** DOLLAR_RISK ≤`AT_RISK_CAP_CENTS`=297c) **and** by
+`_wall_pct_of_book` (BUDGET: order notional ≤10% of book). Sizing F to 8 alone left every F>3 proposal
+dying at the wall (`0+12 > 3`) — a governor by accident. Surfaced to Drew.
+
+**Drew's ruling (2026-07-23):** *per-lane, book-proportional dollar wall — keep the gateway guard, don't
+exempt F.* Implemented:
+- **F self-sizes** to `F_NOTIONAL_PCT` (0.20) of book / price, bounded only by real depth — Kelly and
+  the count cap no longer touch F (`sizing.size_order(..., lane="F")`). Every other lane keeps
+  `min(kelly, depth, cap)`.
+- **The wall is now per-lane proportional:** `AT_RISK_PCT = {F:0.20, H8:0.05, FLIP:0.05, D:0.02, P:0.02}`,
+  `at_risk_cap_cents(lane, book)`. The retired count cap is subsumed (at 97c both bound at 3); the
+  **NET_RISK / DOLLAR_RISK reason names are kept** so WALL_STORM telemetry stays comparable. When
+  `book_cents ≤ 0` (boot/test) the legacy flat walls stand unchanged.
+- **The per-order BUDGET wall is the same fixed-fraction cap** — Drew's principle applies identically, so
+  it too is lane-proportional (F's per-order budget rises to 20%; every other lane keeps the 10% floor,
+  since their proportions are smaller). *(This third wall was not in Drew's text; his stated principle —
+  "a fixed cap holds F flat as the book rises" — governs it, and leaving it flat would silently re-cap F
+  at ~4 lots, defeating the 8-lot ruling. Reported here as an honest extension.)*
+- **Guards:** (a) total deployed ≤ 50% of book across ALL lanes (`ledger.deployed_cents()` clamps each
+  entry in `_score_and_size`; skipped at book≤0); (b) any single F loss > `F_EVENT_TRIPWIRE_C`=60c per
+  contract suppresses F for the day (`ledger.set_f_tripwire`/`f_suppressed`, day-scoped, self-clearing;
+  fired from both F-loss choke points — held-to-settlement and the custodian conclusion; the rate halt
+  structurally can't protect a 97%-win lane); (c) the rail is untouched; (d) kelly/depth/notional/at-risk
+  terms and the binding one logged (`F_SIZE`).
+
+**Why proportional not exempt (Drew):** the wall's real job is catching a **sizing bug**, not market risk —
+three stale constants shipped in three days; F should not be the one lane with no gateway backstop. And a
+fixed cap turns compounding into linear growth (4.7%/day at $41 → 0.98% at $200); proportional fixes the
+decay. **Hard condition honored:** Part 2 (the flatten floor) shipped first, in build 64.
+
+**HARD RAIL / kill conditions:** F behaviour unchanged OTHER than size; deployed never > 50% of book;
+the F tripwire fires > 60c/contract; the rail untouched. New acceptance `test_scale_f.py` (9) + rewritten
+`test_walls.py` (per-lane proportional, scales-with-book, lane-aware budget) + updated sizing tests.
+Suite 725 · preflight 23/23.
+
+**⚠️ The honest caveat (§1.6, carried forward):** F's edge is the salvage — +1.62c/contract at a −40c
+salvaged loss, −0.20c if a loss goes full 97c — resting on 9 losses, **none in the last 81 trades**.
+Scaling multiplies exposure to the unmeasured half. Guard (b) is the mitigation; §4.4 (next) is how the
+loss size finally becomes readable. Treat the first F loss at 8 lots as the most informative event in the
+project and read it immediately.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
