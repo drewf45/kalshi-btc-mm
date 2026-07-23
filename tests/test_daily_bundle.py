@@ -225,6 +225,37 @@ def test_scoreboard_carries_realized_money_and_model_error(populated, tmp_path):
     assert open_cell["model_error"] is not None
 
 
+def test_lifetime_cell_aggregates_carry_avg_loss_for_f(populated):
+    """Acceptance #7 / §4.4 — the F blocker: lifetime aggregates per cell include
+    F's avg_loss (the number the ceiling rests on), read from the whole record."""
+    from relay_engine import scoring
+    led = Ledger(populated[0])
+    agg = scoring.lifetime_cell_aggregates(led)
+    fcell = next(a for a in agg if a["lane"] == "F")
+    assert fcell["n"] == 59 and fcell["wins"] == 50 and fcell["losses"] == 9
+    assert abs(fcell["avg_loss_c"] - 40.0) < 1e-6       # the salvage number, readable
+    assert fcell["avg_win_c"] == 5.0
+    assert fcell["realized_pnl_c"] == 50 * 5 - 9 * 40   # −110¢
+
+
+def test_lifetime_cells_sheet_present_in_the_workbook(populated, tmp_path):
+    """§4.4 — the lifetime aggregates ride the pack as their own sheet, and F's
+    avg_loss also surfaces in the SUMMARY F BLOCKER section."""
+    dbf, now = populated
+    out = str(tmp_path / "daily.xlsx")
+    daily_bundle.build_daily_workbook(dbf, ["x"], out, now=now)
+    assert "LIFETIME_CELLS" in _sheet_names(out)
+    rows = _read_sheet(out, "LIFETIME_CELLS")
+    assert rows[0] == ["lane", "cell", "n", "wins", "losses", "avg_win_c",
+                       "avg_loss_c", "realized_pnl_c"]
+    data = [dict(zip(rows[0], r)) for r in rows[1:]]
+    f = next(d for d in data if d["lane"] == "F")
+    assert f["losses"] == 9 and f["avg_loss_c"] == 40.0
+    # the SUMMARY leads with the F blocker
+    summ = {r[1]: r[2] for r in _read_sheet(out, "SUMMARY")[1:]}
+    assert any("avg_loss" in k for k in summ)
+
+
 def test_open_break_even_anchored_on_live_constant_not_retired_band(populated):
     """Acceptance #3 / A1 — OPEN's honest loss is OPEN_MOMENTUM_STOP_C (the live
     stop), NOT the retired band floor (mid − OPEN_UNDETERMINED_BAND[0])."""

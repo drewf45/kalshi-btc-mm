@@ -45,6 +45,11 @@ _SCOREBOARD_COLS = ("lane", "cell", "n", "W", "LB", "be_modeled", "margin",
                     "pnl_day_c", "pnl_life_c", "loss_modeled_c",
                     "loss_actual_c", "be_implied", "model_error")
 
+# §4.4 lifetime aggregates (the F blocker) — n, wins, losses, and the ACTUAL
+# average win/loss per cell, read from the whole record, not one day.
+_LIFETIME_COLS = ("lane", "cell", "n", "wins", "losses", "avg_win_c",
+                  "avg_loss_c", "realized_pnl_c")
+
 # a cell whose model disagrees with realized losses by more than this is flagged
 # in SUMMARY (model health): the break-even is off by >8 points of win-rate.
 _MODEL_ERROR_FLAG = 0.08
@@ -276,7 +281,7 @@ def _failures_by_tag(conn, day_start: float) -> List[Tuple[str, int]]:
         " GROUP BY why_tag ORDER BY COUNT(*) DESC", (day_start,)).fetchall()]
 
 
-def _summary_sheet(ledger, conn, scoreboard: List[dict],
+def _summary_sheet(ledger, conn, scoreboard: List[dict], life: List[dict],
                    day_start: float) -> Tuple[List[str], list]:
     """§4 — the SUMMARY that LEADS the workbook: money, expectation, model
     health, fees, anomalies, open questions. Three columns [section, item,
@@ -310,6 +315,19 @@ def _summary_sheet(ledger, conn, scoreboard: List[dict],
     sec("EXPECTATION", "wins today", w_day)
     sec("EXPECTATION", "hit rate today",
         f"{(w_day / n_day):.3f}" if n_day else "-")
+
+    # ── THE F BLOCKER (§4.4): F's lifetime loss size — the number Part 1's
+    # ceiling rests on. +1.62c/contract at a −40c salvaged loss, −0.20c if a
+    # loss goes full 97c; scaling multiplies exposure to THIS. Read it first. ──
+    for r in life:
+        if r["lane"] == "F":
+            sec("F BLOCKER (LIFETIME)",
+                f"{r['cell']}  n / losses",
+                f"{r['n']} / {r['losses']}")
+            sec("F BLOCKER (LIFETIME)",
+                f"{r['cell']}  avg_loss / avg_win ¢",
+                f"{r['avg_loss_c'] if r['avg_loss_c'] is not None else '-'} / "
+                f"{r['avg_win_c'] if r['avg_win_c'] is not None else '-'}")
 
     # ── MODEL HEALTH (B2): cells whose modeled BE disagrees with the realized
     # loss by more than the flag — the self-audit surfacing its own worst calls.
@@ -373,11 +391,15 @@ def build_daily_workbook(db_path: str, scoreboard_lines: List[str],
         # trading path still reads the untouched breakeven()/SALVAGE_ADJ_MIN_N,
         # so F and OPEN trade byte-identically (acceptance #9).
         board = scoring.scoreboard_rows(ledger_ro, day_start)
+        life = scoring.lifetime_cell_aggregates(ledger_ro)
         sc_header, sc_rows = _scoreboard_sheet(board)
-        sm_header, sm_rows = _summary_sheet(ledger_ro, conn, board, day_start)
+        life_rows = [[r.get(c) for c in _LIFETIME_COLS] for r in life]
+        sm_header, sm_rows = _summary_sheet(ledger_ro, conn, board, life,
+                                            day_start)
         sheets: List[Tuple[str, List[str], list]] = [
             ("SUMMARY", sm_header, sm_rows),           # §4 — leads the workbook
             ("SCOREBOARD", sc_header, sc_rows),        # B1/B2 — the self-audit
+            ("LIFETIME_CELLS", list(_LIFETIME_COLS), life_rows),  # §4.4 — the F blocker
             # the legacy text scoreboard (what /scoreboard prints) kept for
             # continuity, after the structured truth.
             ("scoreboard_txt", ["line"], [[ln] for ln in scoreboard_lines])]

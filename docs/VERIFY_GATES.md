@@ -3107,6 +3107,41 @@ Scaling multiplies exposure to the unmeasured half. Guard (b) is the mitigation;
 loss size finally becomes readable. Treat the first F loss at 8 lots as the most informative event in the
 project and read it immediately.
 
+## WO-2026-07-23-B §4.4 + Part 3 diagnosis + rolling remainder (build 66)
+
+**§4.4 — the F blocker (acceptance #7): DELIVERED.** `scoring.lifetime_cell_aggregates` returns, per
+(lane, cell), lifetime `n / wins / losses / avg_win_c / avg_loss_c / realized_pnl_c` — read from the
+whole `cell_outcomes` record, not the day. It rides the pack as a **LIFETIME_CELLS** sheet, and F's
+lifetime `avg_loss` also leads the SUMMARY under **F BLOCKER (LIFETIME)** — the "what does an F loss
+actually cost?" number that Part 1's ceiling rests on is now readable. Test: `test_daily_bundle.py`
+(lifetime aggregates carry F's avg_loss; the sheet + SUMMARY line present).
+
+**Part 3 — halt on money, not count: DEFERRED, with the §3.4 diagnosis the WO required.** The WO gates
+Part 3 on trusting `fills_pnl` first ("a better rule on a wrong input is still wrong"). Diagnosis at
+source:
+- The per-lane P&L the rate halt consumes is `surface.settle_market`, computed from
+  `SELECT lane, side, action, price_cents, count` — **`fee_cents` is not even selected**, so the halt's
+  per-lane number is **GROSS of fees** while the round-trip receipt (`record_fill`'s `cell_outcome`) is
+  net. Every window's `fills_pnl` is high by its fees.
+- A closed round trip is re-derived through the **settlement-outcome lens** (entry "collects payoff",
+  exit "forgoes payoff") rather than read as the realized (exit − entry) it already booked. For a clean
+  same-side round trip these are algebraically equal, but a **SELF_NET-booked exit** (an opposite-side
+  buy recorded as EXIT at 100 − price) or an **unmatched leg** (`net_held < 0`) breaks the equality —
+  the likely source of the live `+17c → −4c` divergence Drew saw.
+- **Ruling:** re-tuning the halt to SUM `fills_pnl` would inherit both errors. Part 3 is held until
+  `fills_pnl` is reconciled (net-of-fees + the closed-round-trip path reconciled against the exit-booked
+  cell_outcome). The live count-halt (2-of-4) is unchanged; nothing at risk moves. **Flagged for Drew:**
+  the fee omission may also affect settlement book-cents — worth its own careful build, not rushed
+  alongside a live-halt change.
+
+**Part 4 rolling remainder (assessed):** §4.7 SUMMARY-sheet-first (DELIVERED, build 63, extended here).
+§4.5 model-vs-reality per cell (be_modeled/loss_actual/model_error — DELIVERED build 63; `ev_per_trade`
+as primary sort not yet). §4.6 failure counts WITH day-over-day delta and expectation-vs-outcome σ —
+**deferred:** the delta needs a persisted prior-day snapshot (a data-plane addition), flagged honestly in
+the SUMMARY "open questions". §4.2 market context at every decision and §4.3 per-trade MFE/MAE excursion
+(the target×stop EV grid) — **deferred:** sizable new joins to `book_snapshots`, rolling. Acceptance #8
+(failure counts carry a delta) is the one criterion NOT yet met — it is gated on the prior-day snapshot.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

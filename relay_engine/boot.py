@@ -311,6 +311,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(reachable). PACK-SIDE ONLY — the trading breakeven()/"
                  "SALVAGE_ADJ_MIN_N are UNTOUCHED, so F and OPEN trade "
                  "byte-identically (acceptance #9, a KILL CONDITION)")
+    lines.append("  ORDER TRUTH + F BLOCKER (WO-2026-07-23-B §4.1/§4.4, build "
+                 "65-66): every fill carries requested_count/price beside filled "
+                 "(does size TRAVEL — the scaling unknown); the pack gains a "
+                 "LIFETIME_CELLS sheet + a SUMMARY 'F BLOCKER' line — n, wins, "
+                 "losses, avg_win, avg_loss per cell across the WHOLE record, so "
+                 "F's 9 lifetime losses (the number the ceiling rests on) are "
+                 "finally readable, not hidden by the day scope")
     lines.append(f"  SCALE F (WO-2026-07-23-B Part 1, build 65): F earns ~98% "
                  f"of the book and was capped at {config.NET_RISK_CROSS_LANE_CAP} "
                  f"contracts by a fixed count. F now SELF-SIZES to "

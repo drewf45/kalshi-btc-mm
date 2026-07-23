@@ -334,6 +334,34 @@ def scoreboard_rows(ledger, day_start: Optional[float] = None) -> List[dict]:
     return out
 
 
+def lifetime_cell_aggregates(ledger) -> List[dict]:
+    """WO-2026-07-23-B §4.4 — THE F BLOCKER. The daily pack is day-scoped, so F's
+    9 lifetime losses (the number Part 1's ceiling rests on) are unreadable. This
+    is LIFETIME per (lane, cell): n, wins, losses, avg_win, avg_loss, realized
+    P&L — the salvage question ('what does an F loss actually cost?') answered
+    from the whole record, not one day. Read-only."""
+    rows = ledger.db.execute(
+        "SELECT lane, price_cell, COUNT(*),"
+        " COALESCE(SUM(won),0),"
+        " COALESCE(SUM(CASE WHEN pnl_cents>0 THEN pnl_cents END),0),"
+        " COALESCE(SUM(CASE WHEN pnl_cents>0 THEN 1 ELSE 0 END),0),"
+        " COALESCE(SUM(CASE WHEN pnl_cents<0 THEN -pnl_cents END),0),"
+        " COALESCE(SUM(CASE WHEN pnl_cents<0 THEN 1 ELSE 0 END),0),"
+        " COALESCE(SUM(pnl_cents),0)"
+        " FROM cell_outcomes GROUP BY lane, price_cell").fetchall()
+    out = []
+    for (lane, cell, n, wins, win_sum, win_n, loss_sum, loss_n,
+         pnl) in rows:
+        out.append({
+            "lane": lane, "cell": cell_label(cell), "n": int(n),
+            "wins": int(wins), "losses": int(loss_n),
+            "avg_win_c": round(win_sum / win_n, 1) if win_n else None,
+            "avg_loss_c": round(loss_sum / loss_n, 1) if loss_n else None,
+            "realized_pnl_c": int(pnl)})
+    out.sort(key=lambda r: (r["lane"], r["cell"]))
+    return out
+
+
 def fills_pnl_by_lane(ledger, day_start: Optional[float] = None) -> List[dict]:
     """SUMMARY money (B1/C2): realized fills P&L per lane, day + lifetime — the
     edge number is fills_pnl (strategy), NOT window_pnl (includes accidents)."""
