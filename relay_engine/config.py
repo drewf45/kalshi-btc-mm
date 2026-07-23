@@ -137,6 +137,11 @@ OPEN_ENTRY_MAX_C = 64            # DREW-DEFAULT (WO-...-G, was 70): above this t
 OPEN_ENTRY_DEADLINE_S = 90       # DREW-DEFAULT: unfilled by here → cancel, never chase (== opening window)
 OPEN_GOUGE_C = 17               # DREW-DEFAULT (WO-...-F, was 20): target = entry + 17, cap 90 — capture more often (a nearer target exits before the drifting pile exhausts)
 OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2-poll sustain, maker-first
+# WO-2026-07-23-B Part 2: the uncovered-leg FLATTEN used to sell at whatever the
+# book showed (unbounded mark) — 15c through the stop on the night's worst leg.
+# The flatten now floors at entry − stop − slip and rides ONE poll at the floor
+# before it will cross below it; a cross below the floor is a counted breach.
+SLIP_TOLERANCE_C = 3             # DREW-DEFAULT: flatten may cross at most stop+slip below entry
 # WO-2026-07-22-F "WAIT FOR THE PILE": entry-discipline tuning. Every logged
 # entry so far fired inside the first 57s — before the pile window even opens,
 # on a book that had not moved (trend $0) or already finished (skew 41). FLIP

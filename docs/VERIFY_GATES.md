@@ -3020,6 +3020,39 @@ join is its own build), B7 (expectation ±σ — SUMMARY carries n/wins/hit-rate
 the structured sheet supersedes it). The **HUNT enable/disable ruling** (from WO-L §3.1) and **§4.6 the
 empty DODGED curve** remain open capital-gate calls, surfaced to Drew, not changed here.
 
+## WO-2026-07-23-B Part 2 — THE FLATTEN HAS A PRICE FLOOR (build 64)
+
+**The ruling: the uncovered-leg flatten must not sell at whatever the book shows.** Ships BEFORE Part 1
+(F scaling), because the leak scales linearly with contracts — 21c/night at 3 lots becomes 56c at 8.
+
+**Read-rule at source (TRUE):** `lane_flip.py` esc-2 flatten built the Order with `price_cents=mark`
+(`book.best_yes_bid()`/`best_no_bid()`), crossfire, with no reference to the declared `entry −
+OPEN_MOMENTUM_STOP_C` stop. **TRUE** — measured on tape: four of six stops held to 1c, two blew through
+(230230 entry 61 → exit 45, 6c through the stop; 222100 entry 59 → exit 34, 15c through), 21c of excess
+loss on a night that netted 16c.
+
+**Built:**
+- **The floor** = `entry − OPEN_MOMENTUM_STOP_C − SLIP_TOLERANCE_C` (slip = 3). The entry is the
+  count-weighted cost basis of the **unsettled ENTRY fills** (`_flip_entry_price`, read from the booked
+  ledger so it survives an in-memory reconcile), not a bucket field that can be cleared.
+- **Bounded ride, then counted cross:** when the book is already through the floor, the flatten rests
+  ONE poll AT the floor (maker, `crossfire=False`) instead of dumping at `mark`. If that rest fills, the
+  leg heals — no cross. If it does not, the next poll crosses at `mark` and logs `FLIP_FLOOR_BREACH`
+  with `overshoot = floor − mark`. A cross below the floor is never silent.
+- **No behaviour change when healthy:** `mark ≥ floor` crosses immediately with the ordinary
+  `FLIP_UNCOVERED_FLATTENED` tag (the existing tests — marks all above their floors — stay green).
+- **`SLIP_TOLERANCE_C = 3`** added to config.
+
+**Root note (honest, partial):** §2.4 item 4 (the cover getting `VENUE_REJECTED: post only cross` should
+re-price and re-post rather than escalate) is NOT changed here — the floor is the safety net that bounds
+the damage regardless of why the cascade was reached. The re-price-the-cover root fix is a deeper change
+to the cover path, assessed and left for a follow-up; the floor makes the current escalation safe to run.
+
+**HARD RAIL:** FLIP-only (F/`lane_fh8` untouched — the WO's kill condition is "any F behaviour change
+other than size"); the supersede invariant (§1.1) preserved — the floored flatten still drops competing
+FLIP sells first. New acceptance in `test_uncovered_flatten.py` (rest-then-breach, rest-fills-heals,
+above-floor-crosses-unchanged) + updated supersede test. Suite 715 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

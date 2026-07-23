@@ -220,9 +220,93 @@ def test_flatten_confirmed_prevents_fatal(flip, gateway, ledger):
     assert "yes" not in w.flatten_oids
 
 
+# ── WO-2026-07-23-B Part 2: the flatten has a price floor ──────────────────
+def _at_flatten_deadline(flip, ledger, entry, count=1):
+    """A booked, uncovered leg parked at the flatten deadline (esc2): its take
+    is proposed but never confirms (the self-net void). Returns the window."""
+    w = flip._window(TICKER, CLOSE)
+    ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", entry, count, "PROBE")
+    w.opens["yes"] = {"entry": entry, "fill_ts": CLOSE - 1100, "count": count,
+                      "take_oid": None, "take_proposed": True, "done": False,
+                      "collapse_polls": 0, "catastrophe_polls": 0, "det_ts": None,
+                      "entry_oid": None, "defer_polls": 0, "hold": False}
+    w.heal_attempts["yes"] = 2                    # jump to the flatten deadline
+    w.heal_covered["yes"] = 0
+    return w
+
+
+def test_flatten_rests_at_floor_then_crosses_with_counted_breach(flip, ledger,
+                                                                 funnel):
+    """The 230230 leg: entry 61, the book already 45c (through the floor). The
+    flatten must NOT dump at 45 on the first cross — it rests ONE poll at the
+    floor (61−10−3 = 48), and only crosses below it on the next poll, counting
+    the breach with its overshoot. (Acceptance #1.)"""
+    floor = 61 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 48
+    w = _at_flatten_deadline(flip, ledger, entry=61)
+    b = OrderBook(market=TICKER)
+    b.apply_snapshot({45: 10}, {50: 10}, ts=1.0)      # best yes bid 45 < floor
+
+    # poll 1: rest AT the floor, maker, no cross, no breach counted yet
+    p1 = []
+    flip._check_uncovered(w, TICKER, p1, book=b, event=EVENT, now=CLOSE - 700)
+    sells1 = [p for p in p1 if p.action == "sell" and p.side == "yes"]
+    assert len(sells1) == 1
+    assert sells1[0].price_cents == floor and not sells1[0].crossfire
+    assert _rows(ledger, "FLIP_FLOOR_BREACH") == 0
+    assert _rows(ledger, "FLIP_UNCOVERED_FLATTENED") == 0
+    assert w.flatten_floor_tried["yes"] is True
+
+    # poll 2: still uncovered (the floor rest never filled) → cross at mark,
+    # the breach counted with its overshoot (floor 48 − mark 45 = 3c)
+    p2 = []
+    flip._check_uncovered(w, TICKER, p2, book=b, event=EVENT, now=CLOSE - 699)
+    sells2 = [p for p in p2 if p.action == "sell" and p.side == "yes"]
+    assert len(sells2) == 1 and sells2[0].crossfire
+    assert sells2[0].price_cents == 45
+    assert _rows(ledger, "FLIP_FLOOR_BREACH") == 1        # counted, not silent
+    assert any("FLIP_FLOOR_BREACH" in a for a in funnel)
+
+
+def test_flatten_at_floor_that_fills_never_breaches(flip, ledger):
+    """If the one-poll rest at the floor FILLS (the book covers it), the leg
+    heals — no cross, no breach. The bounded ride did its job."""
+    floor = 61 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C
+    w = _at_flatten_deadline(flip, ledger, entry=61)
+    b = OrderBook(market=TICKER)
+    b.apply_snapshot({45: 10}, {50: 10}, ts=1.0)
+    p1 = []
+    flip._check_uncovered(w, TICKER, p1, book=b, event=EVENT, now=CLOSE - 700)
+    rest = next(p for p in p1 if p.action == "sell" and not p.crossfire)
+    assert rest.price_cents == floor
+    # the rest fills: the booked EXIT lands, the leg covers
+    flip.on_submitted(rest, "FLOOR-1", CLOSE - 700)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", floor, 1, "PROBE")
+    p2 = []
+    flip._check_uncovered(w, TICKER, p2, book=b, event=EVENT, now=CLOSE - 699)
+    sells2 = [p for p in p2 if p.action == "sell" and p.side == "yes"]
+    assert sells2 == []                               # healed — nothing to cross
+    assert _rows(ledger, "FLIP_FLOOR_BREACH") == 0
+
+
+def test_flatten_above_floor_crosses_immediately_unchanged(flip, ledger):
+    """No behaviour change when the book is healthy: a mark AT or ABOVE the
+    floor crosses at once with the ordinary FLATTENED tag — no needless
+    one-poll delay, no breach."""
+    w = _at_flatten_deadline(flip, ledger, entry=61)
+    b = OrderBook(market=TICKER)
+    b.apply_snapshot({55: 10}, {60: 10}, ts=1.0)      # bid 55 ≥ floor 48
+    p1 = []
+    flip._check_uncovered(w, TICKER, p1, book=b, event=EVENT, now=CLOSE - 700)
+    sells = [p for p in p1 if p.action == "sell" and p.side == "yes"]
+    assert len(sells) == 1 and sells[0].crossfire and sells[0].price_cents == 55
+    assert _rows(ledger, "FLIP_UNCOVERED_FLATTENED") == 1
+    assert _rows(ledger, "FLIP_FLOOR_BREACH") == 0
+
+
 # ── HARD RAIL ──────────────────────────────────────────────────────────────
 def test_rails_unchanged():
     assert config.RATE_HALT_LOSSES == 2 and config.RATE_HALT_WINDOW == 4
     assert config.CASH_SILENT_REBASE_CENTS == 5
     assert config.OPEN_BAND == (39, 56)          # OPEN swing gate untouched
     assert config.KELLY_FRACTION_CEILING == pytest.approx(1.0 / 12.0)
+    assert config.SLIP_TOLERANCE_C == 3          # Part 2 floor tolerance

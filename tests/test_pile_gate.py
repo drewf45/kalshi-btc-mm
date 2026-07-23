@@ -168,7 +168,13 @@ def test_flatten_supersedes_a_competing_bail_never_sells_more_than_held(flip,
              and p.action == "sell"]
     assert sum(p.count for p in sells) <= 1            # never more than held
     assert bail not in proposals                       # the bail was superseded
-    assert any("FLATTENED" in (p.reason or "") for p in sells)  # by the flatten
+    assert any("FLATTEN" in (p.reason or "") for p in sells)   # by the flatten
+    # WO-2026-07-23-B Part 2: the bail sat at 44c — BELOW the entry−stop−slip
+    # floor (60−10−3 = 47). The flatten does not sell there; it rests AT the
+    # floor for one poll first (never dumps through it on the first cross).
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C
+    assert all(p.price_cents >= floor for p in sells)  # nothing sold below the floor
+    assert any(p.price_cents == floor and not p.crossfire for p in sells)
 
 
 def test_a_traded_window_never_logs_open_skip(flip, ledger, caplog):

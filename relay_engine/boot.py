@@ -184,6 +184,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(a bail, a stale take), so the crossfire is the ONE close (the "
                  "10:19 −87c short, bail 1 + flatten 1 on a 1-lot position, "
                  "cannot recur)")
+    lines.append(f"  FLIP FLATTEN FLOOR (WO-2026-07-23-B Part 2, build 64): the "
+                 f"uncovered-leg flatten no longer dumps at whatever the book "
+                 f"shows — it FLOORS at entry−{config.OPEN_MOMENTUM_STOP_C}−"
+                 f"{config.SLIP_TOLERANCE_C} (the stop plus slip tolerance), "
+                 "rests ONE poll AT the floor when the book is already through "
+                 "it, and only then crosses below — as a COUNTED FLIP_FLOOR_"
+                 "BREACH with its overshoot, never a silent market dump (the "
+                 "222100 −15c-through-stop leg cannot recur unmeasured)")
     lines.append("  FLIP ENTRY WALL (WO-2026-07-22-J §0.1 → -L §2): ONE per-"
                  "market net check, now CROSS-LANE — it sums EVERY lane's net "
                  "(F under its own key too), so a FLIP lane (OPEN/HUNT) can never "

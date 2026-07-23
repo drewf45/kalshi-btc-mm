@@ -212,6 +212,10 @@ class FlipWindow:
     heal_grace: Dict[str, int] = field(default_factory=dict)
     heal_covered: Dict[str, int] = field(default_factory=dict)
     flatten_oids: Dict[str, tuple] = field(default_factory=dict)
+    # WO-2026-07-23-B Part 2: the flatten floors at entry−stop−slip. When the
+    # book is already through the floor, it rests ONE poll at the floor before
+    # it will cross below it; this records the side that already had its poll.
+    flatten_floor_tried: Dict[str, bool] = field(default_factory=dict)
     # P-FLIP-THESIS-1 §1 (Scientist: LOG-ONLY until measured): continuity —
     # does the prior window's settlement direction predict this entry side?
     continuity_logged: bool = False
@@ -334,6 +338,24 @@ class LaneFlip:
         if not entries:
             return None
         return max(0, int(held))
+
+    def _flip_entry_price(self, market: str, side: str) -> Optional[float]:
+        """WO-2026-07-23-B Part 2: the count-weighted entry (cost basis) of the
+        unsettled FLIP position on a side — the reference the momentum stop and
+        the flatten floor are both measured from. Read from the booked ledger so
+        the floor holds even after the in-memory bucket has been reconciled away.
+        None when there is no unsettled ENTRY to price (then the floor cannot
+        apply and the flatten crosses at mark, exactly as before)."""
+        ledger = getattr(self.gateway, "ledger", None) if self.gateway else None
+        if ledger is None:
+            return None
+        row = ledger.db.execute(
+            "SELECT SUM(price_cents*count), SUM(count) FROM fills"
+            " WHERE market=? AND lane='FLIP' AND side=? AND action='ENTRY'"
+            " AND settled=0", (market, side)).fetchone()
+        if not row or not row[1]:
+            return None
+        return float(row[0]) / float(row[1])
 
     def _exit_count(self, market: str, side: str, rec_count: int) -> int:
         """FLIP-COUNT-1 (Adversary): an exit sells min(memory, booked-held),
@@ -1550,12 +1572,42 @@ class LaneFlip:
                 if n <= 0:
                     w.heal_attempts.pop(side, None)
                     w.heal_covered.pop(side, None)
+                    w.flatten_floor_tried.pop(side, None)
                     continue
+                ev = event or market.rsplit("-", 1)[0]
+                # WO-2026-07-23-B Part 2: FLOOR the flatten. The declared stop is
+                # entry−OPEN_MOMENTUM_STOP_C; the flatten must not sell more than
+                # SLIP_TOLERANCE_C below it. If the book is already through the
+                # floor, rest ONE poll AT the floor (a bounded ride beats an
+                # unbounded market dump) before crossing; a cross below the floor
+                # is a COUNTED breach, never a silent one.
+                entry = self._flip_entry_price(market, side)
+                floor = (int(round(entry)) - config.OPEN_MOMENTUM_STOP_C
+                         - config.SLIP_TOLERANCE_C) if entry is not None else None
+                if (floor is not None and mark < floor
+                        and not w.flatten_floor_tried.get(side)):
+                    # the bounded ride: rest at the floor for one poll; do NOT
+                    # mark the buckets done or advance the stage — revisit next
+                    # cycle and cross then if it still has not filled/covered.
+                    w.flatten_floor_tried[side] = True
+                    proposals.append(Order(
+                        lane="FLIP", event=ev, market=market, side=side,
+                        action="sell", price_cents=floor, count=n,
+                        size_tier=config.TIER_PROBE, purpose="CUT",
+                        crossfire=False,
+                        reason=(f"FLIP_FLATTEN_FLOOR: mark {mark}c through the "
+                                f"{floor}c floor (entry {entry:.0f}−"
+                                f"{config.OPEN_MOMENTUM_STOP_C}−"
+                                f"{config.SLIP_TOLERANCE_C}) — resting one poll "
+                                "before the cross")))
+                    continue
+                # cross NOW: mark ≥ floor, or the floor poll is spent, or there
+                # is no entry to price. Below the floor here is a breach.
                 for bucket in (w.hunts, w.opens):
                     rec = bucket.get(side)
                     if rec is not None:
                         rec["done"] = True
-                ev = event or market.rsplit("-", 1)[0]
+                breached = floor is not None and mark < floor
                 proposals.append(Order(
                     lane="FLIP", event=ev, market=market, side=side,
                     action="sell", price_cents=mark, count=n,
@@ -1563,13 +1615,25 @@ class LaneFlip:
                     crossfire=True,
                     reason="FLIP_UNCOVERED_FLATTENED: cover unconfirmed "
                            "after reconcile+retry — never bare"))
-                failures.fail(
-                    "FLIP_UNCOVERED_FLATTENED",
-                    f"{market} {side}: x{n} flattened at {mark}c — cover "
-                    "could not be confirmed after reconcile+retry; a "
-                    "bounded loss now beats an unbounded ride",
-                    fatal=False, alert=True, market=market, side=side,
-                    count=n, price=mark)
+                if breached:
+                    failures.fail(
+                        "FLIP_FLOOR_BREACH",
+                        f"{market} {side}: x{n} crossed at {mark}c — "
+                        f"{floor - mark}c BELOW the {floor}c flatten floor "
+                        f"(entry {entry:.0f}); the book was through the floor "
+                        "after a resting poll, so a counted breach beats a "
+                        "naked ride",
+                        fatal=False, alert=True, market=market, side=side,
+                        count=n, price=mark, floor=floor,
+                        overshoot=floor - mark, entry=round(entry, 1))
+                else:
+                    failures.fail(
+                        "FLIP_UNCOVERED_FLATTENED",
+                        f"{market} {side}: x{n} flattened at {mark}c — cover "
+                        "could not be confirmed after reconcile+retry; a "
+                        "bounded loss now beats an unbounded ride",
+                        fatal=False, alert=True, market=market, side=side,
+                        count=n, price=mark)
                 w.heal_attempts[side] = 3
             else:
                 # §2.4 the flatten itself never registered a close — a leg
