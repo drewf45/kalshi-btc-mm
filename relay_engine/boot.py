@@ -184,12 +184,14 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(a bail, a stale take), so the crossfire is the ONE close (the "
                  "10:19 −87c short, bail 1 + flatten 1 on a 1-lot position, "
                  "cannot recur)")
-    lines.append("  FLIP ENTRY WALL (WO-2026-07-22-J §0.1): ONE per-market net "
-                 "check shared by EVERY lane (OPEN + HUNT) — a market holding any "
-                 "FLIP net blocks all entries, so HUNT can no longer buy the side "
-                 "OPPOSITE a held position (an auto-net: two fills, two fees, zero "
-                 "position). depth_ratio is LOGGED not gated (§0.2); the pile "
-                 "baseline requires a real spot (§0.3)")
+    lines.append("  FLIP ENTRY WALL (WO-2026-07-22-J §0.1 → -L §2): ONE per-"
+                 "market net check, now CROSS-LANE — it sums EVERY lane's net "
+                 "(F under its own key too), so a FLIP lane (OPEN/HUNT) can never "
+                 "buy the side OPPOSITE a position F or any lane already holds "
+                 "(the auto-net: two fills, two fees, zero position). One net "
+                 "position per market, first lane there owns it. FLIP's own "
+                 "take-quote net stays FLIP-only. depth_ratio LOGGED not gated "
+                 "(§J0.2); the pile baseline requires a real spot (§J0.3)")
     lines.append(f"  F SALVAGE (build 50): a favorite that slips >="
                  f"{config.F_SALVAGE_SLIP_POINTS}pts from entry has lost its "
                  "confidence — an IMMEDIATE table-free price salvage recovers "

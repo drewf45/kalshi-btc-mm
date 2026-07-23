@@ -2902,6 +2902,66 @@ it did for `/scoreboard`). Suite 704 · preflight 23/23.
 table plus SCOREBOARD; book_sample decimated + full-res around trades and the file opens on a phone;
 scoped to the day; read-only (cannot lock the settle path); built in `/tmp`, sent, deleted.
 
+## WO-2026-07-22-L — ALL LANES ON: THE CROSS-LANE WALL (build 62)
+
+**The ruling: every built lane on, every rail kept, tune from `/daily` once a day.** Three independent
+limiters cap the cost of being wrong — 1 lot/trade, per-lane rate halts, the $10.22 drawdown floor —
+so coverage expands while exposure does not. This build ships the **§2 blocker** ("ship before anything
+else") and confirms the rest is already in place or is a capital-gate ruling.
+
+**Read-rule at source (all TRUE, one honest divergence):**
+- **§2** `_net` read only the `"FLIP"` position key. **TRUE** — F holds under `"F"`, so F could hold
+  `yes@98` while OPEN bought `no@60` in the same market: an **auto-net at the exchange** (two fills,
+  two spreads, zero position), and neither lane's wall blocked the other. The docstring already claimed
+  the wall was "shared by EVERY lane"; the code wasn't. This is the 10:19 double-sell one level up —
+  cross-lane instead of intra-FLIP.
+- **DIVERGENCE from the WO's suggested fix (reported honestly):** the WO said "change `_net` to sum all
+  lanes." `_net` has a **second caller** at the take-quote (`held = net>0 and side=='yes'`) that needs
+  FLIP's OWN net — summing F's `yes@98` there would mis-orient FLIP's own take. So `_net` stays
+  FLIP-only and a **new `_market_net`** sums all lanes; the wall (`_market_entry_blocked`) uses it.
+  Same policy, no collateral corruption.
+- **§3** `build_registry` returns "all five lanes, always" (F → H8 → FLIP → D → P). **TRUE** — H8/D/P
+  are already registered and evaluated every cycle; they are n=0 because their bands never appeared,
+  NOT because they're disabled. "Turn on every built lane" needs **no code change** — they are on and
+  condition-gated.
+
+**Built (§2):** `_market_net(market, event)` sums every lane's net in the market; the entry wall refuses
+any FLIP entry (OPEN + HUNT) when it is non-zero — one net position per market, first lane there owns
+it. F evaluates first in registry order, so its position is visible to FLIP's wall before FLIP
+proposes.
+
+**HARD RAIL:** F byte-identical (`lane_fh8`/gateway/custodian unmodified); maker-only; 1 lot; per-lane
+halt intact. New acceptance in `test_pile_gate.py`: the cross-lane wall blocks a FLIP OPEN entry when F
+holds the opposite side under its own key (and `_net` stays FLIP-only, 0); once ANY lane holds a market
+(here D), both a FLIP OPEN pile and a HUNT needle are refused — no two lanes can hold opposing sides.
+Suite 706 · preflight 23/23.
+
+**Honest residual (the one the WO's F-byte-identical rule leaves open):** the wall closes the
+OPEN/HUNT-side of the collision (a FLIP lane buying opposite a held position — the direction the WO's
+own code targets). The **reverse** — F entering opposite a position OPEN already holds — is NOT closed,
+because F is byte-identical and its only cross-lane check is a lane-COUNT cap (`CROSS_LANE_CAP=3`), not
+a side-net exclusion. It is bounded by the narrow price/time overlap of the bands (F 95-99 late; OPEN
+55-64 in the 60-180s pile) and the F-first registry order, and closing it fully would require touching
+F, which this WO forbids. Flagged for the daily read.
+
+**Not code this build (confirmed status):**
+- **§3 enablement** — F/OPEN/H8/D/P already registered and on. H8 (n=0, band 80-94) is the genuine new
+  test; it will trade when its band appears. **HUNT is the one open ruling (§3.1)** — the scoreboard
+  says it loses in every cell over ~18 trades; enabling it buys more n on a table already shown to
+  mis-predict. WO recommendation: OFF. It is currently ON (fires on a needle). **A capital-gate call —
+  surfaced to Drew, not changed unilaterally.**
+- **§4 measurement** — 4.1 (fill lane+cell) and 4.5 (window_econ both pnl columns) already work.
+  4.2 (skip counterfactuals), 4.3 (surface_rows.detail on every decision), 4.4 (halt trigger cells),
+  and **4.6 (the empty DODGED salvage curve mis-flagging F's ⚠)** are measurement gaps — 4.6 is a
+  scoring-margin change worth doing carefully as its own build, not rushed alongside a capital blocker.
+- **§6 the daily loop** — an operating procedure (pull `/daily`, read `fills_pnl` BY LANE, tune the
+  cells the rows indict, log it, let tomorrow grade it), served by the build-61 `/daily` bundle.
+
+**Watch (acceptance):** zero auto-net events (no market with opposing-side fills across lanes); per-lane
+halts fire independently and never stop F; zero taker fills on entry; `window_pnl`/`fills_pnl` converge;
+F's ⚠ clears once the DODGED curve populates; `/daily` delivers the workbook. **Read `fills_pnl` BY
+LANE** — a green week could still be F carrying three losers.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

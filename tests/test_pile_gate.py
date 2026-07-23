@@ -242,6 +242,35 @@ def test_shared_wall_blocks_hunt_auto_net_against_a_held_side(flip):
     assert flip._hunt_entry(w, T, EV, b, sl, 700.0) == []  # no auto-net
 
 
+def test_cross_lane_wall_blocks_flip_when_another_lane_holds(flip):
+    """WO-2026-07-22-L §2: the wall sums EVERY lane's net, not just FLIP's. F
+    holds `yes` under its OWN key ("F"); a FLIP OPEN entry on the opposite side
+    would auto-net at the exchange. The cross-lane wall refuses it — and FLIP's
+    own take-quote net (`_net`) stays FLIP-only so its orientation is untouched."""
+    flip.gateway.positions[(EV, T, "F")] = 1          # F holds yes@98, own key
+    assert flip._net(T, EV) == 0                       # FLIP-only: sees nothing
+    assert flip._market_net(T, EV) == 1                # cross-lane: sees F
+    _poll(flip, 65, 54, 48, 66_000.0)
+    props = _poll(flip, 80, 60, 40, 66_020.0)          # a qualifying OPEN pile
+    assert props == []                                 # blocked — no auto-net
+
+
+def test_no_two_lanes_hold_opposing_sides_of_one_market(flip):
+    """The Engineer's acceptance (§7): once ANY lane holds a market, no FLIP lane
+    (OPEN or HUNT) can enter it — so opposing-side fills across lanes cannot
+    form. Here D holds `no`; both a FLIP OPEN pile and a HUNT needle are refused."""
+    from relay_engine.spotlead import Needle
+    flip.gateway.positions[(EV, T, "D")] = -1         # D holds `no`
+    _poll(flip, 65, 54, 48, 66_000.0)
+    assert _poll(flip, 80, 60, 40, 66_020.0) == []    # OPEN refused
+    b = OrderBook(market=T)
+    b.apply_snapshot({40: 10}, {30: 10}, ts=1.0)
+    sl = Needle(side="yes", d_before=200.0, d_after=20.0,
+                delta_p=config.HUNT_NEEDLE_POINTS + 5, fair_cents=90.0,
+                t_remaining=700.0)
+    assert flip._hunt_entry(flip._window(T, CLOSE), T, EV, b, sl, 700.0) == []
+
+
 def test_pile_baseline_requires_a_real_spot_sample(flip):
     """§0.3: the baseline needs a real spot, not just a skew. A first in-window
     tick with skew but NO spot must not become the baseline (that fell trend to

@@ -287,18 +287,36 @@ class LaneFlip:
         return w
 
     def _net(self, market: str, event: str) -> int:
+        """FLIP's OWN net position in this market. Kept FLIP-only on purpose —
+        the take-quote held-side logic (`held = net>0 and side=='yes'`) reads
+        THIS lane's position; summing F's `yes@98` into it would mis-orient
+        FLIP's own take. The cross-lane wall uses `_market_net` instead."""
         if self.gateway is None:
             return 0
         return self.gateway.positions.get((event, market, "FLIP"), 0)
 
+    def _market_net(self, market: str, event: str) -> int:
+        """WO-2026-07-22-L §2 — THE CROSS-LANE WALL. EVERY lane's net in this
+        market, not just FLIP's. F holds under its own key, so the old FLIP-only
+        wall let F hold `yes@98` while OPEN bought `no@60` in the same market —
+        which auto-NETS at the exchange (two fills, two spreads, ZERO position).
+        Summing all lanes makes the docstring's promise ("shared by EVERY lane")
+        true: one net position per market, first lane there owns it. Invisible
+        until now because F and OPEN rarely picked opposite sides of one live
+        window; "all lanes on every market" makes it routine."""
+        if self.gateway is None:
+            return 0
+        return sum(qty for (ev, mkt, _lane), qty
+                   in self.gateway.positions.items()
+                   if ev == event and mkt == market)
+
     def _market_entry_blocked(self, market: str, event: str) -> bool:
-        """WO-2026-07-22-J §0.1 — THE ONE ENTRY WALL. Exclusivity is per-MARKET
-        net position, shared by EVERY lane (the single definition). OPEN gated
-        per-market but HUNT gated only per-SIDE, so with OPEN holding `no`,
-        HUNT's test for `yes` passed and it bought the opposite side — which
-        auto-NETS at the exchange (two fills, two spreads, two fees, zero
-        position). A non-zero FLIP net on this market blocks any lane's entry."""
-        return self._net(market, event) != 0
+        """WO-...-J §0.1 → -L §2: THE ONE ENTRY WALL, now cross-lane. A non-zero
+        net from ANY lane on this market blocks every FLIP entry (OPEN + HUNT) —
+        so a FLIP lane can never take the side opposite a position F (or another
+        lane) already holds. F evaluates first in registry order (F→FLIP), so its
+        position is visible here before FLIP proposes."""
+        return self._market_net(market, event) != 0
 
     def _booked_held(self, market: str, side: str) -> Optional[int]:
         """FLIP-COUNT-1 §2.2: the booked ledger's held count for a FLIP
