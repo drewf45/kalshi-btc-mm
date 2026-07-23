@@ -3142,6 +3142,57 @@ the SUMMARY "open questions". §4.2 market context at every decision and §4.3 p
 (the target×stop EV grid) — **deferred:** sizable new joins to `book_snapshots`, rolling. Acceptance #8
 (failure counts carry a delta) is the one criterion NOT yet met — it is gated on the prior-day snapshot.
 
+## COLD READ — THE PHANTOM BOOK BUG (build 67)
+
+**The finding: the settlement math, the ledger, and the quarantine were all correct. The bug was that
+`account_value()` read venue `cash + position_value` at a moment those two are not consistent — and that
+unreconciled number was used as both the window-P&L basis and the reported "book."**
+
+**Read-rule at source (every claim verified):**
+- **§2 ruled out, all clean:** the settlement P&L math (`surface.py:158-165`, `(payoff−basis)·count` →
+  `no@97×8` = +24c), `record_settlement`'s idempotency + net-vs-gross bound, the quarantine (`booked ==
+  fills_pnl → no-op`, and it correctly did nothing because settlements held +24c), and `book_cents()`
+  (cash_movements + settlements) — **all TRUE and clean.** The ledger was right the whole time.
+- **§3.1 the source** — `shadow_runner.py:740` returns `int(round((cash + (pv or 0)) * 100)), "venue"`.
+  **TRUE.** `cash` and `pv` settle on different venue clocks.
+- **§3.2 the two worst moments** — `account_value()` is read at `open_bracket` (ENTRY submit, `:1358`)
+  and `close_bracket` (settlement, `:1528`). **TRUE.** At entry the cash is debited but the position
+  isn't reflected (reads LOW by the notional); at settlement the cash is credited but the position isn't
+  cleared (reads HIGH by the notional). `window_econ.py:229` differences the two — **both errors push the
+  same sign**, so the gap = the entry notional (99c/1 lot, ~795c/8 lots — matched every tape sample).
+- **§4 the second bug** — `window_econ.py:266` passes `account_value_cents` into a param named
+  `book_cents`, so the `📊 … book $X` line was the raw venue read mislabeled. **TRUE.**
+- **§4 the safety-critical check (F sizing):** `_score_and_size` reads `self.ledger.book_cents()`
+  (`shadow_runner.py:483, 542`), **NOT** the venue `account_value()`. **The phantom never fed F's
+  size** — the one place §4 warned it could cost real money is clean.
+
+**The fix (Fix 1 + Fix 4, which Fix 1 makes automatic):**
+- A new `bracket_book(now)` returns `(ledger.book_cents(), "ledger")`. `open_bracket` and `close_bracket`
+  use it instead of the venue read. `window_pnl = ledger_close − ledger_open − cash_moves` = the window's
+  settlement delta, phantom-free; and since `close_bracket` now hands the ledger book to `_apply_streak`,
+  the `📊 book $X` line is finally the real book (Fix 4).
+- **The venue read is kept for `standing_reconcile` only** (`:858`, P9 §3 — venue-vs-ledger via the cash
+  protocol, every 60s, on a cadence AWAY from fills/settlements). That is what it is good for (Fix 2);
+  Fix 3 (validate-then-defer) is subsumed — the bracket no longer reads the venue, so there is nothing to
+  validate.
+- **The live invariant is amended:** `_reject_paper_in_live` now accepts `"ledger"` (a real reconciled
+  number) as well as `"venue"`; only `"paper"` (a shadow-mode fabrication) still FATALs in live.
+- In **SHADOW mode `account_value()` already returned `ledger.book_cents()`**, so this changes LIVE only
+  (where the phantom lived); the whole suite was unaffected but for the go-live dry-run, which now
+  *validates* the fix (bracket source `"ledger"`, `window_pnl == fills_pnl`).
+
+**What it means:** no money was lost (Kalshi's $43.06 was the truth, account up 11%); the ledger was
+never wrong; the divergence alarm was honest every time it fired (it reported a real inconsistency
+between two reads); `fills_pnl` is the trustworthy number. **This also retires the WO-2026-07-23-B Part 3
+blocker's root** — the `window_pnl` phantom that made the halt's input untrustworthy is gone (the halt's
+per-lane input was always fills-truth; the phantom lived in `window_pnl`, now ledger-based).
+
+**Honest residual:** `window_pnl` is a GLOBAL book delta, so if another market settles inside this
+bracket's span its P&L contaminates the delta and `WINDOW_ECON_DIVERGENCE` may fire on the overlap — a
+pre-existing property (the venue read was global too), benign (the quarantine no-ops when settlements ==
+fills), not the entry-notional phantom this build removes. Flagged for a follow-up (make `window_pnl`
+per-market = `fills_pnl`). New acceptance `test_cold_read_phantom.py` (3). Suite 730 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -749,6 +749,25 @@ class ShadowEngine:
                 "the venue answers; no paper number will substitute")
         return None, "venue"
 
+    def bracket_book(self, now=None):
+        """WO-2026-07-23 COLD READ (build 67): the window-econ bracket value is
+        the LEDGER book, not the venue account read.
+
+        The bug: `account_value()` sums venue `cash + position_value`, and those
+        two settle on DIFFERENT clocks — at ENTRY the cash is already debited
+        while the position isn't yet reflected (reads LOW by the entry notional),
+        at SETTLEMENT the cash is credited while the position isn't yet cleared
+        (reads HIGH by the same notional). Differencing an OPEN read against a
+        CLOSE read put that notional into `window_pnl` twice, same sign — the
+        +819c-vs-true-+24c phantom. The ledger book is computed from fills that
+        already reconcile (cash_movements + settlements), so it is internally
+        consistent at every instant. The venue read stays — for `standing_
+        reconcile` only (P9 §3, a cadence AWAY from fills/settlements), which is
+        what it is actually good for. Source is "ledger": a REAL reconciled
+        number, never a shadow "paper" fabrication (the live invariant still
+        forbids "paper")."""
+        return self.ledger.book_cents(), "ledger"
+
     def flush_deferred_econ(self, now=None) -> int:
         """P9 §2: deferred brackets complete on the next successful read."""
         if not (self.econ.pending_opens or self.econ.pending_closes):
@@ -1354,8 +1373,11 @@ class ShadowEngine:
                         continue
                     if proposal.purpose == "ENTRY":
                         # P8 §1: OPEN BRACKET at the first order submit on this
-                        # market. P9 §2: a failed live read DEFERS the bracket.
-                        val, src = self.account_value(now)
+                        # market. COLD READ (build 67): the bracket value is the
+                        # LEDGER book — consistent at entry, where the venue read
+                        # is low by the entry notional (cash debited, position not
+                        # yet reflected).
+                        val, src = self.bracket_book(now)
                         self.econ.open_bracket(market, val, now=now, source=src,
                                                transport=transport)
                         # P18: ONE hunt per displacement EVENT — re-anchor at
@@ -1525,7 +1547,13 @@ class ShadowEngine:
         fills_pnl = sum(per_lane.values())
         fills_count = int(self.ledger.db.execute(
             "SELECT COUNT(*) FROM fills WHERE market=?", (market,)).fetchone()[0])
-        val, src = self.account_value(now)
+        # COLD READ (build 67): close on the LEDGER book, not the venue read —
+        # at settlement the venue reads HIGH by the entry notional (cash
+        # credited, position not yet cleared). The ledger book already carries
+        # this window's settlement (recorded above), so the close − open delta
+        # IS the realized window P&L, phantom-free, and the reported "book" is
+        # finally the real book.
+        val, src = self.bracket_book(now)
         self.econ.close_bracket(
             market, val, fills_pnl,
             lanes_active=",".join(sorted(per_lane)), fills_count=fills_count,

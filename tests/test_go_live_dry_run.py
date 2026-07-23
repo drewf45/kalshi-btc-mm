@@ -116,11 +116,14 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
                            "post_only": True}
         assert "LIVE-1" in engine.gateway.live_order_ids
 
-        # bracket OPENED at submit, source=venue
+        # COLD READ (build 67): the bracket OPENS on the LEDGER book (source
+        # "ledger"), not the venue read — the venue's cash/position desync at
+        # entry/settlement is what produced the +819c phantom; the ledger is
+        # internally consistent. The venue read now serves standing_reconcile only.
         src = engine.ledger.db.execute(
             "SELECT source FROM window_econ WHERE market=?",
             (TICKER,)).fetchone()[0]
-        assert src == "venue"
+        assert src == "ledger"
 
         # ── 4. a mocked fill books through FillBooker ──────────────────
         stats = engine.fills.sweep(
@@ -135,7 +138,10 @@ def test_go_live_dry_run(tmp_path, monkeypatch, capsys):
         row = engine.ledger.db.execute(
             "SELECT window_pnl_cents, fills_pnl_cents, source, deferred"
             " FROM window_econ WHERE market=?", (TICKER,)).fetchone()
-        assert row == (3, 3, "venue", "")      # broker truth == fills truth
+        # window_pnl is the ledger book delta (10003 − 10000 = 3), which EQUALS
+        # fills truth (3) — the cold-read fix makes the two agree instead of
+        # differencing an inconsistent venue read into a phantom.
+        assert row == (3, 3, "ledger", "")     # ledger truth == fills truth
         # KAL-50/50 Stage 0.1: the per-lane summary names the lanes settled
         # (broker window pnl still the honest number) instead of a global rate.
         assert any("📊" in m and "+$0.03" in m and "lanes F" in m

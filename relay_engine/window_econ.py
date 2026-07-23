@@ -158,11 +158,19 @@ class WindowEcon:
         return restored
 
     # ── §1: the bracket ────────────────────────────────────────────────
+    # COLD READ (build 67): the bracket value is the LEDGER book, a REAL
+    # reconciled number (cash_movements + settlements), so "ledger" is a valid
+    # live source. Only "paper" — a SHADOW-mode fabrication — remains the lie
+    # this invariant forbids in live.
+    _LIVE_BRACKET_SOURCES = ("venue", "ledger")
+
     def _reject_paper_in_live(self, market: str, source: str) -> None:
-        """P9 §2: a bracket/streak/halt decision may only consume venue-sourced
-        values in live — a paper number offered in live mode is the exact lie
-        this engine exists to forbid."""
-        if config.live_submit_enabled() and source != "venue":
+        """P9 §2 (amended by build 67): a bracket/streak/halt decision may only
+        consume REAL values in live — the venue read OR the reconciled ledger
+        book. A paper (shadow) number offered in live is the exact lie this
+        engine exists to forbid."""
+        if (config.live_submit_enabled()
+                and source not in self._LIVE_BRACKET_SOURCES):
             failures.fail("BRACKET_PAPER_IN_LIVE",
                           f"{market}: bracket offered source={source!r} in LIVE — "
                           f"real numbers only; a paper value never substitutes",
