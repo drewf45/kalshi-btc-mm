@@ -3241,6 +3241,50 @@ rest-back; nothing else touches F). #4/#5 (window/fills agree; halt on money) ri
 acceptance `test_maker_rest_back.py` (sell mirror + F exclusion + CUT unchanged) and `test_pile_gate.py`
 (order-aware wall). Suite 737 · preflight 23/23.
 
+## WO-2026-07-23-E — THE SIZE TEST (build 69)
+
+**Two dials, no logic change:** `FLIP_SIZE_CAP 1→3`, `OPEN_GOUGE_C 17→10`. Same entry gate, same stop,
+same band, same lanes. **F byte-identical** (`lane_fh8.py` untouched; F's notional sizing never reads
+`FLIP_SIZE_CAP`) — only `config.py` changed.
+
+**Read-rule prerequisites (verified shipped in build 68):** Bug 2 sell-side rest-back (`_rest_forward_price`)
+and Bug 1 order-aware wall (`_market_has_live_order`) both present; the `_rest_forward_price` band-ceiling
+check only fires when `order.band` is set, and **`band=` is set only on ENTRY orders** (`lane_flip.py:870,
+1180`) — exits leave it `None`, so the +10 take (entry+10, e.g. 70 from a 60 entry, above the 64 band
+ceiling) is never `REST_BACK_SKIP`'d. Confirmed at source.
+
+**Read-rule DIVERGENCE — surfaced to Drew, ruled:** the WO's §2 said "nothing else moves" and asked for
+4 lots, but `FLIP_SIZE_CAP 1→4` alone can't reach 4 — `size_order` caps non-F lanes at
+`NET_RISK_CROSS_LANE_CAP=3` (so a 4-cap never bites) and the gateway FLIP at-risk wall is 5% of book
+(≈3 lots @60c on a ~$43 book). Both bind below 4. **Drew's ruling: set the cap to an EXPLICIT 3, widen no
+wall.** An explicit 3 is deterministic regardless of book (a 4-cap would drift to 3-today/4-later — a
+book-dependent confound); 1→3 is a 3× read that answers the fill-curve question; widening the at-risk
+wall for 5-6 lots comes *later, with this data behind it*, never in anticipation of it.
+
+**Why +10×3 (Drew):** per-contract the deep target wins, but fill rate degrades with distance from the
+touch (today's pack: F ENTRY 86%, F CUSTODIAN_EXIT 63%, gaps as wide as 7:1). +10 rests 41% closer than
++17 while still a genuine gouge; the size test reads whether the extra fills more than pay for the smaller
+per-contract capture.
+
+**The decision rule (fixed before the data, §4, now /3):** read `requested_count` vs `count` on FLIP
+EXIT orders — **≥2.6 of 3** confirms (then widen the wall for 5-6, *with data*); 1.5-2.5 hold at 3 and
+tune the target; **≤1.1 of 3** reverts to +17×1. Run to 12-15 filled FLIP exits (≈one overnight). The
+requested-vs-filled instrumentation is already in place (build 65 §4.1).
+
+**Edge case (Drew's guard):** 3 lots × 60c = 180c fits the 5% wall (215c) at a $43 book, **but the wall
+binds below ~$36 of book**, where FLIP silently sizes to 2. The per-trade `requested_count`/`count` log
+lets any sub-3 window be filtered out rather than averaged in.
+
+**Noted for later (NOT this build, Drew):** the at-risk wall uses `side_basis = order.price_cents` (full
+notional) as max-loss-per-contract, but FLIP's real risk is the −10 stop (~11.5c) — the wall measures
+notional and calls it risk (the same category error as the retired count cap). A risk-denominated wall
+would let FLIP run 15+ lots inside the same 5%; it's an architecture change, logged not shipped.
+
+**HARD RAIL / kill conditions:** F byte-identical (verified); FLIP-only; no wall widened; per-lane halt
+fires independently. New acceptance `test_size_test.py` (dials, take geometry, F-independence, cap binds);
+`test_flip_*`/`test_p22`/`test_swing_gate` re-anchored to the +10 take and the 3-lot cap. Suite 741 ·
+preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -219,21 +219,31 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
     eng.ledger = ledger
     eng.telegram = type("T", (), {"alert": staticmethod(lambda m: None)})()
     eng._size_zero_logged = set()   # WO-2026-07-23-B: F sizing logs (guard d)
-    # WO-SWING-GATE-EVENT §4.2: FLIP is capped to 1 lot while its swing
-    # gate is miscalibrated — the tier still computes and stamps (reporting
-    # unchanged), but the count is bounded. The full-Kelly FORMULA is
-    # verified on an UNCAPPED lane (F) below.
+    # WO-SWING-GATE-EVENT §4.2 → WO-2026-07-23-E: FLIP is capped to FLIP_SIZE_CAP
+    # (now 3, the size test) — the tier still computes and stamps (reporting
+    # unchanged), but the count is bounded by the cap, never driven by the tier.
+    # On a $30 book kelly (5) and depth (10) both clear the 3-lot cap, so the cap
+    # is what binds. The full-Kelly FORMULA is verified on the UNCAPPED lane (F).
+    ledger.baseline(3000, confirmed_by="test")
     prop = Order(lane="FLIP", event=EVENT, market=TICKER, side="yes",
                  action="buy", price_cents=48, count=1,
                  size_tier=config.TIER_PROBE, purpose="ENTRY",
                  why="OPEN grain yesx2 · join 48c")
     eng._score_and_size(prop, _book(yes=48, no=49))
     assert prop.size_tier == config.TIER_CLEAR   # earned, stamped, reported
-    assert prop.count == config.FLIP_SIZE_CAP    # §4.2: FLIP capped to 1
-    # WO-2026-07-23-B Part 1: F no longer takes the Kelly path — it self-sizes
-    # by NOTIONAL (F_NOTIONAL_PCT of book / price), bounded only by real depth.
-    # On a $12 book at 48c the notional is 5 lots (depth 40·0.25=10 doesn't
-    # bind), driven by the book — NOT clamped to the retired count cap of 3.
+    assert prop.count == config.FLIP_SIZE_CAP == 3   # FLIP capped, not tier-driven
+    # a virgin cell: PROBE stamp, FLIP still capped (ladder reports, never governs)
+    prop2 = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
+                  action="buy", price_cents=44, count=1,
+                  size_tier=config.TIER_PROBE, purpose="ENTRY",
+                  why="OPEN grain nox2 · join 44c")
+    eng._score_and_size(prop2, _book(yes=48, no=44))
+    assert prop2.size_tier == config.TIER_PROBE
+    assert prop2.count == config.FLIP_SIZE_CAP   # capped regardless of the tier
+    # WO-2026-07-23-B Part 1: F no longer takes the Kelly path — it self-sizes by
+    # NOTIONAL (F_NOTIONAL_PCT of book / price), bounded only by real depth. On a
+    # $12 book at 48c the notional is 5 lots — driven by the book, NOT clamped to
+    # the retired count cap of 3.
     ledger.baseline(1200, confirmed_by="test")
     fprop = Order(lane="F", event=EVENT, market=TICKER, side="yes",
                   action="buy", price_cents=48, count=1,
@@ -242,15 +252,6 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
     eng._score_and_size(fprop, _book(yes=48, no=49))
     assert fprop.count == int(1200 * config.F_NOTIONAL_PCT // 48) == 5
     assert fprop.count > config.NET_RISK_CROSS_LANE_CAP   # the cap no longer binds F
-    # a virgin cell: PROBE stamp, FLIP still capped to 1 (ladder reports,
-    # never governs; §4.2 caps the lane, not the formula)
-    prop2 = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
-                  action="buy", price_cents=44, count=1,
-                  size_tier=config.TIER_PROBE, purpose="ENTRY",
-                  why="OPEN grain nox2 · join 44c")
-    eng._score_and_size(prop2, _book(yes=48, no=44))
-    assert prop2.size_tier == config.TIER_PROBE
-    assert prop2.count == config.FLIP_SIZE_CAP
 
 
 def test_no_static_probe_sizing_paths_remain():

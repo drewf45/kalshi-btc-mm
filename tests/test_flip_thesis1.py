@@ -261,7 +261,7 @@ def test_f_agrees_conversion_pre_t10(flip, gateway, ledger, caplog):
     o = _open_position(flip, gateway, ledger)            # favored yes @ 60
     props = flip.evaluate(TICKER, _ctx(_book(yes=60), secs_left=780))
     take = next(p for p in props if p.purpose == "EXIT")
-    assert take.price_cents == LaneFlip._take_price(60) == 77   # entry+17
+    assert take.price_cents == LaneFlip._take_price(60) == 70   # entry+10
     flip.on_submitted(take, "OID-T1", CLOSE - 780)
     # a rising favorite well before the curfew: NO hold conversion — the
     # resting +20 take is the exit, the position sells the gouge, never holds

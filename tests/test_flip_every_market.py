@@ -115,9 +115,11 @@ def test_b1_two_sided_book_required(flip):
 
 
 def test_b1_size_cap_is_one_lot(flip):
-    """HARD RAIL: the liquidity is provided one lot at a time."""
-    assert config.FLIP_SIZE_CAP == 1
+    """WO-2026-07-23-E: the FLIP size cap is 4 (the size test); the lane
+    still PROPOSES one lot — the runner scales it up in _score_and_size."""
+    assert config.FLIP_SIZE_CAP == 3   # WO-2026-07-23-E: the size test (explicit 3)
     props = _prime(flip, _book(yes=45, no=60), favored="no")
+    # the LANE proposes 1 lot; the runner scales to the cap in _score_and_size
     assert props and all(p.count == 1 for p in props)
 
 
@@ -147,26 +149,26 @@ def test_b2_favored_entry_rests_entry_plus_17(flip):
     that fills into demand."""
     exits = _take_prop(flip, "yes", 60)
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(60) == 77
-    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 17
-    assert "open take" in exits[0].reason and "gouge +17" in exits[0].reason
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 70
+    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 10
+    assert "open take" in exits[0].reason and "gouge +10" in exits[0].reason
 
 
 def test_b2_high_entry_take_caps_at_90(flip):
     """WO-2026-07-22-E — the take caps at 90c to stay out of the illiquid
     tail: a high entry rests at 90, NOT entry+20 (95), the other bound of
     the clamp."""
-    exits = _take_prop(flip, "yes", 75)
-    assert exits[0].price_cents == LaneFlip._take_price(75) == 90
-    assert exits[0].price_cents < 75 + config.OPEN_GOUGE_C   # the cap governs
+    exits = _take_prop(flip, "yes", 85)   # 85+10=95 → capped 90
+    assert exits[0].price_cents == LaneFlip._take_price(85) == 90
+    assert exits[0].price_cents < 85 + config.OPEN_GOUGE_C   # the cap governs
 
 
 def test_b2_take_price_is_the_clamp(flip):
     """The pure geometry: min(90, entry + OPEN_GOUGE_C)."""
-    assert LaneFlip._take_price(60) == 77          # entry+17 governs
-    assert LaneFlip._take_price(50) == 67          # entry+17 at the band floor
-    assert LaneFlip._take_price(70) == 87          # entry+17, inside the cap
-    assert LaneFlip._take_price(75) == 90          # cap governs above
+    assert LaneFlip._take_price(60) == 70          # entry+10 governs
+    assert LaneFlip._take_price(50) == 60          # entry+10 at the band floor
+    assert LaneFlip._take_price(70) == 80          # entry+10, inside the cap
+    assert LaneFlip._take_price(85) == 90          # cap governs above
 
 
 # ── B3: ACTIVE LATE-WINDOW WALK-DOWN (load-bearing) ─────────────────────────

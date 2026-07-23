@@ -151,7 +151,8 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"[{config.OPEN_ENTRY_MIN_C},{config.OPEN_ENTRY_MAX_C}]¢ "
                  f"({config.OPEN_ENTRY_MIN_C} the floor — never below fair value "
                  "+ a real pile). The cheap-side filter, swing gate, and "
-                 "trend-skip are RETIRED. One shot/window, maker-only, 1 lot")
+                 f"trend-skip are RETIRED. One shot/window, maker-only, up to "
+                 f"{config.FLIP_SIZE_CAP} lots (WO-2026-07-23-E size test)")
     lines.append(f"  FLIP WAIT-FOR-THE-PILE (WO-2026-07-22-F → -G): entry ONLY "
                  f"in [{config.OPEN_PILE_START_S},{config.OPEN_PILE_END_S}]s into "
                  "the window, and ONLY when ALL agree — favored side in the "
@@ -387,6 +388,15 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "FILLED state when the action can precede the fill — gate on "
                  "INTENT (submitted), clear on fill/cancel/reject (state.traded/"
                  "w.posted/now the order-aware wall)")
+    lines.append(f"  THE SIZE TEST (WO-2026-07-23-E, build 69): two dials, no "
+                 f"logic change — FLIP_SIZE_CAP 1→{config.FLIP_SIZE_CAP} (DREW: "
+                 "explicit 3, not 4 — NET_RISK=3 and the 5% at-risk wall both "
+                 f"bind there, so 3 is deterministic; no walls widened for a "
+                 f"test) and OPEN_GOUGE_C 17→{config.OPEN_GOUGE_C} (take = entry+"
+                 f"{config.OPEN_GOUGE_C}). Does SIZE TRAVEL? Read requested_count "
+                 "vs count on FLIP EXITs; decision rule /3 (≥2.6 confirms, ≤1.1 "
+                 "reverts). Filter windows that ran <3 lots (the 5% wall binds "
+                 "below ~$36 book). F byte-identical — FLIP-only")
     lines.append("EXECUTION REST-BACK: maker BUY entries re-price at LIVE "
                  "placement to rest at/inside the held-side bid, strictly "
                  "below the derived ask — never post_only into a cross; FLIP "

@@ -158,14 +158,14 @@ def test_ride_through_the_stop_crosses_out(flip, gateway, ledger):
 # ── Part D, test 5: the swing to the take → TAKE, exit changes don't touch it ─
 def test_swing_to_take_still_fires(flip, gateway, ledger):
     """The take is unaffected by the exit-doctrine changes — a 60¢ favored
-    entry's take now rests at entry + OPEN_GOUGE_C (=77, cap 90) and a fill there
-    realizes +17."""
+    entry's take now rests at entry + OPEN_GOUGE_C (=70, cap 90) and a fill there
+    realizes +10."""
     o = _entry(flip, gateway, ledger, entry=60)
     assert o["take_oid"] == "OID-T1"       # the take rested
-    assert o["take_px"] == 77              # entry + OPEN_GOUGE_C, cap 90
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 77, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 77, CLOSE - 700, count=1)
-    assert flip.windows[TICKER].window_realized == 17   # 77 − 60
+    assert o["take_px"] == 70              # entry + OPEN_GOUGE_C, cap 90
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 70, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 70, CLOSE - 700, count=1)
+    assert flip.windows[TICKER].window_realized == 10   # 70 − 60
 
 
 # ── Part D, test 6: the cut REASON names the momentum stop ─────────────────

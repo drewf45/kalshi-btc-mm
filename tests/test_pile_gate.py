@@ -70,9 +70,9 @@ def test_enters_when_the_pile_forms(flip):
 def test_target_is_entry_plus_17_and_stop_minus_10(flip):
     props = _prime_then(flip, 80, 60, 40, 66_020.0)
     ent = next(p for p in props if p.purpose == "ENTRY")
-    assert "target 77c (+17, cap 90)" in ent.why    # OPEN_GOUGE_C = 17
+    assert "target 70c (+10, cap 90)" in ent.why    # OPEN_GOUGE_C = 10
     assert "stop 50c" in ent.why                     # entry − OPEN_MOMENTUM_STOP_C
-    assert LaneFlip._take_price(60) == 77
+    assert LaneFlip._take_price(60) == 70
 
 
 def test_no_favored_side_gt_180_no_entry_no_crash(flip):

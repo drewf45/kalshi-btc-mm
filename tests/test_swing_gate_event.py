@@ -182,7 +182,9 @@ def test_flip_capped_to_one_lot_f_untouched():
                size_tier=config.TIER_PROBE, purpose="ENTRY",
                why="OPEN grain yesx2 · join 48c")
     eng._score_and_size(fl, b)
-    assert fl.count == config.FLIP_SIZE_CAP == 1       # FLIP capped
+    # WO-2026-07-23-E: FLIP is bounded by the cap (now 3, the size test); here
+    # depth (10·0.25=2) binds lower still. Either way FLIP is capped small.
+    assert 1 <= fl.count <= config.FLIP_SIZE_CAP == 3
     f = Order(lane="F", event=EVENT, market=TICKER, side="yes",
               action="buy", price_cents=48, count=1,
               size_tier=config.TIER_PROBE, purpose="ENTRY",

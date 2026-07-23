@@ -97,7 +97,7 @@ def test_the_take_rests_at_entry_plus_gouge(flip):
     props = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
     exits = [p for p in props if p.purpose == "EXIT"]
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(60) == 77   # entry+17
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 70   # entry+10
 
 
 # ── WO-2026-07-22-E: dips partition at the stop — above held, below exits ──

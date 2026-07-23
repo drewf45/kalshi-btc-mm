@@ -135,7 +135,7 @@ OPEN_MIDDLE_TARGET = 52          # DREW-DEFAULT: the take target — the 50/50 m
 OPEN_ENTRY_MIN_C = 55            # DREW-DEFAULT (WO-...-G, was 50): the deliberate favored floor
 OPEN_ENTRY_MAX_C = 64            # DREW-DEFAULT (WO-...-G, was 70): above this the move is priced
 OPEN_ENTRY_DEADLINE_S = 90       # DREW-DEFAULT: unfilled by here → cancel, never chase (== opening window)
-OPEN_GOUGE_C = 17               # DREW-DEFAULT (WO-...-F, was 20): target = entry + 17, cap 90 — capture more often (a nearer target exits before the drifting pile exhausts)
+OPEN_GOUGE_C = 10               # DREW-RULED (WO-2026-07-23-E "THE SIZE TEST", was 17): target = entry + 10, cap 90 — 4 lots resting 10c off the touch is a genuine maker quote; the size test reads requested-vs-filled to rule +10×4 vs +17×1
 OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2-poll sustain, maker-first
 # WO-2026-07-23-B Part 2: the uncovered-leg FLATTEN used to sell at whatever the
 # book showed (unbounded mark) — 15c through the stop on the night's worst leg.
@@ -434,7 +434,7 @@ FLIP_FLOOR_SLIP_CENTS = 5
 # rides along as a SHADOW comparison, calibrated against the measured rate
 # before it may ever drive the decision.
 OPEN_SWING_MIN_SAMPLES = 20       # Adversary (a): don't gate on a thin sample
-FLIP_SIZE_CAP = 1                 # DREW-RULED: 1-lot cap while miscalibrated
+FLIP_SIZE_CAP = 3                 # DREW-RULED (WO-2026-07-23-E "THE SIZE TEST", was 1): EXPLICIT 3-lot cap — NET_RISK_CROSS_LANE_CAP=3 and the 5% at-risk wall both bind here, so 3 is deterministic regardless of book (4 would drift with book size — a confound). 1→3 is a 3× read of "does size travel"; widen the wall for 5-6 later WITH this data, never before it
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20

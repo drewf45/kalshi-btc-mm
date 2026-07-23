@@ -112,8 +112,8 @@ def test_60_entry_takes_at_80(flip):
     wanted (flip_fill=38%)."""
     exits = _take_prop(flip, "yes", 60, 60)
     assert len(exits) == 1
-    assert exits[0].price_cents == LaneFlip._take_price(60) == 77
-    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 17
+    assert exits[0].price_cents == LaneFlip._take_price(60) == 70
+    assert exits[0].price_cents - 60 == config.OPEN_GOUGE_C == 10
     assert "open take" in exits[0].reason
     # not the retired middle-target
     assert exits[0].price_cents != config.OPEN_MIDDLE_TARGET
@@ -125,14 +125,14 @@ def test_take_is_orientation_correct_no_mirrors_yes(flip):
     doctrine (WO-2026-07-22-F)."""
     y = _take_prop(flip, "yes", 60, 60)[0]
     n = _take_prop(flip, "no", 60, 60)[0]
-    assert y.price_cents == n.price_cents == 77
+    assert y.price_cents == n.price_cents == 70
 
 
 def test_take_caps_at_90(flip):
     """WO-2026-07-22-E — the take caps at 90¢ to stay out of the illiquid
     tail: a near-ceiling entry never proposes a take above the 90¢ cap."""
-    exits = _take_prop(flip, "yes", 75, 75)
-    assert exits[0].price_cents == LaneFlip._take_price(75) == 90
+    exits = _take_prop(flip, "yes", 85, 85)   # 85+10=95 → capped 90
+    assert exits[0].price_cents == LaneFlip._take_price(85) == 90
 
 
 # ── §4: at simulated size the per-contract take shrinks, volume carries ─────
@@ -163,11 +163,11 @@ def test_second_fill_recomputes_the_take(flip, gateway, ledger, monkeypatch):
     monkeypatch.setattr(config, "WINDOW_BOOK_GOAL_CENTS", 20)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     first = _take_prop(flip, "yes", 60, 60, count=1)
-    assert first[0].price_cents == 77                   # entry+17, 1 lot
+    assert first[0].price_cents == 70                   # entry+10, 1 lot
     # a second contract books; booked-held is now 2 — still entry+17
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     second = _take_prop(flip, "yes", 60, 60, count=2)
-    assert second[0].price_cents == 77                  # size-independent
+    assert second[0].price_cents == 70                  # size-independent
 
 
 # ── §4: a non-converging loser still cuts — now via the MOMENTUM STOP ───────
