@@ -20,7 +20,36 @@ import zipfile
 from typing import List, Optional, Tuple
 from xml.sax.saxutils import escape
 
+from . import scoring
+
 log = logging.getLogger("relay.daily")
+
+
+class _LedgerRO:
+    """Minimal read-only ledger shim: `scoring`'s self-audit functions read the
+    day's numbers through `.db.execute(...)` alone, so a wrapper over the export's
+    own `mode=ro` connection lets the pack compute the honest scoreboard WITHOUT a
+    second DB handle and WITHOUT any write path. It exposes nothing that could
+    take a lock — reads only (§5 read-only-by-construction)."""
+
+    __slots__ = ("db",)
+
+    def __init__(self, conn):
+        self.db = conn
+
+
+# The honest scoreboard's columns, in phone-reading order: identity, evidence,
+# the model, the MONEY beside it (B1), then the model graded against the actual
+# loss (B2 — be_implied is what the realized loss demands; model_error is the gap).
+_SCOREBOARD_COLS = ("lane", "cell", "n", "W", "LB", "be_modeled", "margin",
+                    "pnl_day_c", "pnl_life_c", "loss_modeled_c",
+                    "loss_actual_c", "be_implied", "model_error")
+
+# a cell whose model disagrees with realized losses by more than this is flagged
+# in SUMMARY (model health): the break-even is off by >8 points of win-rate.
+_MODEL_ERROR_FLAG = 0.08
+# thin-evidence threshold — cells below this are "open questions", not verdicts.
+_THIN_N = 10
 
 # §1: every logged table, in the order the sheets appear. SCOREBOARD (computed)
 # is prepended by the builder. `booked_fills`, `window_econ`, `failures`,
@@ -208,6 +237,124 @@ def _write_xlsx(path: str, sheets: List[Tuple[str, List[str], list]]) -> None:
             z.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(header, rows))
 
 
+def _scoreboard_sheet(scoreboard: List[dict]) -> Tuple[List[str], list]:
+    """The honest scoreboard as a STRUCTURED table (B1/B2), one row per cell —
+    realized MONEY beside the model, and the model graded against the actual
+    loss. `None`s (no losses yet ⇒ no implied BE) render as blank cells."""
+    rows = [[r.get(c) for c in _SCOREBOARD_COLS] for r in scoreboard]
+    return list(_SCOREBOARD_COLS), rows
+
+
+def _fees_by_lane_action(conn, day_start: float) -> List[Tuple[str, str, int, int]]:
+    """(lane, action, n_fills, fee_cents) from today's fills — B6 (the venue's
+    cut, split by lane×action). fills carries `action` and `fee_cents`."""
+    if not _table_exists(conn, "fills"):
+        return []
+    return [(str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in conn.execute(
+        "SELECT lane, action, COUNT(*), COALESCE(SUM(fee_cents),0) FROM fills"
+        " WHERE ts >= ? GROUP BY lane, action ORDER BY lane, action",
+        (day_start,)).fetchall()]
+
+
+def _fills_by_size(conn, day_start: float) -> List[Tuple[str, int, int]]:
+    """(size_tier, n_fills, contracts) today — B8 (do the bigger tiers actually
+    fill?). Read-only from fills.size_tier/count."""
+    if not _table_exists(conn, "fills"):
+        return []
+    return [(str(r[0]), int(r[1]), int(r[2])) for r in conn.execute(
+        "SELECT size_tier, COUNT(*), COALESCE(SUM(count),0) FROM fills"
+        " WHERE ts >= ? GROUP BY size_tier ORDER BY size_tier",
+        (day_start,)).fetchall()]
+
+
+def _failures_by_tag(conn, day_start: float) -> List[Tuple[str, int]]:
+    """(why_tag, n) ranked — C3 (what stopped the engine, most-common first)."""
+    if not _table_exists(conn, "failures"):
+        return []
+    return [(str(r[0]), int(r[1])) for r in conn.execute(
+        "SELECT why_tag, COUNT(*) FROM failures WHERE ts >= ?"
+        " GROUP BY why_tag ORDER BY COUNT(*) DESC", (day_start,)).fetchall()]
+
+
+def _summary_sheet(ledger, conn, scoreboard: List[dict],
+                   day_start: float) -> Tuple[List[str], list]:
+    """§4 — the SUMMARY that LEADS the workbook: money, expectation, model
+    health, fees, anomalies, open questions. Three columns [section, item,
+    value] so it reads on a phone. Everything here is a read of what the day
+    already logged — no model output is trusted without its realized number
+    beside it."""
+    rows: list = []
+
+    def sec(section, item, value):
+        rows.append([section, item, value])
+
+    # ── MONEY (B1 / C2): the edge number is fills P&L, per lane, day + life ──
+    money = scoring.fills_pnl_by_lane(ledger, day_start)
+    day_tot = sum((m["pnl_day_c"] or 0) for m in money)
+    life_tot = sum(m["pnl_life_c"] for m in money)
+    sec("MONEY", "fills P&L today (all lanes) ¢", day_tot)
+    sec("MONEY", "fills P&L lifetime (all lanes) ¢", life_tot)
+    for m in money:
+        sec("MONEY", f"{m['lane']}  day / life ¢",
+            f"{m['pnl_day_c'] if m['pnl_day_c'] is not None else '-'} / "
+            f"{m['pnl_life_c']}")
+
+    # ── EXPECTATION (light B7): trades and hit-rate today ──
+    n_day = int(conn.execute(
+        "SELECT COUNT(*) FROM cell_outcomes WHERE ts >= ?",
+        (day_start,)).fetchone()[0]) if _table_exists(conn, "cell_outcomes") else 0
+    w_day = int(conn.execute(
+        "SELECT COALESCE(SUM(won),0) FROM cell_outcomes WHERE ts >= ?",
+        (day_start,)).fetchone()[0]) if n_day else 0
+    sec("EXPECTATION", "cell outcomes today (n)", n_day)
+    sec("EXPECTATION", "wins today", w_day)
+    sec("EXPECTATION", "hit rate today",
+        f"{(w_day / n_day):.3f}" if n_day else "-")
+
+    # ── MODEL HEALTH (B2): cells whose modeled BE disagrees with the realized
+    # loss by more than the flag — the self-audit surfacing its own worst calls.
+    graded = [r for r in scoreboard if r["model_error"] is not None]
+    flagged = sorted((r for r in graded
+                      if abs(r["model_error"]) >= _MODEL_ERROR_FLAG),
+                     key=lambda r: abs(r["model_error"]), reverse=True)
+    sec("MODEL HEALTH", "cells graded vs realized loss", len(graded))
+    sec("MODEL HEALTH", f"cells off by >={_MODEL_ERROR_FLAG:.0%} win-rate",
+        len(flagged))
+    for r in flagged[:8]:
+        sec("MODEL HEALTH",
+            f"{r['lane']} {r['cell']}  be_mod/be_impl",
+            f"{r['be_modeled']} / {r['be_implied']}  (err {r['model_error']:+})")
+
+    # ── FEES (B6): the venue's cut by lane×action + total ──
+    fees = _fees_by_lane_action(conn, day_start)
+    sec("FEES", "total fees today ¢", sum(f[3] for f in fees))
+    for lane, action, nf, fee in fees:
+        sec("FEES", f"{lane} {action}  (n={nf})", fee)
+
+    # ── FILLS BY SIZE (B8): did the bigger tiers fill? ──
+    for tier, nf, contracts in _fills_by_size(conn, day_start):
+        sec("FILLS BY SIZE", f"{tier}  fills / contracts", f"{nf} / {contracts}")
+
+    # ── ANOMALIES (C3): failures by tag, ranked ──
+    fails = _failures_by_tag(conn, day_start)
+    sec("ANOMALIES", "failures logged today", sum(f[1] for f in fails))
+    for tag, n in fails[:10]:
+        sec("ANOMALIES", tag, n)
+
+    # ── OPEN QUESTIONS: thin-evidence cells (verdicts we cannot yet trust),
+    # and the deltas gap (B4) called out honestly rather than left blank. ──
+    thin = [r for r in scoreboard if r["n"] < _THIN_N]
+    sec("OPEN QUESTIONS", f"cells with n<{_THIN_N} (thin evidence)", len(thin))
+    for r in thin[:8]:
+        sec("OPEN QUESTIONS", f"{r['lane']} {r['cell']}  n", r["n"])
+    sec("OPEN QUESTIONS", "day-over-day deltas (B4)",
+        "not yet — no prior-day snapshot persisted")
+    sec("OPEN QUESTIONS", "skips + counterfactuals (B5)",
+        "partial — see failures/decisions sheets")
+
+    return ["section", "item", "value"], rows
+
+
 def build_daily_workbook(db_path: str, scoreboard_lines: List[str],
                          out_path: str, now: Optional[float] = None,
                          days_back: int = 0, decimate_s: int = 15,
@@ -220,8 +367,20 @@ def build_daily_workbook(db_path: str, scoreboard_lines: List[str],
     day_start = _start_of_day(now, days_back)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        ledger_ro = _LedgerRO(conn)
+        # the honest self-audit (A1/A2/A3-corrected margins, realized MONEY, and
+        # the model graded against actual losses). Computed pack-side — the
+        # trading path still reads the untouched breakeven()/SALVAGE_ADJ_MIN_N,
+        # so F and OPEN trade byte-identically (acceptance #9).
+        board = scoring.scoreboard_rows(ledger_ro, day_start)
+        sc_header, sc_rows = _scoreboard_sheet(board)
+        sm_header, sm_rows = _summary_sheet(ledger_ro, conn, board, day_start)
         sheets: List[Tuple[str, List[str], list]] = [
-            ("SCOREBOARD", ["line"], [[ln] for ln in scoreboard_lines])]
+            ("SUMMARY", sm_header, sm_rows),           # §4 — leads the workbook
+            ("SCOREBOARD", sc_header, sc_rows),        # B1/B2 — the self-audit
+            # the legacy text scoreboard (what /scoreboard prints) kept for
+            # continuity, after the structured truth.
+            ("scoreboard_txt", ["line"], [[ln] for ln in scoreboard_lines])]
         total_rows = 0
         for sheet_name, table in TABLE_SHEETS:
             if not _table_exists(conn, table):

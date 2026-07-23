@@ -216,3 +216,138 @@ def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
                      f" < {config.SALVAGE_ADJ_MIN_N} — raw price BE,"
                      f" conservative)")
     return lines
+
+
+# ── WO-2026-07-23-A: THE SELF-AUDIT — put the truth NEXT TO the model ────────
+# READ-ONLY, PACK-SIDE ONLY. These NEVER feed the trading path: the
+# tier→size→custody chain still reads `breakeven()`/`SALVAGE_ADJ_MIN_N` above,
+# UNTOUCHED, so F and OPEN trade byte-identically (acceptance #9). The pack's
+# margin/ranking uses the A1/A2/A3-corrected `breakeven_honest`, and every row
+# carries realized MONEY (B1) and the model graded against the actual loss (B2).
+SALVAGE_ADJ_MIN_N_HONEST = 8    # A3: reachable — F has 9 losses in 285 trades
+
+
+def realized_loss_avg(ledger, lane: str,
+                      cell: Optional[int] = None) -> Tuple[int, float]:
+    """(n_losses, mean |loss| cents) from cell_outcomes — the ACTUAL cost of a
+    loss for a lane (and optionally one cell). The truth `loss_modeled`
+    approximates; today's bug was `loss_modeled 1c` where this read ~24c."""
+    q = ("SELECT COUNT(*), COALESCE(AVG(-pnl_cents),0) FROM cell_outcomes"
+         " WHERE lane=? AND pnl_cents<0"
+         + (" AND price_cell=?" if cell is not None else ""))
+    args = (lane, cell) if cell is not None else (lane,)
+    row = ledger.db.execute(q, args).fetchone()
+    return int(row[0]), float(row[1])
+
+
+def cell_pnl(ledger, lane: str, cell: int,
+             day_start: Optional[float] = None) -> Tuple[Optional[int], int]:
+    """(pnl_day, pnl_life) realized cents for a cell — MONEY, not a model output
+    (B1). A cell can be negative-margin and positive-money; the desk needs both."""
+    life = int(ledger.db.execute(
+        "SELECT COALESCE(SUM(pnl_cents),0) FROM cell_outcomes"
+        " WHERE lane=? AND price_cell=?", (lane, cell)).fetchone()[0])
+    if day_start is None:
+        return None, life
+    day = int(ledger.db.execute(
+        "SELECT COALESCE(SUM(pnl_cents),0) FROM cell_outcomes"
+        " WHERE lane=? AND price_cell=? AND ts>=?",
+        (lane, cell, day_start)).fetchone()[0])
+    return day, life
+
+
+def _take_honest(lane: str) -> float:
+    if lane == "OPEN":
+        return float(config.OPEN_GOUGE_C)       # A1: the actual target (17), not 20
+    return float(config.HUNT_TAKE_CENTS)
+
+
+def _be_from_loss(lane: str, mid: float, loss: float, take: float,
+                  maker: bool = True) -> float:
+    """Break-even win-rate for a given loss/take geometry — the SAME shape as
+    breakeven(), fed an explicit loss so the model is auditable against it."""
+    if lane in HOLD_LANES:
+        denom = (100.0 - mid) + loss
+        return loss / denom if denom > 0 else 1.0
+    fee = 0.0 if maker else taker_fee_cents(max(1.0, loss))
+    denom = take + loss + fee
+    return (loss + fee) / denom if denom > 0 else 1.0
+
+
+def loss_modeled_honest(ledger, lane: str, cell: int) -> float:
+    """The loss the CORRECTED model assigns. A1: OPEN's stop is the flat
+    OPEN_MOMENTUM_STOP_C (10), not the retired band floor (mid−35). A2: a hold
+    loss falls back to the realized mean loss when the DODGED curve is short,
+    never a total loss (mid) — F salvage-cuts at ~−40, not −97."""
+    mid = cell + config.CELL_WIDTH_CENTS // 2
+    if lane in HOLD_LANES:
+        sn, recapture = salvage_recapture_cents(ledger)
+        if sn >= SALVAGE_ADJ_MIN_N_HONEST:       # A3 (reachable) then DODGED
+            return max(1.0, mid - recapture)
+        rn, ravg = realized_loss_avg(ledger, lane)   # A2 realized fallback
+        return min(float(mid), ravg) if rn > 0 else float(mid)
+    if lane == "OPEN":
+        return float(config.OPEN_MOMENTUM_STOP_C)    # A1: flat 10c everywhere
+    if lane == "HUNT":
+        return 2.0
+    return float(config.HUNT_TAKE_CENTS)
+
+
+def breakeven_honest(ledger, lane: str, cell: int) -> float:
+    """The A1/A2/A3-corrected break-even — the pack's margin/ranking, NEVER the
+    trading path."""
+    mid = cell + config.CELL_WIDTH_CENTS // 2
+    loss = loss_modeled_honest(ledger, lane, cell)
+    maker = lane != "HUNT"                        # OPEN exits maker-first; HUNT crosses
+    return _be_from_loss(lane, mid, loss, _take_honest(lane), maker=maker)
+
+
+def scoreboard_rows(ledger, day_start: Optional[float] = None) -> List[dict]:
+    """The structured scoreboard: every cell with realized MONEY beside the model
+    (B1), and the model GRADED against the actual loss (B2). Sorted by the
+    honest margin. Read-only — the instrument grading itself."""
+    cells = ledger.db.execute(
+        "SELECT lane, price_cell FROM cell_outcomes"
+        " GROUP BY lane, price_cell").fetchall()
+    out = []
+    for lane, cell in cells:
+        n, wins, lb = cell_stats(ledger, lane, cell)
+        mid = cell + config.CELL_WIDTH_CENTS // 2
+        be_mod = breakeven_honest(ledger, lane, cell)
+        loss_mod = loss_modeled_honest(ledger, lane, cell)
+        rn, loss_act = realized_loss_avg(ledger, lane, cell)
+        maker = lane != "HUNT"
+        be_impl = (_be_from_loss(lane, mid, loss_act, _take_honest(lane),
+                                 maker=maker) if rn > 0 else None)
+        pnl_day, pnl_life = cell_pnl(ledger, lane, cell, day_start)
+        out.append({
+            "lane": lane, "cell": cell_label(cell), "n": n, "W": wins,
+            "LB": round(lb, 3), "be_modeled": round(be_mod, 3),
+            "margin": round(lb - be_mod, 3),
+            "pnl_day_c": pnl_day, "pnl_life_c": pnl_life,
+            "loss_modeled_c": round(loss_mod, 1),
+            "loss_actual_c": round(loss_act, 1) if rn > 0 else None,
+            "be_implied": round(be_impl, 3) if be_impl is not None else None,
+            "model_error": (round(be_mod - be_impl, 3)
+                            if be_impl is not None else None)})
+    out.sort(key=lambda r: r["margin"], reverse=True)
+    return out
+
+
+def fills_pnl_by_lane(ledger, day_start: Optional[float] = None) -> List[dict]:
+    """SUMMARY money (B1/C2): realized fills P&L per lane, day + lifetime — the
+    edge number is fills_pnl (strategy), NOT window_pnl (includes accidents)."""
+    lanes = [r[0] for r in ledger.db.execute(
+        "SELECT DISTINCT lane FROM cell_outcomes ORDER BY lane").fetchall()]
+    out = []
+    for lane in lanes:
+        life = int(ledger.db.execute(
+            "SELECT COALESCE(SUM(pnl_cents),0) FROM cell_outcomes WHERE lane=?",
+            (lane,)).fetchone()[0])
+        day = None
+        if day_start is not None:
+            day = int(ledger.db.execute(
+                "SELECT COALESCE(SUM(pnl_cents),0) FROM cell_outcomes"
+                " WHERE lane=? AND ts>=?", (lane, day_start)).fetchone()[0])
+        out.append({"lane": lane, "pnl_day_c": day, "pnl_life_c": life})
+    return out

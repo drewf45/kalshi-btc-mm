@@ -291,6 +291,18 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "(cell_outcomes), book tape decimated + full-res around trades, "
                  "scoped to the day. READ-ONLY (mode=ro), built in /tmp, sent, "
                  "deleted — never touches the settle path (/daily N = N days back)")
+    lines.append("  DAILY TRUTH (WO-2026-07-23-A, build 63): the pack now grades "
+                 "itself. A SUMMARY sheet LEADS (money, expectation, model "
+                 "health, fees, anomalies, open questions); the SCOREBOARD is a "
+                 "STRUCTURED table — realized P&L (day+life) BESIDE each cell's "
+                 "margin, and the model graded against the ACTUAL loss "
+                 "(loss_modeled vs loss_actual, be_implied, model_error). A1 "
+                 "OPEN break-even anchors on OPEN_MOMENTUM_STOP_C (the live stop), "
+                 "not the retired band floor; A2 a hold loss falls back to the "
+                 "realized average, never a total loss; A3 salvage gate is 8 "
+                 "(reachable). PACK-SIDE ONLY — the trading breakeven()/"
+                 "SALVAGE_ADJ_MIN_N are UNTOUCHED, so F and OPEN trade "
+                 "byte-identically (acceptance #9, a KILL CONDITION)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

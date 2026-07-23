@@ -2962,6 +2962,64 @@ halts fire independently and never stop F; zero taker fills on entry; `window_pn
 F's ⚠ clears once the DODGED curve populates; `/daily` delivers the workbook. **Read `fills_pnl` BY
 LANE** — a green week could still be F carrying three losers.
 
+## WO-2026-07-23-A — MAKE THE DAILY PACK TELL THE TRUTH (build 63)
+
+**The ruling: put the truth NEXT TO the model.** Instrument only — no trading behaviour change. The pack
+grades itself: realized P&L beside every cell's margin, and the model's break-even graded against the
+loss that actually happened. Where the model was priced on a **retired** constant, the pack computes the
+honest number; the **trading path keeps the old number, byte-for-byte** (acceptance #9, a KILL CONDITION).
+
+**Read-rule at source (all TRUE):**
+- **A1** `breakeven()` (scoring.py:85) for OPEN reads `bail = max(1.0, mid - OPEN_UNDETERMINED_BAND[0])`
+  (= mid − 35) and `take = OPEN_TAKE_CENTS` (= 20). **TRUE** — `OPEN_UNDETERMINED_BAND` is the retired
+  band-exit anchor and 20 is the stale take; the live exit is a flat `OPEN_MOMENTUM_STOP_C` (10) stop
+  and an `OPEN_GOUGE_C` (17) take. The model's OPEN break-even was computed on geometry the lane no
+  longer trades (0.588 modeled vs 0.37 honest at cell 60-64).
+- **A2** the hold-lane branch sets `loss = float(mid)` — a **total** loss. **TRUE** — F salvage-cuts a
+  loser at ~−40¢, not the full −97¢; assuming total loss inflates the hold break-even (0.97 modeled vs
+  0.93 on the realized 40¢ average at cell 95-99).
+- **A3** `SALVAGE_ADJ_MIN_N = 20` (config) is the gate before the DODGED recapture adjusts the hold
+  loss. **TRUE and unreachable** — F has ~9 losses in ~285 trades, so the curve never reaches n=20 and
+  the adjustment never fires. The pack uses a reachable `SALVAGE_ADJ_MIN_N_HONEST = 8`.
+
+**Design decision (the honest divergence, reported):** the WO frames A1/A2/A3 as fixes to the scoring
+model. Tracing `breakeven() → bars_for_cell() → score() → tier_for()`, the tier is a **custody-scaling**
+input (`sizing.size_order` removes the tier from the ENTRY path — entries are full Kelly), and the live
+tier→custody state **cannot be verified from here**. Since acceptance #9 (F/OPEN byte-identical) is a
+KILL CONDITION, the corrected numbers are computed **PACK-SIDE ONLY**: new read-only
+`breakeven_honest`/`loss_modeled_honest`/`scoreboard_rows`/`fills_pnl_by_lane` in scoring.py, all reading
+through `ledger.db` alone. The trading-facing `breakeven()` and `SALVAGE_ADJ_MIN_N` are **left untouched**
+— guaranteeing byte-identical trading. A test asserts `breakeven()` still returns the stale geometry
+(0.97 for F 95, and ≠ `breakeven_honest` for OPEN), i.e. the honest math did not leak into the ladder.
+
+**Built:**
+- **Scoreboard, structured (B1/B2):** `scoring.scoreboard_rows` — one row per cell with `pnl_day_c` /
+  `pnl_life_c` (realized MONEY, B1) beside the margin, and `loss_modeled_c` / `loss_actual_c` /
+  `be_implied` / `model_error` (the model graded against the realized loss, B2). `daily_bundle` renders
+  it as a real table, not text lines.
+- **SUMMARY sheet, leading (§4, acceptance #8):** money (`fills_pnl_by_lane`, day+life, C2), expectation
+  (n/wins/hit-rate), model health (cells whose `model_error` ≥ 8 win-rate points, ranked), fees by
+  lane×action (B6), anomalies by `why_tag` ranked (C3), fills-by-size (B8), and open questions (thin
+  cells n<10; the B4 deltas / B5 counterfactual gaps named honestly rather than left blank).
+- **A1** OPEN honest loss = `OPEN_MOMENTUM_STOP_C`; take = `OPEN_GOUGE_C`. **A2** hold loss falls back to
+  the realized average (`min(mid, realized_avg)`) when the DODGED curve is short. **A3**
+  `SALVAGE_ADJ_MIN_N_HONEST = 8`.
+
+**HARD RAIL:** `breakeven()`, `SALVAGE_ADJ_MIN_N`, `bars_for_cell`, `score`, `tier_for` UNCHANGED;
+`lane_fh8`/gateway/custodian untouched; the pack opens its own `mode=ro` connection (a `_LedgerRO` shim
+over it — reads only, no write path). New acceptance in `test_daily_bundle.py` (14 tests, all pass):
+SUMMARY leads; scoreboard carries realized money + model_error; OPEN BE anchored on the live constant
+not the retired band; hold loss falls back to realized not total; salvage gate reachable; **trading
+break-even byte-identical**. Suite 712 · preflight 23/23.
+
+**Deferred / assessed (reported honestly):** B3 (lifetime cell rows — the scoreboard already carries
+`pnl_life_c`), B4 (day-over-day deltas — needs a persisted prior-day snapshot; flagged in SUMMARY open
+questions), B5 (skips + counterfactuals — partial via failures/decisions sheets; a full counterfactual
+join is its own build), B7 (expectation ±σ — SUMMARY carries n/wins/hit-rate, not the full σ band), C1
+(split the TIER column into tier/kelly_lots/actual_lots — the text scoreboard is kept for continuity;
+the structured sheet supersedes it). The **HUNT enable/disable ruling** (from WO-L §3.1) and **§4.6 the
+empty DODGED curve** remain open capital-gate calls, surfaced to Drew, not changed here.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
