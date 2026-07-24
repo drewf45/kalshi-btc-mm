@@ -3502,6 +3502,48 @@ confirmed (ADVERSARY iii — `test_ten_lots_at_the_band_top_fits_the_at_risk_wal
 `test_f_notional_path_untouched_by_flip`); #8/#9 revert conditions remain in the config comments. New
 `test_morning_four_build2.py` (7 tests). Suite 774 · preflight 23/23.
 
+## WO-2026-07-24-E Phase 1 — THE SIGHTED STOP (instrumentation, build 76)
+
+Trigger: `26JUL240845-45`, entry yes@57 ×9 — the book collapsed toward 80/20 against, climbed back through
+the 40s, and the momentum stop sold at 48 INTO the recovery (−81¢). Drew's read: "you sold due to being
+blind." Two-phase by cadence law — **Phase 1 (weekday) is instrumentation only, ZERO behavior change;**
+Phase 2 (Saturday, on Drew's explicit go after the shadow read) flips the deferral live.
+
+**Read-rule TRUE:** `lane_flip.py:1399-1402` — `o["stop_polls"]` increments on `mark <= stop_px`, a pure
+LEVEL condition with no trajectory term. It counts a poll identically whether the book is falling 57→47 or
+climbing 20→47, so a position reverting hard toward entry satisfies it on every poll of the climb until it
+crosses back above the stop — exactly where the engine sells it. The data to distinguish "thesis wrong" from
+"thesis being repaired" was already recorded and never read back (`skew_ticks` `:241`/`:668`, `exit_obs`
+`:1296`) — the same disease as `scan_attrition`: an instrument lying by omission.
+
+**Part 0 correction (reported honestly):** the WO's mental model referenced a 4-minute hold; there is **no
+hold** in current code — WO-2026-07-22-E retired it on the favored side. The ~3 minutes on the tape was the
+book's own path to the stop plus the 2-poll sustain, not a hold expiring. The finding stands regardless.
+
+**Phase 1 build (SHADOW only):** every poll in `_open_custody` now records `low_mark` (min mark since entry)
+and `mark_prev` (prior poll's mark). **BLIND/MUTE law (acceptance #4):** a None-mark poll updates neither
+(carry forward) and never counts as recovery — a book-fetch failure cannot fabricate a low or a repair. When
+the live stop fires, a shadow verdict is computed and stamped onto the `FLIP_SWING` row:
+`{would_defer, low_mark, mark_at_cut, off_low_c, grace_polls_shadow}`. The sighted rule (Phase 2's future
+behavior, computed here as a counterfactual): an adverse LEVEL is necessary but not sufficient —
+`would_defer` = level `AND` recovering (`mark >= low + OPEN_RECOVERY_MIN_C=6` and not falling) `AND NOT` the
+G1 hard floor (`mark <= stop − SLIP − OPEN_GRACE_HARD_C=8` — a 12→18 bounce is a dead position twitching)
+`AND` grace budget (`< OPEN_RECOVERY_MAX_POLLS=20`). G3: recovery is measured off `low_mark`, so a decaying
+sawtooth keeps making new lows and can't fake a repair. The live `stop_polls` counter and the cut (with
+WO-2026-07-24-D P2's floor/breach) are **byte-identical** — only new `o[...]` keys are written.
+
+**Sibling-path check (acceptance #5, banked law):** `stop_polls` has exactly ONE consumer (`:1400-1402`); no
+other cut path reads it. The named twins reading bare `mark` — the HUNT `scratch_reason` (`:146-160`, a
+deliberately fast scratch in a different mode) and the dead-floor hold backstop (curfew winners, G4/G5) — were
+inspected and **left unchanged**; the sighted stop is the OPEN momentum stop only.
+
+**Acceptance (Phase 1):** the `FLIP_SWING` record carries the shadow fields, the 0845 signature reproduces
+(`would_defer=true, off_low=+28` — `test_stop_into_a_recovery_shadows_would_defer`), a genuine falling cut
+shadows `would_defer=false`, a None-mark poll fabricates nothing (`#4`), G1/G3 hold as shadow verdicts;
+behavior byte-identical (the 137-test momentum-stop corpus passes untouched); **F byte-identical** (`lane_fh8`
+untouched). New `test_sighted_stop_phase1.py` (7 tests). **Phase 2 is Saturday's decision, gated on Drew's go
+after reading the shadow tape — not shipped here.** Suite 781 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

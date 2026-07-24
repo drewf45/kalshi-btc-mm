@@ -142,6 +142,16 @@ OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2
 # The flatten now floors at entry − stop − slip and rides ONE poll at the floor
 # before it will cross below it; a cross below the floor is a counted breach.
 SLIP_TOLERANCE_C = 3             # DREW-DEFAULT: flatten may cross at most stop+slip below entry
+# WO-2026-07-24-E "THE SIGHTED STOP": the momentum stop is a pure LEVEL test
+# (mark <= stop_px) with no trajectory term — it fires identically whether the
+# book is falling to the stop or CLIMBING back through it (26JUL0845: sold at 48
+# into a book that had recovered ~28pts off its low). Phase 1 (today) computes
+# the sighted condition as a SHADOW only. Phase 2 (Saturday, DREW's go) makes an
+# adverse LEVEL necessary-but-not-sufficient: a book measurably recovering toward
+# entry is the reversion thesis WORKING. All three re-derivable from tape.
+OPEN_RECOVERY_MIN_C = 6          # DREW-DEFAULT: mark this far off the low = recovering
+OPEN_RECOVERY_MAX_POLLS = 20     # DREW-DEFAULT: grace budget — deferrals before the stop rules anyway
+OPEN_GRACE_HARD_C = 8            # DREW-DEFAULT: below stop−SLIP−this, cut regardless (G1 bounded worst case)
 # WO-2026-07-22-F "WAIT FOR THE PILE": entry-discipline tuning. Every logged
 # entry so far fired inside the first 57s — before the pile window even opens,
 # on a book that had not moved (trend $0) or already finished (skew 41). FLIP

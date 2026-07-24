@@ -1287,6 +1287,19 @@ class LaneFlip:
             # actually hit) is derived at conclusion from the exit reason.
             if mark is not None and mark >= self._take_price(o["entry"]):
                 o["target_touched"] = True
+            # WO-2026-07-24-E "THE SIGHTED STOP" Phase 1 (SHADOW — zero behavior
+            # change): the flight recorder the level-only stop never reads back.
+            # low_mark = min(mark) since entry; mark_prev = the PRIOR poll's mark
+            # (the local below holds it through this poll). BLIND/MUTE law: a
+            # None-mark poll updates NEITHER (carry forward), so a book-fetch
+            # failure can never fabricate a low or a recovery. Read back onto the
+            # FLIP_SWING record when the live stop fires; Phase 2 (Saturday, on
+            # DREW's go) flips the deferral live behind OPEN_SIGHTED_STOP.
+            mark_prev = o.get("mark_prev")
+            if mark is not None:
+                lm = o.get("low_mark")
+                o["low_mark"] = mark if lm is None else min(lm, mark)
+                o["mark_prev"] = mark
             # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the running EXIT
             # observation: the latest book/spot/timing, stamped every poll so
             # whenever the position concludes the FLIP_SWING record has the true
@@ -1397,9 +1410,43 @@ class LaneFlip:
                                    "gone worthless, evacuate, never ride to zero"))
                 continue
             stop_px = o["entry"] - config.OPEN_MOMENTUM_STOP_C
+            # WO-2026-07-24-E Phase 1 (SHADOW): compute the sighted verdict every
+            # poll and accumulate the shadow grace budget. This CHANGES NOTHING —
+            # the live counter and cut below are byte-identical; only new o[...]
+            # keys are written, read back onto FLIP_SWING at conclusion. The
+            # sighted rule: an adverse LEVEL is necessary but not sufficient — a
+            # book off its low by OPEN_RECOVERY_MIN_C AND not falling this poll is
+            # the reversion thesis WORKING, so a Phase-2 stop would DEFER. G1: a
+            # hard floor (stop−SLIP−OPEN_GRACE_HARD_C) cuts regardless (a bounce
+            # off 12→18 is a dead position twitching, not a repair). G2: the grace
+            # budget caps deferrals. G3: recovery is measured off low_mark, so a
+            # decaying sawtooth keeps making new lows and can't fake recovery.
+            low = o.get("low_mark")
+            off_low = (mark - low) if (mark is not None and low is not None) else None
+            recovering = (mark is not None and low is not None
+                          and mark >= low + config.OPEN_RECOVERY_MIN_C
+                          and mark_prev is not None and mark >= mark_prev)
+            g1_hard = (mark is not None and mark <= stop_px
+                       - config.SLIP_TOLERANCE_C - config.OPEN_GRACE_HARD_C)
+            level = mark is not None and mark <= stop_px
+            budget_left = o.get("grace_polls_shadow", 0) < config.OPEN_RECOVERY_MAX_POLLS
+            would_defer = level and recovering and not g1_hard and budget_left
+            if would_defer:
+                o["grace_polls_shadow"] = o.get("grace_polls_shadow", 0) + 1
             o["stop_polls"] = (o.get("stop_polls", 0) + 1
                                if (mark is not None and mark <= stop_px) else 0)
             if o["stop_polls"] >= 2:
+                # Phase 1: stamp the counterfactual at the moment the LIVE stop
+                # fires — the labeled shadow the Saturday decision reads.
+                o["shadow_would_defer"] = bool(would_defer)
+                o["shadow_mark_at_cut"] = mark
+                o["shadow_off_low"] = off_low
+                if would_defer:
+                    log.info("OPEN_STOP_SHADOW %s %s: live stop firing at %sc but "
+                             "the sighted stop WOULD DEFER — book +%sc off its %sc "
+                             "low and climbing (grace_shadow=%d); Phase 1, no "
+                             "behavior change", market, side, mark, off_low, low,
+                             o.get("grace_polls_shadow", 0))
                 # WO-2026-07-24-D Part 2: the momentum stop gets the SAME price
                 # floor the flatten already has (the sibling path this fix was
                 # missing from). The declared max loss is entry−OPEN_MOMENTUM_
@@ -1893,7 +1940,18 @@ class LaneFlip:
                   "entry_cheap_bid": em.get("cheap_bid"),
                   # the posted gouge level (the middle target) — the x-axis of
                   # the fill-rate-by-price curve (Part B); filled == TAKE_FILL
-                  "posted_take": self._take_price(entry)}
+                  "posted_take": self._take_price(entry),
+                  # WO-2026-07-24-E Phase 1 (SHADOW): the sighted-stop
+                  # counterfactual on every FLIP_SWING row — would the Phase-2
+                  # stop have DEFERRED this cut (book recovering off its low), the
+                  # low itself, the mark at the cut, how far off the low, and the
+                  # shadow grace budget consumed. On the 26JUL0845 tape this reads
+                  # would_defer=true, off_low≈+28. Behavior byte-identical today.
+                  "would_defer": bool((o or {}).get("shadow_would_defer")),
+                  "low_mark": (o or {}).get("low_mark"),
+                  "mark_at_cut": (o or {}).get("shadow_mark_at_cut"),
+                  "off_low_c": (o or {}).get("shadow_off_low"),
+                  "grace_polls_shadow": (o or {}).get("grace_polls_shadow", 0)}
         try:
             surface.write_row("FLIP", market, f"w-{market}", "FLIP_SWING",
                               detail=json.dumps(detail))
