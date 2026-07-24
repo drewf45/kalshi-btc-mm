@@ -422,8 +422,19 @@ SETTLE_NOTIONAL_SLIP_C = 6
 # B3 (DREW-DEFAULT): the halt is a RATE — N losing markets of the last M
 # settled traded markets (per-market broker P&L is the unit). One loss
 # NEVER halts; two-in-a-row was never a reliable signal, 2-of-4 is.
-RATE_HALT_LOSSES = 2
-RATE_HALT_WINDOW = 4
+RATE_HALT_LOSSES = 2         # legacy count-halt constants (retired by WO-2026-07-24-C
+RATE_HALT_WINDOW = 4         # Part 2; kept for reference / a persisted legacy halt)
+# WO-2026-07-24-C Part 2: the per-lane rate halt counts MONEY, not negative
+# windows (−8,−7,+17 nets +2¢ and must NOT halt), over a wider window, against a
+# drawdown threshold DERIVED from the lane's own position size — a flat 40¢
+# threshold sized for 1-lot FLIP would strangle a 10-lot lane before its first
+# loss settled (the same absolute-constant error as NET_RISK/AT_RISK_CAP). At
+# FLIP_SIZE_CAP=3 → 120¢; at 10 → 400¢ (~3.5 stop-outs). F is unaffected in
+# practice (96.9% wins never accumulate it) — F's guard stays the per-event
+# tripwire (F_EVENT_TRIPWIRE_C), the right shape for a rare-and-large loser.
+RATE_HALT_WINDOW_N = 8
+# RATE_HALT_DRAWDOWN_C is derived from FLIP_SIZE_CAP (defined further below), so
+# it is computed right after that constant.
 # WO-FLIP-CHEAP-LIVE §2.2 (DREW-DEFAULT, permissive for live-proof — we
 # WANT data): the two-sided swing gate's floor. p_cross(d_strike, t) is
 # P(spot touches the strike = the 50/50 swing en route to the take);
@@ -445,6 +456,10 @@ FLIP_FLOOR_SLIP_CENTS = 5
 # before it may ever drive the decision.
 OPEN_SWING_MIN_SAMPLES = 20       # Adversary (a): don't gate on a thin sample
 FLIP_SIZE_CAP = 3                 # DREW-RULED (WO-2026-07-23-E "THE SIZE TEST", was 1): EXPLICIT 3-lot cap — NET_RISK_CROSS_LANE_CAP=3 and the 5% at-risk wall both bind here, so 3 is deterministic regardless of book (4 would drift with book size — a confound). 1→3 is a 3× read of "does size travel"; widen the wall for 5-6 later WITH this data, never before it
+# WO-2026-07-24-C Part 2: the per-lane rate-halt drawdown threshold, DERIVED
+# from the lane's own size (4 stop-outs' worth). Scales with FLIP_SIZE_CAP so it
+# never strangles the lane it protects: 120¢ at 3 lots, 400¢ at 10.
+RATE_HALT_DRAWDOWN_C = 4 * FLIP_SIZE_CAP * OPEN_MOMENTUM_STOP_C
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20

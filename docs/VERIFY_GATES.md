@@ -3366,6 +3366,37 @@ stable** — the correction landing, not a regression (Adversary's note); #5 **F
 only, no trading path touched). New `test_truncation.py` (3); `test_cash_fatal1` divergent-alert updated to
 the `.1f` precision. Suite 747 · preflight 23/23.
 
+## WO-2026-07-24-C Part 1+2 — SCOPE THE HALT, SIZE THE HALT (build 72)
+
+Ships FIRST (the test build needs it — without it FLIP halts at 2-of-4 and never reaches 12-15 exits).
+
+**Part 1 — retire the global fallback.** Read-rule TRUE: `window_econ._apply_streak` (`:302-310`) fell
+back, when `per_lane` was empty, to a GLOBAL path that set `HALT_KEY` and halted EVERY lane on aggregate
+window P&L — including F, for losses F did not cause (the one path by which FLIP's behaviour could stop
+the earner). The per-lane halt itself was correctly scoped. **Fix:** deleted the global body — `if not
+per_lane: log + return`. Per-lane attribution now exists on every close (`shadow_runner` settle path), so
+the fallback had no job. `HALT_KEY` stays **readable** and `/reset_halt` still clears a persisted legacy
+halt; **nothing sets it going forward.**
+
+**Part 2 — the halt counts money, and scales with size.** Read-rule TRUE: the per-lane path
+(`:365-370`) counted negative windows (`len(losses) >= RATE_HALT_LOSSES`), so `−8,−7,+17` (net +2¢)
+HALTED. **Fix:** sum the last `RATE_HALT_WINDOW_N=8` windows' fills-P&L against `RATE_HALT_DRAWDOWN_C`,
+**derived from the lane's own size** — `4 · FLIP_SIZE_CAP · OPEN_MOMENTUM_STOP_C` (120¢ at 3 lots, 400¢ at
+10). A flat 40¢ threshold sized for 1-lot FLIP would strangle a 10-lot lane before its first loss settled
+— the same absolute-constant error as `NET_RISK`/`AT_RISK_CAP`. The pnl carries the 0.1¢ fraction (Part-1
+truncation fix). **F is unaffected in practice** (96.9% wins never accumulate that drawdown across 8
+windows); F's guard stays the per-event tripwire (`F_EVENT_TRIPWIRE_C`), the right shape for a
+rare-and-large loser — **F byte-identical** (`lane_fh8` untouched; the halt is a governor, not F's logic).
+
+**Acceptance:** #1 no path sets `HALT_KEY` forward, `/reset_halt` still clears a legacy one
+(`test_per_lane_halt`); #2 a FLIP halt never in F's wall reasons (`test_flip_drawdown_halts_flip_only_f_
+untouched`); #3 halt fires on summed P&L, threshold from `FLIP_SIZE_CAP × OPEN_MOMENTUM_STOP_C`; #4 FLIP
+survives `−8,−7,+17` (`test_profitable_asymmetric_sequence_does_not_halt`, in `test_aplayer` and
+`test_p8_golive`); #8 F byte-identical. The daily pack's RATE-HALT line and the whole halt test corpus
+(`test_aplayer`, `test_p8_golive`, `test_per_lane_halt`, `test_p27_governor`, `test_p17_show_up`,
+`test_p9_real_numbers`, `test_halt_orphan`) re-anchored to the money doctrine; the preflight halt gate
+retargeted. Suite 749 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

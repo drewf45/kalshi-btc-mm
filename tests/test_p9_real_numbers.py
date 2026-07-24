@@ -191,13 +191,15 @@ def test_deferred_close_completes_without_resettling(engine):
     assert engine.econ.streak == 0  # positive window applied the streak once
 
 
-def test_deferred_streak_still_counts_strikes(engine):
-    """A deferral must not launder a red window out of the leash."""
+def test_deferred_drawdown_still_counts(engine):
+    """A deferral must not launder a lane's loss out of the leash — the per-lane
+    money halt (WO-2026-07-24-C) still fires when the deferred close flushes."""
     for i, mkt in enumerate((TICKER, TICKER2)):
-        engine.econ.open_bracket(mkt, 10_000 - i * 10, now=1000.0)
-        engine.econ.close_bracket(mkt, None, -10, now=1900.0)
-        engine.econ.flush_deferred(10_000 - i * 10 - 10, "venue", now=1930.0)
-    assert engine.econ.halted() is True  # two red deferred windows = the leash
+        engine.econ.open_bracket(mkt, 10_000 - i * 70, now=1000.0)
+        engine.econ.close_bracket(mkt, None, -70, now=1900.0,
+                                  per_lane={"FLIP": -70})
+        engine.econ.flush_deferred(10_000 - i * 70 - 70, "venue", now=1930.0)
+    assert "FLIP" in engine.econ.halted_lanes()  # two −70 = −140 < −120: the leash
 
 
 # ── §3: standing live reconcile ────────────────────────────────────────────

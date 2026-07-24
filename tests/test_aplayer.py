@@ -113,40 +113,49 @@ def econ(ledger, gateway, surface):
 
 
 def test_one_loss_never_halts(econ):
-    """Doctrine A1/A2 enforced structurally: a single losing market is
-    NOISE — 1 of the last 4 cannot stop the machine."""
-    for i, pnl in enumerate((+5, +3, -20, +4)):
-        econ._apply_streak(f"M{i}", pnl, BOOK)
+    """WO-2026-07-24-C: the halt counts MONEY — a single loss under the drawdown
+    threshold (120c at FLIP_SIZE_CAP=3) is NOISE and halts nothing."""
+    econ._apply_streak("M0", -20, BOOK, per_lane={"FLIP": -20})
+    assert "FLIP" not in econ.halted_lanes()
     assert not econ.halted()
-    assert any("rate 1/4" in a for a in econ.telegram.alerts)
 
 
-def test_two_of_last_four_halts_and_persists(econ, ledger, gateway,
-                                             surface):
-    """Acceptance: 2-of-4 (NOT consecutive — a win between) halts, pages,
-    and persists across boot; /reset_halt is the only key."""
-    for i, pnl in enumerate((-20, +5, -8)):          # red, win, red
-        econ._apply_streak(f"M{i}", pnl, BOOK)
-    assert econ.halted()
-    assert "RATE_HALT" in gateway.entries_halted_reasons
+def test_profitable_asymmetric_sequence_does_not_halt(econ):
+    """Acceptance #4: −8, −7, +17 nets +2c — a PROFITABLE sequence the old
+    2-of-4 count-halt suppressed. Summing money, it never halts."""
+    for i, pnl in enumerate((-8, -7, +17)):
+        econ._apply_streak(f"M{i}", 0, BOOK, per_lane={"FLIP": pnl})
+    assert "FLIP" not in econ.halted_lanes()
+
+
+def test_lane_drawdown_past_threshold_halts_and_persists(econ, ledger, gateway,
+                                                         surface):
+    """WO-2026-07-24-C: a lane whose summed drawdown crosses
+    RATE_HALT_DRAWDOWN_C halts ONLY itself, pages, and persists across boot;
+    /reset_halt is the only key. The global (all-lane) halt is retired."""
+    for i, pnl in enumerate((-50, +5, -80)):         # net −125 < −120
+        econ._apply_streak(f"M{i}", 0, BOOK, per_lane={"FLIP": pnl})
+    assert "FLIP" in econ.halted_lanes()
+    assert "RATE_HALT:FLIP" in gateway.entries_halted_reasons
+    assert not econ.halted()                         # global untouched
     page = next(a for a in econ.telegram.alerts if "RATE HALT" in a)
-    assert "M0" in page and "M2" in page and "/reset_halt" in page
-    # the reboot: fresh econ over the same DB — the halt survives
+    assert "drew down" in page and "/reset_halt" in page
+    # the reboot: fresh econ over the same DB — the per-lane halt survives
     from relay_engine.window_econ import WindowEcon
     gw2 = Gateway(ledger, surface)
     econ2 = WindowEcon(ledger, gw2, surface, _TG())
     assert econ2.restore_halt_on_boot() is True
-    assert "RATE_HALT" in gw2.entries_halted_reasons
+    assert "RATE_HALT:FLIP" in gw2.entries_halted_reasons
     assert econ2.reset_halt().startswith("halt cleared")
-    assert json.loads(ledger.get_state("rate_halt_outcomes")) == []
+    assert json.loads(ledger.get_state("rate_halt_outcomes:FLIP")) == []
 
 
-def test_per_market_broker_pnl_is_the_unit(econ):
-    """Acceptance: a market that buys 30 / flips 29 and nets +1c of broker
-    P&L is a WIN — the unit is the market, never the lane's inside story."""
+def test_per_lane_pnl_is_the_unit(econ):
+    """Acceptance: a lane that nets small positive over its windows is a WIN —
+    the unit is each lane's own fills-P&L, never the aggregate window."""
     for i, pnl in enumerate((-20, +1, +1, +1)):
-        econ._apply_streak(f"M{i}", pnl, BOOK)
-    assert not econ.halted()                         # rate 1/4
+        econ._apply_streak(f"M{i}", 0, BOOK, per_lane={"FLIP": pnl})
+    assert "FLIP" not in econ.halted_lanes()          # net −17 > −120
 
 
 # ── B4: THE FRACTION IS DREW'S DIAL ────────────────────────────────────────

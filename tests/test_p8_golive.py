@@ -31,16 +31,19 @@ def engine(tmp_path):
     failures._alert_fn = None
 
 
-def trade_and_settle(engine, market, pnl_cents, now=1000.0):
+def trade_and_settle(engine, market, pnl_cents, now=1000.0, lane="FLIP"):
     """Synthetic bracket: open at book, settle with a forced pnl by writing the
-    settlement into the ledger and closing at book+pnl."""
+    settlement into the ledger and closing at book+pnl. WO-2026-07-24-C: the
+    close carries per-lane attribution (the live path) so the per-lane money halt
+    is exercised — the global fallback that could halt every lane is retired."""
     open_value = engine.ledger.book_cents()
     engine.econ.open_bracket(market, open_value, now=now)
-    engine.ledger.record_fill(market, "F", "yes", "ENTRY", 61, 1, "PROBE")
-    engine.ledger.record_settlement(market, "F", pnl_cents, detail="synthetic")
+    engine.ledger.record_fill(market, lane, "yes", "ENTRY", 61, 1, "PROBE")
+    engine.ledger.record_settlement(market, lane, pnl_cents, detail="synthetic")
     return engine.econ.close_bracket(
         market, open_value + pnl_cents, pnl_cents,
-        lanes_active="F", fills_count=1, now=now + 900)
+        lanes_active=lane, fills_count=1, now=now + 900,
+        per_lane={lane: pnl_cents})
 
 
 # ── §1: the bracket ────────────────────────────────────────────────────────
@@ -55,7 +58,7 @@ def test_bracket_writes_window_econ_and_pages(engine):
         "SELECT detail FROM surface_rows WHERE state='WINDOW_ECON' AND market=?",
         (TICKER,)).fetchone()[0]
     assert json.loads(surf)["pnl"] == 39
-    assert any("📊" in m and "+$0.39" in m and "rate 0/" in m
+    assert any("📊" in m and "+$0.39" in m and "lanes FLIP" in m
                for m in engine.telegram_sent)
 
 
@@ -92,40 +95,38 @@ def test_untraded_market_writes_no_bracket(engine):
         "SELECT COUNT(*) FROM window_econ").fetchone()[0] == 0
 
 
-# ── §2: the two-strike halt ────────────────────────────────────────────────
-def test_two_negatives_halt_and_page(engine):
-    trade_and_settle(engine, TICKER, -20, now=1000.0)
-    assert engine.econ.streak == 1 and not engine.econ.halted()
-    trade_and_settle(engine, TICKER2, -15, now=3000.0)
-    assert engine.econ.streak == 2 and engine.econ.halted()
-    assert "RATE_HALT" in engine.gateway.entries_halted_reasons
+# ── §2: the per-lane money halt (WO-2026-07-24-C) ──────────────────────────
+def test_lane_drawdown_halts_the_lane_and_pages(engine):
+    """The halt sums MONEY: a lane whose drawdown crosses RATE_HALT_DRAWDOWN_C
+    halts ONLY itself (the global all-lane halt is retired)."""
+    trade_and_settle(engine, TICKER, -70, now=1000.0)
+    assert "FLIP" not in engine.econ.halted_lanes()      # −70 > −120: NOISE
+    trade_and_settle(engine, TICKER2, -80, now=3000.0)   # −150 total < −120
+    assert "FLIP" in engine.econ.halted_lanes()
+    assert "RATE_HALT:FLIP" in engine.gateway.entries_halted_reasons
+    assert not engine.econ.halted()                      # global untouched
     page = [m for m in engine.telegram_sent if "RATE HALT" in m]
-    assert page and "/reset_halt" in page[0]
-    assert TICKER in page[0] and TICKER2 in page[0]
+    assert page and "/reset_halt" in page[0] and "drew down" in page[0]
 
 
-def test_win_resets_streak(engine):
-    """A-PLAYER B3 OVERTURNED the forgiving win: the consecutive streak
-    still resets for the packs (info), but the HALT is a RATE — a win no
-    longer forgives; red-win-red is 2 losses of the last 3 and HALTS
-    (two-in-a-row was never the signal; the rate is)."""
-    trade_and_settle(engine, TICKER, -20, now=1000.0)
-    trade_and_settle(engine, TICKER2, +5, now=3000.0)
-    assert engine.econ.streak == 0
-    trade_and_settle(engine, TICKER3, -8, now=5000.0)
-    assert engine.econ.streak == 1
-    assert engine.econ.halted()          # 2 of last 3 <= bound 2-of-4
+def test_profitable_asymmetric_sequence_does_not_halt(engine):
+    """Acceptance #4: −8, −7, +17 nets +2c — the old count-halt suppressed this
+    profitable sequence; summing money, it never halts."""
+    trade_and_settle(engine, TICKER, -8, now=1000.0)
+    trade_and_settle(engine, TICKER2, -7, now=3000.0)
+    trade_and_settle(engine, TICKER3, +17, now=5000.0)
+    assert "FLIP" not in engine.econ.halted_lanes()
 
 
-def test_halt_persists_across_restart(engine, tmp_path):
-    trade_and_settle(engine, TICKER, -20, now=1000.0)
-    trade_and_settle(engine, TICKER2, -15, now=3000.0)
-    assert engine.econ.halted()
+def test_lane_halt_persists_across_restart(engine, tmp_path):
+    trade_and_settle(engine, TICKER, -70, now=1000.0)
+    trade_and_settle(engine, TICKER2, -80, now=3000.0)
+    assert "FLIP" in engine.econ.halted_lanes()
     # a redeploy: a NEW engine on the SAME database
     engine2 = ShadowEngine(db_path=str(tmp_path / "econ.db"))
     engine2.boot()
-    assert engine2.econ.halted()
-    assert "RATE_HALT" in engine2.gateway.entries_halted_reasons
+    assert "FLIP" in engine2.econ.halted_lanes()
+    assert "RATE_HALT:FLIP" in engine2.gateway.entries_halted_reasons
     # ...and risk reduction is still allowed (the halt stops NEW risk only)
     from relay_engine.gateway import Order
     from relay_engine import config
@@ -139,24 +140,25 @@ def test_halt_persists_across_restart(engine, tmp_path):
 
 
 def test_reset_halt_is_drews_word(engine):
-    trade_and_settle(engine, TICKER, -20, now=1000.0)
-    trade_and_settle(engine, TICKER2, -15, now=3000.0)
-    assert engine.econ.halted()
-    # the Telegram command clears it — entries only, streak reset, row written
+    trade_and_settle(engine, TICKER, -70, now=1000.0)
+    trade_and_settle(engine, TICKER2, -80, now=3000.0)
+    assert "FLIP" in engine.econ.halted_lanes()
+    # the Telegram command clears it — entries only, row written
     reply = engine.telegram.handle_command("/reset_halt")
     assert "entries re-enabled" in reply and "book $" in reply
-    assert not engine.econ.halted() and engine.econ.streak == 0
-    assert "RATE_HALT" not in engine.gateway.entries_halted_reasons
+    assert "FLIP" not in engine.econ.halted_lanes()
+    assert "RATE_HALT:FLIP" not in engine.gateway.entries_halted_reasons
     row = engine.ledger.db.execute(
         "SELECT detail FROM surface_rows WHERE state='HALT_RESET'").fetchone()
     assert "confirmed_by=telegram" in row[0]
 
 
-def test_pack_shows_streak_and_resets(engine):
+def test_pack_shows_lane_drawdown_and_resets(engine):
     from relay_engine.ops import daily_pack
     trade_and_settle(engine, TICKER, -20, now=1000.0)
     pack = daily_pack(engine.ledger, engine.surface, engine.cash, econ=engine.econ)
-    assert "RATE-HALT: rate=1/1 (bound 2/4) halted=False" in pack
+    # the per-lane money halt: FLIP's −20c drawdown, not halted (< −120 bound)
+    assert "RATE-HALT FLIP: drawdown -20c/1w" in pack and "halted=False" in pack
 
 
 # ── P7 §1: the single book adapter, property-tested ────────────────────────

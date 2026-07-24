@@ -61,8 +61,9 @@ def test_hourly_exposure_still_accumulates_as_reporting(engine):
 
 # ── §3: THE ONE GOVERNOR — mixed-lane, account-level, lane-blind ──────────
 def _mixed_lane_window(engine, market, f_pnl, open_pnl, now):
-    """Two lanes trade ONE window: F wins, OPEN loses (or vice versa) —
-    the streak reads the WINDOW NET, never a lane."""
+    """Two lanes trade ONE window: F wins, FLIP loses (or vice versa). WO-2026-
+    07-24-C: the halt is PER LANE — F's win never offsets FLIP's loss; each
+    lane's own money is tracked."""
     open_value = engine.ledger.book_cents()
     engine.econ.open_bracket(market, open_value, now=now)
     engine.ledger.record_fill(market, "F", "yes", "ENTRY", 61, 1, "PROBE")
@@ -73,39 +74,38 @@ def _mixed_lane_window(engine, market, f_pnl, open_pnl, now):
     net = f_pnl + open_pnl
     engine.econ.close_bracket(market, open_value + net, net,
                               lanes_active="F,FLIP", fills_count=2,
-                              now=now + 900)
+                              now=now + 900,
+                              per_lane={"F": f_pnl, "FLIP": open_pnl})
     return net
 
 
-def test_mixed_lane_window_nets_one_strike_two_halt(engine, tmp_path):
-    """§3 (the Adversary's one requirement): one lane wins, the other
-    loses, window net red → EXACTLY one strike; two consecutive → halt;
-    the halt persists across a restart; /reset_halt is the only key."""
-    net1 = _mixed_lane_window(engine, TICKER, f_pnl=+4, open_pnl=-10,
-                              now=1000.0)
-    assert net1 == -6
-    assert engine.econ.streak == 1 and not engine.econ.halted()
-    net2 = _mixed_lane_window(engine, TICKER2, f_pnl=-3, open_pnl=-5,
-                              now=3000.0)
-    assert net2 == -8
-    assert engine.econ.streak == 2 and engine.econ.halted()
-    assert "RATE_HALT" in engine.gateway.entries_halted_reasons
-    # restart: a NEW engine on the SAME database still halted
+def test_mixed_lane_window_is_tracked_per_lane_not_by_net(engine, tmp_path):
+    """WO-2026-07-24-C: F and FLIP in one window are tracked SEPARATELY — F's
+    win never offsets FLIP's loss, and neither halts on small losses. FLIP
+    crossing its OWN money threshold halts FLIP alone; it persists; /reset_halt
+    is the only key. F is never stopped by FLIP's losses."""
+    TICKER3 = "KXBTC15M-02JAN251030-T99"
+    _mixed_lane_window(engine, TICKER, f_pnl=+4, open_pnl=-10, now=1000.0)
+    assert engine.econ.halted_lanes() == set()          # FLIP −10 > −120: noise
+    # FLIP draws down past −120 across windows while F wins throughout
+    _mixed_lane_window(engine, TICKER2, f_pnl=+6, open_pnl=-70, now=3000.0)
+    _mixed_lane_window(engine, TICKER3, f_pnl=+6, open_pnl=-60, now=5000.0)
+    assert engine.econ.halted_lanes() == {"FLIP"}       # FLIP −140 < −120
+    assert "RATE_HALT:FLIP" in engine.gateway.entries_halted_reasons
+    assert not engine.econ.halted()                     # F untouched, no global
+    # restart: a NEW engine on the SAME database — the per-lane halt survives
     e2 = ShadowEngine(db_path=str(tmp_path / "p27.db"))
     e2.boot()
-    assert e2.econ.halted()
-    # Drew's key, entries only
-    e2.econ.reset_halt()
-    assert not e2.econ.halted()
+    assert "FLIP" in e2.econ.halted_lanes()
+    e2.econ.reset_halt()                                 # Drew's key, entries only
+    assert e2.econ.halted_lanes() == set()
 
 
-def test_mixed_lane_green_window_no_strike(engine):
-    """Lane-blind the other way too: OPEN loses but F wins MORE — the
-    window nets green, zero strikes (a lane's red day is not a strike)."""
-    net = _mixed_lane_window(engine, TICKER, f_pnl=+12, open_pnl=-5,
-                             now=1000.0)
-    assert net == 7
-    assert engine.econ.streak == 0 and not engine.econ.halted()
+def test_mixed_lane_small_losses_halt_nothing(engine):
+    """A lane's small red — even beside another lane's win or loss — is noise
+    under the money threshold: neither lane halts."""
+    _mixed_lane_window(engine, TICKER, f_pnl=+12, open_pnl=-5, now=1000.0)
+    assert engine.econ.halted_lanes() == set()          # FLIP −5, F +12: no halt
 
 
 # ── §4: the era stamp ──────────────────────────────────────────────────────

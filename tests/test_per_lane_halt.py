@@ -90,13 +90,14 @@ def test_wall_blocks_flip_but_lets_f_through(gateway):
     assert e.value.wall == "ENTRIES_HALTED" and "RATE_HALT:FLIP" in str(e.value)
 
 
-# ── the halt DECISION is per-lane ───────────────────────────────────────────
-def test_flip_streak_halts_flip_only_f_untouched(econ, gateway):
-    """FLIP loses 2 of its last 4 FLIP windows while F wins every time —
-    FLIP halts, F does not, and the pages name the lane."""
-    windows = [("M0", {"F": +6, "FLIP": -20}),
-               ("M1", {"F": +5, "FLIP": +4}),   # FLIP win between (not consecutive)
-               ("M2", {"F": +6, "FLIP": -8})]
+# ── the halt DECISION is per-lane and MONEY-based (WO-2026-07-24-C) ─────────
+def test_flip_drawdown_halts_flip_only_f_untouched(econ, gateway):
+    """FLIP draws down past the money threshold while F wins every time — FLIP
+    halts, F does not, and the pages name the lane. A profitable FLIP win in the
+    window reduces the drawdown; only the SUM crossing the bound halts."""
+    windows = [("M0", {"F": +6, "FLIP": -70}),
+               ("M1", {"F": +5, "FLIP": +4}),   # FLIP win between reduces drawdown
+               ("M2", {"F": +6, "FLIP": -80})]  # FLIP net −146 < −120
     for market, per_lane in windows:
         net = sum(per_lane.values())
         econ._apply_streak(market, net, BOOK, per_lane=per_lane)
@@ -109,18 +110,18 @@ def test_flip_streak_halts_flip_only_f_untouched(econ, gateway):
 
 
 def test_f_never_arms_from_its_own_wins(econ):
-    """F wins every window — its per-lane streak stays clean regardless of how
-    badly FLIP does beside it."""
+    """F wins every window — its per-lane drawdown stays positive regardless of
+    how badly FLIP does beside it."""
     for i in range(4):
-        econ._apply_streak(f"M{i}", -14, BOOK, per_lane={"F": +6, "FLIP": -20})
-    assert econ.halted_lanes() == {"FLIP"}       # only FLIP, never F
+        econ._apply_streak(f"M{i}", -34, BOOK, per_lane={"F": +6, "FLIP": -40})
+    assert econ.halted_lanes() == {"FLIP"}       # FLIP −160 < −120; F never
 
 
 def test_per_lane_halt_persists_across_boot(econ, ledger, gateway, surface):
     """A per-lane halt survives a redeploy: a fresh econ over the same DB
     restores the scoped reason."""
     for market in ("M0", "M1"):
-        econ._apply_streak(market, -20, BOOK, per_lane={"FLIP": -20})
+        econ._apply_streak(market, -70, BOOK, per_lane={"FLIP": -70})  # −140 < −120
     assert econ.halted_lanes() == {"FLIP"}
     gw2 = Gateway(ledger, surface)
     econ2 = WindowEcon(ledger, gw2, surface, _TG())
@@ -133,18 +134,39 @@ def test_reset_clears_lane_halt_and_its_window(econ, ledger, gateway):
     """/reset_halt lifts the scoped reason AND wipes the lane's rolling window
     so it restarts clean."""
     for market in ("M0", "M1"):
-        econ._apply_streak(market, -20, BOOK, per_lane={"FLIP": -20})
+        econ._apply_streak(market, -70, BOOK, per_lane={"FLIP": -70})
     assert econ.reset_halt().startswith("halt cleared")
     assert econ.halted_lanes() == set()
     assert "RATE_HALT:FLIP" not in gateway.entries_halted_reasons
     assert json.loads(ledger.get_state("rate_halt_outcomes:FLIP")) == []
 
 
-def test_legacy_global_path_is_unchanged(econ, gateway):
-    """No per_lane → the old per-market global halt fires exactly as before,
-    bare RATE_HALT, blocking every lane."""
-    for i, pnl in enumerate((-20, +5, -8)):
-        econ._apply_streak(f"M{i}", pnl, BOOK)     # no per_lane
+def test_no_path_sets_the_global_halt_key_but_a_legacy_one_still_clears(econ,
+                                                                        ledger,
+                                                                        gateway):
+    """Acceptance #1: nothing SETS HALT_KEY going forward (a per-lane halt leaves
+    it clear), but a persisted legacy global halt stays READABLE and /reset_halt
+    still lifts it."""
+    from relay_engine.window_econ import HALT_KEY
+    # a per-lane halt never sets the global key
+    for m in ("M0", "M1"):
+        econ._apply_streak(m, 0, BOOK, per_lane={"FLIP": -70})
+    assert ledger.get_state(HALT_KEY) != "1"        # global flag untouched
+    # a persisted legacy global halt (from an old build) is still clearable
+    ledger.set_state(HALT_KEY, "1")
+    gateway.halt_entries("RATE_HALT")
     assert econ.halted()
-    assert "RATE_HALT" in gateway.entries_halted_reasons
-    assert gateway.entries_halted_for("F") == {"RATE_HALT"}   # global blocks F too
+    reply = econ.reset_halt()
+    assert "RATE_HALT" in reply and not econ.halted()
+    assert "RATE_HALT" not in gateway.entries_halted_reasons
+
+
+def test_global_fallback_is_retired_halts_nothing(econ, gateway):
+    """WO-2026-07-24-C Part 1: with NO per_lane attribution the global fallback
+    is RETIRED — it can no longer halt every lane (F included) on an aggregate
+    loss. It logs and returns; nothing is set."""
+    for i, pnl in enumerate((-200, -200, -200)):   # would have tripped the old 2-of-4
+        econ._apply_streak(f"M{i}", pnl, BOOK)     # no per_lane
+    assert not econ.halted()                       # global flag never set
+    assert "RATE_HALT" not in gateway.entries_halted_reasons
+    assert gateway.entries_halted_for("F") == set()   # F is free — no lane's loss stops it

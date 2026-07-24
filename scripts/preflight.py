@@ -29,9 +29,9 @@ CHECKS = [
         "tests/test_cash_protocol.py::test_negative_five_deny_branch_stays_fatal",
         "tests/test_cash_protocol.py::test_positive_five_confirms_without_halt",
     ]),
-    ("two-strike halt → restart persistence → /reset_halt", [
-        "tests/test_p8_golive.py::test_two_negatives_halt_and_page",
-        "tests/test_p8_golive.py::test_halt_persists_across_restart",
+    ("per-lane money halt → restart persistence → /reset_halt", [
+        "tests/test_p8_golive.py::test_lane_drawdown_halts_the_lane_and_pages",
+        "tests/test_p8_golive.py::test_lane_halt_persists_across_restart",
         "tests/test_p9_real_numbers.py::test_reset_halt_full_round_trip",
     ]),
     ("live brackets reject paper (P9 §2)", [

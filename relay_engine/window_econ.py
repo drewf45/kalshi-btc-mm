@@ -300,46 +300,19 @@ class WindowEcon:
     # ── §2: THE RATE HALT (A-PLAYER B3; P17 §2.1: late truths count) ───
     def _apply_streak(self, market: str, window_pnl: int, book_cents: int,
                       late: bool = False, per_lane: Optional[dict] = None) -> None:
-        # KAL-50/50 Stage 0.1: with per-lane fills P&L available, the halt is
-        # decided PER LANE so one lane's losses never freeze another. The
-        # legacy global path (no attribution) is preserved unchanged below.
+        # WO-2026-07-24-C Part 1: the GLOBAL fallback is RETIRED. It was the one
+        # path by which an aggregate loss (FLIP's) could halt EVERY lane —
+        # including F, for losses F did not cause. Per-lane attribution now
+        # exists on every close (shadow_runner settle path), so the fallback has
+        # no job. HALT_KEY stays READABLE and /reset_halt still clears it (a
+        # persisted legacy halt can be lifted), but NOTHING sets it going
+        # forward — the halt is per-lane, always.
         if per_lane:
             self._apply_streak_per_lane(market, window_pnl, book_cents,
                                         per_lane, late)
             return
-        # the rolling window of settled traded markets — per-market BROKER
-        # P&L is the unit (Engineer: settled-only; never in-flight marks)
-        outcomes = json.loads(self.ledger.get_state(OUTCOMES_KEY) or "[]")
-        outcomes.append({"market": market, "pnl": window_pnl})
-        outcomes = outcomes[-config.RATE_HALT_WINDOW:]
-        self.ledger.set_state(OUTCOMES_KEY, json.dumps(outcomes))
-        losses = [o for o in outcomes if o["pnl"] < 0]
-        # the consecutive streak still REPORTS (packs); it halts nothing
-        streak = self.streak + 1 if window_pnl < 0 else 0
-        self._set_streak(streak)
-        self.ledger.set_state(STRIKES_KEY, json.dumps(losses[-2:]))
-
-        sign = "+" if window_pnl >= 0 else ""
-        late_s = " (settled late — books healed)" if late else ""
-        self.telegram.alert(
-            f"📊 {market} {sign}${window_pnl / 100:.2f} · "
-            f"book ${book_cents / 100:.2f} · "
-            f"rate {len(losses)}/{len(outcomes)}{late_s}")
-
-        if len(losses) >= config.RATE_HALT_LOSSES and not self.halted():
-            self.ledger.set_state(HALT_KEY, "1")
-            self.gateway.halt_entries(HALT_REASON)
-            named = ", ".join(f"{o['market']} {o['pnl']}c" for o in losses)
-            retro = (f"⛔ RATE HALT (retroactive: {market} settled late): "
-                     if late else "⛔ RATE HALT: ")
-            self.telegram.alert(
-                f"{retro}{len(losses)} of last {len(outcomes)} markets "
-                f"negative — {named} · book ${book_cents / 100:.2f} · "
-                f"reply /reset_halt to resume")
-            failures.fail("RATE_HALT",
-                          f"{len(losses)} of last {len(outcomes)} settled "
-                          f"markets negative: {named}",
-                          outcomes=outcomes, book_cents=book_cents)
+        log.info("WINDOW_ECON %s: no lane attribution — nothing to halt "
+                 "(global fallback retired, WO-2026-07-24-C)", market)
 
     def _apply_streak_per_lane(self, market: str, window_pnl: int,
                                book_cents: int, per_lane: dict,
@@ -356,30 +329,40 @@ class WindowEcon:
             f"lanes {','.join(sorted(per_lane))}{late_s}")
         halted = self.halted_lanes()
         for lane in sorted(per_lane):
-            pnl = int(per_lane[lane])
+            # WO-2026-07-24-C Part 2: count MONEY, not negative windows. A
+            # profitable asymmetric sequence (−8,−7,+17 = +2¢) must NOT halt; a
+            # slow bleed that never trips 2-of-4 must. Sum the last N windows'
+            # fills-P&L against a drawdown threshold DERIVED from the lane's own
+            # size (RATE_HALT_DRAWDOWN_C = 4·FLIP_SIZE_CAP·OPEN_MOMENTUM_STOP_C)
+            # so it scales with the position and never strangles the lane it
+            # protects. pnl carries the 0.1c fraction (truncation fix) — kept.
+            pnl = float(per_lane[lane])
             key = _lane_outcomes_key(lane)
             outcomes = json.loads(self.ledger.get_state(key) or "[]")
             outcomes.append({"market": market, "pnl": pnl})
-            outcomes = outcomes[-config.RATE_HALT_WINDOW:]
+            outcomes = outcomes[-config.RATE_HALT_WINDOW_N:]
             self.ledger.set_state(key, json.dumps(outcomes))
-            losses = [o for o in outcomes if o["pnl"] < 0]
-            if len(losses) >= config.RATE_HALT_LOSSES and lane not in halted:
+            drawdown = sum(o["pnl"] for o in outcomes)
+            if drawdown < -config.RATE_HALT_DRAWDOWN_C and lane not in halted:
                 halted.add(lane)
                 self.ledger.set_state(LANES_HALTED_KEY,
                                       json.dumps(sorted(halted)))
                 self.gateway.halt_entries(f"{HALT_REASON}:{lane}")
-                named = ", ".join(f"{o['market']} {o['pnl']}c" for o in losses)
+                named = ", ".join(f"{o['market']} {o['pnl']:+.0f}c"
+                                  for o in outcomes)
                 retro = (f"⛔ {lane} RATE HALT (retroactive: {market} settled "
                          f"late): " if late else f"⛔ {lane} RATE HALT: ")
                 self.telegram.alert(
-                    f"{retro}{len(losses)} of last {len(outcomes)} {lane} "
-                    f"markets negative — {named} · other lanes trade on · "
-                    f"reply /reset_halt to resume")
+                    f"{retro}{lane} drew down {drawdown:+.0f}¢ over the last "
+                    f"{len(outcomes)} windows (< −{config.RATE_HALT_DRAWDOWN_C}¢) "
+                    f"— {named} · other lanes trade on · reply /reset_halt to "
+                    "resume")
                 failures.fail("RATE_HALT",
-                              f"{lane}: {len(losses)} of last {len(outcomes)} "
-                              f"settled {lane} markets negative: {named}",
-                              lane=lane, outcomes=outcomes,
-                              book_cents=book_cents)
+                              f"{lane}: drawdown {drawdown:+.0f}c over last "
+                              f"{len(outcomes)} {lane} windows < "
+                              f"-{config.RATE_HALT_DRAWDOWN_C}c: {named}",
+                              lane=lane, drawdown_cents=round(drawdown, 1),
+                              outcomes=outcomes, book_cents=book_cents)
 
     def reset_halt(self, confirmed_by: str = "telegram") -> str:
         """Drew's word alone. Re-enables ENTRIES only — it cannot place, amend,
@@ -424,11 +407,29 @@ class WindowEcon:
 
     # ── §2.4: the pack lines ───────────────────────────────────────────
     def pack_lines(self) -> list:
-        outcomes = json.loads(self.ledger.get_state(OUTCOMES_KEY) or "[]")
-        losses = sum(1 for o in outcomes if o["pnl"] < 0)
-        lines = [f"RATE-HALT: rate={losses}/{len(outcomes)} "
-                 f"(bound {config.RATE_HALT_LOSSES}/{config.RATE_HALT_WINDOW})"
-                 f" halted={self.halted()} · streak={self.streak} (info)"]
+        # WO-2026-07-24-C: the halt is per-lane and MONEY-based — show each
+        # lane's summed drawdown over its rolling window against the size-derived
+        # threshold, and which lanes are halted. The global count-rate is retired.
+        halted = self.halted_lanes()
+        lines = []
+        rows = self.ledger.db.execute(
+            "SELECT key, value FROM engine_state WHERE key LIKE ?",
+            (OUTCOMES_KEY + ":%",)).fetchall()
+        for key, val in sorted(rows):
+            lane = key.split(":", 1)[1]
+            outcomes = json.loads(val or "[]")
+            if not outcomes:
+                continue
+            dd = sum(o["pnl"] for o in outcomes)
+            lines.append(
+                f"RATE-HALT {lane}: drawdown {dd:+.0f}c/{len(outcomes)}w "
+                f"(bound -{config.RATE_HALT_DRAWDOWN_C}c) "
+                f"halted={lane in halted}")
+        if not lines:
+            lines.append(
+                f"RATE-HALT: per-lane money halt (bound "
+                f"-{config.RATE_HALT_DRAWDOWN_C}c/{config.RATE_HALT_WINDOW_N}w) "
+                f"· halted={sorted(halted) or 'none'}")
         day_ago = time.time() - 86400
         halts = self.ledger.db.execute(
             "SELECT COUNT(*) FROM failures WHERE why_tag IN"

@@ -337,6 +337,18 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"{config.F_EVENT_TRIPWIRE_C}c/contract suppresses F for the "
                  "day (the rate halt can't protect a 97%-win lane); (d) "
                  "kelly/depth/notional/at-risk terms + the binding one logged")
+    lines.append(f"  SCOPE + SIZE THE HALT (WO-2026-07-24-C, build 72): Part 1 "
+                 "RETIRES the global fallback — an aggregate loss can no longer "
+                 "halt EVERY lane (F included) for losses F did not cause; the "
+                 "halt is per-lane, always (HALT_KEY stays readable + /reset_halt "
+                 "clears a legacy one, but nothing sets it forward). Part 2 the "
+                 "per-lane halt counts MONEY not negative windows (−8,−7,+17 = "
+                 "+2¢ must NOT halt), summed over "
+                 f"{config.RATE_HALT_WINDOW_N} windows against a threshold "
+                 f"DERIVED from size (4·FLIP_SIZE_CAP·OPEN_MOMENTUM_STOP_C = "
+                 f"{config.RATE_HALT_DRAWDOWN_C}¢ now) so it scales with the "
+                 "position and never strangles the lane it protects. F's guard "
+                 "stays the per-event tripwire — F byte-identical")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

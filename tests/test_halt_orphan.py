@@ -49,16 +49,17 @@ def test_reset_halt_clears_orphaned_orientation_and_reports_both(econ,
     """A mixed rate+orientation halt: the OLD reset cleared only the rate
     reason and left ORIENTATION_DIVERGENCE orphaned forever. Now the key
     clears BOTH and names them."""
-    # rate halt trips (2 of 2 negative)
-    econ._apply_streak("M0", -20, 3594)
-    econ._apply_streak("M1", -15, 3594)
-    assert econ.halted() and HALT_REASON in gateway.entries_halted_reasons
+    # a per-lane rate halt trips (FLIP drawdown < −120; WO-2026-07-24-C)
+    econ._apply_streak("M0", 0, 3594, per_lane={"FLIP": -70})
+    econ._apply_streak("M1", 0, 3594, per_lane={"FLIP": -80})
+    assert "FLIP" in econ.halted_lanes() \
+        and "RATE_HALT:FLIP" in gateway.entries_halted_reasons
     # orientation halt trips independently, into the same set
     gateway.halt_entries("ORIENTATION_DIVERGENCE")
     reply = econ.reset_halt()
     assert "ORIENTATION_DIVERGENCE" in reply and "RATE_HALT" in reply
     assert gateway.entries_halted_reasons == set()      # the whole set lifts
-    assert not econ.halted()
+    assert econ.halted_lanes() == set()
 
 
 def test_reset_halt_status_never_lies_orientation_only(econ, gateway):
@@ -194,12 +195,12 @@ def test_rate_halt_still_persists_and_needs_key(econ, gateway, ledger,
                                                 surface):
     """The rate halt is NOT auto-healing: it persists across boot and only
     /reset_halt clears it (unchanged)."""
-    econ._apply_streak("M0", -20, 3594)
-    econ._apply_streak("M1", -15, 3594)
-    assert econ.halted()
+    econ._apply_streak("M0", 0, 3594, per_lane={"FLIP": -70})
+    econ._apply_streak("M1", 0, 3594, per_lane={"FLIP": -80})
+    assert "FLIP" in econ.halted_lanes()
     # a reboot: fresh econ over the same DB — the rate halt survives
     from relay_engine.gateway import Gateway
     gw2 = Gateway(ledger, surface)
     econ2 = WindowEcon(ledger, gw2, surface, _TG())
     assert econ2.restore_halt_on_boot() is True
-    assert HALT_REASON in gw2.entries_halted_reasons    # persisted, not auto-healed
+    assert f"{HALT_REASON}:FLIP" in gw2.entries_halted_reasons  # persisted, not auto-healed
