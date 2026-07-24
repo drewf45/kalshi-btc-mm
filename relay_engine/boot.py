@@ -21,26 +21,29 @@ def sizing_line(book_cents: int) -> str:
     one-lot floor at a high-priced favorite is Kelly arithmetic on a small
     book, not a bug; it self-scales as the book compounds. Every number
     printed here is computed from the live constants, never asserted."""
-    import math
     from .sizing import size_order
     budget = int(book_cents * config.KELLY_FRACTION_CEILING)
-    # P27 §1: full Kelly — the printed lots are min(kelly, depth), no tier
-    l39 = size_order(book_cents, 39, 10_000).contracts
-    l99 = size_order(book_cents, 99, 10_000).contracts
-    l97 = size_order(book_cents, 97, 10_000).contracts
-    l98 = size_order(book_cents, 98, 10_000).contracts
-    # book needed for n lots at the 97c favorite reference (computed, so it
-    # stays honest if the fraction ever moves by Drew's ruling)
-    b2 = math.ceil(2 * 97 / config.KELLY_FRACTION_CEILING / 100)
-    b3 = math.ceil(3 * 97 / config.KELLY_FRACTION_CEILING / 100)
-    # A-PLAYER B4: the fraction is Drew's dial (KELLY_FRACTION env) — the
-    # boot states the LIVE value; code never chooses it.
+    # WO-2026-07-24-G Part 4: the boot preview used to call size_order WITHOUT
+    # lane= — it printed the generic Kelly path, NOT the notional paths F and
+    # FLIP actually trade. Print the REAL per-lane lot counts at the live book so
+    # the banner stops lying about size. F @97¢ (its favorite) and FLIP @58¢ (mid
+    # band) — the two dials that scale with the book.
+    f97 = size_order(book_cents, 97, 10_000, lane="F")
+    flip58 = size_order(book_cents, 58, 10_000, lane="FLIP")
+    # WO-2026-07-24-G Part 2: the rate-halt drawdown recomputes with the book —
+    # print the LIVE value (4 stop-outs at current FLIP size), never a frozen
+    # constant.
+    halt = config.rate_halt_drawdown_c(book_cents)
     frac = config.KELLY_FRACTION_CEILING
-    return (f"SIZING: Kelly fraction={frac:.4f} (DREW dial: KELLY_FRACTION"
-            f" env) · book ${book_cents / 100:.2f} · "
-            f"budget/window {budget}¢ · max lots: {l39} @39¢ · {l99} @99¢ · "
-            f"kelly-bound: {l97} lot @97¢ ({l98} @98¢) — throttle is book "
-            f"size, not a wall; self-scales ~${b2}→2 @97¢, ~${b3}→3")
+    return (f"SIZING: book ${book_cents / 100:.2f} · Kelly fraction={frac:.4f} · "
+            f"budget/window {budget}¢ · "
+            f"F @97¢ → {f97.contracts} lots (dial {config.F_NOTIONAL_PCT:.0%}, "
+            f"wall {config.AT_RISK_PCT['F']:.0%}) · "
+            f"FLIP @58¢ → {flip58.contracts} lots (dial "
+            f"{config.FLIP_NOTIONAL_PCT:.0%}, wall {config.AT_RISK_PCT['FLIP']:.0%}"
+            f", no fixed cap — scales with book) · rate-halt bound "
+            f"−{halt}¢ (4 stop-outs at this book) — throttle is book size + the "
+            "at-risk wall, self-scaling")
 
 
 def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
@@ -151,8 +154,10 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  f"[{config.OPEN_ENTRY_MIN_C},{config.OPEN_ENTRY_MAX_C}]¢ "
                  f"({config.OPEN_ENTRY_MIN_C} the floor — never below fair value "
                  "+ a real pile). The cheap-side filter, swing gate, and "
-                 f"trend-skip are RETIRED. One shot/window, maker-only, up to "
-                 f"{config.FLIP_SIZE_CAP} lots (WO-2026-07-23-E size test)")
+                 f"trend-skip are RETIRED. One shot/window, maker-only; FLIP now "
+                 f"self-scales by notional ({config.FLIP_NOTIONAL_PCT:.0%} of book) "
+                 "with NO fixed cap — depth and the at-risk wall bind "
+                 "(WO-2026-07-24-G)")
     lines.append(f"  FLIP WAIT-FOR-THE-PILE (WO-2026-07-22-F → -G): entry ONLY "
                  f"in [{config.OPEN_PILE_START_S},{config.OPEN_PILE_END_S}]s into "
                  "the window, and ONLY when ALL agree — favored side in the "
@@ -407,6 +412,25 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "onto the FLIP_SWING row. The live cut is byte-identical; "
                  "Phase 2 (Saturday, DREW's go) flips the deferral live. F "
                  "byte-identical")
+    lines.append(f"  THE FLOODGATES ORDER (WO-2026-07-24-G, build 77): the dials "
+                 "to scale with the book already existed; the WALL they pressed "
+                 "against measured imaginary risk in the wrong scope. Part 1 the "
+                 "at-risk wall is now LANE-SCOPED (FLIP's position no longer "
+                 "counts against F's wall — the 40115-class squeeze that halved "
+                 "F in shared windows) and a held leg prices at its BASIS not "
+                 "99¢ (a 58¢ 6-lot is 348¢ at risk, not 594¢); an event's "
+                 f"cross-lane total over {int(config.EVENT_TOTAL_AT_RISK_PCT*100)}"
+                 "% of book PAGES (EVENT_TOTAL_AT_RISK). Walls up: F "
+                 f"{config.AT_RISK_PCT['F']:.0%}, FLIP {config.AT_RISK_PCT['FLIP']:.0%} "
+                 "(dials sit strictly under — boot FATALs on inversion). Part 2 "
+                 "FLIP's fixed cap is RETIRED — min(notional, depth) scales with "
+                 "the book (~21 lots at $90), and the rate-halt bound recomputes "
+                 "with the book (rate_halt_drawdown_c: 4 stop-outs at CURRENT "
+                 "size, printed here + hourly). Part 3 the SIGHTED STOP is LIVE "
+                 "(OPEN_SIGHTED_STOP): a recovery DEFERS, every cut names its "
+                 "trigger [2-poll|G1_HARD|G2_BUDGET|DECISION_SWEEP]. Part 4 the "
+                 "boot line prints REAL per-lane sizes; cell stats are "
+                 "PER-CONTRACT (era-invariant, protects Gate A). F byte-identical")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

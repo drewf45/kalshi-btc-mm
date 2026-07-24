@@ -287,15 +287,15 @@ def test_b4_sizing_line_states_the_binder_in_words():
     live constants, never asserted."""
     from relay_engine.boot import sizing_line
     line = sizing_line(1174)
-    assert "kelly-bound: 1 lot @97¢ (0 @98¢)" in line
-    assert "throttle is book size, not a wall" in line
-    # computed at the 97c reference: 2*97*12=$23.28->~$24, 3*97*12=$34.92
-    # ->~$35 (the order's "~$36" example was 98c math; the PRINTED number
-    # is the COMPUTED number — the read-rule outranks the illustration)
-    assert "self-scales ~$24→2 @97¢, ~$35→3" in line
-    # and it scales UP with the book, as the doctrine states
-    assert "kelly-bound: 2 lot @97¢" in sizing_line(2400)
-    assert "kelly-bound: 3 lot @97¢" in sizing_line(3600)
+    # WO-2026-07-24-G Part 4: the REAL per-lane sizes (F/FLIP notional), computed
+    # from the live constants. F @97¢: 1174*0.20//97 = 2 lots.
+    assert "F @97¢ → 2 lots" in line
+    assert "dial 20%" in line and "wall 25%" in line
+    assert "no fixed cap — scales with book" in line
+    assert "throttle is book size + the at-risk wall" in line
+    # and F scales UP with the book (notional, self-scaling)
+    assert "F @97¢ → 4 lots" in sizing_line(2400)   # 2400*0.20//97 = 4
+    assert "F @97¢ → 7 lots" in sizing_line(3600)   # 3600*0.20//97 = 7
 
 
 def test_b4_boot_tape_carries_the_legible_sizing_line(tmp_path, capsys):
@@ -303,7 +303,7 @@ def test_b4_boot_tape_carries_the_legible_sizing_line(tmp_path, capsys):
     e = ShadowEngine(db_path=str(tmp_path / "b4.db"))
     e.boot()
     out = capsys.readouterr().out
-    assert "throttle is book size, not a wall" in out
+    assert "throttle is book size + the at-risk wall" in out
     failures._ledger = None
 
 

@@ -204,7 +204,12 @@ def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
         margin_honest = s["lb"] - be_honest
         kind = "hold" if lane in HOLD_LANES else "trip"
         mid = cell + config.CELL_WIDTH_CENTS // 2
-        lots = size_order(book_cents, mid, 10_000).contracts  # P27: kelly×depth
+        # WO-2026-07-24-G Part 4: this scoreboard is REPORTING-ONLY (the pack's
+        # lots@book column) — it does NOT feed the entry path (that is
+        # _score_and_size, which passes lane=). But a lane-blind preview MISLEADS
+        # at the scaled book: F and FLIP size by notional, not the generic Kelly
+        # path. Pass lane= so the displayed count is the one the lane will trade.
+        lots = size_order(book_cents, mid, 10_000, lane=lane).contracts
         pend = (lane in HOLD_LANES and salvage_n < config.SALVAGE_ADJ_MIN_N)
         entries.append((margin_honest, lane, cell, kind, s, be_honest, lots,
                         pend))
@@ -352,23 +357,28 @@ def lifetime_cell_aggregates(ledger) -> List[dict]:
     is LIFETIME per (lane, cell): n, wins, losses, avg_win, avg_loss, realized
     P&L — the salvage question ('what does an F loss actually cost?') answered
     from the whole record, not one day. Read-only."""
+    # WO-2026-07-24-G Part 4: avg_win/avg_loss are PER-CONTRACT now (pnl summed
+    # over contracts summed), so an 18-lot era does not blend with the 1-lot era
+    # and fake Gate A progress. win_n/loss_n stay ROW counts (windows) for
+    # n/wins/losses; the averages divide by CONTRACTS.
     rows = ledger.db.execute(
         "SELECT lane, price_cell, COUNT(*),"
         " COALESCE(SUM(won),0),"
         " COALESCE(SUM(CASE WHEN pnl_cents>0 THEN pnl_cents END),0),"
-        " COALESCE(SUM(CASE WHEN pnl_cents>0 THEN 1 ELSE 0 END),0),"
+        " COALESCE(SUM(CASE WHEN pnl_cents>0 THEN contracts END),0),"
         " COALESCE(SUM(CASE WHEN pnl_cents<0 THEN -pnl_cents END),0),"
-        " COALESCE(SUM(CASE WHEN pnl_cents<0 THEN 1 ELSE 0 END),0),"
-        " COALESCE(SUM(pnl_cents),0)"
+        " COALESCE(SUM(CASE WHEN pnl_cents<0 THEN contracts END),0),"
+        " COALESCE(SUM(pnl_cents),0),"
+        " COALESCE(SUM(CASE WHEN pnl_cents<0 THEN 1 ELSE 0 END),0)"
         " FROM cell_outcomes GROUP BY lane, price_cell").fetchall()
     out = []
-    for (lane, cell, n, wins, win_sum, win_n, loss_sum, loss_n,
-         pnl) in rows:
+    for (lane, cell, n, wins, win_sum, win_ct, loss_sum, loss_ct,
+         pnl, loss_n) in rows:
         out.append({
             "lane": lane, "cell": cell_label(cell), "n": int(n),
             "wins": int(wins), "losses": int(loss_n),
-            "avg_win_c": round(win_sum / win_n, 1) if win_n else None,
-            "avg_loss_c": round(loss_sum / loss_n, 1) if loss_n else None,
+            "avg_win_c": round(win_sum / win_ct, 1) if win_ct else None,
+            "avg_loss_c": round(loss_sum / loss_ct, 1) if loss_ct else None,
             "realized_pnl_c": int(pnl)})
     out.sort(key=lambda r: (r["lane"], r["cell"]))
     return out

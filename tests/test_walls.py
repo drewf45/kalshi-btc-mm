@@ -96,18 +96,18 @@ def _rebook(ledger, cents):
 
 def test_per_lane_proportional_risk_wall(gateway, ledger):
     """DREW RULING 2026-07-23: the flat cross-lane count cap (<=3) is retired for
-    a PER-LANE, BOOK-PROPORTIONAL dollar wall. On a $41.62 book F's cap is 20%
-    (832c) — 8 lots at 97c — while D's is 2% (83c). F scales with the book; the
-    small lanes stay bounded. The NET_RISK/DOLLAR_RISK reason names are kept so
-    WALL_STORM telemetry stays comparable."""
+    a PER-LANE, BOOK-PROPORTIONAL dollar wall. WO-2026-07-24-G raised F's wall to
+    25%: on a $41.62 book F's cap is 25% (1040c) — 10 lots at 97c — while D's is
+    2% (83c). F scales with the book; the small lanes stay bounded. The NET_RISK/
+    DOLLAR_RISK reason names are kept so WALL_STORM telemetry stays comparable."""
     _rebook(ledger, 4162)
     b = make_book()
-    # F: 8 lots @97 (776c) fit under the 832c (20%) cap; 9 (873c) trip.
+    # F: 10 lots @97 (970c) fit under the 1040c (25%) cap; 11 (1067c) trip.
     assert gateway.submit(entry(lane="F", event="EF1", market="MF1",
-                                price=97, count=8), b).shadow
+                                price=97, count=10), b).shadow
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(lane="F", event="EF2", market="MF2",
-                             price=97, count=9), b)
+                             price=97, count=11), b)
     assert e.value.wall in ("NET_RISK", "DOLLAR_RISK")
     # D's cap is a tenth of F's (2% vs 20%): 1 lot @60 (60c) fits, 2 (120c) trip.
     assert gateway.submit(entry(lane="D", event="ED1", market="MD1",
@@ -123,11 +123,11 @@ def test_risk_wall_scales_with_the_book(gateway, ledger):
     same 5-lot F order that a $20 book refuses, a $40 book admits — the ceiling
     grows with the money instead of throttling it."""
     b = make_book()
-    _rebook(ledger, 2000)          # $20 → F cap 400c; 5 lots @97 = 485c > 400
+    _rebook(ledger, 1800)          # $18 → F cap 450c (25%); 5 lots @97 = 485c > 450
     with pytest.raises(WallRejection):
         gateway.submit(entry(lane="F", event="EA", market="MA",
                              price=97, count=5), b)
-    _rebook(ledger, 4000)          # $40 → F cap 800c; the same 485c now fits
+    _rebook(ledger, 4000)          # $40 → F cap 1000c; the same 485c now fits
     assert gateway.submit(entry(lane="F", event="EB", market="MB",
                                 price=97, count=5), b).shadow
 

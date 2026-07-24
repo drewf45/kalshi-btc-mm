@@ -328,6 +328,10 @@ class WindowEcon:
             f"book ${book_cents / 100:.2f} · "
             f"lanes {','.join(sorted(per_lane))}{late_s}")
         halted = self.halted_lanes()
+        # WO-2026-07-24-G Part 2: the drawdown threshold recomputes with the BOOK
+        # (four stop-outs at CURRENT FLIP size). FLIP scales with the book now, so
+        # a frozen threshold is the count-vs-money bug reborn.
+        drawdown_bound = config.rate_halt_drawdown_c(book_cents)
         for lane in sorted(per_lane):
             # WO-2026-07-24-C Part 2: count MONEY, not negative windows. A
             # profitable asymmetric sequence (−8,−7,+17 = +2¢) must NOT halt; a
@@ -343,7 +347,7 @@ class WindowEcon:
             outcomes = outcomes[-config.RATE_HALT_WINDOW_N:]
             self.ledger.set_state(key, json.dumps(outcomes))
             drawdown = sum(o["pnl"] for o in outcomes)
-            if drawdown < -config.RATE_HALT_DRAWDOWN_C and lane not in halted:
+            if drawdown < -drawdown_bound and lane not in halted:
                 halted.add(lane)
                 self.ledger.set_state(LANES_HALTED_KEY,
                                       json.dumps(sorted(halted)))
@@ -354,13 +358,13 @@ class WindowEcon:
                          f"late): " if late else f"⛔ {lane} RATE HALT: ")
                 self.telegram.alert(
                     f"{retro}{lane} drew down {drawdown:+.0f}¢ over the last "
-                    f"{len(outcomes)} windows (< −{config.RATE_HALT_DRAWDOWN_C}¢) "
-                    f"— {named} · other lanes trade on · reply /reset_halt to "
-                    "resume")
+                    f"{len(outcomes)} windows (< −{drawdown_bound}¢ — 4 stop-outs "
+                    f"at book ${book_cents / 100:.0f}) — {named} · other lanes "
+                    "trade on · reply /reset_halt to resume")
                 failures.fail("RATE_HALT",
                               f"{lane}: drawdown {drawdown:+.0f}c over last "
                               f"{len(outcomes)} {lane} windows < "
-                              f"-{config.RATE_HALT_DRAWDOWN_C}c: {named}",
+                              f"-{drawdown_bound}c: {named}",
                               lane=lane, drawdown_cents=round(drawdown, 1),
                               outcomes=outcomes, book_cents=book_cents)
 
@@ -411,6 +415,9 @@ class WindowEcon:
         # lane's summed drawdown over its rolling window against the size-derived
         # threshold, and which lanes are halted. The global count-rate is retired.
         halted = self.halted_lanes()
+        # WO-2026-07-24-G Part 2: the bound is book-derived now — show the LIVE
+        # value (4 stop-outs at the current book), not a frozen constant.
+        bound = config.rate_halt_drawdown_c(self.ledger.book_cents())
         lines = []
         rows = self.ledger.db.execute(
             "SELECT key, value FROM engine_state WHERE key LIKE ?",
@@ -423,12 +430,12 @@ class WindowEcon:
             dd = sum(o["pnl"] for o in outcomes)
             lines.append(
                 f"RATE-HALT {lane}: drawdown {dd:+.0f}c/{len(outcomes)}w "
-                f"(bound -{config.RATE_HALT_DRAWDOWN_C}c) "
+                f"(bound -{bound}c) "
                 f"halted={lane in halted}")
         if not lines:
             lines.append(
                 f"RATE-HALT: per-lane money halt (bound "
-                f"-{config.RATE_HALT_DRAWDOWN_C}c/{config.RATE_HALT_WINDOW_N}w) "
+                f"-{bound}c/{config.RATE_HALT_WINDOW_N}w) "
                 f"· halted={sorted(halted) or 'none'}")
         day_ago = time.time() - 86400
         halts = self.ledger.db.execute(

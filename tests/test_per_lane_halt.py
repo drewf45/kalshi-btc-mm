@@ -20,7 +20,8 @@ from relay_engine.window_econ import HALT_REASON, LANES_HALTED_KEY, WindowEcon
 BOOK = 10_000
 # WO-2026-07-24-C: a per-window FLIP loss such that TWO cross the size-derived
 # drawdown threshold (relative, so the test survives cap/threshold changes).
-HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+# WO-2026-07-24-G Part 2: the drawdown threshold is book-derived now.
+HALF = config.rate_halt_drawdown_c(BOOK) // 2 + 50
 PROOF_WHYS = {
     "F": "F tier61 · surv~price",
     "FLIP": "OPEN grain yesx2 · join 48c · PROBE n=0 · geometry=v2",

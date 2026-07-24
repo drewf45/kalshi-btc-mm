@@ -1371,8 +1371,9 @@ class LaneFlip:
                         action="sell", price_cents=mark, count=n,
                         size_tier=config.TIER_PROBE,
                         purpose="CUT", crossfire=True,
-                        reason="open decision point: clear loser before "
-                               "the bell (F's endgame)"))
+                        reason="open decision point [DECISION_SWEEP]: clear loser "
+                               "before the bell (F's endgame) — grace never rides "
+                               "into settlement (G4)"))
                 continue
             # WO-2026-07-22-E — THE MOMENTUM STOP (replaces the hold + salvage +
             # catastrophe + spot-decided walk + walk-down stack). On the FAVORED
@@ -1436,17 +1437,34 @@ class LaneFlip:
             o["stop_polls"] = (o.get("stop_polls", 0) + 1
                                if (mark is not None and mark <= stop_px) else 0)
             if o["stop_polls"] >= 2:
-                # Phase 1: stamp the counterfactual at the moment the LIVE stop
-                # fires — the labeled shadow the Saturday decision reads.
+                # WO-2026-07-24-G Part 3: stamp the trajectory UNCONDITIONALLY —
+                # every cut (agreeing or not) carries its low/mark/off_low record.
                 o["shadow_would_defer"] = bool(would_defer)
                 o["shadow_mark_at_cut"] = mark
                 o["shadow_off_low"] = off_low
-                if would_defer:
-                    log.info("OPEN_STOP_SHADOW %s %s: live stop firing at %sc but "
-                             "the sighted stop WOULD DEFER — book +%sc off its %sc "
-                             "low and climbing (grace_shadow=%d); Phase 1, no "
-                             "behavior change", market, side, mark, off_low, low,
-                             o.get("grace_polls_shadow", 0))
+                # THE SIGHTED STOP IS LIVE (DREW-RULED, OPEN_SIGHTED_STOP): an
+                # adverse LEVEL is necessary but not sufficient. A book measurably
+                # recovering off its low toward entry is the reversion thesis
+                # WORKING — DEFER the cut (the take rests to catch the +4). The
+                # guardrails already folded into `would_defer`: G1 (hard floor)
+                # and G2 (grace budget) both force would_defer False → the cut
+                # fires below. 26JUL0845 (sold at 48 into +28 recovery) defers.
+                if config.OPEN_SIGHTED_STOP and would_defer:
+                    log.info("OPEN_STOP_DEFERRED %s %s: adverse level %sc but book "
+                             "+%sc off its %sc low and climbing — sighted stop "
+                             "DEFERS (grace %d/%d); the take rests", market, side,
+                             mark, off_low, low, o.get("grace_polls_shadow", 0),
+                             config.OPEN_RECOVERY_MAX_POLLS)
+                    continue     # do NOT cut: the reversion is arriving
+                # the cut IS firing — name WHY (the trigger), so every stop is a
+                # labeled datapoint: a hard-floor cut, a spent grace budget, or the
+                # ordinary 2-poll level cut (falling / no recovery).
+                trigger = ("G1_HARD" if g1_hard
+                           else "G2_BUDGET"
+                           if not (o.get("grace_polls_shadow", 0)
+                                   < config.OPEN_RECOVERY_MAX_POLLS)
+                           else "2-poll")
+                o["stop_trigger"] = trigger
                 # WO-2026-07-24-D Part 2: the momentum stop gets the SAME price
                 # floor the flatten already has (the sibling path this fix was
                 # missing from). The declared max loss is entry−OPEN_MOMENTUM_
@@ -1467,8 +1485,9 @@ class LaneFlip:
                             action="sell", price_cents=floor, count=n,
                             size_tier=config.TIER_PROBE, purpose="EXIT",
                             crossfire=False,
-                            reason=f"open momentum stop FLOOR {floor}c (entry "
-                                   f"{o['entry']}−{config.OPEN_MOMENTUM_STOP_C}−"
+                            reason=f"open momentum stop FLOOR {floor}c [{trigger}] "
+                                   f"(entry {o['entry']}−"
+                                   f"{config.OPEN_MOMENTUM_STOP_C}−"
                                    f"{config.SLIP_TOLERANCE_C}) — book through at "
                                    f"{mark}c, rest one poll before the cross"))
                     continue     # do NOT mark done: revisit and cross next poll
@@ -1486,7 +1505,7 @@ class LaneFlip:
                         size_tier=config.TIER_PROBE,
                         purpose=("CUT" if crossed else "EXIT"),
                         crossfire=crossed,
-                        reason=f"open momentum stop → {stop_px}c (entry "
+                        reason=f"open momentum stop → {stop_px}c [{trigger}] (entry "
                                f"{o['entry']}, −{config.OPEN_MOMENTUM_STOP_C}, "
                                f"2-poll{' — book through, cross' if crossed else ' — maker'}"
                                ": favored side moved against, thesis wrong, no hold)"))

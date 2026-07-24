@@ -181,6 +181,16 @@ class Ledger:
                 "ALTER TABLE cell_outcomes ADD COLUMN governor TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # column already present
+        # WO-2026-07-24-G Part 4: the CONTRACT COUNT behind each outcome's pnl, so
+        # the scoreboard's avg_win/avg_loss can be PER-CONTRACT. At 18-lot size a
+        # whole-window avg blends the 1-lot and 8-lot eras and would fake Gate A
+        # progress; per-contract is era-invariant. Legacy rows default to 1 (their
+        # pnl is then read as per-contract, the conservative reading).
+        try:
+            self.db.execute(
+                "ALTER TABLE cell_outcomes ADD COLUMN contracts INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass  # column already present
         # P-CASH-FATAL-1 §4.6: a settlement value the fills cannot reproduce
         # is DISPUTED — the divergent flag keeps it out of book_cents.
         try:
@@ -357,26 +367,29 @@ class Ledger:
                 net = rt - int(fee_cents)
                 self.record_cell_outcome(
                     cell_lane or lane, row[0], won=net > 0, pnl_cents=net,
-                    fees_cents=int(fee_cents), market=market, kind="trip")
+                    fees_cents=int(fee_cents), market=market, kind="trip",
+                    contracts=count)
         return cur.lastrowid
 
     def record_cell_outcome(self, lane: str, entry_price_cents: int,
                             won: bool, pnl_cents: int, fees_cents: int,
-                            market: str, kind: str, now=None) -> None:
+                            market: str, kind: str, now=None,
+                            contracts: int = 1) -> None:
         """P22 §1: one row per CLOSED unit of risk, idempotent by
         (market, lane, kind) — a multi-trip window banks its FIRST trip and
         suppresses re-writes (the same key that makes live+custodian double
-        booking and backfill replays safe)."""
+        booking and backfill replays safe). WO-2026-07-24-G Part 4: `contracts`
+        rides so the scoreboard can report PER-CONTRACT (era-invariant) stats."""
         from . import config, scoring
         self.db.execute(
             "INSERT INTO cell_outcomes (ts, lane, price_cell, won, pnl_cents,"
-            " fees_cents, market, kind, proof, governor)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " fees_cents, market, kind, proof, governor, contracts)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(market, lane, kind) DO NOTHING",
             (time.time() if now is None else now, lane,
              scoring.price_cell(entry_price_cents), int(bool(won)),
              int(pnl_cents), int(fees_cents), market, kind,
-             config.F_PROOF_MODE, "halt-only"))
+             config.F_PROOF_MODE, "halt-only", max(1, int(contracts))))
         self.db.commit()
 
     def backfill_cell_outcomes(self) -> int:
@@ -406,12 +419,13 @@ class Ledger:
                 "SELECT COALESCE(SUM(fee_cents),0) FROM fills WHERE market=?"
                 " AND lane=?", (market, lane)).fetchone()[0])
             if exits >= entries:
-                # flat by round-trips: last exit vs last entry
+                # flat by round-trips: last exit vs last entry (per-unit diff)
                 exit_px = next((p for _, a, p, _ in reversed(fills)
                                 if a != "ENTRY"), None)
                 if exit_px is None:
                     continue
                 net = (exit_px - entry_px) - fees
+                n_contracts = 1        # net is already a per-unit round-trip
             else:
                 # held to settlement: the settlements table has the verdict
                 row = self.db.execute(
@@ -421,9 +435,11 @@ class Ledger:
                 if row is None:
                     continue  # still open — not a closed unit of risk yet
                 net = int(row[0]) - fees
+                n_contracts = max(1, entries)   # settlement pnl is the whole position
             self.record_cell_outcome(lane, entry_px, won=net > 0,
                                      pnl_cents=net, fees_cents=fees,
-                                     market=market, kind="backfill")
+                                     market=market, kind="backfill",
+                                     contracts=n_contracts)
             wrote += 1
         self.set_state("cell_backfill_done", "1")
         return wrote

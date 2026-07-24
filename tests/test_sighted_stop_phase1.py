@@ -98,28 +98,21 @@ def test_none_mark_poll_never_fabricates(flip):
     assert o["stop_polls"] == 0             # None-mark resets the level counter
 
 
-# ── the 0845 counterfactual: a cut INTO a recovery would DEFER ──────────────
-def test_stop_into_a_recovery_shadows_would_defer(flip, ledger):
-    """The finding, reproduced: entry 60, book collapses to 20 then climbs to 48
-    (still <= stop 50) — the level-only stop FIRES on the climb. The shadow
-    records would_defer=true, off_low≈+28 (the 26JUL0845 signature), and the
-    FLIP_SWING row carries the full counterfactual. Behavior byte-identical:
-    the cut still fires this poll."""
+# ── WO-2026-07-24-G Part 3: the sighted stop is LIVE — a recovery DEFERS ─────
+def test_stop_into_a_recovery_defers_live(flip, ledger):
+    """The 26JUL0845 fix, LIVE: entry 60, book collapses to 20 then climbs to 48
+    (off_low +28, still <= stop 50). The level-only stop would have SOLD into the
+    recovery; the sighted stop DEFERS — no CUT this poll, the position rides and
+    the take rests to catch the +4. (OPEN_SIGHTED_STOP is on by default.)"""
     o, now = _pos(flip, entry=60)           # stop 50, floor 47, hard floor 39
     _poll(flip, o, 20, now)                 # poll 1: the trough (stop_polls=1)
-    props = _poll(flip, o, 48, now)         # poll 2: climbing, still <= stop → FIRES
-    assert o["stop_polls"] == 2             # the live stop fired (unchanged)
-    assert any(p.purpose == "CUT" for p in props)   # it still cut this poll
+    props = _poll(flip, o, 48, now)         # poll 2: climbing → the sighted DEFER
+    assert o["stop_polls"] == 2             # the level counter reached the stop
+    assert not any(p.purpose in ("CUT", "EXIT") for p in props)  # NO cut: deferred
+    assert not o.get("done")                # the position rides
     assert o["shadow_would_defer"] is True
     assert o["shadow_off_low"] == 28 and o["low_mark"] == 20
     assert o["grace_polls_shadow"] == 1
-    # and the counterfactual lands on the FLIP_SWING forensic record
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 48, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 48, now, count=1)
-    r = _swing_row(ledger)
-    assert r["would_defer"] is True and r["off_low_c"] == 28
-    assert r["low_mark"] == 20 and r["mark_at_cut"] == 48
-    assert r["grace_polls_shadow"] == 1
 
 
 def test_genuine_falling_cut_shadows_no_defer(flip, ledger):

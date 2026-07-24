@@ -133,7 +133,7 @@ def test_lane_drawdown_past_threshold_halts_and_persists(econ, ledger, gateway,
     """WO-2026-07-24-C: a lane whose summed drawdown crosses
     RATE_HALT_DRAWDOWN_C halts ONLY itself, pages, and persists across boot;
     /reset_halt is the only key. The global (all-lane) halt is retired."""
-    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    HALF = config.rate_halt_drawdown_c(BOOK) // 2 + 50  # WO-2026-07-24-G: book-derived
     for i, pnl in enumerate((-HALF, +5, -HALF)):       # two crossings < -threshold
         econ._apply_streak(f"M{i}", 0, BOOK, per_lane={"FLIP": pnl})
     assert "FLIP" in econ.halted_lanes()
@@ -174,8 +174,14 @@ def test_fraction_dial_admits_multi_lot_when_ruled(monkeypatch):
 def test_boot_sizing_line_states_the_dial():
     from relay_engine.boot import sizing_line
     line = sizing_line(1174)
-    assert "DREW dial: KELLY_FRACTION env" in line
+    # WO-2026-07-24-G Part 4: the boot line now prints the REAL per-lane sizes
+    # (F/FLIP notional paths), their dials, their walls, and the book-derived
+    # rate-halt bound — not the generic Kelly preview.
     assert f"fraction={config.KELLY_FRACTION_CEILING:.4f}" in line
+    assert "F @97¢ →" in line and "FLIP @58¢ →" in line
+    assert f"dial {config.F_NOTIONAL_PCT:.0%}" in line
+    assert f"wall {config.AT_RISK_PCT['F']:.0%}" in line
+    assert "rate-halt bound" in line and "scales with book" in line
 
 
 # ── B5: THE P&L-BLIND CUT ──────────────────────────────────────────────────

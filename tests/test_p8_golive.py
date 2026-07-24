@@ -99,7 +99,7 @@ def test_untraded_market_writes_no_bracket(engine):
 def test_lane_drawdown_halts_the_lane_and_pages(engine):
     """The halt sums MONEY: a lane whose drawdown crosses RATE_HALT_DRAWDOWN_C
     halts ONLY itself (the global all-lane halt is retired)."""
-    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    HALF = config.rate_halt_drawdown_c(10_000) // 2 + 50  # WO-2026-07-24-G: book-derived (~$100 engine book)
     trade_and_settle(engine, TICKER, -HALF, now=1000.0)
     assert "FLIP" not in engine.econ.halted_lanes()      # one loss > -threshold: NOISE
     trade_and_settle(engine, TICKER2, -HALF, now=3000.0)  # two cross the threshold
@@ -120,7 +120,7 @@ def test_profitable_asymmetric_sequence_does_not_halt(engine):
 
 
 def test_lane_halt_persists_across_restart(engine, tmp_path):
-    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    HALF = config.rate_halt_drawdown_c(10_000) // 2 + 50  # WO-2026-07-24-G: book-derived (~$100 engine book)
     trade_and_settle(engine, TICKER, -HALF, now=1000.0)
     trade_and_settle(engine, TICKER2, -HALF, now=3000.0)
     assert "FLIP" in engine.econ.halted_lanes()
@@ -141,7 +141,7 @@ def test_lane_halt_persists_across_restart(engine, tmp_path):
 
 
 def test_reset_halt_is_drews_word(engine):
-    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    HALF = config.rate_halt_drawdown_c(10_000) // 2 + 50  # WO-2026-07-24-G: book-derived (~$100 engine book)
     trade_and_settle(engine, TICKER, -HALF, now=1000.0)
     trade_and_settle(engine, TICKER2, -HALF, now=3000.0)
     assert "FLIP" in engine.econ.halted_lanes()

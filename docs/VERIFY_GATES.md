@@ -3544,6 +3544,62 @@ behavior byte-identical (the 137-test momentum-stop corpus passes untouched); **
 untouched). New `test_sighted_stop_phase1.py` (7 tests). **Phase 2 is Saturday's decision, gated on Drew's go
 after reading the shadow tape — not shipped here.** Suite 781 · preflight 23/23.
 
+## WO-2026-07-24-G — THE FLOODGATES ORDER (build 77)
+
+Drew's ruling: deposit $50, scale F AND FLIP with the book. The dials to scale already existed (F/FLIP
+notional); what blocked the floodgates was the WALL — it measured imaginary risk in the wrong scope, and on
+the live tape it quietly halved F in the desk's two busiest windows (the 40115/40700 F underfills, exactly
+the windows FLIP held a concurrent position).
+
+**Part 1a — the wall summed CROSS-LANE but capped PER-LANE (read-rule TRUE, `gateway.py:487`/`:533`).**
+`_event_exposure` returned exposure "across lanes" yet `_wall_net_risk_and_at_risk` compared it to
+`at_risk_cap_cents(order.lane, book)` — so FLIP's position counted against F's wall. **Fix:** `_event_
+exposure(event, lane=)` is lane-scoped for the wall (a lane's own risk vs its own cap); the cross-lane total
+is still computed and, over `EVENT_TOTAL_AT_RISK_PCT`=40% of book, PAGES `EVENT_TOTAL_AT_RISK` (ADVERSARY i
+backstop; the hard 50% portfolio cap still stops deployment).
+
+**Part 1b — a held leg priced at 99¢ regardless of basis (read-rule TRUE, `:501`).** The resting-ENTRY
+sibling in the same function already priced at `o.price_cents`. **Fix:** `pos_basis` tracks the weighted-
+average entry basis on fills (cleared when the key goes flat); the held leg prices at basis (a 58¢ 6-lot is
+348¢ at risk, not 594¢). Dials raised strictly UNDER their walls: `AT_RISK_PCT["F"]` 0.20→0.25 (dial 0.20),
+`["FLIP"]` 0.15→0.18 (dial 0.14).
+
+**Part 2 — FLIP's fixed cap froze it (read-rule TRUE, `config.py:501`).** At a $90 book notional says ~21
+lots and a 10-cap would freeze FLIP where Drew ruled it scale (the count-vs-compound disease P27 killed for
+Kelly). **Fix:** sizing FLIP = `min(notional, depth)`, no cap (the redundant re-cap in `_score_and_size`
+removed too). The halt follows the size: `rate_halt_drawdown_c(book)` = 4 stop-outs at CURRENT FLIP size,
+recomputed live in `window_econ` and printed in the boot banner + hourly (a threshold frozen at yesterday's
+size is the count-vs-money bug reborn). `FLIP_SIZE_CAP` is kept only as the book==0 fallback + revert
+narrative.
+
+**Part 3 — the sighted stop goes LIVE (read-rule on the shadow-stamp bug: FALSE as cited — the stamps were
+already unconditional in build 76; reported honestly).** `OPEN_SIGHTED_STOP` (default on) makes an adverse
+LEVEL necessary-but-not-sufficient: a book off its low by `OPEN_RECOVERY_MIN_C` and not falling DEFERS
+(logs `OPEN_STOP_DEFERRED`); G1 (hard floor), G2 (grace budget), G3 (recovery off `low_mark`) intact. Every
+cut names its trigger `[2-poll|G1_HARD|G2_BUDGET|DECISION_SWEEP]`.
+
+**Part 4 — instrument truth.** The boot preview called `size_order` without `lane=` (read-rule TRUE,
+`boot.py:28`) — it previewed the generic Kelly path, not the notional paths F/FLIP trade; now it prints real
+per-lane sizes + the book-derived rate-halt bound. `scoring.py:207` is REPORTING-ONLY (the scoreboard's
+`lots@book`, not entry-path EV — the entry path `_score_and_size` already passes `lane=`); made lane-aware
+for display truth. Cell stats are now PER-CONTRACT (`cell_outcomes.contracts` migration; avg_win/avg_loss
+divide by contracts) so an 18-lot era can't blend with the 1-lot era and fake Gate A. Part 6: boot FATALs
+`DIAL_OVER_WALL` if any dial ≥ its wall.
+
+**Sibling greps (#7):** `FLIP_SIZE_CAP` — retired from `sizing`/`shadow_runner`, kept as halt fallback +
+revert; boot banner reference updated. `ONE_LOT_MAX_LOSS_CENTS` — `gateway:530` is the basis fallback;
+`ops.py:203` (daily kill-clamp) is a separate bound, inspected and LEFT unchanged. `size_order` callers —
+the entry path (`shadow_runner:499`) already passes `lane=`; only the reporting scoreboard didn't.
+
+**Acceptance:** #1 lane-scoped wall + basis pricing + 40% page (`test_flip_exposure_does_not_count_against_
+f_wall`, `…held_leg_prices_at_basis`, `…event_total_over_forty_percent_pages`); #2 FLIP notional-or-depth +
+book-derived halt (`test_flip_scales_with_book_no_fixed_cap`, `…rate_halt_drawdown_scales`); #3 sighted stop
+live + trigger names (`test_sighted_stop_live_defers_a_recovery`, `…names_the_2poll_trigger`, `…g1_hard…`,
+revert flag); #4 boot per-lane sizes; #5 per-contract cell stats (`test_cell_stats_are_per_contract`); #6
+dial<wall asserted (`test_dials_sit_under_their_walls`, `…a_dial_over_its_wall_is_caught`); #7 sibling greps
+above; #8 **F byte-identical** (`lane_fh8` untouched; F's notional path unchanged — only its wall loosened).
+New `test_floodgates.py` (16 tests). Suite 797 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

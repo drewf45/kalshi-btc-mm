@@ -68,19 +68,22 @@ def _swing_row(ledger):
 # ── Part 3: the dials are set (acceptance #5, #9) ──────────────────────────
 def test_part3_dials_are_set():
     assert config.OPEN_GOUGE_C == 4          # target = entry + 4
-    assert config.FLIP_SIZE_CAP == 10        # the +4×10 lot cap
-    assert config.AT_RISK_PCT["FLIP"] == 0.15   # the wall Drew ruled to 15%
-    # acceptance #9: the revert condition lives in the config comment, together
+    # WO-2026-07-24-G: the fixed cap is retired as a binder; the FLIP wall rose
+    # to 18% (dial 14% sits under it), and the halt is book-derived.
+    assert config.AT_RISK_PCT["FLIP"] == 0.18
+    assert config.FLIP_NOTIONAL_PCT < config.AT_RISK_PCT["FLIP"]   # dial < wall
+    # acceptance #9: the revert levers live in the config comment
     import inspect
     src = inspect.getsource(config)
-    assert "REVERT" in src and "FLIP_SIZE_CAP" in src
+    assert "REVERT" in src
 
 
 # ── #7: the binding sizing term is logged on EVERY FLIP entry ──────────────
 def test_flip_size_logs_the_binding_term(ledger, caplog):
-    """The FLIP_SIZE log names the term that bound the lot count. On an ample
-    book the CAP is the ceiling; the reason string says '→ cap bound'."""
-    ledger.baseline(80_000, confirmed_by="test")   # big book: kelly/depth clear
+    """The FLIP_SIZE log names the term that bound the lot count. WO-2026-07-24-G:
+    the fixed cap is RETIRED — on a deep book NOTIONAL is the ceiling (FLIP scales
+    with the book), and the reason says '→ notional bound (no cap …)'."""
+    ledger.baseline(8_000, confirmed_by="test")   # $80 book
     eng = _engine(ledger)
     p = Order(lane="FLIP", event=EVENT, market=TICKER, side="yes",
               action="buy", price_cents=48, count=1, size_tier=config.TIER_PROBE,
@@ -90,7 +93,9 @@ def test_flip_size_logs_the_binding_term(ledger, caplog):
     line = next((r.getMessage() for r in caplog.records
                  if r.getMessage().startswith("FLIP_SIZE")), None)
     assert line is not None
-    assert "→ cap bound" in line and "count=10" in line
+    # 8000*0.14//48 = 23 notional; depth ample → notional binds; no cap
+    assert "→ notional bound" in line and "no cap" in line
+    assert "count=23" in line
 
 
 def test_flip_size_log_names_depth_when_depth_binds(ledger, caplog):

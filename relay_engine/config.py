@@ -145,13 +145,16 @@ SLIP_TOLERANCE_C = 3             # DREW-DEFAULT: flatten may cross at most stop+
 # WO-2026-07-24-E "THE SIGHTED STOP": the momentum stop is a pure LEVEL test
 # (mark <= stop_px) with no trajectory term — it fires identically whether the
 # book is falling to the stop or CLIMBING back through it (26JUL0845: sold at 48
-# into a book that had recovered ~28pts off its low). Phase 1 (today) computes
-# the sighted condition as a SHADOW only. Phase 2 (Saturday, DREW's go) makes an
-# adverse LEVEL necessary-but-not-sufficient: a book measurably recovering toward
-# entry is the reversion thesis WORKING. All three re-derivable from tape.
+# into a book that had recovered ~28pts off its low). WO-2026-07-24-G Part 3
+# (DREW's cadence re-ruling — ships on proof, any day) makes the deferral LIVE:
+# an adverse LEVEL is necessary-but-not-sufficient — a book measurably recovering
+# toward entry is the reversion thesis WORKING, so the stop DEFERS. Guardrails
+# G1 (hard floor cuts regardless), G2 (grace budget), G3 (recovery off low_mark).
+# Revert lever: OPEN_SIGHTED_STOP=0 → back to the pure-level stop (shadow only).
 OPEN_RECOVERY_MIN_C = 6          # DREW-DEFAULT: mark this far off the low = recovering
 OPEN_RECOVERY_MAX_POLLS = 20     # DREW-DEFAULT: grace budget — deferrals before the stop rules anyway
 OPEN_GRACE_HARD_C = 8            # DREW-DEFAULT: below stop−SLIP−this, cut regardless (G1 bounded worst case)
+OPEN_SIGHTED_STOP = os.environ.get("OPEN_SIGHTED_STOP", "1") == "1"  # DREW-RULED live; =0 reverts to pure-level
 # WO-2026-07-22-F "WAIT FOR THE PILE": entry-discipline tuning. Every logged
 # entry so far fired inside the first 57s — before the pile window even opens,
 # on a book that had not moved (trend $0) or already finished (skew 41). FLIP
@@ -287,12 +290,23 @@ AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap
 # NET_RISK / DOLLAR_RISK reason NAMES are kept so WALL_STORM telemetry stays
 # comparable across builds.
 # WO-2026-07-24-C "+4×10": FLIP 0.05→0.15 — 10×60¢ = 600¢ ≈ 14% of a $42 book.
-# ⚠️ REVERT CONDITION (a risk-parameter increase authorised for an EXPERIMENT
-# does not survive it): if the +4×10 test reads ≤4 of 10 filled, revert
-# FLIP_SIZE_CAP→3 AND AT_RISK_PCT["FLIP"]→0.05 together. This wall must not
-# quietly stay at 15% after the experiment ends.
-AT_RISK_PCT = {"F": 0.20, "H8": 0.05, "FLIP": 0.15, "D": 0.02, "P": 0.02}
+# WO-2026-07-24-G "FLOODGATES": the wall is now the FLIP backstop (the fixed cap
+# is retired as a binder). Each lane's SIZING DIAL must sit STRICTLY UNDER its
+# wall — a dial == wall converts every rounding edge into a WALL reject + 30s
+# backoff. F: dial F_NOTIONAL_PCT=0.20 under wall 0.25 (80% of wall). FLIP: dial
+# FLIP_NOTIONAL_PCT=0.14 under wall 0.18. boot asserts dial < wall (fail loud).
+# REVERT LEVERS (post-experiment): FLIP dial FLIP_NOTIONAL_PCT→lower and/or
+# AT_RISK_PCT["FLIP"]→0.05; OPEN_SIGHTED_STOP=0. The wall must not silently stay
+# loose after the experiment ends.
+AT_RISK_PCT = {"F": 0.25, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02}
 AT_RISK_PCT_DEFAULT = 0.02        # any unlisted lane (ORPHAN, …) — conservative
+# WO-2026-07-24-G Part 1 (ADVERSARY i backstop): the per-lane wall is now scoped
+# per-lane, so a lane can't be squeezed by another's exposure — but the whole
+# SETTLEMENT EVENT still must not run hot. This is the cross-lane total backstop:
+# an event whose summed at-risk (all lanes) exceeds this fraction of book PAGES
+# (the CEO's whole-event view; the hard 50% portfolio cap in _score_and_size
+# still stops deployment). Page, not reject — the per-lane walls do the stopping.
+EVENT_TOTAL_AT_RISK_PCT = 0.40    # DREW-DEFAULT: summed event at-risk over this % of book pages
 
 
 def at_risk_cap_cents(lane: str, book_cents: int) -> int:
@@ -348,7 +362,26 @@ F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.20"))  # DREW DIAL: F
 # the +4×10 test ran at half the ruled size. 10 lots × 60c = 600c ≈ 14% of a
 # $43 book, so notional gives 10; the 15% at-risk wall (10 × 64c = 640c vs 645c)
 # is the gateway backstop above it. REVERT with the cap/wall (≤4 of 10 fill).
-FLIP_NOTIONAL_PCT = float(os.environ.get("FLIP_NOTIONAL_PCT", "0.14"))  # DREW DIAL: FLIP size = pct of book / price, capped at FLIP_SIZE_CAP
+FLIP_NOTIONAL_PCT = float(os.environ.get("FLIP_NOTIONAL_PCT", "0.14"))  # DREW DIAL: FLIP size = pct of book / price (no fixed cap — WO-2026-07-24-G Part 2)
+
+
+# WO-2026-07-24-G Part 1 / acceptance #6: a lane's SIZING DIAL (notional pct)
+# must sit STRICTLY UNDER its at-risk WALL — a dial >= wall converts every
+# rounding edge into a WALL reject + 30s backoff (the Adversary's 07-24-D
+# warning, now with tape). The two self-scaling lanes are F and FLIP.
+DIAL_OF_LANE = {"F": F_NOTIONAL_PCT, "FLIP": FLIP_NOTIONAL_PCT}
+
+
+def dial_wall_violations() -> list:
+    """Return [(lane, dial, wall), …] for every lane whose sizing dial is NOT
+    strictly under its at-risk wall. Empty = healthy. Boot asserts this and
+    FATALs loud on any inversion (a dial that would fight its own wall)."""
+    bad = []
+    for lane, dial in DIAL_OF_LANE.items():
+        wall = AT_RISK_PCT.get(lane, AT_RISK_PCT_DEFAULT)
+        if dial >= wall:
+            bad.append((lane, dial, wall))
+    return bad
 # Guard (a): total deployed capital across ALL lanes never exceeds this % of
 # book (F and FLIP can hold different markets at once; nothing else bounds the sum).
 PORTFOLIO_DEPLOY_PCT = 0.50       # DREW-DEFAULT: sum of open notional <= 50% of book
@@ -487,11 +520,28 @@ FLIP_FLOOR_SLIP_CENTS = 5
 # rides along as a SHADOW comparison, calibrated against the measured rate
 # before it may ever drive the decision.
 OPEN_SWING_MIN_SAMPLES = 20       # Adversary (a): don't gate on a thin sample
-FLIP_SIZE_CAP = 10                # DREW-RULED (WO-2026-07-24-C "+4×10", was 3): 10-lot cap — DEPTH is now the binding term (the thing being measured); if the book supports 6 the engine takes 6 and the log says depth bound it. Also lifts RATE_HALT_DRAWDOWN_C to 400c (~3.5 stop-outs). REVERT with the wall below (≤4 of 10 fill)
-# WO-2026-07-24-C Part 2: the per-lane rate-halt drawdown threshold, DERIVED
-# from the lane's own size (4 stop-outs' worth). Scales with FLIP_SIZE_CAP so it
-# never strangles the lane it protects: 120¢ at 3 lots, 400¢ at 10.
-RATE_HALT_DRAWDOWN_C = 4 * FLIP_SIZE_CAP * OPEN_MOMENTUM_STOP_C
+FLIP_SIZE_CAP = 10                # LEGACY reference — RETIRED as a sizing binder by WO-2026-07-24-G Part 2 (FLIP now scales with the book via min(notional, depth)); kept only for the book==0 halt fallback and the revert narrative. The live binder is FLIP_NOTIONAL_PCT + the at-risk wall.
+FLIP_HALT_REF_PRICE_C = 55        # DREW-DEFAULT: the mid-band FLIP price the halt sizes its lot count at
+
+
+def rate_halt_drawdown_c(book_cents: int) -> int:
+    """WO-2026-07-24-G Part 2: the per-lane rate-halt drawdown threshold = FOUR
+    stop-outs' worth at the lane's CURRENT size. FLIP now scales with the book
+    (notional, no fixed cap), so a threshold frozen at yesterday's size is the
+    count-vs-money bug reborn — it must recompute with the book. Lots ≈ notional
+    at the mid-band reference price; 4 × lots × OPEN_MOMENTUM_STOP_C. book<=0
+    (boot/test with no book yet) falls back to the legacy cap-sized 400¢."""
+    if book_cents and book_cents > 0:
+        lots = int(book_cents * FLIP_NOTIONAL_PCT / FLIP_HALT_REF_PRICE_C)
+    else:
+        lots = FLIP_SIZE_CAP
+    return max(1, 4 * max(1, lots) * OPEN_MOMENTUM_STOP_C)
+
+
+# Module-level default (book==0) — the legacy display value + a test reference;
+# the LIVE threshold is rate_halt_drawdown_c(book) computed from the current book
+# at settle time (window_econ) and printed in the boot banner + hourly.
+RATE_HALT_DRAWDOWN_C = rate_halt_drawdown_c(0)
 # §2: PROBE mode runs only WHILE the cells fill — a mature cell (n >= this)
 # with negative margin means the receipts argue against the lane: it sits.
 OPEN_PROBE_MAX_N = 20

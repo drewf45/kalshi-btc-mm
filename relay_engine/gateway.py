@@ -152,6 +152,12 @@ class Gateway:
         # P15 Fix A: gross open contracts per (event, market, lane) — net
         # yes-terms masks a filled pair; the walls read BOTH.
         self.gross_open: Dict[Tuple[str, str, str], int] = {}
+        # WO-2026-07-24-G Part 1b: the weighted-average ENTRY basis (cents/
+        # contract) per open position, so the at-risk wall prices a held leg at
+        # its ACTUAL max loss (the basis) instead of the 99¢ constant — a 58¢
+        # 6-lot is 348¢ at risk, not 594¢. Cleared when the key goes flat.
+        self.pos_basis: Dict[Tuple[str, str, str], int] = {}
+        self._event_total_paged: set = set()   # EVENT_TOTAL_AT_RISK page latch
 
     # P10 §4 knobs
     WALL_BACKOFF_S = 30.0
@@ -414,9 +420,22 @@ class Gateway:
         # in yes-terms and would vanish from every wall; gross keeps the
         # paired exposure visible (pending-exposure wall).
         if order.purpose == "ENTRY":
-            self.gross_open[key] = self.gross_open.get(key, 0) + cnt
+            # WO-2026-07-24-G Part 1b: fold this ENTRY fill's price into the
+            # weighted-average basis over the gross-open contracts (all lots of
+            # one maker ENTRY fill at the order's posted price; re-entries at a
+            # new price blend). The at-risk wall reads this instead of 99¢.
+            prev_gross = self.gross_open.get(key, 0)
+            prev_basis = self.pos_basis.get(key, order.price_cents)
+            new_gross = prev_gross + cnt
+            self.pos_basis[key] = int(round(
+                (prev_basis * prev_gross + order.price_cents * cnt)
+                / max(1, new_gross)))
+            self.gross_open[key] = new_gross
         else:
             self.gross_open[key] = max(0, self.gross_open.get(key, 0) - cnt)
+        # the position is flat (net 0 AND no gross pair) — forget its basis
+        if self.positions.get(key, 0) == 0 and self.gross_open.get(key, 0) == 0:
+            self.pos_basis.pop(key, None)
         self.filled_counts[order_id] = self.filled_counts.get(order_id, 0) + cnt
         if self.filled_counts[order_id] >= order.count:
             self.resting.pop(order_id, None)
@@ -483,35 +502,73 @@ class Gateway:
         if self.positions.get(key, 0) != 0 or self.gross_open.get(key, 0) != 0:
             raise WallRejection("SINGLE_ENTRY", f"lane {order.lane} already positioned on {order.market}")
 
-    def _event_exposure(self, event: str) -> Tuple[int, int]:
-        """(net contracts at risk, cents at risk) across lanes for one settlement
-        event: open positions + resting ENTRY orders. Resting EXITs never count."""
+    def _event_exposure(self, event: str, lane: str = None) -> Tuple[int, int]:
+        """(net contracts at risk, cents at risk) for one settlement event: open
+        positions + resting ENTRY orders. Resting EXITs never count.
+
+        WO-2026-07-24-G Part 1a: when `lane` is given, ONLY that lane's exposure
+        counts — the per-lane wall must compare a lane's own risk to its own cap
+        (FLIP's position in a market was counting against F's wall, halving F in
+        every shared window). When `lane` is None, the CROSS-LANE total (the
+        CEO's whole-event view + the 40%-of-book backstop page). Part 1b: a held
+        leg prices at its ACTUAL basis (pos_basis), not the 99¢ constant."""
         contracts = 0
         cents = 0
         # P15 Fix A: exposure = max(|net|, gross) per key — a filled pair
         # (net 0, gross 2) stays visible to the caps.
         keys = set(self.positions) | set(self.gross_open)
-        for (ev, market, lane) in keys:
-            if ev != event:
+        for (ev, market, ln) in keys:
+            if ev != event or (lane is not None and ln != lane):
                 continue
-            eff = max(abs(self.positions.get((ev, market, lane), 0)),
-                      self.gross_open.get((ev, market, lane), 0))
+            eff = max(abs(self.positions.get((ev, market, ln), 0)),
+                      self.gross_open.get((ev, market, ln), 0))
             if eff:
                 contracts += eff
-                cents += eff * config.ONE_LOT_MAX_LOSS_CENTS
+                # Part 1b: max loss per contract = the position's own basis
+                # (price → 0), falling back to the 99¢ ceiling when unknown.
+                basis = self.pos_basis.get((ev, market, ln),
+                                           config.ONE_LOT_MAX_LOSS_CENTS)
+                cents += eff * basis
         for o in self.resting.values():
-            if o.event == event and o.purpose == "ENTRY":
+            if (o.event == event and o.purpose == "ENTRY"
+                    and (lane is None or o.lane == lane)):
                 contracts += o.count
                 # side-terms basis = max loss per contract, both sides
                 cents += o.count * o.price_cents
         return contracts, cents
 
     def _wall_net_risk_and_at_risk(self, order: Order) -> None:
-        contracts, cents = self._event_exposure(order.event)
+        # WO-2026-07-24-G Part 1a: LANE-SCOPED exposure vs the LANE's own cap.
+        contracts, cents = self._event_exposure(order.event, lane=order.lane)
         side_basis = order.price_cents  # side-terms basis = max loss per contract
         projected_at_risk = cents + order.count * side_basis
         projected_count = contracts + order.count
         book_cents = self.ledger.book_cents()
+        # ADVERSARY (i) backstop: the whole event's cross-lane at-risk still must
+        # not run hot — page (don't reject; the per-lane walls stop, the 50%
+        # portfolio cap in _score_and_size is the hard limit) once over the
+        # threshold, latched per event so a busy window doesn't spam.
+        if book_cents > 0:
+            tot_c, tot_cents = self._event_exposure(order.event)   # all lanes
+            proj_total = tot_cents + order.count * side_basis
+            ceiling = int(book_cents * config.EVENT_TOTAL_AT_RISK_PCT)
+            if proj_total > ceiling:
+                if order.event not in self._event_total_paged:
+                    self._event_total_paged.add(order.event)
+                    self.alert_fn(
+                        f"⚠ EVENT_TOTAL_AT_RISK {order.event}: cross-lane at-risk "
+                        f"{proj_total}c > {int(config.EVENT_TOTAL_AT_RISK_PCT*100)}% "
+                        f"of book ({ceiling}c) — the per-lane walls still gate; "
+                        "the 50% portfolio cap is the hard stop")
+                    failures.fail(
+                        "EVENT_TOTAL_AT_RISK",
+                        f"{order.event}: cross-lane at-risk {proj_total}c > "
+                        f"{ceiling}c ({int(config.EVENT_TOTAL_AT_RISK_PCT*100)}% "
+                        f"of book {book_cents}c)",
+                        alert=False, event=order.event, at_risk=proj_total,
+                        ceiling=ceiling, book_cents=book_cents)
+            elif order.event in self._event_total_paged:
+                self._event_total_paged.discard(order.event)   # cooled: re-arm
         if book_cents <= 0:
             # boot/test with no book to proportion against — the legacy flat
             # walls stand (production always carries a book). Unchanged behaviour.

@@ -500,13 +500,11 @@ class ShadowEngine:
                          lane=proposal.lane)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
         proposal.count = max(1, dec.contracts)
-        # WO-SWING-GATE-EVENT §4.2 (DREW-RULED 2026-07-20): FLIP's swing
-        # gate measured the wrong event and rubber-stamped falling knives —
-        # cap FLIP entries at 1 lot until the gate tracks measured
-        # took_swing. F is untouched (its survival gate is correct). This
-        # bounds the 3-lot bleed while Instrument 1 keeps calibrating.
-        if proposal.lane == "FLIP":
-            proposal.count = min(proposal.count, config.FLIP_SIZE_CAP)
+        # WO-2026-07-24-G Part 2: the FLIP_SIZE_CAP re-cap that used to sit here
+        # is RETIRED — FLIP now scales with the book via sizing.size_order
+        # (min(notional, depth)), and the book-proportional at-risk WALL is the
+        # backstop. A fixed count here would re-introduce the very governor Part
+        # 2 removes (compound growth clamped to linear).
         # WO-2026-07-23-B Part 1 guard (d): F's sizing terms are logged once
         # per (market, price) — kelly_max, depth_max, notional_max, and which
         # bound applied — so "is depth ever real" is answered from the tape,
@@ -686,6 +684,25 @@ class ShadowEngine:
         # knows must be honored on the wall before the first cycle — or
         # FATAL loud rather than trade.
         print(self.audit_durable_stops(), flush=True)
+        # WO-2026-07-24-G acceptance #6: every self-scaling lane's dial must sit
+        # STRICTLY under its wall — a dial >= wall fights its own wall (every
+        # rounding edge → WALL reject + backoff). FATAL loud before the first
+        # cycle rather than trade into a self-throttling misconfiguration.
+        violations = config.dial_wall_violations()
+        if violations:
+            named = "; ".join(f"{ln} dial {d:.0%} >= wall {w:.0%}"
+                              for ln, d, w in violations)
+            failures.fail(
+                "DIAL_OVER_WALL",
+                f"sizing dial not under its at-risk wall ({named}) — the dial "
+                "would fight its own wall, converting every rounding edge into a "
+                "WALL reject; refusing to trade a self-throttling config",
+                fatal=True)
+        else:
+            print("DIAL<WALL SELF-TEST: "
+                  + " · ".join(f"{ln} {d:.0%}<{config.AT_RISK_PCT[ln]:.0%}"
+                               for ln, d in config.DIAL_OF_LANE.items())
+                  + " — every dial under its wall", flush=True)
         # WO-VERIFY-LOSSTERM-1 B1: the salvage registration path must be
         # provably reachable before the first cycle — ARMED or
         # DISABLED_TAGGED, never silence on a held position.
@@ -1674,7 +1691,8 @@ class ShadowEngine:
                 pnl = ((100 - s["entry"]) if won else -s["entry"]) * s["net"]
                 self.ledger.record_cell_outcome(
                     lane, s["entry"], won=won, pnl_cents=pnl, fees_cents=0,
-                    market=market, kind="settle", now=now_eff)
+                    market=market, kind="settle", now=now_eff,
+                    contracts=s["net"])   # WO-2026-07-24-G Part 4: per-contract
                 # WO-2026-07-23-B Part 1 guard (b): an F position that rode to
                 # settlement and LOST paid its full entry per contract — the
                 # unsalvaged loss the tripwire exists to catch (§1.6).

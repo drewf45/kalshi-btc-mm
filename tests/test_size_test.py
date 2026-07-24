@@ -11,8 +11,10 @@ from relay_engine.lane_flip import LaneFlip
 
 
 def test_the_two_dials_are_set():
-    assert config.FLIP_SIZE_CAP == 10          # +4×10 size test
     assert config.OPEN_GOUGE_C == 4           # target = entry + 4
+    # WO-2026-07-24-G: the fixed cap is retired as a binder — FLIP scales by
+    # notional; its dial sits under the wall.
+    assert config.FLIP_NOTIONAL_PCT < config.AT_RISK_PCT["FLIP"]
 
 
 def test_take_geometry_is_entry_plus_ten_capped_ninety():
@@ -29,14 +31,13 @@ def test_flip_cap_does_not_touch_F_sizing():
     assert "cap n/a" in scoring.size_order(4162, 97, 10_000, lane="F").reason
 
 
-def test_flip_sizes_up_to_the_cap_when_kelly_and_depth_allow():
-    """WO-2026-07-24-C: FLIP is lane-aware now — min(kelly, depth, FLIP_SIZE_CAP),
-    NOT the retired NET_RISK count cap. On a book where kelly and depth both
-    clear it, the 10-lot cap is the binding term (depth becomes the ceiling in
-    a live thin book — the thing the +4×10 test measures)."""
-    dec = scoring.size_order(8000, 48, 10_000, lane="FLIP")  # kelly 13, depth ample
-    assert dec.contracts == config.FLIP_SIZE_CAP == 10
-    assert "→ cap bound" in dec.reason
-    # a thin book: depth binds below the cap and the reason says so
+def test_flip_scales_with_the_book_no_fixed_cap():
+    """WO-2026-07-24-G Part 2: the fixed cap is RETIRED — FLIP = min(notional,
+    depth), scaling with the book like F. On a deep book NOTIONAL is the ceiling
+    (8000*0.14//48 = 23), not a frozen 10; a thin book lets DEPTH bind below."""
+    dec = scoring.size_order(8000, 48, 10_000, lane="FLIP")  # notional 23, depth ample
+    assert dec.contracts == 23 and "→ notional bound" in dec.reason
+    assert "no cap — scales with book" in dec.reason
+    # a thin book: depth binds below the notional and the reason says so
     thin = scoring.size_order(8000, 48, 12, lane="FLIP")     # depth 12·0.25 = 3
     assert thin.contracts == 3 and "→ depth bound" in thin.reason

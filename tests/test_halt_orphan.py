@@ -50,7 +50,7 @@ def test_reset_halt_clears_orphaned_orientation_and_reports_both(econ,
     reason and left ORIENTATION_DIVERGENCE orphaned forever. Now the key
     clears BOTH and names them."""
     # a per-lane rate halt trips (FLIP drawdown < −120; WO-2026-07-24-C)
-    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    HALF = config.rate_halt_drawdown_c(3594) // 2 + 50  # WO-2026-07-24-G: book-derived
     econ._apply_streak("M0", 0, 3594, per_lane={"FLIP": -HALF})
     econ._apply_streak("M1", 0, 3594, per_lane={"FLIP": -HALF})
     assert "FLIP" in econ.halted_lanes() \
@@ -196,7 +196,7 @@ def test_rate_halt_still_persists_and_needs_key(econ, gateway, ledger,
                                                 surface):
     """The rate halt is NOT auto-healing: it persists across boot and only
     /reset_halt clears it (unchanged)."""
-    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    HALF = config.rate_halt_drawdown_c(3594) // 2 + 50  # WO-2026-07-24-G: book-derived
     econ._apply_streak("M0", 0, 3594, per_lane={"FLIP": -HALF})
     econ._apply_streak("M1", 0, 3594, per_lane={"FLIP": -HALF})
     assert "FLIP" in econ.halted_lanes()

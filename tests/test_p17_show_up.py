@@ -49,13 +49,14 @@ def test_late_settlement_marks_receipt_and_retroactive_halt(engine):
         close = infer_close_ts_from_ticker(mkt)
         engine.market_meta[mkt] = {"close_ts": close}
         engine.econ.open_bracket(mkt, 10_000 - i, now=close - 100)
-        engine.ledger.record_fill(mkt, "F", "yes", "ENTRY", 99, 3, "PROBE")
+        engine.ledger.record_fill(mkt, "F", "yes", "ENTRY", 99, 6, "PROBE")
         # held to settlement (no cut) — settle NO 20 min AFTER close (late by the
-        # 300s rule): a full −297/window F loss (3 lots × 99c), so two windows
-        # cross the size-derived drawdown threshold whatever the cap is set to.
+        # 300s rule): a full −594/window F loss (6 lots × 99c), so two windows
+        # (−1188) cross the size-derived drawdown threshold at the ~$100 book
+        # (WO-2026-07-24-G: rate_halt_drawdown_c(10000) = 1000).
         engine.settle_traded_market(mkt, settled_yes=False, now=close + 1200)
     # WO-2026-07-24-C: the rate halt is per-lane and MONEY-based — both windows
-    # traded only F, and F's own drawdown crosses RATE_HALT_DRAWDOWN_C. The
+    # traded only F, and F's own drawdown crosses the book-derived bound. The
     # retroactive page names the lane. (F halts only itself.)
     assert engine.econ.halted_lanes() == {"F"}
     late_receipts = [m for m in engine.telegram_sent

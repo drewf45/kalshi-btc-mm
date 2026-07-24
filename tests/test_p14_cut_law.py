@@ -184,19 +184,18 @@ def test_exit_booking_ends_custody_of_flat_position(engine, monkeypatch):
 
 # ── §3: sizing narration — the budget is the invariant ─────────────────────
 def test_sizing_line_says_both_prices():
-    """WO-VERIFY-LOSSTERM-1 B4 EXTENDED this line (kelly-bound stated in
-    words + self-scale points); the P14 law — say the budget AND the lots
-    at both reference prices — stands as a prefix."""
+    """WO-2026-07-24-G Part 4: the line now states the budget AND the REAL
+    per-lane sizes F and FLIP actually trade (notional paths), each with its
+    dial and wall — not the generic Kelly preview that lied about size."""
     from relay_engine.boot import sizing_line
     line = sizing_line(541)   # the 7:35 book: $5.41
-    assert line.startswith(
-        "SIZING: Kelly fraction=0.0833 (DREW dial: KELLY_FRACTION env) · "
-        "book $5.41 · budget/window 45¢ · "
-        "max lots: 1 @39¢ · 0 @99¢")
-    assert "throttle is book size, not a wall" in line   # B4 legibility
+    assert line.startswith("SIZING: book $5.41 · Kelly fraction=0.0833 · "
+                           "budget/window 45¢ · ")
+    assert "F @97¢ →" in line and "FLIP @58¢ →" in line
+    assert "throttle is book size + the at-risk wall" in line
 
 
 def test_boot_tape_carries_the_two_price_readout(engine):
     from relay_engine.boot import boot_tape
     tape = "\n".join(boot_tape(boot_caps=engine.ledger.boot_caps))
-    assert "budget/window" in tape and "@39¢" in tape and "@99¢" in tape
+    assert "budget/window" in tape and "F @97¢ →" in tape and "FLIP @58¢ →" in tape
