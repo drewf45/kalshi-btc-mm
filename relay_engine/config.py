@@ -333,6 +333,12 @@ NET_RISK_CROSS_LANE_CAP = 3  # net contracts at risk per settlement event, acros
 # cap. F ALONE takes this path; every other lane keeps min(kelly, depth, cap).
 # ---------------------------------------------------------------------------
 F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.20"))  # DREW DIAL: F size = pct of book / price
+# WO-2026-07-24-D Part 1: FLIP self-scales by NOTIONAL too (like F), else KELLY
+# caps it at ~5-6 on a $43 book (358c/60c) and FLIP_SIZE_CAP=10 never bites —
+# the +4×10 test ran at half the ruled size. 10 lots × 60c = 600c ≈ 14% of a
+# $43 book, so notional gives 10; the 15% at-risk wall (10 × 64c = 640c vs 645c)
+# is the gateway backstop above it. REVERT with the cap/wall (≤4 of 10 fill).
+FLIP_NOTIONAL_PCT = float(os.environ.get("FLIP_NOTIONAL_PCT", "0.14"))  # DREW DIAL: FLIP size = pct of book / price, capped at FLIP_SIZE_CAP
 # Guard (a): total deployed capital across ALL lanes never exceeds this % of
 # book (F and FLIP can hold different markets at once; nothing else bounds the sum).
 PORTFOLIO_DEPLOY_PCT = 0.50       # DREW-DEFAULT: sum of open notional <= 50% of book

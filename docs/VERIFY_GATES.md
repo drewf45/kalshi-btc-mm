@@ -3472,6 +3472,36 @@ breach`); #2 live-market recovery OR `ORIENTATION_HALT_STUCK` (`test_orientation
 `RECON_NO_PV`, no crash; #6 `WALL_STORM`/closed-gate latch; #7 **F byte-identical** (`lane_fh8` untouched;
 the stop floor is FLIP-only). New `test_morning_four_build1.py` (11 tests). Suite 767 · preflight 23/23.
 
+## WO-2026-07-24-D Part 1 — SIZE THE LANE, build 2/2 (build 75)
+
+Ships LAST (it doubles FLIP's size — it must land on build-74's floored stop and visible reconcile). The
++4 thesis is proven (80% conversion, maker fills, zero fees); this closes the gap between what was ruled
+and what traded.
+
+**Read-rule TRUE:** `sizing.py:97` sized FLIP `min(kelly_max, depth_max, cap)` — Kelly still bound. At a
+$43 book / 60c entry, `kelly = 4300 · (1/12) // 60 = 5`, so `FLIP_SIZE_CAP=10` never bit and the size test
+ran at half the ruled size. `sizing.py:63-68` gave **F alone** a notional Kelly-bypass ("NOT by Kelly …
+Every other lane is unchanged") — FLIP never got it. The third instance this week of a fix on one of two
+siblings. **Fix:** FLIP self-scales by notional too — `notional = int(book · FLIP_NOTIONAL_PCT // price)`,
+`contracts = min(notional, depth, cap)`, `FLIP_NOTIONAL_PCT = 0.14` (10 × 60c = 600c ≈ 14% of a $43 book).
+Kelly is retired from FLIP's bind and rides the reason as `kelly n/a` for the audit. On the live book
+notional gives exactly 10; on a thin book depth binds below (the term the test measures); on a large book
+the cap binds. The 15% at-risk wall (`AT_RISK_PCT["FLIP"]`) is the gateway backstop — 10 × 64c (the take,
+entry+`OPEN_GOUGE_C`) = 640c vs 645c at $43, fitting with nothing spare; below ~$42.67 the wall binds first
+(correct — the backstop does its job). REVERT with the cap/wall (`config.py` comments, WO-C #9).
+
+**Test hygiene (a real flake, fixed):** `test_swing_gate_event.py:178` did a bare
+`scoring.tier_for = lambda …` with no restore, leaking globally; once FLIP's size shifted, a later test that
+relies on the real tier (`test_p22_scoreboard`) began failing order-dependently — a flaky "DO NOT GO LIVE"
+preflight. Converted to `monkeypatch.setattr` (restores at teardown); preflight is deterministic 23/23 again.
+
+**Acceptance:** #5 FLIP sizes to 10 at the live book, binding term named (`test_flip_reaches_ten_at_the_live_
+book`, `…no_longer_capped_by_kelly`, `…depth_still_binds`, `…cap_binds_on_a_large_book`); wall headroom
+confirmed (ADVERSARY iii — `test_ten_lots_at_the_band_top_fits_the_at_risk_wall`); #7 **F byte-identical**
+(`lane_fh8` untouched; F's `F_NOTIONAL_PCT` path never reads `FLIP_NOTIONAL_PCT` and vice-versa —
+`test_f_notional_path_untouched_by_flip`); #8/#9 revert conditions remain in the config comments. New
+`test_morning_four_build2.py` (7 tests). Suite 774 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

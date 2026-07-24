@@ -379,6 +379,18 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "pinning the gate on a stale number. Part 5 the closed-gate "
                  "reject latches once per (lane, market) until the gate opens. "
                  "F byte-identical")
+    lines.append(f"  SIZE THE LANE (WO-2026-07-24-D, build 75 build 2/2): Part 1 "
+                 "— FLIP self-scales by NOTIONAL (FLIP_NOTIONAL_PCT "
+                 f"{config.FLIP_NOTIONAL_PCT}) like F, NOT Kelly. Kelly capped "
+                 "FLIP at ~5-6 on a $43 book (358c/60c), so FLIP_SIZE_CAP=10 "
+                 "never bit and the +4×10 test ran at HALF the ruled size — the "
+                 "third instance of a fix on one of two siblings (F had the "
+                 "bypass, FLIP did not). Now min(notional, depth, cap): 4300·"
+                 f"{config.FLIP_NOTIONAL_PCT}//60 = 10, so FLIP reaches the "
+                 "cap; depth binds below on a thin book; the 15% at-risk wall "
+                 "(10×64c=640c vs 645c) is the gateway backstop. Ships LAST so "
+                 "the doubled size lands on build-74's floored stop + visible "
+                 "reconcile. F byte-identical (its F_NOTIONAL_PCT path untouched)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

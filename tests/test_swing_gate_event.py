@@ -157,7 +157,7 @@ def test_distance_for_p_inverts_the_table(monkeypatch):
 
 
 # ── §4.2: the 1-lot FLIP cap (DREW-RULED) ──────────────────────────────────
-def test_flip_capped_to_one_lot_f_untouched():
+def test_flip_capped_to_one_lot_f_untouched(monkeypatch):
     from relay_engine.gateway import Order
     from relay_engine.shadow_runner import ShadowEngine
     eng = object.__new__(ShadowEngine)
@@ -175,7 +175,10 @@ def test_flip_capped_to_one_lot_f_untouched():
     eng.telegram = type("T", (), {"alert": staticmethod(lambda m: None)})()
     eng._size_zero_logged = set()   # WO-2026-07-23-B: F sizing logs (guard d)
     from relay_engine import scoring
-    scoring.tier_for = lambda *a, **k: config.TIER_PROBE
+    # WO-2026-07-24-D test hygiene: a bare `scoring.tier_for = ...` leaked
+    # globally (no restore) and made preflight order-dependently flaky once a
+    # later test relied on the real tier. monkeypatch restores it at teardown.
+    monkeypatch.setattr(scoring, "tier_for", lambda *a, **k: config.TIER_PROBE)
     b = _book(yes=48, no=49)
     fl = Order(lane="FLIP", event=EVENT, market=TICKER, side="yes",
                action="buy", price_cents=48, count=1,
