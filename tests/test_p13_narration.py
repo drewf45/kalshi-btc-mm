@@ -103,18 +103,30 @@ def test_entry_page_names_the_why(engine):
 
 
 def test_exit_page_names_reason_fee_and_the_net_line(engine):
-    """The 0715-15 scratch, re-narrated: sell@42 after entry@46, fee 2¢ —
-    the page that would have prevented the panic."""
+    """The 0715-15 scratch, re-narrated: sell@42 after entry@46, fee 2¢. WO-H
+    "ONE POSITION, ONE STORY": the ↔ line reads the POSITION — a full round-trip
+    prints CLOSED with the blended basis and the position net, not a fill pair."""
+    gw = engine.gateway
+    en = Order(lane="FLIP", event=EVENT, market=TICKER, side="no", action="buy",
+               price_cents=46, count=1, size_tier=config.TIER_PROBE,
+               purpose="ENTRY", why="OPEN grain nox2 · join 46c")
+    gw.order_index["E"] = en
+    gw.resting["E"] = en
+    gw.on_fill("E")                              # gateway tracks: gross 1, basis 46
     engine.ledger.record_fill(TICKER, "FLIP", "no", "ENTRY", 46, 1, "PROBE")
     exit_order = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
                        action="sell", price_cents=42, count=1,
                        size_tier=config.TIER_PROBE, purpose="CUT",
                        reason="PER_CONTRACT_STOP")
+    gw.order_index["X"] = exit_order
+    gw.resting["X"] = exit_order
+    gw.on_fill("X", fee_cents=2)                 # concludes the position (flat)
     engine._on_fill_booked(exit_order, "CUSTODIAN_EXIT", 42, 1, 1001.0, 2)
     exit_page = [m for m in engine.telegram_sent if m.startswith("✂️ EXIT")][0]
     assert "sell no@42¢ x1 (fee 2¢) — PER_CONTRACT_STOP" in exit_page
     net_page = [m for m in engine.telegram_sent if m.startswith("↔")][0]
-    assert "round-trip -4¢ + fee 2¢ = -6¢" in net_page   # the morning's -6c
+    assert "ROUND-TRIP CLOSED x1 basis 46¢" in net_page
+    assert "net -6¢" in net_page                 # (42−46)*1 − 2 fee = −6c
 
 
 def test_a_mute_fill_cannot_exist(engine):
@@ -259,6 +271,12 @@ def test_pack_itemizes_scratches_and_fees(engine):
     engine.ledger.record_fill(TICKER, "FLIP", "no", "ENTRY", 46, 1, "PROBE")
     engine.ledger.record_fill(TICKER, "FLIP", "no", "CUSTODIAN_EXIT", 42, 1,
                               "PROBE", fee_cents=2)
+    # WO-2026-07-24-H: scratches read the POSITION-level cell outcome now (one
+    # concluded no@46 → 42 round-trip, net −6 = gross −4 − fee 2). The gross −4
+    # is the scratch cost, fees 2 from the fills.
+    engine.ledger.record_cell_outcome("OPEN", 46, won=False, pnl_cents=-6,
+                                      fees_cents=2, market=TICKER, kind="trip",
+                                      contracts=1)
     from relay_engine.ops import daily_pack
     pack = daily_pack(engine.ledger, engine.surface, engine.cash, econ=engine.econ)
     assert "scratches: 1 · scratch cost: 4¢ · fees: 2¢" in pack

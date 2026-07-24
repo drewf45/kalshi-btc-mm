@@ -158,6 +158,14 @@ class Gateway:
         # 6-lot is 348¢ at risk, not 594¢. Cleared when the key goes flat.
         self.pos_basis: Dict[Tuple[str, str, str], int] = {}
         self._event_total_paged: set = set()   # EVENT_TOTAL_AT_RISK page latch
+        # WO-2026-07-24-H "ONE POSITION, ONE STORY": the position-level accrual
+        # the ↔ round-trip line and the cell outcome must read (fills are
+        # evidence that accrue basis; P&L and "concluded" exist only at count→0).
+        # pos_story[key] = {basis, entry_ct, exit_ct, exit_proceeds, fees}; on
+        # conclusion it snapshots into last_concluded[key] for the CLOSED line +
+        # the single per-position cell row.
+        self.pos_story: Dict[Tuple[str, str, str], dict] = {}
+        self.last_concluded: Dict[Tuple[str, str, str], dict] = {}
 
     # P10 §4 knobs
     WALL_BACKOFF_S = 30.0
@@ -404,9 +412,14 @@ class Gateway:
         """Cancels skip walls. True unless the venue state is UNKNOWN."""
         return self.cancel_tristate(order_id) != "UNKNOWN"
 
-    def on_fill(self, order_id: str, count: Optional[int] = None) -> Order:
+    def on_fill(self, order_id: str, count: Optional[int] = None,
+                fee_cents: int = 0) -> Order:
         """Book a (possibly partial) fill's position effect. The order stays
-        resting until its full count is filled. Returns the order."""
+        resting until its full count is filled. Returns the order.
+
+        WO-2026-07-24-H: the fill also accrues the POSITION story — basis on
+        entry, exit proceeds + fees on exit — so the narration and the cell
+        outcome can speak per-position (once, at count→0), never per-fill."""
         order = self.order_index.get(order_id)
         if order is None:
             failures.fail("FILL_UNKNOWN_ORDER",
@@ -416,6 +429,9 @@ class Gateway:
         key = (order.event, order.market, order.lane)
         sign = 1 if self._signed_yes_delta(order) > 0 else -1
         self.positions[key] = self.positions.get(key, 0) + sign * cnt
+        st = self.pos_story.setdefault(
+            key, {"basis": order.price_cents, "entry_ct": 0, "exit_ct": 0,
+                  "exit_proceeds": 0, "fees": 0})
         # P15 Fix A: GROSS open contracts — a filled yes+no PAIR nets to zero
         # in yes-terms and would vanish from every wall; gross keeps the
         # paired exposure visible (pending-exposure wall).
@@ -431,11 +447,43 @@ class Gateway:
                 (prev_basis * prev_gross + order.price_cents * cnt)
                 / max(1, new_gross)))
             self.gross_open[key] = new_gross
+            # WO-2026-07-24-H: the story's basis IS the wall's basis (blended)
+            st["basis"] = self.pos_basis[key]
+            st["entry_ct"] += cnt
+            st["fees"] += int(fee_cents)
         else:
             self.gross_open[key] = max(0, self.gross_open.get(key, 0) - cnt)
-        # the position is flat (net 0 AND no gross pair) — forget its basis
+            st["exit_ct"] += cnt
+            st["exit_proceeds"] += order.price_cents * cnt
+            st["fees"] += int(fee_cents)
+        # the position is flat (net 0 AND no gross pair) — CONCLUDED: snapshot
+        # the whole story for the CLOSED line + the one cell row, then forget it.
         if self.positions.get(key, 0) == 0 and self.gross_open.get(key, 0) == 0:
             self.pos_basis.pop(key, None)
+            if st["exit_ct"] > 0:
+                basis, xc = st["basis"], st["exit_ct"]
+                avg_exit = int(round(st["exit_proceeds"] / xc))
+                gross = st["exit_proceeds"] - basis * xc
+                net = gross - st["fees"]
+                self.last_concluded[key] = {
+                    "basis": basis, "count": xc, "avg_exit": avg_exit,
+                    "gross_cents": gross, "fees_cents": st["fees"],
+                    "net_cents": net}
+                # WO-2026-07-24-H P2: the "trip" cell outcome books ONCE, HERE,
+                # at the position's CONCLUSION (count→0) — blended basis, TOTAL
+                # count, position net — never per-exit-fill against one entry's
+                # price. This is the single point every round-tripped position
+                # passes, on every fill path (the sweep AND custodian cuts both
+                # call on_fill), so the Gate A stats read the position, not a
+                # fill pair. Held-to-settle still books kind="settle" at settle.
+                if self.ledger is not None:
+                    from . import scoring
+                    self.ledger.record_cell_outcome(
+                        scoring.cell_lane(order.lane, order.reason or order.why),
+                        basis, won=net > 0, pnl_cents=net,
+                        fees_cents=st["fees"], market=order.market,
+                        kind="trip", contracts=xc)
+            self.pos_story.pop(key, None)
         self.filled_counts[order_id] = self.filled_counts.get(order_id, 0) + cnt
         if self.filled_counts[order_id] >= order.count:
             self.resting.pop(order_id, None)
@@ -476,6 +524,31 @@ class Gateway:
         self.entries_halted_reasons = {r for r in self.entries_halted_reasons
                                        if r in keep}
         return cleared
+
+    def check_exit_oversize(self) -> None:
+        """WO-2026-07-24-H P3 (the standing assert): NO resting EXIT may sell
+        more than its position holds. A take that became oversized when a later
+        partial fill shrank the position would, if fully lifted, sell what we do
+        not hold — and auto-net turns that into OPENING the opposite side. The
+        self-net wall guards ENTRIES; this is its unguarded twin. note_exit
+        cancels the oversized take the moment the partial books; this per-cycle
+        check is the belt — it pages EXIT_OVERSIZE only if that cancel failed
+        (a cancel-reject race), never on honest tape."""
+        by_key: Dict[Tuple[str, str, str], int] = {}
+        for o in self.resting.values():
+            if o.purpose in ("EXIT", "CUT") and o.action == "sell":
+                k = (o.event, o.market, o.lane)
+                by_key[k] = by_key.get(k, 0) + o.count
+        for (ev, market, lane), exit_ct in by_key.items():
+            held = self.gross_open.get((ev, market, lane), 0)
+            if exit_ct > held:
+                failures.fail(
+                    "EXIT_OVERSIZE",
+                    f"{market} {lane}: resting EXIT x{exit_ct} > held x{held} — a "
+                    "take oversized by a later partial fill would sell more than "
+                    "we hold (auto-net opens the opposite side)",
+                    alert=True, market=market, lane=lane,
+                    exit_count=exit_ct, held=held)
 
     # ------------------------------------------------------------------
     # Walls, in canon order

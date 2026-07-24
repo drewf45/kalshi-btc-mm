@@ -600,20 +600,41 @@ class ShadowEngine:
                 f"✂️ EXIT {order.lane} {order.market} "
                 f"{order.action} {order.side}@{price_cents}¢ x{count}{fee_s}"
                 f" — {reason}")
-            # the desk's unit of thought: one glance, one verdict per pair
-            row = self.ledger.db.execute(
-                "SELECT price_cents FROM fills WHERE market=? AND lane=?"
-                " AND action='ENTRY' ORDER BY id DESC LIMIT 1",
-                (order.market, order.lane)).fetchone()
-            if row is not None:
-                rt = (price_cents - row[0]) * count
-                net = rt - fee_cents
+            # WO-2026-07-24-H "ONE POSITION, ONE STORY": the ↔ line reads the
+            # POSITION, not the fills table. gateway.on_fill has already booked
+            # this exit's effect, so the position state below is post-fill: if it
+            # is now FLAT, the whole story concluded (CLOSED with blended math);
+            # if contracts remain, this was a PARTIAL and the line says how many
+            # ride. (The old line selected ONE entry fill and declared a
+            # round-trip on any partial — 10/17 riding read as "concluded".)
+            key = (order.event, order.market, order.lane)
+            flat = (self.gateway.positions.get(key, 0) == 0
+                    and self.gateway.gross_open.get(key, 0) == 0)
 
-                def s(v):
-                    return f"{'+' if v > 0 else ''}{v}"
+            def s(v):
+                return f"{'+' if v > 0 else ''}{int(round(v))}"
+            if not flat:
+                # a partial: GOOD news, honestly narrated — x banked, R riding
+                basis = self.gateway.pos_basis.get(key)
+                riding = self.gateway.gross_open.get(key, 0)
+                b_s = f" (basis {basis}¢)" if basis is not None else ""
+                this = (price_cents - basis) * count if basis is not None else None
+                pnl_s = f" {s(this)}¢" if this is not None else ""
                 self.telegram.alert(
-                    f"↔ {order.market} {order.lane} round-trip {s(rt)}¢ "
-                    f"+ fee {fee_cents}¢ = {s(net)}¢")
+                    f"↔ {order.market} {order.lane} PARTIAL x{count} @{price_cents}¢"
+                    f"{b_s}{pnl_s} — {riding} riding")
+            else:
+                # concluded: the position's accrued totals ARE the story
+                c = self.gateway.last_concluded.get(key)
+                if c is not None:
+                    # the position's accrued totals ARE the story (the cell
+                    # outcome was booked at conclusion inside gateway.on_fill —
+                    # P2; this surface just tells it).
+                    self.telegram.alert(
+                        f"↔ {order.market} {order.lane} ROUND-TRIP CLOSED "
+                        f"x{c['count']} basis {c['basis']}¢ → avg exit "
+                        f"{c['avg_exit']}¢, net {s(c['net_cents'])}¢ "
+                        f"(+ fee {c['fees_cents']}¢)")
         if order.lane == "FLIP":
             # FLIP-COUNT-1: the fill's COUNT rides into custody — a second
             # same-side fill merges, an exit realizes ×count and decrements.
@@ -1359,6 +1380,10 @@ class ShadowEngine:
         now = time.time() if now is None else now
         if spot is None:
             spot = self.fresh_spot(now)
+
+        # WO-2026-07-24-H P3: the standing assert — no resting EXIT may exceed
+        # its position's live count (a take oversized by a later partial fill).
+        self.gateway.check_exit_oversize()
 
         # P9 §2: deferred brackets complete the moment the venue answers again
         self.flush_deferred_econ(now)

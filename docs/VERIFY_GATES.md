@@ -3600,6 +3600,58 @@ dial<wall asserted (`test_dials_sit_under_their_walls`, `…a_dial_over_its_wall
 above; #8 **F byte-identical** (`lane_fh8` untouched; F's notional path unchanged — only its wall loosened).
 New `test_floodgates.py` (16 tests). Suite 797 · preflight 23/23.
 
+## WO-2026-07-24-H — ONE POSITION, ONE STORY (build 78)
+
+Trigger (12:18 window, `1230-30`): entry pieced no@61 ×7 + ×10 (17 total, merge law fired correctly), then
+EXIT ×7 @65 and the ↔ line declared "round-trip +28¢" as a concluded story while **10 contracts still rode**.
+"Reconciliation of the same thing we just saw, but at the flip level" — the -G fix (positions, not fills)
+applied to the story surfaces and the exit path. The unit of account is the POSITION; fills are evidence
+that accrue basis; P&L and "concluded" exist only at count→0.
+
+**H1 (read-rule TRUE, `shadow_runner.py:604-616`):** the ↔ line selected the single most recent ENTRY fill
+(`ORDER BY id DESC LIMIT 1`) and printed `(exit − that_fill) × exit_count` as "round-trip" on ANY exit —
+declaring a conclusion on a partial, pricing against one fill not the blended basis, and subtracting two
+different objects' fields. **H2 (TRUE, `ledger.py:356`):** the cell outcome (the Gate A instrument) persisted
+the same fill-pair fiction per exit fill. **H3 (TRUE, race-armed):** the merge correctly cancels+re-proposes
+the take at the merged size, but a resting take can outlive a partial exit OVERSIZED — a resting EXIT larger
+than the position, if lifted, sells what we don't hold and auto-net OPENS the opposite side (the unguarded
+twin of the self-net entry wall).
+
+**P1 — the ↔ line reads the POSITION.** The gateway (from -G) owns per-position basis + count, and
+`gateway.on_fill` runs before the narration, so the post-fill state is the truth: a new `pos_story` accrual
+(basis, entry/exit counts, exit proceeds, fees) snapshots into `last_concluded` at count→0. The line prints
+`PARTIAL x7 @65¢ (basis 61¢) +28¢ — 10 riding` while it rides, and only at flat `ROUND-TRIP CLOSED x17 basis
+61¢ → avg exit 65¢, net +68¢`.
+
+**P2 — the cell outcome books ONCE, at conclusion.** Removed from `record_fill` (per-exit-fill); booked at
+the position's conclusion in `gateway.on_fill` (regular exits) and `custodian.execute_cut` (custodian cuts —
+which bypass `on_fill`; that path is their conclusion point and knows the position basis+count), both
+idempotent by `(market, lane, kind)`. Blended basis, total count, position net — never a fill pair.
+
+**P3 — the take re-sizes on a partial + a standing assert.** `note_exit`: when a partial leaves `count > 0`
+and a resting take's `take_count > count`, cancel it and let custody re-propose at the remainder (the merge's
+cancel+re-propose, reused). `gateway.check_exit_oversize()` runs each cycle: no resting EXIT may exceed its
+position's live count → pages `EXIT_OVERSIZE` (the belt if a cancel-reject race ever leaves one; never on
+honest tape).
+
+**Sibling greps (ENGINEER, acceptance #3):** the `fills … ORDER BY id DESC LIMIT 1` pattern on
+story/economics surfaces is retired — the ↔ line (H1), the cell outcome (H2), and the pack's scratch /
+FLIP-R6 P&L (`ops.py`, now reads the position-level `cell_outcomes`, `gross = net + fees`). The remaining
+consumers are position **reconstruction**, not P&L stories: `lane_flip.py:1859` (reboot-orphan basis+fill_ts
+recovery) and `reconcile.py:131` (unsettled-position lane/side/basis recovery) — both cited as position-safe,
+left unchanged.
+
+**P4 — today's remainder (analysis):** the 1230-30's riding 10 — with P3 live, a take oversized by a later
+partial is cancelled the instant the partial books and re-proposed at the remainder; the belt would have
+paged `EXIT_OVERSIZE` had the cancel not landed. No oversized ×17 can sit resting unmeasured.
+
+**Acceptance:** #1 pieced-entry PARTIAL then CLOSED, cell row only at conclusion with position totals
+(`test_pieced_entry_partial_then_closed`, `test_cell_outcome_books_at_conclusion_with_totals`); #2 take
+re-sizes on partial, `EXIT_OVERSIZE` fireable in test / silent on honest tape (`test_partial_exit_cancels_
+the_oversized_take`, `test_exit_oversize_assert_is_fireable`); #3 sibling greps above; #4 **F byte-identical**
+(`lane_fh8` untouched; no entry-gate/target/One-Shot change). New `test_one_position_one_story.py` (5 tests).
+Suite 802 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

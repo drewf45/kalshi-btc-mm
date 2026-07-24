@@ -352,23 +352,13 @@ class Ledger:
              None if requested_price is None else float(requested_price)),
         )
         self.db.commit()
-        # P22 §1.1(a): a non-ENTRY booking CLOSES a unit of risk — the
-        # round-trip receipt (the ↔ line's data) persists as a cell outcome
-        # at the single point every exit passes (sweep exits AND custodian
-        # cuts both book here). cell_lane splits FLIP's intents (OPEN/HUNT);
-        # the fills row keeps the attribution lane unchanged.
-        if action != "ENTRY":
-            row = self.db.execute(
-                "SELECT price_cents FROM fills WHERE market=? AND lane=?"
-                " AND action='ENTRY' ORDER BY id DESC LIMIT 1",
-                (market, lane)).fetchone()
-            if row is not None:
-                rt = (price_cents - row[0]) * count
-                net = rt - int(fee_cents)
-                self.record_cell_outcome(
-                    cell_lane or lane, row[0], won=net > 0, pnl_cents=net,
-                    fees_cents=int(fee_cents), market=market, kind="trip",
-                    contracts=count)
+        # WO-2026-07-24-H P2: the "trip" cell outcome USED to book HERE, per
+        # exit fill, against the single most-recent ENTRY price (ORDER BY id DESC
+        # LIMIT 1) × the exit-fill count — fill-level accounting wearing a
+        # position costume. On a pieced entry at mixed prices that contaminated
+        # the exact Gate A stats. It now books ONCE, at position CONCLUSION
+        # (gateway count→0), with the position's BLENDED basis and TOTAL count —
+        # see shadow_runner._on_fill_booked. The fills row is unchanged.
         return cur.lastrowid
 
     def record_cell_outcome(self, lane: str, entry_price_cents: int,

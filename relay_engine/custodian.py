@@ -686,6 +686,19 @@ class Custodian:
                                 fee_cents=fee_cents,
                                 requested_count=remaining,     # §4.1: cut books whole
                                 requested_price=cut_price_cents)
+        # WO-2026-07-24-H P2: a custodian cut is the position's CONCLUSION (it
+        # sells the whole ledger-remaining and dels the position below) — book
+        # the trip cell outcome HERE with the position's OWN basis and count
+        # (this path bypasses gateway.on_fill; this is its conclusion point).
+        # Position-level, not the retired per-exit-fill fiction. Idempotent by
+        # (market, lane, kind) — if the position also concluded via on_fill, the
+        # first booking wins and this is a no-op.
+        from . import scoring as _scoring
+        net = (cut_price_cents - pos.entry_price_cents) * remaining - fee_cents
+        self.ledger.record_cell_outcome(
+            _scoring.cell_lane(pos.lane, trigger), pos.entry_price_cents,
+            won=net > 0, pnl_cents=net, fees_cents=fee_cents,
+            market=pos.market, kind="trip", contracts=remaining)
         # SALV-1 §2.3: the position concludes here — one summary, always
         self.emit_salvage_summary(pos, trigger,
                                   realized_cents=cut_price_cents

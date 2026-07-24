@@ -606,6 +606,22 @@ class LaneFlip:
                                         exit_price_cents, now,
                                         o.get("fill_ts", now), o=o)
                 self._promote_late_fill(w, market, side, now)
+            elif (o.get("take_oid") and self.gateway is not None
+                  and o.get("take_count", 0) > o["count"]):
+                # WO-2026-07-24-H P3: the partial shrank the position but a
+                # resting take sized to the OLD (larger) count still rests — if
+                # fully lifted it would sell MORE than we hold, and auto-net turns
+                # that into OPENING the opposite side (the unguarded twin of the
+                # self-net ENTRY wall). Cancel it; custody re-proposes at the
+                # remainder next cycle — the merge path already owns this exact
+                # cancel+re-propose dance (note_fill), reused here, not reinvented.
+                self.gateway.cancel(o["take_oid"])
+                o["take_oid"] = None
+                o["take_proposed"] = False
+                o.pop("take_count", None)
+                log.warning("FLIP take re-size %s %s: partial left %d held, "
+                            "cancelling the oversized resting take", market, side,
+                            o["count"])
             # P26 §3.1: ANY OPEN exit consumes the window's one shot — the
             # pop above no longer re-opens the door (the located loophole).
             w.open_consumed = True

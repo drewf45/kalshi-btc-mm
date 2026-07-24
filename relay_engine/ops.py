@@ -368,26 +368,27 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
     # P13 (CEO knob): tuition itemized, never mysterious — scratches, their
     # cost, and fees, from the fills ledger.
     try:
-        exits = ledger.db.execute(
-            "SELECT market, lane, price_cents, count, fee_cents, id FROM fills"
-            " WHERE action IN ('EXIT','CUSTODIAN_EXIT') ORDER BY id").fetchall()
+        # WO-2026-07-24-H "ONE POSITION, ONE STORY": scratches and FLIP trip P&L
+        # read the POSITION-level cell outcomes (one row per concluded position,
+        # blended basis × total count), not the retired per-exit-fill fill pair
+        # (last ENTRY before each EXIT × exit count) — which on a pieced entry
+        # counted the same position many times at one leg's price. gross = net +
+        # fees reconstructs the pre-fee round-trip (the scratch basis); flip_trips
+        # is the position net (fee-inclusive). FLIP intents split to OPEN/HUNT.
+        concluded = ledger.db.execute(
+            "SELECT lane, pnl_cents, fees_cents FROM cell_outcomes").fetchall()
         total_fees = int(ledger.db.execute(
             "SELECT COALESCE(SUM(fee_cents),0) FROM fills").fetchone()[0])
         scratches = 0
         scratch_cost = 0
-        flip_trips = []   # P15 R-1: net per completed FLIP trip, fee included
-        for market, lane, px, cnt, fee, xid in exits:
-            entry = ledger.db.execute(
-                "SELECT price_cents FROM fills WHERE market=? AND lane=?"
-                " AND action='ENTRY' AND id<? ORDER BY id DESC LIMIT 1",
-                (market, lane, xid)).fetchone()
-            if entry is not None:
-                rt = (px - entry[0]) * cnt
-                if rt < 0:
-                    scratches += 1
-                    scratch_cost += -rt
-                if lane == "FLIP":
-                    flip_trips.append(rt - fee)
+        flip_trips = []   # P15 R-1: net per completed FLIP TRIP (position), fee incl.
+        for lane, pnl, fees in concluded:
+            gross = pnl + fees          # the pre-fee round-trip (old scratch basis)
+            if gross < 0:
+                scratches += 1
+                scratch_cost += -gross
+            if lane in ("OPEN", "HUNT"):
+                flip_trips.append(pnl)
         lines.append(f"scratches: {scratches} · scratch cost: {scratch_cost}¢ "
                      f"· fees: {total_fees}¢")
         # P15 R-1: the lane's own pack line is REQUIRED READING — yesterday's

@@ -187,6 +187,11 @@ def test_flip_r6_line_renders_daily(engine):
     engine.ledger.record_fill(TICKER, "FLIP", "no", "ENTRY", 46, 1, "PROBE")
     engine.ledger.record_fill(TICKER, "FLIP", "no", "CUSTODIAN_EXIT", 42, 1,
                               "PROBE", fee_cents=2)
+    # WO-2026-07-24-H: FLIP trip P&L reads the POSITION-level cell outcome (one
+    # concluded no@46 → 42 round-trip, net −6) — not the per-exit-fill fill pair.
+    engine.ledger.record_cell_outcome("OPEN", 46, won=False, pnl_cents=-6,
+                                      fees_cents=2, market=TICKER, kind="trip",
+                                      contracts=1)
     from relay_engine.ops import daily_pack
     pack = daily_pack(engine.ledger, engine.surface, engine.cash, econ=engine.econ)
     assert "FLIP R6: trips 1 · WR 0% · net/trip -6.0¢" in pack
