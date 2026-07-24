@@ -480,10 +480,29 @@ class LaneFlip:
                     rec["entry"] = int(round((rec["entry"] * rec["count"]
                                               + price_cents * add) / total))
                     rec["count"] = total
+                    # WO-2026-07-24-I P4 (the x34 ROOT): the merge used to call
+                    # the boolean cancel() and UNCONDITIONALLY clear take_oid +
+                    # repost — but on an UNKNOWN (in-flight) cancel the venue
+                    # answer is discarded and cancel_tristate has PUT THE ORDER
+                    # BACK in the registry, so the old take still rests and the
+                    # repost DOUBLES the cover (1345: 17 old + 17 new = 34). Now
+                    # the tristate answer rules: only a CONFIRMED cancel clears
+                    # take_oid + arms the repost; an UNKNOWN keeps the old take
+                    # (still covering its share) and re-attempts next cycle — the
+                    # heal ladder tops the gap from broker truth (P1/P2), never a
+                    # second full take. One take identity per record.
                     if rec.get("take_oid") and self.gateway is not None:
-                        self.gateway.cancel(rec["take_oid"])
-                        rec["take_oid"] = None
-                    rec["take_proposed"] = False
+                        state = self.gateway.cancel_tristate(rec["take_oid"])
+                        if state == "UNKNOWN":
+                            log.warning("FLIP merge %s %s: take cancel UNKNOWN — "
+                                        "old take still rests, NOT reposting "
+                                        "(no double-cover); retry next cycle",
+                                        market, side)
+                        else:                     # CANCELED / ALREADY_TERMINAL
+                            rec["take_oid"] = None
+                            rec["take_proposed"] = False
+                    else:
+                        rec["take_proposed"] = False
                     w.posted.pop(side, None)
                     log.warning("FLIP-COUNT-1 merge %s %s: +%d -> count %d @ "
                                 "blended %dc", market, side, add, total,
@@ -1571,21 +1590,70 @@ class LaneFlip:
                 w.heal_attempts.pop(side, None)
                 w.heal_covered.pop(side, None)
                 continue
-            covered = 0
-            provenance = []
             h = w.hunts.get(side)
-            if h is not None and h.get("take_oid") is not None:
-                covered += h.get("take_count", h["count"])
-                provenance.append(f"hunts:{h['count']}")
             o = w.opens.get(side)
-            if o is not None and o.get("take_oid") is not None:
-                covered += o.get("take_count", o["count"])
-                provenance.append(f"opens:{o['count']}")
-            if side in w.takes_posted:
+            # WO-2026-07-24-I P1: the SINGLE coverage authority is the broker-
+            # truth resting REGISTRY (the same read EXIT_OVERSIZE uses), not the
+            # in-memory custody buckets — on 1345 the buckets read 0 and the
+            # registry read 34 for the same leg in the same minute, and the
+            # destructive close fired on the reading that said zero. The registry
+            # was right. An UNKNOWN-cancelled order stays in it, so a cover in
+            # flight (CANCEL_IN_FLIGHT) still counts as covered.
+            resting = (self.gateway.resting_exits(market, side)
+                       if self.gateway is not None else None)
+            if resting is None:
+                # HEAL_BLIND: no broker truth this cycle — blindness PAUSES, it
+                # never fires. Absence of confirmation is not absence of cover;
+                # hold the escalation and retry next cycle (P2/P3).
+                log.info("HEAL_BLIND %s %s: coverage unreadable this cycle — "
+                         "holding escalation, no orders", market, side)
+                continue
+            # the registry is the PRIMARY authority (it drives the surplus detect
+            # + cancellation below and is the actionable truth on 1345). A bucket
+            # take/flatten pointer the registry does NOT already hold counts as a
+            # FALLBACK — its intent to cover is real (a reboot before the registry
+            # rehydrates, or a cover in flight) — but never DOUBLE-counted when the
+            # registry has the same order. One number, registry-first.
+            reg_oids = {oid for oid, _ in resting}
+            covered = sum(c for _, c in resting)
+            provenance = [f"{oid}:{c}" for oid, c in resting]
+            for rec in (h, o):
+                if (rec is not None and rec.get("take_oid") is not None
+                        and rec["take_oid"] not in reg_oids):
+                    covered += rec.get("take_count", rec["count"])
+                    provenance.append(f"bucket:{rec['take_oid']}")
+            if (side in w.takes_posted
+                    and w.takes_posted[side] not in reg_oids):
                 covered += w.take_counts.get(side, 1)
                 provenance.append(f"fills:{w.fills.get(side)}")
-            if side in w.flatten_oids:
-                covered += w.flatten_oids[side][1]   # a crossing close
+            if (side in w.flatten_oids
+                    and w.flatten_oids[side][0] not in reg_oids):
+                covered += w.flatten_oids[side][1]
+                provenance.append(f"flatten:{w.flatten_oids[side][0]}")
+            if covered > held:
+                # WO-2026-07-24-I P2: DOUBLE-covered (1345: resting 34 vs held
+                # 17) — cancel the SURPLUS resting exits (newest first, keep the
+                # original take) until cover matches. No flatten, no taker fee:
+                # resolve, don't panic-reverse a position that is already bounded.
+                surplus = covered - held
+                for oid, cnt in reversed(resting):
+                    if surplus <= 0:
+                        break
+                    if self.gateway.cancel_tristate(oid) != "UNKNOWN":
+                        surplus -= cnt
+                        for rec in (h, o):
+                            if rec is not None and rec.get("take_oid") == oid:
+                                rec["take_oid"] = None  # stale pointer, no repost
+                failures.fail(
+                    "FLIP_COVER_SURPLUS",
+                    f"{market} {side}: resting {covered} > held {held} — "
+                    "cancelled the surplus, cover retained (no flatten, no fee)",
+                    fatal=False, alert=True, market=market, side=side,
+                    held=held, resting=covered)
+                w.heal_attempts.pop(side, None)
+                w.heal_grace.pop(side, None)
+                w.heal_covered.pop(side, None)
+                continue
             if held <= covered:
                 # CONFIRMED resting exit(s) against the booked count —
                 # only now is the side healed (§2.1: never on intent).
@@ -1693,9 +1761,39 @@ class LaneFlip:
                         rec["take_oid"] = None
                 w.heal_attempts[side] = 2
             elif esc == 2:
-                # §2.3 THE DEADLINE: cover unconfirmed after reconcile +
-                # retry — FLATTEN at market NOW, booked-net clamped
-                # (Engineer), never bare
+                # WO-2026-07-24-I P2 — BLIND IS NOT BARE: a destructive close
+                # requires POSITIVE knowledge of bareness from broker truth. If
+                # the registry shows ANY resting cover (0 < covered < held), the
+                # leg is bounded — TOP UP the gap with a resting MAKER exit at the
+                # take price, never market-cross the whole leg. Only a leg that
+                # reads ZERO resting after grace + reconcile is positively bare
+                # and flattens. (1345 read 34 covered → this branch would have
+                # cancelled surplus above and never reached here.)
+                if covered > 0:
+                    entry = self._flip_entry_price(market, side)
+                    take_px = (self._take_price(int(round(entry)))
+                               if entry is not None else None)
+                    if take_px is not None:
+                        n = self._exit_count(market, side, gap)
+                        if n > 0:
+                            proposals.append(Order(
+                                lane="FLIP", event=event or market.rsplit("-", 1)[0],
+                                market=market, side=side, action="sell",
+                                price_cents=take_px, count=n,
+                                size_tier=config.TIER_PROBE, purpose="EXIT",
+                                crossfire=False,
+                                reason=f"FLIP_COVER_TOPUP: partially covered "
+                                       f"({covered}/{held}) — top up the {gap} gap "
+                                       "as a MAKER at the take, never a market "
+                                       "flatten of a bounded leg"))
+                            log.warning("FLIP_COVER_TOPUP %s %s: covered %d/%d — "
+                                        "maker top-up x%d @%dc, escalation reset",
+                                        market, side, covered, held, n, take_px)
+                    w.heal_attempts.pop(side, None)   # progress: not bare, reset
+                    w.heal_grace.pop(side, None)
+                    continue
+                # §2.3 THE DEADLINE (positively bare, covered==0): FLATTEN at
+                # market NOW, booked-net clamped (Engineer), never bare
                 mark = (book.best_yes_bid() if side == "yes"
                         else book.best_no_bid()) if book is not None else None
                 if mark is None:

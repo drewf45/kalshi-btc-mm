@@ -525,6 +525,20 @@ class Gateway:
                                        if r in keep}
         return cleared
 
+    def resting_exits(self, market: str, side: str, lane: str = "FLIP") -> list:
+        """WO-2026-07-24-I P1: broker-truth resting exit coverage for (market,
+        side, lane) — the SAME registry EXIT_OVERSIZE reads, now the single
+        coverage authority the heal ladder consults instead of the in-memory
+        custody buckets (the 1345 leg read 0 from the buckets and 34 from HERE
+        in the same minute; the registry was right). Returns [(order_id, count),
+        …] of resting EXIT/CUT sells — an UNKNOWN-cancelled order stays in the
+        registry (cancel_tristate put it back), so a cover in flight still
+        counts as covered. Ordered oldest-first (dict insertion) so a surplus
+        cancel drops the NEWEST duplicates and keeps the original take."""
+        return [(oid, o.count) for oid, o in self.resting.items()
+                if o.lane == lane and o.market == market and o.side == side
+                and o.action == "sell" and o.purpose in ("EXIT", "CUT")]
+
     def check_exit_oversize(self) -> None:
         """WO-2026-07-24-H P3 (the standing assert): NO resting EXIT may sell
         more than its position holds. A take that became oversized when a later

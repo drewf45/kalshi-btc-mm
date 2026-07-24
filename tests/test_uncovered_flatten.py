@@ -122,34 +122,33 @@ def test_192145_self_net_void_flattens_not_rides(flip, gateway, ledger,
 
 
 # ── §4: self-net reconcile — broker confirms held → cover recovers ─────────
-def test_self_net_reconcile_cancels_stale_and_recovers(flip, gateway,
-                                                       ledger):
-    """A stale resting sell blocks the cover (self-net). The reconcile
-    cancels it; broker confirms the held size; the revived record covers
-    the whole leg. No flatten, no bare leg."""
+def test_a_resting_sell_is_cover_the_leg_heals_not_flattens(flip, gateway,
+                                                            ledger):
+    """WO-2026-07-24-I "BLIND IS NOT BARE": a leg with a resting exit is ALREADY
+    bounded — the coverage authority is the broker-truth REGISTRY, so a resting
+    sell against the held count reads COVERED and the leg heals. It is never
+    panic-flattened (the old 'self-net void' doctrine assumed a resting sell did
+    not count; the registry says it does — a position with a resting exit loses
+    the stop honestly or wins the take honestly, either beats donating the
+    spread)."""
     w = flip._window(TICKER, CLOSE)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 40, 1, "PROBE")
     gateway.positions[(EVENT, TICKER, "FLIP")] = 1
-    w.fills["yes"] = 48          # rung-A leg: re-proposes its take, never
-    w.first_fill_ts = CLOSE - 790  # confirms (the self-net void)
+    w.fills["yes"] = 48
+    w.first_fill_ts = CLOSE - 790
     w.trips = 1
-    # a stale resting FLIP sell against the leg (the self-net artifact the
-    # reconcile must cancel before a fresh cover can land)
-    stale = gateway.submit(Order(
+    # a resting FLIP sell against the leg — under the registry authority this IS
+    # cover (held 1 == resting 1), so the leg reads COVERED, no reconcile-cancel.
+    rest = gateway.submit(Order(
         lane="FLIP", event=EVENT, market=TICKER, side="yes", action="sell",
         price_cents=68, count=1, size_tier=config.TIER_PROBE,
         purpose="EXIT"), _book())
-    assert stale.order_id in gateway.resting
-    # drive past grace: the escalation reconciles, cancelling the stale
-    # resting sell, and revives a fresh once-proposing cover
+    assert rest.order_id in gateway.resting
     for s in range(780, 772, -1):
         flip.evaluate(TICKER, _ctx(_book(yes=48), secs_left=s))
-        if stale.order_id not in gateway.resting:
-            break
-    assert stale.order_id not in gateway.resting     # the stale sell cancelled
-    o = flip.windows[TICKER].opens.get("yes")
-    assert o is not None and o["count"] == 1         # revived whole leg
-    assert _rows(ledger, "FLIP_UNCOVERED_FLATTENED") == 0
+    assert rest.order_id in gateway.resting          # the cover STAYS — bounded
+    assert _rows(ledger, "FLIP_UNCOVERED_FLATTENED") == 0   # never flattened
+    assert _rows(ledger, "FLIP_UNCOVERED_UNHEALABLE") == 0
 
 
 # ── §4: phantom gap — broker says smaller → no phantom cover, no bare ──────

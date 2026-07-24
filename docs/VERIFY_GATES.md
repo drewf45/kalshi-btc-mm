@@ -3652,6 +3652,58 @@ the_oversized_take`, `test_exit_oversize_assert_is_fireable`); #3 sibling greps 
 (`lane_fh8` untouched; no entry-gate/target/One-Shot change). New `test_one_position_one_story.py` (5 tests).
 Suite 802 · preflight 23/23.
 
+## WO-2026-07-24-I — BLIND IS NOT BARE (build 79)
+
+Trigger (1345-45, 1:32 PM): entry no@62 ×17 → `FLIP_UNCOVERED_LEG "held 17 > covered 0"` → `EXIT_OVERSIZE
+"resting EXIT x34 > held 17"` → `FLIP_UNCOVERED_FLATTENED ×17 @51` (−247¢ on a green day). The leg was never
+bare — it was **DOUBLE-covered**. Two instruments read the same position as 0 and 34 in the same minute, and
+the destructive close fired on the reading that said zero. **The law: a destructive close requires POSITIVE
+knowledge of bareness from broker truth; blindness pauses, it never fires** (this morning's -H lesson —
+positions, not fills — applied to the engine's own orders).
+
+**Read-rule (against build 78, all TRUE):** I1 `lane_flip.py:1695` — the flatten deadline fires on
+`esc == 2` (failure to CONFIRM), not on positive bareness. I2 `covered` was summed from in-memory custody
+buckets while the -H `EXIT_OVERSIZE` reads the gateway resting registry — 0 and 34 for the same leg. I3
+`gateway.py:386` `cancel_tristate` returns CANCELED|ALREADY_TERMINAL|UNKNOWN and on UNKNOWN **puts the order
+back in `resting`** — but the FLIP merge called the boolean `cancel()` and unconditionally cleared `take_oid`
++ reposted, so an in-flight cancel read as gone and the repost doubled the cover (the x34). I4 escalation is
+cycle-counted.
+
+**P1 — one coverage authority.** The heal ladder's `covered` now reads the broker-truth resting **registry**
+(`gateway.resting_exits(market, side)` — the same read `EXIT_OVERSIZE` uses). The registry is the *primary*
+authority (it drives surplus detection + cancellation, the only actionable truth on 1345); a bucket
+`take_oid`/`take_count`/`flatten_oid` counts as a **fallback only where the registry does not already hold
+that order** (a cover in flight, or a reboot before the registry rehydrates) — one number, never double-
+counted. **A resting exit IS cover — a bounded position is not panic-reversed.**
+
+**P2 — flatten requires positive bareness.** `covered > held` (the 1345 x34) → cancel the SURPLUS resting
+exits newest-first, keep the original take, `FLIP_COVER_SURPLUS`, no flatten/fee. `0 < covered < held` → top
+up the gap with a resting **MAKER** exit at the take (`FLIP_COVER_TOPUP`), never a market cross of a bounded
+leg. `covered == 0` after grace + reconcile → positively bare → the flatten fires exactly as before (the
+doctrine survives). Registry unreadable → `HEAL_BLIND`, hold escalation, no orders.
+
+**P4 — the x34 root.** The merge (`note_fill`) now respects `cancel_tristate`: on UNKNOWN it keeps the old
+take resting and does NOT repost (the heal ladder tops the gap from broker truth); only CANCELED/
+ALREADY_TERMINAL clears `take_oid` and arms the repost. One take identity per record.
+
+**P5** — the phantom ×8 narrations are structurally impossible: the fills loop books each fill exactly once
+(`booked_fills` fill-id dedup → one narration per fill), and P4 removes the double-order root, so one
+economic event prints one line. No redundant narration dedup added.
+
+**Sibling greps (ENGINEER):** the merge was the one cancel-then-**repost** site (fixed by P4). The other
+`gateway.cancel()` sites (`_cancel_resting` before a CUT/hold, the HUNT take cancels, the reconcile stale-
+cancel) are cancel-before-**cut**, not repost — an UNKNOWN leftover there is a *surplus* caught by P1's
+registry surplus-cancel, never a double-cover; cited, left unchanged. `covered`/`heal_covered` has a single
+consumer (`_check_uncovered`), now registry-first.
+
+**Acceptance:** #1 replay (17/34) → surplus cancelled, cover 17 retained, zero flatten, zero taker fee
+(`test_replay_17_held_34_resting_cancels_surplus_no_flatten`); partial (17/7) → maker top-up; #2 replay
+(17/0 confirmed) → flatten survives; #3 replay (read-fail) → `HEAL_BLIND`, no escalation, no orders; #4 merge
+UNKNOWN keeps one take, CONFIRMED reposts (`test_merge_unknown_cancel_keeps_one_take`); #5 one event → one
+line (fills-loop dedup + P4); #6 **F byte-identical** (`lane_fh8` untouched; stop/take/One-Shot unchanged).
+New `test_blind_is_not_bare.py` (7 tests); `test_uncovered_flatten`/`test_flip_count1` re-anchored to the
+registry doctrine (a resting sell is cover). Suite 809 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
