@@ -218,9 +218,13 @@ def test_exit_decision_is_provably_independent_of_pnl(ledger, gateway,
             # window; depth 10 is real). Poll twice; the 2nd is the decision.
             flip.evaluate(mkt, ctx)
             props = flip.evaluate(mkt, ctx)
+            # WO-2026-07-24-D Part 2: through the floor the momentum stop first
+            # RESTS at the floor (a maker EXIT tagged 'momentum stop') before it
+            # crosses — that floor-rest IS the P&L-blind exit decision firing, so
+            # the decision is captured by the reason tag, not the CUT purpose.
             decisions.setdefault(name, []).append(
-                bool([p for p in props if p.purpose == "CUT"]))
-    # same table/time state -> same decision, up or down: hold at 48, cut at
-    # the P&L-blind catastrophe floor (20), identical for the +5 and −5 basis
+                bool([p for p in props if "momentum stop" in (p.reason or "")]))
+    # same table/time state -> same decision, up or down: hold at 48, exit at
+    # the P&L-blind stop (20), identical for the +5 and −5 basis
     assert decisions["down5"] == decisions["up5"] == [False, True]
     failures._ledger = None

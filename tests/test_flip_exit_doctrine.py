@@ -145,12 +145,18 @@ def test_ride_through_the_stop_crosses_out(flip, gateway, ledger):
     """REPLACED by WO-2026-07-22-E: the fixed catastrophe floor for a live scalp
     is retired (it now only backstops a curfew HOLD). A non-hold favored position
     that gaps THROUGH its momentum stop (book already below entry−10) is crossed
-    out at the mark on 2 sustained polls — a bounded cut, never a ride to the
-    bell."""
+    out at the mark — a bounded cut, never a ride to the bell. WO-2026-07-24-D
+    Part 2: through the FLOOR (mark below stop−slip) it first rests ONE poll at
+    the floor, then crosses at the mark with a counted breach (the flatten's
+    floor, mirrored) — so the cross lands on the 3rd sustained poll."""
     o = _entry(flip, gateway, ledger, entry=60)
     flip.evaluate(TICKER, _ctx(_book(yes=20, no=55), secs_left=771))  # poll 1
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=20, no=55), secs_left=770))  # rest
+    assert _cuts(p2) == [] and any(p.price_cents == floor and not p.crossfire
+                                   for p in p2 if p.purpose == "EXIT")
     cuts = _cuts(flip.evaluate(TICKER, _ctx(_book(yes=20, no=55),
-                                            secs_left=770)))
+                                            secs_left=769)))              # cross
     assert len(cuts) == 1 and cuts[0].crossfire
     assert cuts[0].price_cents == 20 and "momentum stop" in cuts[0].reason
 

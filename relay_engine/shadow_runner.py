@@ -251,6 +251,21 @@ class ShadowEngine:
         # — re-checked with a FRESH record each cycle; a passing recheck
         # auto-resumes (a transient staleness halt self-heals, no key).
         self._orientation_halt_market = None
+        # WO-2026-07-24-D Part 3: when the halt fired, so the hard ceiling can
+        # page ORIENTATION_HALT_STUCK instead of sitting silent forever once the
+        # halting market expires and its book is pruned (recovery can't pin to a
+        # dead market). None = no live orientation halt.
+        self._orientation_halt_ts = None
+        # WO-2026-07-24-D Part 4: reconcile health — the operator must be able to
+        # tell a verified book from an unverified one. _recon_last_ok_ts is the
+        # last CLEAN venue cross-check; the streak counts consecutive cycles that
+        # deferred or could not read (a stall pages RECON_STALLED).
+        self._recon_last_ok_ts = None
+        self._recon_deferred_streak = 0
+        # WO-2026-07-24-D Part 5: latch the closed-gate reject storm — a halted
+        # lane re-proposing every poll must count/log ONCE per (lane, market)
+        # until the gate opens, not ~5/min of noise that hides a real reject.
+        self._halt_reject_latched = set()
         self.windows_seen = 0          # P17 §6.1: the show-up counter
         # P18: the displacement-event anchor per market — ONE hunt per event;
         # re-anchored on each hunt submit (a new hunt needs a NEW needle).
@@ -757,6 +772,13 @@ class ShadowEngine:
             self._last_venue_pv_cents = int(round((pv or 0.0) * 100))
             return int(round((cash + (pv or 0.0)) * 100)), "venue"
         self._av_fail_streak += 1
+        # WO-2026-07-24-D Part 4: a FAILED read must INVALIDATE the pv, not
+        # preserve it. `_last_venue_pv_cents` refreshed only on success, so a
+        # value read while holding a position stayed non-zero after the position
+        # cleared — pinning the reconcile's pv-consistency gate on a stale number
+        # so it deferred forever. None means "no trustworthy pv" (the reconcile
+        # then defers as RECON_NO_PV, distinguishable from a real boundary).
+        self._last_venue_pv_cents = None
         failures.fail("ACCOUNT_VALUE_UNREADABLE",
                       f"live account value read failed "
                       f"(attempt {self._av_fail_streak}/{self.AV_PAGE_AT_STREAK})",
@@ -892,9 +914,14 @@ class ShadowEngine:
         """P9 §3: every 60s in live — venue truth vs ledger expectation, routed
         to the EXISTING cash protocol (quiescence window, halt + breakdown page,
         /confirm_cash | /deny_cash). Drift pages between brackets, not at them."""
+        from . import failures
+        now = time.time() if now is None else now
         val, src = self.account_value(now)
         if val is None or src != "venue":
-            return "UNREADABLE"
+            # WO-2026-07-24-D Part 4: an unreadable venue is an un-cross-checked
+            # cycle — it counts toward the stall, same as a defer. Silence here
+            # is exactly the failure this WO is closing.
+            return self._recon_note_deferred("UNREADABLE", now)
         # WO-INFRA-HARDENING E1 — the reconcile-side source trail: when the
         # book disagrees with the venue and there is NOTHING pending to explain
         # it (no unsettled fills, no resting orders), that is the phantom
@@ -915,16 +942,22 @@ class ShadowEngine:
         # and runs cleanly every flat window (both sides ~0).
         pv_cents = getattr(self, "_last_venue_pv_cents", 0)
         deployed = self.ledger.deployed_cents()
+        # WO-2026-07-24-D Part 4: a None pv is a FAILED read invalidating itself
+        # (account_value cleared it) — defer as RECON_NO_PV, distinguishable from
+        # a real settlement boundary and never an `abs(None - deployed)` crash.
+        if pv_cents is None:
+            log.info("RECON_DEFERRED live: venue pv unavailable (last read "
+                     "failed) — deferring as RECON_NO_PV until a clean read")
+            return self._recon_note_deferred("RECON_NO_PV", now)
         if abs(pv_cents - deployed) > config.PV_TOLERANCE_C:
             log.info("RECON_DEFERRED %s: venue pv %dc vs deployed %dc "
                      "(gap %+dc > %dc) — cash/pv read across a settlement "
                      "boundary; reconcile waits for a consistent read",
                      "live", pv_cents, deployed, pv_cents - deployed,
                      config.PV_TOLERANCE_C)
-            return "DEFERRED"
+            return self._recon_note_deferred("PV_BOUNDARY", now)
         if (unsettled == 0 and resting == 0
                 and abs(book - val) > config.RECON_AUDIT_FLOOR_CENTS):
-            from . import failures
             failures.fail(
                 "RECON_BOOK_VENUE_DELTA",
                 f"book {book}c vs venue {val}c delta {book - val:+d}c with 0 "
@@ -932,11 +965,51 @@ class ShadowEngine:
                 "SETTLE_AUDIT trail names which settlement moved the book",
                 alert=False, book_cents=book, venue_cents=val,
                 delta_cents=book - val)
-        return self.cash.reconcile(
+        result = self.cash.reconcile(
             venue_balance_cents=val,
             in_flight_orders=resting,
             unsettled_fills=unsettled,
             now=now)
+        # a completed cross-check (OK / PROMPTED / REBASED) verifies the book
+        # against the venue — reset the stall. A cash-protocol DEFERRED here is
+        # a benign quiescence hold (in-flight/unsettled), not an un-cross-checked
+        # cycle: the venue read WAS clean+consistent, so it does not advance the
+        # stall streak, but it is not a completed reconcile either.
+        if result != "DEFERRED":
+            self._recon_last_ok_ts = now
+            self._recon_deferred_streak = 0
+        return result
+
+    def _recon_note_deferred(self, reason: str, now: float) -> str:
+        """WO-2026-07-24-D Part 4: a deferred/unreadable cycle is one where the
+        book was NOT cross-checked against the venue. Count the run; a run this
+        long PAGES (RECON_STALLED) — "nothing pending" must never be silently
+        indistinguishable from "not checked in an hour". Returns the reason so
+        the caller's status is preserved."""
+        from . import failures
+        self._recon_deferred_streak += 1
+        if self._recon_deferred_streak == config.RECON_STALL_STREAK:
+            failures.fail(
+                "RECON_STALLED",
+                f"no clean venue cross-check for {self._recon_deferred_streak} "
+                f"consecutive reconcile cycles (latest: {reason}) — the book's "
+                "only check against the venue has stopped running; it may have "
+                "been unverified for a while",
+                fatal=False, alert=True, reason=reason,
+                streak=self._recon_deferred_streak)
+        return reason if reason in ("UNREADABLE",) else "DEFERRED"
+
+    def recon_status_line(self, now=None) -> str:
+        """WO-2026-07-24-D Part 4: the hourly's reconcile-health field — a stale
+        cross-check is visible without a log grep. recon_ok is seconds since the
+        last CLEAN reconcile (— = never yet); recon_deferred is the current
+        consecutive un-cross-checked run."""
+        now = time.time() if now is None else now
+        if self._recon_last_ok_ts is None:
+            ago = "—"
+        else:
+            ago = f"{int(now - self._recon_last_ok_ts)}s"
+        return f"recon_ok={ago} recon_deferred={self._recon_deferred_streak}"
 
     def listener_status(self) -> str:
         """P9 §1c: the hourly line's `listener:` field."""
@@ -1140,22 +1213,59 @@ class ShadowEngine:
         now = time.time() if now is None else now
         # §1.3 AUTO-RECOVER: a live orientation halt re-checks itself with a
         # FRESH record; a clean fresh read resumes entries (no key needed).
-        if ("ORIENTATION_DIVERGENCE" in self.gateway.entries_halted_reasons
-                and self._orientation_halt_market is not None):
-            mkt = self._orientation_halt_market
-            book = self.feed.books.get(mkt)
-            ours = book.best_yes_bid() if book is not None else None
-            fresh = self._fresh_record_touches(mkt)
-            fbid = fresh[0] if fresh is not None else None
-            if ours is not None and fbid is not None and abs(ours - fbid) <= 3:
+        # WO-2026-07-24-D Part 3: the halt is about OUR BOOK's orientation, not
+        # one market's. Recovery was PINNED to the halting market — but that
+        # market expires within minutes and `feed.books.get(mkt)` then yields
+        # nothing, so `ours` is None and the clean-read condition can NEVER be
+        # satisfied again (161 minutes of dead time, twice, each cleared only by
+        # the operator's key). Recover on the FIRST currently-open market that
+        # reads clean; and a hard ceiling pages if the halt is genuinely stuck.
+        if "ORIENTATION_DIVERGENCE" in self.gateway.entries_halted_reasons:
+            recovered_on = None
+            # the halting market first (still cheap if it is live), then any
+            # other currently-tracked (i.e. not-yet-pruned) live market.
+            candidates = [self._orientation_halt_market] if \
+                self._orientation_halt_market is not None else []
+            candidates += [m for m in sorted(self.feed.books)
+                           if m != self._orientation_halt_market]
+            for mkt in candidates:
+                book = self.feed.books.get(mkt)
+                ours = book.best_yes_bid() if book is not None else None
+                if ours is None:
+                    continue
+                fresh = self._fresh_record_touches(mkt)
+                fbid = fresh[0] if fresh is not None else None
+                if fbid is not None and abs(ours - fbid) <= 3:
+                    recovered_on = (mkt, ours, fbid)
+                    break
+            if recovered_on is not None:
+                mkt, ours, fbid = recovered_on
                 self.gateway.resume_entries("ORIENTATION_DIVERGENCE")
                 self._orientation_halt_market = None
+                self._orientation_halt_ts = None
                 self.telegram.alert(
-                    f"✅ ORIENTATION recovered {mkt}: fresh record y{fbid}¢ "
+                    f"✅ ORIENTATION recovered on {mkt}: fresh record y{fbid}¢ "
                     f"agrees with ours y{ours}¢ (≤3¢) — entries re-enabled "
-                    "automatically (WO-HALT-ORPHAN §1.3)")
+                    "automatically (WO-2026-07-24-D Part 3: any live market, "
+                    "not the expired one that tripped it)")
                 log.warning("ORIENTATION_DIVERGENCE auto-cleared on %s: "
                             "fresh y%s vs ours y%s", mkt, fbid, ours)
+            elif (self._orientation_halt_ts is not None
+                  and now - self._orientation_halt_ts
+                  > config.ORIENTATION_HALT_MAX_S):
+                # the promise (auto-recovery) could not be kept within the
+                # ceiling — page LOUD rather than sit silent behind a dead
+                # market, and re-arm the ceiling so it does not spam every cycle.
+                self._orientation_halt_ts = now
+                failures.fail(
+                    "ORIENTATION_HALT_STUCK",
+                    f"entries have been ORIENTATION_DIVERGENCE-halted for "
+                    f">{int(config.ORIENTATION_HALT_MAX_S)}s with no live market "
+                    "reading clean — the halting market likely expired; needs "
+                    "/reset_halt or a look",
+                    fatal=False, alert=True,
+                    halt_market=self._orientation_halt_market,
+                    ceiling_s=config.ORIENTATION_HALT_MAX_S)
         for market, w in list(self.divergence_watches.items()):
             if now > w["until"]:
                 del self.divergence_watches[market]
@@ -1175,10 +1285,12 @@ class ShadowEngine:
                     del self.divergence_watches[market]
                     self.gateway.halt_entries("ORIENTATION_DIVERGENCE")
                     self._orientation_halt_market = market
+                    self._orientation_halt_ts = now   # Part 3: arm the ceiling
                     self.telegram.alert(
                         f"⛔ ORIENTATION_DIVERGENCE {market}: ours y{ours}¢ vs "
                         f"FRESH record y{rec}¢ >3¢ x3 — entries HALTED "
-                        "(auto-recovers on a clean fresh recheck)")
+                        "(auto-recovers on the first live market that reads "
+                        "clean; pages if stuck)")
                     failures.fail("ORIENTATION_DIVERGENCE",
                                   f"{market}: ours {ours}¢ vs FRESH record "
                                   f"{rec}¢ diverged 3 consecutive checks "
@@ -1390,9 +1502,23 @@ class ShadowEngine:
                     if (proposal.purpose == "ENTRY"
                             and br_key in self._budget_rejected):
                         continue
+                    # WO-2026-07-24-D Part 5: the moment a lane's gate is open,
+                    # release its closed-gate latch so the NEXT halt counts fresh.
+                    if not self.gateway.entries_halted_for(lane.name):
+                        self._halt_reject_latched.discard((lane.name, market))
                     try:
                         result = self.gateway.submit(proposal, book)
                     except WallRejection as e:
+                        # WO-2026-07-24-D Part 5: a closed-gate refusal (entries
+                        # halted) is not a wall bug — a halted lane re-proposes
+                        # every poll (~5/min). Count and log it ONCE per (lane,
+                        # market) until the gate opens, so hundreds of polls of
+                        # noise cannot bury a real reject in the `rejects=` field.
+                        if e.wall == "ENTRIES_HALTED":
+                            lk = (lane.name, market)
+                            if lk in self._halt_reject_latched:
+                                continue          # already noted; wait for open
+                            self._halt_reject_latched.add(lk)
                         self.gateway.reject_counts[e.wall] = \
                             self.gateway.reject_counts.get(e.wall, 0) + 1
                         # §2B: one budget rejection per lane/side/price/window
@@ -1862,6 +1988,7 @@ async def run():
                     f"frames={engine.feed.frames_seen} "
                     f"rejects={sum(engine.gateway.reject_counts.values())} "
                     f"venue_rejects={engine.gateway.venue_rejects} "
+                    f"{engine.recon_status_line()} "
                     f"listener={engine.listener_status()} "
                     f"brain={'ok' if _delta.is_loaded() else 'absent'} "
                     f"book✓ {engine.book_checks_total} "

@@ -114,12 +114,16 @@ def test_191030_replay_partial_fills_straddle_determined_exit(flip, gateway,
     assert take.count == 2                             # never a 1-lot split
     flip.on_submitted(take, "OID-T", CLOSE - 778)
     flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=777))   # poll 1: sustain
-    p_exit = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=776))
+    # WO-2026-07-24-D Part 2: mark 20 is below the floor (38−3=35) → rest one
+    # poll at the floor, then cross at the mark on the next poll — full size both.
+    p_rest = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=776))
+    assert [p for p in p_rest if p.purpose == "CUT"] == []
+    p_exit = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=775))
     cuts = [p for p in p_exit if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].count == 2       # ONE covered action
     assert "momentum stop" in cuts[0].reason
     ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 34, 2, "PROBE")
-    flip.note_exit(TICKER, "yes", 34, CLOSE - 776, count=2)
+    flip.note_exit(TICKER, "yes", 34, CLOSE - 775, count=2)
     assert w.window_realized == -28                    # bound loss, together
     flip.evaluate(TICKER, _ctx(_book(yes=34), secs_left=775))
     assert _rows(ledger, "FLIP_UNCOVERED_LEG") == 0    # ZERO pages, ever
@@ -146,7 +150,10 @@ def test_late_fill_on_closing_bucket_buffers_then_reopens(flip, gateway,
     flip.on_submitted(next(p for p in p_take if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 781)
     flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=780))    # poll 1: sustain
-    p_cut = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=779))
+    # WO-2026-07-24-D Part 2: below the floor (35) → rest one poll, then cross
+    p_rest = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=779))
+    assert [p for p in p_rest if p.purpose == "CUT"] == []
+    p_cut = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=778))
     cut = next(p for p in p_cut if p.purpose == "CUT")
     assert cut.count == 1
     w = flip.windows[TICKER]

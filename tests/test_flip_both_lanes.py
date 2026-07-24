@@ -130,12 +130,20 @@ def test_a_deep_low_needs_two_polls_never_a_single_dump(flip):
     """REPLACED by WO-2026-07-22-E: the hard-hold catastrophe suppression is
     retired (there is no hold on the favored side). But the 'never a single-poll
     dump' guard survives in the momentum stop — even a deep low bid (20c) does
-    NOT fire on ONE poll; it takes 2 sustained polls before it crosses out."""
+    NOT fire on ONE poll; it takes 2 sustained polls to fire. WO-2026-07-24-D
+    Part 2: through the FLOOR (mark below stop−slip) the stop now rests ONE poll
+    at the floor before crossing — a bounded ride, then the cross at the mark
+    with a counted breach (the flatten's floor, mirrored onto the stop)."""
     w, now = _inject(flip, entry=60, secs=800, age=30)
     b = _book(yes=20, no=55)                             # depth 10, deep low
     assert _cuts(_custody(flip, w, b, 800, now)) == []   # one poll: no dump
-    cuts = _cuts(_custody(flip, w, b, 799, CLOSE - 799))
-    assert len(cuts) == 1 and cuts[0].price_cents == 20  # 2 polls: crosses out
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
+    p2 = _custody(flip, w, b, 799, CLOSE - 799)          # 2 polls: rest at floor
+    assert _cuts(p2) == [] and any(
+        p.price_cents == floor and not p.crossfire
+        for p in p2 if p.purpose == "EXIT")
+    cuts = _cuts(_custody(flip, w, b, 798, CLOSE - 798))  # 3rd poll: crosses out
+    assert len(cuts) == 1 and cuts[0].price_cents == 20  # at the mark, breach counted
 
 
 # ── C: THE DECISION POINT (F's inventory-aware endgame) ────────────────────

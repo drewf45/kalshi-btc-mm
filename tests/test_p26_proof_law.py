@@ -178,14 +178,20 @@ def test_consumed_on_determined_too(flip, gateway):
 def test_evacuation_crosses_at_the_mark(flip, gateway):
     """SPOT_DECIDED is RETIRED. WO-2026-07-22-E: the MOMENTUM STOP prices AT
     the mark when the book is already THROUGH the stop (mark < entry−10) — a
-    CUT that crossfires, not a maker-grace slide to 31. (When mark still sits
-    at the stop it rests maker-first; here the book has gone through us.)"""
+    CUT that crossfires, not a maker-grace slide to 31. WO-2026-07-24-D Part 2:
+    below the FLOOR (stop−slip) it now rests ONE poll at the floor (EXIT, maker)
+    before that cross — the flatten's floor, mirrored — so the cross lands on
+    the 3rd sustained poll and prices at the mark with a counted breach."""
     _open_position(flip, gateway, entry=60)          # favored yes@60, stop 50
     take = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    # book collapses THROUGH the stop (mark 44 < stop 50), sustained 2 polls
-    flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=771))
-    props = flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=770))
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
+    # book collapses THROUGH the floor (mark 44 < floor 47), sustained
+    flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=771))     # poll 1
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=770))  # rest
+    assert len(p2) == 1 and p2[0].purpose == "EXIT" and not p2[0].crossfire
+    assert p2[0].price_cents == floor
+    props = flip.evaluate(TICKER, _ctx(_book(yes=44, no=56), secs_left=769))  # cross
     assert len(props) == 1
     p = props[0]
     assert p.purpose == "CUT" and p.crossfire

@@ -176,7 +176,8 @@ def test_non_converging_loser_still_cut(flip):
     intact, now via the MOMENTUM STOP (WO-2026-07-22-E, replacing the retired
     catastrophe/salvage/walk stack). A favored 60¢ entry whose mark falls to
     entry−10 and stays there is exited: a first poll does NOT fire, two
-    sustained polls do. The book is already through the stop → it crosses."""
+    sustained polls do. WO-2026-07-24-D Part 2: below the floor (stop−slip) it
+    rests one poll at the floor before the cross, so the cut lands on poll 3."""
     w = flip._window(TICKER, CLOSE)
     w.opens.clear()
     now = CLOSE - 700
@@ -184,10 +185,14 @@ def test_non_converging_loser_still_cut(flip):
                       "count": 1, "take_oid": None, "take_proposed": True,
                       "collapse_polls": 0, "catastrophe_polls": 0,
                       "det_ts": None, "entry_oid": None, "defer_polls": 0}
-    book = _mirror_book("yes", 40)          # mark 40 < stop 50: book through us
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
+    book = _mirror_book("yes", 40)          # mark 40 < floor 47: book through us
     p1 = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)
     assert [p for p in p1 if p.purpose in ("CUT", "EXIT")] == []   # 1 poll: armed
-    props = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)
+    p2 = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)  # rest
+    assert [p for p in p2 if p.purpose == "CUT"] == []
+    assert any(p.price_cents == floor and p.purpose == "EXIT" for p in p2)
+    props = flip._open_custody(w, TICKER, EVENT, book, _ctx(book), 700, now)  # cross
     cuts = [p for p in props if p.purpose == "CUT"]
     assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
     assert cuts[0].price_cents == 40 and cuts[0].crossfire is True

@@ -94,8 +94,12 @@ def test_first_minute_dip_is_noise_not_a_decision(flip, gateway, ledger):
     assert [p for p in p2 if p.purpose in ("CUT", "EXIT")] == []
     assert o["stop_polls"] == 1
     assert o.get("done") is not True                     # the position HOLDS
-    # a SECOND sustained poll DOES exit — the 2-poll momentum stop
+    # a SECOND sustained poll fires the stop — WO-2026-07-24-D Part 2: 45 is
+    # below the floor (50−3=47), so it rests one poll at the floor (not yet
+    # done), then the THIRD poll crosses at the mark and concludes.
     flip.evaluate(TICKER, _ctx(_book(yes=45), secs_left=729))
+    assert o.get("done") is not True
+    flip.evaluate(TICKER, _ctx(_book(yes=45), secs_left=728))
     assert o.get("done") is True
 
 
@@ -350,15 +354,21 @@ def test_no_new_scalp_entry_at_or_after_t10(flip):
 def test_post_window_genuine_collapse_cuts_hard(flip, gateway, ledger):
     """build 57: SPOT_DECIDED is RETIRED — the MOMENTUM STOP cuts a genuine
     collapse, loss bounded. An adverse move through the stop (mark < entry−10),
-    sustained 2 polls, crosses at the mark (crossfire) — no hold to ride."""
+    sustained, crosses at the mark (crossfire) — no hold to ride. WO-2026-07-24-D
+    Part 2: below the floor (stop−slip) it rests one poll at the floor first, so
+    the cross lands on the 3rd sustained poll (the flatten's floor, mirrored)."""
     o = _open_position(flip, gateway, ledger)            # favored yes @ 60
     p1 = flip.evaluate(TICKER, _ctx(_book(yes=60), secs_left=780))
     flip.on_submitted(next(p for p in p1 if p.purpose == "EXIT"),
                       "OID-T1", CLOSE - 780)
-    # book collapses through the stop (20 < entry−10 = 50), sustained 2 polls
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
+    # book collapses through the floor (20 < 47), sustained
     flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=701))  # poll 1: sustain
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=20), secs_left=700))  # poll 2: rest
+    assert [p for p in p2 if p.purpose == "CUT"] == []
+    assert any(p.price_cents == floor and p.purpose == "EXIT" for p in p2)
     cuts = [p for p in flip.evaluate(TICKER, _ctx(_book(yes=20),
-                                                  secs_left=700))
+                                                  secs_left=699))
             if p.purpose == "CUT"]
     assert len(cuts) == 1
     assert "momentum stop" in cuts[0].reason

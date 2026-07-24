@@ -1400,11 +1400,37 @@ class LaneFlip:
             o["stop_polls"] = (o.get("stop_polls", 0) + 1
                                if (mark is not None and mark <= stop_px) else 0)
             if o["stop_polls"] >= 2:
+                # WO-2026-07-24-D Part 2: the momentum stop gets the SAME price
+                # floor the flatten already has (the sibling path this fix was
+                # missing from). The declared max loss is entry−OPEN_MOMENTUM_
+                # STOP_C; the stop must not sell more than SLIP_TOLERANCE_C below
+                # it. If the book has gapped THROUGH the floor, rest ONE poll AT
+                # the floor (a bounded ride beats an unbounded market dump) before
+                # crossing; a cross below the floor is a COUNTED breach, never a
+                # silent one. Last night: entry 58, stop 48, sold at 44 (−94¢) —
+                # the unfloored `mark` cross gave back half the night on one exit.
+                floor = stop_px - config.SLIP_TOLERANCE_C
+                if (mark is not None and mark < floor
+                        and not o.get("stop_floor_tried")):
+                    o["stop_floor_tried"] = True
+                    n = self._exit_count(market, side, o["count"])
+                    if n > 0:
+                        props.append(Order(
+                            lane="FLIP", event=event, market=market, side=side,
+                            action="sell", price_cents=floor, count=n,
+                            size_tier=config.TIER_PROBE, purpose="EXIT",
+                            crossfire=False,
+                            reason=f"open momentum stop FLOOR {floor}c (entry "
+                                   f"{o['entry']}−{config.OPEN_MOMENTUM_STOP_C}−"
+                                   f"{config.SLIP_TOLERANCE_C}) — book through at "
+                                   f"{mark}c, rest one poll before the cross"))
+                    continue     # do NOT mark done: revisit and cross next poll
                 self._cancel_resting(o)
                 o["done"] = True
                 n = self._exit_count(market, side, o["count"])
                 if n > 0:
-                    crossed = mark < stop_px            # book already through us
+                    crossed = mark is not None and mark < stop_px  # book through us
+                    breached = mark is not None and mark < floor
                     o["exit_reason"] = "MOMENTUM_STOP"
                     props.append(Order(
                         lane="FLIP", event=event, market=market, side=side,
@@ -1417,6 +1443,21 @@ class LaneFlip:
                                f"{o['entry']}, −{config.OPEN_MOMENTUM_STOP_C}, "
                                f"2-poll{' — book through, cross' if crossed else ' — maker'}"
                                ": favored side moved against, thesis wrong, no hold)"))
+                    if breached:
+                        # a cross below the floor after a resting poll: bounded
+                        # loss counted, never a naked unbounded dump.
+                        from . import failures
+                        failures.fail(
+                            "FLIP_FLOOR_BREACH",
+                            f"{market} {side}: momentum stop crossed at {mark}c — "
+                            f"{floor - mark}c BELOW the {floor}c stop floor (entry "
+                            f"{o['entry']}−{config.OPEN_MOMENTUM_STOP_C}−"
+                            f"{config.SLIP_TOLERANCE_C}); the book was through the "
+                            "floor after a resting poll, so a counted breach beats "
+                            "a naked ride",
+                            fatal=False, alert=True, market=market, side=side,
+                            count=n, price=mark, floor=floor,
+                            overshoot=floor - mark, entry=o["entry"])
         return props
 
     def _check_uncovered(self, w: FlipWindow, market: str,

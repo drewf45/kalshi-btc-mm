@@ -3428,6 +3428,50 @@ cases (`test_size_test_data`); #7 binding term logged on every FLIP entry, F pat
 F sizes by notional, a path that never reads `FLIP_SIZE_CAP`; the FLIP_SIZE log is lane-gated); #9 revert
 condition in the config comment. Suite 756 · preflight 23/23.
 
+## WO-2026-07-24-D Part 2/3/4/5 — THE MORNING FOUR, build 1/2 (build 74)
+
+Four incomplete fixes, each read-rule verified **TRUE at source** — every one a correct idea landed on one
+path and not its sibling (the fourth instance of that pattern this week). No exposure change; ships before
+the size build so the doubled lane lands on a floored stop and a visible reconcile.
+
+**Part 2 — the momentum stop had no price floor.** Read-rule TRUE: `lane_flip.py` momentum stop priced
+`mark if crossed` (unbounded down) while the flatten (`:1602-1652`, WO-2026-07-23-B Part 2) already had the
+full `SLIP_TOLERANCE_C` floor — the same fix on one of two exit paths. Last night entry 58 / stop 48 sold
+at 44 (−94¢), half the night on one exit. **Fix:** mirror the flatten exactly — below `stop_px −
+SLIP_TOLERANCE_C` rest ONE poll at the floor (a bounded ride catches any floor liquidity), then cross at the
+mark with a **counted** `FLIP_FLOOR_BREACH` (acceptance #1: no fill below the floor without a counted
+breach). Within slip, unchanged. The 17 momentum-stop tests across 9 files re-anchored to the floor-then-
+cross doctrine (the through-floor exit now takes a 3rd poll).
+
+**Part 3 — ORIENTATION_DIVERGENCE could not auto-recover.** Read-rule TRUE: `shadow_runner.py:1143-1152`
+pinned recovery to `feed.books.get(self._orientation_halt_market)` — but that market expires in minutes and
+is pruned (`on_market_closed`), so `ours` is `None` forever and the clean-read condition can never fire
+again. Two occurrences, 161 minutes of dead time, each cleared only by Drew's key; no time ceiling existed.
+**Fix:** recover on the FIRST currently-open market (`feed.books`) that reads clean — orientation is our
+book's property, not one market's — and arm `_orientation_halt_ts` so a halt stuck past
+`ORIENTATION_HALT_MAX_S` (900s) pages `ORIENTATION_HALT_STUCK` instead of sitting silent (acceptance #2).
+
+**Part 4 — the reconcile deferred silently, and a stale pv pinned it.** Read-rule TRUE: `:918-924` deferred
+via `log.info` only (not Telegram/pack/hourly), and `_last_venue_pv_cents` refreshed only inside the
+`if cash is not None` success block (`:757`) — a failed read preserved a stale non-zero pv, and with
+`deployed_cents` later 0 the boundary gate deferred forever (and `abs(None − deployed)` would even crash).
+**Fix:** a failed `account_value` sets pv `None` (invalidate, don't preserve); a `None` pv defers as
+`RECON_NO_PV`; the hourly gains `recon_ok=<seconds since last clean cross-check>` + `recon_deferred=<streak>`
+(acceptance #3); and a run of `RECON_STALL_STREAK` (10) un-cross-checked cycles pages `RECON_STALLED`
+(acceptance #4). A completed reconcile resets the streak; a benign cash-protocol quiescence `DEFERRED` does
+not advance it.
+
+**Part 5 — the wall storm did not latch.** Read-rule TRUE: the `ENTRIES_HALTED` refusal (`gateway.py:240`)
+never flowed through the `_note_wall_reject` storm latch, and `reject_counts` climbed every poll (747→1359
+during one halt). **Fix:** count/skip the closed-gate reject ONCE per `(lane, market)` until the gate opens
+(`_halt_reject_latched`, released the moment `entries_halted_for(lane)` is empty) — acceptance #6.
+
+**Acceptance:** #1 floor + counted breach (`test_stop_rests_at_floor_then_crosses_below_with_a_counted_
+breach`); #2 live-market recovery OR `ORIENTATION_HALT_STUCK` (`test_orientation_recovers_on_a_live_market…`,
+`…stuck_pages_after_the_ceiling`); #3 `recon_ok=<s>` on the hourly + `RECON_STALLED`; #4 failed read →
+`RECON_NO_PV`, no crash; #6 `WALL_STORM`/closed-gate latch; #7 **F byte-identical** (`lane_fh8` untouched;
+the stop floor is FLIP-only). New `test_morning_four_build1.py` (11 tests). Suite 767 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

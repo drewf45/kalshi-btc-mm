@@ -118,11 +118,17 @@ def test_f1_decision_walks_to_scratch_never_crossfire(flip):
 def test_f1_catastrophe_still_crossfires(flip):
     """WO-2026-07-22-E re-anchor: a book already THROUGH the momentum stop
     (mark below entry−10, sustained) crossfires out at top of book rather than
-    resting a maker nobody will hit — the deep-adverse path still crossfires."""
+    resting a maker nobody will hit — the deep-adverse path still crossfires.
+    WO-2026-07-24-D Part 2: below the floor (stop−slip) it rests one poll at the
+    floor first, so the crossfire lands on the 3rd poll (the flatten's floor)."""
     w, now = _held(flip, entry=40, age=100)
-    b = _book(yes=20, no=55)                          # mark 20 < stop 30: book through us
+    floor = 40 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 27
+    b = _book(yes=20, no=55)                          # mark 20 < floor 27: through us
     _custody(flip, w, b, now)                         # poll 1
-    cuts = [p for p in _custody(flip, w, b, now) if p.purpose == "CUT"]
+    p2 = _custody(flip, w, b, now)                    # poll 2: rest at floor
+    assert [p for p in p2 if p.purpose == "CUT"] == []
+    assert any(p.price_cents == floor and p.purpose == "EXIT" for p in p2)
+    cuts = [p for p in _custody(flip, w, b, now) if p.purpose == "CUT"]  # poll 3
     assert len(cuts) == 1 and cuts[0].crossfire
     assert cuts[0].price_cents == 20 and "momentum stop" in cuts[0].reason
 

@@ -149,9 +149,11 @@ def test_mirror_holds_t10_handoff(flip):
 def test_momentum_stop_fires_both_sides(flip):
     """WO-2026-07-22-E: the momentum stop (entry − OPEN_MOMENTUM_STOP_C,
     sustained 2 polls) fires on EITHER held side, at the held-side mark,
-    symmetric. Here the book is THROUGH the stop (mark below it), so both sides
-    cross out — CUT, crossfire — at their own held mark. The exit is oriented to
-    the held side, so a YES and its NO mirror get byte-identical decisions."""
+    symmetric. Here the book is THROUGH the stop (mark below it). WO-2026-07-24-D
+    Part 2: through the FLOOR it rests ONE poll at the floor (EXIT, maker) then
+    crosses at the mark (CUT, crossfire) with a counted breach — both sides get
+    byte-identical decisions, the exit oriented to the held side."""
+    floor = 44 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 31
     for side in ("yes", "no"):
         w = flip._window(TICKER, CLOSE)
         w.opens.clear()
@@ -166,8 +168,12 @@ def test_momentum_stop_fires_both_sides(flip):
         b = _mirror_book(side, 20)              # 20 < entry−10 (34): book through
         ctx = _ctx(b, secs_left=700)
         flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)      # poll 1
+        p2 = flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)  # rest@floor
+        assert [p for p in p2 if p.purpose == "CUT"] == []
+        assert any(p.price_cents == floor and not p.crossfire
+                   for p in p2 if p.purpose == "EXIT")
         cuts = [p for p in flip._open_custody(w, TICKER, EVENT, b, ctx, 700, now)
-                if p.purpose == "CUT"]
+                if p.purpose == "CUT"]                                # cross
         assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
         assert cuts[0].price_cents == 20 and cuts[0].crossfire
         assert w.opens[side].get("exit_reason") == "MOMENTUM_STOP"

@@ -202,14 +202,20 @@ def test_favored_dip_through_the_stop_cuts_no_illiquidity_hold(flip, gateway,
     """INVERTED from WO-FLIP-LIQUIDITY-HOLD: on the favored side a low mark is
     NOT illiquidity to hold through — an adverse move is the thesis being
     WRONG. A shallow dip within the stop holds; a deep dip THROUGH the stop
-    (34 < 50), sustained 2 polls, cuts (the book is already through us → cross)."""
+    (34 < 50), sustained, cuts. WO-2026-07-24-D Part 2: through the floor (47)
+    it rests one poll at the floor before the cross (the flatten's floor)."""
     o = _open_pos(flip, gateway, ledger)                    # entry 60, stop 50
     for secs in (780, 779):                 # shallow dip within the stop: holds
         p = flip.evaluate(TICKER, _ctx(_book(yes=55, no=40), secs_left=secs))
         assert [x for x in p if x.purpose in ("CUT", "EXIT")] == []
     assert not o.get("done")
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
     flip.evaluate(TICKER, _ctx(_book(yes=34, no=40), secs_left=778))   # poll 1
-    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=40), secs_left=777))
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=34, no=40), secs_left=777))  # rest
+    assert [x for x in p2 if x.purpose == "CUT"] == [] and any(
+        x.price_cents == floor and not x.crossfire
+        for x in p2 if x.purpose == "EXIT")
+    props = flip.evaluate(TICKER, _ctx(_book(yes=34, no=40), secs_left=776))  # cross
     cuts = [x for x in props if x.purpose in ("CUT", "EXIT")]
     assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
     assert cuts[0].crossfire and o.get("done")
@@ -237,11 +243,16 @@ def test_the_momentum_stop_is_the_price_backstop(flip, gateway, ledger):
     """WO-2026-07-22-E: the fixed 20c CATASTROPHE floor is retired for live
     positions (the dead-floor now only guards a curfew-HELD winner). The
     momentum stop IS the price backstop — a book crashed to 20c is far through
-    the stop (50) and crosses out at the mark on 2 sustained polls."""
+    the stop (50) and crosses out at the mark. WO-2026-07-24-D Part 2: below the
+    floor (47) it rests one poll at the floor first, then crosses on the 3rd."""
     o = _open_pos(flip, gateway, ledger)                    # entry 60, stop 50
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
     flip.evaluate(TICKER, _ctx(_book(yes=20, no=40), secs_left=771))  # poll 1
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=20, no=40), secs_left=770))  # rest
+    assert [x for x in p2 if x.purpose == "CUT"] == [] and any(
+        x.price_cents == floor for x in p2 if x.purpose == "EXIT")
     cuts = [x for x in flip.evaluate(TICKER, _ctx(_book(yes=20, no=40),
-                                                  secs_left=770))
+                                                  secs_left=769))
             if x.purpose in ("CUT", "EXIT")]
     assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
     assert cuts[0].price_cents == 20 and cuts[0].crossfire

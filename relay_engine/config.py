@@ -308,6 +308,17 @@ RECON_AUDIT_FLOOR_CENTS = 2  # DREW-DEFAULT: E1 records an unexplained book/venu
 # cost, so a large-unrealized open position also defers — safe (skip + retry;
 # the reconcile still runs every flat window, where both are ~0).
 PV_TOLERANCE_C = 20  # DREW-DEFAULT: max venue-pv vs deployed_cents gap to trust the read
+# WO-2026-07-24-D Part 3: an ORIENTATION_DIVERGENCE halt auto-recovers on the
+# first CURRENTLY-OPEN market that reads clean (the halting market expires in
+# minutes and its book is pruned, so pinning recovery to it can never clear —
+# 161 minutes of dead time on two occasions). This is the hard ceiling: a halt
+# stuck longer than this pages ORIENTATION_HALT_STUCK rather than sitting silent.
+ORIENTATION_HALT_MAX_S = 900   # DREW-DEFAULT: ~11 windows — a stuck halt must page, not wait
+# WO-2026-07-24-D Part 4: a run of deferred/unreadable reconciles this long with
+# NO clean venue cross-check pages RECON_STALLED — "nothing pending" must be
+# distinguishable from "the check has not run in an hour" (the operator had no
+# way to tell a verified book from an unverified one).
+RECON_STALL_STREAK = 10        # DREW-DEFAULT: consecutive un-cross-checked cycles before it pages
 
 # ---------------------------------------------------------------------------
 # Walls (C.3 / BUILD_SEQUENCE 3.2)

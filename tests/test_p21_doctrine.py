@@ -183,14 +183,20 @@ def test_patient_hold_ignores_wiggles(flip, gateway):
 def test_determined_against_spot_evacuation(flip, gateway):
     """WO-2026-07-22-E: SPOT_DECIDED is retired. An adverse move that carries
     the held-side mark THROUGH the stop (mark < entry−OPEN_MOMENTUM_STOP_C),
-    sustained 2 polls, evacuates MAKER-FIRST — but the book is already through
-    us, so the resting sell crosses at the mark (CUT, crossfire)."""
+    sustained, evacuates MAKER-FIRST. WO-2026-07-24-D Part 2: below the FLOOR
+    (stop−slip) it rests ONE poll at the floor (EXIT, maker) then crosses at the
+    mark (CUT, crossfire) with a counted breach — the flatten's floor mirrored."""
     w = _open_position(flip, gateway, side="yes", entry=60)
     take = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))[0]
     flip.on_submitted(take, "OID-T", CLOSE - 780)
-    # mark drops through the stop (40 < entry−10 = 50), sustained 2 polls
-    flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=771))
-    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=770))
+    floor = 60 - config.OPEN_MOMENTUM_STOP_C - config.SLIP_TOLERANCE_C   # 47
+    # mark drops through the floor (40 < 47), sustained
+    flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=771))     # poll 1
+    p2 = flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=770))  # rest
+    assert len(p2) == 1
+    assert (p2[0].purpose, p2[0].action, p2[0].price_cents) == ("EXIT", "sell", floor)
+    assert not p2[0].crossfire
+    props = flip.evaluate(TICKER, _ctx(_book(yes=40, no=60), secs_left=769))  # cross
     assert len(props) == 1
     p = props[0]
     assert (p.purpose, p.action, p.price_cents) == ("CUT", "sell", 40)

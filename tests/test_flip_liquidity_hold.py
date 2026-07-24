@@ -117,14 +117,25 @@ def test_dips_above_the_stop_held_below_the_stop_exit(flip):
         assert [x for x in p2 if x.purpose in ("EXIT", "CUT")] == [], \
             f"mark {mark} above stop exited"
         assert not o.get("done")
+    # WO-2026-07-24-D Part 2: at/within-slip of the stop it exits on poll 2;
+    # THROUGH the floor (stop−slip) it rests one poll at the floor, then crosses.
+    floor = stop_px - config.SLIP_TOLERANCE_C          # 47
     for mark in (50, 45, 40):                          # at/below the stop: exits
         o, now = _pos(flip, entry=entry)
         b = _book(yes=mark, no=40)
         flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1
         p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2
-        exd = [x for x in p2 if x.purpose in ("EXIT", "CUT")]
-        assert len(exd) == 1 and o.get("exit_reason") == "MOMENTUM_STOP", \
-            f"mark {mark} at/below stop held"
+        if mark >= floor:                              # within slip: exits poll 2
+            exd = [x for x in p2 if x.purpose in ("EXIT", "CUT")]
+            assert len(exd) == 1 and o.get("exit_reason") == "MOMENTUM_STOP", \
+                f"mark {mark} at/below stop held"
+        else:                                          # through floor: rest then cross
+            assert any(x.price_cents == floor and x.purpose == "EXIT"
+                       for x in p2), f"mark {mark} did not rest at the floor"
+            p3 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 3
+            exd = [x for x in p3 if x.purpose in ("EXIT", "CUT")]
+            assert len(exd) == 1 and o.get("exit_reason") == "MOMENTUM_STOP", \
+                f"mark {mark} through floor never crossed"
 
 
 # ── WO-2026-07-22-E: the stop is armed from poll 1 — no opening-window grace ─
@@ -136,10 +147,14 @@ def test_fresh_position_stops_no_opening_window_grace(flip):
     THROUGH the stop for 2 polls crosses out at the mark just the same."""
     o, now = _pos(flip, entry=60, gap=10)              # fresh: held 10s
     stop_px = 60 - config.OPEN_MOMENTUM_STOP_C          # 50
-    b = _book(yes=stop_px - 5, no=40)                   # 45: book through the stop
+    floor = stop_px - config.SLIP_TOLERANCE_C           # 47
+    b = _book(yes=stop_px - 5, no=40)                   # 45: through the floor
     flip._open_custody(*w_side_ctx(flip, b, now, 700, None))     # poll 1
-    p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2
-    cuts = [x for x in p2 if x.purpose == "CUT"]
+    p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 2: rest
+    # WO-2026-07-24-D Part 2: below the floor it rests one poll before crossing
+    assert any(x.price_cents == floor and x.purpose == "EXIT" for x in p2)
+    p3 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))  # poll 3: cross
+    cuts = [x for x in p3 if x.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].price_cents == 45 and cuts[0].crossfire
     assert o.get("exit_reason") == "MOMENTUM_STOP"
 
@@ -172,10 +187,15 @@ def test_momentum_stop_crosses_when_book_through(flip):
     that has left. Sustained 2 polls; a single print does not fire."""
     o, now = _pos(flip, entry=60, gap=config.FLIP_NO_SELL_S + 30)
     stop_px = 60 - config.OPEN_MOMENTUM_STOP_C         # 50
-    mark = stop_px - 6                                  # 44: book through the stop
+    floor = stop_px - config.SLIP_TOLERANCE_C          # 47
+    mark = stop_px - 6                                  # 44: through the floor
     b = _book(yes=mark, no=55)
     p1 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))    # poll 1: sustain
     assert [p for p in p1 if p.purpose == "CUT"] == []
+    # WO-2026-07-24-D Part 2: poll 2 rests at the floor, poll 3 crosses at mark
+    p2 = flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
+    assert [p for p in p2 if p.purpose == "CUT"] == []
+    assert any(p.price_cents == floor and p.purpose == "EXIT" for p in p2)
     cuts = [p for p in flip._open_custody(*w_side_ctx(flip, b, now, 700, None))
             if p.purpose == "CUT"]
     assert len(cuts) == 1 and "momentum stop" in cuts[0].reason
