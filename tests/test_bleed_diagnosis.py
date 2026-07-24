@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from relay_engine import config, failures
+from relay_engine import config, delta, failures
 from relay_engine.book import OrderBook
 from relay_engine.custodian import Custodian
 from relay_engine.feed import DegradeLadder
@@ -70,6 +70,18 @@ def funnel(ledger):
                        boot_id=1)
     yield alerts
     failures._ledger = None
+
+
+@pytest.fixture(autouse=True)
+def _settle_surface(monkeypatch):
+    """WO-2026-07-24-J: HUNT's forward gate reads the SETTLE surface. These
+    bleed tests exercise the re-entry guards (which sit BEFORE gate B), so a
+    high, permissive settle LB lets the first hunt fire and the guards do their
+    job — the point of these tests is direction/averaging discipline, not the
+    edge floor (that is graded in test_p18_detective / the WO-J suite)."""
+    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL": 0.92)
+    monkeypatch.setattr(delta, "p_end_wilson_lb",
+                        lambda d, t, session="ALL": 0.90)
 
 
 @pytest.fixture

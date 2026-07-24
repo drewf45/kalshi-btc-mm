@@ -64,6 +64,18 @@ HUNT_TIMEBOX_M_S = 60.0    # TIME-BOX: the lag pays in a minute or it never was
 HUNT_BAND = (5, 95)        # no side-max, no price cap — the whole book
 
 # ---------------------------------------------------------------------------
+# WO-2026-07-24-J "POINT THE HUNTER FORWARD" — the forward (settle) gate. The
+# hunt no longer buys the TOUCH lag; it buys the SETTLE edge. Gate B is now
+#   edge = wilson_LB(p_end(d,t)) * 100 − join_cost   (cents of expected value)
+# and entry requires edge >= HUNT_EDGE_MIN_C. The needle (touch) demotes to an
+# ATTENTION signal (gate A: it decides WHEN the hunt looks, never WHETHER it
+# buys). DREW-DEFAULT 6c: floored at the taker fee-band cost (~4c round-trip on
+# a PROBE clip) + 2c of headroom — re-derive from the fill ledger, don't guess.
+# ---------------------------------------------------------------------------
+HUNT_EDGE_MIN_C = 6.0      # gate B: settle-edge (Wilson-LB EV) floor, in cents
+HUNT_EDGE_GONE_POLLS = 3   # P3 thesis-exit: settle-edge <= 0 sustained N polls
+
+# ---------------------------------------------------------------------------
 # P19 "SALVAGE" — the custodian earns Lane F. Needle-collapse exits for the
 # hold-to-settlement lanes; K is tuned from the DODGED_LOSS vs SALVAGE_REGRET
 # curve on Saturdays, never from a bad night.

@@ -332,6 +332,105 @@ def flip_fill_rate_by_price(ledger, limit: int = 500) -> str:
     return "FILL-RATE BY POSTED PRICE (24h): " + " · ".join(parts)
 
 
+import re as _re
+
+# WO-2026-07-24-J §P4 — the ENTRY casefile is the full tag set; DIVERGENCE
+# reads it back. Every HUNT entry line carries {p_end (settle%), p_end_LB,
+# p_touch, book, edge, ev_c}; the arrow is the side. One regex, one row.
+_HUNT_CASE_RE = _re.compile(
+    r"HUNT (?P<arrow>[↑↓]) spot \$(?P<dist>\d+) off strike, "
+    r"T-\d+:\d+ · settle (?P<settle>\d+)% \(LB (?P<lb>\d+)\) · "
+    r"book (?P<book>\d+)¢ · edge (?P<edge>[+-]?\d+) · "
+    r"touch (?P<touch>\d+)% \(info\) · EV (?P<ev>[+-]?\d+)")
+
+
+def _parse_hunt_case(detail: str) -> Optional[dict]:
+    m = _HUNT_CASE_RE.search(detail or "")
+    if not m:
+        return None
+    return {"side": "yes" if m.group("arrow") == "↑" else "no",
+            "dist": int(m.group("dist")),
+            "p_end": int(m.group("settle")), "p_end_lb": int(m.group("lb")),
+            "book": int(m.group("book")), "edge": int(m.group("edge")),
+            "p_touch": int(m.group("touch")), "ev_c": int(m.group("ev"))}
+
+
+def hunt_divergence_lines(ledger, since: Optional[float] = None) -> list:
+    """WO-2026-07-24-J §P5 — the DIVERGENCE read-back, HUNT-scoped. Settled
+    HUNT-eligible windows bucketed by EDGE answer three calibration questions
+    the desk must confront every day:
+      (1) REALIZED — of the HUNT-side bets in this edge bucket, how many
+          actually SETTLED in favor (window_outcomes.settled_yes vs side)?
+      (2) p_end   — what did the TABLE predict (mean settle%)?
+      (3) book    — what did the MARKET price (mean book cost = implied %)?
+    Divergence between (1), (2), (3) is the whole point: if realized tracks
+    p_end and both beat book, the forward gate has an edge; if realized lags
+    p_end, the table is overconfident and HUNT stays PROBE. HUNT tier is NOT
+    promoted here — this section only measures; promotion waits on the Wilson
+    bar clearing, reported per bucket."""
+    from .sizing import wilson_lower_bound
+    since = (time.time() - 86400) if since is None else since
+    rows = ledger.db.execute(
+        "SELECT detail, market FROM surface_rows WHERE lane='FLIP'"
+        " AND state='PROPOSED'"
+        " AND (detail LIKE 'HUNT ↑%' OR detail LIKE 'HUNT ↓%') AND ts>?",
+        (since,)).fetchall()
+    outcomes = dict(ledger.db.execute(
+        "SELECT market, settled_yes FROM window_outcomes").fetchall())
+    # edge buckets: at-floor, mid, rich — coarse (HUNT is selective, low count)
+    def _bucket(edge: int) -> str:
+        if edge < 8:
+            return "6-7"
+        if edge < 12:
+            return "8-11"
+        return "12+"
+    buckets = {}   # label -> {n, settled_known, settled_yes, p_end_sum, book_sum}
+    for detail, market in rows:
+        c = _parse_hunt_case(detail)
+        if c is None:
+            continue
+        b = buckets.setdefault(_bucket(c["edge"]),
+                               {"n": 0, "known": 0, "won": 0,
+                                "p_end_sum": 0, "book_sum": 0})
+        b["n"] += 1
+        b["p_end_sum"] += c["p_end"]
+        b["book_sum"] += c["book"]
+        sy = outcomes.get(market)
+        if sy is not None:
+            b["known"] += 1
+            hunt_side_won = (bool(sy) and c["side"] == "yes") or \
+                            ((not sy) and c["side"] == "no")
+            if hunt_side_won:
+                b["won"] += 1
+    if not buckets:
+        return ["HUNT DIVERGENCE (24h): no HUNT-eligible windows yet — the "
+                "forward gate is selective (low count reads as discipline)"]
+    out = ["HUNT DIVERGENCE (24h) — realized settle vs p_end vs book, by edge:"]
+    for label in ("6-7", "8-11", "12+"):
+        b = buckets.get(label)
+        if not b:
+            continue
+        mean_pe = b["p_end_sum"] / b["n"]
+        mean_bk = b["book_sum"] / b["n"]
+        if b["known"]:
+            realized = 100.0 * b["won"] / b["known"]
+            lb = wilson_lower_bound(b["won"], b["known"])
+            # the Wilson bar: realized-LB must clear the market's implied price
+            # for the edge to be real; until then HUNT is PROBE.
+            cleared = (lb * 100.0) > mean_bk
+            realized_s = (f"realized {realized:.0f}% (LB {lb * 100:.0f}%, "
+                          f"n={b['known']})")
+            bar_s = (" · Wilson bar CLEARED (LB>book) → promotable"
+                     if cleared else " · PROBE (LB≤book, not yet earned)")
+        else:
+            realized_s = "realized n/a (no settled windows yet)"
+            bar_s = " · PROBE (unmeasured)"
+        out.append(
+            f"  edge {label}: {realized_s} vs p_end {mean_pe:.0f}% vs "
+            f"book {mean_bk:.0f}%{bar_s} · entries {b['n']}")
+    return out
+
+
 def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[int] = None,
                foreign_fills: int = 0, econ=None) -> str:
     """The daily pack: EPOCH 2 header, the worst-day bound, live-vs-pending
@@ -553,6 +652,13 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
                 "— shadow drives live only once it tracks measured")
     except Exception as e:
         lines.append(f"SWING GATE CAL: unavailable ({e})")
+    # WO-2026-07-24-J §P5: THE DIVERGENCE READ-BACK — HUNT's forward gate on
+    # trial. Realized settle vs the table's p_end vs the market's book, by
+    # edge; HUNT stays PROBE until a bucket's Wilson LB clears the book.
+    try:
+        lines.extend(hunt_divergence_lines(ledger))
+    except Exception as e:
+        lines.append(f"HUNT DIVERGENCE: unavailable ({e})")
     # WO-BLEED-DIAGNOSIS §3: the data for Drew's F passthrough ruling —
     # break-even at +3-5c wins vs -93.5c tails is ~95%+; rule A-vs-B from
     # THIS number, never from one bad print.

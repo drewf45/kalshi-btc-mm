@@ -124,12 +124,22 @@ def load(path: Optional[str] = None) -> bool:
                 d = int(row["distance_usd"])
                 t = int(row["secs_remaining"])
                 s = row["session"]
-                table[(d, t, s)] = {
+                cell = {
                     "p_cross": float(row["p_cross"]),
                     "n": int(row["n"]),
                     "effective_n": int(row["effective_n"]),
                     "wilson_ub": float(row["wilson_ub"]),
                 }
+                # WO-2026-07-24-J P1: the SETTLE surface — p_end (window CLOSES
+                # beyond the strike, the question the market prices) rides the
+                # SAME table as one new column family. Absent on legacy tables →
+                # not in the cell → the accessors return None → HUNT stays BLIND
+                # (exactly the touch table's own absence discipline).
+                if row.get("p_end") not in (None, ""):
+                    cell["p_end"] = float(row["p_end"])
+                    cell["p_end_n"] = int(row.get("p_end_n") or row["n"])
+                    cell["p_end_wilson_lb"] = float(row["p_end_wilson_lb"])
+                table[(d, t, s)] = cell
         _TABLE = table
         _LOADED = True
         _REFUSAL_REASON = None
@@ -263,6 +273,37 @@ def p_survive(distance_usd: float, secs_remaining: float,
     """Survival probability = 1 - p_cross. Gate-input only."""
     p = p_cross(distance_usd, secs_remaining, session)
     return None if p is None else 1.0 - p
+
+
+def p_end(distance_usd: float, secs_remaining: float,
+          session: str = "ALL") -> Optional[float]:
+    """WO-2026-07-24-J P1: the SETTLE question — P(the window CLOSES at least
+    `distance_usd` from where it started in the time left), the empirical
+    analog of a contract settling beyond a strike that far away. The point
+    estimate; GATE on p_end_wilson_lb (the conservative LOWER bound). None when
+    the table is absent OR carries no settle surface (legacy touch-only) — HUNT
+    is BLIND, never a guess, exactly like the touch table."""
+    cell = _lookup(distance_usd, secs_remaining, session)
+    return cell.get("p_end") if cell else None
+
+
+def p_end_wilson_lb(distance_usd: float, secs_remaining: float,
+                    session: str = "ALL") -> Optional[float]:
+    """The Wilson LOWER bound on p_end, computed with effective_n — the number
+    HUNT's edge gate reads (never the point estimate; the Adversary's thin-cell
+    guard). None = table/surface absent → BLIND."""
+    cell = _lookup(distance_usd, secs_remaining, session)
+    return cell.get("p_end_wilson_lb") if cell else None
+
+
+def settle_loaded() -> bool:
+    """True when the loaded table carries the SETTLE surface (p_end). A legacy
+    touch-only table returns False → HUNT's forward gate stays BLIND."""
+    if not _LOADED:
+        return False
+    for cell in _TABLE.values():
+        return "p_end" in cell
+    return False
 
 
 def h8_table_verdict(distance_usd: float, secs_remaining: float,

@@ -254,32 +254,42 @@ CHECKS_P17 = [
 ]
 
 
-# ── P18 "THE DETECTIVE" — expected tape ────────────────────────────────────
+# ── P18 "THE DETECTIVE" · WO-2026-07-24-J "POINT THE HUNTER FORWARD" ────────
 def _hunt_rows(db, since):
+    """HUNT ENTRY casefiles. WO-J §P4 rewrote the why to the forward format
+    (`HUNT ↑/↓ spot $.. off strike, T-.. · settle ..% (LB ..) · book ..¢ ·
+    edge .. · touch ..% (info) · EV ..`), so the filter keys on the arrow
+    prefix, not the retired `HUNT needle`."""
     return db.execute(
         "SELECT detail, ts, market FROM surface_rows WHERE lane='FLIP'"
-        " AND state='PROPOSED' AND detail LIKE '%HUNT needle%' AND ts>?",
+        " AND state='PROPOSED'"
+        " AND (detail LIKE 'HUNT ↑%' OR detail LIKE 'HUNT ↓%') AND ts>?",
         (since,)).fetchall()
 
 
 def check_hunt_whys_complete(db, since):
-    """every HUNT why carries (ΔP, d_before→d_after, fair, gap, converge)."""
+    """WO-J §P4 — every HUNT entry casefile names its questions: SETTLE (gated,
+    with its Wilson LB), BOOK cost in ¢, the EDGE the gate used, TOUCH marked
+    (info), and the EV tag. "fair" is banned; every distance carries $."""
     rows = _hunt_rows(db, since)
     bad = sum(1 for (d, _, _) in rows
-              if not all(tok in d for tok in
-                         ("needle +", "d ", "fair", "gap", "converging")))
+              if not (all(tok in d for tok in
+                          ("spot $", "settle ", "(LB ", "book ", "edge ",
+                           "touch ", "(info)", "EV "))
+                      and "fair" not in d))
     return bad == 0, f"{bad} incomplete of {len(rows)} hunt casefiles"
 
 
-def check_hunt_needles_at_or_above_n(db, since):
-    """zero HUNT entries with ΔP < N (gate A is the law, graded)."""
+def check_hunt_edge_at_or_above_floor(db, since):
+    """WO-J §P2 — zero HUNT entries with edge < HUNT_EDGE_MIN_C (gate B, the
+    FORWARD gate, is the law, graded from the printed edge)."""
     from relay_engine import config as _cfg
     bad = 0
     for detail, _, _ in _hunt_rows(db, since):
-        m = re.search(r"needle \+(\d+)pts", detail)
-        if m and float(m.group(1)) < _cfg.HUNT_NEEDLE_POINTS:
+        m = re.search(r"edge ([+-]?\d+)", detail)
+        if m and float(m.group(1)) < _cfg.HUNT_EDGE_MIN_C:
             bad += 1
-    return bad == 0, f"{bad} sub-N needle(s)"
+    return bad == 0, f"{bad} sub-floor edge(s)"
 
 
 def check_no_p_hunt_collision(db, since):
@@ -335,8 +345,8 @@ def check_hit_rate_bar_ships(db, since):
 
 
 CHECKS_P18 = [
-    ("every HUNT casefile complete: ΔP, d, fair, gap, converge", check_hunt_whys_complete),
-    ("zero HUNT entries with ΔP < N (gate A graded)", check_hunt_needles_at_or_above_n),
+    ("every HUNT casefile complete: settle+LB, book, edge, touch(info), EV", check_hunt_whys_complete),
+    ("zero HUNT entries with edge < floor (gate B graded)", check_hunt_edge_at_or_above_floor),
     ("zero P-vs-HUNT collisions (suppression instead)", check_no_p_hunt_collision),
     ("every hunt resolves — no aging flip inventory", check_hunts_resolve),
     ("PAIR mode still posts on two-way books", check_pair_mode_alive),

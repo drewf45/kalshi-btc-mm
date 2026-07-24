@@ -65,12 +65,14 @@ re-runs every TAPE line here forever (registry tests never retire).
 - CODE: `relay_engine/custodian.py:503`
 - TAPE: `zero BATON_VIOLATION FATALs (P14)`
 
-### 8. The needle is the trigger
-- LAW: HUNT entries fire only on a measured spot-displacement needle with
-  a complete casefile — ΔP, d, fair, gap, convergence (live hunt
-  receipts).
-- CODE: `relay_engine/spotlead.py:58`
-- TAPE: `every HUNT casefile complete: ΔP, d, fair, gap, converge`
+### 8. The needle points; the settle edge fires
+- LAW: HUNT looks only on a measured spot-displacement needle (gate A,
+  ATTENTION), but it BUYS only on the forward SETTLE edge — every entry
+  carries a casefile that names each probability's question (settle / touch),
+  its $ distance, the EDGE the gate used, the info-only touch, and the EV tag
+  (WO-2026-07-24-J). "fair" is banned — it names no question.
+- CODE: `relay_engine/lane_flip.py:1244`
+- TAPE: `every HUNT casefile complete: settle+LB, book, edge, touch(info), EV`
 
 ### 9. The custodian earned F
 - LAW: salvage (needle-collapse maker-first exit, K15/S10, 👑 11:06) is the
@@ -128,7 +130,7 @@ re-runs every TAPE line here forever (registry tests never retire).
   measures the lead in probability points (P18 §0, banked in spotlead.py's
   docstring).
 - CODE: `relay_engine/spotlead.py:1`
-- TAPE: `zero HUNT entries with ΔP < N (gate A graded)`
+- TAPE: `zero HUNT entries with edge < floor (gate B graded)`
 
 ### 17. The score decides the size
 - LAW: every closed unit of risk writes its cell (lane × 5¢ entry

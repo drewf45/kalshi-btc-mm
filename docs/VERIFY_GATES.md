@@ -3704,6 +3704,80 @@ line (fills-loop dedup + P4); #6 **F byte-identical** (`lane_fh8` untouched; sto
 New `test_blind_is_not_bare.py` (7 tests); `test_uncovered_flatten`/`test_flip_count1` re-anchored to the
 registry doctrine (a resting sell is cover). Suite 809 · preflight 23/23.
 
+## WO-2026-07-24-J — POINT THE HUNTER FORWARD (build 80)
+
+The banked Divergence Engine (the WO-F design) goes LIVE as HUNT's first scope — **HUNT is not turned
+off; it is pointed forward.** The hunt was buying the wrong number: the touch-lag (`fair = 100 ×
+p_survive`) is P(BTC ever *touches* the strike), but the KXBTC15M contract settles on where the window
+**CLOSES**. So the hunt paid for touches and the market paid for closes, and the gap between them was
+the bleed. WO-J builds the missing surface, gates on it, exits on it, narrates it, and reads it back.
+
+**Read-rule (against build 79, all TRUE):** J1 `spotlead.py:37,73` — the needle's `fair_cents` is
+`100 × p_side` and `p_side` derives from `delta.p_survive` (= 1 − p_cross, the TOUCH surface); the name
+"fair" names no question — TRUE, renamed. J2 `lane_flip.py:1191` — gate B was `gap = sl.fair_cents −
+join >= HUNT_GAP_CENTS`, a touch-lag gate — TRUE, replaced by the settle-edge gate. J3
+`lane_flip.py:1300` — the `mark <= entry − 2` two-tick level bail — TRUE, retired. J4 the delta corpus
+(`delta_builder.py`) already walks every 15-min window's candles for the touch max-excursion; the
+**close-at-window-end** is the same walk's free byproduct — TRUE, one new counter, no second corpus.
+
+**P1 — the SETTLE surface, question-tagged.** `delta_builder.compute_delta_table` now emits a second
+column family from the SAME 180-day Coinbase corpus: `p_end(d,t)` = fraction of windows whose **net**
+close displacement `|end_close − start_close| × sub_minute_scale ≥ d`, with `p_end_n` and
+`p_end_wilson_lb` (the Wilson **LOWER** bound on `effective_n` distinct windows — the hunt gates at the
+conservative bound, never the point). The accessors `delta.p_end` / `delta.p_end_wilson_lb` /
+`delta.settle_loaded` return **None/False** on a legacy touch-only tape → HUNT stays **BLIND**, exactly
+the touch table's own absence discipline. **The physics (Adversary ii):** a window that closes beyond
+`d` necessarily *touched* `d`, so `p_end ≤ p_cross` **everywhere** — the validator gates it (`A1: p_end
+<= p_cross (settle ⊆ touch)`), and the two surfaces are provably DIFFERENT numbers, not one mislabeled.
+CSV schema, A1–A5, session-hash parity, synthetic/non-Coinbase/SHA refusal all extend to the new family.
+
+**P2 — the forward gate.** HUNT's gate B is now `edge = wilson_LB(p_end(d,t)) × 100 − join`, entry
+requires `edge ≥ HUNT_EDGE_MIN_C` (**DREW-DEFAULT 6c** — floored at a PROBE round-trip taker cost ~4c +
+2c headroom, re-derivable from the fill ledger). The needle **demotes to ATTENTION**: gate A (ΔP ≥ N)
+still decides *when the hunt looks*, never *whether it buys* — the settle edge decides that. Absent the
+settle surface the gate is BLIND and sits out (`HUNT_BLIND`, paged once). Every ENTRY carries the EV tag
+`ev_c = p_end(point) × 100 − join`. Gate C (sustained convergence) unchanged; One-Shot, HUNT seniority,
+HUNT_REFUSE_LOWER, direction-lock all preserved.
+
+**P3 — the exit watches the thesis.** The two-tick level bail retires. `_hunt_custody` re-reads the
+settle LB at the **current** geometry (`_hunt_settle_lb`: spot→strike distance now, secs now) and bails
+when `wilson_LB(p_end) × 100 ≤ cost` sustained `HUNT_EDGE_GONE_POLLS` (3) polls — the edge that bought
+the hunt is gone — logging **both numbers** (`hunt exit — edge gone (settle X% ≤ cost Y¢)`). Blindness
+never fires it (no strike / no surface → the check abstains; the named guardrails — breakeven-not-out-
+in-R, TIME-BOX, CURFEW — still fire).
+
+**P4 — every probability names its question.** The casefile is ONE format (`lane_flip.py:_hunt_casefile`):
+`HUNT ↑ spot $56 off strike, T-9:05 · settle 22% (LB 18) · book 15¢ · edge +3 · touch 70% (info) · EV +7`.
+Distances carry `$`; the gated quantity is **edge** (the Wilson-LB cents the gate used); the touch
+probability is INFO-only, marked `(info)`; the EV tag rides. **"fair" is banned** — `Needle.casefile`
+relabels its touch number `touch NN% (info)`. The touch surface itself is **untouched**, only labeled.
+
+**P5 — the DIVERGENCE read-back.** The daily bundle gains a HUNT-scoped section (`ops.hunt_divergence_
+lines`): settled HUNT-eligible windows bucketed by **edge** answer three calibration questions —
+(1) REALIZED settle rate (HUNT-side wins vs `window_outcomes.settled_yes`), (2) the table's **p_end**,
+(3) the market's **book**-implied. The full tag set `{p_end, p_end_LB, p_touch, book, edge, ev_c}` is
+parsed straight from the entry casefile. HUNT is **not promoted here** — it stays PROBE until a bucket's
+realized Wilson LB clears the book (reported per bucket); this section measures, it does not size.
+
+**Sibling greps (acceptance #7 — every touch-probability consumer cited):** HUNT's gate B is the ONLY
+migration to `p_end`. `spotlead.needle` (`p_survive`) stays touch — it is now the ATTENTION signal, relabeled.
+`lanes.py:284` (F/H8 swing-gate floor), `custodian.py:317` (salvage needle), `lane_flip.py:1032-1094`
+(OPEN two-barrier + shadow proxy), `shadow_runner.py:1114` all stay **touch** (their questions are touch
+questions), cited unchanged. `lane_fh8.py:354` (F's `|TBL_…p_cross|` info line) stays **byte-identical**.
+
+**Acceptance:** #1 settle table builds with per-cell {p_end,n,wilson_lb}, question-tagged, `p_end ≤
+p_cross` proven, touch untouched (`test_settle_surface_built_question_tagged_and_bounded`,
+`test_accessors_blind_on_legacy_table`); #2 entries fire only on `edge ≥ floor` from the Wilson-LB, needle
+as attention, EV tag logged (`test_confirmed_needle_hunts_with_casefile`, `test_edge_under_floor_never_
+hunts`, `test_blind_settle_surface_never_hunts`); #3 two-tick bail gone, `edge gone` exit with both numbers
+(`test_job_b_thesis_exit_when_edge_gone`, `test_thesis_exit_blind_never_fires`); #4 casefile/exit match the
+P4 format, "fair" banished (`test_casefile_names_its_questions_and_banishes_fair`); #5 DIVERGENCE with three
+computable questions + full tag set (`test_divergence_computes_realized_vs_p_end_vs_book`,
+`test_divergence_parses_full_tag_set`); #6 **F byte-identical** (`lane_fh8` untouched), FLIP desk / One-Shot /
+seniority / gate C preserved; #7 sibling greps above. New `test_point_the_hunter_forward.py` (12 tests);
+`test_p18_detective` re-anchored to the forward gate; `tape_grade`/`SEMANTICS.md` registry updated to the
+new casefile vocabulary. Suite 823 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

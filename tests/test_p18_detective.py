@@ -31,12 +31,18 @@ def engine(tmp_path):
 @pytest.fixture
 def table(monkeypatch):
     """A deterministic delta-table stand-in: survival rises with distance,
-    scaled by time (near strike + clock on it = volatile; far/late = frozen)."""
+    scaled by time (near strike + clock on it = volatile; far/late = frozen).
+    WO-2026-07-24-J: the SETTLE surface (p_end / p_end_wilson_lb) is stubbed
+    too — HUNT's forward gate reads it, and a high LB (0.70) means a 60c join
+    clears the +6 edge floor while a 91c join does not."""
     def p_survive(d, t, session="ALL"):
         # reachability shrinks with clock: ~$0.30/s of plausible travel
         edge = min(1.0, d / (0.3 * max(1.0, t)))
         return 0.5 + 0.43 * edge
     monkeypatch.setattr(delta, "p_survive", p_survive)
+    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL": 0.72)
+    monkeypatch.setattr(delta, "p_end_wilson_lb",
+                        lambda d, t, session="ALL": 0.70)
     return p_survive
 
 
@@ -99,8 +105,15 @@ def test_confirmed_needle_hunts_with_casefile(engine, table):
     assert o.purpose == "ENTRY" and o.side == "yes" and o.action == "buy"
     assert o.price_cents == 60          # MAKER JOIN at the touch, no chasing
     assert o.band == config.HUNT_BAND   # no side-max, no price cap
-    for tok in ("HUNT needle +", "d ", "fair", "gap", "converging"):
+    # WO-2026-07-24-J §P4: the forward casefile — every probability names ITS
+    # question (settle / touch), distances carry $, the gate quantity is EDGE,
+    # the info-only touch is marked, and the EV tag rides. "fair" is banned.
+    for tok in ("HUNT ↑", "spot $", "settle ", "(LB ", "book ", "edge +",
+                "touch ", "(info)", "EV "):
         assert tok in o.why, (tok, o.why)
+    assert "fair" not in o.why
+    # edge = p_end_lb(0.70)*100 − join(60) = +10
+    assert "edge +10" in o.why
 
 
 def test_single_frame_never_hunts(engine, table):
@@ -108,9 +121,21 @@ def test_single_frame_never_hunts(engine, table):
     assert props == []                  # no single-tick knives (gate C)
 
 
-def test_gap_under_g_never_hunts(engine, table):
-    # fair ≈ 93 for this needle; a join at 91 leaves gap < 4 — invisible lag
+def test_edge_under_floor_never_hunts(engine, table):
+    # WO-J §P2: settle-LB 70%, a join at 91c leaves edge = 70−91 = −21 < 6 —
+    # the market has caught up; there is no forward edge to buy.
     props = drive_hunt(engine, join=91)
+    assert props == []
+
+
+def test_blind_settle_surface_never_hunts(engine, monkeypatch):
+    # WO-J §P2: a legacy touch-only table (p_end absent) → the forward gate is
+    # BLIND → HUNT sits out. A qualifying needle is NOT enough on its own.
+    monkeypatch.setattr(delta, "p_survive",
+                        lambda d, t, session="ALL": 0.93)
+    monkeypatch.setattr(delta, "p_end_wilson_lb",
+                        lambda d, t, session="ALL": None)
+    props = drive_hunt(engine, join=60)
     assert props == []
 
 
@@ -171,15 +196,42 @@ def test_job_b_breakeven_reprice_then_bail(engine, table):
     assert "not-out-in" in cuts[0].reason
 
 
-def test_job_b_hard_bail_at_entry_minus_2(engine, table):
+def test_job_b_thesis_exit_when_edge_gone(engine, table, monkeypatch):
+    """WO-2026-07-24-J §P3: the two-tick level bail (`mark<=entry-2`) RETIRES.
+    A hunt is not wrong because the mark ticked; it is wrong when the SETTLE
+    edge is gone — wilson_LB(p_end) at CURRENT geometry ≤ the mark, sustained
+    N polls — and the exit logs BOTH numbers."""
     w = hunted(engine, table)
     w.hunts["yes"]["take_oid"] = "TAKE-1"
     w.hunts["yes"]["take_proposed"] = True
-    props = engine.flip.evaluate(TICKER, hunt_ctx(hunt_book(58), STRIKE + 80,
-                                                  secs_left=496))
-    cuts = [p for p in props if p.purpose == "CUT"]
+    # the settle LB collapses below the 60c mark → the edge that bought it is gone
+    monkeypatch.setattr(delta, "p_end_wilson_lb",
+                        lambda d, t, session="ALL": 0.45)
+
+    def ctx(secs):
+        return {"book": hunt_book(60), "now": CLOSE - secs, "close_ts": CLOSE,
+                "spot": STRIKE + 80, "boundary_hi": STRIKE, "boundary_lo": None,
+                "spotlead": None}
+    cuts = []
+    for i in range(config.HUNT_EDGE_GONE_POLLS):     # sustained N polls
+        props = engine.flip.evaluate(TICKER, ctx(496 - i))
+        cuts = [p for p in props if p.purpose == "CUT"]
     assert len(cuts) == 1 and cuts[0].crossfire is True
-    assert "mark<=entry-2" in cuts[0].reason
+    assert "edge gone" in cuts[0].reason
+    assert "settle 45%" in cuts[0].reason and "cost 60¢" in cuts[0].reason
+
+
+def test_thesis_exit_blind_never_fires(engine, table):
+    """The thesis exit NEVER fires on blindness: no boundaries → no strike →
+    the settle LB is unreadable → the edge-gone bail cannot trigger (the named
+    guardrails still can)."""
+    w = hunted(engine, table)
+    w.hunts["yes"]["take_oid"] = "TAKE-1"
+    w.hunts["yes"]["take_proposed"] = True
+    for i in range(config.HUNT_EDGE_GONE_POLLS + 2):
+        props = engine.flip.evaluate(TICKER, hunt_ctx(hunt_book(60),
+                                                      STRIKE + 80, 496 - i))
+        assert not [p for p in props if p.purpose == "CUT"]
 
 
 def test_timebox_flattens_at_m(engine, table):
@@ -243,11 +295,14 @@ def test_pack_prints_the_bar(engine):
     assert "bar ≥50%" in pack and "HUNT volume expected LOW" in pack
 
 
-def test_p18_tape_grade_clean_and_catches_sub_n(engine):
+def test_p18_tape_grade_clean_and_catches_sub_floor(engine):
     from scripts.tape_grade import CHECKS_P18, grade
     assert all(ok for _, ok, _ in grade(engine.ledger.db, checks=CHECKS_P18))
-    engine.surface.write_row("FLIP", TICKER, "w-x", "PROPOSED",
-                             detail="order=1 ENTRY @60c why=HUNT needle +3pts "
-                                    "(d 80→10, T-8:20) · fair 64 · gap 4 · converging")
+    # WO-2026-07-24-J §P2: a HUNT entry printed with edge below the floor is a
+    # graded violation (the forward gate is the law).
+    engine.surface.write_row(
+        "FLIP", TICKER, "w-x", "PROPOSED",
+        detail="HUNT ↑ spot $80 off strike, T-8:20 · settle 62% (LB 58) · "
+               "book 55¢ · edge +3 · touch 70% (info) · EV +7")
     results = {n: ok for n, ok, _ in grade(engine.ledger.db, checks=CHECKS_P18)}
-    assert results["zero HUNT entries with ΔP < N (gate A graded)"] is False
+    assert results["zero HUNT entries with edge < floor (gate B graded)"] is False

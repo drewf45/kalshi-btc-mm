@@ -227,6 +227,7 @@ class FlipWindow:
     hunt_last_entry: Optional[int] = None
     hunt_lost: bool = False
     hunt_refuse_logged: bool = False
+    hunt_blind_logged: bool = False   # WO-J §P2: the settle-surface BLIND pages ONCE
     trips: int = 0
     scratches: int = 0
     window_realized: int = 0
@@ -730,7 +731,8 @@ class LaneFlip:
         # 1.5) P18 HUNT custody — JOB A takes, JOB B bails, curfew flat.
         # Runs EVERY cycle regardless of the discipline gates below (risk
         # management never waits its turn).
-        proposals.extend(self._hunt_custody(w, market, event, book, secs, now))
+        proposals.extend(self._hunt_custody(w, market, event, book, secs, now,
+                                            ctx))
 
         # 1.6) P21 A5 OPEN custody — THE PATIENT HOLD's three exits. Also
         # every cycle, before any entry gate.
@@ -1141,6 +1143,7 @@ class LaneFlip:
                     sl, secs: float) -> List[Order]:
         """The three questions as arithmetic — ALL required. ONE hunt per
         displacement event (the runner re-anchors on submit)."""
+        from . import delta
         if secs <= FLIP_CURFEW:            # no hunt entries after the handoff
             w.hunt_pending = None
             return []
@@ -1188,8 +1191,26 @@ class LaneFlip:
                          "no averaging down; sit out (WO-BLEED-1)",
                          market, side, join, w.hunt_last_entry)
             return []
-        gap = sl.fair_cents - join
-        if gap < config.HUNT_GAP_CENTS:                 # gate B
+        # ── gate B — THE FORWARD (SETTLE) GATE · WO-2026-07-24-J §P2 ─────────
+        # The hunt no longer buys the TOUCH lag (needle · fair). The market
+        # prices the CLOSE, so the edge is the conservative expected value of
+        # the SETTLE question at the Wilson LOWER bound, in cents:
+        #     edge = wilson_LB(p_end(d_after, t)) * 100 − join_cost
+        # Entry requires edge >= HUNT_EDGE_MIN_C. Absent the settle surface the
+        # hunt is BLIND (never a touch-fair guess) — evidence-born, exactly like
+        # D on no table. The needle above is now ATTENTION only (gate A: it
+        # decides WHEN the hunt looks, never WHETHER it buys).
+        p_end_lb = delta.p_end_wilson_lb(sl.d_after, secs)
+        if p_end_lb is None:                            # no settle surface → BLIND
+            w.hunt_pending = None
+            if not w.hunt_blind_logged:
+                w.hunt_blind_logged = True
+                log.info("HUNT_BLIND %s %s: settle surface absent (p_end) — the "
+                         "forward gate cannot price; sitting out (WO-J)",
+                         market, side)
+            return []
+        edge = p_end_lb * 100.0 - join                  # cents of conservative EV
+        if edge < config.HUNT_EDGE_MIN_C:               # gate B: the settle edge
             w.hunt_pending = None
             return []
         # gate C: convergence + sustained confirm (lane_p's flicker-proof
@@ -1207,19 +1228,72 @@ class LaneFlip:
         if pend["confirms"] < config.HUNT_CONFIRM_FRAMES:
             return []
         w.hunt_pending = None
-        why = (f"HUNT {sl.casefile()} · gap {gap:.0f} · converging")
+        # ── P4 casefile — every probability names ITS question ──────────────
+        # SETTLE (gated) and TOUCH (info) are different surfaces; the line says
+        # so. Distances carry $; the gate quantity is called EDGE (the Wilson-LB
+        # cents the gate used); the info-only touch is marked. The EV tag rides
+        # after: ev_c = p_end(point)*100 − join — the point-estimate EV, logged
+        # on every entry (§P2) for the DIVERGENCE read-back (§P5).
+        why = self._hunt_casefile(side, sl, secs, p_end_lb, join, edge)
         return [Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
             size_tier=config.TIER_PROBE, purpose="ENTRY",
             band=config.HUNT_BAND, rest_fp=book.best_fp(side), why=why)]
 
+    @staticmethod
+    def _hunt_casefile(side: str, sl, secs: float, p_end_lb: float,
+                       join: float, edge: float) -> str:
+        """WO-2026-07-24-J §P4 — the ENTRY casefile, ONE format:
+          HUNT ↑ spot $56 off strike, T-9:05 · settle 22% (LB 18) · book 15¢
+               · edge +3 · touch 70% (info) · EV +7
+        Every probability names its question (settle / touch); every distance
+        carries $; the gate quantity is EDGE (the Wilson-LB the gate used);
+        the info-only touch is (info). "fair" is BANNED. The trailing EV tag
+        is the point-estimate expected value in cents (§P2)."""
+        from . import delta
+        arrow = "↑" if side == "yes" else "↓"
+        tmin, tsec = int(secs // 60), int(secs % 60)
+        p_end_pt = delta.p_end(sl.d_after, secs)
+        settle_pct = (p_end_pt * 100.0) if p_end_pt is not None else (p_end_lb * 100.0)
+        ev_c = (p_end_pt * 100.0 - join) if p_end_pt is not None else edge
+        return (f"HUNT {arrow} spot ${sl.d_after:.0f} off strike, "
+                f"T-{tmin}:{tsec:02d} · settle {settle_pct:.0f}% "
+                f"(LB {p_end_lb * 100:.0f}) · book {join:.0f}¢ · "
+                f"edge {edge:+.0f} · touch {sl.fair_cents:.0f}% (info) · "
+                f"EV {ev_c:+.0f}")
+
+    @staticmethod
+    def _hunt_settle_lb(ctx: Optional[dict], side: str, secs: float,
+                        now: float) -> Optional[float]:
+        """WO-2026-07-24-J §P3 — the settle Wilson-LB at the CURRENT geometry
+        (distance from strike now, time left now). None = BLIND (no ctx / spot
+        blind / no strike / settle surface absent): the thesis exit never fires
+        on blindness, only on a POSITIVE reading that the edge is gone."""
+        if ctx is None:
+            return None
+        from . import delta, spotlead as _sl
+        spot = ctx.get("spot")
+        if spot is None:
+            return None
+        strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
+                                 ctx.get("boundary_hi"))
+        if strike is None:
+            return None
+        return delta.p_end_wilson_lb(abs(spot - strike), secs)
+
     def _hunt_custody(self, w: FlipWindow, market: str, event: str, book,
-                      secs: float, now: float) -> List[Order]:
+                      secs: float, now: float, ctx: Optional[dict] = None
+                      ) -> List[Order]:
         """§3 — JOB A: flip it (take at entry+T the instant the fill books).
-        JOB B: hold nothing (breakeven reprice, then flatten). TIME-BOX and
-        CURFEW flat. No averaging, no thesis-defense — inventory is F's
-        privilege, not the flip's."""
+        JOB B: EXIT WATCHES THE THESIS (WO-2026-07-24-J §P3). The two-tick
+        level bail (`mark<=entry-2`) is RETIRED — a hunt is not wrong because
+        the mark ticked down; it is wrong when the SETTLE edge that justified
+        it is gone. So the bail is `wilson_LB(p_end(d_now,t)) * 100 <= cost`
+        sustained N polls (edge gone), plus the named guardrails that survive:
+        breakeven-not-out-in-R, TIME-BOX, and CURFEW flat. Absent geometry the
+        thesis check is BLIND (it never fires on blindness — the guardrails still
+        do)."""
         props: List[Order] = []
         for side, h in list(w.hunts.items()):
             if h.get("done"):
@@ -1246,10 +1320,21 @@ class LaneFlip:
                     reason=f"hunt take entry+{config.HUNT_TAKE_CENTS}"))
                 continue
             flatten_reason = None
+            # §P3 THESIS EXIT — the settle edge, re-checked at current geometry.
+            # settle_lb = wilson_LB(p_end(d_now, t)); cost = the held-side mark.
+            # When settle_lb*100 <= cost the edge that bought the hunt is gone;
+            # sustained N polls (flicker-proof) it bails, logging BOTH numbers.
+            settle_lb = self._hunt_settle_lb(ctx, side, secs, now)
+            if (settle_lb is not None and mark is not None
+                    and settle_lb * 100.0 <= mark):
+                h["edge_gone_polls"] = h.get("edge_gone_polls", 0) + 1
+            else:
+                h["edge_gone_polls"] = 0
             if secs <= FLIP_CURFEW:
                 flatten_reason = "hunt curfew flat (T-curfew handoff to F)"
-            elif mark is not None and mark <= h["entry"] - 2:
-                flatten_reason = "hunt bail mark<=entry-2"
+            elif h.get("edge_gone_polls", 0) >= config.HUNT_EDGE_GONE_POLLS:
+                flatten_reason = (f"hunt exit — edge gone (settle "
+                                  f"{settle_lb * 100:.0f}% ≤ cost {mark:.0f}¢)")
             elif (h.get("be_ts") is not None
                   and now - h["be_ts"] >= config.HUNT_BAIL_R_S):
                 flatten_reason = (f"hunt bail not-out-in-"

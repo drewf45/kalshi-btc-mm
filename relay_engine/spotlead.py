@@ -34,15 +34,22 @@ class Needle:
     d_before: float      # |spot − strike| at the anchor, $
     d_after: float       # |spot − strike| now, $
     delta_p: float       # POINTS (0-100) the favored side gained
-    fair_cents: float    # 100 × p_side(d_after, t) — question B's fair
+    fair_cents: float    # 100 × p_side(d_after, t) — the TOUCH probability
+                         # (p_survive/1−p_cross). WO-2026-07-24-J: this is the
+                         # TOUCH surface, INFO-only for HUNT (gate B now prices
+                         # SETTLE, p_end). "fair" is banned — it names no
+                         # question; this is `touch`.
     t_remaining: float
 
     def casefile(self) -> str:
-        """§6 OFF-THE-STREET: the page is a casefile."""
+        """§6 OFF-THE-STREET: the needle's attention page. WO-2026-07-24-J §P4:
+        every probability names ITS question — this is the TOUCH probability,
+        marked (info) because HUNT's gate now prices SETTLE, not touch. "fair"
+        is banned."""
         tmin, tsec = int(self.t_remaining // 60), int(self.t_remaining % 60)
         return (f"needle +{self.delta_p:.0f}pts "
                 f"(d {self.d_before:.0f}→{self.d_after:.0f}, T-{tmin}:{tsec:02d})"
-                f" · fair {self.fair_cents:.0f}")
+                f" · touch {self.fair_cents:.0f}% (info)")
 
 
 def pick_strike(spot: Optional[float], boundary_lo, boundary_hi) -> Optional[float]:

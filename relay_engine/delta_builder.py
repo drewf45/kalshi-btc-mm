@@ -141,6 +141,17 @@ def _wilson_ub(p: float, n: int, z: float = 1.96) -> float:
     return min(1.0, centre + spread)
 
 
+def _wilson_lb(p: float, n: int, z: float = 1.96) -> float:
+    """WO-2026-07-24-J P1: the Wilson LOWER bound — HUNT's settle gate reads the
+    conservative bound (an edge that clears fees at the LB, never the point)."""
+    if n == 0:
+        return 0.0
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    spread = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
+    return max(0.0, centre - spread)
+
+
 def compute_delta_table(candles: list) -> list:
     """Compute P(cross) + wilson_ub for each (distance, time, session) cell.
 
@@ -172,8 +183,10 @@ def compute_delta_table(candles: list) -> list:
         sub_minute_scale = math.sqrt(t_secs / GRANULARITY_SEC) if t_secs < GRANULARITY_SEC else 1.0
 
         session_crosses = defaultdict(lambda: defaultdict(int))
+        session_ends = defaultdict(lambda: defaultdict(int))
         session_n = defaultdict(int)
         total_crosses = defaultdict(int)
+        total_ends = defaultdict(int)
         total_n = 0
 
         for i in range(n_candles - t_candles):
@@ -183,6 +196,11 @@ def compute_delta_table(candles: list) -> list:
             max_high = max(highs[i + 1:window_end])
             min_low = min(lows[i + 1:window_end])
             max_move = max(max_high - start_close, start_close - min_low) * sub_minute_scale
+            # WO-2026-07-24-J P1: the SETTLE move — where the window ENDED, not
+            # what it touched. |close_at_window_end − start| is the settle-
+            # question analog of the touch max_move (same sub-minute scaling).
+            end_close = closes[window_end - 1]
+            end_move = abs(end_close - start_close) * sub_minute_scale
 
             sess = session_tag(timestamps[i])
             all_sessions.add(sess)
@@ -193,12 +211,16 @@ def compute_delta_table(candles: list) -> list:
                 if max_move >= d:
                     total_crosses[d] += 1
                     session_crosses[sess][d] += 1
-                else:
-                    break
+                if end_move >= d:
+                    total_ends[d] += 1
+                    session_ends[sess][d] += 1
+                elif max_move < d:
+                    break   # both are monotone in d — nothing larger can hit
 
         # ALL session rows
         for d in DISTANCE_GRID:
             p = total_crosses[d] / total_n if total_n > 0 else 0.0
+            pe = total_ends[d] / total_n if total_n > 0 else 0.0
             eff_n = independent_windows
             results.append({
                 "distance_usd": d,
@@ -207,6 +229,9 @@ def compute_delta_table(candles: list) -> list:
                 "n": total_n,
                 "effective_n": eff_n,
                 "wilson_ub": round(_wilson_ub(p, eff_n), 6),
+                "p_end": round(pe, 6),
+                "p_end_n": total_n,
+                "p_end_wilson_lb": round(_wilson_lb(pe, eff_n), 6),
                 "session": "ALL",
             })
 
@@ -216,6 +241,7 @@ def compute_delta_table(candles: list) -> list:
             eff_n_s = max(1, n_s // (INDEPENDENT_WINDOW_SEC // GRANULARITY_SEC))
             for d in DISTANCE_GRID:
                 p = session_crosses[sess][d] / n_s if n_s > 0 else 0.0
+                pe = session_ends[sess][d] / n_s if n_s > 0 else 0.0
                 results.append({
                     "distance_usd": d,
                     "secs_remaining": t_secs,
@@ -223,6 +249,9 @@ def compute_delta_table(candles: list) -> list:
                     "n": n_s,
                     "effective_n": eff_n_s,
                     "wilson_ub": round(_wilson_ub(p, eff_n_s), 6),
+                    "p_end": round(pe, 6),
+                    "p_end_n": n_s,
+                    "p_end_wilson_lb": round(_wilson_lb(pe, eff_n_s), 6),
                     "session": sess,
                 })
 
@@ -233,7 +262,8 @@ def compute_delta_table(candles: list) -> list:
     return results
 
 
-CSV_FIELDS = ["distance_usd", "secs_remaining", "p_cross", "n", "effective_n", "wilson_ub", "session"]
+CSV_FIELDS = ["distance_usd", "secs_remaining", "p_cross", "n", "effective_n",
+              "wilson_ub", "p_end", "p_end_n", "p_end_wilson_lb", "session"]
 
 
 def write_csv(rows: list, path: str) -> str:
@@ -327,6 +357,31 @@ def validate_in_process(csv_file: str, manifest_file: str,
     actual_cols = set(rows[0].keys()) if rows else set()
     gate("Schema has all required columns", required_cols.issubset(actual_cols),
          f"missing={required_cols - actual_cols}" if not required_cols.issubset(actual_cols) else "OK")
+
+    # WO-2026-07-24-J P1: the SETTLE surface — question-tagged (ADVERSARY ii: a
+    # table that cannot say WHICH question it answers fails). A tape built after
+    # this WO carries the p_end column family; validate it alongside the touch
+    # surface (a legacy touch-only tape passes without it and HUNT stays BLIND).
+    settle_cols = {"p_end", "p_end_n", "p_end_wilson_lb"}
+    has_settle = settle_cols.issubset(actual_cols)
+    if has_settle:
+        # A1: p_end in [0,1]; the settle LB never exceeds the point (LOWER bound)
+        pe_bound = sum(1 for r in rows
+                       if not (-1e-9 <= float(r["p_end"]) <= 1.0 + 1e-9))
+        gate("A1: p_end in [0,1]", pe_bound == 0, f"{pe_bound} violations")
+        lb_viol = sum(1 for r in rows
+                      if float(r["p_end_wilson_lb"]) > float(r["p_end"]) + 1e-6)
+        gate("A1: p_end_wilson_lb <= p_end", lb_viol == 0, f"{lb_viol} violations")
+        # SCIENTIST falsifiability: the settle can NEVER exceed the touch (a
+        # window that closes beyond d necessarily touched d) — the physical law
+        # that proves the two surfaces answer DIFFERENT questions, not the same
+        # number mislabeled (ADVERSARY ii). p_end <= p_cross everywhere.
+        pe_le_pc = sum(1 for r in rows
+                       if float(r["p_end"]) > float(r["p_cross"]) + 1e-6)
+        gate("A1: p_end <= p_cross (settle ⊆ touch)", pe_le_pc == 0,
+             f"{pe_le_pc} violations")
+    else:
+        lines.append("  (legacy touch-only tape — no settle surface; HUNT BLIND)")
 
     # A5: Session hash parity
     builder_hash = session_hash()
