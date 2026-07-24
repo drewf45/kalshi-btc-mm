@@ -85,6 +85,22 @@ def size_order(book_cents: int, price_cents: int,
             "-", contracts,
             f"F: notional={notional_max} depth={depth_max} "
             f"(kelly={kelly_max}, cap n/a) → {bound} bound")
+    if lane == "FLIP":
+        # WO-2026-07-24-C "+4×10": FLIP is bounded by FLIP_SIZE_CAP and DEPTH —
+        # the retired NET_RISK_CROSS_LANE_CAP no longer binds it (else the 3-cap
+        # would silently re-cap FLIP at 3 and FLIP_SIZE_CAP=10 would never bite,
+        # exactly as it did before WO-E). DEPTH is the term the size test
+        # measures: if the book supports 6, FLIP takes 6 and the reason says so.
+        # kelly still bounds; the per-lane at-risk WALL (15%) is the gateway
+        # backstop above this. Guard (d): all terms + the binding one logged.
+        cap = config.FLIP_SIZE_CAP
+        contracts = min(kelly_max, depth_max, cap)
+        term = {"kelly": kelly_max, "depth": depth_max, "cap": cap}
+        bound = min(term, key=term.get)
+        return SizeDecision(
+            "-", contracts,
+            f"FLIP: min(kelly={kelly_max}, depth={depth_max}, "
+            f"cap={cap}) → {bound} bound")
     # The kept walls are LAW (P27 §2d): net-risk <=3/event stands, so
     # sizing proposes at most the cap — full Kelly lives UNDER the wall,
     # it does not fight it (a 7-lot proposal dying whole at the wall would

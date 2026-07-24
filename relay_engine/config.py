@@ -135,7 +135,7 @@ OPEN_MIDDLE_TARGET = 52          # DREW-DEFAULT: the take target — the 50/50 m
 OPEN_ENTRY_MIN_C = 55            # DREW-DEFAULT (WO-...-G, was 50): the deliberate favored floor
 OPEN_ENTRY_MAX_C = 64            # DREW-DEFAULT (WO-...-G, was 70): above this the move is priced
 OPEN_ENTRY_DEADLINE_S = 90       # DREW-DEFAULT: unfilled by here → cancel, never chase (== opening window)
-OPEN_GOUGE_C = 10               # DREW-RULED (WO-2026-07-23-E "THE SIZE TEST", was 17): target = entry + 10, cap 90 — 4 lots resting 10c off the touch is a genuine maker quote; the size test reads requested-vs-filled to rule +10×4 vs +17×1
+OPEN_GOUGE_C = 4                # DREW-RULED (WO-2026-07-24-C "+4×10", was 10): target = entry + 4, cap 90 — the ask is fees + a cent. 4c in a 15-min binary needs ONE move; 10c needs the move AND volume that far out. Break-even ≈74% must reach +4 (MFE says 85% touch); the read is touched-vs-filled. REVERT: conversion <75% OR ≤4 of 10 fill → back to +10
 OPEN_MOMENTUM_STOP_C = 10        # DREW-DEFAULT: stop = entry − 10, NO hold, 2-poll sustain, maker-first
 # WO-2026-07-23-B Part 2: the uncovered-leg FLATTEN used to sell at whatever the
 # book showed (unbounded mark) — 15c through the stop on the night's worst leg.
@@ -276,7 +276,12 @@ AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap
 # constraint (297/97 ≈ 3.06); a correct dollar wall subsumes the count wall. The
 # NET_RISK / DOLLAR_RISK reason NAMES are kept so WALL_STORM telemetry stays
 # comparable across builds.
-AT_RISK_PCT = {"F": 0.20, "H8": 0.05, "FLIP": 0.05, "D": 0.02, "P": 0.02}
+# WO-2026-07-24-C "+4×10": FLIP 0.05→0.15 — 10×60¢ = 600¢ ≈ 14% of a $42 book.
+# ⚠️ REVERT CONDITION (a risk-parameter increase authorised for an EXPERIMENT
+# does not survive it): if the +4×10 test reads ≤4 of 10 filled, revert
+# FLIP_SIZE_CAP→3 AND AT_RISK_PCT["FLIP"]→0.05 together. This wall must not
+# quietly stay at 15% after the experiment ends.
+AT_RISK_PCT = {"F": 0.20, "H8": 0.05, "FLIP": 0.15, "D": 0.02, "P": 0.02}
 AT_RISK_PCT_DEFAULT = 0.02        # any unlisted lane (ORPHAN, …) — conservative
 
 
@@ -455,7 +460,7 @@ FLIP_FLOOR_SLIP_CENTS = 5
 # rides along as a SHADOW comparison, calibrated against the measured rate
 # before it may ever drive the decision.
 OPEN_SWING_MIN_SAMPLES = 20       # Adversary (a): don't gate on a thin sample
-FLIP_SIZE_CAP = 3                 # DREW-RULED (WO-2026-07-23-E "THE SIZE TEST", was 1): EXPLICIT 3-lot cap — NET_RISK_CROSS_LANE_CAP=3 and the 5% at-risk wall both bind here, so 3 is deterministic regardless of book (4 would drift with book size — a confound). 1→3 is a 3× read of "does size travel"; widen the wall for 5-6 later WITH this data, never before it
+FLIP_SIZE_CAP = 10                # DREW-RULED (WO-2026-07-24-C "+4×10", was 3): 10-lot cap — DEPTH is now the binding term (the thing being measured); if the book supports 6 the engine takes 6 and the log says depth bound it. Also lifts RATE_HALT_DRAWDOWN_C to 400c (~3.5 stop-outs). REVERT with the wall below (≤4 of 10 fill)
 # WO-2026-07-24-C Part 2: the per-lane rate-halt drawdown threshold, DERIVED
 # from the lane's own size (4 stop-outs' worth). Scales with FLIP_SIZE_CAP so it
 # never strangles the lane it protects: 120¢ at 3 lots, 400¢ at 10.

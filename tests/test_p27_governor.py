@@ -85,12 +85,13 @@ def test_mixed_lane_window_is_tracked_per_lane_not_by_net(engine, tmp_path):
     crossing its OWN money threshold halts FLIP alone; it persists; /reset_halt
     is the only key. F is never stopped by FLIP's losses."""
     TICKER3 = "KXBTC15M-02JAN251030-T99"
+    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
     _mixed_lane_window(engine, TICKER, f_pnl=+4, open_pnl=-10, now=1000.0)
-    assert engine.econ.halted_lanes() == set()          # FLIP −10 > −120: noise
-    # FLIP draws down past −120 across windows while F wins throughout
-    _mixed_lane_window(engine, TICKER2, f_pnl=+6, open_pnl=-70, now=3000.0)
-    _mixed_lane_window(engine, TICKER3, f_pnl=+6, open_pnl=-60, now=5000.0)
-    assert engine.econ.halted_lanes() == {"FLIP"}       # FLIP −140 < −120
+    assert engine.econ.halted_lanes() == set()          # FLIP small: noise
+    # FLIP draws down past the threshold across windows while F wins throughout
+    _mixed_lane_window(engine, TICKER2, f_pnl=+6, open_pnl=-HALF, now=3000.0)
+    _mixed_lane_window(engine, TICKER3, f_pnl=+6, open_pnl=-HALF, now=5000.0)
+    assert engine.econ.halted_lanes() == {"FLIP"}       # FLIP sum < -threshold
     assert "RATE_HALT:FLIP" in engine.gateway.entries_halted_reasons
     assert not engine.econ.halted()                     # F untouched, no global
     # restart: a NEW engine on the SAME database — the per-lane halt survives

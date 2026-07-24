@@ -3397,6 +3397,37 @@ survives `−8,−7,+17` (`test_profitable_asymmetric_sequence_does_not_halt`, i
 `test_p9_real_numbers`, `test_halt_orphan`) re-anchored to the money doctrine; the preflight halt gate
 retargeted. Suite 749 · preflight 23/23.
 
+## WO-2026-07-24-C Part 3+4 — SIZE THE LANE, COLLECT THE DATA (build 73)
+
+Ships SECOND (clean attribution: a risk-parameter change lands on its own build, on top of the halt that
+protects it). Authority: Drew — RULED.
+
+**Part 3 — the +4×10 dials, and the lane the cap actually binds.** Read-rule TRUE (the recurring blocker):
+`OPEN_GOUGE_C` and `FLIP_SIZE_CAP` are set, but `sizing.size_order`'s non-F branch (`:108-109`) capped
+every non-F lane at `NET_RISK_CROSS_LANE_CAP=3` — so `FLIP_SIZE_CAP` alone **never bound** and a "10" would
+have silently sized 3, exactly as it did through WO-E. **Fix:** FLIP is now **lane-aware** — a dedicated
+branch sizes `min(kelly, depth, FLIP_SIZE_CAP)`, mirroring F's own-dial path; the retired count cap no
+longer re-caps it. Dials: `OPEN_GOUGE_C 10→4` (target = entry+4, a reachable maker gouge), `FLIP_SIZE_CAP
+3→10`, `AT_RISK_PCT["FLIP"] 0.05→0.15` (the per-lane book-proportional dollar wall Drew ruled up to carry
+10 lots). The **REVERT condition** rides in the config comment beside both constants: conversion <75% OR ≤4
+of 10 fill → `FLIP_SIZE_CAP→3` AND `AT_RISK_PCT["FLIP"]→0.05` **together** (acceptance #9). Depth is the
+term the live test measures — on a thin book depth binds below 10 and the reason says so.
+
+**Part 4 — the experiment emits its own data.** #7: a `FLIP_SIZE` log fires once per `(market, price)` on
+every FLIP entry (mirroring the `F_SIZE` block, lane-gated) naming the **binding term** via `dec.reason`
+(`→ cap/depth/kelly bound`) — "did the 10-cap ever bite, or was depth the ceiling" is read from the tape.
+#6: `target_touched` (the book reached `entry+OPEN_GOUGE_C`, our posted take — high-water stamped every exit
+poll, or the exit itself made it) and `target_filled` (our **resting** take concluded the trade —
+`exit_reason` still `TAKE_FILL`, no stop/handoff/floor path overrode it) ride **every** `FLIP_SWING` row.
+`touched && !filled` is the central question: the middle came to us and we missed the fill.
+
+**Acceptance:** #5 `OPEN_GOUGE_C=4`, `FLIP_SIZE_CAP=10`, wall 15% (`test_part3_dials_are_set`,
+`test_size_test`); #6 touched/filled on every trade — take-fill, momentum-stop, and touched-not-filled
+cases (`test_size_test_data`); #7 binding term logged on every FLIP entry, F path writes `F_SIZE` never
+`FLIP_SIZE` (`test_flip_size_log_is_flip_only_f_untouched`); #8 **F byte-identical** (`lane_fh8` untouched;
+F sizes by notional, a path that never reads `FLIP_SIZE_CAP`; the FLIP_SIZE log is lane-gated); #9 revert
+condition in the config comment. Suite 756 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

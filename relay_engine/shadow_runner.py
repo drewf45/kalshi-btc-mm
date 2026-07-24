@@ -504,6 +504,20 @@ class ShadowEngine:
                          "(count=%d)", proposal.market, proposal.price_cents,
                          book_c, dec.reason,
                          config.at_risk_cap_cents("F", book_c), proposal.count)
+        # WO-2026-07-24-C Part 4 #7: the size test's DATA. FLIP is lane-aware
+        # now (min(kelly, depth, cap)) — log the BINDING term on every entry so
+        # the experiment can read whether the 10-cap ever bit or depth was the
+        # ceiling the whole time. Same once-per-(market, price) guard as F_SIZE;
+        # dec.reason already names the bound ("→ cap/depth/kelly bound").
+        if proposal.lane == "FLIP" and proposal.action == "buy":
+            key = (proposal.market, proposal.price_cents, "flip_size")
+            if key not in self._size_zero_logged:
+                self._size_zero_logged.add(key)
+                log.info("FLIP_SIZE %s @%dc book=%dc → %s at_risk_cap=%dc "
+                         "(count=%d)", proposal.market, proposal.price_cents,
+                         book_c, dec.reason,
+                         config.at_risk_cap_cents("FLIP", book_c),
+                         proposal.count)
         # WO-2026-07-23-B Part 1 guard (b): F's per-event tripwire. A single F
         # loss worse than F_EVENT_TRIPWIRE_C/contract suppresses F entries for
         # the rest of that day (F's 97% win rate means the rate halt never

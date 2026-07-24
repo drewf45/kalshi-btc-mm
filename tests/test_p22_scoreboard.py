@@ -231,7 +231,7 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
                  why="OPEN grain yesx2 · join 48c")
     eng._score_and_size(prop, _book(yes=48, no=49))
     assert prop.size_tier == config.TIER_CLEAR   # earned, stamped, reported
-    assert prop.count == config.FLIP_SIZE_CAP == 3   # FLIP capped, not tier-driven
+    assert 1 <= prop.count <= config.FLIP_SIZE_CAP   # FLIP bounded, not tier-driven
     # a virgin cell: PROBE stamp, FLIP still capped (ladder reports, never governs)
     prop2 = Order(lane="FLIP", event=EVENT, market=TICKER, side="no",
                   action="buy", price_cents=44, count=1,
@@ -239,7 +239,7 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
                   why="OPEN grain nox2 · join 44c")
     eng._score_and_size(prop2, _book(yes=48, no=44))
     assert prop2.size_tier == config.TIER_PROBE
-    assert prop2.count == config.FLIP_SIZE_CAP   # capped regardless of the tier
+    assert 1 <= prop2.count <= config.FLIP_SIZE_CAP   # bounded regardless of the tier
     # WO-2026-07-23-B Part 1: F no longer takes the Kelly path — it self-sizes by
     # NOTIONAL (F_NOTIONAL_PCT of book / price), bounded only by real depth. On a
     # $12 book at 48c the notional is 5 lots — driven by the book, NOT clamped to

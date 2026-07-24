@@ -11,14 +11,14 @@ from relay_engine.lane_flip import LaneFlip
 
 
 def test_the_two_dials_are_set():
-    assert config.FLIP_SIZE_CAP == 3          # explicit 3 (not 4 — no book drift)
-    assert config.OPEN_GOUGE_C == 10          # target = entry + 10
+    assert config.FLIP_SIZE_CAP == 10          # +4×10 size test
+    assert config.OPEN_GOUGE_C == 4           # target = entry + 4
 
 
 def test_take_geometry_is_entry_plus_ten_capped_ninety():
-    assert LaneFlip._take_price(60) == 70     # entry + 10
-    assert LaneFlip._take_price(50) == 60     # at the band floor
-    assert LaneFlip._take_price(85) == 90     # cap governs (85+10=95 → 90)
+    assert LaneFlip._take_price(60) == 64     # entry + 4
+    assert LaneFlip._take_price(50) == 54     # at the band floor
+    assert LaneFlip._take_price(90) == 90     # cap governs (90+4=94 → 90)
 
 
 def test_flip_cap_does_not_touch_F_sizing():
@@ -30,8 +30,13 @@ def test_flip_cap_does_not_touch_F_sizing():
 
 
 def test_flip_sizes_up_to_the_cap_when_kelly_and_depth_allow():
-    """FLIP reaches the 3-lot cap when kelly and depth both clear it; the cap —
-    not the retired 1-lot leash — is now what bounds the lane."""
-    # book $30, 48c: kelly 5, depth ample → min(kelly, depth, NET_RISK=3) = 3
-    dec = scoring.size_order(3000, 48, 10_000, lane="FLIP")
-    assert min(dec.contracts, config.FLIP_SIZE_CAP) == 3
+    """WO-2026-07-24-C: FLIP is lane-aware now — min(kelly, depth, FLIP_SIZE_CAP),
+    NOT the retired NET_RISK count cap. On a book where kelly and depth both
+    clear it, the 10-lot cap is the binding term (depth becomes the ceiling in
+    a live thin book — the thing the +4×10 test measures)."""
+    dec = scoring.size_order(8000, 48, 10_000, lane="FLIP")  # kelly 13, depth ample
+    assert dec.contracts == config.FLIP_SIZE_CAP == 10
+    assert "→ cap bound" in dec.reason
+    # a thin book: depth binds below the cap and the reason says so
+    thin = scoring.size_order(8000, 48, 12, lane="FLIP")     # depth 12·0.25 = 3
+    assert thin.contracts == 3 and "→ depth bound" in thin.reason

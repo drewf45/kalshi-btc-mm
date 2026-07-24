@@ -1280,6 +1280,13 @@ class LaneFlip:
             if self._defer_or_cancel_partial(o, market, side):
                 continue
             mark = self.held_price(side, book)   # WO-FLIP-SIDE-ORIENT: canonical held-side price
+            # WO-2026-07-24-C Part 4 #6: high-water on the take target. Record
+            # if the book ever reached entry+OPEN_GOUGE_C (the posted take) while
+            # we held — the numerator of the "did the middle come to us"
+            # fill-rate the +4×10 test measures. target_filled (our resting take
+            # actually hit) is derived at conclusion from the exit reason.
+            if mark is not None and mark >= self._take_price(o["entry"]):
+                o["target_touched"] = True
             # WO-INSTRUMENTATION-AND-FLIP-TIMING (build 51) — the running EXIT
             # observation: the latest book/spot/timing, stamped every poll so
             # whenever the position concludes the FLIP_SWING record has the true
@@ -1813,7 +1820,21 @@ class LaneFlip:
         xo = (o or {}).get("exit_obs") or {}
         reason = "HANDOFF_WINNER" if held_to_settle else (o or {}).get(
             "exit_reason", "TAKE_FILL")
+        # WO-2026-07-24-C Part 4 #6: the fill-rate-by-price data, on EVERY FLIP
+        # trade. target_touched — the book reached entry+OPEN_GOUGE_C (our
+        # posted take) at some poll (high-water above, or the exit itself made
+        # it). target_filled — our RESTING take is what concluded the trade
+        # (exit_reason still TAKE_FILL: no stop/handoff/floor path overrode it).
+        # touched-not-filled is the +4×10 test's central question: did the
+        # middle come to us and we missed the fill?
+        take_target = self._take_price(entry)
+        target_filled = reason == "TAKE_FILL"
+        target_touched = (bool((o or {}).get("target_touched"))
+                          or target_filled or exit_px >= take_target)
         detail = {"market": market, "entry_price": entry,
+                  "target_touched": bool(target_touched),
+                  "target_filled": bool(target_filled),
+                  "take_target": take_target,
                   "took_swing": bool(took), "exit_price": exit_px,
                   "gross_cents": gross, "salvaged": gross < 0,
                   "secs_to_swing": round(max(0.0, now - fill_ts), 1),

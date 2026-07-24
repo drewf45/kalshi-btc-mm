@@ -165,7 +165,7 @@ def test_patient_hold_ignores_wiggles(flip, gateway):
     props = flip.evaluate(TICKER, _ctx(_book(yes=60, no=40), secs_left=780))
     # WO-2026-07-22-F: the resting take is entry + OPEN_GOUGE_C (17) → 60 → 77c
     take_px = LaneFlip._take_price(60)
-    assert take_px == 70
+    assert take_px == 64
     assert [p.reason for p in props] == \
         [f"open take → middle {take_px}c (entry 60, gouge +{take_px - 60})"]
     flip.on_submitted(props[0], "OID-T", CLOSE - 780)

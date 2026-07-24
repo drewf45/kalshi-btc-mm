@@ -18,6 +18,9 @@ from relay_engine.gateway import Gateway, Order
 from relay_engine.window_econ import HALT_REASON, LANES_HALTED_KEY, WindowEcon
 
 BOOK = 10_000
+# WO-2026-07-24-C: a per-window FLIP loss such that TWO cross the size-derived
+# drawdown threshold (relative, so the test survives cap/threshold changes).
+HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
 PROOF_WHYS = {
     "F": "F tier61 · surv~price",
     "FLIP": "OPEN grain yesx2 · join 48c · PROBE n=0 · geometry=v2",
@@ -95,9 +98,9 @@ def test_flip_drawdown_halts_flip_only_f_untouched(econ, gateway):
     """FLIP draws down past the money threshold while F wins every time — FLIP
     halts, F does not, and the pages name the lane. A profitable FLIP win in the
     window reduces the drawdown; only the SUM crossing the bound halts."""
-    windows = [("M0", {"F": +6, "FLIP": -70}),
+    windows = [("M0", {"F": +6, "FLIP": -HALF}),
                ("M1", {"F": +5, "FLIP": +4}),   # FLIP win between reduces drawdown
-               ("M2", {"F": +6, "FLIP": -80})]  # FLIP net −146 < −120
+               ("M2", {"F": +6, "FLIP": -HALF})]  # FLIP sum < −threshold
     for market, per_lane in windows:
         net = sum(per_lane.values())
         econ._apply_streak(market, net, BOOK, per_lane=per_lane)
@@ -113,15 +116,15 @@ def test_f_never_arms_from_its_own_wins(econ):
     """F wins every window — its per-lane drawdown stays positive regardless of
     how badly FLIP does beside it."""
     for i in range(4):
-        econ._apply_streak(f"M{i}", -34, BOOK, per_lane={"F": +6, "FLIP": -40})
-    assert econ.halted_lanes() == {"FLIP"}       # FLIP −160 < −120; F never
+        econ._apply_streak(f"M{i}", 0, BOOK, per_lane={"F": +6, "FLIP": -HALF})
+    assert econ.halted_lanes() == {"FLIP"}       # FLIP crosses the threshold; F never
 
 
 def test_per_lane_halt_persists_across_boot(econ, ledger, gateway, surface):
     """A per-lane halt survives a redeploy: a fresh econ over the same DB
     restores the scoped reason."""
     for market in ("M0", "M1"):
-        econ._apply_streak(market, -70, BOOK, per_lane={"FLIP": -70})  # −140 < −120
+        econ._apply_streak(market, 0, BOOK, per_lane={"FLIP": -HALF})
     assert econ.halted_lanes() == {"FLIP"}
     gw2 = Gateway(ledger, surface)
     econ2 = WindowEcon(ledger, gw2, surface, _TG())
@@ -134,7 +137,7 @@ def test_reset_clears_lane_halt_and_its_window(econ, ledger, gateway):
     """/reset_halt lifts the scoped reason AND wipes the lane's rolling window
     so it restarts clean."""
     for market in ("M0", "M1"):
-        econ._apply_streak(market, -70, BOOK, per_lane={"FLIP": -70})
+        econ._apply_streak(market, 0, BOOK, per_lane={"FLIP": -HALF})
     assert econ.reset_halt().startswith("halt cleared")
     assert econ.halted_lanes() == set()
     assert "RATE_HALT:FLIP" not in gateway.entries_halted_reasons

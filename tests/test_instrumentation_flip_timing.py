@@ -129,13 +129,13 @@ def _run_trade(flip, ledger, entry_spot=66_400, exit_spot=66_455):
     flip.on_submitted(props[0], "E1", CLOSE - 820)
     ledger.record_fill(TICKER, "FLIP", "yes", "ENTRY", 60, 1, "PROBE")
     flip.note_fill(TICKER, "yes", 60, CLOSE - 818)
-    # a custody poll posts the take (entry+10 = 70 for a 60c entry) and stamps
+    # a custody poll posts the take (entry+4 = 64 for a 60c entry) and stamps
     # the exit observation (spot/book)
     flip.evaluate(TICKER, _ctx(_book(yes=52, no=45), secs_left=790,
                                spot=exit_spot))
     # the take fills at its posted price → note_exit writes the record
-    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 70, 1, "PROBE")
-    flip.note_exit(TICKER, "yes", 70, CLOSE - 700, count=1)
+    ledger.record_fill(TICKER, "FLIP", "yes", "EXIT", 64, 1, "PROBE")
+    flip.note_exit(TICKER, "yes", 64, CLOSE - 700, count=1)
 
 
 def test_a_swing_record_is_the_full_data_point(flip, ledger):
@@ -144,9 +144,9 @@ def test_a_swing_record_is_the_full_data_point(flip, ledger):
     reconstructable after the fact."""
     _run_trade(flip, ledger, entry_spot=66_400, exit_spot=66_455)
     r = _swing_row(ledger)
-    # the money — favored yes@60, take +10 = 70
-    assert r["entry_price"] == 60 and r["exit_price"] == 70
-    assert r["gross_cents"] == 10
+    # the money — favored yes@60, take +4 = 64
+    assert r["entry_price"] == 60 and r["exit_price"] == 64
+    assert r["gross_cents"] == 4
     # spot prices — the BTC move, reconstructable (not just the delta)
     assert r["entry_spot"] == 66_400 and r["exit_spot"] == 66_455
     # precise window timing — the pile-window entry (secs_into 80) vs the exit
@@ -157,7 +157,7 @@ def test_a_swing_record_is_the_full_data_point(flip, ledger):
     # book state both ends + the posted gouge level (favored bid recorded)
     assert r["entry_spread"] == 20 and r["entry_cheap_bid"] == 60
     assert r["entry_depth"] == [10, 10]
-    assert r["posted_take"] == 70              # _take_price(60) = entry+10 cap90
+    assert r["posted_take"] == 64              # _take_price(60) = entry+4 cap90
 
 
 def test_a_entry_why_carries_spot_timing_and_book(flip):

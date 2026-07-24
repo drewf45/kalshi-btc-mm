@@ -133,7 +133,8 @@ def test_lane_drawdown_past_threshold_halts_and_persists(econ, ledger, gateway,
     """WO-2026-07-24-C: a lane whose summed drawdown crosses
     RATE_HALT_DRAWDOWN_C halts ONLY itself, pages, and persists across boot;
     /reset_halt is the only key. The global (all-lane) halt is retired."""
-    for i, pnl in enumerate((-50, +5, -80)):         # net −125 < −120
+    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
+    for i, pnl in enumerate((-HALF, +5, -HALF)):       # two crossings < -threshold
         econ._apply_streak(f"M{i}", 0, BOOK, per_lane={"FLIP": pnl})
     assert "FLIP" in econ.halted_lanes()
     assert "RATE_HALT:FLIP" in gateway.entries_halted_reasons

@@ -194,11 +194,12 @@ def test_deferred_close_completes_without_resettling(engine):
 def test_deferred_drawdown_still_counts(engine):
     """A deferral must not launder a lane's loss out of the leash — the per-lane
     money halt (WO-2026-07-24-C) still fires when the deferred close flushes."""
+    HALF = config.RATE_HALT_DRAWDOWN_C // 2 + 50
     for i, mkt in enumerate((TICKER, TICKER2)):
-        engine.econ.open_bracket(mkt, 10_000 - i * 70, now=1000.0)
-        engine.econ.close_bracket(mkt, None, -70, now=1900.0,
-                                  per_lane={"FLIP": -70})
-        engine.econ.flush_deferred(10_000 - i * 70 - 70, "venue", now=1930.0)
+        engine.econ.open_bracket(mkt, 10_000 - i * HALF, now=1000.0)
+        engine.econ.close_bracket(mkt, None, -HALF, now=1900.0,
+                                  per_lane={"FLIP": -HALF})
+        engine.econ.flush_deferred(10_000 - i * HALF - HALF, "venue", now=1930.0)
     assert "FLIP" in engine.econ.halted_lanes()  # two −70 = −140 < −120: the leash
 
 
