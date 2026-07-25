@@ -97,3 +97,34 @@ def needle(anchor_spot: Optional[float], spot_now: Optional[float],
 def is_confirmed_needle(sl: Optional[Needle]) -> bool:
     """Gate A passed — the §4.2 P-suppression predicate."""
     return sl is not None and sl.delta_p >= config.HUNT_NEEDLE_POINTS
+
+
+def settle_fair_favored(spot: Optional[float], strike: Optional[float],
+                        side: str, t_remaining: Optional[float]
+                        ) -> Optional[float]:
+    """WO-2026-07-25-K §P2 — THE CONFIDENCE INSTRUMENT. The favored side's
+    SETTLE-fair (cents): the probability that the window CLOSES on the favored
+    side of the strike, given spot is `d = |spot − strike|` away on that side
+    with `t` left. This is the settle analog of the touch `p_side` — it prices
+    fragility FORWARD, the number the market actually settles on.
+
+    Derivation from the -J settle surface: p_end(d, t) is the DIRECTIONLESS
+    P(|net close displacement| ≥ d). By the reflection symmetry of a ~zero-drift
+    15-min walk, the favored side loses only if the net ADVERSE move ≥ d (the
+    close crosses back over the strike), and that is half the directionless
+    mass: P(close crosses back) = p_end(d, t) / 2. So
+
+        settle_fair_favored = (1 − p_end(d, t) / 2) × 100
+
+    Pinned to the strike (d → 0, p_end → 1) this tends to 50 — a coin on its
+    edge, exactly the four Saturday losses. None = BLIND (spot/strike unknown or
+    the settle surface absent) → the desk's conf gate abstains, tuition bounds it.
+    """
+    from . import delta
+    if spot is None or strike is None or t_remaining is None or t_remaining <= 0:
+        return None
+    d = abs(spot - strike)
+    pe = delta.p_end(d, t_remaining)
+    if pe is None:                       # legacy touch-only tape → BLIND
+        return None
+    return (1.0 - pe / 2.0) * 100.0

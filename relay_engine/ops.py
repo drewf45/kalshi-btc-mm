@@ -512,6 +512,14 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
                          "UNPROVEN, mechanism proven")
     except Exception:
         pass
+    # WO-2026-07-25-K §P3: the desk-size ladder — the trailing-N conversion, the
+    # promote/demote bars, and the LIVE dial. The tape moves the size, not a
+    # ruling; the desk re-earns full notional when the conversion clears the bar.
+    try:
+        from . import flip_ladder
+        lines.append(flip_ladder.ladder_line(ledger))
+    except Exception as e:
+        lines.append(f"DESK SIZE: unavailable ({e})")
     # P8 §2.4: the streak, halts, and resets
     if econ is not None:
         lines.extend(econ.pack_lines())

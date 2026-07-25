@@ -374,14 +374,39 @@ F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.20"))  # DREW DIAL: F
 # the +4×10 test ran at half the ruled size. 10 lots × 60c = 600c ≈ 14% of a
 # $43 book, so notional gives 10; the 15% at-risk wall (10 × 64c = 640c vs 645c)
 # is the gateway backstop above it. REVERT with the cap/wall (≤4 of 10 fill).
-FLIP_NOTIONAL_PCT = float(os.environ.get("FLIP_NOTIONAL_PCT", "0.14"))  # DREW DIAL: FLIP size = pct of book / price (no fixed cap — WO-2026-07-24-G Part 2)
+# WO-2026-07-25-K "THE DESK EARNS ITS SIZE" P1 — TUITION SIZE. The +4 desk was
+# 6-of-11 (55% conversion) against a ~73% breakeven; Saturday priced it at
+# OPEN −$12.35. Demote instantly to tuition (the constitution's own words): the
+# desk keeps its full armor and keeps buying cells, at ~−35¢/day worst instead
+# of −$12 days. FLIP_NOTIONAL_PCT is the LIVE FLOOR (tuition); the desk re-earns
+# FLIP_FULL_NOTIONAL_PCT by CONVERSION (P3), the tape moving the dial — no ruling
+# at either edge. rate_halt_drawdown_c re-derives from the ACTIVE dial (verified).
+FLIP_NOTIONAL_PCT = float(os.environ.get("FLIP_NOTIONAL_PCT", "0.04"))  # DREW DIAL: FLIP TUITION size = pct of book / price (WO-K P1; was 0.14)
+FLIP_FULL_NOTIONAL_PCT = float(os.environ.get("FLIP_FULL_NOTIONAL_PCT", "0.14"))  # the EARNED full size (WO-K P3 promotion target)
+# WO-K P3 — PROMOTION BY CONVERSION: the size ladder is mechanical. The desk
+# re-earns full notional when trailing-N round-trip conversion clears the top
+# bar; demotion back to tuition is INSTANT under the bottom bar (promote slowly,
+# demote instantly). The margin tiebreaker: no full size while the ENTRY cell's
+# Wilson margin is negative, regardless of streak (blocks a lucky streak from
+# up-sizing a structurally-losing cell — ADVERSARY's gaming check).
+FLIP_CONV_WINDOW = 20       # trailing round-trips the conversion reads (FLIP_SWING)
+FLIP_PROMOTE_CONV = 0.75    # >= this over the window → promote to full (above breakeven w/ margin)
+FLIP_DEMOTE_CONV = 0.65     # < this → demote to tuition, instant
+# WO-K P2 — THE CONFIDENCE INSTRUMENT: the -J settle table's desk duty. At OPEN
+# entry, the favored side's SETTLE-fair must exceed the join by this margin —
+# the entry must buy a side the physics already favors by more than the spread
+# being paid (the fragility veto: a coin balanced on its edge reads settle-fair
+# ≈ 50 and is refused). DREW-DEFAULT 4c; derive properly once tagged trades exist.
+FLIP_CONF_MIN_C = float(os.environ.get("FLIP_CONF_MIN_C", "4"))
 
 
 # WO-2026-07-24-G Part 1 / acceptance #6: a lane's SIZING DIAL (notional pct)
 # must sit STRICTLY UNDER its at-risk WALL — a dial >= wall converts every
 # rounding edge into a WALL reject + 30s backoff (the Adversary's 07-24-D
-# warning, now with tape). The two self-scaling lanes are F and FLIP.
-DIAL_OF_LANE = {"F": F_NOTIONAL_PCT, "FLIP": FLIP_NOTIONAL_PCT}
+# warning, now with tape). The two self-scaling lanes are F and FLIP. WO-K: the
+# FLIP entry guards the FULL (promoted) size — the largest the dial can reach —
+# so the wall bounds the ceiling, not just the tuition floor.
+DIAL_OF_LANE = {"F": F_NOTIONAL_PCT, "FLIP": FLIP_FULL_NOTIONAL_PCT}
 
 
 def dial_wall_violations() -> list:

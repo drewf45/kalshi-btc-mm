@@ -845,6 +845,22 @@ class LaneFlip:
         held_d = y_depth if side == "yes" else n_depth
         other_d = n_depth if side == "yes" else y_depth
         depth_ratio = round(held_d / other_d, 2) if other_d else None
+        # WO-2026-07-25-K §P2 — THE CONFIDENCE INSTRUMENT. Before any flow
+        # question, the trader's FIRST question: is this open already decided
+        # enough to lean on? The -J settle table prices the favored side's
+        # SETTLE-fair FORWARD; the entry must buy a side the physics already
+        # favors by more than the spread paid: settle_fair >= join + CONF_MIN.
+        # All four Saturday losses had spot pinned to the strike (settle-fair
+        # ≈ 50) and are REFUSED here. BLIND (no settle surface) → the gate
+        # abstains; tuition size (P1) bounds the unread risk.
+        from . import spotlead as _sl
+        strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
+                                 ctx.get("boundary_hi"))
+        settle_fair = _sl.settle_fair_favored(spot, strike, side, secs)
+        conf_c = (settle_fair - join) if settle_fair is not None else None
+        conf_note = (f"settle-fair {settle_fair:.0f} vs join {join} → "
+                     f"conf {conf_c:+.0f}" if settle_fair is not None
+                     else "conf n/a (settle BLIND — tuition bounds it)")
         # WO-2026-07-22-F/-G — THE PILE, and THE ALL-OF GATE. skew is the book's
         # commitment (|yes_bid − no_bid|); growth is how much it has GROWN since
         # the pile window opened (the stampede-in-progress, the heart of the
@@ -863,7 +879,10 @@ class LaneFlip:
                  else "agree" if ((trend_usd > 0) == (side == "yes"))
                  else "disagree")
         vals = {"skew": skew, "growth": growth,
-                "trend": round(trend_usd), "ratio": depth_ratio}
+                "trend": round(trend_usd), "ratio": depth_ratio,
+                "settle_fair": (round(settle_fair, 1)
+                                if settle_fair is not None else None),
+                "conf_c": (round(conf_c, 1) if conf_c is not None else None)}
         reason = None
         if not (config.OPEN_ENTRY_MIN_C <= join <= config.OPEN_ENTRY_MAX_C):
             reason = "price_band"                    # favored side out of [55,64]
@@ -873,6 +892,13 @@ class LaneFlip:
             reason = "trend_disagree"                # spot and book disagree
         elif growth < config.OPEN_SKEW_GROWTH_C:
             reason = "no_growth"                     # static skew, not a stampede
+        elif conf_c is not None and conf_c < config.FLIP_CONF_MIN_C:
+            # WO-K §P2: the fragility veto — the physics doesn't favor this side
+            # by more than the spread paid. A coin on its edge is not an edge.
+            reason = "conf_fragile"
+            log.info("OPEN_CONF_REFUSED %s %s@%dc — %s < min %.0f (fragile: the "
+                     "settle table does not favor this side enough)", market,
+                     side, join, conf_note, config.FLIP_CONF_MIN_C)
         # WO-2026-07-22-J §0.2: depth_ratio is LOGGED (in `vals`/the why), NOT
         # gated. Normalized held/other it showed no predictive value — the one
         # winner read 0.71, inside the losers' 0.56-0.85 — so the gate only cost
@@ -915,7 +941,7 @@ class LaneFlip:
                 f"ratio {dr_s} trend ${trend_usd:+.0f} {agree}) "
                 f"target {target}c (+{target - join}, cap 90) · stop "
                 f"{join - config.OPEN_MOMENTUM_STOP_C}c · {proof} · "
-                f"pile: all-of met · {grain_note}"))
+                f"{conf_note} ✓ · pile: all-of met · {grain_note}"))
         return proposals
 
     @staticmethod

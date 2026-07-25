@@ -3778,6 +3778,76 @@ seniority / gate C preserved; #7 sibling greps above. New `test_point_the_hunter
 `test_p18_detective` re-anchored to the forward gate; `tape_grade`/`SEMANTICS.md` registry updated to the
 new casefile vocabulary. Suite 823 · preflight 23/23.
 
+## WO-2026-07-25-K — THE DESK EARNS ITS SIZE (build 81)
+
+The honest diagnosis: the +4 OPEN desk is **6-of-11 since the target change (55% conversion) against a
+~73% breakeven** — win +4¢/contract, the four Saturday stops averaged −14.25¢, and at 3.5:1 loss-to-win
+55% loses (Saturday priced it: OPEN −$12.35 against F's +$18.95). The hard finding: **no recorded
+feature separates the winners from the losers at n=11** — ratio, skew, growth, trend-agree, into-seconds,
+time-band, and the Wilson cell margin (negative on *every* entry, printed "info" while trading full size)
+all passed on all four losses. High confidence cannot be a threshold on the existing instruments — they
+measure the pile's shape, not whether the open is fragile. All four losses were the same shape: a 56–62¢
+favorite with spot pinned to the strike, where one $10–30 drift flips the book. The instrument that reads
+*that* is the one already banked — the -J settle table.
+
+**Read-rule (against build 80):** K1 `config.py:377` — `FLIP_NOTIONAL_PCT = 0.14` — TRUE, demoted to
+0.04. K2 `config.py:539` `rate_halt_drawdown_c(book)` computes `lots = book·FLIP_NOTIONAL_PCT/ref` — TRUE,
+it re-derives from the dial, so the halt shrank with the demotion automatically. K3 the FLIP_SWING records
+`lane_flip.py:2174` writes at conclusion (`gross_cents`, `took_swing`) and the pack reads them
+(`ops.flip_fill_rate_by_price`, `fill_economics`) — TRUE. K4 `lane_flip.py:889` the cell margin prints
+`(info)` on every OPEN card — TRUE. K5 **honest divergence** — the WO's "worst-day boot banner re-derives
+from the dial" is imprecise: `ops.worst_day_bound_line` derives from the at-risk **WALL** (`AT_RISK_CAP_
+CENTS`), which the sizing-dial change does NOT touch (correct — the wall is unchanged; a voluntary smaller
+size doesn't loosen the ceiling). The **SIZING boot banner** (`boot.sizing_line`) IS dial-derived and
+re-derives the FLIP lots + halt; that is where "prints both" is satisfied. Reported, not papered over.
+
+**P1 — tuition size.** `FLIP_NOTIONAL_PCT: 0.14 → 0.04` (≈5–6 lots at the ~$90 book). The desk keeps every
+piece of armor (sighted stop, -I healing, floor counting) and keeps buying cells, at ~−35¢/day expected
+worst instead of −$12 days. F is untouched at its earned 0.20. The rate-halt re-derives from the tuition
+dial (a stop budget of 4 stop-outs at the *current* size, not a frozen constant); the boot SIZING banner
+prints the tuition lots, the full target, the ladder bars, and the re-derived halt on one line.
+
+**P2 — the confidence instrument.** The -J settle table gains its desk duty. `spotlead.settle_fair_favored`
+prices the favored side's SETTLE-fair from `p_end`: a zero-drift 15-min walk is symmetric, so the favored
+side loses only if the net ADVERSE move crosses back over the strike, which is half the directionless
+`p_end` mass — hence **settle_fair = (1 − p_end(d, t)/2) × 100**, tending to 50 as spot pins to the strike
+(d → 0, p_end → 1). New OPEN gate (the last of the all-of chain, `lane_flip.py`): **favored-side
+settle-fair ≥ join + FLIP_CONF_MIN_C** (DREW-DEFAULT 4). All four Saturday losses (settle-fair ≈ 54 vs a
+58–60¢ join → conf ≈ −6) are REFUSED (`OPEN_CONF_REFUSED`, reason `conf_fragile`); a genuine edge (spot
+$300 off the strike → settle-fair ≈ 75, conf ≈ +15) passes and the card carries `settle-fair N vs join M →
+conf +K ✓`. Absent the settle surface the gate ABSTAINS (BLIND) and the desk trades on its pile gates, tuition
+bounding the unread risk — the seal's ordering (tuition pays while the instrument is built). Phase-two vol
+axis (`p_end(d, t, vol)`) stays banked. Point estimate, not a bound — the +4 headroom is the conservatism;
+a vol-conditioned upper-bound version is the phase-two refinement.
+
+**P3 — promotion by conversion.** `flip_ladder.py` makes the size ladder mechanical: `trailing_conversion`
+reads the last `FLIP_CONV_WINDOW` (20) FLIP_SWING round-trips (a trip CONVERTS when `gross_cents > 0`);
+`evaluate_size_tier` promotes tuition→full at conversion **≥ 0.75** over a full window and demotes
+full→tuition **instantly** under **0.65** (hysteretic band holds between; promote slowly, demote
+instantly), paging ONCE per flip with the number that moved it (`DESK_SIZE_CHANGE` + Telegram). The
+sizing chokepoint `_score_and_size` reads `active_notional_pct(ledger, cell_margin)` and passes it to
+`size_order(..., notional_pct=)`; the **margin tiebreaker** rides on top — full size only when the desk is
+promoted AND the entry cell's Wilson margin ≥ 0, so a lucky streak can never up-size a structurally-losing
+cell (ADVERSARY's gaming check). Conversion is size-independent, so tuition trips keep earning promotion
+(ADVERSARY's deadlock check). The ladder line surfaces in the hourly and the daily pack.
+
+**Sibling greps:** `size_order`'s FLIP branch is the one notional consumer; it gained an optional
+`notional_pct` (default → `FLIP_NOTIONAL_PCT` tuition, so bare callers/boot preview read tuition). F's
+branch (`F_NOTIONAL_PCT`) is untouched. `rate_halt_drawdown_c` and `DIAL_OF_LANE`/`dial_wall_violations`
+were re-pointed at the correct dial (the wall now guards the FULL ceiling 0.14 < 0.18). The `_score_and_size`
+FLIP-pct block is wrapped so sizing never blocks on a partial ledger (tuition is the safe floor).
+
+**Acceptance:** #1 tuition sizes ~5–6 lots, halt re-derived, boot prints both (`test_tuition_sizes_five_or_
+six_lots_at_the_live_book`, `test_rate_halt_re_derives_from_the_tuition_dial`, `test_boot_banner_prints_both_
+tuition_and_the_halt`); #2 conversion visible in hourly + pack, promotion/demotion mechanical with the
+number (`test_promotion_and_demotion_fire_mechanically`, `test_ladder_line_reports_the_number`,
+`test_hysteresis_band_holds_the_tier`); #3 settle-fair + conf logged, refusals named, the four Saturday
+losses replay REFUSED (`test_saturday_losses_replay_as_refused`, `test_genuine_edge_passes_the_conf_gate`,
+`test_blind_settle_surface_proceeds_at_tuition`); #4 **F byte-identical** (`lane_fh8` untouched;
+`test_f_sizing_untouched`). New `test_desk_earns_its_size.py` (15 tests); `test_morning_four_build2` /
+`test_size_test` / `test_size_test_data` re-anchored (full-size mechanism tests now exercise the promoted
+dial explicitly; tuition is the default). Suite 838 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

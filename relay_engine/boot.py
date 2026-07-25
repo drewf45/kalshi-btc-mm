@@ -35,15 +35,23 @@ def sizing_line(book_cents: int) -> str:
     # constant.
     halt = config.rate_halt_drawdown_c(book_cents)
     frac = config.KELLY_FRACTION_CEILING
+    # WO-2026-07-25-K §P1: FLIP starts at TUITION and re-earns FULL by conversion
+    # (P3). The boot preview sizes at the tuition floor (a bare size_order reads
+    # FLIP_NOTIONAL_PCT); print the earned full target + the ladder bars beside it.
+    flip58_full = size_order(book_cents, 58, 10_000, lane="FLIP",
+                             notional_pct=config.FLIP_FULL_NOTIONAL_PCT)
     return (f"SIZING: book ${book_cents / 100:.2f} · Kelly fraction={frac:.4f} · "
             f"budget/window {budget}¢ · "
             f"F @97¢ → {f97.contracts} lots (dial {config.F_NOTIONAL_PCT:.0%}, "
             f"wall {config.AT_RISK_PCT['F']:.0%}) · "
-            f"FLIP @58¢ → {flip58.contracts} lots (dial "
-            f"{config.FLIP_NOTIONAL_PCT:.0%}, wall {config.AT_RISK_PCT['FLIP']:.0%}"
-            f", no fixed cap — scales with book) · rate-halt bound "
-            f"−{halt}¢ (4 stop-outs at this book) — throttle is book size + the "
-            "at-risk wall, self-scaling")
+            f"FLIP @58¢ → {flip58.contracts} lots TUITION (dial "
+            f"{config.FLIP_NOTIONAL_PCT:.0%}) / {flip58_full.contracts} lots FULL "
+            f"(dial {config.FLIP_FULL_NOTIONAL_PCT:.0%}, wall "
+            f"{config.AT_RISK_PCT['FLIP']:.0%}) — earned at trailing-"
+            f"{config.FLIP_CONV_WINDOW} conversion ≥{config.FLIP_PROMOTE_CONV:.0%} "
+            f"(demote <{config.FLIP_DEMOTE_CONV:.0%}) · no fixed cap — scales "
+            f"with book · rate-halt bound −{halt}¢ (4 stop-outs at the tuition "
+            "book) — throttle is book size + the at-risk wall, self-scaling")
 
 
 def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
@@ -484,6 +492,30 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "DIVERGENCE read-back — realized settle vs p_end vs book by "
                  "edge; HUNT stays PROBE until a bucket's Wilson LB clears the "
                  "book. Touch surface untouched (labeled info); F byte-identical")
+    lines.append("  THE DESK EARNS ITS SIZE (WO-2026-07-25-K, build 81): the +4 "
+                 "OPEN desk was 6-of-11 (55% conversion) against a ~73% "
+                 "breakeven and no recorded feature separated its winners from "
+                 "its losers at n=11 — the gates measured the crowd (really "
+                 "there, piling onto a coin on its edge), not the fragility of "
+                 "the open. P1 TUITION SIZE: demote instantly — FLIP dial "
+                 f"{config.FLIP_NOTIONAL_PCT:.0%} (was 14%), ~5-6 lots; full "
+                 "armor kept, cells still bought, at ~−35¢/day worst instead of "
+                 "−$12 days. The rate-halt re-derives from the tuition dial "
+                 "(verified). F untouched. P2 THE CONFIDENCE INSTRUMENT: the -J "
+                 "settle table gains its desk duty — at OPEN entry the favored "
+                 "side's SETTLE-fair (1−p_end/2, the reflection of the "
+                 "directionless settle mass) must beat the join by "
+                 f"FLIP_CONF_MIN_C ({config.FLIP_CONF_MIN_C:.0f}c); the four "
+                 "Saturday losses (spot pinned to strike → settle-fair ≈ 50) "
+                 "are REFUSED. BLIND on a legacy tape → tuition bounds it. P3 "
+                 "PROMOTION BY CONVERSION: the size ladder is mechanical — "
+                 f"trailing-{config.FLIP_CONV_WINDOW} conversion "
+                 f"≥{config.FLIP_PROMOTE_CONV:.0%} re-earns full "
+                 f"({config.FLIP_FULL_NOTIONAL_PCT:.0%}), "
+                 f"<{config.FLIP_DEMOTE_CONV:.0%} demotes instantly (promote "
+                 "slowly, demote instantly, no ruling); the entry cell's "
+                 "negative Wilson margin blocks a lucky streak from up-sizing a "
+                 "losing cell. The tape moves the dial. F byte-identical")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

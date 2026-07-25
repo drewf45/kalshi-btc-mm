@@ -50,7 +50,8 @@ class SizeDecision:
 
 
 def size_order(book_cents: int, price_cents: int,
-               visible_depth: int, lane: str = None) -> SizeDecision:
+               visible_depth: int, lane: str = None,
+               notional_pct: float = None) -> SizeDecision:
     """P27 §1 — SIZING = FULL KELLY; GOVERNORS DIE (Drew's ruling, twice):
     contracts = min(kelly_lots, depth_lots). The tier term is REMOVED from
     the entry path — the Wilson ladder remains as reporting (scoreboard,
@@ -95,14 +96,19 @@ def size_order(book_cents: int, price_cents: int,
         # depth), like F: depth is the term the size test measures, the per-lane
         # at-risk WALL is the (book-proportional) backstop above. Guard (d): all
         # terms + kelly (n/a) + the binding one logged.
-        notional_max = int(book_cents * config.FLIP_NOTIONAL_PCT // price_cents)
+        # WO-2026-07-25-K §P3: the notional is the DESK LADDER's active dial —
+        # tuition (FLIP_NOTIONAL_PCT) unless the caller passes the promoted pct
+        # (full, gated on conversion + the entry cell's margin). Default = the
+        # tuition floor, so a bare size_order (tests, boot preview) reads tuition.
+        pct = config.FLIP_NOTIONAL_PCT if notional_pct is None else notional_pct
+        notional_max = int(book_cents * pct // price_cents)
         contracts = min(notional_max, depth_max)
         term = {"notional": notional_max, "depth": depth_max}
         bound = min(term, key=term.get)
         return SizeDecision(
             "-", contracts,
-            f"FLIP: min(notional={notional_max}, depth={depth_max}) → {bound} "
-            f"bound (no cap — scales with book; kelly n/a={kelly_max})")
+            f"FLIP: min(notional={notional_max}@{pct:.0%}, depth={depth_max}) → "
+            f"{bound} bound (no cap — scales with book; kelly n/a={kelly_max})")
     # The kept walls are LAW (P27 §2d): net-risk <=3/event stands, so
     # sizing proposes at most the cap — full Kelly lives UNDER the wall,
     # it does not fight it (a 7-lot proposal dying whole at the wall would

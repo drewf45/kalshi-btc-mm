@@ -93,9 +93,10 @@ def test_flip_size_logs_the_binding_term(ledger, caplog):
     line = next((r.getMessage() for r in caplog.records
                  if r.getMessage().startswith("FLIP_SIZE")), None)
     assert line is not None
-    # 8000*0.14//48 = 23 notional; depth ample → notional binds; no cap
+    # WO-2026-07-25-K: FLIP defaults to TUITION (0.04) until the desk earns full
+    # by conversion; here 8000*0.04//48 = 6 notional binds below ample depth.
     assert "→ notional bound" in line and "no cap" in line
-    assert "count=23" in line
+    assert f"count={int(8000 * config.FLIP_NOTIONAL_PCT // 48)}" in line
 
 
 def test_flip_size_log_names_depth_when_depth_binds(ledger, caplog):

@@ -496,8 +496,23 @@ class ShadowEngine:
                                 alert_fn=self.telegram.alert)
         depth = book.visible_depth(proposal.side, proposal.price_cents) or 0
         book_c = self.ledger.book_cents()
+        # WO-2026-07-25-K §P3: the FLIP notional is the DESK LADDER's active dial
+        # — full only when the desk is conversion-promoted AND this entry's cell
+        # margin is non-negative, else tuition. The tier flip pages once (mechanical
+        # promotion/demotion, no ruling). Only FLIP self-scales by notional.
+        flip_pct = None
+        if proposal.lane == "FLIP":
+            try:
+                from . import flip_ladder
+                cell_margin = scoring.score(self.ledger, lane,
+                                            proposal.price_cents).get("margin")
+                flip_pct = flip_ladder.active_notional_pct(
+                    self.ledger, cell_margin, now=None,
+                    alert_fn=self.telegram.alert)
+            except Exception:
+                flip_pct = None    # sizing never blocks — tuition is the safe floor
         dec = size_order(book_c, proposal.price_cents, depth,
-                         lane=proposal.lane)
+                         lane=proposal.lane, notional_pct=flip_pct)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
         proposal.count = max(1, dec.contracts)
         # WO-2026-07-24-G Part 2: the FLIP_SIZE_CAP re-cap that used to sit here
@@ -2021,6 +2036,12 @@ async def run():
                 engine.telegram.alert(pack)  # the daily full pack, on the phone
             else:
                 from . import delta as _delta   # P26 §1.2: brain on the line
+                # WO-2026-07-25-K §P3: the desk-size ladder ticks every hour too
+                # (a demotion/promotion fires even in a quiet hour), and the
+                # conversion + live dial ride the hourly line.
+                from . import flip_ladder
+                flip_ladder.evaluate_size_tier(
+                    engine.ledger, alert_fn=engine.telegram.alert)
                 engine.telegram.alert(
                     f"📗 hourly: book={engine.ledger.book_cents()}c "
                     f"windows={engine.windows_seen} "
@@ -2037,7 +2058,8 @@ async def run():
                     f"book✓ {engine.book_checks_total} "
                     f"fetch_fail={getattr(engine.feed, 'failed_fetches', 0)} "
                     f"failures={engine.ledger.db.execute('SELECT COUNT(*) FROM failures').fetchone()[0]} "
-                    + flip_fill_rate_hourly(engine.ledger))
+                    + flip_fill_rate_hourly(engine.ledger)
+                    + " · " + flip_ladder.ladder_line(engine.ledger))
 
     # ── §2c/R6: the inbound listener — EXACTLY the accounting pair ─────────
     async def listener_task():

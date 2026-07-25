@@ -35,9 +35,12 @@ def test_flip_scales_with_the_book_no_fixed_cap():
     """WO-2026-07-24-G Part 2: the fixed cap is RETIRED — FLIP = min(notional,
     depth), scaling with the book like F. On a deep book NOTIONAL is the ceiling
     (8000*0.14//48 = 23), not a frozen 10; a thin book lets DEPTH bind below."""
-    dec = scoring.size_order(8000, 48, 10_000, lane="FLIP")  # notional 23, depth ample
+    # WO-2026-07-25-K: FLIP's default is now TUITION; this asserts the FULL-size
+    # scaling mechanism, so it exercises the promoted dial explicitly.
+    _full = config.FLIP_FULL_NOTIONAL_PCT
+    dec = scoring.size_order(8000, 48, 10_000, lane="FLIP", notional_pct=_full)  # notional 23, depth ample
     assert dec.contracts == 23 and "→ notional bound" in dec.reason
     assert "no cap — scales with book" in dec.reason
     # a thin book: depth binds below the notional and the reason says so
-    thin = scoring.size_order(8000, 48, 12, lane="FLIP")     # depth 12·0.25 = 3
+    thin = scoring.size_order(8000, 48, 12, lane="FLIP", notional_pct=_full)     # depth 12·0.25 = 3
     assert thin.contracts == 3 and "→ depth bound" in thin.reason
