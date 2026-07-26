@@ -69,9 +69,11 @@ class Surface:
             if self._last_state.get(key) == state:
                 self.interim_counters[(lane, state)] += 1
                 return False
+            # §A1: insert FIRST — a why-less row is REFUSED here (raises) with no
+            # state mutation, so a refused write leaves no trace to dedup against.
+            self._insert(key, state, 0, transport, detail, ts)
             self._last_state[key] = state
             self._last_detail[key] = detail
-            self._insert(key, state, 0, transport, detail, ts)
             return True
         prev = self._terminal.get(key)
         if prev is not None:
@@ -90,12 +92,27 @@ class Surface:
                 failures.fail("DUPLICATE_TERMINAL_ROW",
                               f"terminal REGRESSION for {key}: had {prev}, "
                               f"got {state}", fatal=True)
+        # §A1: insert FIRST (refuses a why-less terminal before any state change).
+        self._insert(key, state, 1, transport, detail, ts)
         self._terminal[key] = state
         self._last_state[key] = state
-        self._insert(key, state, 1, transport, detail, ts)
         return True
 
     def _insert(self, key, state, terminal, transport, detail, ts):
+        # ── WO-2026-07-26-P §A1 — THE WHY LAW AT THE WRITE CHOKEPOINT ──────────
+        # Every surface row is a claim about money or state, and a claim with no
+        # reason is exactly the silent fabrication the one-lot bug rode in on: a
+        # number with nobody standing behind it. This is the ONE shared writer —
+        # every write_row branch (interim state-change AND terminal) funnels
+        # through here, and there is no other path to surface_rows. So it refuses
+        # a row that carries no why. (Same-state interim repeats never reach here;
+        # write_row bumps a counter and returns before calling _insert.)
+        if detail is None or not str(detail).strip():
+            raise ValueError(
+                f"WHY_REQUIRED: surface row {key} state={state!r} was written "
+                "with no why/reason. Every row must carry a sentence — a number "
+                "with no reason is a fabrication (Why Law §A1). Give the writer "
+                "a detail= that says what this row claims and why.")
         lane, market, window_id = key
         self.ledger.db.execute(
             "INSERT INTO surface_rows (ts, lane, market, window_id, state, terminal,"

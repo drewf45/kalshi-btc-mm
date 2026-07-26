@@ -843,4 +843,15 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(fill_economics(ledger))
     except Exception as e:
         lines.append(f"FILL ECONOMICS: unavailable ({e})")
+    # WO-2026-07-26-P §A3: the data-question registry rides the pack — every
+    # surface with its question and last-read; unread>14d pages DATA_WITHOUT_
+    # QUESTION. The pack IS a read of these surfaces, so stamp them read here.
+    try:
+        from . import registry
+        lines.extend(registry.registry_pack_lines(ledger.db))
+        registry.page_unread(ledger.db)          # page BEFORE stamping this read
+        for _s in registry.registered_surfaces():
+            registry.record_read(ledger.db, _s)  # the pack IS the read event
+    except Exception as e:
+        lines.append(f"DATA-QUESTION REGISTRY: unavailable ({e})")
     return "\n".join(lines)

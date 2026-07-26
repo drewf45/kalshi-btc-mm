@@ -373,10 +373,16 @@ class ShadowEngine:
         if rb.yes_bid is None and rb.no_bid is None:
             return None
         ob = OrderBook(market=market, transport="REST")
+        # fallback-audited: a REST poll that REPORTS a touch (rb.yes_bid is not
+        # None) proves >=1 lot rests there — the level's existence is the venue's
+        # own claim. When the poll omits qty, `or 1` records the minimum the
+        # touch already guarantees, never a wall out of nothing (same RULING-3
+        # logic as sizing: a real level admits >=1 lot). This REST book is the
+        # standing arbiter (book_check), not the sizing read.
         if rb.yes_bid is not None:
-            ob.yes_bids[rb.yes_bid] = rb.yes_bid_qty or 1
+            ob.yes_bids[rb.yes_bid] = rb.yes_bid_qty or 1  # fallback-audited: touch proves >=1
         if rb.no_bid is not None:
-            ob.no_bids[rb.no_bid] = rb.no_bid_qty or 1
+            ob.no_bids[rb.no_bid] = rb.no_bid_qty or 1  # fallback-audited: touch proves >=1
         ob.has_snapshot = True
         ob.last_update_ts = time.time()
         return ob
@@ -487,6 +493,27 @@ class ShadowEngine:
                           fatal=False, alert=False, market=market,
                           per_contract_c=round(per_contract_loss_c, 1))
 
+    def _defer_entry(self, proposal, reason: str, ctx: dict) -> None:
+        """WO-2026-07-26-P §B2 — the honest defer. A depth/size read that cannot
+        produce a chosen number does NOT fabricate one: the entry sits out ONE
+        cycle with a named row ({reason, terms}), and re-proposes next cycle when
+        the book may have formed. count=0 is the signal the submit loop skips on."""
+        proposal.count = 0
+        key = (proposal.market, proposal.lane, proposal.side,
+               proposal.price_cents, reason)
+        if key not in self._size_zero_logged:
+            self._size_zero_logged.add(key)
+            log.info("%s %s %s %s@%dc — deferring one cycle: %s", reason,
+                     proposal.lane, proposal.market, proposal.side,
+                     proposal.price_cents, ctx)
+            try:
+                self.surface.write_row(
+                    proposal.lane, proposal.market,
+                    self._window_of.get(proposal.market, f"w-{proposal.market}"),
+                    "WATCHING", detail=json.dumps({"defer": reason, **ctx}))
+            except Exception:
+                pass
+
     def _score_and_size(self, proposal, book) -> None:
         """P27 §1 — SIZING = FULL KELLY: contracts = min(kelly, depth); the
         Wilson ladder still scores every cell (tier_for — the REPORTING
@@ -498,7 +525,26 @@ class ShadowEngine:
         lane = scoring.cell_lane(proposal.lane, proposal.why)
         tier = scoring.tier_for(self.ledger, lane, proposal.price_cents,
                                 alert_fn=self.telegram.alert)
-        depth = book.visible_depth(proposal.side, proposal.price_cents) or 0
+        # WO-2026-07-26-P §B1/B2 — the TWO-QUESTION depth, no silent fallback.
+        # `joining` is contracts AT the exact level (None = blind book, never a
+        # fabricated 0). The notional lanes (F/FLIP) that CREATE a level in front
+        # of a deep band size to the band they functionally trade, not the empty
+        # level — the one-lot bug's fix.
+        side, price = proposal.side, proposal.price_cents
+        joining = book.joining_depth(side, price)
+        if joining is None:                       # §B2: DEPTH_BLIND — defer, don't guess
+            self._defer_entry(proposal, "DEPTH_BLIND",
+                              {"side": side, "price": price})
+            return
+        # §B1: EVERY lane that creates a level in front of a band sizes to the
+        # band it functionally trades, not the empty level. `band` bounded to the
+        # price's own tier band (Adversary i); the reference is the larger of the
+        # honest joining depth and the band fraction. Both print on the size row.
+        w = config.SIZING_BAND_HALFWIDTH_C
+        band = book.band_depth(side, max(1, price - w), min(99, price + w))
+        band = band if band is not None else 0
+        band_ref = int(band * config.BAND_DEPTH_FRACTION)
+        depth = max(joining, band_ref)
         # WO-2026-07-26-O §O2: SIZE and the portfolio cap work off TRADEABLE
         # (book − owed), never raw book — the operator's scrape is earmarked and
         # never sized against.
@@ -524,7 +570,21 @@ class ShadowEngine:
         dec = size_order(book_c, proposal.price_cents, depth,
                          lane=proposal.lane, notional_pct=flip_pct)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
-        proposal.count = max(1, dec.contracts)
+        # WO-2026-07-26-P §B2: a 0 does NOT silently become a 1. If the math
+        # produced no size, the proposal DEFERS with the full term set — a 1-lot
+        # order may only ever exist because the math said 1.
+        if dec.contracts <= 0:
+            self._defer_entry(proposal, "SIZE_ZERO_DEFER", {
+                "tradeable": book_c, "joining": joining, "band": band,
+                "band_ref": band_ref, "depth_used": depth, "sizing": dec.reason})
+            return
+        proposal.count = dec.contracts
+        # §B1 / Article 1: both depth terms + the chosen reference ride the size
+        # row, so "why this size?" is answered on the entry card, including N=1.
+        proposal.why = ((proposal.why + " · ") if proposal.why else "") + (
+            f"size {dec.contracts} [joining={joining}"
+            + (f" band={band}→ref={band_ref}" if band is not None else "")
+            + f" used={depth}; {dec.reason}]")
         # WO-2026-07-24-G Part 2: the FLIP_SIZE_CAP re-cap that used to sit here
         # is RETIRED — FLIP now scales with the book via sizing.size_order
         # (min(notional, depth)), and the book-proportional at-risk WALL is the
@@ -587,22 +647,11 @@ class ShadowEngine:
                                 clamped, self.ledger.deployed_cents(),
                                 int(config.PORTFOLIO_DEPLOY_PCT * 100), book_c)
                 proposal.count = clamped
-        # WO-VERIFY-LOSSTERM-1 B4 (pure logging): when Kelly is the term
-        # that zeroed a favorite, say so BY NAME once per (market, price) —
-        # "0 @98c" must be self-explaining arithmetic, never a mystery bug.
-        if dec.contracts == 0:
-            book_c = self.ledger.book_cents()
-            kelly_budget = int(book_c * config.KELLY_FRACTION_CEILING)
-            if kelly_budget // max(1, proposal.price_cents) == 0:
-                key = (proposal.market, proposal.price_cents)
-                if key not in self._size_zero_logged:
-                    self._size_zero_logged.add(key)
-                    log.info(
-                        "SIZE_ZERO_BY_KELLY %s price=%dc book=%dc "
-                        "kelly_budget=%dc — throttle is book size, not a "
-                        "wall (count=1 proposed; the walls refuse by name)",
-                        proposal.market, proposal.price_cents, book_c,
-                        kelly_budget)
+        # WO-VERIFY-LOSSTERM-1 B4 → WO-2026-07-26-P §B2: the "0 → count=1, let the
+        # walls refuse" path is RETIRED. A computed-0 now DEFERS at sizing
+        # (_defer_entry, above) with the full term set — the size is never
+        # fabricated up to 1 for the walls to catch. This block is unreachable
+        # (contracts<=0 returned above); kept as a tombstone for the read-rule.
 
     def simulate_shadow_fills(self, market, book, now) -> int:
         """WO-2026-07-25-L §P1 — the pessimistic shadow fill sweep. For each
@@ -1669,6 +1718,11 @@ class ShadowEngine:
                     # next proposal, no grace. Exits/cuts are never resized.
                     if proposal.purpose == "ENTRY":
                         self._score_and_size(proposal, book)
+                        # WO-2026-07-26-P §B2: a deferred entry (DEPTH_BLIND /
+                        # SIZE_ZERO_DEFER) carries count=0 — it does NOT go out at
+                        # a fabricated 1. It sits this cycle and re-proposes next.
+                        if proposal.count <= 0:
+                            continue
                     # WO-HALT-ORPHAN §2B: an ENTRY the budget wall already
                     # refused this window is not re-submitted — the wall
                     # can't change within a window (byte-identical book).

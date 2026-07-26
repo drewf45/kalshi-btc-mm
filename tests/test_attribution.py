@@ -58,18 +58,21 @@ def test_terminal_lattice_monotonic(surface):
     """P17 §1 overturned the old immutable-terminal law here: PASS is
     provisional (interim) mid-window; a stale PASS terminal meeting SETTLED
     UPGRADES (logged, never fatal); only a REGRESSION stays FATAL."""
-    surface.write_row("F", MKT, WIN, PASS)                      # provisional
-    assert surface.write_row("F", MKT, WIN, PASS) is False      # dedup no-op
-    assert surface.write_row("F", MKT, WIN, SETTLED) is True    # 9:30 shape heals
+    # Why Law §A1: every row carries a sentence — even these mechanics fixtures.
+    surface.write_row("F", MKT, WIN, PASS, detail="no edge")     # provisional
+    assert surface.write_row("F", MKT, WIN, PASS, detail="no edge") is False  # dedup
+    assert surface.write_row("F", MKT, WIN, SETTLED, detail="pnl") is True    # heals
     with pytest.raises(FatalIntegrityError):
-        surface.write_row("F", MKT, WIN, PASS, final=True)      # regression = bug
+        surface.write_row("F", MKT, WIN, PASS, detail="no edge",
+                          final=True)                            # regression = bug
 
 
 def test_stale_pass_terminal_upgrades_logged(surface, ledger):
     from relay_engine import failures
     failures.configure(ledger, alert_fn=lambda m: None, run_mode="TEST", boot_id=1)
     try:
-        surface.write_row("H8", MKT, WIN, PASS, final=True)     # terminal PASS
+        surface.write_row("H8", MKT, WIN, PASS, detail="no edge",
+                          final=True)                           # terminal PASS
         assert surface.write_row("H8", MKT, WIN, SETTLED, detail="pnl") is True
         row = ledger.db.execute(
             "SELECT detail FROM surface_rows WHERE lane='H8' AND state='SETTLED'"
@@ -84,10 +87,12 @@ def test_stale_pass_terminal_upgrades_logged(surface, ledger):
 
 
 def test_interim_rows_on_state_change_only(surface):
-    assert surface.write_row("D", MKT, WIN, "PROPOSED") is True
-    assert surface.write_row("D", MKT, WIN, "PROPOSED") is False  # counter, not row
+    assert surface.write_row("D", MKT, WIN, "PROPOSED", detail="cheap side") is True
+    assert surface.write_row("D", MKT, WIN, "PROPOSED",
+                             detail="cheap side") is False       # counter, not row
     assert surface.interim_counters[("D", "PROPOSED")] == 1
-    assert surface.write_row("D", MKT, WIN, "ENTERED") is True  # state change: full row
+    assert surface.write_row("D", MKT, WIN, "ENTERED",
+                             detail="filled") is True            # state change: full row
 
 
 def test_settlement_split_no_side(ledger, surface):

@@ -74,7 +74,12 @@ def size_order(book_cents: int, price_cents: int,
     kelly_max = int(kelly_budget_cents // price_cents)
     depth_max = int(visible_depth * config.DEPTH_FRACTION)
     if visible_depth >= 1:
-        depth_max = max(1, depth_max)
+        # fallback-audited: RULING-3 (WO-P §B3) — a real book with >=1 visible
+        # lot admits 1 lot even when the DEPTH_FRACTION rounds to zero. This is
+        # depth-DRIVEN and HONEST: the guard fires only when the book actually
+        # SHOWS >=1 resting lot. A blind/empty book never reaches here — it
+        # deferred as DEPTH_BLIND / SIZE_ZERO_DEFER upstream (shadow_runner).
+        depth_max = max(1, depth_max)  # fallback-audited: RULING-3 depth-driven floor
     if lane == "F":
         # F's dial: notional = pct of book, bounded by depth only. Kelly and
         # the count cap do NOT bind F (the whole point of the WO). count=1

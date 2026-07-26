@@ -365,6 +365,13 @@ def at_risk_cap_cents(lane: str, book_cents: int) -> int:
     return int(book_cents * AT_RISK_PCT.get(lane, AT_RISK_PCT_DEFAULT))
 LANE_D_FLOOR_CENTS = 60  # DREW-DEFAULT: Lane D band floor, pending Chunk 2 data (50c vs 60c open)
 DEPTH_FRACTION = 0.25  # DREW-DEFAULT: per-level size <= 25% of visible depth
+# WO-2026-07-26-P §B1 — the band-depth reference for the notional lanes (F/FLIP).
+# When a lane CREATES a level in front of a deep band, it sizes to a fraction of
+# the band it functionally trades with, not the empty level it's joining. The
+# band is the price ± halfwidth (the lane's own tier band, bounded — never the
+# whole side, Adversary i). DREW-DEFAULT 0.15: derive upward from fill-quality.
+BAND_DEPTH_FRACTION = 0.15         # DREW-DEFAULT(pending derivation): band size the notional lanes may take
+SIZING_BAND_HALFWIDTH_C = 4        # DREW-DEFAULT: the band is price ± this many cents
 # WO-INFRA-HARDENING E1: a book-vs-venue gap wider than this, with 0 unsettled
 # fills and 0 resting orders, is an unexplained divergence (the phantom
 # signature) and is recorded to the E1 trail. Book and venue both round once,
@@ -737,6 +744,110 @@ def drew_defaults() -> dict:
         "lane_d_floor": f"{LANE_D_FLOOR_CENTS}c (pending Chunk 2 data)",
         "depth_fraction": f"{DEPTH_FRACTION:.0%}",
     }
+
+
+# ---------------------------------------------------------------------------
+# WO-2026-07-26-P §A4 — CONSTANT PROVENANCE TAGS. Every capital-relevant number
+# is one of three things, and the tree says which IN CODE: RULED(date) (Drew
+# ruled it, with the day it was ruled), DERIVED(source) (computed from a stated
+# source), or DREW-DEFAULT(pending) (a placeholder standing until ruled). A
+# DERIVED tag with no source is a number pretending to be reasoned — it FAILS
+# LOUD (assert_constant_tags_sane). Boot prints the constants that CHANGED this
+# deploy with their tag, so a size move is never silent. `baseline` is the value
+# at the prior deploy (build 84); _NEW marks a constant introduced this deploy.
+# ---------------------------------------------------------------------------
+RULED, DERIVED, DREW_DEFAULT = "RULED", "DERIVED", "DREW-DEFAULT"
+_NEW = object()  # sentinel: a constant born this deploy (no prior baseline)
+
+
+class ConstantTag:
+    """One capital constant's provenance, value, and prior-deploy baseline."""
+    __slots__ = ("name", "kind", "provenance", "value", "baseline")
+
+    def __init__(self, name, kind, provenance, value, baseline):
+        self.name = name
+        self.kind = kind                # RULED | DERIVED | DREW-DEFAULT
+        self.provenance = provenance    # date / source / "pending …"
+        self.value = value
+        self.baseline = baseline        # prior-deploy value, or _NEW
+
+    def is_new(self) -> bool:
+        return self.baseline is _NEW
+
+    def is_changed(self) -> bool:
+        return self.is_new() or self.value != self.baseline
+
+    def derived_without_source(self) -> bool:
+        return self.kind == DERIVED and not str(self.provenance).strip()
+
+    def tag_str(self) -> str:
+        return f"{self.kind}({self.provenance})"
+
+
+def constant_tags() -> list:
+    """The provenance table. Every capital-relevant constant is tagged; the
+    baseline is the value shipped in build 84 (so `is_changed` flags this
+    deploy's moves). WO-P adds exactly the two band constants and changes no
+    dial — the changed set is those two NEW entries, nothing else."""
+    return [
+        ConstantTag("DEPTH_FRACTION", DREW_DEFAULT, "pending derivation",
+                    DEPTH_FRACTION, 0.25),
+        ConstantTag("BAND_DEPTH_FRACTION", DREW_DEFAULT,
+                    "pending derivation from fill-quality", BAND_DEPTH_FRACTION, _NEW),
+        ConstantTag("SIZING_BAND_HALFWIDTH_C", DREW_DEFAULT, "pending derivation",
+                    SIZING_BAND_HALFWIDTH_C, _NEW),
+        ConstantTag("F_NOTIONAL_PCT", RULED, "2026-07-25 WO-L P2",
+                    F_NOTIONAL_PCT, 0.24),
+        ConstantTag("AT_RISK_PCT.F", RULED, "2026-07-25 WO-L P2",
+                    AT_RISK_PCT["F"], 0.30),
+        ConstantTag("FLIP_NOTIONAL_PCT", RULED, "2026-07-25 WO-K P1",
+                    FLIP_NOTIONAL_PCT, 0.04),
+        ConstantTag("SCRAPE_MILESTONE_C", RULED, "2026-07-26 WO-O",
+                    SCRAPE_MILESTONE_C, 1000),
+        ConstantTag("SCRAPE_PER_MILESTONE_C", RULED, "2026-07-26 WO-O",
+                    SCRAPE_PER_MILESTONE_C, 500),
+        ConstantTag("LANE_D_FLOOR_CENTS", DREW_DEFAULT, "pending Chunk 2 data",
+                    LANE_D_FLOOR_CENTS, 60),
+        ConstantTag("RECON_AUDIT_FLOOR_CENTS", DREW_DEFAULT, "pending derivation",
+                    RECON_AUDIT_FLOOR_CENTS, 2),
+    ]
+
+
+def derived_without_source(tags=None) -> list:
+    """DERIVED tags carrying no source — numbers pretending to be reasoned."""
+    return [t for t in (tags or constant_tags()) if t.derived_without_source()]
+
+
+def changed_constants(tags=None) -> list:
+    """Constants whose value differs from the prior deploy (or are new)."""
+    return [t for t in (tags or constant_tags()) if t.is_changed()]
+
+
+def assert_constant_tags_sane(fail_fn=None, tags=None) -> None:
+    """FAIL LOUD if any DERIVED constant has no source. Called at boot."""
+    orphans = derived_without_source(tags)
+    if orphans:
+        names = ", ".join(t.name for t in orphans)
+        detail = (f"DERIVED constants with no source: {names} — a DERIVED tag "
+                  "must name what it was derived FROM (Why Law §A4)")
+        if fail_fn is not None:
+            fail_fn("DERIVED_WITHOUT_SOURCE", detail, fatal=True)
+        else:
+            from . import failures
+            failures.fail("DERIVED_WITHOUT_SOURCE", detail, fatal=True)
+
+
+def constant_tag_boot_lines() -> list:
+    """Boot tape: the constants that CHANGED this deploy, with their tags."""
+    changed = changed_constants()
+    if not changed:
+        return ["CONSTANTS (WO-P A4): no capital constant changed this deploy "
+                "(all tagged RULED/DERIVED/DREW-DEFAULT in-source)"]
+    lines = ["CONSTANTS CHANGED THIS DEPLOY (WO-P A4) — each tagged in-source:"]
+    for t in changed:
+        was = "NEW" if t.is_new() else f"was {t.baseline}"
+        lines.append(f"  {t.name} = {t.value} [{t.tag_str()}] ({was})")
+    return lines
 
 
 def live_submit_enabled() -> bool:

@@ -320,7 +320,10 @@ def test_b4_size_zero_by_kelly_logs_once_and_changes_nothing(tmp_path,
     e = ShadowEngine(db_path=str(tmp_path / "b4z.db"))
     e.ledger.baseline(1174, confirmed_by="boot")         # today's live book
     book = OrderBook(market=TICKER)
-    book.apply_snapshot({98: 10}, {1: 10}, ts=1.0)
+    # 98c favorite (the Kelly-zeroed case) plus a real resting wall at 39c so the
+    # 39c proposal has depth to size against — under §B2 a positive size requires
+    # the book to actually SHOW depth, never a fabricated fallback.
+    book.apply_snapshot({98: 10, 39: 10}, {1: 10}, ts=1.0)
 
     # WO-2026-07-23-B Part 1 moved F off the Kelly path (F now sizes by
     # notional), so the "zeroed by Kelly" demonstration uses H8 — a hold lane
@@ -331,18 +334,21 @@ def test_b4_size_zero_by_kelly_logs_once_and_changes_nothing(tmp_path,
                      action="buy", price_cents=price, count=1,
                      size_tier=config.TIER_PROBE, purpose="ENTRY",
                      why="H8 tier98 · surv~price")
+    # WO-2026-07-26-P §B2: a Kelly-zeroed favorite no longer goes out at a
+    # fabricated 1 — it DEFERS (SIZE_ZERO_DEFER, count=0), logged once. A 1-lot
+    # order may only exist because the math said 1.
     with caplog.at_level(logging.INFO, logger="relay.shadow"):
         p = prop(98)
         e._score_and_size(p, book)
-        assert p.count == 1                              # behavior unchanged
+        assert p.count == 0                              # deferred, NOT a fabricated 1
         e._score_and_size(prop(98), book)                # dedup: once only
-        e._score_and_size(prop(39), book)                # 39c sizes fine
+        p39 = prop(39)
+        e._score_and_size(p39, book)                     # 39c sizes fine
+        assert p39.count >= 1
     zero_lines = [r.message for r in caplog.records
-                  if "SIZE_ZERO_BY_KELLY" in r.message]
+                  if "SIZE_ZERO_DEFER" in r.message]
     assert len(zero_lines) == 1
-    assert "price=98c" in zero_lines[0]
-    assert "book=1174c" in zero_lines[0]
-    assert "kelly_budget=97c" in zero_lines[0]
+    assert "98c" in zero_lines[0]
     # rollover clears the dedup key with the window
     e.on_market_closed(TICKER)
     assert (TICKER, 98) not in e._size_zero_logged

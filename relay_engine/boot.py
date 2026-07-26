@@ -87,6 +87,15 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append("DREW-DEFAULT constants in force:")
     for k, v in config.drew_defaults().items():
         lines.append(f"  DREW-DEFAULT {k} = {v}")
+    # WO-2026-07-26-P §A4 — the constant provenance tags. A DERIVED number with
+    # no source FAILS LOUD; the constants that CHANGED this deploy print with
+    # their tag so a size move is never silent.
+    config.assert_constant_tags_sane()
+    lines.extend(config.constant_tag_boot_lines())
+    # WO-2026-07-26-P §A3 — the data-question registry. Boot asserts every
+    # declared writer carries a complete question (WARN 24h, then FATAL).
+    from . import registry as _registry
+    lines.append(_registry.assert_writers_registered())
     lines.append(
         f"RATE GOVERNOR: bucket={config.RATE_BUCKET_CAPACITY} tokens, "
         f"refill={config.RATE_REFILL_PER_SECOND}/s (printed number IS the enforced number)")
@@ -631,6 +640,25 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "boot/daily; /owed; OWED_UNDERWATER halts if tradeable < one F "
                  "lot. No salvage event can ever increment owed. F entry/hold "
                  "logic byte-identical (exits, accounting, capital arithmetic only)")
+    lines.append("  THE WHY BAKE & THE ONE-LOT TRACE (WO-2026-07-26-P, build 85, "
+                 "one deploy): the one-lot bug traced to its root and the Why Law "
+                 "baked into code. B — the size chokepoint no longer fabricates: "
+                 "the book answers TWO questions (joining_depth: the level an "
+                 "order joins · band_depth: the wall it trades in front of), a "
+                 f"fresh level sizes to max(joining, band×{config.BAND_DEPTH_FRACTION:.0%}) "
+                 f"in a ±{config.SIZING_BAND_HALFWIDTH_C}¢ band with BOTH terms + "
+                 "the binder printed on the size row; a blind book DEFERS "
+                 "(DEPTH_BLIND) and a zero size DEFERS (SIZE_ZERO_DEFER, count=0), "
+                 "never a 1 — the two silent fallbacks (`depth or 0`, "
+                 "`max(1,contracts)`) are gone and a lint FAILS the build on a "
+                 "new one. A — every surface row now REFUSES to write without a "
+                 "why (§A1, the shared chokepoint); the data-question registry "
+                 "(§A3) makes every surface declare the question it answers, its "
+                 "consumer, and its last-read (unread>14d pages DATA_WITHOUT_"
+                 "QUESTION); and every capital constant is tagged in-source RULED/"
+                 "DERIVED/DREW-DEFAULT (§A4) — a DERIVED with no source fails "
+                 "loud. F entry/hold/accounting byte-identical (sizing chokepoint "
+                 "+ evidence law only)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

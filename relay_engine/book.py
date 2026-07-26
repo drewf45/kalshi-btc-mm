@@ -104,9 +104,35 @@ class OrderBook:
         return 100 - nb if nb is not None else None
 
     def visible_depth(self, side: str, price_cents: int) -> int:
-        """Visible contracts resting at the level an order would join (sizing wall input)."""
+        """Visible contracts resting at the level an order would join (sizing wall
+        input). LEGACY name; `joining_depth` is the WO-P B1 canonical accessor."""
         levels = self.yes_bids if side == "yes" else self.no_bids
         return levels.get(int(price_cents), 0)
+
+    # ── WO-2026-07-26-P §B1 — THE TWO-QUESTION DEPTH API ─────────────────────
+    # The one-lot bug was an HONEST answer to the WRONG question: F pricing a
+    # FRESH tier asked "how big is the level I'm joining?", got the true 0 (nobody
+    # rests there yet — F is CREATING the level), and two silent fallbacks turned
+    # that 0 into a 1-lot bet. Split the question in two, and NAME which one sizing
+    # used. A blind book (no snapshot) returns None — never a fabricated 0.
+    def joining_depth(self, side: str, price_cents: int):
+        """Contracts resting AT the exact level an order would join. None if the
+        book is blind (no snapshot) — the honest 'I don't know', never a 0."""
+        if not self.has_snapshot:
+            return None
+        levels = self.yes_bids if side == "yes" else self.no_bids
+        return levels.get(int(price_cents), 0)
+
+    def band_depth(self, side: str, band_lo: int, band_hi: int):
+        """Total contracts resting on `side` within [band_lo, band_hi] — the WALL
+        the lane functionally trades with when it creates a level in front of a
+        deep band. Bounded to the given band (never the whole side — Adversary i).
+        None if the book is blind."""
+        if not self.has_snapshot:
+            return None
+        levels = self.yes_bids if side == "yes" else self.no_bids
+        lo, hi = int(min(band_lo, band_hi)), int(max(band_lo, band_hi))
+        return sum(q for p, q in levels.items() if lo <= p <= hi)
 
     def total_bid_depth(self, side: str) -> int:
         levels = self.yes_bids if side == "yes" else self.no_bids

@@ -4065,6 +4065,48 @@ book/owed/tradeable + `OWED_UNDERWATER` guard. New `test_scrape_and_salvage.py` 
 grep-guard + sizing-line suites re-anchored (3-poll confirm, tradeable base, released tokens, /owed
 whitelist). Suite 886 · preflight 23/23.
 
+## WO-2026-07-26-P — THE WHY BAKE & THE ONE-LOT TRACE (build 85, one deploy)
+
+**Read-rule.** The one-lot chain verified TRUE at source: `book.visible_depth(side, price)`
+returns contracts at the EXACT level (0 when F prices a fresh tier it is CREATING) →
+`depth or 0` (former shadow_runner sizing) coerced the honest 0 → `min(notional, 0×0.25)=0`
+→ `max(1, contracts)=1`. Two silent fallbacks turned an honest 0 into a 1-lot bet. Sibling
+sweep (B3): the ONLY true sizing fabrications were those two; `sizing.py:77` (`max(1,
+depth_max)` under `if visible_depth >= 1`) is RULING-3 — DEPTH-driven and HONEST (a real
+book with ≥1 visible lot admits 1 lot); the REST-touch qty `or 1` proves ≥1 from a reported
+touch (same logic); `max(1, price−w)`/`max(1, price_cents)` are price-clamp/div-guards. Each
+cited HONEST or FIXED.
+
+**Part B — the trace fixed.** #B1 two-question depth API in `book.py`: `joining_depth(side,
+price)` (contracts AT the level an order joins; **None** on a blind book — the honest "I
+don't know", never a fabricated 0) and `band_depth(side, lo, hi)` (total resting in a bounded
+band). Every lane that creates a level in front of a band sizes its depth ref to
+`max(joining, band × BAND_DEPTH_FRACTION)` inside a ±`SIZING_BAND_HALFWIDTH_C`¢ band, and the
+size row's why names **joining, band, band_ref, and used** (`test_b1_fresh_level_sizes_to_band…`).
+#B2 both silent fallbacks killed: a blind book (`joining_depth` None) → `DEPTH_BLIND` defer,
+count=0; a real book sizing to 0 → `SIZE_ZERO_DEFER` with `{tradeable, joining, band,
+band_ref, depth_used, sizing}`, count=0 — **never a fabricated 1**; the submit loop skips any
+count≤0 proposal (`test_b2_blind_book_defers…`, `test_b2_zero_size_defers_not_one`,
+`test_the_two_one_lot_windows_replayed`). A 1-lot may only exist because the math said 1.
+
+**Part A — the Why Law, baked.** #A1 the shared surface writer (`Surface._insert`, the ONE
+path to `surface_rows`) REFUSES a row with no why — insert-before-record, so a refused write
+leaves no state to dedup against (`test_a1_surface_row_without_why_is_refused`). #A2
+`tests/test_no_silent_fallbacks.py` greps the money modules (sizing/book/scoring/shadow_runner)
+for the fallback family (`depth/mark … or <n>`, `max(1, <size/depth>)`), FAILS on a new one,
+and is PROVEN to catch a planted `or 0`; audited honest floors carry an in-source
+`fallback-audited:` marker (RULING-3, the REST-touch guess). #A3 `registry.py` — every surface
+declares `{surface, question, validates_or_invalidates, consumer}`; 6 standing questions seeded;
+boot asserts writers registered (WARN until 2026-07-27, then FATAL); the daily pack prints the
+registry + each surface's last-read; a surface unread >14d pages `DATA_WITHOUT_QUESTION`
+(`test_a3_*`). #A4 every capital constant is tagged in-source RULED(date)/DERIVED(source)/
+DREW-DEFAULT(pending); boot prints the constants that CHANGED this deploy with their tag (WO-P
+changes exactly the two band constants, no dial moves); a DERIVED with no source fails loud
+(`test_a4_*`). #6 **F entry/hold byte-identical** — `lane_fh8.py` untouched (kill condition
+honored); the two-question API lives in `book.py` + the shadow_runner chokepoint, never inside
+F. New suites `test_why_law.py` (16) + `test_no_silent_fallbacks.py` (3); `test_verify_lossterm1`
++ `test_attribution` re-anchored to the defer/why law. Suite 903 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
