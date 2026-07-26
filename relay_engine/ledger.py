@@ -198,6 +198,18 @@ class Ledger:
                 "ALTER TABLE settlements ADD COLUMN divergent INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already present
+        # WO-2026-07-25-L §P1 — TWO LEDGERS, ONE TABLE, CLEARLY LABELED. A cell
+        # outcome from a SHADOW lane (F is the only LIVE lane; everything else
+        # rehearses) is tagged shadow=1 so it NEVER mixes with live cells in the
+        # scoreboard, sizing, or promotion authority. Treasury never reads this
+        # table at all (book_cents/lifetime = settlements+cash; deployed = fills),
+        # so shadow P&L cannot reach tradeable capital by this column's existence;
+        # the tag keeps shadow cells out of LIVE sizing. Legacy rows default live.
+        try:
+            self.db.execute(
+                "ALTER TABLE cell_outcomes ADD COLUMN shadow INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already present
         # WO-2026-07-23-B §4.1: order-level truth — the requested count/price
         # beside the filled count/price. "requested vs filled" is the field that
         # answers whether SIZE TRAVELS (the one unknown scaling F introduces);
@@ -340,6 +352,20 @@ class Ledger:
                     fee_cents: int = 0, cell_lane: str = None,
                     requested_count: int = None,
                     requested_price=None) -> int:
+        # WO-2026-07-25-L §P1b (ADVERSARY ii) — THE ISOLATION RAIL. The `fills`
+        # table feeds deployed_cents (tradeable-capital-at-risk); a SHADOW lane's
+        # rehearsed fill must NEVER reach it. In a LIVE run a fill for a
+        # not-LIVE lane is a leak of simulated money into real capital — FATAL
+        # loud rather than book it. (In a global SHADOW run every lane is paper
+        # by construction; the guard is inert there, so tests are untouched.)
+        from . import config as _cfg, failures
+        if _cfg.live_submit_enabled() and not _cfg.lane_is_live(lane):
+            failures.fail(
+                "SHADOW_ROW_TO_TRADEABLE_CAPITAL",
+                f"a SHADOW lane ({lane}) tried to write a live fill "
+                f"({market} {side} {action} {price_cents}c x{count}) — simulated "
+                f"money must never reach deployed_cents/treasury", fatal=True,
+                lane=lane, market=market)
         # WO-2026-07-23-B §4.1: requested_count/price ride the fill so the pack
         # can read "did size travel" per order (filled_count IS `count`).
         cur = self.db.execute(
@@ -364,22 +390,25 @@ class Ledger:
     def record_cell_outcome(self, lane: str, entry_price_cents: int,
                             won: bool, pnl_cents: int, fees_cents: int,
                             market: str, kind: str, now=None,
-                            contracts: int = 1) -> None:
+                            contracts: int = 1, shadow: bool = False) -> None:
         """P22 §1: one row per CLOSED unit of risk, idempotent by
         (market, lane, kind) — a multi-trip window banks its FIRST trip and
         suppresses re-writes (the same key that makes live+custodian double
         booking and backfill replays safe). WO-2026-07-24-G Part 4: `contracts`
-        rides so the scoreboard can report PER-CONTRACT (era-invariant) stats."""
+        rides so the scoreboard can report PER-CONTRACT (era-invariant) stats.
+        WO-2026-07-25-L §P1: `shadow` tags a rehearsed (non-placed) outcome so it
+        never mixes with live cells in sizing/promotion authority."""
         from . import config, scoring
         self.db.execute(
             "INSERT INTO cell_outcomes (ts, lane, price_cell, won, pnl_cents,"
-            " fees_cents, market, kind, proof, governor, contracts)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            " fees_cents, market, kind, proof, governor, contracts, shadow)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(market, lane, kind) DO NOTHING",
             (time.time() if now is None else now, lane,
              scoring.price_cell(entry_price_cents), int(bool(won)),
              int(pnl_cents), int(fees_cents), market, kind,
-             config.F_PROOF_MODE, "halt-only", max(1, int(contracts))))
+             config.F_PROOF_MODE, "halt-only", max(1, int(contracts)),
+             int(bool(shadow))))
         self.db.commit()
 
     def backfill_cell_outcomes(self) -> int:

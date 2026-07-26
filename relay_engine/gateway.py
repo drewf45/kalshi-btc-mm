@@ -293,7 +293,7 @@ class Gateway:
             # maker BUY entry is re-priced to rest PASSIVELY at the live book —
             # never a post_only order at a crossing price. LIVE placement only
             # (the post-only-cross is a live-venue reject; shadow has no venue).
-            if (config.live_submit_enabled()
+            if (config.lane_is_live(order.lane)
                     and order.purpose == "ENTRY" and order.action == "buy"
                     and not order.crossfire and book is not None):
                 rested = self._rest_back_price(order, book)   # may raise REST_BACK_SKIP
@@ -310,7 +310,7 @@ class Gateway:
         # custodian salvage posts a maker sell too, and this build must leave F
         # byte-identical (acceptance #6) — F keeps its maker→crossfire-after-R
         # salvage escalation untouched. CUTs (crossfire) cross on purpose.
-        if (config.live_submit_enabled() and order.action == "sell"
+        if (config.lane_is_live(order.lane) and order.action == "sell"
                 and not order.crossfire and book is not None
                 and order.lane != "F"):
             order.price_cents = self._rest_forward_price(order, book)
@@ -325,9 +325,16 @@ class Gateway:
                 raise WallRejection("RATE_GOVERNED", self.governor.alert_line())
 
         payload = self._payload(order)
-        if config.live_submit_enabled():
+        # WO-2026-07-25-L §P1 — PER-LANE RUN MODE. The live door opens ONLY when
+        # the global kill is off (RUN_MODE=LIVE + phrase) AND this order's lane
+        # is LIVE. Every shadow lane (the desk, HUNT, D/P, H8) takes the recorded-
+        # but-not-placed path even inside a LIVE run: a SHADOW- oid, full custody
+        # simulation downstream, ZERO broker traffic. F gets the book; the rest
+        # rehearse offstage.
+        if config.lane_is_live(order.lane):
             # LIVE PATH (P3.1). Reached ONLY when Drew set RUN_MODE=LIVE + the
-            # I_UNDERSTAND_LIVE phrase — go-live is a human act, never code's.
+            # I_UNDERSTAND_LIVE phrase AND the lane earned LIVE mode — go-live is
+            # a human act, never code's.
             return self._submit_live(order, payload)
         self._shadow_seq += 1
         oid = f"SHADOW-{self._shadow_seq}"
@@ -482,7 +489,8 @@ class Gateway:
                         scoring.cell_lane(order.lane, order.reason or order.why),
                         basis, won=net > 0, pnl_cents=net,
                         fees_cents=st["fees"], market=order.market,
-                        kind="trip", contracts=xc)
+                        kind="trip", contracts=xc,
+                        shadow=config.lane_books_shadow(order.lane))
             self.pos_story.pop(key, None)
         self.filled_counts[order_id] = self.filled_counts.get(order_id, 0) + cnt
         if self.filled_counts[order_id] >= order.count:

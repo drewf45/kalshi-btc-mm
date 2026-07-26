@@ -242,15 +242,15 @@ def test_runner_sizes_entries_from_the_score(ledger, gateway, surface):
     assert 1 <= prop2.count <= config.FLIP_SIZE_CAP   # bounded regardless of the tier
     # WO-2026-07-23-B Part 1: F no longer takes the Kelly path — it self-sizes by
     # NOTIONAL (F_NOTIONAL_PCT of book / price), bounded only by real depth. On a
-    # $12 book at 48c the notional is 5 lots — driven by the book, NOT clamped to
-    # the retired count cap of 3.
+    # $12 book at 48c the notional is driven by the book (WO-L: dial 0.24), NOT
+    # clamped to the retired count cap of 3.
     ledger.baseline(1200, confirmed_by="test")
     fprop = Order(lane="F", event=EVENT, market=TICKER, side="yes",
                   action="buy", price_cents=48, count=1,
                   size_tier=config.TIER_PROBE, purpose="ENTRY",
                   why="F tier48 · surv~price")
     eng._score_and_size(fprop, _book(yes=48, no=49))
-    assert fprop.count == int(1200 * config.F_NOTIONAL_PCT // 48) == 5
+    assert fprop.count == int(1200 * config.F_NOTIONAL_PCT // 48)
     assert fprop.count > config.NET_RISK_CROSS_LANE_CAP   # the cap no longer binds F
 
 

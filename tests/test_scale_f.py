@@ -44,10 +44,11 @@ def _f_entry(price=97):
 
 # ── §1.3: F sizes to a percentage of book, self-scaling (acceptance #3) ─────
 def test_f_sizes_to_notional_percent_of_book():
-    # $41.62 book at 97c: notional = int(4162 * 0.20 // 97) = 8 (depth ample)
+    # WO-L P2: F dial 0.24 — $41.62 book at 97c: notional = int(4162*0.24//97) = 10
+    n = int(4162 * config.F_NOTIONAL_PCT // 97)
     dec = scoring.size_order(4162, 97, 10_000, lane="F")
-    assert dec.contracts == 8
-    assert "notional=8" in dec.reason and "→ notional bound" in dec.reason
+    assert dec.contracts == n
+    assert f"notional={n}" in dec.reason and "→ notional bound" in dec.reason
 
 
 def test_f_size_scales_with_the_book():
@@ -62,16 +63,17 @@ def test_f_size_scales_with_the_book():
 def test_f_size_bounded_by_real_depth_and_logged():
     """Guard (d): when depth is the smaller term it binds, and the reason names
     all three terms so 'is depth ever real' is answered permanently."""
-    dec = scoring.size_order(4162, 97, 20, lane="F")   # depth 20·0.25 = 5 < notional 8
+    n = int(4162 * config.F_NOTIONAL_PCT // 97)        # WO-L: 10 at dial 0.24
+    dec = scoring.size_order(4162, 97, 20, lane="F")   # depth 20·0.25 = 5 < notional
     assert dec.contracts == 5 and "→ depth bound" in dec.reason
-    assert "kelly=" in dec.reason and "notional=8" in dec.reason and "depth=5" in dec.reason
+    assert "kelly=" in dec.reason and f"notional={n}" in dec.reason and "depth=5" in dec.reason
 
 
 def test_non_f_lanes_keep_the_kelly_path():
     """Only F takes the notional path — every other lane is min(kelly, depth, cap)."""
     f = scoring.size_order(4162, 97, 10_000, lane="F").contracts
     h8 = scoring.size_order(4162, 97, 10_000, lane="H8").contracts
-    assert f == 8
+    assert f == int(4162 * config.F_NOTIONAL_PCT // 97)
     assert h8 == min(int(4162 / 12 // 97), 2500, config.NET_RISK_CROSS_LANE_CAP)
 
 

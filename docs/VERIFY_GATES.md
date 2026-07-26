@@ -3848,6 +3848,93 @@ losses replay REFUSED (`test_saturday_losses_replay_as_refused`, `test_genuine_e
 `test_size_test` / `test_size_test_data` re-anchored (full-size mechanism tests now exercise the promoted
 dial explicitly; tuition is the default). Suite 838 · preflight 23/23.
 
+## WO-2026-07-25-L — F GETS THE BOOK; EVERYTHING ELSE EARNS IT (build 82)
+
+An outside review read the tape and Drew ruled: **move anything not-F to shadow; F gets as much as
+possible; everything else has to earn it.** Supersedes -K's tuition sizing (shadow is the stronger form
+of the same demotion); -K's settle-fair conf gate (P2) and conversion ladder (P3) survive as the
+earn-back criteria. **Review reconciled item-by-item:** #1 leave-F-alone → adopted, amended to F-maximum
+(P2); #2 FLIP-down → superseded by full shadow; #3 uncovered-leg/oversized-exit → **already closed** (-H/-I,
+verified live 07/25 14:33 `FLIP_COVER_SURPLUS … no flatten, no fee`; the review read the pre-deploy tape —
+cited so it isn't re-opened); #4 recalibrate be → P4; #5 suppress worst cells → superseded by shadow-all;
+#6 named reversible experiments → the standing PROMOTION PROTOCOL (P3).
+
+**Read-rule (against build 81, all TRUE):** L1 `config.py:14` `RUN_MODE` defaults SHADOW; `config.py:691`
+`live_submit_enabled()` = `RUN_MODE==LIVE and phrase` — the born-shadow global kill. L2 `gateway.py:328`
+the submit branch gated on the **global** `live_submit_enabled()` — TRUE, made per-lane. L3 (survey) the
+treasury math — `ledger.book_cents`/`lifetime_pnl_cents` sum `settlements`(divergent=0)+`cash_movements`,
+`deployed_cents` sums unsettled `fills`; **none read `cell_outcomes`** — so shadow isolation = shadow
+lanes never write `fills`/`settlements`/`cash`, and `cell_outcomes` gains a tag. L4 `book_snapshots` stores
+raw frames (no trade-print); through-price is derived from best-bid crossings. L5 `F_NOTIONAL_PCT=0.20`
+(`config.py:371`), `AT_RISK_PCT["F"]=0.25` — TRUE, raised. **Honest divergence:** the WO's `LANE_MODE`
+dict names only F as LIVE and omits **H8**; under "everything else earns it" I applied the default SHADOW
+to H8 (the seal's "one lane"). F's *logic* is byte-identical (`lane_fh8` untouched); only its size params
+and H8's placement mode change.
+
+**P1 — per-lane run mode + the pessimistic fill model.** `config.LANE_MODE` (F LIVE, the rest SHADOW,
+env-overridable) + `lane_is_live(lane)` = `live_submit_enabled() and mode=="LIVE"` (per-lane only restricts
+below the global). `gateway.submit` takes the live door only when `lane_is_live`; every shadow lane gets a
+`SHADOW-` oid and **zero broker traffic** even inside a LIVE run (F places; the desk rehearses). The
+rest-back/rest-forward re-pricings re-gate on `lane_is_live` too. `shadow_fill.py` is the **pessimistic**
+model (Scientist owns it, its statement prints in the pack): a maker fills only when the book trades AT or
+THROUGH its price after ≥1 poll of rest (`buy` fills when the opposing bid reaches 100−price; `sell` when
+its own bid reaches price); at-the-touch is not a fill; unfilled by window-end = expired. `ShadowEngine.
+simulate_shadow_fills` sweeps resting `SHADOW-` orders each poll and books fills through the **same**
+`gateway.on_fill` → `_on_fill_booked` path a live fill uses (👻-marked), so shadow custody is real; no
+`fills`/`settlement`/`cash` row is ever written.
+
+**P1b — two ledgers, one table, clearly labeled.** `cell_outcomes` gains a `shadow` column (legacy rows
+default live); `record_cell_outcome(..., shadow=)` is tagged at every booking site by
+`config.lane_books_shadow(lane)` (= live-run AND non-live lane; **False in a global-shadow run**, so the
+born-state one-paper-ledger behavior and every existing test are untouched). LIVE sizing/promotion authority
+(`cell_stats`, `realized_loss_avg`, `score`) reads `shadow=0` only — a rehearsed cell never drives live
+size. The scoreboard renders LIVE and SHADOW in **separate labeled sections** (never a shared row). **The
+isolation rail (ADVERSARY ii):** `record_fill` FATALs `SHADOW_ROW_TO_TRADEABLE_CAPITAL` if a shadow lane
+tries to write a live fill in a LIVE run; a boot self-test asserts the treasury queries contain no
+`cell_outcomes`/`shadow` reference (`SHADOW_LEAK_INTO_TREASURY` FATAL else). Simulated P&L provably cannot
+reach real capital.
+
+**P2 — F maximum.** `F_NOTIONAL_PCT 0.20 → 0.24`, `AT_RISK_PCT["F"] 0.25 → 0.30` (dial stays 80% of wall;
+`dial_wall_violations` still empty, boot won't FATAL). The boot banner prints per-lane modes, the new
+dial/wall, and **the single-loss bound**: one full unsalvaged F loss ≈ dial × book ≈ 24% of book (the
+stated, accepted ceiling), with the note that further raises gate on salvage shipping (at ~40–50¢ salvaged
+losses the same math supports dials past 0.30). F takes the desk's freed risk budget through this raise
+alone — walls are lane-scoped, nothing transfers.
+
+**P3 — the earn-back protocol.** A lane leaves shadow ONLY as a named experiment with promotion evidence,
+a stated live size (tuition first), a pre-stated mechanical revert, and Drew's sign-off. `flip_ladder.
+promotion_distance_lines` prints each shadow lane's **distance to promotion** in the daily pack (desk:
+trailing-20 shadow conversion vs 75%; HUNT: shadow-entry count vs 30) so an all-shadow future is never a
+stuck mood — the door is numbers, printed daily. (This reports the evidence bar; the experiment + sign-off
+are still required to actually go live.)
+
+**P4 — break-even recalibration + THIN.** `CELL_THIN_MIN_N=10`: a cell with fewer than 10 **realized**
+outcomes is THIN and carries **no gate authority** — `score()["thin"]` nulls its margin in the WO-K ladder
+tiebreaker (`_score_and_size`), `cell_has_authority` is False, and the scoreboard greys it with its n (the
+red-margin ⚠ still shows — a warning is a warning — but marked `·THIN, no authority`). A cell leaves THIN
+only by realized n, never modeled numbers. The displayed be stays the honest realized-derived
+`breakeven_honest` (the review's item #4).
+
+**Sibling greps:** the two live-only re-pricings (`gateway.py:296,313`) and the live door (`:328`) all now
+gate on `lane_is_live`. Every `record_cell_outcome` caller (gateway on_fill, custodian cut, settle sweep)
+passes the shadow tag. Every treasury/tradeable read was audited (survey) — none touch `cell_outcomes`.
+`cell_stats`/`realized_loss_avg`/`score` gained a `shadow` param defaulting to live authority.
+
+**Acceptance:** #1 boot prints per-lane modes + F dial/wall + single-loss bound + worst-day (`test_boot_
+banner...`, rendered); #2 F places live, desk lane is a `SHADOW-` ghost with zero broker traffic (`test_f_
+places_live_desk_lane_is_a_ghost`); #3 shadow & live cells never share a row, treasury reads live-only by
+construction + FATAL rail (`test_shadow_cell_is_tagged...`, `test_shadow_lane_fill_is_fatal_refused_in_
+live`, `test_treasury_reads_live_only_by_construction`); #4 pack gains the fill-model statement,
+distance-to-promotion, THIN tags, recalibrated be (`test_promotion_distance...`, `test_scoreboard_separates_
+live_and_shadow_and_marks_thin`); #5 the 07/25 lesson — the pessimistic sim never fills a price the book
+missed, and books a real shadow round-trip when it does (`test_pessimistic_sim_never_fills_a_price_the_book_
+missed`, `test_shadow_sim_roundtrip_books_a_shadow_cell`); #6 **F byte-identical in logic** (`lane_fh8`
+untouched; `test_f_sizing_logic_untouched`). Honest scope: the shadow fill simulator's numerical
+calibration against the real 07/25 tape awaits that tape on the live box (test env has none — the model +
+sim are proven on synthetic books, the -J synthetic-corpus pattern). New `shadow_fill.py`,
+`test_f_gets_the_book.py` (18 tests); `test_scale_f`/`test_walls`/`test_p16`/`test_p22`/`test_verify_
+lossterm1`/`test_maker_rest_back` re-anchored to the F raise + per-lane gate. Suite 856 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

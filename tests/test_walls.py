@@ -102,12 +102,14 @@ def test_per_lane_proportional_risk_wall(gateway, ledger):
     DOLLAR_RISK reason names are kept so WALL_STORM telemetry stays comparable."""
     _rebook(ledger, 4162)
     b = make_book()
-    # F: 10 lots @97 (970c) fit under the 1040c (25%) cap; 11 (1067c) trip.
+    # WO-2026-07-25-L: F's wall is 0.30. On a $41.62 book the cap is
+    # int(4162*0.30)=1248c → 12 lots @97 (1164c) fit, 13 (1261c) trip.
+    fit = int(4162 * config.AT_RISK_PCT["F"]) // 97
     assert gateway.submit(entry(lane="F", event="EF1", market="MF1",
-                                price=97, count=10), b).shadow
+                                price=97, count=fit), b).shadow
     with pytest.raises(WallRejection) as e:
         gateway.submit(entry(lane="F", event="EF2", market="MF2",
-                             price=97, count=11), b)
+                             price=97, count=fit + 1), b)
     assert e.value.wall in ("NET_RISK", "DOLLAR_RISK")
     # D's cap is a tenth of F's (2% vs 20%): 1 lot @60 (60c) fits, 2 (120c) trip.
     assert gateway.submit(entry(lane="D", event="ED1", market="MD1",
@@ -123,11 +125,13 @@ def test_risk_wall_scales_with_the_book(gateway, ledger):
     same 5-lot F order that a $20 book refuses, a $40 book admits — the ceiling
     grows with the money instead of throttling it."""
     b = make_book()
-    _rebook(ledger, 1800)          # $18 → F cap 450c (25%); 5 lots @97 = 485c > 450
+    # WO-L: F wall 0.30 — 5 lots @97 = 485c. A $15 book caps at 450c (< 485,
+    # refused); a $40 book caps at 1200c (fits).
+    _rebook(ledger, 1500)
     with pytest.raises(WallRejection):
         gateway.submit(entry(lane="F", event="EA", market="MA",
                              price=97, count=5), b)
-    _rebook(ledger, 4000)          # $40 → F cap 1000c; the same 485c now fits
+    _rebook(ledger, 4000)          # $40 → F cap 1200c; the same 485c now fits
     assert gateway.submit(entry(lane="F", event="EB", market="MB",
                                 price=97, count=5), b).shadow
 

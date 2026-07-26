@@ -55,11 +55,16 @@ def taker_fee_cents(price_cents: float) -> float:
     return 100.0 * config.EXPECTED_FEE_MULTIPLIER * p * (1.0 - p)
 
 
-def cell_stats(ledger, lane: str, cell: int) -> Tuple[int, int, float]:
-    """(n, wins, wilson_lower_bound) for one (lane, price_cell)."""
+def cell_stats(ledger, lane: str, cell: int,
+               shadow: bool = False) -> Tuple[int, int, float]:
+    """(n, wins, wilson_lower_bound) for one (lane, price_cell). WO-2026-07-25-L:
+    LIVE authority reads live cells ONLY (shadow=0) — a shadow (rehearsed) cell
+    NEVER drives live sizing/promotion. Pass shadow=True to read the rehearsal
+    ledger (the earn-back promotion evidence)."""
     row = ledger.db.execute(
         "SELECT COUNT(*), COALESCE(SUM(won),0) FROM cell_outcomes"
-        " WHERE lane=? AND price_cell=?", (lane, cell)).fetchone()
+        " WHERE lane=? AND price_cell=? AND shadow=?",
+        (lane, cell, int(bool(shadow)))).fetchone()
     n, wins = int(row[0]), int(row[1])
     return n, wins, wilson_lower_bound(wins, n)
 
@@ -127,9 +132,10 @@ def bars_for_cell(ledger, lane: str, cell: int) -> Tuple[float, float]:
     return lean, clear
 
 
-def score(ledger, lane: str, cell: int) -> dict:
-    """§2.3 — the full cell verdict: (n, wins, lb, breakeven, margin, tier)."""
-    n, wins, lb = cell_stats(ledger, lane, cell)
+def score(ledger, lane: str, cell: int, shadow: bool = False) -> dict:
+    """§2.3 — the full cell verdict: (n, wins, lb, breakeven, margin, tier).
+    WO-2026-07-25-L: shadow=True scores the rehearsal ledger (promotion evidence)."""
+    n, wins, lb = cell_stats(ledger, lane, cell, shadow=shadow)
     be = breakeven(ledger, lane, cell)
     lean, clear = bars_for_cell(ledger, lane, cell)
     if lb >= clear:
@@ -140,7 +146,19 @@ def score(ledger, lane: str, cell: int) -> dict:
         tier = config.TIER_PROBE  # existence is a ruling, not a bar (R1/R2)
     return {"n": n, "wins": wins, "lb": lb, "breakeven": be,
             "margin": lb - be, "tier": tier, "lean_bar": lean,
-            "clear_bar": clear}
+            "clear_bar": clear,
+            # WO-2026-07-25-L §P4: a cell with < CELL_THIN_MIN_N realized outcomes
+            # carries NO gate authority — its margin never authorizes or blocks.
+            "thin": n < config.CELL_THIN_MIN_N}
+
+
+def cell_has_authority(ledger, lane: str, cell: int,
+                       shadow: bool = False) -> bool:
+    """WO-2026-07-25-L §P4 — does this cell hold gate authority? Only when it has
+    cleared THIN by REALIZED n (never by modeled numbers). A THIN cell's margin
+    is shown greyed and votes on nothing (promotion, sizing tiebreaker)."""
+    n, _, _ = cell_stats(ledger, lane, cell, shadow=shadow)
+    return n >= config.CELL_THIN_MIN_N
 
 
 def tier_for(ledger, lane: str, price_cents: int,
@@ -194,40 +212,56 @@ def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
     edge you read is honest; the tier you see is exactly what the machine uses."""
     book_cents = ledger.book_cents() if book_cents is None else book_cents
     salvage_n, _ = salvage_recapture_cents(ledger)
-    rows = ledger.db.execute(
-        "SELECT lane, price_cell FROM cell_outcomes"
-        " GROUP BY lane, price_cell").fetchall()
-    entries = []
-    for lane, cell in rows:
-        s = score(ledger, lane, cell)              # tier (custody) — UNTOUCHED
-        be_honest = breakeven_honest(ledger, lane, cell)   # §3: the honest edge
-        margin_honest = s["lb"] - be_honest
-        kind = "hold" if lane in HOLD_LANES else "trip"
-        mid = cell + config.CELL_WIDTH_CENTS // 2
-        # WO-2026-07-24-G Part 4: this scoreboard is REPORTING-ONLY (the pack's
-        # lots@book column) — it does NOT feed the entry path (that is
-        # _score_and_size, which passes lane=). But a lane-blind preview MISLEADS
-        # at the scaled book: F and FLIP size by notional, not the generic Kelly
-        # path. Pass lane= so the displayed count is the one the lane will trade.
-        lots = size_order(book_cents, mid, 10_000, lane=lane).contracts
-        pend = (lane in HOLD_LANES and salvage_n < config.SALVAGE_ADJ_MIN_N)
-        entries.append((margin_honest, lane, cell, kind, s, be_honest, lots,
-                        pend))
-    entries.sort(key=lambda e: e[0], reverse=True)
-    lines = ["CELL SCOREBOARD          n   W   LB    BE    MARGIN  TIER  lots@book"]
-    for margin, lane, cell, kind, s, be_honest, lots, pend in entries:
-        warn = " ⚠" if margin < 0 else ""
-        star = "*" if pend else " "
-        lines.append(
-            f"{lane:<5} {cell_label(cell):<7} ({kind}) "
-            f"{s['n']:>3} {s['wins']:>3}  {s['lb']:.2f}  {be_honest:.2f}{star} "
-            f"{margin:+.2f}{warn}  {s['tier']:<5} {lots}")
-    covered = {lane for _, lane, *_ in entries}
+
+    def _rows_for(shadow: bool):
+        # WO-2026-07-25-L §P1: LIVE cells and SHADOW (rehearsal) cells NEVER share
+        # a table row — enumerate each ledger separately, labeled.
+        rows = ledger.db.execute(
+            "SELECT lane, price_cell FROM cell_outcomes WHERE shadow=?"
+            " GROUP BY lane, price_cell", (int(shadow),)).fetchall()
+        out = []
+        for lane, cell in rows:
+            s = score(ledger, lane, cell, shadow=shadow)   # shadow-scoped
+            be_honest = breakeven_honest(ledger, lane, cell)   # §3: the honest edge
+            margin_honest = s["lb"] - be_honest
+            kind = "hold" if lane in HOLD_LANES else "trip"
+            mid = cell + config.CELL_WIDTH_CENTS // 2
+            lots = size_order(book_cents, mid, 10_000, lane=lane).contracts
+            pend = (lane in HOLD_LANES and salvage_n < config.SALVAGE_ADJ_MIN_N)
+            out.append((margin_honest, lane, cell, kind, s, be_honest, lots, pend))
+        out.sort(key=lambda e: e[0], reverse=True)
+        return out
+
+    def _fmt(entries):
+        sub = []
+        for margin, lane, cell, kind, s, be_honest, lots, pend in entries:
+            # WO-2026-07-25-L §P4: a THIN cell (n < CELL_THIN_MIN_N) is greyed —
+            # it holds NO gate authority (never a promotion or margin vote) — but
+            # the red-margin ⚠ still shows (a warning is a warning); the ·THIN
+            # tag says the number carries no authority. Leaves THIN by realized n.
+            warn = " ⚠" if margin < 0 else ""
+            star = "*" if pend else " "
+            tag = f"  ·THIN (n<{config.CELL_THIN_MIN_N}, no authority)" \
+                if s.get("thin") else ""
+            sub.append(
+                f"{lane:<5} {cell_label(cell):<7} ({kind}) "
+                f"{s['n']:>3} {s['wins']:>3}  {s['lb']:.2f}  {be_honest:.2f}{star} "
+                f"{margin:+.2f}{warn}  {s['tier']:<5} {lots}{tag}")
+        return sub
+
+    live = _rows_for(shadow=False)
+    lines = ["CELL SCOREBOARD (LIVE)   n   W   LB    BE    MARGIN  TIER  lots@book"]
+    lines.extend(_fmt(live))
+    covered = {lane for _, lane, *_ in live}
     for lane in _SCOREBOARD_LANES:
         if lane not in covered:
             kind = "hold" if lane in HOLD_LANES else "trip"
             lines.append(f"{lane:<5} {'--':<7} ({kind})   0   -   -     -"
                          f"       -    PROBE 1")
+    shadow = _rows_for(shadow=True)
+    if shadow:
+        lines.append("CELL SCOREBOARD (SHADOW — rehearsal, NOT tradeable capital):")
+        lines.extend(_fmt(shadow))
     if salvage_n < config.SALVAGE_ADJ_MIN_N:
         lines.append(f"  *salvage-adj pending (DODGED curve n={salvage_n}"
                      f" < {config.SALVAGE_ADJ_MIN_N} — raw price BE,"
@@ -245,14 +279,17 @@ SALVAGE_ADJ_MIN_N_HONEST = 8    # A3: reachable — F has 9 losses in 285 trades
 
 
 def realized_loss_avg(ledger, lane: str,
-                      cell: Optional[int] = None) -> Tuple[int, float]:
+                      cell: Optional[int] = None,
+                      shadow: bool = False) -> Tuple[int, float]:
     """(n_losses, mean |loss| cents) from cell_outcomes — the ACTUAL cost of a
     loss for a lane (and optionally one cell). The truth `loss_modeled`
-    approximates; today's bug was `loss_modeled 1c` where this read ~24c."""
+    approximates; today's bug was `loss_modeled 1c` where this read ~24c.
+    WO-2026-07-25-L: LIVE authority reads live cells only (shadow=0)."""
     q = ("SELECT COUNT(*), COALESCE(AVG(-pnl_cents),0) FROM cell_outcomes"
-         " WHERE lane=? AND pnl_cents<0"
+         " WHERE lane=? AND pnl_cents<0 AND shadow=?"
          + (" AND price_cell=?" if cell is not None else ""))
-    args = (lane, cell) if cell is not None else (lane,)
+    args = (lane, int(bool(shadow)), cell) if cell is not None \
+        else (lane, int(bool(shadow)))
     row = ledger.db.execute(q, args).fetchone()
     return int(row[0]), float(row[1])
 

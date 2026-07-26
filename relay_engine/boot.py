@@ -86,9 +86,31 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append(
         f"RATE GOVERNOR: bucket={config.RATE_BUCKET_CAPACITY} tokens, "
         f"refill={config.RATE_REFILL_PER_SECOND}/s (printed number IS the enforced number)")
+    # WO-2026-07-25-L §P1/P2 — the ruling, printed. Per-lane run mode (F LIVE,
+    # everything else SHADOW until it earns back), and the single-loss bound the
+    # F raise is accepted against (the CEO's stated ceiling).
+    live = [ln for ln, m in config.LANE_MODE.items() if m == "LIVE"]
+    shadow = [ln for ln, m in config.LANE_MODE.items() if m != "LIVE"]
+    lines.append(
+        "LANE MODE (WO-L): LIVE=" + (",".join(live) or "none")
+        + " · SHADOW=" + (",".join(shadow) or "none")
+        + (" · GLOBAL LIVE" if config.live_submit_enabled()
+           else " · GLOBAL SHADOW (born state — nothing placed, LANE_MODE"
+                " restricts below it)")
+        + " — F gets the book; everything else rehearses (👻) and earns it back")
     if boot_caps is not None:
         # P8 §3 + P14 §3: 1/12-Kelly honestly stated, at BOTH reference prices.
         lines.append(sizing_line(boot_caps.book_cents))
+        # WO-L §P2: THE SINGLE-LOSS BOUND — one full unsalvaged F loss ≈ dial ×
+        # book. The stated, accepted ceiling of the F raise; further raises gate
+        # on salvage shipping. Printed next to the worst-day math (CEO lens).
+        slb_pct = config.f_single_loss_bound_pct()
+        lines.append(
+            f"SINGLE-LOSS BOUND (WO-L P2): one full unsalvaged F loss ≈ "
+            f"{slb_pct:.0%} of book (dial × book at a ~97¢ favorite) = "
+            f"−${boot_caps.book_cents * slb_pct / 100.0:.2f} — the accepted "
+            f"ceiling; further F raises gate on salvage (≈40–50¢ salvaged losses "
+            f"support dials past {config.AT_RISK_PCT['F']:.0%})")
         # P17 §2.3: the rail state in words — never a silently-zero bound.
         floor_c = int(config.DRAWDOWN_ABSOLUTE_FLOOR_USD * 100)
         if boot_caps.book_cents <= floor_c * 2:
@@ -516,6 +538,32 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "slowly, demote instantly, no ruling); the entry cell's "
                  "negative Wilson margin blocks a lucky streak from up-sizing a "
                  "losing cell. The tape moves the dial. F byte-identical")
+    lines.append("  F GETS THE BOOK; EVERYTHING ELSE EARNS IT (WO-2026-07-25-L, "
+                 "build 82): the outside review, made law — one lane earned the "
+                 "book, so it gets the book; everything else keeps every rep at "
+                 "full speed, with real signals and honest referees, for no "
+                 "money at all. P1 PER-LANE RUN MODE: LANE_MODE branches "
+                 "gateway.submit — F LIVE, the rest (FLIP/OPEN/HUNT/PAIR/D/P/H8) "
+                 "SHADOW even in a live run (SHADOW- oids, full custody sim, cell "
+                 "outcomes tagged shadow, ZERO broker traffic, 👻 on every line); "
+                 "the global kill still rules, per-lane only restricts below it. "
+                 "The PESSIMISTIC fill model (Scientist owns it): a maker fills "
+                 "only when the book trades AT/THROUGH its price after rest — no "
+                 "fantasy fills buy a fake promotion. P1b TWO LEDGERS: treasury "
+                 "(book/lifetime = settlements+cash; deployed = live fills) NEVER "
+                 "reads cell_outcomes, and a shadow-lane fill is FATAL-refused — "
+                 "simulated P&L can't reach real capital (asserted at boot). P2 F "
+                 f"MAXIMUM: dial {config.F_NOTIONAL_PCT:.0%} (80% of the "
+                 f"{config.AT_RISK_PCT['F']:.0%} wall); the single-loss bound "
+                 f"(≈{config.f_single_loss_bound_pct():.0%} of book on one "
+                 "unsalvaged F loss) is the stated ceiling — further raises gate "
+                 "on salvage shipping. P3 EARN-BACK: shadow first, golden tape, "
+                 "named revert, Drew's sign-off — the pack prints each lane's "
+                 "distance to promotion daily (the door, marked with numbers). "
+                 "P4 THIN: a cell with <10 realized outcomes holds NO gate "
+                 "authority (greyed with its n); it leaves THIN only by realized "
+                 "n, never modeled numbers. F byte-identical in logic (size "
+                 "params only)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

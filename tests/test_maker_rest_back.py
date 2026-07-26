@@ -32,6 +32,10 @@ def _entry(lane, side="yes", price=61, band=None):
 def live(gateway, monkeypatch):
     placed = []
     monkeypatch.setattr(config, "live_submit_enabled", lambda: True)
+    # WO-2026-07-25-L: these tests exercise LIVE placement mechanics (rest-back,
+    # rest-forward, deliberate CUT cross) on a lane stand-in — opt every lane
+    # into LIVE for the fixture so the per-lane gate lets the live path run.
+    monkeypatch.setattr(config, "lane_is_live", lambda lane: True)
     gateway.venue_client = object()
     monkeypatch.setattr(venue, "get_balance", lambda c: (1000.0, 0.0))
 

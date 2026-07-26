@@ -116,6 +116,44 @@ def active_notional_pct(ledger, cell_margin: Optional[float],
     return config.FLIP_NOTIONAL_PCT
 
 
+def promotion_distance_lines(ledger) -> list:
+    """WO-2026-07-25-L §P3 — THE DOOR, MARKED WITH NUMBERS, PRINTED DAILY. Each
+    shadow lane's DISTANCE to promotion, so an all-shadow future can never be a
+    stuck mood — the thresholds are numbers and the gap to each is on the tape.
+    (The protocol still requires a NAMED experiment + Drew's sign-off to actually
+    leave shadow; this only reports whether the evidence bar is met.)"""
+    from . import config
+    out = ["EARN-BACK — distance to promotion (shadow → tuition-live; "
+           "named experiment + sign-off still required):"]
+    conv = trailing_conversion(ledger)
+    if conv["rate"] is None:
+        out.append(f"  DESK (FLIP/OPEN): 0/{config.FLIP_CONV_WINDOW} shadow "
+                   f"round-trips — need ≥{config.FLIP_PROMOTE_CONV:.0%} over "
+                   f"{config.FLIP_CONV_WINDOW}, the -J conf gate live, cell "
+                   f"margins ≥ 0")
+    else:
+        met = (conv["n"] >= config.FLIP_CONV_WINDOW
+               and conv["rate"] >= config.FLIP_PROMOTE_CONV)
+        gap = max(0.0, config.FLIP_PROMOTE_CONV - conv["rate"]) * 100
+        out.append(
+            f"  DESK (FLIP/OPEN): shadow conversion {conv['rate']:.0%} "
+            f"({conv['wins']}/{conv['n']}) vs bar {config.FLIP_PROMOTE_CONV:.0%}"
+            + ("  ✓ evidence MET (awaiting named experiment + sign-off)"
+               if met else
+               f"  — {gap:.0f}pts short"
+               + ("" if conv["n"] >= config.FLIP_CONV_WINDOW
+                  else f", {config.FLIP_CONV_WINDOW - conv['n']} more trips")))
+    # HUNT: ships only as -J in shadow; live at PROBE after ≥30 shadow entries
+    # with realized edge ≥ fee-adjusted threshold (reported from FLIP_SWING/hunt).
+    hn = ledger.db.execute(
+        "SELECT COUNT(*) FROM surface_rows WHERE lane='FLIP'"
+        " AND state='PROPOSED' AND (detail LIKE 'HUNT ↑%' OR detail LIKE 'HUNT ↓%')"
+    ).fetchone()[0]
+    out.append(f"  HUNT: {hn} shadow entries — need ≥30 with trailing-30 "
+               f"realized edge > 0 (revert: edge ≤ 0)")
+    return out
+
+
 def ladder_line(ledger) -> str:
     """The pack/hourly line: the conversion, the bars, the live tier + dial."""
     conv = trailing_conversion(ledger)

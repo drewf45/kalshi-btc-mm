@@ -693,12 +693,13 @@ class Custodian:
         # Position-level, not the retired per-exit-fill fiction. Idempotent by
         # (market, lane, kind) — if the position also concluded via on_fill, the
         # first booking wins and this is a no-op.
-        from . import scoring as _scoring
+        from . import scoring as _scoring, config as _config
         net = (cut_price_cents - pos.entry_price_cents) * remaining - fee_cents
         self.ledger.record_cell_outcome(
             _scoring.cell_lane(pos.lane, trigger), pos.entry_price_cents,
             won=net > 0, pnl_cents=net, fees_cents=fee_cents,
-            market=pos.market, kind="trip", contracts=remaining)
+            market=pos.market, kind="trip", contracts=remaining,
+            shadow=_config.lane_books_shadow(pos.lane))
         # SALV-1 §2.3: the position concludes here — one summary, always
         self.emit_salvage_summary(pos, trigger,
                                   realized_cents=cut_price_cents

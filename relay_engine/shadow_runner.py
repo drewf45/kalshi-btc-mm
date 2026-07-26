@@ -246,6 +246,7 @@ class ShadowEngine:
         self.gateway.alert_fn = self.telegram.alert  # WALL_STORM page path
         # P13 §3: orientation sentinels + §4 sit-out page wiring
         self.divergence_watches = {}   # market -> {until, strikes}
+        self._shadow_rested = {}        # WO-L §P1: SHADOW oid -> polls rested (fill sim)
         self._orientation_checked = False
         # WO-HALT-ORPHAN §1.3: the market that tripped ORIENTATION_DIVERGENCE
         # — re-checked with a FRESH record each cycle; a passing recheck
@@ -504,8 +505,11 @@ class ShadowEngine:
         if proposal.lane == "FLIP":
             try:
                 from . import flip_ladder
-                cell_margin = scoring.score(self.ledger, lane,
-                                            proposal.price_cents).get("margin")
+                _s = scoring.score(self.ledger, lane, proposal.price_cents)
+                # WO-2026-07-25-L §P4: a THIN cell (n < CELL_THIN_MIN_N) carries
+                # NO gate authority — its margin can neither authorize full size
+                # nor block it; treat it as absent so the ladder holds tuition.
+                cell_margin = None if _s.get("thin") else _s.get("margin")
                 flip_pct = flip_ladder.active_notional_pct(
                     self.ledger, cell_margin, now=None,
                     alert_fn=self.telegram.alert)
@@ -594,15 +598,50 @@ class ShadowEngine:
                         proposal.market, proposal.price_cents, book_c,
                         kelly_budget)
 
+    def simulate_shadow_fills(self, market, book, now) -> int:
+        """WO-2026-07-25-L §P1 — the pessimistic shadow fill sweep. For each
+        resting SHADOW order on this market, if it has rested ≥1 poll AND the
+        book has traded AT or THROUGH its price (shadow_fill.would_fill), book it
+        exactly as a live fill would: gateway.on_fill (which books the cell
+        outcome tagged shadow, since the lane is not LIVE) then _on_fill_booked
+        (👻 narration + lane custody). NO fills/settlements/cash row is ever
+        written — treasury stays live-only. Returns the count booked."""
+        from . import shadow_fill
+        rested = self._shadow_rested
+        booked = 0
+        # snapshot: on_fill mutates gateway.resting, so iterate a copy
+        for oid, order in list(self.gateway.resting.items()):
+            if not oid.startswith("SHADOW-") or order.market != market:
+                continue
+            rested[oid] = rested.get(oid, 0) + 1
+            if not shadow_fill.would_fill(order, book, rested[oid]):
+                continue
+            remaining = order.count - self.gateway.filled_counts.get(oid, 0)
+            if remaining <= 0:
+                continue
+            filled = self.gateway.on_fill(oid, count=remaining)
+            if filled is None:
+                continue
+            action = "ENTRY" if order.purpose == "ENTRY" else (
+                "CUSTODIAN_EXIT" if order.purpose == "CUT" else "EXIT")
+            self._on_fill_booked(order, action, order.price_cents, remaining,
+                                 now, shadow=True)
+            rested.pop(oid, None)
+            booked += 1
+        return booked
+
     def _on_fill_booked(self, order, action, price_cents, count, now,
-                        fee_cents=0):
+                        fee_cents=0, shadow=False):
         """P13 §1: fill pages say WHAT and WHY. A scratch-sell must never
         read like a second buy — on live money, mute narration is
-        indistinguishable from inversion."""
+        indistinguishable from inversion. WO-2026-07-25-L §P1: a SHADOW
+        (rehearsed) fill is marked 👻 on every line — a rehearsal is never
+        mistaken for money."""
+        gh = "👻 " if shadow else ""
         if action == "ENTRY":
             why = f" — why: {order.why}" if order.why else ""
             self.telegram.alert(
-                f"✅ ENTRY {order.lane} {order.market} "
+                f"{gh}✅ ENTRY {order.lane} {order.market} "
                 f"{order.action} {order.side}@{price_cents}¢ x{count}{why}")
             # §3 (P12 §4): 30s post-entry divergence watch, armed per entry
             self.divergence_watches[order.market] = {
@@ -612,7 +651,7 @@ class ShadowEngine:
                                       if action == "CUSTODIAN_EXIT" else "exit")
             fee_s = f" (fee {fee_cents}¢)" if fee_cents else ""
             self.telegram.alert(
-                f"✂️ EXIT {order.lane} {order.market} "
+                f"{gh}✂️ EXIT {order.lane} {order.market} "
                 f"{order.action} {order.side}@{price_cents}¢ x{count}{fee_s}"
                 f" — {reason}")
             # WO-2026-07-24-H "ONE POSITION, ONE STORY": the ↔ line reads the
@@ -636,7 +675,7 @@ class ShadowEngine:
                 this = (price_cents - basis) * count if basis is not None else None
                 pnl_s = f" {s(this)}¢" if this is not None else ""
                 self.telegram.alert(
-                    f"↔ {order.market} {order.lane} PARTIAL x{count} @{price_cents}¢"
+                    f"{gh}↔ {order.market} {order.lane} PARTIAL x{count} @{price_cents}¢"
                     f"{b_s}{pnl_s} — {riding} riding")
             else:
                 # concluded: the position's accrued totals ARE the story
@@ -646,7 +685,7 @@ class ShadowEngine:
                     # outcome was booked at conclusion inside gateway.on_fill —
                     # P2; this surface just tells it).
                     self.telegram.alert(
-                        f"↔ {order.market} {order.lane} ROUND-TRIP CLOSED "
+                        f"{gh}↔ {order.market} {order.lane} ROUND-TRIP CLOSED "
                         f"x{c['count']} basis {c['basis']}¢ → avg exit "
                         f"{c['avg_exit']}¢, net {s(c['net_cents'])}¢ "
                         f"(+ fee {c['fees_cents']}¢)")
@@ -739,6 +778,30 @@ class ShadowEngine:
                   + " · ".join(f"{ln} {d:.0%}<{config.AT_RISK_PCT[ln]:.0%}"
                                for ln, d in config.DIAL_OF_LANE.items())
                   + " — every dial under its wall", flush=True)
+        # WO-2026-07-25-L §P1b (ADVERSARY ii) — SHADOW ISOLATION, asserted at
+        # boot. Treasury (book_cents/lifetime = settlements+cash) and tradeable
+        # capital (deployed_cents = unsettled fills) NEVER read cell_outcomes, and
+        # a SHADOW lane's fill is FATAL-refused at record_fill — so simulated
+        # money cannot reach real capital. FATAL loud if the treasury SUMs ever
+        # grow a cell_outcomes/shadow reference (a leak), else name the rail.
+        import inspect as _inspect
+        treasury_src = (_inspect.getsource(self.ledger.book_cents.__func__)
+                        + _inspect.getsource(self.ledger.lifetime_pnl_cents.__func__)
+                        + _inspect.getsource(self.ledger.deployed_cents.__func__))
+        if "cell_outcomes" in treasury_src or "shadow" in treasury_src:
+            failures.fail(
+                "SHADOW_LEAK_INTO_TREASURY",
+                "a treasury/tradeable-capital query references cell_outcomes or a "
+                "shadow row — simulated P&L must never touch real capital",
+                fatal=True)
+        else:
+            _shadow_lanes = [ln for ln, m in config.LANE_MODE.items()
+                             if m != "LIVE"]
+            print("SHADOW-ISOLATION SELF-TEST: treasury reads settlements+cash "
+                  "only, deployed reads live fills only; a shadow-lane fill is "
+                  f"FATAL-refused (rail armed). Rehearsing: {','.join(_shadow_lanes)}"
+                  " — their P&L is cell_outcomes(shadow=1), never tradeable",
+                  flush=True)
         # WO-VERIFY-LOSSTERM-1 B1: the salvage registration path must be
         # provably reachable before the first cycle — ARMED or
         # DISABLED_TAGGED, never silence on a held position.
@@ -1468,6 +1531,15 @@ class ShadowEngine:
                                            "WATCHING", transport=transport,
                                            detail=tag)
                 continue
+            # WO-2026-07-25-L §P1: the pessimistic SHADOW fill sweep — every
+            # resting SHADOW order on this market is filled ONLY when the healthy
+            # book trades through its price after rest. Runs here (post book-health
+            # guard, pre-evaluation) so a rehearsed fill feeds custody the same
+            # cycle a live fill would. Zero broker traffic; treasury untouched.
+            try:
+                self.simulate_shadow_fills(market, book, now)
+            except Exception as e:
+                log.warning("shadow fill sweep error on %s: %s", market, e)
             # P18 §4.1: shared eyes, not orders — the spot-lead signal
             # computes ONCE per cycle here; FLIP·HUNT consumes it as trigger,
             # F/H8 record it as a why-tag field, P yields the floor.
@@ -1732,7 +1804,8 @@ class ShadowEngine:
                 self.ledger.record_cell_outcome(
                     lane, s["entry"], won=won, pnl_cents=pnl, fees_cents=0,
                     market=market, kind="settle", now=now_eff,
-                    contracts=s["net"])   # WO-2026-07-24-G Part 4: per-contract
+                    contracts=s["net"],   # WO-2026-07-24-G Part 4: per-contract
+                    shadow=config.lane_books_shadow(lane))  # WO-L: live-fills only, tagged for safety
                 # WO-2026-07-23-B Part 1 guard (b): an F position that rode to
                 # settlement and LOST paid its full entry per contract — the
                 # unsalvaged loss the tripwire exists to catch (§1.6).

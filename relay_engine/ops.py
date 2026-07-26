@@ -520,6 +520,15 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.append(flip_ladder.ladder_line(ledger))
     except Exception as e:
         lines.append(f"DESK SIZE: unavailable ({e})")
+    # WO-2026-07-25-L §P1/P3/P4: the ghosts' pack — the pessimistic fill model's
+    # assumptions (Scientist's load-bearing honesty), and each shadow lane's
+    # distance to promotion (the door, marked with numbers, printed daily).
+    try:
+        from . import flip_ladder, shadow_fill
+        lines.append(shadow_fill.MODEL_STATEMENT)
+        lines.extend(flip_ladder.promotion_distance_lines(ledger))
+    except Exception as e:
+        lines.append(f"EARN-BACK: unavailable ({e})")
     # P8 §2.4: the streak, halts, and resets
     if econ is not None:
         lines.extend(econ.pack_lines())

@@ -310,7 +310,7 @@ AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap
 # REVERT LEVERS (post-experiment): FLIP dial FLIP_NOTIONAL_PCT→lower and/or
 # AT_RISK_PCT["FLIP"]→0.05; OPEN_SIGHTED_STOP=0. The wall must not silently stay
 # loose after the experiment ends.
-AT_RISK_PCT = {"F": 0.25, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02}
+AT_RISK_PCT = {"F": 0.30, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02}  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
 AT_RISK_PCT_DEFAULT = 0.02        # any unlisted lane (ORPHAN, …) — conservative
 # WO-2026-07-24-G Part 1 (ADVERSARY i backstop): the per-lane wall is now scoped
 # per-lane, so a lane can't be squeezed by another's exposure — but the whole
@@ -368,7 +368,16 @@ NET_RISK_CROSS_LANE_CAP = 3  # net contracts at risk per settlement event, acros
 # book (self-scaling), bounded only by REAL depth — not by Kelly or the count
 # cap. F ALONE takes this path; every other lane keeps min(kelly, depth, cap).
 # ---------------------------------------------------------------------------
-F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.20"))  # DREW DIAL: F size = pct of book / price
+# WO-2026-07-25-L "F GETS THE BOOK" P2 — F MAXIMUM. F earns ~98% of the profit
+# and just had every other lane moved to shadow (P1); it takes the desk's freed
+# risk budget through THIS raise (walls are lane-scoped, so nothing else needs
+# transferring). Dial 0.20 → 0.24 (stays 80% of the 0.30 wall). THE CEILING,
+# STATED: at ~97¢ entries one full unsalvaged F loss costs ≈ dial × book ≈ 24%
+# of book — the accepted bound of this ruling. Past ~0.25 a single ordinary loss
+# is a one-third-of-book event; FURTHER F RAISES ARE GATED ON SALVAGE (the
+# 1.2-point Gate A order) shipping and proving on tape (at ~40–50¢ salvaged loss
+# sizes the same math supports dials well past 0.30).
+F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.24"))  # DREW DIAL: F size = pct of book / price (WO-L P2; was 0.20)
 # WO-2026-07-24-D Part 1: FLIP self-scales by NOTIONAL too (like F), else KELLY
 # caps it at ~5-6 on a $43 book (358c/60c) and FLIP_SIZE_CAP=10 never bites —
 # the +4×10 test ran at half the ruled size. 10 lots × 60c = 600c ≈ 14% of a
@@ -557,6 +566,12 @@ FLIP_FLOOR_SLIP_CENTS = 5
 # rides along as a SHADOW comparison, calibrated against the measured rate
 # before it may ever drive the decision.
 OPEN_SWING_MIN_SAMPLES = 20       # Adversary (a): don't gate on a thin sample
+# WO-2026-07-25-L §P4 — BREAK-EVEN RECALIBRATION + THIN. A cell with fewer than
+# this many REALIZED outcomes carries NO gate authority anywhere — not in
+# promotion evidence, not as a margin tiebreaker; it shows greyed with its n. A
+# cell leaves THIN only by realized n, NEVER by modeled numbers (the review's
+# item #4: 25 of 29 cells were off ≥8% on placeholder be/loss values).
+CELL_THIN_MIN_N = 10              # DREW-DEFAULT: realized-n floor for a cell to hold gate authority
 FLIP_SIZE_CAP = 10                # LEGACY reference — RETIRED as a sizing binder by WO-2026-07-24-G Part 2 (FLIP now scales with the book via min(notional, depth)); kept only for the book==0 halt fallback and the revert narrative. The live binder is FLIP_NOTIONAL_PCT + the at-risk wall.
 FLIP_HALT_REF_PRICE_C = 55        # DREW-DEFAULT: the mid-band FLIP price the halt sizes its lot count at
 
@@ -682,3 +697,51 @@ def drew_defaults() -> dict:
 def live_submit_enabled() -> bool:
     """The hard-disable pattern (§B3). Both legs must hold; SHADOW never places orders."""
     return RUN_MODE == "LIVE" and I_UNDERSTAND_LIVE == I_UNDERSTAND_LIVE_PHRASE
+
+
+# ---------------------------------------------------------------------------
+# WO-2026-07-25-L "F GETS THE BOOK; EVERYTHING ELSE EARNS IT" P1 — PER-LANE RUN
+# MODE. The global kill (RUN_MODE/§B3) still rules everything; a per-lane mode
+# can only RESTRICT below it, never widen it. One lane earned the book (F); it
+# trades live. Every other lane keeps every rep — same signals, same custody,
+# same swing records — but places NOTHING: SHADOW oids, simulated fills, cell
+# outcomes tagged shadow. Ghosts until they graduate (the earn-back protocol, P3).
+# ---------------------------------------------------------------------------
+LANE_MODE = {
+    # THE RULING, literal: F is the one lane that earned the book. Everything
+    # else — including H8 (the WO's dict names only F) — earns it back from
+    # shadow via the P3 protocol. "one lane earned the book, so it gets the book."
+    "F": os.environ.get("LANE_MODE_F", "LIVE").upper(),
+    "H8": os.environ.get("LANE_MODE_H8", "SHADOW").upper(),
+    "FLIP": os.environ.get("LANE_MODE_FLIP", "SHADOW").upper(),
+    "OPEN": os.environ.get("LANE_MODE_OPEN", "SHADOW").upper(),
+    "HUNT": os.environ.get("LANE_MODE_HUNT", "SHADOW").upper(),
+    "PAIR": os.environ.get("LANE_MODE_PAIR", "SHADOW").upper(),
+    "D": os.environ.get("LANE_MODE_D", "SHADOW").upper(),
+    "P": os.environ.get("LANE_MODE_P", "SHADOW").upper(),
+}
+LANE_MODE_DEFAULT = "SHADOW"   # any unlisted lane rehearses — conservative
+
+
+def lane_is_live(lane: str) -> bool:
+    """A lane places live orders ONLY when the global kill is off AND the lane's
+    own mode is LIVE. Per-lane can only restrict below the global — a SHADOW
+    global forces every lane to shadow regardless of LANE_MODE (born state)."""
+    return (live_submit_enabled()
+            and LANE_MODE.get(lane, LANE_MODE_DEFAULT) == "LIVE")
+
+
+def lane_books_shadow(lane: str) -> bool:
+    """Does this lane's outcome book to the SHADOW (rehearsal) ledger? Only
+    meaningful inside a LIVE run, where F is live and the rest rehearse: a lane
+    that is NOT live books shadow. In a global-SHADOW run every lane is one paper
+    ledger (returns False for all) — the born-state behavior, tests untouched.
+    So the shadow TAG marks the live-run mixed-mode split, never the global mode."""
+    return live_submit_enabled() and not lane_is_live(lane)
+
+
+def f_single_loss_bound_pct() -> float:
+    """WO-L P2 — the CEO's single-loss bound: one full unsalvaged F loss at a
+    ~97¢ favorite costs ≈ the dial × book (the position is ~all-of-clip at that
+    price). Printed next to the worst-day math; the stated, accepted ceiling."""
+    return F_NOTIONAL_PCT

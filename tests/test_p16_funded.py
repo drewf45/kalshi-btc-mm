@@ -94,9 +94,9 @@ def test_confirm_cash_branch_also_rescales(cash, ledger):
 
 def test_rescale_math_at_35_50_100():
     assert "budget/window 291¢" in sizing_line(3_500)
-    # WO-2026-07-24-G Part 4: the line now states the REAL per-lane notional
-    # sizes; F @97¢ at $35 book = 3500*0.20//97 = 7 lots (was the generic Kelly).
-    assert "F @97¢ → 7 lots" in sizing_line(3_500)
+    # WO-2026-07-24-G Part 4 / WO-L P2: the line states the REAL per-lane notional
+    # sizes; F @97¢ at $35 book = 3500*0.24//97 lots at dial 0.24.
+    assert f"F @97¢ → {int(3500 * config.F_NOTIONAL_PCT // 97)} lots" in sizing_line(3_500)
     assert "budget/window 416¢" in sizing_line(5_000)
     assert "budget/window 833¢" in sizing_line(10_000)
 

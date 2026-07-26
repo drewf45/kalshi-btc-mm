@@ -287,15 +287,16 @@ def test_b4_sizing_line_states_the_binder_in_words():
     live constants, never asserted."""
     from relay_engine.boot import sizing_line
     line = sizing_line(1174)
-    # WO-2026-07-24-G Part 4: the REAL per-lane sizes (F/FLIP notional), computed
-    # from the live constants. F @97¢: 1174*0.20//97 = 2 lots.
-    assert "F @97¢ → 2 lots" in line
-    assert "dial 20%" in line and "wall 25%" in line
+    # WO-2026-07-24-G Part 4 / WO-L P2: the REAL per-lane sizes (F/FLIP notional),
+    # computed from the live constants. F @97¢: 1174*0.24//97 lots at dial 0.24.
+    assert f"F @97¢ → {int(1174 * config.F_NOTIONAL_PCT // 97)} lots" in line
+    assert f"dial {config.F_NOTIONAL_PCT:.0%}" in line \
+        and f"wall {config.AT_RISK_PCT['F']:.0%}" in line
     assert "no fixed cap — scales with book" in line
     assert "throttle is book size + the at-risk wall" in line
     # and F scales UP with the book (notional, self-scaling)
-    assert "F @97¢ → 4 lots" in sizing_line(2400)   # 2400*0.20//97 = 4
-    assert "F @97¢ → 7 lots" in sizing_line(3600)   # 3600*0.20//97 = 7
+    assert f"F @97¢ → {int(2400 * config.F_NOTIONAL_PCT // 97)} lots" in sizing_line(2400)
+    assert f"F @97¢ → {int(3600 * config.F_NOTIONAL_PCT // 97)} lots" in sizing_line(3600)
 
 
 def test_b4_boot_tape_carries_the_legible_sizing_line(tmp_path, capsys):
