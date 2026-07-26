@@ -330,8 +330,11 @@ class WindowEcon:
         halted = self.halted_lanes()
         # WO-2026-07-24-G Part 2: the drawdown threshold recomputes with the BOOK
         # (four stop-outs at CURRENT FLIP size). FLIP scales with the book now, so
-        # a frozen threshold is the count-vs-money bug reborn.
-        drawdown_bound = config.rate_halt_drawdown_c(book_cents)
+        # a frozen threshold is the count-vs-money bug reborn. WO-2026-07-26-O §O2:
+        # off TRADEABLE = the passed account value − owed, so the halt tightens as
+        # the scrape banks (subtract owed from the value handed in, don't re-read).
+        drawdown_bound = config.rate_halt_drawdown_c(
+            max(0, book_cents - self.ledger.owed_cents()))
         for lane in sorted(per_lane):
             # WO-2026-07-24-C Part 2: count MONEY, not negative windows. A
             # profitable asymmetric sequence (−8,−7,+17 = +2¢) must NOT halt; a
@@ -415,9 +418,9 @@ class WindowEcon:
         # lane's summed drawdown over its rolling window against the size-derived
         # threshold, and which lanes are halted. The global count-rate is retired.
         halted = self.halted_lanes()
-        # WO-2026-07-24-G Part 2: the bound is book-derived now — show the LIVE
-        # value (4 stop-outs at the current book), not a frozen constant.
-        bound = config.rate_halt_drawdown_c(self.ledger.book_cents())
+        # WO-2026-07-24-G Part 2 / WO-O §O2: the bound is TRADEABLE-derived now —
+        # show the LIVE value (4 stop-outs at current tradeable), not a constant.
+        bound = config.rate_halt_drawdown_c(self.ledger.tradeable_cents())
         lines = []
         rows = self.ledger.db.execute(
             "SELECT key, value FROM engine_state WHERE key LIKE ?",

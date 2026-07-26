@@ -78,52 +78,46 @@ def _rows(ledger, state):
         "SELECT COUNT(*) FROM surface_rows WHERE state=?", (state,)).fetchone()[0]
 
 
-def test_saturday_slip_no_fire_when_gagged(custodian, ledger):
-    """10:27 PM: F no@97 ×18, mark slips to 50 and SUSTAINS — the untuned SLIP cut
-    it at maximum pain on a window that settled a WINNER. GAGGED: it holds to the
-    bell, writes the counterfactual, takes NO cut."""
-    assert config.SALVAGE_GAGGED is True                    # the ruled state
+def test_saturday_transient_slip_no_fire_sighted(custodian, ledger):
+    """WO-M §S1: 10:27 PM — F no@97 ×18 dipped to 50 then RECOVERED (it settled a
+    winner). Salvage is now LIVE but SIGHTED: a dip that does not stay pinned never
+    fires — the exact overnight regret shape is refused by the confirm, not a gag."""
+    assert config.SALVAGE_GAGGED is False                   # LIVE, disciplined
     pos = _f_pos(custodian, ledger, entry=97)
-    _tick(custodian, CLOSE - 400, held_bid=50)              # tick 1 (sustain needed)
-    cuts = _tick(custodian, CLOSE - 399, held_bid=50)       # tick 2: would fire
+    _tick(custodian, CLOSE - 400, held_bid=50)              # dip (deep)
+    _tick(custodian, CLOSE - 399, held_bid=97)              # recovered → not deep
     assert pos.salvage_fired is None                         # NO cut
-    assert pos.salvage_would_fire == "SALVAGE_SLIP"          # counterfactual logged
-    assert cuts == [] or all(t != "SALVAGE_SLIP" for _, _, t in cuts)
-    assert _rows(ledger, "SALVAGE_WOULD_FIRE") >= 1
-    # the position is HELD — no CUSTODIAN_EXIT fill was booked
     assert ledger.db.execute(
         "SELECT COUNT(*) FROM fills WHERE action='CUSTODIAN_EXIT'").fetchone()[0] == 0
     assert f"{TICKER}:F" in custodian.positions              # rode to the bell
 
 
-def test_second_saturday_slip_also_no_fire(custodian, ledger):
-    """11:43 PM: F yes@95 ×11 → SLIP at 52, same class. Also NO-FIRE."""
+def test_second_saturday_slip_no_fire_sighted(custodian, ledger):
+    """11:43 PM: F yes@95 ×11 dipped to 52 then recovered — same class, NO-FIRE."""
     pos = _f_pos(custodian, ledger, entry=95)
     _tick(custodian, CLOSE - 400, held_bid=52)
-    _tick(custodian, CLOSE - 399, held_bid=52)
-    assert pos.salvage_fired is None and pos.salvage_would_fire == "SALVAGE_SLIP"
+    _tick(custodian, CLOSE - 399, held_bid=95)
+    assert pos.salvage_fired is None
 
 
-def test_rearm_path_fires_on_a_sustained_reversal(custodian, ledger, monkeypatch):
-    """The -M re-arm is real: un-gagged, a SUSTAINED decisive reversal salvages
-    MAKER-FIRST (never the overnight's immediate crossfire)."""
-    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
+def test_sighted_salvage_fires_on_a_sustained_pinned_reversal(custodian, ledger):
+    """§S1–S4: a decisive reversal that stays PINNED for the confirm polls salvages
+    MAKER-FIRST — the earned cut (never the overnight's immediate crossfire)."""
     pos = _f_pos(custodian, ledger, entry=97)
-    _tick(custodian, CLOSE - 400, held_bid=50)
-    _tick(custodian, CLOSE - 399, held_bid=50)
+    for i in range(config.SALVAGE_CONFIRM_POLLS):
+        _tick(custodian, CLOSE - 400 + i, held_bid=50)      # pinned at 50, sustained
     assert pos.salvage_fired == "SALVAGE_SLIP" and pos.salvage_oid is not None
     assert ledger.db.execute(
         "SELECT COUNT(*) FROM fills WHERE action='CUSTODIAN_EXIT'").fetchone()[0] == 0
 
 
-def test_rearm_single_tick_dip_still_no_fire(custodian, ledger, monkeypatch):
-    """Even un-gagged, the -M confirms-symmetric guard keeps a transient dip (the
-    exact Saturday shape) from salvaging — a single tick that recovers NO-FIRES."""
-    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
+def test_below_worth_floor_no_fire(custodian, ledger):
+    """§S2: a favorite that has collapsed BELOW the worth-floor (mark < 30) has
+    almost nothing left to recover — no fee-wasting cut, ride the last of it."""
     pos = _f_pos(custodian, ledger, entry=97)
-    _tick(custodian, CLOSE - 400, held_bid=50)              # dip
-    _tick(custodian, CLOSE - 399, held_bid=97)              # recovered
-    assert pos.salvage_fired is None and pos.salvage_slip_strikes == 0
+    for i in range(config.SALVAGE_CONFIRM_POLLS + 1):
+        _tick(custodian, CLOSE - 400 + i, held_bid=20)      # deep + pinned but < floor
+    assert pos.salvage_fired is None
 
 
 # ══ P4.3 · THE TWO BUILD-6 FIXES, REPLAYED ══════════════════════════════════
@@ -196,10 +190,9 @@ def test_no_dial_changes_f_stays_24_30():
 def test_boot_prints_the_doctrine():
     from relay_engine import boot
     tape = "\n".join(boot.boot_tape())
-    assert "SALVAGE: GAGGED" in tape
+    assert "SALVAGE: LIVE" in tape                           # WO-M: the gag ended
     assert "RESTATED" in tape
     assert "CASH-SENTINEL DOCTRINE" in tape
-    assert "NO CHANGES this deploy" in tape
 
 
 def test_f_sizing_logic_untouched():

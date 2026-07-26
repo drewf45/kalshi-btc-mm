@@ -10,7 +10,11 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FORBIDDEN = ["water" + "fall", "scr" + "ape", "mark_" + "paid", "owed"]
+# WO-2026-07-26-O "THE SCRAPE" (Drew's ruling) REVIVES `scrape`/`owed` as the
+# operator's earn — a DIFFERENT thing from the retired WATERFALL profit-split
+# (the thing this guard was built to keep dead). The waterfall itself
+# (`waterfall`, `mark_paid`) stays forbidden; `scrape`/`owed` are now ruled terms.
+FORBIDDEN = ["water" + "fall", "mark_" + "paid"]
 SCAN_DIRS = ["relay_engine"]
 
 
@@ -41,6 +45,9 @@ def test_no_paid_command():
     (P-CASH-FATAL-1 §4.4) plus /daily (WO-2026-07-22-K — the read-only day
     export). Still no order-shaped command."""
     from relay_engine.ops import Telegram
+    # WO-2026-07-26-O §O4 adds /owed (read-only scrape look) — still no order-shaped
+    # command; /paid (the waterfall payout) stays retired.
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
-                                 "/scoreboard", "/clear_cash_fatal", "/daily")
+                                 "/scoreboard", "/clear_cash_fatal", "/daily",
+                                 "/owed")
     assert "/paid" not in Telegram.COMMANDS

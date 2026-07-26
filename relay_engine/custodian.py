@@ -146,6 +146,8 @@ class OpenPosition:
     salvage_strikes: int = 0
     salvage_slip_strikes: int = 0    # WO-N §P4.2: -M confirms-symmetric slip counter
     salvage_would_fire: Optional[str] = None  # WO-N: the gagged counterfactual (telemetry)
+    salvage_confirms: int = 0        # WO-M §S1: sighted-confirm poll counter (deep+pinned+spot)
+    low_mark: Optional[int] = None   # WO-M §S1: low-water mark (pinned-at-lows confirmation)
     salvage_attempted: bool = False
     salvage_oid: Optional[str] = None
     salvage_ts: float = 0.0
@@ -285,6 +287,10 @@ class Custodian:
                     else book.best_no_bid())
             if mark is None:
                 continue
+            # WO-2026-07-26-M §S1: the low-water mark — a salvage confirmation
+            # requires the mark to be PINNED at its lows (not a dip already
+            # recovering). Tracked every tick, the sighted-stop's low_mark.
+            pos.low_mark = mark if pos.low_mark is None else min(pos.low_mark, mark)
             blo, bhi = (boundaries or {}).get(pos.market, (None, None))
             # P19 §2: the SALVAGE machine runs for salvage-enabled lanes
             # BEFORE the classic triggers (it is gentler: maker-first).
@@ -368,19 +374,26 @@ class Custodian:
                     pos.lane, pos.market, trigger, mark)
 
     def _salvage_rarity_check(self, now: float) -> None:
-        """§P4.2 -M rarity assert: salvage is EXCEPTIONAL. If it fires more than
-        SALVAGE_RARITY_MAX_PER_DAY in a rolling day, page (non-fatal) — a salvage
-        that fires often is mis-tuned, not a rescue."""
+        """§S3 RARITY + AUTO-GAG: salvage is EXCEPTIONAL. More than
+        SALVAGE_RARITY_MAX_PER_DAY fires in a rolling day AUTO-GAGS the machine
+        (SALVAGE_OVERACTIVE) and pages — a hot salvage is mis-tuned, not a rescue,
+        and it disarms itself rather than keep cutting. Cleared only by restart /
+        manual review."""
         self._salvage_fire_ts = [t for t in getattr(self, "_salvage_fire_ts", [])
                                  if now - t < 86400.0]
         self._salvage_fire_ts.append(now)
         if len(self._salvage_fire_ts) > config.SALVAGE_RARITY_MAX_PER_DAY:
+            self._salvage_auto_gagged = True
             failures.fail(
-                "SALVAGE_TOO_FREQUENT",
+                "SALVAGE_OVERACTIVE",
                 f"salvage fired {len(self._salvage_fire_ts)}x in a day > "
-                f"{config.SALVAGE_RARITY_MAX_PER_DAY} — salvage is exceptional; "
-                f"this cadence says mis-tuned, review the re-arm",
+                f"{config.SALVAGE_RARITY_MAX_PER_DAY} — AUTO-GAGGED (mis-tuned; "
+                f"disarming rather than keep cutting, review before re-arm)",
                 fatal=False, alert=True)
+
+    def salvage_disarmed(self) -> bool:
+        """§S3: the machine is disarmed by the manual gag OR the auto-gag."""
+        return config.SALVAGE_GAGGED or getattr(self, "_salvage_auto_gagged", False)
 
     def _fire_or_gag_salvage(self, pos: OpenPosition, trigger: str, mark: int,
                              book, now: float, **ctx) -> Optional[str]:
@@ -390,12 +403,19 @@ class Custodian:
         side's mark, stage-2 crossfire after R via the existing salvage_oid clock),
         never the overnight's immediate crossfire."""
         pos.salvage_attempted = True            # one salvage decision per position
-        if config.SALVAGE_GAGGED:
+        if self.salvage_disarmed():
+            # GAGGED (manual kill) or AUTO-GAGGED (S3 overactive): record the
+            # counterfactual and HOLD — no cut, no fee, ride to settlement.
             pos.salvage_would_fire = trigger
             self._note_salvage_would_fire(pos, trigger, mark, **ctx)
-            return None                         # HELD — telemetry only
-        # ── RE-ARMED (-M): rarity assert + tri-state cancel + re-derive + maker ──
+            return None
+        # ── LIVE (S4): rarity/auto-gag check + tri-state cancel + re-derive + maker ──
         self._salvage_rarity_check(now)
+        if getattr(self, "_salvage_auto_gagged", False):
+            # this fire tripped the auto-gag — hold THIS one too, disarmed now
+            pos.salvage_would_fire = trigger
+            self._note_salvage_would_fire(pos, trigger, mark, **ctx)
+            return None
         if pos.resting_exit_id is not None:
             state = self.gateway.cancel_tristate(pos.resting_exit_id)
             if state == "UNKNOWN":
@@ -447,19 +467,37 @@ class Custodian:
                     "entry": pos.entry_price_cents}))
         except Exception:
             pass
-        # WO-2026-07-23-B Part 1 guard (b): an F position concluding at a loss
-        # worse than F_EVENT_TRIPWIRE_C per contract (a cut that ran past the
-        # wire, or a ride to settlement) suppresses F for the day. The ledger
-        # owns the day-stamp; the sizing path reads it. Salvage keeps most F
-        # losses ~40c (under the wire) — this catches the one that got past it.
+        # WO-2026-07-26-M §S6 — SALVAGE_MISSED_WINDOW. A position that went DEEP
+        # (its low-water reached the slip threshold) yet concluded a big loss
+        # WITHOUT salvage firing is a window the sighted machine should have
+        # caught — page it (the 1315-15 case). Salvage LIVE means missed windows
+        # are the falsifiable failure, not the fires.
+        went_deep = (pos.low_mark is not None
+                     and pos.low_mark <= pos.entry_price_cents
+                     - config.F_SALVAGE_SLIP_POINTS)
+        if (pos.lane == "F" and realized_cents is not None
+                and realized_cents < -config.SALVAGE_MISSED_LOSS_C
+                and pos.salvage_fired is None and pos.salvage_would_fire is None
+                and went_deep and not self.salvage_disarmed()):
+            failures.fail(
+                "SALVAGE_MISSED_WINDOW",
+                f"{pos.market}: F concluded {-realized_cents:.0f}c/contract loss "
+                f"({exit_trigger}) after going deep (low {pos.low_mark}c ≤ entry "
+                f"{pos.entry_price_cents}−{config.F_SALVAGE_SLIP_POINTS}) yet "
+                f"salvage never fired — a window the sighted machine missed",
+                fatal=False, alert=True, market=pos.market,
+                per_contract_c=round(-realized_cents, 1))
+        # WO-2026-07-26-M: F_EVENT_TRIPWIRE's DAY-LONG SUPPRESSION is RETIRED — the
+        # money-based rate halt is the ruled governor (a single loss is noise; a
+        # RUN of losses is what halts). The per-contract loss still PAGES (the
+        # operator sees the tail), but it no longer suppresses F for the day.
         if (pos.lane == "F" and realized_cents is not None
                 and realized_cents < -config.F_EVENT_TRIPWIRE_C):
-            self.ledger.set_f_tripwire()
             failures.fail(
-                "F_EVENT_TRIPWIRE",
+                "F_LARGE_LOSS",
                 f"{pos.market}: F loss {-realized_cents:.0f}c/contract > "
-                f"{config.F_EVENT_TRIPWIRE_C}c ({exit_trigger}) — F entries "
-                "suppressed for the rest of the day",
+                f"{config.F_EVENT_TRIPWIRE_C}c ({exit_trigger}) — noted; the rate "
+                "halt governs a RUN, not this single loss (WO-M: tripwire retired)",
                 fatal=False, alert=True, market=pos.market,
                 per_contract_c=round(-realized_cents, 1))
 
@@ -495,32 +533,50 @@ class Custodian:
         # to −90. IMMEDIATE crossfire (the slip IS the decision, no maker wait).
         # One attempt (salvage_attempted latches); NO re-entry (Wall 3 single-
         # entry keeps the ticker out of lane F for the rest of the window).
+        # WO-2026-07-26-M §S1 — THE SIGHTED, CONFIRMED SLIP. The overnight cut two
+        # winners because it fired level-only on the instantaneous mark. Now a
+        # salvage fires ONLY after SALVAGE_CONFIRM_POLLS consecutive polls where
+        # ALL THREE hold: DEEP-against (mark ≤ entry − slip), PINNED-at-lows (mark
+        # within ε of the low-water — not already recovering), and SPOT-CONFIRM
+        # (spot on the losing side; spot-blind-proof — an unseen spot never blocks
+        # the table-free slip). §S2 worth-floor + §S6 band bound the fire.
         if pos.lane == "F" and not pos.salvage_attempted:
-            slipped = (mark <= pos.entry_price_cents
-                       - config.F_SALVAGE_SLIP_POINTS)
-            if slipped:
-                # WO-2026-07-26-N §P4.2 -M confirms-SYMMETRIC: the overnight SLIP
-                # fired level-only on the instantaneous mark and cut TWO winners
-                # at the bottom (a transient dip that recovered). A decisive
-                # reversal SUSTAINS — require SALVAGE_SLIP_CONFIRMS consecutive
-                # ticks; a single-tick dip never salvages.
-                pos.salvage_slip_strikes += 1
-                if pos.salvage_slip_strikes < config.SALVAGE_SLIP_CONFIRMS:
-                    self._note_salvage_gag(pos, "SLIP_STRIKES_1", mark=mark,
+            deep = (mark <= pos.entry_price_cents - config.F_SALVAGE_SLIP_POINTS)
+            if deep:
+                pinned = (pos.low_mark is not None
+                          and mark <= pos.low_mark + config.SALVAGE_PINNED_EPS_C)
+                spot_confirms = True
+                if spot is not None:
+                    from . import spotlead as _sl0
+                    strike0 = _sl0.pick_strike(spot, blo, bhi)
+                    if strike0 is not None:
+                        spot_confirms = ((spot < strike0) if pos.side == "yes"
+                                         else (spot > strike0))
+                if pinned and spot_confirms:
+                    pos.salvage_confirms += 1
+                else:
+                    pos.salvage_confirms = 0
+                    self._note_salvage_gag(
+                        pos, "SLIP_UNCONFIRMED", mark=mark, low=pos.low_mark,
+                        pinned=pinned, spot_ok=spot_confirms, t_rem=round(t_rem, 1))
+                    return None
+                if pos.salvage_confirms < config.SALVAGE_CONFIRM_POLLS:
+                    self._note_salvage_gag(pos, "SLIP_CONFIRMING", mark=mark,
+                                           polls=pos.salvage_confirms,
                                            t_rem=round(t_rem, 1))
                     return None
-                # -M worth-floor: below the floor there is nothing worth a fee to
-                # recover — riding costs no more than the salvage would keep.
-                if mark < config.SALVAGE_WORTH_FLOOR_C:
-                    self._note_salvage_gag(pos, "SLIP_BELOW_WORTH", mark=mark,
+                # §S2 worth-floor + §S6 middle-band: surrender must land in the
+                # band where it is worth something.
+                if not (config.SALVAGE_WORTH_FLOOR_C <= mark
+                        <= config.SALVAGE_BAND_MAX_C):
+                    self._note_salvage_gag(pos, "SLIP_OUT_OF_BAND", mark=mark,
                                            t_rem=round(t_rem, 1))
                     return None
-                # sustained + worthy decisive reversal. GAGGED → telemetry only,
-                # ride to the bell; re-armed → -M maker-first cut.
+                # sighted + confirmed + floored → fire (maker-first).
                 return self._fire_or_gag_salvage(pos, "SALVAGE_SLIP", mark, book,
                                                  now, t_rem=round(t_rem, 1))
             else:
-                pos.salvage_slip_strikes = 0   # recovered — the reversal wasn't real
+                pos.salvage_confirms = 0   # not deep — the reversal isn't there
         if pos.salvage_attempted or pos.p_entry is None:
             # one attempt per position; no anchor = disabled — SAID (SALV-1)
             self._note_salvage_gag(
@@ -572,15 +628,21 @@ class Custodian:
             return None      # sustained 2 consecutive ticks — no knives
 
         # TRIGGERED — §2.3: tri-state cancel artifacts, re-derive, maker.
-        # WO-2026-07-26-N §P4.2: GAGGED → record the counterfactual and HOLD to
-        # the bell (the needle-collapse cut is disarmed alongside the slip cut).
-        if config.SALVAGE_GAGGED:
+        # WO-2026-07-26-M §S2/S6: the needle-collapse cut obeys the same worth-floor
+        # and middle-band as the slip (one discipline, §S7). Out of band → hold.
+        if not (config.SALVAGE_WORTH_FLOOR_C <= mark <= config.SALVAGE_BAND_MAX_C):
+            self._note_salvage_gag(pos, "NEEDLE_OUT_OF_BAND", mark=mark,
+                                   fair=round(fair, 1), t_rem=round(t_rem, 1))
+            return None
+        # disarmed (manual/auto gag) → record the counterfactual and HOLD.
+        if self.salvage_disarmed():
             pos.salvage_attempted = True
             pos.salvage_would_fire = "SALVAGE_MAKER"
             self._note_salvage_would_fire(
                 pos, "SALVAGE_MAKER", mark, drop_pts=round(drop_pts, 1),
                 fair=round(fair, 1), t_rem=round(t_rem, 1))
             return None
+        self._salvage_rarity_check(now)
         pos.salvage_attempted = True
         if pos.resting_exit_id is not None:
             state = self.gateway.cancel_tristate(pos.resting_exit_id)

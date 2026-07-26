@@ -4003,6 +4003,68 @@ duplicate-cut + duplicate-fill book once; #4 pack RESTATED + distance-to-promoti
 (`test_p19_salvage`, `test_salv1/2`, `test_flip_both_lanes`, `test_p24`) re-anchored to the -M re-arm path
 (run un-gagged) with the slip now confirms-symmetric + maker-first. Suite 869 · preflight 23/23.
 
+## WO-2026-07-26-M + WO-2026-07-26-O — SALVAGE EARNS ITS CUT + THE SCRAPE (build 84, one deploy)
+
+Two promises kept on the restated meter (the -N P4 lifetime restatement is Step 0 — it already shipped, and
+the scrape's high-water seeds from it): the machine learns exactly when to surrender, and learns to pay its
+operator five dollars of every true ten. **Read-rule:** the cited full-spec files (`WO_2026-07-26-M…md`,
+`WO_2026-07-26-O…md`) are **absent** from the repo — built from this handoff's S1–S7 / O1–O4 summaries,
+reported here. The overnight fixes (baton lifecycle, fill dedup) and the -N gag were independently verified
+in the prior build. A real collision surfaced and was resolved (below).
+
+**STEP 1 · WO-M — the sighted, confirmed, floored salvage.** The -N gag ends; `SALVAGE_GAGGED` now defaults
+**off** and salvage is LIVE, but only as discipline. **S1 confirmation** (`custodian._salvage_tick`): a slip
+fires only after `SALVAGE_CONFIRM_POLLS=3` consecutive polls where ALL of {deep-against (mark ≤ entry−slip),
+pinned-at-lows (mark ≤ `low_mark`+ε — a new per-position low-water tracked each `tick`), spot-confirm (spot
+on the losing side; spot-blind-proof — an unseen spot never blocks)} hold — a single-tick dip that recovers
+never fires (the exact overnight regret). **S2 worth-floor** = `SALVAGE_WORTH_FLOOR_C=30`¢ residual. **S3
+rarity + auto-gag**: more than `SALVAGE_RARITY_MAX_PER_DAY=6` fires in a rolling day sets `_salvage_auto_
+gagged` (`SALVAGE_OVERACTIVE` page) and the machine holds — `salvage_disarmed()` = manual gag OR auto-gag.
+**S4 maker-first** (`_fire_or_gag_salvage`): rest at the held mark, stage-2 crossfire after R — never the
+overnight's immediate crossfire. **S5** the regret ledger (`SALVAGE_SUMMARY`/`SALVAGE_WOULD_FIRE`) stays on.
+**S6 middle-band** invariant (`SALVAGE_WORTH_FLOOR_C ≤ mark ≤ SALVAGE_BAND_MAX_C`) on both the slip and
+needle paths; a position that went deep yet concluded a big loss without firing pages `SALVAGE_MISSED_WINDOW`.
+**S7** all cut paths fold under one discipline. **F_EVENT_TRIPWIRE's day-long suppression is RETIRED** — the
+money rate halt governs a run; a single loss only pages (`F_LARGE_LOSS`).
+
+**STEP 2 · WO-O — the scrape.** `ledger.owed_cents` / `tradeable_cents` (`ledger.py`): `trading_equity =
+book − Σ(non-BASELINE cash)` = baseline + Σ settlements, so a **deposit never mints** (raises book and cash
+equally) and a **loss never un-owes** (the high-water `high_water_cents` is a pure `max(persisted, live)` —
+only `bank_scrape` persists the advance). **owed** = `$5 per full $10` of high-water above the seed, less
+`Σ CONFIRMED_WITHDRAWAL` (a **withdrawal decrements**, no extra wiring). **`tradeable = book − owed`**.
+**§O2 — substituted at EVERY sizing base** (the grep artifact): sizing + portfolio cap (`shadow_runner._
+score_and_size:book_c`), the at-risk wall + event backstop (`gateway._wall_net_risk_and_at_risk`), the
+pct-of-book budget (`gateway._wall_pct_of_book`, now live not snapshot), the rate-halt (`window_econ` —
+passed-value − owed, so the account-value param is preserved), the worst-day rail (`ops.worst_day_bound_
+line`), `ledger.drawdown_breached`, the scoreboard preview (`scoring`), and `boot.sizing_line`. Treasury /
+reconcile / invariant keep reading raw `book_cents` (the owed money is earmarked, still in the account).
+**§O1/Step-0** seeds the high-water at the restated equity at boot with a 💰 announcement. **§O3** `bank_
+scrape_and_watch` banks silently, announces 💰 only on a milestone crossing, and prints owed on hourly/boot
+(`sizing_line` now leads `book / owed / tradeable`)/daily (`ops.owed_line`). **§O4** `/owed` command,
+withdrawal auto-decrement, and `OWED_UNDERWATER` (halt entries if tradeable < one F lot, auto-clears on
+recovery). **Wiring assert:** no salvage event can increment owed — a salvage realizes a loss, the
+high-water is monotonic (`test_salvage_loss_never_increments_owed`).
+
+**Honest divergence / collision resolved:** the engine carried a grep-guard (`test_epoch2_grep`) that
+**forbade the tokens `scrape` and `owed`** as retired *waterfall*-era profit-split terms. WO-O (Drew's
+ruling) revives `scrape`/`owed` as the operator-earn — a *different* thing — so the guard's `FORBIDDEN` list
+was narrowed to keep `waterfall`/`mark_paid` dead while releasing `scrape`/`owed` as ruled terms; cited in
+the test. The venue-CSV cross-check (restated lifetime reconciles to the 07-26 CSV within $1) is a
+boot-time artifact — the test env has no CSV, so it's noted, not automated (the restatement itself is
+tested).
+
+**Acceptance:** #1 restatement RESTATED tag prints (`test_daily_pack_carries_the_restated_tag`, -N); #2
+salvage replays — sustained-pinned SHOULD-FIRE maker-first, spot-recovered NO-FIRE, worth-floor NO-FIRE,
+overactive auto-gag (`test_52230_should_fire…`, `test_52345_no_fire…`, `test_worth_floor…`, `test_overactive_
+auto_gags`); #3 scrape walk — +$10→owed $5, drawdown/recovery owes nothing new, +$20→$10, deposit mints
+nothing, withdrawal decrements, salvage-loss never increments, `/owed` correct (`test_scrape_and_salvage`);
+#4 sizing truth — worst-day/entry-path/wall/boot read tradeable (`test_worst_day_bound_reads_tradeable`,
+`test_size_order_base_is_tradeable…`, `test_gateway_wall_and_boot_read_tradeable`); #5 **F entry/hold logic
+byte-identical** (`lane_fh8` untouched; `test_f_sizing_logic_untouched`); #6 boot prints salvage LIVE +
+book/owed/tradeable + `OWED_UNDERWATER` guard. New `test_scrape_and_salvage.py` (17); salvage-mechanics +
+grep-guard + sizing-line suites re-anchored (3-poll confirm, tradeable base, released tokens, /owed
+whitelist). Suite 886 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

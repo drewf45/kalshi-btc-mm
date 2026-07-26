@@ -107,17 +107,31 @@ SALVAGE_GAG_MAX_TRANSITIONS = 12
 # has always outearned. The gags + would-have-fired shadow rows buy the tuning
 # data; the -M re-arm carries the Gate A unlock and gets a named review (first
 # weekly pack with ≥ SALVAGE_REARM_REVIEW_N gag summaries).
-SALVAGE_GAGGED = os.environ.get("SALVAGE_GAGGED", "true").strip().lower() in ("1", "true", "yes")
-SALVAGE_REARM_REVIEW_N = 50   # gag summaries banked before the re-arm review
-# The -M RE-ARM PATH (the disciplined salvage that runs when un-gagged): the
-# level-only slip becomes confirms-SYMMETRIC (a decisive reversal must SUSTAIN,
-# never a single-tick dip that recovers — the exact Saturday shape), worth-
-# floored (only cut when the recovery clears a real save), maker-FIRST (never an
-# immediate crossfire), and RARITY-asserted (salvage is exceptional; a run of
-# fires pages). These are the criteria a re-arm must meet; the gag sits on top.
-SALVAGE_SLIP_CONFIRMS = 2     # -M confirms-symmetric: sustained ticks before a slip salvages (mirrors the needle's 2)
-SALVAGE_WORTH_FLOOR_C = 8     # -M worth-floor: min cents the salvage must recover vs riding, or don't bother
-SALVAGE_RARITY_MAX_PER_DAY = 6  # -M rarity assert: salvage is exceptional; more than this in a day pages
+# WO-2026-07-26-M "SALVAGE EARNS ITS CUT" (S1–S7) — salvage goes LIVE, but only
+# as the SIGHTED, CONFIRMED, FLOORED discipline. The -N gag ends with this deploy;
+# SALVAGE_GAGGED now defaults OFF (the flag survives only as a manual kill).
+# Every cut path (SLIP + K-collapse + CATASTROPHIC) is folded under one discipline;
+# catastrophe survives ONLY for broker-truth emergencies.
+SALVAGE_GAGGED = os.environ.get("SALVAGE_GAGGED", "false").strip().lower() in ("1", "true", "yes")
+SALVAGE_REARM_REVIEW_N = 50   # gag summaries banked before a weekly review of the fires
+# S1 — CONFIRMATION: a salvage fires only after N consecutive polls where ALL of
+# {deep-against (mark ≤ entry − slip), pinned-at-lows (mark ≤ low_mark + ε — not
+# already recovering), spot-confirm (spot on the losing side, when spot is seen)}
+# hold. A single-tick dip that recovers never fires (the exact overnight shape).
+SALVAGE_CONFIRM_POLLS = 3     # S1: sighted-confirm polls (deep + pinned + spot)
+SALVAGE_PINNED_EPS_C = 2      # S1: mark within this of the low-water = still pinned
+# S2 — WORTH-FLOOR: surrender must be worth something. Cut only when the residual
+# recovered (the mark we sell at) clears this floor; below it, riding costs no
+# more than the fee we'd pay to salvage.
+SALVAGE_WORTH_FLOOR_C = 30    # S2: min residual cents recovered, or don't bother (was 8)
+# S3 — RARITY: salvage is exceptional. More than this many fires in a rolling day
+# AUTO-GAGS the machine (SALVAGE_OVERACTIVE) and pages — a hot salvage is mis-tuned.
+SALVAGE_RARITY_MAX_PER_DAY = 6
+# S6 — MIDDLE-BAND: salvage recovers value only in the band where surrender is
+# worth something. Outside [floor, entry−slip] it does not fire; a window that MET
+# the confirms but concluded a big loss without firing pages SALVAGE_MISSED_WINDOW.
+SALVAGE_BAND_MAX_C = 90       # S6: above this mark there is no decisive reversal to salvage
+SALVAGE_MISSED_LOSS_C = 40    # S6: a conclusion worse than this that met confirms = a missed window
 
 # ---------------------------------------------------------------------------
 # P21 "THE DOCTRINE ENGINE" — Lane OPEN (A4) + the grain (A3) + patient holds
@@ -383,6 +397,15 @@ RECON_STALL_STREAK = 10        # DREW-DEFAULT: consecutive un-cross-checked cycl
 # ---------------------------------------------------------------------------
 NET_RISK_CROSS_LANE_CAP = 3  # net contracts at risk per settlement event, across lanes
 
+# ---------------------------------------------------------------------------
+# WO-2026-07-26-O "THE SCRAPE" — the operator's cut. $5 owed per full $10 of NEW
+# high-water trading equity; sizing works off tradeable = book − owed. §O4: if
+# tradeable ever falls below one F lot the desk is OWED_UNDERWATER — it has
+# earmarked more than it can trade a single favorite with — so it PAGES and halts
+# entries until the operator withdraws (reconciling owed down) or equity recovers.
+SCRAPE_MILESTONE_C = 1000          # $10.00 of new high-water per milestone
+SCRAPE_PER_MILESTONE_C = 500       # $5.00 owed each — half of every true ten
+ONE_F_LOT_COST_C = 97              # a favorite's per-lot cost — the underwater floor
 # ---------------------------------------------------------------------------
 # WO-2026-07-23-B Part 1 — SCALE F. F earns ~98% of the book's profit and was
 # capped at NET_RISK_CROSS_LANE_CAP=3 (a fixed count, named for risk, that turns

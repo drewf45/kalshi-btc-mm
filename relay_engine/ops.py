@@ -34,7 +34,7 @@ class Telegram:
     # P-CASH-FATAL-1 §4.4: /clear_cash_fatal — the ONLY key to a denied
     # cash delta (a restart is not); symmetric with /reset_halt.
     COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard",
-                "/clear_cash_fatal", "/daily")
+                "/clear_cash_fatal", "/daily", "/owed")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
@@ -48,6 +48,9 @@ class Telegram:
         # to build the .xlsx, send it as a document, and delete it. Takes the raw
         # command text (for the optional "/daily N" days-back arg).
         self.daily_fn = lambda text="": "no daily export wired"
+        # WO-2026-07-26-O §O4: /owed — the operator's read-only look at the scrape
+        # (book / owed / tradeable / distance to the next milestone). Read-only.
+        self.owed_fn = lambda: "no scrape wired"
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         self._session = None
@@ -124,6 +127,8 @@ class Telegram:
             return self.daily_fn(text)      # read-only export; never trades
         if cmd == "/clear_cash_fatal":
             return self.cash.clear_cash_fatal()
+        if cmd == "/owed":
+            return self.owed_fn()           # read-only scrape look; never trades
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 
@@ -201,7 +206,9 @@ def worst_day_bound_line(ledger) -> str:
           at today's book size)."""
     cap_events_usd = config.AT_RISK_CAP_CENTS * 96 / 100.0
     kill_clamp_usd = 5 * 3 * config.ONE_LOT_MAX_LOSS_CENTS * 24 / 100.0
-    rail_usd = max(0.0, ledger.book_cents() / 100.0 - config.DRAWDOWN_ABSOLUTE_FLOOR_USD)
+    # WO-2026-07-26-O §O2: the worst-day rail is measured against TRADEABLE
+    # (book − owed) — the operator's scrape is not risk capital to draw down.
+    rail_usd = max(0.0, ledger.tradeable_cents() / 100.0 - config.DRAWDOWN_ABSOLUTE_FLOOR_USD)
     binding = min(cap_events_usd, kill_clamp_usd, rail_usd)
     return (f"WORST-DAY BOUND: ${binding:.2f} = min(cap x events ${cap_events_usd:.2f}, "
             f"kill clamp ${kill_clamp_usd:.2f}, drawdown rail ${rail_usd:.2f})")
@@ -209,6 +216,24 @@ def worst_day_bound_line(ledger) -> str:
 
 LANES_LIVE = ("F", "H8", "FLIP", "D", "P")
 LANES_PENDING = ()  # every lane that exists trades (R1); empty until a new lane is designed
+
+
+def owed_line(ledger) -> str:
+    """WO-2026-07-26-O §O3/O4 — the scrape, in one line: book / owed / tradeable
+    and the distance to the next milestone. Used by /owed, the daily pack, boot."""
+    seed = ledger.scrape_seed_cents()
+    if seed is None:
+        return "SCRAPE: not seeded yet"
+    book = ledger.book_cents()
+    owed = ledger.owed_cents()
+    tradeable = ledger.tradeable_cents()
+    hwm = ledger.high_water_cents()
+    into = max(0, hwm - seed) % config.SCRAPE_MILESTONE_C   # cents into the current $10
+    to_next = config.SCRAPE_MILESTONE_C - into if into else config.SCRAPE_MILESTONE_C
+    return (f"SCRAPE: book ${book / 100:.2f} · owed ${owed / 100:.2f} · tradeable "
+            f"${tradeable / 100:.2f} · high-water ${hwm / 100:.2f} (seed "
+            f"${seed / 100:.2f}) · ${to_next / 100:.2f} of new high to the next "
+            f"${config.SCRAPE_PER_MILESTONE_C / 100:.0f}")
 
 
 def restated_money_lines(ledger) -> list:
@@ -494,6 +519,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(restated_money_lines(ledger))
     except Exception as e:
         lines.append(f"MONEY (RESTATED): unavailable ({e})")
+    # WO-2026-07-26-O §O3: the scrape owed line rides the daily pack.
+    try:
+        lines.append(owed_line(ledger))
+    except Exception as e:
+        lines.append(f"SCRAPE: unavailable ({e})")
     rows = ledger.db.execute(
         "SELECT lane, state, COUNT(*) FROM surface_rows WHERE terminal=1"
         " GROUP BY lane, state ORDER BY lane, state").fetchall()

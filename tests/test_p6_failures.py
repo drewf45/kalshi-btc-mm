@@ -234,7 +234,8 @@ def test_command_surface_is_exactly_the_whitelist(cash):
     command, ever."""
     tg = Telegram(cash, send_fn=lambda m: None)
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
-                                 "/scoreboard", "/clear_cash_fatal", "/daily")
+                                 "/scoreboard", "/clear_cash_fatal", "/daily",
+                                 "/owed")   # WO-O §O4: read-only scrape look
     for stray in ("/resume_yes", "/paid", "/buy KXBTC15M 5", "/status", "hello"):
         assert "accounting commands only" in tg.handle_command(stray)
     assert tg.handle_command("/reset_halt") == "no halt manager wired"

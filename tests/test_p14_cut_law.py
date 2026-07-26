@@ -188,9 +188,10 @@ def test_sizing_line_says_both_prices():
     per-lane sizes F and FLIP actually trade (notional paths), each with its
     dial and wall — not the generic Kelly preview that lied about size."""
     from relay_engine.boot import sizing_line
-    line = sizing_line(541)   # the 7:35 book: $5.41
-    assert line.startswith("SIZING: book $5.41 · Kelly fraction=0.0833 · "
-                           "budget/window 45¢ · ")
+    line = sizing_line(541)   # the 7:35 book: $5.41 (owed $0 → tradeable = book)
+    # WO-2026-07-26-O §O2: the line now leads with book / owed / tradeable
+    assert line.startswith("SIZING: book $5.41 · owed $0.00 · tradeable $5.41")
+    assert "Kelly fraction=0.0833 · budget/window 45¢ · " in line
     assert "F @97¢ →" in line and "FLIP @58¢ →" in line
     assert "throttle is book size + the at-risk wall" in line
 

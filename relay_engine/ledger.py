@@ -242,6 +242,87 @@ class Ledger:
         return int(round(float(self.db.execute(
             "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0").fetchone()[0])))
 
+    # ── WO-2026-07-26-O "THE SCRAPE" — the operator earns from the ledger ──────
+    # Five dollars of every true ten of NEW high-water TRADING equity is banked
+    # (owed) for the operator; sizing then works off TRADEABLE = book − owed.
+    #   trading_equity = book − Σ(non-BASELINE cash) = baseline + Σ settlements —
+    # so a DEPOSIT (raises book AND cash equally) never moves it and can never
+    # MINT owed; a trading gain (settlement) raises it; the high-water is
+    # MONOTONIC so a loss (salvage or ride) can never UN-OWE. A withdrawal
+    # (CONFIRMED_WITHDRAWAL, negative) decrements owed — the operator taking it.
+    def trading_equity_cents(self) -> int:
+        ext = self.db.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements"
+            " WHERE kind != 'BASELINE'").fetchone()[0]
+        return self.book_cents() - int(ext)
+
+    def scrape_seed_cents(self):
+        s = self.get_state("scrape_seed_c")
+        return int(s) if s is not None else None
+
+    def seed_scrape(self, now=None) -> int:
+        """O1/Step-0: seed the high-water at the RESTATED trading equity, ONCE.
+        Owed accrues only on gains ABOVE this line — the deploy starts owing $0."""
+        if self.scrape_seed_cents() is None:
+            te = self.trading_equity_cents()
+            self.set_state("scrape_seed_c", str(te))
+            self.set_state("scrape_hwm_c", str(te))
+        return self.scrape_seed_cents()
+
+    def high_water_cents(self):
+        """The MONOTONIC high-water trading equity: max(persisted, live). A PURE
+        read — it never persists (only bank_scrape does), so reading owed can't
+        silently advance the high-water and hide a milestone crossing. Monotone
+        because it maxes against the persisted floor, which only bank_scrape
+        raises: a drawdown can never lower it → losses never un-owe."""
+        seed = self.scrape_seed_cents()
+        if seed is None:
+            return None
+        stored = int(self.get_state("scrape_hwm_c") or seed)
+        return max(stored, self.trading_equity_cents())
+
+    def owed_cents(self) -> int:
+        """$5 owed per full $10 of high-water trading equity above the seed,
+        less anything already withdrawn. Never negative."""
+        seed = self.scrape_seed_cents()
+        if seed is None:
+            return 0
+        hwm = self.high_water_cents()
+        gross = self._owed_gross_from(hwm)           # $5.00 per $10.00 of new high
+        withdrawn = -int(self.db.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements"
+            " WHERE kind='CONFIRMED_WITHDRAWAL'").fetchone()[0])   # negatives → positive
+        return max(0, gross - max(0, withdrawn))
+
+    def tradeable_cents(self) -> int:
+        """The base ALL sizing/walls/halts read (WO-O O2): book minus the owed
+        scrape. The owed money is still IN the account — it is earmarked, not
+        spent — so treasury/reconcile/invariant keep reading raw book_cents."""
+        return max(0, self.book_cents() - self.owed_cents())
+
+    def _owed_gross_from(self, hwm: int) -> int:
+        seed = self.scrape_seed_cents()
+        if seed is None:
+            return 0
+        return config.SCRAPE_PER_MILESTONE_C * (
+            max(0, hwm - int(seed)) // config.SCRAPE_MILESTONE_C)
+
+    def bank_scrape(self) -> int:
+        """O1/O3 — advance the high-water and return the cents MINTED this bank
+        (a new milestone crossed) so the runner can announce 💰. Silent overnight;
+        no halts, no nags — banking is patient. A drawdown/loss mints nothing
+        (the high-water is monotonic), so no salvage event can ever increment owed."""
+        seed = self.scrape_seed_cents()
+        if seed is None:
+            return 0
+        stored = int(self.get_state("scrape_hwm_c") or seed)
+        before = self._owed_gross_from(stored)
+        new_hwm = self.high_water_cents()          # pure max(stored, live)
+        if new_hwm > stored:
+            self.set_state("scrape_hwm_c", str(new_hwm))   # PERSIST the advance
+        after = self._owed_gross_from(new_hwm)
+        return max(0, after - before)
+
     def deployed_cents(self) -> int:
         """WO-2026-07-23-B Part 1 guard (a): capital currently AT RISK across
         ALL lanes — the sum, per open (market, lane, side), of held contracts ×
@@ -550,7 +631,9 @@ class Ledger:
         return int(config.DRAWDOWN_ABSOLUTE_FLOOR_USD * 100)
 
     def drawdown_breached(self) -> bool:
-        return self.book_cents() < self.drawdown_floor_cents()
+        # WO-2026-07-26-O §O2: the rail protects TRADEABLE capital — the owed
+        # scrape is earmarked for the operator, not a cushion to draw down into.
+        return self.tradeable_cents() < self.drawdown_floor_cents()
 
 
 # ---------------------------------------------------------------------------

@@ -12,8 +12,10 @@ from typing import List
 from . import config
 
 
-def sizing_line(book_cents: int) -> str:
+def sizing_line(book_cents: int, owed_cents: int = 0) -> str:
     """P14 §3: the BUDGET is the invariant; lots depend on price — say both.
+    WO-2026-07-26-O §O2/O3: sizing works off TRADEABLE = book − owed; the banner
+    prints book / owed / tradeable so the scrape is visible and the size honest.
     (The 7:35 confusion: 'max lots 0' printed at a 99¢ reference while the
     engine correctly traded 1 lot at 39¢ — both were true.)
 
@@ -22,26 +24,28 @@ def sizing_line(book_cents: int) -> str:
     book, not a bug; it self-scales as the book compounds. Every number
     printed here is computed from the live constants, never asserted."""
     from .sizing import size_order
-    budget = int(book_cents * config.KELLY_FRACTION_CEILING)
+    tradeable = max(0, book_cents - owed_cents)   # WO-O §O2: the real sizing base
+    budget = int(tradeable * config.KELLY_FRACTION_CEILING)
     # WO-2026-07-24-G Part 4: the boot preview used to call size_order WITHOUT
     # lane= — it printed the generic Kelly path, NOT the notional paths F and
     # FLIP actually trade. Print the REAL per-lane lot counts at the live book so
     # the banner stops lying about size. F @97¢ (its favorite) and FLIP @58¢ (mid
     # band) — the two dials that scale with the book.
-    f97 = size_order(book_cents, 97, 10_000, lane="F")
-    flip58 = size_order(book_cents, 58, 10_000, lane="FLIP")
+    f97 = size_order(tradeable, 97, 10_000, lane="F")
+    flip58 = size_order(tradeable, 58, 10_000, lane="FLIP")
     # WO-2026-07-24-G Part 2: the rate-halt drawdown recomputes with the book —
     # print the LIVE value (4 stop-outs at current FLIP size), never a frozen
-    # constant.
-    halt = config.rate_halt_drawdown_c(book_cents)
+    # constant. WO-O §O2: off tradeable.
+    halt = config.rate_halt_drawdown_c(tradeable)
     frac = config.KELLY_FRACTION_CEILING
     # WO-2026-07-25-K §P1: FLIP starts at TUITION and re-earns FULL by conversion
     # (P3). The boot preview sizes at the tuition floor (a bare size_order reads
     # FLIP_NOTIONAL_PCT); print the earned full target + the ladder bars beside it.
-    flip58_full = size_order(book_cents, 58, 10_000, lane="FLIP",
+    flip58_full = size_order(tradeable, 58, 10_000, lane="FLIP",
                              notional_pct=config.FLIP_FULL_NOTIONAL_PCT)
-    return (f"SIZING: book ${book_cents / 100:.2f} · Kelly fraction={frac:.4f} · "
-            f"budget/window {budget}¢ · "
+    return (f"SIZING: book ${book_cents / 100:.2f} · owed ${owed_cents / 100:.2f} "
+            f"· tradeable ${tradeable / 100:.2f} (WO-O: sizing off tradeable) · "
+            f"Kelly fraction={frac:.4f} · budget/window {budget}¢ · "
             f"F @97¢ → {f97.contracts} lots (dial {config.F_NOTIONAL_PCT:.0%}, "
             f"wall {config.AT_RISK_PCT['F']:.0%}) · "
             f"FLIP @58¢ → {flip58.contracts} lots TUITION (dial "
@@ -100,12 +104,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
         + " — F gets the book; everything else rehearses (👻) and earns it back")
     # WO-2026-07-26-N §P4.2/P4.4/P4.5 — THE OVERNIGHT DOCTRINE, printed.
     lines.append(
-        "SALVAGE: " + ("GAGGED (WO-N P4.2 — telemetry-only, held to the bell; "
-        "the untuned slip cut two winners overnight, −$14.30 for $0 dodged). "
-        "Re-arm path is -M: confirms-symmetric + worth-floor + maker-first + "
-        f"rarity; review after {config.SALVAGE_REARM_REVIEW_N} gag summaries"
+        "SALVAGE: " + ("GAGGED (manual kill — telemetry-only, held to the bell)"
         if config.SALVAGE_GAGGED else
-        "ARMED (-M: confirms-symmetric, worth-floor, maker-first, rarity-asserted)"))
+        f"LIVE (WO-M S1–S7: sighted {config.SALVAGE_CONFIRM_POLLS}-poll confirm "
+        f"[deep+pinned+spot] · worth-floor {config.SALVAGE_WORTH_FLOOR_C}¢ · "
+        f"middle-band · maker-first · rarity auto-gag > "
+        f"{config.SALVAGE_RARITY_MAX_PER_DAY}/day · all cut paths folded; "
+        "catastrophe survives for broker-truth only). The overnight gag ended."))
     lines.append(
         "MONEY: lifetime is RESTATED (WO-N P4.4) — rebuilt from the settlements "
         "ledger alone; the overnight double-booked cuts corrupted cell/window "
@@ -605,6 +610,27 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "to an alarm, never confirm); P4.6 NO dial changes. FLIP stays "
                  "in shadow (55% vs 73%, lifetime ≈ −$26); the door back is -L "
                  "P3, printed daily. F byte-identical (mode/env/restatement only)")
+    lines.append("  SALVAGE EARNS ITS CUT + THE SCRAPE (WO-2026-07-26-M+O, build "
+                 "84, one deploy): two promises kept on the restated meter. M — "
+                 "salvage goes LIVE as the SIGHTED discipline: a cut fires only "
+                 f"after {config.SALVAGE_CONFIRM_POLLS} confirmed polls "
+                 "(deep-against + pinned-at-lows via low_mark + spot-confirm), "
+                 f"above the {config.SALVAGE_WORTH_FLOOR_C}¢ worth-floor, inside "
+                 "the middle band, MAKER-FIRST, rarity auto-gagging over "
+                 f"{config.SALVAGE_RARITY_MAX_PER_DAY}/day; ALL cut paths "
+                 "(SLIP+K-collapse+CATASTROPHIC) folded under it, catastrophe "
+                 "surviving only for broker-truth emergencies; the overnight gag "
+                 "ended and F_EVENT_TRIPWIRE's day-long suppression retired (the "
+                 "money rate halt governs the run, not a single loss). O — THE "
+                 f"SCRAPE: ${config.SCRAPE_PER_MILESTONE_C / 100:.0f} owed per "
+                 f"${config.SCRAPE_MILESTONE_C / 100:.0f} of new high-water "
+                 "trading equity, seeded at the RESTATED equity; tradeable = "
+                 "book − owed substituted at EVERY sizing base (F notional, "
+                 "wall, worst-day, rate-halt); deposits never mint, losses never "
+                 "un-owe, withdrawals decrement; 💰 milestone + owed on hourly/"
+                 "boot/daily; /owed; OWED_UNDERWATER halts if tradeable < one F "
+                 "lot. No salvage event can ever increment owed. F entry/hold "
+                 "logic byte-identical (exits, accounting, capital arithmetic only)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

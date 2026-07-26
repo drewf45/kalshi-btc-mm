@@ -219,30 +219,29 @@ def _f_tick(custodian, now, yes_bid, *, spot=None):
 
 
 def test_d_sustained_forty_point_slip_salvages_maker_first(custodian, ledger):
-    """WO-2026-07-26-N -M: a 95c favorite that slips to 55c (−40) and SUSTAINS is
-    a decisive reversal — salvage now fires MAKER-FIRST (never the overnight's
-    immediate crossfire that cut two winners at the bottom), and only after
-    confirms-symmetric sustain (a single-tick dip that recovers never fires)."""
+    """WO-2026-07-26-M §S1: a 95c favorite that slips to 55c (−40) and stays PINNED
+    at its lows for SALVAGE_CONFIRM_POLLS (3) polls is a sighted, confirmed reversal
+    — salvage fires MAKER-FIRST (never the overnight's immediate crossfire that cut
+    two winners), above the §S2 worth-floor and inside the §S6 band."""
     pos = _f_pos(custodian, ledger, entry=95)
-    _f_tick(custodian, CLOSE - 400, yes_bid=55, spot=None)   # tick 1: not yet sustained
-    assert pos.salvage_fired is None and pos.salvage_slip_strikes == 1
-    _f_tick(custodian, CLOSE - 399, yes_bid=55, spot=None)   # tick 2: SUSTAINED
-    assert pos.salvage_attempted is True
-    assert pos.salvage_fired == "SALVAGE_SLIP"
-    assert pos.salvage_oid is not None                       # a MAKER rests…
-    # …NOT an immediate crossfire cut
+    for i in range(config.SALVAGE_CONFIRM_POLLS - 1):
+        _f_tick(custodian, CLOSE - 400 + i, yes_bid=55, spot=None)   # confirming
+        assert pos.salvage_fired is None
+    _f_tick(custodian, CLOSE - 397, yes_bid=55, spot=None)           # 3rd poll: FIRE
+    assert pos.salvage_attempted is True and pos.salvage_fired == "SALVAGE_SLIP"
+    assert pos.salvage_oid is not None                               # a MAKER rests…
     assert ledger.db.execute(
         "SELECT COUNT(*) FROM fills WHERE market=? AND action='CUSTODIAN_EXIT'",
-        (TICKER,)).fetchone()[0] == 0
+        (TICKER,)).fetchone()[0] == 0                                # …not a crossfire
 
 
-def test_d_single_tick_slip_recovers_no_salvage(custodian, ledger):
-    """Confirms-symmetric: a −40 slip that does NOT sustain (recovers next tick)
-    never salvages — the exact Saturday shape that cut two winners is gone."""
+def test_d_dip_that_recovers_no_salvage(custodian, ledger):
+    """§S1 pinned-at-lows: a −40 dip that does NOT stay pinned (recovers next
+    tick) never salvages — the exact Saturday shape that cut two winners is gone."""
     pos = _f_pos(custodian, ledger, entry=95)
     _f_tick(custodian, CLOSE - 400, yes_bid=55, spot=None)   # dip
-    _f_tick(custodian, CLOSE - 399, yes_bid=96, spot=None)   # recovered
-    assert pos.salvage_fired is None and pos.salvage_slip_strikes == 0
+    _f_tick(custodian, CLOSE - 399, yes_bid=96, spot=None)   # recovered → not deep
+    assert pos.salvage_fired is None and pos.salvage_confirms == 0
 
 
 def test_d_slip_below_forty_is_not_a_price_salvage(custodian, ledger):
@@ -261,8 +260,8 @@ def test_d_salvage_is_one_attempt(custodian, ledger):
     no second bite (and Wall 3 single-entry blocks re-entry for the window).
     WO-N -M: the fire needs the confirms-symmetric sustain (two ticks)."""
     pos = _f_pos(custodian, ledger, entry=96)
-    _f_tick(custodian, CLOSE - 400, yes_bid=50, spot=None)  # −46 tick 1
-    _f_tick(custodian, CLOSE - 399, yes_bid=50, spot=None)  # sustained → fires
+    for i in range(config.SALVAGE_CONFIRM_POLLS):
+        _f_tick(custodian, CLOSE - 400 + i, yes_bid=50, spot=None)  # −46, sustained
     assert pos.salvage_attempted is True and pos.salvage_fired == "SALVAGE_SLIP"
 
 

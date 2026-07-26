@@ -210,7 +210,9 @@ def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:
     that one is untouched because it feeds custody cut-scaling (`scaled(size_
     tier)`), and changing it would alter F's cuts (F byte-identical). So the
     edge you read is honest; the tier you see is exactly what the machine uses."""
-    book_cents = ledger.book_cents() if book_cents is None else book_cents
+    # WO-2026-07-26-O §O2: the lots@book preview sizes off TRADEABLE (the base the
+    # entry path actually uses), so the scoreboard doesn't over-promise the size.
+    book_cents = ledger.tradeable_cents() if book_cents is None else book_cents
     salvage_n, _ = salvage_recapture_cents(ledger)
 
     def _rows_for(shadow: bool):

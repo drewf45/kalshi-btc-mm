@@ -638,7 +638,10 @@ class Gateway:
         side_basis = order.price_cents  # side-terms basis = max loss per contract
         projected_at_risk = cents + order.count * side_basis
         projected_count = contracts + order.count
-        book_cents = self.ledger.book_cents()
+        # WO-2026-07-26-O §O2: the at-risk WALL and the event backstop bound risk
+        # against TRADEABLE (book − owed), not raw book — the owed scrape is not
+        # risk capital.
+        book_cents = self.ledger.tradeable_cents()
         # ADVERSARY (i) backstop: the whole event's cross-lane at-risk still must
         # not run hot — page (don't reject; the per-lane walls stop, the 50%
         # portfolio cap in _score_and_size is the hard limit) once over the
@@ -858,7 +861,10 @@ class Gateway:
         # fixed-fraction cap that would hold F flat as the book rises. F's ruling
         # (20% notional) needs a 20% per-order budget; every other lane keeps the
         # standing 10% floor (their proportions are smaller, so the max is 10%).
-        lane_budget = config.at_risk_cap_cents(order.lane, caps.book_cents)
+        # WO-2026-07-26-O §O2: the per-order pct-of-book budget reads live
+        # TRADEABLE (book − owed), not the boot snapshot — owed can move between
+        # boots (a milestone banks overnight), so the snapshot would size stale.
+        lane_budget = config.at_risk_cap_cents(order.lane, self.ledger.tradeable_cents())
         budget = max(caps.order_budget_cents, lane_budget)
         notional = order.price_cents * order.count
         if notional > budget:

@@ -166,6 +166,9 @@ def test_flip_capped_to_one_lot_f_untouched(monkeypatch):
         def book_cents(self):
             return 5000        # a book big enough for >1 lot
 
+        def tradeable_cents(self):
+            return 5000        # WO-2026-07-26-O §O2: sizing reads tradeable (owed 0 here)
+
         def deployed_cents(self):
             return 0           # WO-2026-07-23-B guard (a): nothing deployed
 

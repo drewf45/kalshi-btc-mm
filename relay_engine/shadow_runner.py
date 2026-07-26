@@ -198,6 +198,9 @@ class ShadowEngine:
         from . import scoring as _scoring
         self.telegram.scoreboard_fn = (
             lambda: "\n".join(_scoring.scoreboard_lines(self.ledger)))
+        # WO-2026-07-26-O §O4: /owed — the operator's read-only scrape look.
+        from .ops import owed_line as _owed_line
+        self.telegram.owed_fn = lambda: _owed_line(self.ledger)
         # WO-2026-07-22-K: /daily — the read-only day export (one .xlsx, every
         # table, bounded to the day). Built in /tmp, sent, deleted.
         self.telegram.daily_fn = self._build_and_send_daily
@@ -496,7 +499,10 @@ class ShadowEngine:
         tier = scoring.tier_for(self.ledger, lane, proposal.price_cents,
                                 alert_fn=self.telegram.alert)
         depth = book.visible_depth(proposal.side, proposal.price_cents) or 0
-        book_c = self.ledger.book_cents()
+        # WO-2026-07-26-O §O2: SIZE and the portfolio cap work off TRADEABLE
+        # (book − owed), never raw book — the operator's scrape is earmarked and
+        # never sized against.
+        book_c = self.ledger.tradeable_cents()
         # WO-2026-07-25-K §P3: the FLIP notional is the DESK LADDER's active dial
         # — full only when the desk is conversion-promoted AND this entry's cell
         # margin is non-negative, else tuition. The tier flip pages once (mechanical
@@ -629,6 +635,36 @@ class ShadowEngine:
             rested.pop(oid, None)
             booked += 1
         return booked
+
+    def bank_scrape_and_watch(self) -> int:
+        """WO-2026-07-26-O §O3/O4 — bank the high-water scrape (silent unless a
+        milestone crosses → 💰), then guard OWED_UNDERWATER: if tradeable ever
+        falls below one F lot, the desk has earmarked more than it can trade with
+        → page + halt entries until it recovers or the operator withdraws (which
+        reconciles owed down). Returns cents minted this bank."""
+        minted = self.ledger.bank_scrape()
+        if minted > 0:
+            owed = self.ledger.owed_cents()
+            self.telegram.alert(
+                f"💰 MILESTONE — banked ${minted / 100:.2f} for you (new "
+                f"high-water). Owed now ${owed / 100:.2f}; tradeable "
+                f"${self.ledger.tradeable_cents() / 100:.2f}. Silent and patient "
+                "until you reach for it (/owed).")
+        tradeable = self.ledger.tradeable_cents()
+        if tradeable < config.ONE_F_LOT_COST_C:
+            if "OWED_UNDERWATER" not in self.gateway.entries_halted_reasons:
+                from . import failures
+                self.gateway.halt_entries("OWED_UNDERWATER")
+                failures.fail(
+                    "OWED_UNDERWATER",
+                    f"tradeable {tradeable}c < one F lot "
+                    f"({config.ONE_F_LOT_COST_C}c) — owed {self.ledger.owed_cents()}c "
+                    "earmarks more than the desk can trade a favorite with; "
+                    "entries HALTED until equity recovers or you withdraw (/owed)",
+                    fatal=False, alert=True)
+        else:
+            self.gateway.resume_entries("OWED_UNDERWATER")
+        return minted
 
     def _on_fill_booked(self, order, action, price_cents, count, now,
                         fee_cents=0, shadow=False):
@@ -815,6 +851,16 @@ class ShadowEngine:
             f"👑 custodian promoted: Lane F salvage armed "
             f"(K={config.SALVAGE_K_POINTS:.0f} S={config.SALVAGE_S_CENTS:.0f} "
             f"R={config.SALVAGE_R_S:.0f} floor={config.SALVAGE_T_FLOOR_S:.0f}s)")
+        # WO-2026-07-26-O §O1/Step-0: SEED THE SCRAPE at the RESTATED trading
+        # equity (owed starts at $0), ONCE, with a Telegram announcement — from
+        # here $5 of every true $10 of new high-water is banked for the operator.
+        seed_c = self.ledger.seed_scrape()
+        self.page_once(
+            "page_scrape_seeded",
+            f"💰 SCRAPE seeded at ${seed_c / 100:.2f} trading equity (RESTATED) — "
+            f"owed $0.00; from here ${config.SCRAPE_PER_MILESTONE_C / 100:.0f} of "
+            f"every ${config.SCRAPE_MILESTONE_C / 100:.0f} of new high-water banks "
+            "for you. Silent, patient, until you reach for it (/owed).")
         # P26 §1 — ONE BRAIN, LOADED OR EXPLAINED: boot provisions the delta
         # table. Load from disk (manifest+SHA gated); else BUILD via
         # delta_builder's own A1-A5-gated path and hot-load on PASS. The
@@ -1965,7 +2011,7 @@ def _send_boot_page_rest(engine) -> None:
         f"[{config.RUN_MODE}] EPOCH {config.EPOCH} — "
         f"{len(engine.market_meta)} market(s)\n"
         f"transport: REST 1s (A3 proven ground; WS shelved as an upgrade)\n"
-        f"{sizing_line(engine.ledger.book_cents())}\n"
+        f"{sizing_line(engine.ledger.book_cents(), engine.ledger.owed_cents())}\n"
         f"{worst_day_bound_line(engine.ledger)}\n"
         f"listener: {engine.listener_status()}")
 
@@ -2115,8 +2161,13 @@ async def run():
                 from . import flip_ladder
                 flip_ladder.evaluate_size_tier(
                     engine.ledger, alert_fn=engine.telegram.alert)
+                # WO-2026-07-26-O §O3: bank the scrape silently; announce 💰 only
+                # when a milestone crosses; the owed/tradeable ride the line.
+                engine.bank_scrape_and_watch()
                 engine.telegram.alert(
                     f"📗 hourly: book={engine.ledger.book_cents()}c "
+                    f"owed={engine.ledger.owed_cents()}c "
+                    f"tradeable={engine.ledger.tradeable_cents()}c "
                     f"windows={engine.windows_seen} "
                     f"markets={len(engine.market_meta)} "
                     f"orders={len(engine.gateway.order_index)} "
@@ -2266,7 +2317,7 @@ async def run():
                         f"{len(subscribed)} market(s) subscribed\n"
                         f"channels: {sorted(subscriber.accepted.values()) or '(none accepted)'}"
                         + (f" / degraded: {subscriber.degraded}" if subscriber.degraded else "")
-                        + f"\n{sizing_line(engine.ledger.book_cents())}\n"
+                        + f"\n{sizing_line(engine.ledger.book_cents(), engine.ledger.owed_cents())}\n"
                         f"{worst_day_bound_line(engine.ledger)}\n"
                         f"listener: {engine.listener_status()}")
 
