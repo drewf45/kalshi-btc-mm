@@ -466,32 +466,23 @@ class ShadowEngine:
                 live.add(o.lane)
         return ",".join(sorted(live))
 
-    def _f_suppressed_today(self) -> bool:
-        """WO-2026-07-23-B Part 1 guard (b): is F held out for the day by its
-        per-event tripwire? (self-clears at the next local day)."""
-        return self.ledger.f_suppressed()
-
-    def _trip_f_event(self, per_contract_loss_c: float, market: str,
-                      detail: str, now=None) -> None:
-        """Guard (b) producer: an F loss worse than F_EVENT_TRIPWIRE_C/contract
-        suppresses F for the day and PAGES. Called from every F-loss choke point
-        (held-to-settlement and any custodian cut). Idempotent for the day."""
+    def _page_f_big_loss(self, per_contract_loss_c: float, market: str,
+                         detail: str) -> None:
+        """WO-2026-07-26-Q — the LAST silent governor is DELETED. A big F loss no
+        longer suppresses F for the day (the money-based rate halt is the ruled
+        governor for a RUN of losses; a single loss is noise). It PAGES only —
+        information, never a governor — above F_EVENT_TRIPWIRE_C/contract, so the
+        operator sees the tail and the loss-clustering datum keeps flowing."""
         if per_contract_loss_c <= config.F_EVENT_TRIPWIRE_C:
             return
-        already = self.ledger.f_suppressed(now)
-        self.ledger.set_f_tripwire(now)
-        if not already:
-            self.telegram.alert(
-                f"🛑 F EVENT TRIPWIRE: {market} lost "
-                f"{per_contract_loss_c:.0f}c/contract (> "
-                f"{config.F_EVENT_TRIPWIRE_C}c) — F entries SUPPRESSED for the "
-                f"rest of the day. {detail}")
-            from . import failures
-            failures.fail("F_EVENT_TRIPWIRE",
-                          f"{market}: F loss {per_contract_loss_c:.0f}c/contract "
-                          f"> {config.F_EVENT_TRIPWIRE_C}c — F suppressed today",
-                          fatal=False, alert=False, market=market,
-                          per_contract_c=round(per_contract_loss_c, 1))
+        from . import failures
+        failures.fail(
+            "F_BIG_LOSS",
+            f"{market}: F loss {per_contract_loss_c:.0f}c/contract > "
+            f"{config.F_EVENT_TRIPWIRE_C}c ({detail}) — noted; the rate halt "
+            "governs a RUN, not this single loss (WO-Q: tripwire deleted)",
+            fatal=False, alert=True, market=market,
+            per_contract_c=round(per_contract_loss_c, 1))
 
     def _defer_entry(self, proposal, reason: str, ctx: dict) -> None:
         """WO-2026-07-26-P §B2 — the honest defer. A depth/size read that cannot
@@ -616,20 +607,12 @@ class ShadowEngine:
                          book_c, dec.reason,
                          config.at_risk_cap_cents("FLIP", book_c),
                          proposal.count)
-        # WO-2026-07-23-B Part 1 guard (b): F's per-event tripwire. A single F
-        # loss worse than F_EVENT_TRIPWIRE_C/contract suppresses F entries for
-        # the rest of that day (F's 97% win rate means the rate halt never
-        # protects it). Self-clears the next local day; refuses the entry now.
-        if (proposal.lane == "F" and proposal.action == "buy"
-                and self._f_suppressed_today()):
-            proposal.count = 0
-            key = (proposal.market, "f_tripwire")
-            if key not in self._size_zero_logged:
-                self._size_zero_logged.add(key)
-                log.warning("F_SUPPRESSED %s: an F loss > %dc/contract today "
-                            "tripped the per-event guard — F entries refused "
-                            "until tomorrow", proposal.market,
-                            config.F_EVENT_TRIPWIRE_C)
+        # WO-2026-07-26-Q — guard (b) (F's per-event day-long suppression) is
+        # DELETED. It duplicated the money-based rate halt with a cruder rule
+        # (one event, calendar-scoped, self-clearing at midnight, no resume
+        # lever) and was the last governor nobody could name until it fired. One
+        # risk, one governor: the rate halt stays; the duplicate is gone. A big
+        # F loss now PAGES (F_BIG_LOSS) and never refuses the next window.
         # WO-2026-07-23-B Part 1 guard (a): the PORTFOLIO CAP. Total deployed
         # notional across ALL lanes may never exceed PORTFOLIO_DEPLOY_PCT of
         # book. An entry is clamped to the room that remains (0 = refused);
@@ -835,6 +818,14 @@ class ShadowEngine:
                 f"BOOT_LOOP: {boots_last_hour} boots in the last hour — "
                 f"last FATAL: {last_fatal}")
         self.boot_id = boot_id
+        # WO-2026-07-26-Q: the last silent governor's migration. Guard (b) (the
+        # day-long F suppression) is deleted; a live `f_tripwire_day` flag left in
+        # the DB would otherwise keep refusing F until local midnight — the bug
+        # surviving its own funeral. Clear it on boot so this deploy resumes F.
+        if self.ledger.clear_f_tripwire_migration():
+            print("MIGRATION (WO-Q): cleared a live f_tripwire_day flag — the "
+                  "deleted day-long F suppression can no longer refuse F; the "
+                  "money rate halt is the ruled governor", flush=True)
         # P8 §2.3: restarts and redeploys do NOT clear the two-strike halt
         self.econ.restore_halt_on_boot()
         # P17 §1.3/§1.4: heal across restarts — reload open brackets (so the
@@ -1906,13 +1897,13 @@ class ShadowEngine:
                     market=market, kind="settle", now=now_eff,
                     contracts=s["net"],   # WO-2026-07-24-G Part 4: per-contract
                     shadow=config.lane_books_shadow(lane))  # WO-L: live-fills only, tagged for safety
-                # WO-2026-07-23-B Part 1 guard (b): an F position that rode to
-                # settlement and LOST paid its full entry per contract — the
-                # unsalvaged loss the tripwire exists to catch (§1.6).
+                # WO-2026-07-26-Q: an F position that rode to settlement and LOST
+                # paid its full entry per contract. The day-long tripwire this
+                # once fed is DELETED — the loss PAGES (F_BIG_LOSS, information
+                # only) and never suppresses the next window.
                 if lane == "F" and not won:
-                    self._trip_f_event(float(s["entry"]), market,
-                                       "held to settlement (unsalvaged)",
-                                       now=now_eff)
+                    self._page_f_big_loss(float(s["entry"]), market,
+                                          "held to settlement (unsalvaged)")
         per_lane = self.surface.settle_market(market, window,
                                               settled_yes=settled_yes)
         # P19 §2.6: every salvage row gets its settlement COUNTERFACTUAL —

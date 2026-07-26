@@ -487,17 +487,18 @@ class Custodian:
                 f"salvage never fired — a window the sighted machine missed",
                 fatal=False, alert=True, market=pos.market,
                 per_contract_c=round(-realized_cents, 1))
-        # WO-2026-07-26-M: F_EVENT_TRIPWIRE's DAY-LONG SUPPRESSION is RETIRED — the
-        # money-based rate halt is the ruled governor (a single loss is noise; a
-        # RUN of losses is what halts). The per-contract loss still PAGES (the
-        # operator sees the tail), but it no longer suppresses F for the day.
+        # WO-2026-07-26-M retired the day-long suppression here; WO-2026-07-26-Q
+        # DELETED the last surviving copy (shadow_runner) and made this the ONE
+        # page name for a big F loss: F_BIG_LOSS. The money-based rate halt is the
+        # ruled governor (a single loss is noise; a RUN is what halts). The
+        # per-contract loss PAGES (the operator sees the tail), never suppresses F.
         if (pos.lane == "F" and realized_cents is not None
                 and realized_cents < -config.F_EVENT_TRIPWIRE_C):
             failures.fail(
-                "F_LARGE_LOSS",
+                "F_BIG_LOSS",
                 f"{pos.market}: F loss {-realized_cents:.0f}c/contract > "
                 f"{config.F_EVENT_TRIPWIRE_C}c ({exit_trigger}) — noted; the rate "
-                "halt governs a RUN, not this single loss (WO-M: tripwire retired)",
+                "halt governs a RUN, not this single loss (WO-Q: tripwire deleted)",
                 fatal=False, alert=True, market=pos.market,
                 per_contract_c=round(-realized_cents, 1))
 

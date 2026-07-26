@@ -4107,6 +4107,41 @@ honored); the two-question API lives in `book.py` + the shadow_runner chokepoint
 F. New suites `test_why_law.py` (16) + `test_no_silent_fallbacks.py` (3); `test_verify_lossterm1`
 + `test_attribution` re-anchored to the defer/why law. Suite 903 · preflight 23/23.
 
+## WO-2026-07-26-Q — DELETE GUARD (B): THE LAST SILENT GOVERNOR (build 86)
+
+**Read-rule.** The surviving governor verified TRUE at source: WO-M retired the F day-long
+tripwire only at the custodian (custodian.py:490); the ORIGINAL pair from WO-2026-07-23-B lived
+on in shadow_runner — producer `_trip_f_event` (474-494, set the ledger flag + paged on any F
+loss > `F_EVENT_TRIPWIRE_C`=60¢/contract), consumer `_f_suppressed_today` (469-472) at the entry
+choke (620-632, the `F_SUPPRESSED … refused until tomorrow` log), backed by ledger
+`set_f_tripwire`/`f_suppressed` and the persisted `f_tripwire_day` state key. Today's 1:13 PM
+loss set the flag; every F proposal since sized full and was refused for ~5h.
+
+**The change — deletion, not modification.** #1 `_trip_f_event` deleted; its held-to-settlement
+call site now pages `_page_f_big_loss` (F_BIG_LOSS, information only). #2 `_f_suppressed_today`
+and the `F_SUPPRESSED` entry-choke branch deleted. #3 ledger `set_f_tripwire`/`f_suppressed`
+(and their orphaned `_day_key` helper) deleted; a one-time boot migration
+`clear_f_tripwire_migration` drops any live `f_tripwire_day` flag so the deploy resumes F (the
+resume-tonight test). #4 `F_EVENT_TRIPWIRE_C` retired from gating — it survives ONLY as the
+F_BIG_LOSS page threshold, retagged **RULED(2026-07-26)** in the WO-P constant table. #5 sibling
+sweep: zero surviving governor consumers (grep-guard test); the custodian's page unified to the
+one name F_BIG_LOSS; boot banner guard-(b) line + PROFILE build 86 announce the deletion.
+
+**Why (the Why Law, one paragraph).** The machine already has a ruled, money-denominated,
+self-scaling governor for this risk: the F rate halt (a RUN of stop-equivalents, pages loudly,
+resumable). Guard (b) duplicated that judgment with a cruder rule and no resume lever — one risk,
+two governors, jointly unaccountable. One risk, one governor, one why: the rate halt stays, the
+duplicate dies.
+
+**Acceptance.** #1 a set `f_tripwire_day` flag is cleared on boot and the next F window sizes
+full (`test_q_boot_migration_clears_a_live_tripwire_flag`, `test_q_big_f_loss_pages_but_never_
+suppresses`). #2 `F_SUPPRESSED` gone from the tree; F_BIG_LOSS pages at >60¢/contract with zero
+entry effect. #3 sibling grep artifact — zero surviving flag-family consumers
+(`test_q_no_suppression_consumer_survives`); boot banner updated. #4 **F selection/sizing/walls/
+salvage/scrape byte-identical** — `lane_fh8` untouched; this order deletes, it does not tune.
+`test_scale_f` tripwire tests re-anchored to the deletion; `test_swing_gate_event` mock cleaned.
+Suite 903 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

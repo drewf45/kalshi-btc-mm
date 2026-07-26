@@ -483,10 +483,11 @@ def dial_wall_violations() -> list:
 # Guard (a): total deployed capital across ALL lanes never exceeds this % of
 # book (F and FLIP can hold different markets at once; nothing else bounds the sum).
 PORTFOLIO_DEPLOY_PCT = 0.50       # DREW-DEFAULT: sum of open notional <= 50% of book
-# Guard (b): F's rate halt cannot protect it (at 97% wins it never sees 2-of-4
-# negative). A single F loss worse than this per contract SUPPRESSES F for the
-# rest of the day and pages — F's only real guard, the unsalvaged-loss tripwire.
-F_EVENT_TRIPWIRE_C = 60           # DREW-DEFAULT: one F loss > 60c/contract halts F for the day
+# WO-2026-07-26-Q: guard (b) (the day-long F suppression) is DELETED — it
+# duplicated the money-based rate halt, the one governor ruled for this risk.
+# This constant SURVIVES ONLY as the threshold for the F_BIG_LOSS page —
+# information the operator sees when F takes a rare large tail, NEVER a governor.
+F_EVENT_TRIPWIRE_C = 60           # RULED(2026-07-26): page F_BIG_LOSS above one F loss > 60c/contract (WO-Q; no longer gates)
 
 # ---------------------------------------------------------------------------
 # Sizing (C.3 / Charter §8): tiers move on Wilson lower bounds only.
@@ -593,8 +594,9 @@ RATE_HALT_WINDOW = 4         # Part 2; kept for reference / a persisted legacy h
 # threshold sized for 1-lot FLIP would strangle a 10-lot lane before its first
 # loss settled (the same absolute-constant error as NET_RISK/AT_RISK_CAP). At
 # FLIP_SIZE_CAP=3 → 120¢; at 10 → 400¢ (~3.5 stop-outs). F is unaffected in
-# practice (96.9% wins never accumulate it) — F's guard stays the per-event
-# tripwire (F_EVENT_TRIPWIRE_C), the right shape for a rare-and-large loser.
+# practice (96.9% wins never accumulate it). WO-Q: F's old per-event tripwire is
+# DELETED — the money rate halt is F's governor now (a RUN of losses, not one);
+# F_EVENT_TRIPWIRE_C survives only as the F_BIG_LOSS page threshold.
 RATE_HALT_WINDOW_N = 8
 # RATE_HALT_DRAWDOWN_C is derived from FLIP_SIZE_CAP (defined further below), so
 # it is computed right after that constant.
@@ -810,6 +812,9 @@ def constant_tags() -> list:
                     LANE_D_FLOOR_CENTS, 60),
         ConstantTag("RECON_AUDIT_FLOOR_CENTS", DREW_DEFAULT, "pending derivation",
                     RECON_AUDIT_FLOOR_CENTS, 2),
+        # WO-Q: retagged DREW-DEFAULT→RULED — no longer a governor, the page threshold.
+        ConstantTag("F_EVENT_TRIPWIRE_C", RULED, "2026-07-26 WO-Q (F_BIG_LOSS page only)",
+                    F_EVENT_TRIPWIRE_C, 60),
     ]
 
 

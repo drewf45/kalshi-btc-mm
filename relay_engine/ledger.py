@@ -342,19 +342,18 @@ class Ledger:
                 deployed += held * avg_entry
         return int(round(deployed))
 
-    @staticmethod
-    def _day_key(now=None) -> str:
-        return time.strftime("%Y%m%d",
-                             time.localtime(time.time() if now is None else now))
-
-    def set_f_tripwire(self, now=None) -> None:
-        """WO-2026-07-23-B Part 1 guard (b): stamp F suppressed for TODAY (local
-        day). Self-clears tomorrow — a new day_key no longer matches."""
-        self.set_state("f_tripwire_day", self._day_key(now))
-
-    def f_suppressed(self, now=None) -> bool:
-        """True while an F per-event tripwire from earlier today still stands."""
-        return self.get_state("f_tripwire_day") == self._day_key(now)
+    # WO-2026-07-26-Q: set_f_tripwire / f_suppressed (guard (b)'s ledger state)
+    # are DELETED. The day-long F suppression was a duplicate of the money-based
+    # rate halt — one risk, one governor. The persisted `f_tripwire_day` flag is
+    # cleared on boot (clear_f_tripwire_migration) so a live flag can no longer
+    # keep refusing F after the deploy that removed its reader.
+    def clear_f_tripwire_migration(self) -> bool:
+        """One-time migration: drop any surviving `f_tripwire_day` flag so tonight's
+        deploy resumes F immediately. Returns True if a live flag was cleared."""
+        had = self.get_state("f_tripwire_day") is not None
+        if had:
+            self.del_state("f_tripwire_day")
+        return had
 
     def quarantine_divergent_settlements(self, market: str,
                                          fills_pnl_cents: int) -> int:

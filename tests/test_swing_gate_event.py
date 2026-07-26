@@ -171,9 +171,7 @@ def test_flip_capped_to_one_lot_f_untouched(monkeypatch):
 
         def deployed_cents(self):
             return 0           # WO-2026-07-23-B guard (a): nothing deployed
-
-        def f_suppressed(self, now=None):
-            return False       # guard (b): no tripwire today
+        # WO-2026-07-26-Q: guard (b) (f_suppressed) is deleted — no mock needed.
     eng.ledger = _L()
     eng.telegram = type("T", (), {"alert": staticmethod(lambda m: None)})()
     eng._size_zero_logged = set()   # WO-2026-07-23-B: F sizing logs (guard d)

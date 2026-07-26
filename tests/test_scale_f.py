@@ -2,12 +2,12 @@
 capped at 3 contracts by NET_RISK_CROSS_LANE_CAP (a fixed count that turned
 compound growth into linear growth). F now sizes to a % of book (self-scaling),
 bounded only by real depth; the gateway keeps a PER-LANE, BOOK-PROPORTIONAL
-dollar wall (Drew's ruling — keep the guard, don't exempt F), plus the two WO
-guards: (a) the 50%-of-book portfolio cap and (b) the F per-event tripwire.
+dollar wall (Drew's ruling — keep the guard, don't exempt F), plus guard (a)
+the 50%-of-book portfolio cap. WO-2026-07-26-Q DELETED guard (b) (the F per-event
+day-long suppression) — a duplicate of the money rate halt; a big F loss now
+PAGES (F_BIG_LOSS) and never suppresses the next window.
 
 HARD RAIL: F behaviour unchanged OTHER than size (the WO's kill condition)."""
-
-import time
 
 import pytest
 
@@ -103,39 +103,53 @@ def test_portfolio_cap_clamps_an_entry_that_would_exceed_half_the_book(tmp_path)
     assert p2.count == 0
 
 
-# ── Guard (b): the F per-event tripwire (acceptance #5) ─────────────────────
-def test_f_tripwire_suppresses_f_for_the_day_on_a_big_loss(tmp_path):
+# ── WO-2026-07-26-Q — guard (b) DELETED: the last silent governor ───────────
+def test_q_big_f_loss_pages_but_never_suppresses(tmp_path, caplog):
+    """A big F loss PAGES (F_BIG_LOSS) and has NO entry effect — the day-long
+    suppression is deleted; the money rate halt is F's one governor."""
+    import logging
+    from relay_engine import failures
     led = Ledger(str(tmp_path / "t.db"))
     led.baseline(4162, confirmed_by="test")
+    failures.configure(led, alert_fn=lambda m: None, run_mode="TEST", boot_id=1)
     eng = _engine(led)
-    assert led.f_suppressed() is False
-    # a loss of exactly 60c/contract does NOT trip (strictly greater)
-    eng._trip_f_event(60.0, TICKER, "at the wire")
-    assert led.f_suppressed() is False
-    # 61c/contract trips → F suppressed, and _score_and_size refuses F entries
-    eng._trip_f_event(61.0, TICKER, "past the wire")
-    assert led.f_suppressed() is True
-    p = _f_entry(price=97)
-    eng._score_and_size(p, _book())
-    assert p.count == 0
+    try:
+        # a loss of exactly 60c/contract does NOT page (strictly greater)
+        eng._page_f_big_loss(60.0, TICKER, "at the wire")
+        assert led.db.execute(
+            "SELECT COUNT(*) FROM failures WHERE why_tag='F_BIG_LOSS'"
+        ).fetchone()[0] == 0
+        # 61c/contract PAGES — and the very next F window still SIZES full
+        eng._page_f_big_loss(61.0, TICKER, "past the wire")
+        assert led.db.execute(
+            "SELECT COUNT(*) FROM failures WHERE why_tag='F_BIG_LOSS'"
+        ).fetchone()[0] == 1
+        p = _f_entry(price=97)
+        eng._score_and_size(p, _book())
+        assert p.count >= 1                # F is NOT suppressed — it sizes normally
+    finally:
+        failures._ledger = None
+        failures._alert_fn = None
 
 
-def test_f_tripwire_self_clears_the_next_day(tmp_path):
+def test_q_boot_migration_clears_a_live_tripwire_flag(tmp_path):
+    """The resume-tonight test: a live f_tripwire_day flag in the DB is cleared
+    on boot so the deploy that removed its reader actually resumes F."""
     led = Ledger(str(tmp_path / "c.db"))
-    t = time.time()
-    led.set_f_tripwire(now=t)
-    assert led.f_suppressed(now=t) is True
-    assert led.f_suppressed(now=t + 86_400) is False    # a new day no longer matches
+    led.set_state("f_tripwire_day", "20260726")         # a flag from the old build
+    assert led.clear_f_tripwire_migration() is True     # cleared
+    assert led.get_state("f_tripwire_day") is None
+    assert led.clear_f_tripwire_migration() is False    # idempotent, nothing left
 
 
-def test_non_f_lanes_are_not_touched_by_the_tripwire(tmp_path):
-    """The tripwire is F's alone — it never suppresses another lane."""
-    led = Ledger(str(tmp_path / "n.db"))
-    led.baseline(4162, confirmed_by="test")
-    eng = _engine(led)
-    led.set_f_tripwire()
-    d = Order(lane="D", event=EVENT, market=TICKER, side="yes", action="buy",
-              price_cents=60, count=1, size_tier=config.TIER_PROBE,
-              purpose="ENTRY", why="d-table verdict yes@60¢ · reserved")
-    eng._score_and_size(d, _book(price=60))
-    assert d.count >= 1                                 # D unaffected by F's tripwire
+def test_q_no_suppression_consumer_survives():
+    """Sibling grep, in code: the flag family has zero surviving consumers."""
+    import inspect
+    from relay_engine import shadow_runner, ledger as ledger_mod
+    for mod in (shadow_runner, ledger_mod):
+        src = inspect.getsource(mod)
+        assert "F_SUPPRESSED" not in src
+        assert "_f_suppressed_today" not in src
+        assert "def set_f_tripwire" not in src
+        assert "def f_suppressed" not in src
+        assert "def _trip_f_event" not in src
