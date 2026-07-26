@@ -96,6 +96,28 @@ F_SALVAGE_SLIP_POINTS = 40  # DREW-DEFAULT: price slip from entry that rules the
 # SALV-1 §2.3 (Adversary): flap guard — logged gag TRANSITIONS per position
 # per window cap here; the settlement summary still counts every tick.
 SALVAGE_GAG_MAX_TRANSITIONS = 12
+# ---------------------------------------------------------------------------
+# WO-2026-07-26-N "THE OVERNIGHT DOCTRINE" P4.2 — SALVAGE GAGGED. The 07/25→26
+# overnight ran untuned salvage (level-only, no confirms) and it fired TWICE at
+# maximum pain — SALVAGE_SLIP at 50¢ and 52¢, both on windows that later SETTLED
+# AS WINNERS: −$14.30 realized against $0 dodged, 0-for-2. Drew's ruling: GAG
+# salvage to telemetry-only (log the would-have-fired counterfactual, take NO
+# cut, ride to the bell) until it re-earns its cut the same way entries earn
+# their fills. Hold-to-settlement's cost is F's known ~3.8% loss rate, which it
+# has always outearned. The gags + would-have-fired shadow rows buy the tuning
+# data; the -M re-arm carries the Gate A unlock and gets a named review (first
+# weekly pack with ≥ SALVAGE_REARM_REVIEW_N gag summaries).
+SALVAGE_GAGGED = os.environ.get("SALVAGE_GAGGED", "true").strip().lower() in ("1", "true", "yes")
+SALVAGE_REARM_REVIEW_N = 50   # gag summaries banked before the re-arm review
+# The -M RE-ARM PATH (the disciplined salvage that runs when un-gagged): the
+# level-only slip becomes confirms-SYMMETRIC (a decisive reversal must SUSTAIN,
+# never a single-tick dip that recovers — the exact Saturday shape), worth-
+# floored (only cut when the recovery clears a real save), maker-FIRST (never an
+# immediate crossfire), and RARITY-asserted (salvage is exceptional; a run of
+# fires pages). These are the criteria a re-arm must meet; the gag sits on top.
+SALVAGE_SLIP_CONFIRMS = 2     # -M confirms-symmetric: sustained ticks before a slip salvages (mirrors the needle's 2)
+SALVAGE_WORTH_FLOOR_C = 8     # -M worth-floor: min cents the salvage must recover vs riding, or don't bother
+SALVAGE_RARITY_MAX_PER_DAY = 6  # -M rarity assert: salvage is exceptional; more than this in a day pages
 
 # ---------------------------------------------------------------------------
 # P21 "THE DOCTRINE ENGINE" — Lane OPEN (A4) + the grain (A3) + patient holds

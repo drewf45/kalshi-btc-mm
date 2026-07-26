@@ -98,6 +98,27 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
            else " · GLOBAL SHADOW (born state — nothing placed, LANE_MODE"
                 " restricts below it)")
         + " — F gets the book; everything else rehearses (👻) and earns it back")
+    # WO-2026-07-26-N §P4.2/P4.4/P4.5 — THE OVERNIGHT DOCTRINE, printed.
+    lines.append(
+        "SALVAGE: " + ("GAGGED (WO-N P4.2 — telemetry-only, held to the bell; "
+        "the untuned slip cut two winners overnight, −$14.30 for $0 dodged). "
+        "Re-arm path is -M: confirms-symmetric + worth-floor + maker-first + "
+        f"rarity; review after {config.SALVAGE_REARM_REVIEW_N} gag summaries"
+        if config.SALVAGE_GAGGED else
+        "ARMED (-M: confirms-symmetric, worth-floor, maker-first, rarity-asserted)"))
+    lines.append(
+        "MONEY: lifetime is RESTATED (WO-N P4.4) — rebuilt from the settlements "
+        "ledger alone; the overnight double-booked cuts corrupted cell/window "
+        "REPORTING only, never settlements. The daily pack carries the delta.")
+    lines.append(
+        "CASH-SENTINEL DOCTRINE (WO-N P4.5, banked): a CASH DELTA that fires "
+        "within 30 min of ANY anomaly page → /deny_cash + investigate, never "
+        "/confirm — a sentinel next to an alarm is EVIDENCE, and confirming it "
+        "launders the error into the books. /confirm is for known deposits only.")
+    lines.append(
+        "DIALS: NO CHANGES this deploy (WO-N P4.6) — F stays "
+        f"{config.F_NOTIONAL_PCT:.0%}/{config.AT_RISK_PCT['F']:.0%}; the next size "
+        "conversation happens on a restated, trusted lifetime line.")
     if boot_caps is not None:
         # P8 §3 + P14 §3: 1/12-Kelly honestly stated, at BOTH reference prices.
         lines.append(sizing_line(boot_caps.book_cents))
@@ -564,6 +585,26 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "authority (greyed with its n); it leaves THIN only by realized "
                  "n, never modeled numbers. F byte-identical in logic (size "
                  "params only)")
+    lines.append("  THE OVERNIGHT DOCTRINE (WO-2026-07-26-N, build 83): the "
+                 "07/25→26 run, read cold — the newest idea (untuned salvage) "
+                 "fired TWICE without confirmation and sold two winners at the "
+                 "bottom (−$14.30 for $0 dodged); the bookkeeper wrote each cut "
+                 "down twice (custodian direct-write + fills-poller); and every "
+                 "alarm rang true (sentinel, oversize assert, F rate halt). Both "
+                 "root causes were already fixed in build 6 (baton lifecycle "
+                 "custodian.execute_cut: tri-state cancel, ledger re-derive, cut "
+                 "only proven holdings, FLAT_RACE skip, UNKNOWN=FATAL; unified "
+                 "fill dedup fills.py: fill_id primary-keyed, no path privileged). "
+                 "The one deploy: P4.1 enforce the ruled shadow modes (FLIP/OPEN/"
+                 "HUNT/H8 SHADOW, F LIVE); P4.2 GAG salvage to telemetry-only "
+                 "until it re-earns its cut (-M re-arm: confirms-symmetric, "
+                 "worth-floor, maker-first, rarity); P4.3 replay both Saturday "
+                 "salvages as NO-FIRE + the duplicate-cut/duplicate-fill "
+                 "scenarios book ONCE; P4.4 RESTATE lifetime from settlements "
+                 "alone; P4.5 the cash-sentinel doctrine (deny+investigate next "
+                 "to an alarm, never confirm); P4.6 NO dial changes. FLIP stays "
+                 "in shadow (55% vs 73%, lifetime ≈ −$26); the door back is -L "
+                 "P3, printed daily. F byte-identical (mode/env/restatement only)")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

@@ -15,6 +15,13 @@ from relay_engine.custodian import OpenPosition, salvage_params
 from relay_engine.reconcile import live_boot_reconcile
 from relay_engine.shadow_runner import ShadowEngine
 
+
+@pytest.fixture(autouse=True)
+def _rearm_salvage(monkeypatch):
+    # WO-2026-07-26-N §P4.2: the -M re-arm execution path runs un-gagged here;
+    # the production gag is covered in test_overnight_doctrine.
+    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 STRIKE = 118_000.0
 

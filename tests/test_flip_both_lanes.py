@@ -31,6 +31,17 @@ from relay_engine.custodian import (Custodian, OpenPosition, salvage_params)
 from relay_engine.feed import DegradeLadder
 from relay_engine.lane_flip import LaneFlip
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _rearm_salvage(monkeypatch):
+    # WO-2026-07-26-N §P4.2: the slip-salvage EXECUTION path (now -M confirms-
+    # symmetric + maker-first) runs un-gagged in these mechanics tests; the
+    # production GAG (NO-FIRE) is covered in test_overnight_doctrine.
+    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
+
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 EVENT = TICKER.rsplit("-", 1)[0]
 CLOSE = 1_000_000.0
@@ -207,19 +218,31 @@ def _f_tick(custodian, now, yes_bid, *, spot=None):
         spot=spot, boundaries={TICKER: (None, STRIKE)})
 
 
-def test_d_forty_point_slip_salvages_immediately_table_blind(custodian, ledger):
-    """A 95c favorite that slips to 55c (−40) is a decisive reversal: the price
-    salvage cuts IMMEDIATELY, even with NO spot/table (the exact case that rode
-    to −90). Recover ~−40, not −90."""
+def test_d_sustained_forty_point_slip_salvages_maker_first(custodian, ledger):
+    """WO-2026-07-26-N -M: a 95c favorite that slips to 55c (−40) and SUSTAINS is
+    a decisive reversal — salvage now fires MAKER-FIRST (never the overnight's
+    immediate crossfire that cut two winners at the bottom), and only after
+    confirms-symmetric sustain (a single-tick dip that recovers never fires)."""
     pos = _f_pos(custodian, ledger, entry=95)
-    cuts = _f_tick(custodian, CLOSE - 400, yes_bid=55, spot=None)  # −40, blind
+    _f_tick(custodian, CLOSE - 400, yes_bid=55, spot=None)   # tick 1: not yet sustained
+    assert pos.salvage_fired is None and pos.salvage_slip_strikes == 1
+    _f_tick(custodian, CLOSE - 399, yes_bid=55, spot=None)   # tick 2: SUSTAINED
     assert pos.salvage_attempted is True
     assert pos.salvage_fired == "SALVAGE_SLIP"
-    assert any(t == "SALVAGE_SLIP" for _, _, t in cuts)
-    row = ledger.db.execute(
-        "SELECT price_cents FROM fills WHERE market=? AND action='CUSTODIAN_EXIT'",
-        (TICKER,)).fetchone()
-    assert row is not None and row[0] == 55               # recovered at the mark
+    assert pos.salvage_oid is not None                       # a MAKER rests…
+    # …NOT an immediate crossfire cut
+    assert ledger.db.execute(
+        "SELECT COUNT(*) FROM fills WHERE market=? AND action='CUSTODIAN_EXIT'",
+        (TICKER,)).fetchone()[0] == 0
+
+
+def test_d_single_tick_slip_recovers_no_salvage(custodian, ledger):
+    """Confirms-symmetric: a −40 slip that does NOT sustain (recovers next tick)
+    never salvages — the exact Saturday shape that cut two winners is gone."""
+    pos = _f_pos(custodian, ledger, entry=95)
+    _f_tick(custodian, CLOSE - 400, yes_bid=55, spot=None)   # dip
+    _f_tick(custodian, CLOSE - 399, yes_bid=96, spot=None)   # recovered
+    assert pos.salvage_fired is None and pos.salvage_slip_strikes == 0
 
 
 def test_d_slip_below_forty_is_not_a_price_salvage(custodian, ledger):
@@ -235,9 +258,11 @@ def test_d_slip_below_forty_is_not_a_price_salvage(custodian, ledger):
 
 def test_d_salvage_is_one_attempt(custodian, ledger):
     """The slip salvage latches salvage_attempted — one attempt per position;
-    no second bite (and Wall 3 single-entry blocks re-entry for the window)."""
+    no second bite (and Wall 3 single-entry blocks re-entry for the window).
+    WO-N -M: the fire needs the confirms-symmetric sustain (two ticks)."""
     pos = _f_pos(custodian, ledger, entry=96)
-    _f_tick(custodian, CLOSE - 400, yes_bid=50, spot=None)  # −46 → fires
+    _f_tick(custodian, CLOSE - 400, yes_bid=50, spot=None)  # −46 tick 1
+    _f_tick(custodian, CLOSE - 399, yes_bid=50, spot=None)  # sustained → fires
     assert pos.salvage_attempted is True and pos.salvage_fired == "SALVAGE_SLIP"
 
 

@@ -211,6 +211,40 @@ LANES_LIVE = ("F", "H8", "FLIP", "D", "P")
 LANES_PENDING = ()  # every lane that exists trades (R1); empty until a new lane is designed
 
 
+def restated_money_lines(ledger) -> list:
+    """WO-2026-07-26-N §P4.4 — the MONEY section, RESTATED. The 07/25→26 overnight
+    double-booked its custodian cuts (custodian direct-write + fills-poller booked
+    the SAME cut twice), corrupting the DISPLAYED window P&L and the cell/fills
+    reporting (the −2389¢ line, the inflated window). But `lifetime_pnl_cents`
+    reads the SETTLEMENTS ledger alone (ledger.py:239) — settlements are written
+    once at bell, and the phantom cuts were never settlements — so the honest
+    lifetime needs no data rebuild; it was correct throughout. This publishes the
+    before/after with the delta explained line-item, tagged RESTATED once."""
+    settle = int(ledger.db.execute(
+        "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=0"
+    ).fetchone()[0])
+    cash = int(ledger.db.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements").fetchone()[0])
+    lifetime = ledger.lifetime_pnl_cents()
+    book = ledger.book_cents()
+    # a pre-restate displayed figure, if the operator/boot banked one
+    prior = ledger.get_state("prerestate_lifetime_c")
+    delta_line = (f"  Δ vs the pre-restate displayed −2389¢ line: the phantom "
+                  f"double-booked cuts touched cell/window REPORTING only, never "
+                  f"settlements → lifetime delta from the corruption is 0c"
+                  if prior is None else
+                  f"  Δ before {int(prior)}c → after {lifetime}c "
+                  f"({lifetime - int(prior):+d}c, the phantom cuts backed out)")
+    return [
+        f"MONEY (RESTATED — WO-N P4.4): lifetime {lifetime}c rebuilt from the "
+        f"settlements ledger alone (Σ settlements[divergent=0]={settle}c)",
+        delta_line,
+        f"  book {book}c = cash_movements {cash}c + settlements {settle}c; the "
+        f"/confirm_cash re-baselines absorbed a booking error into cash_movements "
+        f"— the cash-sentinel doctrine (P4.5) blocks the recurrence",
+    ]
+
+
 def fill_economics(ledger, lanes=("FLIP", "F", "HUNT")) -> list:
     """WO-DAILY-PACK-FILL-ECON (build 47): read-only fill economics per lane —
     what we paid to enter, what we sold at, the gross spread, fees, the NET
@@ -451,6 +485,15 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         f"book={ledger.book_cents()}c lifetime_pnl={ledger.lifetime_pnl_cents()}c "
         f"(honest lifetime = settlements ledger only)",
     ]
+    # WO-2026-07-26-N §P4.4 — THE RESTATEMENT. The overnight double-booking
+    # corrupted REPORTING (cell/window P&L, the −2389¢ line) but the lifetime is
+    # rebuilt from the settlements ledger ALONE (build 6's law), which those
+    # phantom cuts never touched. The MONEY section carries a RESTATED tag with
+    # the line-item delta so the meter is trusted before any size conversation.
+    try:
+        lines.extend(restated_money_lines(ledger))
+    except Exception as e:
+        lines.append(f"MONEY (RESTATED): unavailable ({e})")
     rows = ledger.db.execute(
         "SELECT lane, state, COUNT(*) FROM surface_rows WHERE terminal=1"
         " GROUP BY lane, state ORDER BY lane, state").fetchall()

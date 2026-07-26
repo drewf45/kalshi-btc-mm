@@ -3935,6 +3935,74 @@ sim are proven on synthetic books, the -J synthetic-corpus pattern). New `shadow
 `test_f_gets_the_book.py` (18 tests); `test_scale_f`/`test_walls`/`test_p16`/`test_p22`/`test_verify_
 lossterm1`/`test_maker_rest_back` re-anchored to the F raise + per-lane gate. Suite 856 · preflight 23/23.
 
+## WO-2026-07-26-N — THE OVERNIGHT DOCTRINE (build 83)
+
+One document, one deploy, the whole 07/25→26 overnight run audited and ruled. Consolidates the deploy
+questions of -L (shadow), -M (salvage), and the incident. **What happened, verdicts final:** boot #70 shipped
+-K/-L sizing healthy; then untuned salvage (`F_SALVAGE_SLIP_POINTS=40`, level-only, no confirms) fired
+**twice at maximum pain** — `SALVAGE_SLIP` at 50¢ (F no@97 ×18) and 52¢ (F yes@95 ×11), both on windows that
+**settled as winners** (≈ −$14.30 realized for $0 dodged, 0-for-2); the custodian's direct ledger write +
+the fills-poller **double-booked the same cut** (→ `EXIT_OVERSIZE` ×80, `SETTLE_UNMATCHED_LEG` ×2, the
+−2389¢ lifetime line); and **every alarm rang true** (cash sentinel, oversize assert, F rate halt at
+−750¢/8). The lane itself was never broken — Sunday it clipped 34 clean windows.
+
+**Read-rule (independently verified at source, all TRUE):** N1 **baton lifecycle** `custodian.execute_cut`
+(the agent confirmed lines ~636–708): tri-state cancel before cutting, `resweep`+`ledger_remaining`
+re-derive, `UNKNOWN`→`BATON_VIOLATION` FATAL, `FLAT_RACE` skip, cut sells only `remaining` — the execution
+double-cut class is dead. N2 **unified fill dedup** `fills.py`: `booked_fills(fill_id TEXT PRIMARY KEY)`,
+`_already_booked` pre-check, "no path is privileged" verbatim — a re-delivered fill books at most once. N3
+**lifetime from settlements** `ledger.lifetime_pnl_cents` (`SUM(pnl_cents) FROM settlements WHERE
+divergent=0`) — TRUE. **Honest divergences, reported:** (a) **no restatement method / `RESTATED` concept
+existed** — P4.4 is net-new, and because lifetime already reads settlements-only (which the phantom cuts
+never touched), the "restatement" is a *reporting acknowledgment*, not a data rebuild; the honest lifetime
+was correct throughout. (b) The salvage **"would-have-fired" telemetry was net-new** — the existing
+`_note_salvage_gag` rows record *why salvage did NOT fire*, not a counterfactual fire.
+
+**P4.1 — the ruled shadow modes.** `LANE_MODE` already defaults FLIP/OPEN/HUNT/H8 → SHADOW, F → LIVE (the
+-L build); the boot banner prints them. Enforcement is env (`LANE_MODE_*`); acceptance is a 👻 on the next
+desk signal + venue silence on its oid (test_f_gets_the_book, extended here).
+
+**P4.2 — salvage GAGGED + the -M re-arm.** `SALVAGE_GAGGED` (default true): both the price-slip and the
+needle-collapse triggers route through `_fire_or_gag_salvage`, which — when gagged — writes a
+`SALVAGE_WOULD_FIRE` counterfactual row (👻 alert, the tuning data the re-arm review reads) and **takes no
+cut, rides to the bell**. The **-M re-arm path** (the disciplined salvage that runs un-gagged) rebuilt the
+level-only slip into: **confirms-symmetric** (`SALVAGE_SLIP_CONFIRMS=2` sustained ticks, reset on recovery —
+a single-tick dip that recovers, the exact Saturday shape, never fires); **worth-floor**
+(`SALVAGE_WORTH_FLOOR_C` — nothing worth a fee below it); **maker-first** (rest at the held mark, stage-2
+crossfire after R — never the overnight's immediate crossfire); **rarity assert**
+(`SALVAGE_RARITY_MAX_PER_DAY`, pages if salvage runs hot). Review after `SALVAGE_REARM_REVIEW_N=50` gag
+summaries (the Gate A unlock is named, not left to rot).
+
+**P4.3 — the two build-6 fixes, replayed.** `test_duplicate_cut_books_once_and_sells_only_ledger_remaining`
+(a second cut on a concluded position `FLAT_RACE`-skips — one `CUSTODIAN_EXIT`, never two);
+`test_duplicate_venue_fill_books_once` (the same `fill_id` swept twice → `booked=1, duplicate=1`, one `fills`
+row). The exact overnight classes, green.
+
+**P4.4 — the restatement.** `ops.restated_money_lines`: the daily pack MONEY section carries a **`RESTATED`**
+tag, publishing lifetime rebuilt from the settlements ledger alone with the line-item delta — the phantom
+double-booked cuts corrupted cell/window REPORTING only (settlements written once at bell, never a cut), so
+the lifetime delta from the corruption is 0c; the `/confirm_cash` re-baselines are in `cash_movements`
+(book). `test_lifetime_is_settlements_only_unhurt_by_phantom_cells` proves a phantom cell never moves
+lifetime.
+
+**P4.5 — the cash-sentinel doctrine (banked).** Boot prints it: a `CASH DELTA` that fires within 30 min of
+ANY anomaly page → **/deny_cash + investigate**, never /confirm — a sentinel next to an alarm is *evidence*,
+and confirming it launders the error into the books. **P4.6 — no dial changes:** F stays 24/30 (asserted);
+the next size conversation happens on a restated, trusted lifetime.
+
+**FLIP promotion verdict (data, not mood): STAYS IN SHADOW.** 6-of-11 (55%) vs 73% breakeven; FLIP/OPEN/HUNT
+lifetime ≈ −$26; every entry cell Wilson-negative. The path back is -L P3 (shadow trailing-20 ≥ 75% under the
+pessimistic fill + the -J conf gate live + cell margin ≥ 0), printed daily as distance-to-promotion.
+
+**Acceptance:** #1 boot prints modes + salvage GAGGED + RESTATED + no-dial (`test_boot_prints_the_doctrine`);
+#2 next desk signal is a ghost / F single-booked (-L tests + N2 dedup); #3 replay green — both Saturday
+salvages NO-FIRE (`test_saturday_slip_no_fire_when_gagged`, `test_second_saturday_slip_also_no_fire`),
+duplicate-cut + duplicate-fill book once; #4 pack RESTATED + distance-to-promotion + gag summaries
+(`test_daily_pack_carries_the_restated_tag`); #5 F logic byte-identical (`lane_fh8` untouched;
+`test_f_sizing_logic_untouched`). New `test_overnight_doctrine.py` (12 tests); the salvage-mechanics suites
+(`test_p19_salvage`, `test_salv1/2`, `test_flip_both_lanes`, `test_p24`) re-anchored to the -M re-arm path
+(run un-gagged) with the slip now confirms-symmetric + maker-first. Suite 869 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

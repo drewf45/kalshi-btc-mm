@@ -13,6 +13,14 @@ from relay_engine.book import OrderBook
 from relay_engine.custodian import Custodian, OpenPosition, salvage_params
 from relay_engine.feed import DegradeLadder
 
+
+@pytest.fixture(autouse=True)
+def _rearm_salvage(monkeypatch):
+    # WO-2026-07-26-N §P4.2: the salvage execution machinery (the -M re-arm path)
+    # runs un-gagged in these mechanics tests; the production gag is tested in
+    # test_overnight_doctrine.
+    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 EVENT = TICKER.rsplit("-", 1)[0]
 STRIKE = 118_000.0

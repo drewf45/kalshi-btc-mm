@@ -121,6 +121,10 @@ def test_1715_replay_price_anchor_salvages_the_slide(gateway, ledger,
     anchor (None, None, 0.95) — the collapse trigger fires on the 95→16
     slide and the salvage maker rests at ≥40¢ instead of riding to 16."""
     from relay_engine.custodian import salvage_params
+    # WO-2026-07-26-N §P4.2: salvage is GAGGED in production; this is a re-arm
+    # EXECUTION mechanics test, so it runs un-gagged (the gag NO-FIRE is covered
+    # in test_overnight_doctrine).
+    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
     monkeypatch.setattr(delta, "p_survive",
                         lambda d, t, session="ALL":
                         0.5 + 0.43 * min(1.0, d / (0.3 * max(1.0, t))))

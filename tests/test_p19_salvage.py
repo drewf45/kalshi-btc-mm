@@ -11,6 +11,14 @@ from relay_engine.book import OrderBook
 from relay_engine.custodian import OpenPosition, salvage_params
 from relay_engine.shadow_runner import ShadowEngine
 
+
+@pytest.fixture(autouse=True)
+def _rearm_salvage(monkeypatch):
+    # WO-2026-07-26-N §P4.2: salvage is GAGGED in production (telemetry-only);
+    # these tests exercise the salvage EXECUTION machinery (the -M re-arm path),
+    # so they run un-gagged. The gag itself is covered in test_overnight_doctrine.
+    monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 EVENT = TICKER.rsplit("-", 1)[0]
 STRIKE = 118_000.0
