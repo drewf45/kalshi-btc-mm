@@ -245,14 +245,23 @@ class _PortedLane(Lane):
             # scoreboard, and the at-close rebuild (DIAG-1) all keep
             # learning from it — but the mute is DELETED. It returns as a
             # gate only by future Drew ruling with v2 at-close units.
-            anchor = self._table_survival(order.side, ctx)
+            # WO-2026-07-26-T Guard 2: the card's surv number is attributable to
+            # its OWN series' corpus or it says BLIND — never BTC physics on a
+            # foreign card. The table is consulted with the market's series.
+            series = config.series_of(order.market)
+            anchor = self._table_survival(order.side, ctx, series=series)
             stamp = "v2-buffer" if config.F_PROOF_MODE == "v2" else "v1"
             if anchor is not None:
                 surv, d_usd, t_rem = anchor
                 order.why += (f" surv{surv:.2f} (any-touch, info) "
                               f"d={d_usd:.0f} t={t_rem:.0f} proof={stamp}")
             else:
-                order.why += f" surv~price proof={stamp}"
+                from . import delta as _d
+                if _d.is_loaded() and series != _d.table_series():
+                    # honest BLIND: the loaded table is another series' corpus
+                    order.why += f" surv n/a (no {series} table) proof={stamp}"
+                else:
+                    order.why += f" surv~price proof={stamp}"
             return Decision(self.name, market, order)
         if kind == "PROPOSE":  # the decision went to the other lane's band
             return Decision(self.name, market, None, pass_reason=self.other_band_reason)
@@ -261,11 +270,13 @@ class _PortedLane(Lane):
 
 
     @staticmethod
-    def _table_survival(side: str, ctx: dict):
+    def _table_survival(side: str, ctx: dict, series: str = None):
         """Held-side survival from the loaded table at the entry instant —
         (surv, d_usd, t_rem), or None when the brain is absent or blind.
         DIAG-1: d and t ride along so the pass rows carry the full cell
-        (the interrogator's histogram needs them)."""
+        (the interrogator's histogram needs them). WO-T Guard 2: `series` scopes
+        the consultation — a foreign series returns None (the BTC table never
+        answers an XRP card)."""
         from . import delta, spotlead as _sl
         if not delta.is_loaded():
             return None
@@ -281,7 +292,7 @@ class _PortedLane(Lane):
         if t_rem <= 0:
             return None
         d_usd = abs(spot - strike)
-        ps = delta.p_survive(d_usd, t_rem)
+        ps = delta.p_survive(d_usd, t_rem, series=series)
         if ps is None:
             return None
         on_side = "yes" if spot >= strike else "no"

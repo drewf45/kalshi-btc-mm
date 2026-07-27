@@ -4234,6 +4234,48 @@ BOOK is the unit of stewardship). Suite 944 · preflight 23/23. **XRP opens via 
 (or `SERIES_LIST=KXBTC15M,KXXRP15M`) — the default roster stays BTC-only so the printing room
 keeps printing until Drew opens the second.**
 
+## WO-2026-07-26-T — THE TWO GUARDS (open the room clean, build 89)
+
+Two protections named by the -S build's own review, landed BEFORE KXXRP15M's first live
+window. Both are no-ops on BTC (the printing room stays byte-identical); both bound a trap the
+per-series halt can't price.
+
+**Guard 1 — the counterparty-liquidity gate into F's entry path.** The finding: F's entry
+sequence had no counterparty check (only H8's inherited ladder R2 reset, lane_fh8:428-437). A
+maker buy fills against the OPPOSITE side; on XRP's thin book an empty opposite side means the
+order rests forever (cheap) or — worse — fills into a vanishing book with NO exit liquidity
+(salvage's maker-first rest has nobody to rest against; the bound widens from salvageable to
+TOTAL). In `_score_and_size`, after DEPTH_BLIND and before sizing, F entries read the opposite
+side's best bid from the book already in hand: `opp_bid is None or depth == 0` → `NO_COUNTERPARTY`
+defer (re-eligible next poll, the why on the row), counted once per window in `failures` by
+series/hour. Existence, not a threshold (constant-free). Applies to all series (Drew: "all — it's
+free and BTC never triggers it"). Registered data-question `NO_COUNTERPARTY` + pack section
+`no_counterparty_by_series_hour` (the room's liquidity map). `test_two_guards.py` G1 (5): empty
+opposite refuses; a bid next poll re-proposes; BTC deep book never triggers; counted once not
+every poll.
+
+**Guard 2 — the table speaks its series or says BLIND.** The finding: the delta table is
+BTC-trained (Coinbase BTC-USD, 180d) and no consultation was series-scoped — the -S Adversary
+lens's exact named leak. `delta._TABLE_SERIES = "KXBTC15M"`; `_lookup`/`p_cross`/`p_survive`/
+`p_end`/`p_end_wilson_lb`/`distance_for_p` gain `series=None` and return None (BLIND) for a
+foreign series. The F card composer (lanes.py) prints `surv n/a (no KXXRP15M table)` instead of
+borrowed BTC physics — the Why Law's Article 1 (a row's numbers answer for themselves). **Sibling
+sweep** (every delta value/query consumer, cited): lanes.py:295 (F card, series-passed);
+spotlead.py:82/129 `needle`/`settle_fair_favored` (series param, callers pass it);
+custodian.py:327 (salvage anchor, pos.market's series); shadow_runner.py:1375 (F entry-proof
+card, market's series); lane_flip.py:1087/1091/1092/1125/1233/1287/1313 (FLIP swing + HUNT
+gates, ctx["_series"] stamped at evaluate). Every consumer was already None-safe (built for
+blind/absent table); the series scoping makes a foreign lookup None, which propagates safely with
+no fabricated number (Adversary ii; the planted-None test proves it). `test_two_guards.py` G2 (4):
+BTC answers / foreign is BLIND; the XRP card prints surv n/a; spotlead needle+settle BLIND for a
+foreign series; a planted foreign None fabricates nothing downstream.
+
+**BTC F path byte-identical** — both guards are no-ops on BTC (deep two-sided book, own-series
+table); every new signature defaults `series=None` (legacy behavior). The golden-tape F/H8
+regression is green. Test fallout: the many tests that monkeypatch delta functions had their stub
+signatures widened to accept the new kwarg (`**_kw`). Suite 953 · preflight 23/23. **XRP's
+SERIES_MODE flips LIVE only in the deploy carrying both guards green (this one).**
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

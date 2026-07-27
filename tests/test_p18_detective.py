@@ -35,14 +35,14 @@ def table(monkeypatch):
     WO-2026-07-24-J: the SETTLE surface (p_end / p_end_wilson_lb) is stubbed
     too — HUNT's forward gate reads it, and a high LB (0.70) means a 60c join
     clears the +6 edge floor while a 91c join does not."""
-    def p_survive(d, t, session="ALL"):
+    def p_survive(d, t, session="ALL", **_kw):
         # reachability shrinks with clock: ~$0.30/s of plausible travel
         edge = min(1.0, d / (0.3 * max(1.0, t)))
         return 0.5 + 0.43 * edge
     monkeypatch.setattr(delta, "p_survive", p_survive)
-    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL": 0.72)
+    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL", **_kw: 0.72)
     monkeypatch.setattr(delta, "p_end_wilson_lb",
-                        lambda d, t, session="ALL": 0.70)
+                        lambda d, t, session="ALL", **_kw: 0.70)
     return p_survive
 
 
@@ -77,7 +77,7 @@ def test_needle_none_without_evidence(table):
 
 
 def test_needle_none_when_table_absent(monkeypatch):
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": None)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: None)
     assert spotlead.needle(117_920.0, 118_080.0, STRIKE, 300) is None
 
 
@@ -132,9 +132,9 @@ def test_blind_settle_surface_never_hunts(engine, monkeypatch):
     # WO-J §P2: a legacy touch-only table (p_end absent) → the forward gate is
     # BLIND → HUNT sits out. A qualifying needle is NOT enough on its own.
     monkeypatch.setattr(delta, "p_survive",
-                        lambda d, t, session="ALL": 0.93)
+                        lambda d, t, session="ALL", **_kw: 0.93)
     monkeypatch.setattr(delta, "p_end_wilson_lb",
-                        lambda d, t, session="ALL": None)
+                        lambda d, t, session="ALL", **_kw: None)
     props = drive_hunt(engine, join=60)
     assert props == []
 
@@ -206,7 +206,7 @@ def test_job_b_thesis_exit_when_edge_gone(engine, table, monkeypatch):
     w.hunts["yes"]["take_proposed"] = True
     # the settle LB collapses below the 60c mark → the edge that bought it is gone
     monkeypatch.setattr(delta, "p_end_wilson_lb",
-                        lambda d, t, session="ALL": 0.45)
+                        lambda d, t, session="ALL", **_kw: 0.45)
 
     def ctx(secs):
         return {"book": hunt_book(60), "now": CLOSE - secs, "close_ts": CLOSE,

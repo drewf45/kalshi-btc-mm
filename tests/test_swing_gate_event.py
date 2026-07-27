@@ -81,9 +81,9 @@ def test_old_strike_touch_proxy_is_constant_across_cheap_entries(flip,
     # p_cross depends only on distance; near 50/50 the distance is ~tiny
     # for every cheap side, so the proxy is ~constant
     monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": 0.89 if d < 30 else 0.30)
+                        lambda d, t, session="ALL", **_kw: 0.89 if d < 30 else 0.30)
     monkeypatch.setattr(delta, "distance_for_p",
-                        lambda p, t, session="ALL": None)   # §2 shadow off
+                        lambda p, t, session="ALL", **_kw: None)   # §2 shadow off
     # a cheap side is cheap BECAUSE spot sits near the strike — tiny d
     near = _ctx(_book(), spot=STRIKE - 10)
     g1 = flip._swing_gate(near, CLOSE - 800, 44, "yes", TICKER)
@@ -137,9 +137,9 @@ def test_shadow_two_barrier_computes_price_barriers(flip, monkeypatch):
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
     # a monotone table: closer = more likely to cross; invert cleanly
     monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": max(0.0, 1.0 - d / 400.0))
+                        lambda d, t, session="ALL", **_kw: max(0.0, 1.0 - d / 400.0))
     monkeypatch.setattr(delta, "distance_for_p",
-                        lambda p, t, session="ALL": (1.0 - p) * 400.0)
+                        lambda p, t, session="ALL", **_kw: (1.0 - p) * 400.0)
     p_up, p_down = flip._shadow_two_barrier(_ctx(_book()), 44, 700.0, "yes")
     assert p_up is not None and p_down is not None
     # reaching +20 (a big reprice) is LESS likely than reaching the nearer
@@ -150,7 +150,7 @@ def test_shadow_two_barrier_computes_price_barriers(flip, monkeypatch):
 def test_distance_for_p_inverts_the_table(monkeypatch):
     monkeypatch.setattr(delta, "_LOADED", True)
     monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": max(0.0, 1.0 - d / 1000.0))
+                        lambda d, t, session="ALL", **_kw: max(0.0, 1.0 - d / 1000.0))
     # p_cross(d)=1-d/1000 → p=0.5 at d=500
     d = delta.distance_for_p(0.5, 700.0)
     assert d == pytest.approx(500, abs=5)

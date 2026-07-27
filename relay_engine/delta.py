@@ -195,12 +195,30 @@ def _nearest_time_down(secs: float) -> int:
 
 _MISS_LOGGED: set = set()   # P26 §1.3: (d, t, session) grid gaps, once each
 
+# WO-2026-07-26-T Guard 2 — THE TABLE SPEAKS ITS SERIES OR SAYS BLIND. This table
+# is BTC-trained (180 days of Coinbase BTC-USD minutes). It answers ONLY BTC
+# questions; a consultation carrying a DIFFERENT series returns None (honest
+# BLIND, never a borrowed BTC-physics number on a foreign card). When XRP earns
+# its own table (the same builder pointed at XRP-USD — a banked follow-up), the
+# loader maps series → table and this map gains an entry. A caller that passes
+# series=None keeps the legacy BTC behavior byte-identical (no scoping).
+_TABLE_SERIES = "KXBTC15M"
+
+
+def table_series() -> str:
+    """The series this loaded table was trained on."""
+    return _TABLE_SERIES
+
 
 def _lookup(distance_usd: float, secs_remaining: float,
-            session: str = "ALL") -> Optional[dict]:
-    """Raw cell lookup. Returns dict with p_cross, n, effective_n, wilson_ub."""
+            session: str = "ALL", series: Optional[str] = None) -> Optional[dict]:
+    """Raw cell lookup. Returns dict with p_cross, n, effective_n, wilson_ub.
+    WO-T Guard 2: a lookup that names a series OTHER than the table's own returns
+    None — the BTC table never answers an XRP question."""
     if not _LOADED:
         return None
+    if series is not None and series != _TABLE_SERIES:
+        return None      # BLIND — this corpus cannot speak for that series
     d = _round_distance_down(distance_usd)
     if d > 2000:
         d = 2000
@@ -228,14 +246,15 @@ def _lookup(distance_usd: float, secs_remaining: float,
 
 
 def p_cross(distance_usd: float, secs_remaining: float,
-            session: str = "ALL") -> Optional[float]:
-    """Point estimate P(cross). Use wilson_ub for gating decisions."""
-    cell = _lookup(distance_usd, secs_remaining, session)
+            session: str = "ALL", series: Optional[str] = None) -> Optional[float]:
+    """Point estimate P(cross). Use wilson_ub for gating decisions. WO-T Guard 2:
+    pass the card's series; a foreign series → None (BLIND)."""
+    cell = _lookup(distance_usd, secs_remaining, session, series)
     return cell["p_cross"] if cell else None
 
 
 def distance_for_p(target_p: float, secs_remaining: float,
-                   session: str = "ALL") -> Optional[float]:
+                   session: str = "ALL", series: Optional[str] = None) -> Optional[float]:
     """WO-SWING-GATE-EVENT §2: invert the table — the distance at which
     P(cross)=target_p in the time left. p_cross falls monotonically with
     distance (farther = less likely to touch), so scan the $5 grid for the
@@ -245,6 +264,8 @@ def distance_for_p(target_p: float, secs_remaining: float,
     table is absent or the target lies outside the grid's range."""
     if not _LOADED or secs_remaining <= 0:
         return None
+    if series is not None and series != _TABLE_SERIES:
+        return None      # WO-T Guard 2: foreign series → BLIND
     prev_d, prev_p = None, None
     d = 50
     while d <= 2000:
@@ -269,30 +290,32 @@ def wilson_ub(distance_usd: float, secs_remaining: float,
 
 
 def p_survive(distance_usd: float, secs_remaining: float,
-              session: str = "ALL") -> Optional[float]:
-    """Survival probability = 1 - p_cross. Gate-input only."""
-    p = p_cross(distance_usd, secs_remaining, session)
+              session: str = "ALL", series: Optional[str] = None) -> Optional[float]:
+    """Survival probability = 1 - p_cross. Gate-input only. WO-T Guard 2: a
+    foreign series → None (BLIND)."""
+    p = p_cross(distance_usd, secs_remaining, session, series)
     return None if p is None else 1.0 - p
 
 
 def p_end(distance_usd: float, secs_remaining: float,
-          session: str = "ALL") -> Optional[float]:
+          session: str = "ALL", series: Optional[str] = None) -> Optional[float]:
     """WO-2026-07-24-J P1: the SETTLE question — P(the window CLOSES at least
     `distance_usd` from where it started in the time left), the empirical
     analog of a contract settling beyond a strike that far away. The point
     estimate; GATE on p_end_wilson_lb (the conservative LOWER bound). None when
     the table is absent OR carries no settle surface (legacy touch-only) — HUNT
-    is BLIND, never a guess, exactly like the touch table."""
-    cell = _lookup(distance_usd, secs_remaining, session)
+    is BLIND, never a guess, exactly like the touch table. WO-T Guard 2: a
+    foreign series → None (BLIND)."""
+    cell = _lookup(distance_usd, secs_remaining, session, series)
     return cell.get("p_end") if cell else None
 
 
 def p_end_wilson_lb(distance_usd: float, secs_remaining: float,
-                    session: str = "ALL") -> Optional[float]:
+                    session: str = "ALL", series: Optional[str] = None) -> Optional[float]:
     """The Wilson LOWER bound on p_end, computed with effective_n — the number
     HUNT's edge gate reads (never the point estimate; the Adversary's thin-cell
-    guard). None = table/surface absent → BLIND."""
-    cell = _lookup(distance_usd, secs_remaining, session)
+    guard). None = table/surface absent → BLIND. WO-T Guard 2: foreign series → None."""
+    cell = _lookup(distance_usd, secs_remaining, session, series)
     return cell.get("p_end_wilson_lb") if cell else None
 
 

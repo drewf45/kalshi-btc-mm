@@ -231,10 +231,10 @@ def test_shadow_uses_held_side_complement_for_no(flip, monkeypatch):
     0.56 for NO@44. The retired code used 0.44 for both — the sign bug."""
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
     monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": 0.5)
+                        lambda d, t, session="ALL", **_kw: 0.5)
     calls = []
 
-    def _rec(p, t, session="ALL"):
+    def _rec(p, t, session="ALL", **_kw):
         calls.append(round(p, 4))
         return 100.0
     monkeypatch.setattr(delta, "distance_for_p", _rec)
@@ -257,9 +257,9 @@ def test_shadow_symmetric_table_gives_mirror(flip, monkeypatch):
     held-price symmetry as the live exit."""
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
     monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": max(0.0, 1.0 - d / 400.0))
+                        lambda d, t, session="ALL", **_kw: max(0.0, 1.0 - d / 400.0))
     monkeypatch.setattr(delta, "distance_for_p",
-                        lambda p, t, session="ALL": (1.0 - p) * 400.0)
+                        lambda p, t, session="ALL", **_kw: (1.0 - p) * 400.0)
     y_up, y_down = flip._shadow_two_barrier(_ctx(_book()), 44, 700.0, "yes")
     n_up, n_down = flip._shadow_two_barrier(_ctx(_book()), 44, 700.0, "no")
     assert (y_up, y_down) == (n_up, n_down)
@@ -272,10 +272,10 @@ def test_swing_gate_forwards_side_to_shadow(flip, monkeypatch):
     bare _shadow_two_barrier."""
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
     monkeypatch.setattr(delta, "p_cross",
-                        lambda d, t, session="ALL": 0.5)
+                        lambda d, t, session="ALL", **_kw: 0.5)
     calls = []
     monkeypatch.setattr(delta, "distance_for_p",
-                        lambda p, t, session="ALL": calls.append(round(p, 4)) or 100.0)
+                        lambda p, t, session="ALL", **_kw: calls.append(round(p, 4)) or 100.0)
     flip._window(TICKER, CLOSE)
     flip._swing_gate(_ctx(_book()), CLOSE - 700, 44, "no", TICKER)
     assert 0.56 in set(calls) and 0.44 not in set(calls)

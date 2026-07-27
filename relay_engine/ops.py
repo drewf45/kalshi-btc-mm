@@ -276,6 +276,32 @@ def restated_money_lines(ledger) -> list:
     ]
 
 
+def no_counterparty_by_series_hour(ledger) -> list:
+    """WO-2026-07-26-T Guard 1 — the room's liquidity map. NO_COUNTERPARTY
+    refusals (opposite side empty at F entry) counted by series and UTC hour: a
+    free read of when each room actually has counterparties. A room that refuses
+    all afternoon has none and SHOULD starve — the gate telling the truth."""
+    try:
+        rows = ledger.db.execute(
+            "SELECT json_extract(how_json,'$.series') AS series, "
+            " strftime('%H', ts, 'unixepoch') AS hr, COUNT(*) "
+            "FROM failures WHERE why_tag='NO_COUNTERPARTY' "
+            "GROUP BY series, hr ORDER BY series, hr").fetchall()
+    except Exception as e:
+        return [f"NO_COUNTERPARTY (liquidity map): unavailable ({e})"]
+    if not rows:
+        return ["NO_COUNTERPARTY (liquidity map, WO-T): none — every F entry had "
+                "a counterparty this window"]
+    by_series = {}
+    for series, hr, n in rows:
+        by_series.setdefault(series or "?", []).append(f"{hr}h:{n}")
+    lines = ["NO_COUNTERPARTY (liquidity map, WO-T Guard 1) — opposite side empty "
+             "at F entry, by room · UTC hour:"]
+    for s in sorted(by_series):
+        lines.append(f"  [{s}] {' '.join(by_series[s])}")
+    return lines
+
+
 def series_chapter_lines(ledger) -> list:
     """WO-2026-07-26-S §1 — THE PER-SERIES CHAPTER (the pack section every room
     gets from day one). One block per rostered room: its mode, F dial, settled
@@ -920,6 +946,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(book_stale_by_hour(ledger))
     except Exception as e:
         lines.append(f"BOOK_STALE: unavailable ({e})")
+    # WO-2026-07-26-T Guard 1: the counterparty liquidity map by series/hour.
+    try:
+        lines.extend(no_counterparty_by_series_hour(ledger))
+    except Exception as e:
+        lines.append(f"NO_COUNTERPARTY: unavailable ({e})")
     # WO-2026-07-26-S §1: the per-series chapter — one room each, from day one.
     try:
         lines.extend(series_chapter_lines(ledger))

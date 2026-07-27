@@ -528,11 +528,13 @@ class ShadowEngine:
             fatal=False, alert=True, market=market,
             per_contract_c=round(per_contract_loss_c, 1))
 
-    def _defer_entry(self, proposal, reason: str, ctx: dict) -> None:
+    def _defer_entry(self, proposal, reason: str, ctx: dict) -> bool:
         """WO-2026-07-26-P §B2 — the honest defer. A depth/size read that cannot
         produce a chosen number does NOT fabricate one: the entry sits out ONE
         cycle with a named row ({reason, terms}), and re-proposes next cycle when
-        the book may have formed. count=0 is the signal the submit loop skips on."""
+        the book may have formed. count=0 is the signal the submit loop skips on.
+        Returns True the FIRST time this (market, lane, side, price, reason) is
+        deferred in the window (so callers can count once, not every poll)."""
         proposal.count = 0
         key = (proposal.market, proposal.lane, proposal.side,
                proposal.price_cents, reason)
@@ -548,6 +550,8 @@ class ShadowEngine:
                     "WATCHING", detail=json.dumps({"defer": reason, **ctx}))
             except Exception:
                 pass
+            return True
+        return False
 
     def _score_and_size(self, proposal, book) -> None:
         """P27 §1 — SIZING = FULL KELLY: contracts = min(kelly, depth); the
@@ -571,6 +575,35 @@ class ShadowEngine:
             self._defer_entry(proposal, "DEPTH_BLIND",
                               {"side": side, "price": price})
             return
+        # ── WO-2026-07-26-T Guard 1 — THE COUNTERPARTY-LIQUIDITY GATE ─────────
+        # A maker buy fills against the OPPOSITE side. An empty opposite side means
+        # the order rests forever (cheap) or — the deeper trap on a thin book —
+        # fills into a vanishing book with NO exit liquidity: salvage's maker-first
+        # rest (M §S4) has nobody to rest against, the worth-band cut can't execute,
+        # and the position rides to settlement with its bound widened from
+        # salvageable to TOTAL. Refuse at entry, re-eligible next poll (liquidity
+        # returns — not a window kill). Existence, not a threshold: nothing to tune,
+        # nothing to tag. Applies to ALL series (Drew: "all — it's free and BTC
+        # never triggers it"); scoped to F's entry path (the guard's subject).
+        if proposal.lane == "F" and proposal.action == "buy":
+            opp_side = "no" if side == "yes" else "yes"
+            opp_bid = book.best_no_bid() if side == "yes" else book.best_yes_bid()
+            opp_depth = book.joining_depth(opp_side, opp_bid) if opp_bid is not None else 0
+            if opp_bid is None or not opp_depth:
+                first = self._defer_entry(proposal, "NO_COUNTERPARTY", {
+                    "side": side, "opp_side": opp_side, "opp_bid": opp_bid,
+                    "yb": book.best_yes_bid(), "nb": book.best_no_bid()})
+                if first:   # count once per window — the room's liquidity map
+                    from . import failures
+                    failures.fail(
+                        "NO_COUNTERPARTY",
+                        f"{proposal.market}: buy {side} but the opposite ({opp_side}) "
+                        f"side is empty (yb={book.best_yes_bid()} nb="
+                        f"{book.best_no_bid()}) — no one to fill or EXIT against; "
+                        "waiting for liquidity (WO-T Guard 1)",
+                        alert=False, series=config.series_of(proposal.market),
+                        side=side, hour=int(time.strftime("%H", time.gmtime())))
+                return
         # §B1: EVERY lane that creates a level in front of a band sizes to the
         # band it functionally trades, not the empty level. `band` bounded to the
         # price's own tier band (Adversary i); the reference is the larger of the
@@ -1338,9 +1371,10 @@ class ShadowEngine:
         if t_rem <= 0:
             return "close"     # window already over by the clock
         d = abs(spot - strike)
-        ps = delta.p_survive(d, t_rem)
+        # WO-2026-07-26-T Guard 2: this market's series' physics or BLIND.
+        ps = delta.p_survive(d, t_rem, series=config.series_of(market))
         if ps is None:
-            return "table"     # delta-table cell miss
+            return "table"     # delta-table cell miss (or a foreign-series BLIND)
         on_side = "yes" if spot >= strike else "no"
         p_entry = ps if on_side == side else 1.0 - ps
         return (d, t_rem, p_entry)
@@ -1731,7 +1765,8 @@ class ShadowEngine:
                 close_for = meta.get("close_ts") or _infer(market)
                 if strike is not None and close_for is not None:
                     anchor = self.hunt_anchor.setdefault(market, spot)
-                    sl = _sl.needle(anchor, spot, strike, close_for - now)
+                    sl = _sl.needle(anchor, spot, strike, close_for - now,
+                                    series=config.series_of(market))  # WO-T Guard 2
             # P26 §1.2: a mute organ must say it's mute (R5, applied to the
             # brain) — while the table is unloaded, each window's proven-lane
             # silence tags itself ONCE as UNPROVEN, never a shrug.

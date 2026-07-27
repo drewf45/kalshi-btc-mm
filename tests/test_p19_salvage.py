@@ -40,7 +40,7 @@ def engine(tmp_path):
 
 @pytest.fixture
 def table(monkeypatch):
-    def p_survive(d, t, session="ALL"):
+    def p_survive(d, t, session="ALL", **_kw):
         edge = min(1.0, d / (0.3 * max(1.0, t)))
         return 0.5 + 0.43 * edge
     monkeypatch.setattr(delta, "p_survive", p_survive)

@@ -79,9 +79,9 @@ def _settle_surface(monkeypatch):
     high, permissive settle LB lets the first hunt fire and the guards do their
     job — the point of these tests is direction/averaging discipline, not the
     edge floor (that is graded in test_p18_detective / the WO-J suite)."""
-    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL": 0.92)
+    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL", **_kw: 0.92)
     monkeypatch.setattr(delta, "p_end_wilson_lb",
-                        lambda d, t, session="ALL": 0.90)
+                        lambda d, t, session="ALL", **_kw: 0.90)
 
 
 @pytest.fixture

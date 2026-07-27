@@ -63,10 +63,12 @@ def pick_strike(spot: Optional[float], boundary_lo, boundary_hi) -> Optional[flo
 
 
 def needle(anchor_spot: Optional[float], spot_now: Optional[float],
-           strike: Optional[float], t_remaining: Optional[float]
-           ) -> Optional[Needle]:
+           strike: Optional[float], t_remaining: Optional[float],
+           series: Optional[str] = None) -> Optional[Needle]:
     """Gate A's arithmetic. None = no evidence (spot blind, no strike, table
-    absent, or no move) — and no evidence means no hunt, never a guess."""
+    absent, or no move) — and no evidence means no hunt, never a guess.
+    WO-2026-07-26-T Guard 2: `series` scopes the table — a foreign series' needle
+    is None (BLIND), never BTC physics on another room's card."""
     from . import delta
     if (anchor_spot is None or spot_now is None or strike is None
             or t_remaining is None or t_remaining <= 0
@@ -77,7 +79,7 @@ def needle(anchor_spot: Optional[float], spot_now: Optional[float],
     def p_side(spot: float) -> Optional[float]:
         d = abs(spot - strike)
         on_side = "yes" if spot >= strike else "no"
-        ps = delta.p_survive(d, t_remaining)
+        ps = delta.p_survive(d, t_remaining, series=series)
         if ps is None:
             return None
         return ps if on_side == side else 1.0 - ps
@@ -100,8 +102,8 @@ def is_confirmed_needle(sl: Optional[Needle]) -> bool:
 
 
 def settle_fair_favored(spot: Optional[float], strike: Optional[float],
-                        side: str, t_remaining: Optional[float]
-                        ) -> Optional[float]:
+                        side: str, t_remaining: Optional[float],
+                        series: Optional[str] = None) -> Optional[float]:
     """WO-2026-07-25-K §P2 — THE CONFIDENCE INSTRUMENT. The favored side's
     SETTLE-fair (cents): the probability that the window CLOSES on the favored
     side of the strike, given spot is `d = |spot − strike|` away on that side
@@ -124,7 +126,7 @@ def settle_fair_favored(spot: Optional[float], strike: Optional[float],
     if spot is None or strike is None or t_remaining is None or t_remaining <= 0:
         return None
     d = abs(spot - strike)
-    pe = delta.p_end(d, t_remaining)
-    if pe is None:                       # legacy touch-only tape → BLIND
+    pe = delta.p_end(d, t_remaining, series=series)   # WO-T Guard 2: series-scoped
+    if pe is None:                       # legacy touch-only tape / foreign series → BLIND
         return None
     return (1.0 - pe / 2.0) * 100.0

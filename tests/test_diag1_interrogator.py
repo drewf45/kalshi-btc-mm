@@ -144,7 +144,7 @@ def test_surv_prints_as_info_never_gates(monkeypatch):
     from relay_engine.lanes import LaneF
     monkeypatch.setattr(config, "F_PROOF_MODE", "v1")
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.93)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: 0.93)
     res = type("R", (), {"lane": "F"})()
     shared = type("S", (), {})()
     shared.decide = lambda m, c: ("PROPOSE", res)
@@ -164,7 +164,7 @@ def test_proof_mode_still_stamps_the_era(monkeypatch):
     from relay_engine.lanes import LaneF
     monkeypatch.setattr(config, "F_PROOF_MODE", "v2")
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.93)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: 0.93)
     res = type("R", (), {"lane": "F"})()
     shared = type("S", (), {})()
     shared.decide = lambda m, c: ("PROPOSE", res)

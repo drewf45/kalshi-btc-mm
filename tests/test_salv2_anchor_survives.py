@@ -62,7 +62,7 @@ def test_restart_readopts_with_anchor_and_salvage_fires(engine, monkeypatch):
     monkeypatch.setattr(venue, "get_positions",
                         lambda c: [{"ticker": TICKER, "position": 1}])
     monkeypatch.setattr(delta, "p_survive",
-                        lambda d, t, session="ALL":
+                        lambda d, t, session="ALL", **_kw:
                         0.5 + 0.43 * min(1.0, d / (0.3 * max(1.0, t))))
     # our own fill explains the position -> RECOGNIZED re-adopt
     engine.ledger.record_fill(TICKER, "F", "yes", "ENTRY", 95, 1, "PROBE")
@@ -100,7 +100,7 @@ def test_restart_without_table_disables_loudly_backstop_stands(engine,
     from relay_engine import venue
     monkeypatch.setattr(venue, "get_positions",
                         lambda c: [{"ticker": TICKER, "position": 1}])
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": None)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: None)
     engine.ledger.record_fill(TICKER, "F", "yes", "ENTRY", 95, 1, "PROBE")
     _seed_market(engine, spot=STRIKE + 300)
     live_boot_reconcile(engine, _Client())
@@ -125,7 +125,7 @@ def test_orphan_uses_venue_mark_not_50(engine, monkeypatch):
     from relay_engine import venue
     monkeypatch.setattr(venue, "get_positions",
                         lambda c: [{"ticker": TICKER, "position": 1}])
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.9)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: 0.9)
     _seed_market(engine, spot=STRIKE + 300)   # no fill of ours -> ORPHAN
     engine.feed.book(TICKER).apply_snapshot({83: 10}, {15: 10}, ts=1.0)
     live_boot_reconcile(engine, _Client())

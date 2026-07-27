@@ -69,7 +69,7 @@ def test_boot_banner_prints_both_tuition_and_the_halt():
 
 
 # ══ P2 · THE CONFIDENCE INSTRUMENT ══════════════════════════════════════════
-def _p_end_stub(d, t, session="ALL"):
+def _p_end_stub(d, t, session="ALL", **_kw):
     """A monotone settle surface: p_end HIGH near the strike (any drift closes
     beyond a tiny d), LOW far out. Pinned → settle-fair ≈ 50; far → ≈ 90."""
     return max(0.05, 1.0 - d / 600.0)
@@ -84,7 +84,7 @@ def test_settle_fair_favored_prices_fragility_forward(monkeypatch):
     favored = spotlead.settle_fair_favored(66_000.0, 65_700.0, "yes", 500)
     assert favored > 70 and favored > pinned
     # BLIND on a legacy touch-only tape
-    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL": None)
+    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL", **_kw: None)
     assert spotlead.settle_fair_favored(66_000.0, 65_700.0, "yes", 500) is None
 
 
@@ -147,7 +147,7 @@ def test_blind_settle_surface_proceeds_at_tuition(flip, monkeypatch):
     """No settle surface (legacy tape) → the conf gate ABSTAINS (BLIND); the desk
     still trades on its pile gates, bounded by tuition size (the seal's ordering:
     tuition pays while the instrument gets built)."""
-    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL": None)
+    monkeypatch.setattr(delta, "p_end", lambda d, t, session="ALL", **_kw: None)
     props = _drive_open(flip, strike=66_000.0, entry_spot=66_000.0)
     entries = [p for p in props if p.purpose == "ENTRY"]
     assert len(entries) == 1

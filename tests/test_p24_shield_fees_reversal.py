@@ -107,9 +107,9 @@ def test_salvage_anchor_names_all_four_misses(tmp_path, monkeypatch):
     import time as _t
     eng.market_meta[TICKER] = {"boundary_hi": STRIKE,
                                "close_ts": _t.time() + 500}
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": None)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: None)
     assert eng._salvage_anchor(TICKER, "yes") == "table"
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.9)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: 0.9)
     anchor = eng._salvage_anchor(TICKER, "yes")
     assert isinstance(anchor, tuple) and anchor[2] == pytest.approx(0.1)
 
@@ -126,7 +126,7 @@ def test_1715_replay_price_anchor_salvages_the_slide(gateway, ledger,
     # in test_overnight_doctrine).
     monkeypatch.setattr(config, "SALVAGE_GAGGED", False)
     monkeypatch.setattr(delta, "p_survive",
-                        lambda d, t, session="ALL":
+                        lambda d, t, session="ALL", **_kw:
                         0.5 + 0.43 * min(1.0, d / (0.3 * max(1.0, t))))
     custodian.set_lane_params("F", salvage_params())
     pos = OpenPosition(event=EVENT, market=TICKER, lane="F", side="yes",

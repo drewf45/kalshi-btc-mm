@@ -114,7 +114,7 @@ def test_fh8_nonreversal_gate_and_tag(monkeypatch):
     # table loaded: (surv, d, t) — DIAG-1 rides the cell along for the
     # interrogator's histogram
     monkeypatch.setattr(delta, "is_loaded", lambda: True)
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.9)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: 0.9)
     surv, d_usd, t_rem = _PortedLane._table_survival("yes", ctx)
     assert surv == pytest.approx(0.9)
     assert d_usd == pytest.approx(50.0) and t_rem == pytest.approx(500.0)

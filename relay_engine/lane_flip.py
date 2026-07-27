@@ -678,6 +678,10 @@ class LaneFlip:
         are normal — the lane re-proposes at the fresh join next cycle."""
         if self.killed:
             return []
+        # WO-2026-07-26-T Guard 2: stamp the market's series into ctx so every
+        # table consultation below reads its OWN corpus or BLIND — a FLIP gate on
+        # a foreign-series market never reads BTC physics.
+        ctx["_series"] = config.series_of(market)
         now = ctx.get("now", time.time())
         close_ts = ctx.get("close_ts")
         book = ctx.get("book")
@@ -856,7 +860,7 @@ class LaneFlip:
         from . import spotlead as _sl
         strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
                                  ctx.get("boundary_hi"))
-        settle_fair = _sl.settle_fair_favored(spot, strike, side, secs)
+        settle_fair = _sl.settle_fair_favored(spot, strike, side, secs, series=ctx.get("_series"))
         conf_c = (settle_fair - join) if settle_fair is not None else None
         conf_note = (f"settle-fair {settle_fair:.0f} vs join {join} → "
                      f"conf {conf_c:+.0f}" if settle_fair is not None
@@ -1080,12 +1084,13 @@ class LaneFlip:
             # complement (the side sign, Part C.3)
             p_hold = held_px / 100.0
             p_cross_target = p_hold if side == "yes" else 1.0 - p_hold
-            return delta.distance_for_p(p_cross_target, t_rem)
+            return delta.distance_for_p(p_cross_target, t_rem,
+                                        series=ctx.get("_series"))
         d0, d_up, d_down = _dist(join), _dist(take_px), _dist(cut_px)
         if d0 is None or d_up is None or d_down is None:
             return None, None
-        p_up = delta.p_cross(abs(d0 - d_up), t_rem)
-        p_down = delta.p_cross(abs(d0 - d_down), t_rem)
+        p_up = delta.p_cross(abs(d0 - d_up), t_rem, series=ctx.get("_series"))
+        p_down = delta.p_cross(abs(d0 - d_down), t_rem, series=ctx.get("_series"))
         return p_up, p_down
 
     def _swing_gate(self, ctx: dict, now: float, join: int,
@@ -1118,7 +1123,7 @@ class LaneFlip:
             strike = _sl.pick_strike(spot, ctx.get("boundary_lo"),
                                      ctx.get("boundary_hi"))
             if strike is not None:
-                proxy = delta.p_cross(abs(spot - strike), t_rem)
+                proxy = delta.p_cross(abs(spot - strike), t_rem, series=ctx.get("_series"))
         # LIVE decision: the measured rate is ground truth once it exists
         calibrated = rate is not None and n >= config.OPEN_SWING_MIN_SAMPLES
         if calibrated:
@@ -1226,7 +1231,7 @@ class LaneFlip:
         # hunt is BLIND (never a touch-fair guess) — evidence-born, exactly like
         # D on no table. The needle above is now ATTENTION only (gate A: it
         # decides WHEN the hunt looks, never WHETHER it buys).
-        p_end_lb = delta.p_end_wilson_lb(sl.d_after, secs)
+        p_end_lb = delta.p_end_wilson_lb(sl.d_after, secs, series=config.series_of(market))
         if p_end_lb is None:                            # no settle surface → BLIND
             w.hunt_pending = None
             if not w.hunt_blind_logged:
@@ -1260,7 +1265,7 @@ class LaneFlip:
         # cents the gate used); the info-only touch is marked. The EV tag rides
         # after: ev_c = p_end(point)*100 − join — the point-estimate EV, logged
         # on every entry (§P2) for the DIVERGENCE read-back (§P5).
-        why = self._hunt_casefile(side, sl, secs, p_end_lb, join, edge)
+        why = self._hunt_casefile(side, sl, secs, p_end_lb, join, edge, series=config.series_of(market))
         return [Order(
             lane="FLIP", event=event, market=market, side=side,
             action="buy", price_cents=join, count=1,
@@ -1269,7 +1274,7 @@ class LaneFlip:
 
     @staticmethod
     def _hunt_casefile(side: str, sl, secs: float, p_end_lb: float,
-                       join: float, edge: float) -> str:
+                       join: float, edge: float, series: str = None) -> str:
         """WO-2026-07-24-J §P4 — the ENTRY casefile, ONE format:
           HUNT ↑ spot $56 off strike, T-9:05 · settle 22% (LB 18) · book 15¢
                · edge +3 · touch 70% (info) · EV +7
@@ -1280,7 +1285,7 @@ class LaneFlip:
         from . import delta
         arrow = "↑" if side == "yes" else "↓"
         tmin, tsec = int(secs // 60), int(secs % 60)
-        p_end_pt = delta.p_end(sl.d_after, secs)
+        p_end_pt = delta.p_end(sl.d_after, secs, series=series)   # WO-T Guard 2
         settle_pct = (p_end_pt * 100.0) if p_end_pt is not None else (p_end_lb * 100.0)
         ev_c = (p_end_pt * 100.0 - join) if p_end_pt is not None else edge
         return (f"HUNT {arrow} spot ${sl.d_after:.0f} off strike, "
@@ -1306,7 +1311,7 @@ class LaneFlip:
                                  ctx.get("boundary_hi"))
         if strike is None:
             return None
-        return delta.p_end_wilson_lb(abs(spot - strike), secs)
+        return delta.p_end_wilson_lb(abs(spot - strike), secs, series=ctx.get("_series"))
 
     def _hunt_custody(self, w: FlipWindow, market: str, event: str, book,
                       secs: float, now: float, ctx: Optional[dict] = None

@@ -320,9 +320,11 @@ class Custodian:
 
     def _held_p(self, pos: OpenPosition, spot: float, strike: float,
                 t_rem: float) -> Optional[float]:
-        from . import delta
+        from . import config, delta
         d = abs(spot - strike)
-        ps = delta.p_survive(d, t_rem)
+        # WO-2026-07-26-T Guard 2: the salvage survival is the POSITION's series'
+        # physics or None — a BTC number never anchors an XRP salvage.
+        ps = delta.p_survive(d, t_rem, series=config.series_of(pos.market))
         if ps is None:
             return None
         on_side = "yes" if spot >= strike else "no"

@@ -84,7 +84,7 @@ def test_oscillation_capped_and_one_summary(custodian, gateway, ledger,
     ledger.record_fill(TICKER, "F", "yes", "ENTRY", 95, 1, "PROBE")
     state = {"gap": False}
 
-    def p_survive(d, t, session="ALL"):
+    def p_survive(d, t, session="ALL", **_kw):
         state["gap"] = not state["gap"]
         return None if state["gap"] else 0.93   # healthy: no collapse
     monkeypatch.setattr(delta, "p_survive", p_survive)
@@ -116,7 +116,7 @@ def test_no_anchor_registers_disabled_and_summary_names_it(custodian,
         " state='SALVAGE_DISABLED_TAGGED'").fetchone()[0]
     assert json.loads(row)["reason"] == "NO_ANCHOR"
     ledger.record_fill(TICKER, "F", "yes", "ENTRY", 95, 1, "PROBE")
-    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL": 0.9)
+    monkeypatch.setattr(delta, "p_survive", lambda d, t, session="ALL", **_kw: 0.9)
     _tick(custodian, pos, spot=STRIKE + 300, now=CLOSE - 500)
     custodian.emit_salvage_summary(pos, "SETTLED", realized_cents=-95)
     s = _summaries(ledger)
@@ -129,7 +129,7 @@ def test_fired_salvage_armed_then_summary_with_save(custodian, gateway,
     """ARMED at registration → (gags if any) → SALVAGE_MAKER →
     crossfire → summary carrying the realized save."""
     monkeypatch.setattr(delta, "p_survive",
-                        lambda d, t, session="ALL":
+                        lambda d, t, session="ALL", **_kw:
                         0.5 + 0.43 * min(1.0, d / (0.3 * max(1.0, t))))
     pos = _pos(p_entry=0.93)
     custodian.adopt(pos)

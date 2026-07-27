@@ -72,7 +72,7 @@ def registered_surfaces() -> set:
 SEED_SURFACES = (
     "SIZE_DECISION", "SETTLE_AUDIT", "OPEN_SKIP",
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
-    "BOOK_STALE", "CORRELATED_LOSS",
+    "BOOK_STALE", "CORRELATED_LOSS", "NO_COUNTERPARTY",
 )
 
 
@@ -131,6 +131,16 @@ def seed() -> None:
         "combined size turn ENSEMBLE_AT_RISK_PCT from a DREW-DEFAULT into a DERIVED "
         "number. Rare/small → the cap can relax; clustered/large → it tightens.",
         "the ensemble worst-day math / ENSEMBLE_AT_RISK_PCT derivation (WO-S §2)")
+    register(
+        "NO_COUNTERPARTY",
+        "How often, and when, is a room's OPPOSITE side empty at entry — the "
+        "thin-book trap?",
+        "VALIDATES the counterparty gate's necessity per room: an empty opposite "
+        "side means the order can't fill or (worse) can't EXIT. The by-series/hour "
+        "counts are the new room's free liquidity map — a room that refuses all "
+        "afternoon has no counterparties and SHOULD starve (the gate telling the "
+        "truth about the room, WO-T Guard 1).",
+        "the daily pack's counterparty-by-series/hour line / XRP go/no-go read")
 
 
 def missing_registration(active_surfaces) -> List[str]:
