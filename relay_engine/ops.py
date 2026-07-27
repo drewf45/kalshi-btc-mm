@@ -34,7 +34,7 @@ class Telegram:
     # P-CASH-FATAL-1 §4.4: /clear_cash_fatal — the ONLY key to a denied
     # cash delta (a restart is not); symmetric with /reset_halt.
     COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard",
-                "/clear_cash_fatal", "/daily", "/owed")
+                "/clear_cash_fatal", "/daily", "/owed", "/series")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
@@ -51,6 +51,10 @@ class Telegram:
         # WO-2026-07-26-O §O4: /owed — the operator's read-only look at the scrape
         # (book / owed / tradeable / distance to the next milestone). Read-only.
         self.owed_fn = lambda: "no scrape wired"
+        # WO-2026-07-26-S §1 — /series: the room start command, without a second
+        # deploy. "/series xrp on|off|live|shadow" opens/parks a room (roster +
+        # mode + F family + halt-key migration). Wired by the runner to the engine.
+        self.series_fn = lambda text="": "no series manager wired"
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         self._session = None
@@ -129,6 +133,8 @@ class Telegram:
             return self.cash.clear_cash_fatal()
         if cmd == "/owed":
             return self.owed_fn()           # read-only scrape look; never trades
+        if cmd == "/series":
+            return self.series_fn(text)     # opens/parks a room; never places directly
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 
@@ -268,6 +274,45 @@ def restated_money_lines(ledger) -> list:
         f"/confirm_cash re-baselines absorbed a booking error into cash_movements "
         f"— the cash-sentinel doctrine (P4.5) blocks the recurrence",
     ]
+
+
+def series_chapter_lines(ledger) -> list:
+    """WO-2026-07-26-S §1 — THE PER-SERIES CHAPTER (the pack section every room
+    gets from day one). One block per rostered room: its mode, F dial, settled
+    windows and P&L (from terminal surface rows, grouped by series_of(market)).
+    A NEW room (not BTC) carries its FIRST-DAY MECHANICS WATCHLIST — the venue
+    facts no BTC record can vouch for: maker $0 must be OBSERVED on its own tape,
+    settlement attribution clean, tick/strike matching discovery. These PAGE on
+    anomaly; they never pre-block (Part 3 item 3). The room's own halt is the
+    stated bound on the cost of learning them live."""
+    lines = ["=== SERIES CHAPTERS (WO-S) — one book, a room each ==="]
+    rows = ledger.db.execute(
+        "SELECT market, state, detail FROM surface_rows WHERE terminal=1"
+    ).fetchall()
+    by_series = {}
+    for market, state, detail in rows:
+        s = config.series_of(market)
+        agg = by_series.setdefault(s, {"settled": 0, "pnl": 0, "pass": 0})
+        if state == "PASS":
+            agg["pass"] += 1
+        else:
+            agg["settled"] += 1
+            try:
+                agg["pnl"] += int(json.loads(detail).get("pnl_cents", 0))
+            except Exception:
+                pass
+    for s in config.SERIES:
+        a = by_series.get(s, {"settled": 0, "pnl": 0, "pass": 0})
+        lines.append(
+            f"[{s}] {config.series_mode(s)} · F@{config.f_notional_pct_of(s):.0%} "
+            f"· settled {a['settled']} ({a['pnl']:+d}¢) · passes {a['pass']}")
+        if s != "KXBTC15M" and config.series_mode(s) != "OFF":
+            lines.append(
+                f"   FIRST-DAY WATCHLIST ({s}): confirm maker $0 on ITS tape · "
+                "settlement attribution clean · tick/strike match discovery — "
+                "pages on anomaly, never pre-blocks; the room's own halt bounds "
+                "the cost of learning the venue live (Part 3)")
+    return lines
 
 
 def book_stale_by_hour(ledger) -> list:
@@ -875,6 +920,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(book_stale_by_hour(ledger))
     except Exception as e:
         lines.append(f"BOOK_STALE: unavailable ({e})")
+    # WO-2026-07-26-S §1: the per-series chapter — one room each, from day one.
+    try:
+        lines.extend(series_chapter_lines(ledger))
+    except Exception as e:
+        lines.append(f"SERIES CHAPTERS: unavailable ({e})")
     # WO-2026-07-26-P §A3: the data-question registry rides the pack — every
     # surface with its question and last-read; unread>14d pages DATA_WITHOUT_
     # QUESTION. The pack IS a read of these surfaces, so stamp them read here.

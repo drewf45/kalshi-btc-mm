@@ -823,6 +823,23 @@ def f_enabled_series() -> list:
     return [s for s in SERIES if series_mode(s) != "OFF"]
 
 
+# Known 15-minute crypto series, by short asset name (for the /series command).
+# XRP first (Drew's pick), then SOL, then ETH (ETH last — "needs its own tuning").
+KNOWN_SERIES = {"BTC": "KXBTC15M", "XRP": "KXXRP15M",
+                "SOL": "KXSOL15M", "ETH": "KXETH15M"}
+
+
+def resolve_series(name: str):
+    """Map a /series argument to a Kalshi series ticker. Accepts the short asset
+    ('xrp') or the full ticker ('KXXRP15M'). None if unknown."""
+    up = name.strip().upper()
+    if up in KNOWN_SERIES:
+        return KNOWN_SERIES[up]
+    if up in KNOWN_SERIES.values():
+        return up
+    return None
+
+
 def halt_scope(series: str, lane: str) -> str:
     """WO-2026-07-26-S §2 — PER-SERIES HALTS (RULED 07-26: "each lane gets its own
     halt"). The money rate-halt keys on (series, lane): XRP's drawdown parks XRP

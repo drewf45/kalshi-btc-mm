@@ -245,7 +245,7 @@ def list_open_markets(client: KalshiClient) -> List[Dict]:
     markets flow into the same lifecycle with no other change. Series-scoped
     queries keep each room's markets attributable at the source."""
     out = []
-    for series in config.SERIES:
+    for series in config.f_enabled_series():   # OFF rooms are polled by nothing
         resp = client.request("GET", "/markets",
                               params={"series_ticker": series,
                                       "status": "open", "limit": 200})

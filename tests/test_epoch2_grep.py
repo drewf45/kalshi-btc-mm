@@ -49,5 +49,6 @@ def test_no_paid_command():
     # command; /paid (the waterfall payout) stays retired.
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
                                  "/scoreboard", "/clear_cash_fatal", "/daily",
-                                 "/owed")
+                                 "/owed",
+                                 "/series")   # WO-S §1: opens/parks a room, never places
     assert "/paid" not in Telegram.COMMANDS

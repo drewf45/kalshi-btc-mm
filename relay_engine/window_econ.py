@@ -389,6 +389,41 @@ class WindowEcon:
                               lane=lane, drawdown_cents=round(drawdown, 1),
                               outcomes=outcomes, book_cents=book_cents)
 
+    # WO-2026-07-26-S §2: the lanes whose per-(series,lane) halt state migrates
+    # when the roster grows past one room (bare-lane keys → series-scoped).
+    _HALT_LANES = ("F", "H8", "FLIP", "OPEN", "HUNT", "D", "P")
+
+    def migrate_halt_keys_to_series(self, default_series: str = "KXBTC15M") -> int:
+        """WO-2026-07-26-S §2 — when a SECOND room joins the roster, halt_scope
+        flips from the bare lane to '{series}:{lane}' for EVERY room (BTC too).
+        A live BTC halt persisted under the bare key must move with it, or a real
+        drawdown-halt would silently orphan. Rename the bare-lane outcomes state,
+        the halted-set entries, and any live gateway RATE_HALT:<lane> reason to
+        their {default_series}:<lane> form. Idempotent (a bare key that no longer
+        exists is skipped). Returns the count migrated."""
+        moved = 0
+        for lane in self._HALT_LANES:
+            bare = _lane_outcomes_key(lane)
+            scoped = _lane_outcomes_key(f"{default_series}:{lane}")
+            val = self.ledger.get_state(bare)
+            if val is not None and self.ledger.get_state(scoped) is None:
+                self.ledger.set_state(scoped, val)
+                self.ledger.del_state(bare)
+                moved += 1
+        # the halted-set: bare lane names → scoped
+        halted = set(json.loads(self.ledger.get_state(LANES_HALTED_KEY) or "[]"))
+        rescoped = {s if ":" in s else f"{default_series}:{s}" for s in halted}
+        if rescoped != halted:
+            self.ledger.set_state(LANES_HALTED_KEY, json.dumps(sorted(rescoped)))
+        # live gateway reasons: RATE_HALT:<lane> → RATE_HALT:<series>:<lane>
+        for r in list(self.gateway.entries_halted_reasons):
+            if r.startswith(f"{HALT_REASON}:") and r.count(":") == 1:
+                lane = r.split(":", 1)[1]
+                if lane in self._HALT_LANES:
+                    self.gateway.resume_entries(r)
+                    self.gateway.halt_entries(f"{HALT_REASON}:{default_series}:{lane}")
+        return moved
+
     def record_correlated_window(self, window_slot: str,
                                  series_pnls: dict) -> Optional[dict]:
         """WO-2026-07-26-S §2 — THE CORRELATED-LOSS RULE (RULED: "correlated risk

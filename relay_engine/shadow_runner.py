@@ -204,6 +204,8 @@ class ShadowEngine:
         # WO-2026-07-22-K: /daily — the read-only day export (one .xlsx, every
         # table, bounded to the day). Built in /tmp, sent, deleted.
         self.telegram.daily_fn = self._build_and_send_daily
+        # WO-2026-07-26-S §1: /series — the room start command (no second deploy).
+        self.telegram.series_fn = self._cmd_series
         # P22 §1.2: first-boot backfill — today's clips and round-trips are
         # not lost history (guarded + idempotent inside; never boot-fatal)
         try:
@@ -334,6 +336,48 @@ class ShadowEngine:
         self.lanes[4].p.states.pop(ticker, None)
         self.fh8_shared.ladders.pop(ticker, None)
         self.fh8_shared._cache.pop(ticker, None)
+
+    # ── WO-2026-07-26-S §1: the rooms — roster + the /series start command ──
+    def _apply_series_roster(self) -> None:
+        """Widen F's series family to the enabled roster and migrate the halt
+        keys the moment a second room joins (bare-lane → series-scoped). Called
+        at boot and after every /series change — idempotent."""
+        from . import lane_fh8
+        lane_fh8.F_SERIES_ALLOWED = set(config.f_enabled_series()) or {"KXBTC15M"}
+        if len(config.SERIES) > 1:
+            self.econ.migrate_halt_keys_to_series("KXBTC15M")
+
+    def _cmd_series(self, text: str) -> str:
+        """`/series <asset> <on|off|live|shadow>` — open or park a room without a
+        second deploy. on/live add the room to the roster at LIVE; shadow adds it
+        rehearsing; off removes it. BTC (the proven room) can never be turned
+        off from here. The global kill still governs every room."""
+        parts = text.strip().split()
+        if len(parts) < 3:
+            return ("usage: /series <asset> <on|off|live|shadow> — rooms: "
+                    + ", ".join(sorted(config.KNOWN_SERIES)) + "; live now: "
+                    + ", ".join(config.f_enabled_series()))
+        series = config.resolve_series(parts[1])
+        action = parts[2].strip().lower()
+        if series is None:
+            return f"unknown room {parts[1]!r}; known: {', '.join(sorted(config.KNOWN_SERIES))}"
+        if series == "KXBTC15M" and action in ("off",):
+            return "BTC is the proven room — it cannot be turned off from here"
+        mode = {"on": "LIVE", "live": "LIVE", "shadow": "SHADOW",
+                "off": "OFF"}.get(action)
+        if mode is None:
+            return f"unknown action {action!r}; use on|off|live|shadow"
+        config.SERIES_MODE[series] = mode
+        if mode == "OFF":
+            config.SERIES[:] = [s for s in config.SERIES if s != series]
+        elif series not in config.SERIES:
+            config.SERIES.append(series)
+        self._apply_series_roster()
+        return (f"room {series} → {mode}. roster now: "
+                f"{', '.join(config.SERIES)}; F trades: "
+                f"{', '.join(config.f_enabled_series())} "
+                f"(global {'LIVE' if config.live_submit_enabled() else 'SHADOW'} "
+                "governs all)")
 
     # ── P10 §2: poison episodes, quarantine, REST marks ─────────────────
     def note_poison_episode(self, market: str, yb, nb) -> None:
@@ -842,6 +886,9 @@ class ShadowEngine:
             print("MIGRATION (WO-Q): cleared a live f_tripwire_day flag — the "
                   "deleted day-long F suppression can no longer refuse F; the "
                   "money rate halt is the ruled governor", flush=True)
+        # WO-2026-07-26-S §1: apply the rooms — widen F's family to the enabled
+        # roster and migrate the halt keys if a second room boots in.
+        self._apply_series_roster()
         # P8 §2.3: restarts and redeploys do NOT clear the two-strike halt
         self.econ.restore_halt_on_boot()
         # P17 §1.3/§1.4: heal across restarts — reload open brackets (so the
