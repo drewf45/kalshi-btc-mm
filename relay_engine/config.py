@@ -823,6 +823,27 @@ def f_enabled_series() -> list:
     return [s for s in SERIES if series_mode(s) != "OFF"]
 
 
+def halt_scope(series: str, lane: str) -> str:
+    """WO-2026-07-26-S §2 — PER-SERIES HALTS (RULED 07-26: "each lane gets its own
+    halt"). The money rate-halt keys on (series, lane): XRP's drawdown parks XRP
+    while BTC keeps printing. With a SINGLE room the scope IS the lane — byte-
+    identical to the per-lane halt, no persisted-key migration — so the machinery
+    is in place now and the series dimension activates the moment a second room
+    joins the roster (Stage 3, which carries the key migration)."""
+    return lane if len(SERIES) <= 1 else f"{series}:{lane}"
+
+
+# WO-2026-07-26-S §2 — THE ENSEMBLE CAP (the correlated-tail governor). Total
+# SIMULTANEOUS at-risk across ALL rooms ≤ this % of TRADEABLE, at all times — one
+# summed check ABOVE the lane walls (never replacing them). Non-correlated rooms
+# could safely deploy more than one room ever could, BUT the tail is correlated:
+# a cross-crypto air-pocket is the one shock that flips every room's favorite at
+# once. This is the board condition — growth in rooms may never grow the one-shock
+# loss past this. It reuses the existing summed-deployed check (guard a), now
+# named and measured against tradeable (book − owed). RULED 2026-07-26.
+ENSEMBLE_AT_RISK_PCT = PORTFOLIO_DEPLOY_PCT   # 0.50 — the ruled ensemble ceiling
+
+
 def drew_defaults() -> dict:
     """The DREW-DEFAULT constants, for the boot tape (printed until ruled)."""
     return {

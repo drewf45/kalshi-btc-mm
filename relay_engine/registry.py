@@ -72,7 +72,7 @@ def registered_surfaces() -> set:
 SEED_SURFACES = (
     "SIZE_DECISION", "SETTLE_AUDIT", "OPEN_SKIP",
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
-    "BOOK_STALE",
+    "BOOK_STALE", "CORRELATED_LOSS",
 )
 
 
@@ -123,6 +123,14 @@ def seed() -> None:
         "trouble would INVALIDATE that and earn BOOK_STALE_OFFSET_C a derived "
         "number instead of a DREW-DEFAULT.",
         "the daily pack's endpoint-lag-by-hour line (WO-R) / threshold derivation")
+    register(
+        "CORRELATED_LOSS",
+        "How often do ≥2 rooms lose the SAME wall-clock window — the correlated tail?",
+        "VALIDATES (or shrinks) the 50% ensemble cap: the cross-crypto air-pocket "
+        "is the one shock that reaches every room at once; measured frequency and "
+        "combined size turn ENSEMBLE_AT_RISK_PCT from a DREW-DEFAULT into a DERIVED "
+        "number. Rare/small → the cap can relax; clustered/large → it tightens.",
+        "the ensemble worst-day math / ENSEMBLE_AT_RISK_PCT derivation (WO-S §2)")
 
 
 def missing_registration(active_surfaces) -> List[str]:

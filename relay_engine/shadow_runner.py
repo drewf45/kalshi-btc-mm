@@ -620,22 +620,31 @@ class ShadowEngine:
         # lever) and was the last governor nobody could name until it fired. One
         # risk, one governor: the rate halt stays; the duplicate is gone. A big
         # F loss now PAGES (F_BIG_LOSS) and never refuses the next window.
-        # WO-2026-07-23-B Part 1 guard (a): the PORTFOLIO CAP. Total deployed
-        # notional across ALL lanes may never exceed PORTFOLIO_DEPLOY_PCT of
-        # book. An entry is clamped to the room that remains (0 = refused);
-        # F and FLIP holding different markets can no longer sum past the cap.
+        # WO-2026-07-23-B guard (a) → WO-2026-07-26-S §2: THE ENSEMBLE CAP, the
+        # correlated-tail governor. Total SIMULTANEOUS at-risk across ALL rooms
+        # (deployed_cents sums every market of every series) may never exceed
+        # ENSEMBLE_AT_RISK_PCT of TRADEABLE (book_c is tradeable = book − owed).
+        # One summed check ABOVE the lane walls, never replacing them (Adversary
+        # iii). An entry is clamped to the room that remains (0 = defers with the
+        # why); F-BTC and F-XRP holding different rooms can no longer sum past
+        # the one-shock ceiling. Cross-crypto air-pockets flip every favorite at
+        # once — this is the board condition that the growth in rooms respects.
         if proposal.action == "buy" and proposal.count > 0 and book_c > 0:
-            room = int(book_c * config.PORTFOLIO_DEPLOY_PCT) \
-                - self.ledger.deployed_cents()
-            max_by_portfolio = room // max(1, proposal.price_cents)
-            if max_by_portfolio < proposal.count:
-                clamped = max(0, max_by_portfolio)
-                if clamped < proposal.count:
-                    log.warning("PORTFOLIO_CAP %s %s: %d→%d lots — deployed "
-                                "%dc + this would exceed %d%% of book %dc",
-                                proposal.lane, proposal.market, proposal.count,
-                                clamped, self.ledger.deployed_cents(),
-                                int(config.PORTFOLIO_DEPLOY_PCT * 100), book_c)
+            deployed = self.ledger.deployed_cents()
+            room = int(book_c * config.ENSEMBLE_AT_RISK_PCT) - deployed
+            max_by_ensemble = room // max(1, proposal.price_cents)
+            if max_by_ensemble < proposal.count:
+                clamped = max(0, max_by_ensemble)
+                log.warning("ENSEMBLE_CAP %s %s: %d→%d lots — deployed %dc across "
+                            "all rooms + this would exceed %d%% of tradeable %dc",
+                            proposal.lane, proposal.market, proposal.count,
+                            clamped, deployed,
+                            int(config.ENSEMBLE_AT_RISK_PCT * 100), book_c)
+                # §A1 why-on-row: the ensemble ceiling names itself on the size row.
+                proposal.why = ((proposal.why + " · ") if proposal.why else "") + (
+                    f"ensemble-cap {proposal.count}→{clamped} "
+                    f"[deployed={deployed}c ≤{int(config.ENSEMBLE_AT_RISK_PCT*100)}%"
+                    f" tradeable={book_c}c]")
                 proposal.count = clamped
         # WO-VERIFY-LOSSTERM-1 B4 → WO-2026-07-26-P §B2: the "0 → count=1, let the
         # walls refuse" path is RETIRED. A computed-0 now DEFERS at sizing
@@ -1761,7 +1770,8 @@ class ShadowEngine:
                         continue
                     # WO-2026-07-24-D Part 5: the moment a lane's gate is open,
                     # release its closed-gate latch so the NEXT halt counts fresh.
-                    if not self.gateway.entries_halted_for(lane.name):
+                    _scope = config.halt_scope(config.series_of(market), lane.name)
+                    if not self.gateway.entries_halted_for(_scope):
                         self._halt_reject_latched.discard((lane.name, market))
                     try:
                         result = self.gateway.submit(proposal, book)

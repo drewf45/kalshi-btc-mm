@@ -249,7 +249,11 @@ class Gateway:
             # one lane ("RATE_HALT:FLIP") blocks only that lane's entries; every
             # other reason (and a bare "RATE_HALT", the legacy global) blocks all
             # lanes. FLIP's losing streak must never halt F, the earner.
-            blocking = self.entries_halted_for(order.lane)
+            # WO-2026-07-26-S §2: the scope keys on (series, lane) once a second
+            # room joins — XRP-F's halt parks XRP-F, never BTC-F. One room ⇒ the
+            # scope is the bare lane (byte-identical).
+            blocking = self.entries_halted_for(
+                config.halt_scope(config.series_of(order.market), order.lane))
             if blocking:
                 raise WallRejection("ENTRIES_HALTED", ",".join(sorted(blocking)))
             if self.in_backoff(order.market):

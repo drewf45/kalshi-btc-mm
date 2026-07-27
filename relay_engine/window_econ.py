@@ -58,6 +58,19 @@ LANES_HALTED_KEY = "rate_halt_lanes"  # JSON list of currently lane-halted lanes
 def _lane_outcomes_key(lane: str) -> str:
     return f"{OUTCOMES_KEY}:{lane}"
 
+
+def combined_correlated_loss(series_pnls: dict) -> Optional[dict]:
+    """WO-2026-07-26-S §2 — the correlated-loss test, pure. Given {series:
+    pnl_cents} for the rooms that settled a shared wall-clock window, return the
+    combined-size event when ≥2 rooms LOST (the correlated tail), else None.
+    Counted ONCE at combined size — never per-room-summed twice."""
+    losers = {s: int(p) for s, p in series_pnls.items() if p < 0}
+    if len(losers) < 2:
+        return None
+    return {"series": sorted(losers),
+            "per_series": losers,
+            "combined_cents": int(sum(losers.values()))}
+
 ECON_SCHEMA = """
 CREATE TABLE IF NOT EXISTS window_econ (
     id INTEGER PRIMARY KEY,
@@ -335,6 +348,10 @@ class WindowEcon:
         # the scrape banks (subtract owed from the value handed in, don't re-read).
         drawdown_bound = config.rate_halt_drawdown_c(
             max(0, book_cents - self.ledger.owed_cents()))
+        # WO-2026-07-26-S §2: the rate halt keys on (series, lane). scope is the
+        # bare lane while one room is rostered (byte-identical) and '{series}:
+        # {lane}' with more — so XRP's drawdown parks XRP, BTC keeps printing.
+        series = config.series_of(market)
         for lane in sorted(per_lane):
             # WO-2026-07-24-C Part 2: count MONEY, not negative windows. A
             # profitable asymmetric sequence (−8,−7,+17 = +2¢) must NOT halt; a
@@ -343,18 +360,19 @@ class WindowEcon:
             # size (RATE_HALT_DRAWDOWN_C = 4·FLIP_SIZE_CAP·OPEN_MOMENTUM_STOP_C)
             # so it scales with the position and never strangles the lane it
             # protects. pnl carries the 0.1c fraction (truncation fix) — kept.
+            scope = config.halt_scope(series, lane)
             pnl = float(per_lane[lane])
-            key = _lane_outcomes_key(lane)
+            key = _lane_outcomes_key(scope)
             outcomes = json.loads(self.ledger.get_state(key) or "[]")
             outcomes.append({"market": market, "pnl": pnl})
             outcomes = outcomes[-config.RATE_HALT_WINDOW_N:]
             self.ledger.set_state(key, json.dumps(outcomes))
             drawdown = sum(o["pnl"] for o in outcomes)
-            if drawdown < -drawdown_bound and lane not in halted:
-                halted.add(lane)
+            if drawdown < -drawdown_bound and scope not in halted:
+                halted.add(scope)
                 self.ledger.set_state(LANES_HALTED_KEY,
                                       json.dumps(sorted(halted)))
-                self.gateway.halt_entries(f"{HALT_REASON}:{lane}")
+                self.gateway.halt_entries(f"{HALT_REASON}:{scope}")
                 named = ", ".join(f"{o['market']} {o['pnl']:+.0f}c"
                                   for o in outcomes)
                 retro = (f"⛔ {lane} RATE HALT (retroactive: {market} settled "
@@ -370,6 +388,37 @@ class WindowEcon:
                               f"-{drawdown_bound}c: {named}",
                               lane=lane, drawdown_cents=round(drawdown, 1),
                               outcomes=outcomes, book_cents=book_cents)
+
+    def record_correlated_window(self, window_slot: str,
+                                 series_pnls: dict) -> Optional[dict]:
+        """WO-2026-07-26-S §2 — THE CORRELATED-LOSS RULE (RULED: "correlated risk
+        is all"). Losses in ≥2 series inside the SAME wall-clock window are the
+        one shock that reaches every room at once (a cross-crypto air-pocket
+        flipping every favorite together). Count it ONCE at COMBINED size and
+        name it: it PAGES, writes a CORRELATED_LOSS surface row (the measured
+        datum that lets the 50% ensemble cap become DERIVED, not guessed), and is
+        scored against the ensemble. The per-series halts are ALREADY fed by each
+        window's own per-lane P&L (_apply_streak_per_lane) — this is the ensemble
+        marker on top, never a double-count of the per-room drawdown. Additive:
+        with one room it can never fire. Returns the event dict, or None."""
+        ev = combined_correlated_loss(series_pnls)
+        if ev is None:
+            return None
+        ev["window_slot"] = window_slot
+        self.telegram.alert(
+            f"🌐 CORRELATED LOSS — {len(ev['series'])} rooms lost the same "
+            f"window ({window_slot}): {', '.join(ev['series'])} combined "
+            f"{ev['combined_cents']:+d}¢. The one shock that reaches every room "
+            "— counted once, at combined size (WO-S §2).")
+        self.surface.write_row(
+            "ENSEMBLE", "ENGINE", f"corr-{window_slot}", "CORRELATED_LOSS",
+            detail=json.dumps(ev))
+        failures.fail("CORRELATED_LOSS",
+                      f"{len(ev['series'])} rooms lost window {window_slot}: "
+                      f"{ev['per_series']} combined {ev['combined_cents']}c",
+                      alert=False, series=",".join(ev["series"]),
+                      combined_cents=ev["combined_cents"], window_slot=window_slot)
+        return ev
 
     def reset_halt(self, confirmed_by: str = "telegram") -> str:
         """Drew's word alone. Re-enables ENTRIES only — it cannot place, amend,

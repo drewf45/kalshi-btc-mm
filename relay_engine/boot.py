@@ -106,6 +106,13 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     lines.append(f"SERIES ROOMS (WO-S): {_rooms} — one book, own dials/records "
                  "per room, same doctrine; the global kill governs all")
     lines.append(
+        f"ENSEMBLE (WO-S §2): cap {int(config.ENSEMBLE_AT_RISK_PCT * 100)}% of "
+        "tradeable — total SIMULTANEOUS at-risk across ALL rooms, one summed "
+        "check ABOVE the lane walls (defers with the why on the row); per-series "
+        "halts key on (series, lane) so one room parks itself while the others "
+        "print; the correlated tail (≥2 rooms lose one window) is counted once at "
+        "combined size — the measured datum that makes the cap derivable")
+    lines.append(
         f"RATE GOVERNOR: bucket={config.RATE_BUCKET_CAPACITY} tokens, "
         f"refill={config.RATE_REFILL_PER_SECOND}/s (printed number IS the enforced number)")
     # WO-2026-07-25-L §P1/P2 — the ruling, printed. Per-lane run mode (F LIVE,
