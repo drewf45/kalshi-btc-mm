@@ -4178,6 +4178,62 @@ untouched; the inversion protection is unchanged, narrowed to its disease. New s
 `test_watch_asks_its_question.py` (9); `test_p13_narration` divergence test re-anchored to an
 inversion (a 7¢ freshness offset no longer halts). Suite 913 · preflight 23/23.
 
+## WO-2026-07-26-S — THE SECOND ROOM (build 88, four stages, one branch)
+
+Multi-series F: the proven gates, more markets, one book. F is expanded to more SERIES, not
+more features — coverage is an ensemble property, caution is a lane property. Shipped in four
+green, pushed stages (Drew's ruling: incremental commits, each green).
+
+**Part 1c — the cold read** (`docs/S_COLD_READ.md`). On receipt of the archived multi-asset
+repo, every old-era mechanism tagged SALVAGE / SUPERSEDED / DEAD. **Headline finding (honest
+divergence from the order's premise):** the cross-asset ensemble cap and correlated-loss
+detector NEVER existed in the crypto era — the four bots were byte-identical separate processes,
+each risking 20% off the full balance with zero coordination (the blind-twins pathology §1b
+rejects). The correlated-tail governor is built FRESH; the blueprint is the weather-era
+`d_worker/budget.py` reservation ledger. Portable salvage: the counterparty-liquidity gate
+(already live in F's R2 ladder) and the XRP mechanics (KXXRP15M, 1¢ tick, maker-only, $0 fee to
+be OBSERVED, 15-min hold-to-settle, no TWAP).
+
+**Stage 1 — series as a dimension.** Every lane key becomes (series, lane); no schema migration
+because series is a COMPUTED key (`series_of(market)` = ticker prefix). config: `SERIES` roster,
+per-series `SERIES_MODE`/`series_is_live`, per-series F dial `f_notional_pct_of` (BTC 24% earned,
+new room born 20% RULED). Sibling sweep: `lane_fh8` wall-1 gate parameterized to
+`F_SERIES_ALLOWED` (default `{KXBTC15M}` → golden tape byte-identical); the dial threads into
+`sizing.size_order` via `notional_pct`; `venue.list_open_markets` iterates the roster; `lane_d`
+stays explicitly BTC-scoped (cited). `test_second_room.py` (9).
+
+**Stage 2 — the ensemble governor.** The existing guard (a) reframed as the ENSEMBLE CAP
+(`ENSEMBLE_AT_RISK_PCT` RULED 50%): total simultaneous at-risk across ALL rooms ≤ 50% of
+TRADEABLE, one summed check above the lane walls, defers with the why on the row. Per-series
+halts: `halt_scope(series, lane)` — the rate halt keys on (series, lane); with one room the scope
+is the bare lane (byte-identical, zero migration), `{series}:{lane}` with more. Correlated-loss
+rule: `combined_correlated_loss` / `record_correlated_window` — ≥2 rooms losing one wall-clock
+window counted ONCE at combined size, paged + a CORRELATED_LOSS registry question (the measured
+datum that derives the cap). `test_ensemble_governor.py` (7).
+
+**Stage 3 — the XRP room.** `/series <asset> on|off|live|shadow` (the start command, no second
+deploy) → `engine._cmd_series`: opens/parks a room, widens F's family, migrates the halt keys the
+moment a second room joins (`migrate_halt_keys_to_series` — a live BTC halt survives the roster
+growing, real-money safety). BTC cannot be turned off from here; the global kill governs all.
+Discovery iterates `f_enabled_series()` (OFF rooms polled by nothing). Pack: `series_chapter_lines`
+— one block per room with the FIRST-DAY MECHANICS WATCHLIST for a new room (maker $0 observed on
+its own tape, settlement attribution, tick/strike — pages, never pre-blocks). The counterparty
+gate (Part 3 item 2) is already live in F's R2 ladder. `test_second_room_open.py` (8); the
+command-whitelist tests updated for `/series`.
+
+**Acceptance (`test_second_room_acceptance.py`, 7).** #1 boot banner carries per-room modes/dials,
+the ensemble cap, and the build-88 PROFILE; XRP's chapter renders once the room opens. #2 (series,
+lane) is a computed key — no row migration; hardcoded-BTC sites parameterized (F gate) or
+explicitly BTC-scoped (D). #3 ensemble cap defers-with-why; correlated-window losses count once at
+combined size. #4 (SUPERSEDED by Drew's live-day-one ruling — the ghost/tuition graduation is
+replaced by the first-day mechanics watchlist + the room's own halt) the watchlist is present and
+never pre-blocks. #5 **BTC's F path byte-identical** — the BTC room dial equals the earned
+constant, the golden tape is green, `F_SERIES_ALLOWED` defaults BTC-only. #6 scrape/salvage/
+sentinels shared — one hwm, one owed; `owed_cents`/`tradeable_cents` take no series argument (the
+BOOK is the unit of stewardship). Suite 944 · preflight 23/23. **XRP opens via `/series xrp on`
+(or `SERIES_LIST=KXBTC15M,KXXRP15M`) — the default roster stays BTC-only so the printing room
+keeps printing until Drew opens the second.**
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
