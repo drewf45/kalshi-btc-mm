@@ -84,7 +84,11 @@ def size_order(book_cents: int, price_cents: int,
         # F's dial: notional = pct of book, bounded by depth only. Kelly and
         # the count cap do NOT bind F (the whole point of the WO). count=1
         # floor is applied by the caller (_score_and_size), as before.
-        notional_max = int(book_cents * config.F_NOTIONAL_PCT // price_cents)
+        # WO-2026-07-26-S: the caller passes the ROOM's dial via notional_pct
+        # (f_notional_pct_of series). Absent → the earned BTC F_NOTIONAL_PCT, so
+        # the BTC F path is byte-identical.
+        f_dial = notional_pct if notional_pct is not None else config.F_NOTIONAL_PCT
+        notional_max = int(book_cents * f_dial // price_cents)
         contracts = min(notional_max, depth_max)
         bound = "notional" if notional_max <= depth_max else "depth"
         return SizeDecision(

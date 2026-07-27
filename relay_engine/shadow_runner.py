@@ -558,8 +558,15 @@ class ShadowEngine:
                     alert_fn=self.telegram.alert)
             except Exception:
                 flip_pct = None    # sizing never blocks — tuition is the safe floor
+        # WO-2026-07-26-S: F sizes to its ROOM's dial. BTC keeps its earned 24%
+        # (f_notional_pct_of("KXBTC15M") == F_NOTIONAL_PCT → byte-identical); a new
+        # room is born at 20% until its own record argues. FLIP keeps its ladder pct.
+        if proposal.lane == "F":
+            size_pct = config.f_notional_pct_of(config.series_of(proposal.market))
+        else:
+            size_pct = flip_pct
         dec = size_order(book_c, proposal.price_cents, depth,
-                         lane=proposal.lane, notional_pct=flip_pct)
+                         lane=proposal.lane, notional_pct=size_pct)
         proposal.size_tier = tier   # reporting + custody scaling, never a cap
         # WO-2026-07-26-P §B2: a 0 does NOT silently become a 1. If the math
         # produced no size, the proposal DEFERS with the full term set — a 1-lot

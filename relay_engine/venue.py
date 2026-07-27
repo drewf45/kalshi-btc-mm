@@ -236,17 +236,24 @@ def get_market(client: KalshiClient, ticker: str) -> Dict:
 
 
 def list_open_markets(client: KalshiClient) -> List[Dict]:
-    """F1a: all open series markets (signed REST) — the subscription's ground
-    truth at connect and on the 60s rediscovery sweep."""
-    resp = client.request("GET", "/markets",
-                          params={"series_ticker": SERIES_TICKER,
-                                  "status": "open", "limit": 200})
-    mkts = resp.get("markets", []) if isinstance(resp, dict) else []
+    """F1a: all open markets across EVERY rostered series (signed REST) — the
+    subscription's ground truth at connect and on the 60s rediscovery sweep.
+
+    WO-2026-07-26-S §1: discovery iterates config.SERIES (the roster of rooms),
+    one signed call per series. The roster is BTC-only until a second room opens,
+    so this is byte-identical until then; when KXXRP15M joins the roster, its open
+    markets flow into the same lifecycle with no other change. Series-scoped
+    queries keep each room's markets attributable at the source."""
     out = []
-    for m in mkts:
-        ticker = m.get("ticker") or m.get("market_ticker", "")
-        if ticker and resolve_close_ts(m, ticker) is not None:
-            out.append(m)
+    for series in config.SERIES:
+        resp = client.request("GET", "/markets",
+                              params={"series_ticker": series,
+                                      "status": "open", "limit": 200})
+        mkts = resp.get("markets", []) if isinstance(resp, dict) else []
+        for m in mkts:
+            ticker = m.get("ticker") or m.get("market_ticker", "")
+            if ticker and resolve_close_ts(m, ticker) is not None:
+                out.append(m)
     return out
 
 

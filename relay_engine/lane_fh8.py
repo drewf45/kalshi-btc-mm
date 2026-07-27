@@ -54,6 +54,12 @@ WATCH_WINDOW_SEC = 900
 CANCEL_BEFORE_EXPIRY_SEC = 10
 POLL_INTERVAL_SEC = 5
 MAX_REPRICES_LOW_BAND = 1
+# WO-2026-07-26-S: the series family F trades. Defaults to BTC-only so the port
+# stays byte-identical to the vendored LIVE k_worker (the golden tape replays BTC
+# tapes); the engine widens this at boot to config.f_enabled_series() when a
+# second room opens (Stage 3). Kept a module global (not a config import) so this
+# ported module stays pure — its source of truth is the vendored engine, not config.
+F_SERIES_ALLOWED = {"KXBTC15M"}
 
 CONFIRM_LADDER = [
     {"lo_sec": 600, "hi_sec": 900, "floor_cents": 99, "confirms": 9},
@@ -186,11 +192,16 @@ def evaluate(ticker: str, book: TouchBook, secs_to_expiry: float,
     Walls byte-identical to k_worker/gateway.py::evaluate, except D1
     (tradeable = cash_usd, EPOCH 2) and D4 (stats adapter)."""
 
-    # Wall 1: KXBTC15M only
-    if not ticker.startswith("KXBTC15M"):
+    # Wall 1: series family. WO-2026-07-26-S — F is series-portable by design
+    # (Part 0): the gate widens from a BTC literal to the rostered family set.
+    # F_SERIES_ALLOWED defaults to {"KXBTC15M"} so BTC decisions (and the golden
+    # tape, which replays BTC tapes) are byte-identical; the engine widens it at
+    # boot to config.f_enabled_series() when a second room opens. series =
+    # ticker prefix before the first '-'.
+    if ticker.split("-", 1)[0] not in F_SERIES_ALLOWED:
         return EvalResult(
             allowed=False, reject_code="WRONG_FAMILY",
-            reject_reason=f"Not KXBTC15M: {ticker}",
+            reject_reason=f"series not enabled for F: {ticker}",
         )
 
     # Determine favorite side

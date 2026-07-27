@@ -746,6 +746,82 @@ API_PREFIX = os.getenv("KALSHI_API_PREFIX", "/trade-api/v2").rstrip("/")
 WS_URL = os.getenv("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
 SERIES_TICKER = os.getenv("SERIES", "KXBTC15M")
 
+# ---------------------------------------------------------------------------
+# WO-2026-07-26-S "THE SECOND ROOM" §1 — SERIES AS A DIMENSION, NOT A FORK.
+# One repo, one process, one gateway, one ledger, one Telegram, one pack. Every
+# lane key becomes (series, lane): F-BTC and F-XRP are siblings sharing ALL
+# doctrine code and NONE of their records. SERIES is the ordered roster of rooms
+# that discovery iterates; series_of(market) is the ONE canonical market→series
+# map. Explicitly rejected (the old era's four-bots pattern): copying the repo
+# per series — four ledgers was how the legacy era lost track of truth (§1b).
+# ---------------------------------------------------------------------------
+# The roster default is BTC-ONLY through Stage 1/2 (the dimension + the ensemble
+# governor land first, BTC byte-identical); Stage 3 adds KXXRP15M when the XRP
+# room's config, gate, and pack chapter are all in place. Override with SERIES_LIST.
+SERIES = [s.strip() for s in os.getenv(
+    "SERIES_LIST", "KXBTC15M").split(",") if s.strip()]
+
+
+def series_of(market: str) -> str:
+    """THE canonical market→series map: the ticker prefix before the first '-'
+    (Kalshi tickers are 'KXBTC15M-25JAN...'; series is 'KXBTC15M'). The ONE
+    place a market names its room — every (series, lane) key derives from here."""
+    return market.split("-", 1)[0] if market else ""
+
+
+# Per-series MODE (OFF | SHADOW | LIVE). The global kill (RUN_MODE /
+# I_UNDERSTAND_LIVE, §B3) still rules everything; a per-series mode can only
+# RESTRICT below it, never widen it (the LANE_MODE precedent, WO-L). BTC is the
+# proven room; XRP is BORN LIVE at its own dial (Drew 07-26 RULING: "no ghost
+# phase — one room per day, LIVE at full per-series size, each with its own
+# halt") — but the global-SHADOW born state forces every room to shadow until
+# Drew arms the account. OFF = a room not discovered or traded at all.
+SERIES_MODE = {
+    "KXBTC15M": os.getenv("SERIES_MODE_BTC", "LIVE").upper(),
+    "KXXRP15M": os.getenv("SERIES_MODE_XRP", "LIVE").upper(),
+}
+SERIES_MODE_DEFAULT = "OFF"    # an unrostered series does nothing (conservative)
+
+
+def series_mode(series: str) -> str:
+    return SERIES_MODE.get(series, SERIES_MODE_DEFAULT)
+
+
+def series_is_live(series: str) -> bool:
+    """A room places live orders ONLY when the global kill is off AND the room's
+    own mode is LIVE. Per-series can only restrict below the global."""
+    return live_submit_enabled() and series_mode(series) == "LIVE"
+
+
+def series_books_shadow(series: str) -> bool:
+    """Does this room's outcome book to the SHADOW ledger? In a LIVE run a room
+    that is not itself LIVE rehearses; in a global-SHADOW run every room is one
+    paper ledger (the born state)."""
+    return live_submit_enabled() and not series_is_live(series)
+
+
+# Per-series F NOTIONAL DIAL. BTC keeps its earned 24%; every NEW series is born
+# at 20% (RULED 2026-07-26 WO-S) — "until the record argues": the ladder may
+# raise a room above 20 only on its OWN Wilson record, and demotes it instantly
+# on its own tape. The dial threads into sizing.size_order via notional_pct, so
+# F-BTC sizing is byte-identical (KXBTC15M → F_NOTIONAL_PCT, unchanged).
+NEW_SERIES_F_DIAL = 0.20           # RULED(2026-07-26 WO-S): a new room is born here
+
+
+def f_notional_pct_of(series: str) -> float:
+    """The F notional dial for a room. BTC = the earned F_NOTIONAL_PCT (0.24);
+    any other series = the born-at 20% until its own record argues."""
+    if series == "KXBTC15M":
+        return F_NOTIONAL_PCT
+    return NEW_SERIES_F_DIAL
+
+
+def f_enabled_series() -> list:
+    """The rostered series F is allowed to trade — every SERIES whose mode is not
+    OFF. The engine widens lane_fh8.F_SERIES_ALLOWED to this at boot; a room set
+    OFF is discovered by nothing and traded by no lane."""
+    return [s for s in SERIES if series_mode(s) != "OFF"]
+
 
 def drew_defaults() -> dict:
     """The DREW-DEFAULT constants, for the boot tape (printed until ruled)."""
@@ -829,6 +905,9 @@ def constant_tags() -> list:
         ConstantTag("ORIENTATION_GROSS_DIVERGENCE_C", DREW_DEFAULT,
                     "pending derivation from endpoint-lag-by-hour",
                     ORIENTATION_GROSS_DIVERGENCE_C, _NEW),
+        # WO-S: a new room is born at 20% F notional until its own record argues.
+        ConstantTag("NEW_SERIES_F_DIAL", RULED, "2026-07-26 WO-S (born-at, per-series)",
+                    NEW_SERIES_F_DIAL, _NEW),
     ]
 
 

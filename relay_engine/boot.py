@@ -96,6 +96,15 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     # declared writer carries a complete question (WARN 24h, then FATAL).
     from . import registry as _registry
     lines.append(_registry.assert_writers_registered())
+    # WO-2026-07-26-S §1 — THE ROOMS. One process, one book; every lane key is
+    # (series, lane). Each room prints its mode and its F dial. (The ensemble cap
+    # and per-series halts join this banner in Stage 2; XRP joins the roster in
+    # Stage 3.)
+    _rooms = " · ".join(
+        f"{s} {config.series_mode(s)} F@{config.f_notional_pct_of(s):.0%}"
+        for s in config.SERIES)
+    lines.append(f"SERIES ROOMS (WO-S): {_rooms} — one book, own dials/records "
+                 "per room, same doctrine; the global kill governs all")
     lines.append(
         f"RATE GOVERNOR: bucket={config.RATE_BUCKET_CAPACITY} tokens, "
         f"refill={config.RATE_REFILL_PER_SECOND}/s (printed number IS the enforced number)")
