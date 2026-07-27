@@ -4142,6 +4142,42 @@ salvage/scrape byte-identical** — `lane_fh8` untouched; this order deletes, it
 `test_scale_f` tripwire tests re-anchored to the deletion; `test_swing_gate_event` mock cleaned.
 Suite 903 · preflight 23/23.
 
+## WO-2026-07-26-R — THE WATCH ASKS ITS OWN QUESTION (build 87)
+
+**Read-rule.** Verified at source: the post-entry watch arms per entry (shadow_runner.py:715,
+`divergence_watches[market] = {until, strikes}`) and its check (1471-1503) halted on
+`abs(ours − rec) > 3` sustained x3 → `ORIENTATION_DIVERGENCE`, where `rec` is a FRESH
+market-record read from a different endpoint than the orderbook. The correct inversion detector
+already exists: `_mirror_signature` (shadow_runner.py:1300-1302, `abs(ours−rec) > 10 and
+abs(ours−(100−rec)) ≤ 3` — the WO cited 1309-1311; honest line divergence, logic matches). On
+quiet books the summary endpoint lags the orderbook by a spread routinely → Sunday's two halts
+(y30-vs-y26, a 4¢ offset) were freshness noise wearing an orientation alarm. Why-Law class: right
+sentinel, wrong question.
+
+**The change.** The halt condition is now `_mirror_signature(ours, rec)` (inversion) OR a gross
+non-mirror gap (`≥ ORIENTATION_GROSS_DIVERGENCE_C`=15¢, DREW-DEFAULT), each sustained x3 — the
+cases that actually mean our read can't be trusted. A small sub-gross, non-mirror offset
+(`> BOOK_STALE_OFFSET_C`=3¢) demotes to `BOOK_STALE`: both values logged (Article 1), a feed
+resync request (`feed.resync_needed.add`), counted by UTC hour in the daily pack
+(`ops.book_stale_by_hour`) — the registry question (`registry.py` BOOK_STALE: endpoint-lag by
+hour) that makes the tolerance derivable — and the halt strikes RESET (a stale read is affirmative
+evidence the book is not inverted). Auto-recovery (the `≤3¢`-agreement resume), the
+ORIENTATION_HALT_STUCK page, and /reset_halt are untouched. Both thresholds tagged NEW in the
+WO-P constant table.
+
+**Acceptance.** #1 Sunday's y30-vs-y26 replays as BOOK_STALE + resync across three checks, no
+halt, entries continue (`test_tonights_y30_vs_y26_is_book_stale_not_a_halt`). #2 synthetic
+inversion (ours 30, record 70 — exact mirror) → HALT x3, ceiling armed, auto-recovery on a clean
+fresh read intact (`test_synthetic_inversion_halts_x3_and_arms_recovery`,
+`test_inversion_auto_recovers_on_a_clean_fresh_read`). #3 gross non-mirror gap (ours 30, record
+50 = 20¢) → HALT — the unknown-unknown catch (`test_gross_non_mirror_divergence_halts`). #4 pack
+counts BOOK_STALE by hour, both constants tagged NEW, the check reuses `_mirror_signature`
+(`test_pack_counts_book_stale_by_hour`, `test_both_constants_tagged_and_new_this_deploy`,
+`test_the_watch_reuses_the_existing_mirror_detector`). **F path byte-identical** — `lane_fh8`
+untouched; the inversion protection is unchanged, narrowed to its disease. New suite
+`test_watch_asks_its_question.py` (9); `test_p13_narration` divergence test re-anchored to an
+inversion (a 7¢ freshness offset no longer halts). Suite 913 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

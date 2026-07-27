@@ -393,6 +393,14 @@ PV_TOLERANCE_C = 20  # DREW-DEFAULT: max venue-pv vs deployed_cents gap to trust
 # 161 minutes of dead time on two occasions). This is the hard ceiling: a halt
 # stuck longer than this pages ORIENTATION_HALT_STUCK rather than sitting silent.
 ORIENTATION_HALT_MAX_S = 900   # DREW-DEFAULT: ~11 windows — a stuck halt must page, not wait
+# WO-2026-07-26-R: the post-entry watch asks the RIGHT question. It halts only on
+# what actually means "our book read can't be trusted" — an INVERSION (the mirror
+# signature, _mirror_signature) or a GROSS non-mirror gap. A small sub-gross
+# offset is the market-summary endpoint LAGGING the orderbook by a spread on a
+# quiet book (freshness noise, not orientation): it demotes to BOOK_STALE info +
+# a resync request, counted by hour so the tolerance becomes derivable.
+BOOK_STALE_OFFSET_C = 3            # DREW-DEFAULT(pending derivation): offset above this but sub-gross, non-mirror = endpoint lag, not a halt
+ORIENTATION_GROSS_DIVERGENCE_C = 15  # DREW-DEFAULT(pending derivation): a non-mirror gap this wide means the read is untrustworthy — halt
 # WO-2026-07-24-D Part 4: a run of deferred/unreadable reconciles this long with
 # NO clean venue cross-check pages RECON_STALLED — "nothing pending" must be
 # distinguishable from "the check has not run in an hour" (the operator had no
@@ -815,6 +823,12 @@ def constant_tags() -> list:
         # WO-Q: retagged DREW-DEFAULT→RULED — no longer a governor, the page threshold.
         ConstantTag("F_EVENT_TRIPWIRE_C", RULED, "2026-07-26 WO-Q (F_BIG_LOSS page only)",
                     F_EVENT_TRIPWIRE_C, 60),
+        # WO-R: the orientation watch's two thresholds (NEW this deploy).
+        ConstantTag("BOOK_STALE_OFFSET_C", DREW_DEFAULT,
+                    "pending derivation from endpoint-lag-by-hour", BOOK_STALE_OFFSET_C, _NEW),
+        ConstantTag("ORIENTATION_GROSS_DIVERGENCE_C", DREW_DEFAULT,
+                    "pending derivation from endpoint-lag-by-hour",
+                    ORIENTATION_GROSS_DIVERGENCE_C, _NEW),
     ]
 
 

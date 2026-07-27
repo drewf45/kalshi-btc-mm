@@ -270,6 +270,33 @@ def restated_money_lines(ledger) -> list:
     ]
 
 
+def book_stale_by_hour(ledger) -> list:
+    """WO-2026-07-26-R: the orientation watch's registry question, answered —
+    endpoint-lag (BOOK_STALE) counts by UTC hour. The market-summary endpoint
+    trails the orderbook by a spread on quiet books; if weekday data shows the
+    offsets clustering with real trouble, BOOK_STALE_OFFSET_C gets a DERIVED
+    number instead of a DREW-DEFAULT. Read-only; a demoted alarm, never a halt."""
+    try:
+        rows = ledger.db.execute(
+            "SELECT strftime('%H', ts, 'unixepoch') AS hr, COUNT(*), "
+            " MAX(json_extract(how_json,'$.offset')) "
+            "FROM failures WHERE why_tag='BOOK_STALE' GROUP BY hr ORDER BY hr"
+        ).fetchall()
+    except Exception as e:
+        return [f"BOOK_STALE (endpoint lag): unavailable ({e})"]
+    if not rows:
+        return ["BOOK_STALE (endpoint lag, WO-R): none — the watch never demoted "
+                "a read this window (no halt, no lag noise)"]
+    total = sum(n for _, n, _ in rows)
+    by_hr = " ".join(f"{hr}h:{n}" for hr, n, _ in rows)
+    worst = max((mx or 0) for _, _, mx in rows)
+    return [f"BOOK_STALE (endpoint lag, WO-R): {total} demoted read(s) — never "
+            f"halted; by UTC hour {by_hr}; worst offset {worst}¢ "
+            f"(threshold {config.BOOK_STALE_OFFSET_C}¢, gross halt "
+            f"≥{config.ORIENTATION_GROSS_DIVERGENCE_C}¢). Clustering with real "
+            "trouble → the threshold earns a DERIVED number."]
+
+
 def fill_economics(ledger, lanes=("FLIP", "F", "HUNT")) -> list:
     """WO-DAILY-PACK-FILL-ECON (build 47): read-only fill economics per lane —
     what we paid to enter, what we sold at, the gross spread, fees, the NET
@@ -843,6 +870,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(fill_economics(ledger))
     except Exception as e:
         lines.append(f"FILL ECONOMICS: unavailable ({e})")
+    # WO-2026-07-26-R: endpoint-lag (BOOK_STALE) by hour — the registry answer.
+    try:
+        lines.extend(book_stale_by_hour(ledger))
+    except Exception as e:
+        lines.append(f"BOOK_STALE: unavailable ({e})")
     # WO-2026-07-26-P §A3: the data-question registry rides the pack — every
     # surface with its question and last-read; unread>14d pages DATA_WITHOUT_
     # QUESTION. The pack IS a read of these surfaces, so stamp them read here.

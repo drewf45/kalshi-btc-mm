@@ -225,16 +225,18 @@ def test_settlement_cross_check_flags_suspect(engine):
 
 def test_divergence_watch_halts_after_three_strikes(engine, monkeypatch):
     """WO-HALT-ORPHAN §2C: the strike is cast by a FRESH record (re-pulled),
-    never a stale one — a movement-lag stale record can no longer force a
-    false halt. Here the fresh record still diverges 7¢, so 3 strikes halt
-    (and §1.3: the halt stamps its market for auto-recovery)."""
+    never a stale one. WO-2026-07-26-R: the strike is cast only by what actually
+    means our read can't be trusted — here a real INVERSION (ours y45 vs record
+    y57: 100−57=43 ≈ 45, the mirror signature) — so 3 strikes halt (and §1.3:
+    the halt stamps its market for auto-recovery). A mere freshness offset no
+    longer strikes (that path is exercised in test_watch_asks_its_question)."""
     engine.feed.handle_frame(json.dumps(
         {"type": "orderbook_snapshot",
          "msg": {"market_ticker": TICKER, "yes": [[45, 10]], "no": [[30, 10]]}}),
         now=1000.0)
-    # a FRESH record 7c apart (yes_bid 52 vs ours 45) casts the strike
+    # a FRESH record that is the mirror of ours (inverted book): 100−57=43 ≈ 45
     monkeypatch.setattr(engine, "_fresh_record_touches",
-                        lambda market: (52, 55))
+                        lambda market: (57, 59))
     engine._on_fill_booked(entry_order(), "ENTRY", 46, 1, 1000.0, 0)
     assert TICKER in engine.divergence_watches
     for i in range(3):

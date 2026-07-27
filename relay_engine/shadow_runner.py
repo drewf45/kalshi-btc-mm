@@ -1481,8 +1481,22 @@ class ShadowEngine:
             rec = fresh[0] if fresh is not None else None
             if rec is None:
                 continue
-            if abs(ours - rec) > 3:
+            # WO-2026-07-26-R: the watch asks its OWN question. It halts ONLY on
+            # what actually means "our book read can't be trusted": an INVERSION
+            # (the mirror signature the codebase already owns) or a GROSS non-
+            # mirror gap. A small sub-gross offset is the market-summary endpoint
+            # LAGGING the orderbook by a spread on a quiet book — freshness noise
+            # wearing an orientation alarm (tonight's two halts). That demotes to
+            # BOOK_STALE info + a resync request, counted by hour, NEVER a halt.
+            offset = abs(ours - rec)
+            inversion = self._mirror_signature(ours, rec)
+            gross = (not inversion
+                     and offset >= config.ORIENTATION_GROSS_DIVERGENCE_C)
+            if inversion or gross:
                 w["strikes"] += 1
+                kind = ("INVERSION (mirror signature)" if inversion
+                        else f"GROSS ≥{config.ORIENTATION_GROSS_DIVERGENCE_C}¢ "
+                             "non-mirror")
                 if w["strikes"] >= 3:
                     del self.divergence_watches[market]
                     self.gateway.halt_entries("ORIENTATION_DIVERGENCE")
@@ -1490,15 +1504,31 @@ class ShadowEngine:
                     self._orientation_halt_ts = now   # Part 3: arm the ceiling
                     self.telegram.alert(
                         f"⛔ ORIENTATION_DIVERGENCE {market}: ours y{ours}¢ vs "
-                        f"FRESH record y{rec}¢ >3¢ x3 — entries HALTED "
+                        f"FRESH record y{rec}¢ — {kind} x3 — entries HALTED "
                         "(auto-recovers on the first live market that reads "
                         "clean; pages if stuck)")
                     failures.fail("ORIENTATION_DIVERGENCE",
                                   f"{market}: ours {ours}¢ vs FRESH record "
-                                  f"{rec}¢ diverged 3 consecutive checks "
+                                  f"{rec}¢ — {kind} on 3 consecutive checks "
                                   f"post-entry",
                                   market=market, ours=ours, record=rec,
-                                  alert=False)
+                                  kind=kind, offset=offset, alert=False)
+            elif offset > config.BOOK_STALE_OFFSET_C:
+                # Endpoint lag, not inversion. A stale read is AFFIRMATIVE
+                # evidence this is not an inverted book — reset the halt strikes,
+                # log both values (Article 1), request a resync, count for the
+                # pack. A 4¢ offset can never be an inverted book (Adversary).
+                w["strikes"] = 0
+                self.feed.resync_needed.add(market)
+                failures.fail(
+                    "BOOK_STALE",
+                    f"{market}: ours y{ours}¢ vs FRESH record y{rec}¢ (offset "
+                    f"{offset}¢, sub-gross, non-mirror) — the summary endpoint "
+                    "lags the orderbook by a spread on a quiet book; resync "
+                    "requested, entries continue (WO-R: not a halt)",
+                    market=market, ours=ours, record=rec, offset=offset,
+                    hour=int(time.strftime("%H", time.gmtime(now))),
+                    alert=False)
             else:
                 w["strikes"] = 0
 

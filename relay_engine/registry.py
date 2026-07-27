@@ -72,6 +72,7 @@ def registered_surfaces() -> set:
 SEED_SURFACES = (
     "SIZE_DECISION", "SETTLE_AUDIT", "OPEN_SKIP",
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
+    "BOOK_STALE",
 )
 
 
@@ -114,6 +115,14 @@ def seed() -> None:
         "VALIDATES the Wilson size ladder — a tier moves on the cell's OWN "
         "bars, never a ruling; a stale tier INVALIDATES the size it authorizes.",
         "sizing tiering / custody cut-scaling / the scoreboard")
+    register(
+        "BOOK_STALE",
+        "How far, and when, does the market-summary endpoint lag the orderbook?",
+        "VALIDATES that the post-entry watch's small offsets are endpoint LAG "
+        "(freshness noise), not orientation inversion — clustering with real "
+        "trouble would INVALIDATE that and earn BOOK_STALE_OFFSET_C a derived "
+        "number instead of a DREW-DEFAULT.",
+        "the daily pack's endpoint-lag-by-hour line (WO-R) / threshold derivation")
 
 
 def missing_registration(active_surfaces) -> List[str]:
