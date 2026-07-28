@@ -141,6 +141,9 @@ class Gateway:
         self.backoff_until: Dict[str, float] = {}
         self.reject_counts: Dict[str, int] = {}
         self.venue_rejects = 0
+        # WO-2026-07-27-V B1: markets already paged BALANCE_REJECTED this window
+        # (the ticker rolls each window → one page per window per market).
+        self._balance_rejected: set = set()
         # P10 §4: wall-reject backoff — identical ENTRY re-proposals rest 30s.
         # Keyed (lane, market) holding (tag, fingerprint, until); the
         # fingerprint includes the touch, so a moved book re-opens the door.
@@ -380,6 +383,31 @@ class Gateway:
             self.note_backoff(order.market)
             err = str(e)
             definitive = "HTTP 4" in err and "HTTP 429" not in err
+            # WO-2026-07-27-V B1 — INSUFFICIENT BALANCE SCREAMS. A lane silently
+            # dying at the venue for hours is its own Article-2 violation (the
+            # February live-balance law had this missing half). A rejection whose
+            # error EXPLICITLY says insufficient funds PAGES loudly, once per
+            # window (the market ticker rolls each window → natural dedup), with
+            # the cost and the last confirmed venue cash. Keyed on the venue's
+            # explicit insufficient-funds text only — a transient 500 never pages
+            # this (Adversary ii).
+            if self._is_balance_error(err) and order.market not in self._balance_rejected:
+                self._balance_rejected.add(order.market)
+                cost = order.count * order.price_cents
+                try:
+                    conf = self.ledger.get_state("last_venue_cash_cents")
+                    conf_s = f"{int(conf)}c" if conf is not None else "unknown"
+                except Exception:
+                    conf_s = "unknown"
+                failures.fail(
+                    "BALANCE_REJECTED",
+                    f"{order.lane} {config.series_of(order.market)} "
+                    f"{order.market}: the venue REFUSED the order for insufficient "
+                    f"funds (cost {cost}c, last confirmed venue cash {conf_s}) — a "
+                    "lane dying silently is its own alarm; the book may be a "
+                    "phantom, restart to re-base (WO-V B1)",
+                    fatal=False, alert=True, lane=order.lane,
+                    series=config.series_of(order.market), cost_cents=cost)
             failures.fail("VENUE_REJECTED" if definitive else "VENUE_AMBIGUOUS",
                           f"{order.lane} {order.market} {order.side}@{order.price_cents}c: {err[:200]}",
                           lane=order.lane, market=order.market)
@@ -505,6 +533,15 @@ class Gateway:
     # scoped; everything else (LANE_KILL:*, ORIENTATION_DIVERGENCE, cash-fatal,
     # a bare RATE_HALT) is global and blocks every lane.
     RATE_HALT_SCOPE_PREFIX = "RATE_HALT:"
+
+    @staticmethod
+    def _is_balance_error(err: str) -> bool:
+        """WO-2026-07-27-V B1: True only when the venue error EXPLICITLY names
+        insufficient funds/balance — not a transient 500/429/timeout. Keys on the
+        venue's own insufficient-funds language so a flaky venue never manufactures
+        a false BALANCE_REJECTED page (Adversary ii)."""
+        e = err.lower()
+        return "insufficient" in e and ("balance" in e or "fund" in e)
 
     def _reason_blocks_lane(self, reason: str, lane) -> bool:
         if reason.startswith(self.RATE_HALT_SCOPE_PREFIX):

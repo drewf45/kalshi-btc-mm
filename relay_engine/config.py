@@ -406,6 +406,18 @@ ORIENTATION_GROSS_DIVERGENCE_C = 15  # DREW-DEFAULT(pending derivation): a non-m
 # distinguishable from "the check has not run in an hour" (the operator had no
 # way to tell a verified book from an unverified one).
 RECON_STALL_STREAK = 10        # DREW-DEFAULT: consecutive un-cross-checked cycles before it pages
+# WO-2026-07-27-V T1: the SLEEPING-SENTINEL backstop. RECON_STALL_STREAK only
+# counts UN-cross-checked defers (unreadable / pv-boundary); a QUIESCENCE defer
+# (resting/unsettled busy) was treated as benign and never advanced it — so a
+# two-room engine that never goes quiet silently never reconciled (the ~$45
+# withdrawal walked past every guard). This is a WALL-CLOCK backstop: the book
+# has not been verified against the venue in this long, for ANY reason → page
+# RECON_STARVED, so quiescence starvation can never be silent again.
+RECON_MAX_QUIET_S = 1800       # DREW-DEFAULT: 30 min unverified → RECON_STARVED (quiescence or stall)
+# WO-2026-07-27-V B2: the sanity clamp's staleness threshold. A live confirmed
+# venue-cash read older than this is not solvent evidence — blind is not solvent,
+# so it defers everything and pages rather than sizing off a stale number.
+CASH_CONFIRM_MAX_AGE_S = 1800  # DREW-DEFAULT: 30 min — a confirmed venue cash older than this defers + pages
 
 # ---------------------------------------------------------------------------
 # Walls (C.3 / BUILD_SEQUENCE 3.2)
@@ -946,6 +958,11 @@ def constant_tags() -> list:
         # WO-S: a new room is born at 20% F notional until its own record argues.
         ConstantTag("NEW_SERIES_F_DIAL", RULED, "2026-07-26 WO-S (born-at, per-series)",
                     NEW_SERIES_F_DIAL, _NEW),
+        # WO-V: the sleeping-sentinel backstops (NEW this deploy).
+        ConstantTag("RECON_MAX_QUIET_S", DREW_DEFAULT, "pending derivation from recon cadence",
+                    RECON_MAX_QUIET_S, _NEW),
+        ConstantTag("CASH_CONFIRM_MAX_AGE_S", DREW_DEFAULT, "pending derivation",
+                    CASH_CONFIRM_MAX_AGE_S, _NEW),
     ]
 
 

@@ -73,6 +73,7 @@ SEED_SURFACES = (
     "SIZE_DECISION", "SETTLE_AUDIT", "OPEN_SKIP",
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
     "BOOK_STALE", "CORRELATED_LOSS", "NO_COUNTERPARTY",
+    "RECON_CADENCE", "BALANCE_REJECTED",
 )
 
 
@@ -141,6 +142,22 @@ def seed() -> None:
         "afternoon has no counterparties and SHOULD starve (the gate telling the "
         "truth about the room, WO-T Guard 1).",
         "the daily pack's counterparty-by-series/hour line / XRP go/no-go read")
+    register(
+        "RECON_CADENCE",
+        "Is the cash sentinel actually running — how many clean reconciles per hour?",
+        "VALIDATES that the book is being verified against the venue; a run of "
+        "hours with 0 clean reads is quiescence starvation — the sentinel asleep "
+        "(the ~$45-withdrawal condition). INVALIDATES any belief that a quiet "
+        "engine is a verified one (WO-V T1).",
+        "the daily pack's RECON CADENCE line / RECON_STARVED page")
+    register(
+        "BALANCE_REJECTED",
+        "Is a lane silently dying at the venue for insufficient funds?",
+        "VALIDATES that the venue's refusal channel is heard: a lane whose orders "
+        "the venue refuses for insufficient balance is a phantom-book signal, "
+        "paged once per window — a lane dying silently is its own Article-2 "
+        "violation (WO-V B1). Never fires on a transient venue 500.",
+        "the BALANCE_REJECTED page / the phantom-book restart decision")
 
 
 def missing_registration(active_surfaces) -> List[str]:

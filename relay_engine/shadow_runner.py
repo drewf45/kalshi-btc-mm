@@ -723,11 +723,52 @@ class ShadowEngine:
                     f"[deployed={deployed}c ≤{int(config.ENSEMBLE_AT_RISK_PCT*100)}%"
                     f" tradeable={book_c}c]")
                 proposal.count = clamped
+        # ── WO-2026-07-27-V B2 — THE SANITY CLAMP ─────────────────────────────
+        # A phantom book can never spend money the venue already said isn't there.
+        # Before submit, an ENTRY's cash cost is checked against the LAST CONFIRMED
+        # VENUE CASH (the venue number, not the ledger's belief) with its age. Cost
+        # over that cash → DEFER (CASH_SANITY) — the ~$45-withdrawal phantom could
+        # never have sized $19 onto $20.70 of real cash without this catching a
+        # deeper phantom. A confirmed cash older than CASH_CONFIRM_MAX_AGE_S is not
+        # solvent evidence: blind is not solvent — defer everything and page. LIVE
+        # only (shadow has no venue cash); a no-op whenever the book agrees with
+        # the venue, so BTC/XRP entries are byte-identical on a healthy book.
+        if (config.live_submit_enabled() and proposal.action == "buy"
+                and proposal.count > 0):
+            self._cash_sanity_clamp(proposal)
         # WO-VERIFY-LOSSTERM-1 B4 → WO-2026-07-26-P §B2: the "0 → count=1, let the
         # walls refuse" path is RETIRED. A computed-0 now DEFERS at sizing
         # (_defer_entry, above) with the full term set — the size is never
         # fabricated up to 1 for the walls to catch. This block is unreachable
         # (contracts<=0 returned above); kept as a tombstone for the read-rule.
+
+    def _cash_sanity_clamp(self, proposal) -> None:
+        """WO-2026-07-27-V B2: refuse to spend past the last CONFIRMED venue cash.
+        Cost > venue cash → CASH_SANITY defer; a stale confirmation (age beyond
+        threshold) defers everything and pages (blind is not solvent)."""
+        conf = self.ledger.get_state("last_venue_cash_cents")
+        ts = self.ledger.get_state("last_venue_cash_ts")
+        if conf is None or ts is None:
+            return   # no venue read yet (pre-first-reconcile); the boot reconcile owns this
+        venue_cash = int(conf)
+        age_s = int(time.time() - float(ts))
+        cost = proposal.count * proposal.price_cents
+        if age_s > config.CASH_CONFIRM_MAX_AGE_S:
+            from . import failures
+            if self._defer_entry(proposal, "CASH_SANITY", {
+                    "reason": "stale_confirmation", "cost": cost,
+                    "venue_cash": venue_cash, "age_s": age_s}):
+                failures.fail(
+                    "CASH_STALE",
+                    f"the last confirmed venue cash is {age_s}s old (> "
+                    f"{config.CASH_CONFIRM_MAX_AGE_S}s) — blind is not solvent; "
+                    "deferring every entry until a fresh reconcile (WO-V B2)",
+                    alert=True, age_s=age_s)
+            return
+        if cost > venue_cash:
+            self._defer_entry(proposal, "CASH_SANITY", {
+                "reason": "cost_over_venue_cash", "cost": cost,
+                "venue_cash": venue_cash, "age_s": age_s})
 
     def simulate_shadow_fills(self, market, book, now) -> int:
         """WO-2026-07-25-L §P1 — the pessimistic shadow fill sweep. For each
@@ -1068,6 +1109,13 @@ class ShadowEngine:
             # threw it away — the phantom's origin). standing_reconcile reads it
             # to refuse a reconcile taken across a settlement boundary.
             self._last_venue_pv_cents = int(round((pv or 0.0) * 100))
+            # WO-2026-07-27-V B2: stamp the last CONFIRMED venue CASH (not the
+            # total) with its age on the ledger, so the pre-submit sanity clamp
+            # and the balance-rejected page can refuse to spend money the venue
+            # already said isn't there — a phantom book can never outrun this.
+            cash_c = int(round(cash * 100))
+            self.ledger.set_state("last_venue_cash_cents", str(cash_c))
+            self.ledger.set_state("last_venue_cash_ts", str(now))
             return int(round((cash + (pv or 0.0)) * 100)), "venue"
         self._av_fail_streak += 1
         # WO-2026-07-24-D Part 4: a FAILED read must INVALIDATE the pv, not
@@ -1276,7 +1324,55 @@ class ShadowEngine:
         if result != "DEFERRED":
             self._recon_last_ok_ts = now
             self._recon_deferred_streak = 0
+            self._recon_starved_paged = False   # re-arm the backstop on a clean check
+        else:
+            # WO-2026-07-27-V T1 — THE SLEEPING-SENTINEL BACKSTOP. A cash-protocol
+            # DEFERRED here is a QUIESCENCE hold (resting/unsettled busy). The old
+            # code called it benign and never advanced the stall — so a two-room
+            # engine that never goes quiet reconciled NEVER, silently, and a ~$45
+            # withdrawal walked past the sentinel. Quiescence starvation is NOT
+            # benign: a book unverified against the venue for RECON_MAX_QUIET_S,
+            # for ANY reason, PAGES. The venue read WAS clean here (we got past
+            # the defers above), so this is purely "too busy to ever check".
+            self._recon_check_starved(now)
         return result
+
+    def record_recon_cycle(self, result: str, now=None) -> None:
+        """WO-2026-07-27-V T1 — the sentinel-cadence measurement (acceptance #4).
+        Persist each reconcile cycle's result so the pack can plot clean reads per
+        hour: if the sentinel has been part-time (quiescence starvation) for
+        longer than tonight, the cadence line shows it. Bounded — pruned to 2 days."""
+        now = time.time() if now is None else now
+        try:
+            db = self.ledger.db
+            db.execute("CREATE TABLE IF NOT EXISTS recon_cycles ("
+                       "ts REAL NOT NULL, result TEXT NOT NULL)")
+            db.execute("INSERT INTO recon_cycles (ts, result) VALUES (?,?)",
+                       (now, result))
+            db.execute("DELETE FROM recon_cycles WHERE ts < ?", (now - 2 * 86400,))
+            db.commit()
+        except Exception:
+            pass   # the measurement never blocks the reconcile
+
+    def _recon_check_starved(self, now: float) -> None:
+        """WO-2026-07-27-V T1: page RECON_STARVED when the book has not been
+        verified against the venue for RECON_MAX_QUIET_S — covering the
+        quiescence starvation the stall-streak never counted. Once per episode
+        (re-armed by the next completed reconcile)."""
+        last_ok = self._recon_last_ok_ts
+        quiet_for = (now - last_ok) if last_ok is not None else None
+        if quiet_for is not None and quiet_for > config.RECON_MAX_QUIET_S \
+                and not getattr(self, "_recon_starved_paged", False):
+            self._recon_starved_paged = True
+            from . import failures
+            failures.fail(
+                "RECON_STARVED",
+                f"the book has not been verified against the venue in "
+                f"{int(quiet_for)}s (> {config.RECON_MAX_QUIET_S}s) — the rooms "
+                "have stayed too busy to ever reach a quiescent reconcile; the "
+                "cash sentinel is effectively asleep. Sizing may be running on a "
+                "stale book — restart to force a boot reconcile (WO-V T1)",
+                fatal=False, alert=True, quiet_s=int(quiet_for))
 
     def _recon_note_deferred(self, reason: str, now: float) -> str:
         """WO-2026-07-24-D Part 4: a deferred/unreadable cycle is one where the
@@ -2389,7 +2485,8 @@ async def run():
         while not stop.is_set():
             await asyncio.sleep(60.0)
             if config.live_submit_enabled():
-                await asyncio.to_thread(engine.standing_reconcile)
+                _r = await asyncio.to_thread(engine.standing_reconcile)
+                engine.record_recon_cycle(_r)   # WO-V T1: cadence measurement
 
     # ── P10 §3: the venue REST book audits the WS book every 60s.
     # In REST mode the book IS the venue's REST book — there is no second

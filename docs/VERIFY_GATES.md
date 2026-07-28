@@ -4276,6 +4276,50 @@ regression is green. Test fallout: the many tests that monkeypatch delta functio
 signatures widened to accept the new kwarg (`**_kw`). Suite 953 · preflight 23/23. **XRP's
 SERIES_MODE flips LIVE only in the deploy carrying both guards green (this one).**
 
+## WO-2026-07-27-V — THE SLEEPING SENTINEL (build 90)
+
+A live-money state-integrity defect: Drew withdrew ~$45 mid-session (venue $20.70 cash) and the
+machine never noticed — no CASH DELTA page, sizing on a phantom $97 book, BTC bouncing
+insufficient-funds silently for hours while XRP's ~$2 depth-bound entries still fit real cash.
+
+**Root cause (traced line-level).** T2 ruled out: `bank_scrape_and_watch` (O4, shadow_runner:764)
+never touches `book_cents` — the withdrawal isn't consumed there. T3 ruled out: `account_value`
+(shadow_runner:1062) reads a *fresh* venue balance each attempt, not cached. **T1 confirmed:**
+`cash.reconcile` defers whenever `in_flight_orders != 0 or unsettled_fills != 0` (ledger.py:748 —
+the quiescence window), and `standing_reconcile` treated that quiescence-DEFERRED as **benign** —
+it did NOT advance the stall streak (shadow_runner:1276-1278), so `_recon_note_deferred` /
+RECON_STALLED never fired. A two-room engine that never goes quiet therefore reconciled NEVER,
+silently, and the book stayed a phantom. This is the U6 class (RECON_STALLED not counting
+quiescence holds), promoted from cosmetic to causal and shipped here.
+
+**The fix (T1).** Quiescence starvation is not benign: `_recon_check_starved` pages `RECON_STARVED`
+when the book has gone unverified against the venue for `RECON_MAX_QUIET_S` (30 min, DREW-DEFAULT),
+for ANY reason including a busy quiescence hold — once per episode, re-armed by the next clean
+reconcile. The sentinel's pulse (clean reconciles per UTC hour) is persisted (`recon_cycles` table,
+`record_recon_cycle`) and rides the pack (`recon_cadence_lines`) — a run of 0-clean hours is
+visible starvation. `account_value` now stamps the last CONFIRMED venue *cash* + age on the ledger
+for the belts.
+
+**The two belts (ship regardless of trace).** **B1** — `gateway._is_balance_error` classifies a
+venue rejection whose error EXPLICITLY names insufficient funds/balance → `BALANCE_REJECTED
+{lane, series, cost, last_confirmed_cash}` once per window (the market ticker rolls each window →
+natural dedup); a transient 500/429 never pages it. A lane dying silently is its own Article-2
+violation — the February live-balance law's missing SCREAM half. **B2** — `_cash_sanity_clamp`,
+pre-submit: an entry's cash cost over the last CONFIRMED venue cash (the venue number, not the
+ledger's belief) DEFERS `CASH_SANITY`; a confirmation older than `CASH_CONFIRM_MAX_AGE_S` (30 min)
+defers everything and pages `CASH_STALE` — blind is not solvent. A phantom book can never spend
+money the venue already said isn't there.
+
+**Acceptance (`test_sleeping_sentinel.py`, 11).** T1: quiescence starvation pages RECON_STARVED
+once per episode; a fresh reconcile does not; the cadence is recorded and packed. B1:
+insufficient-balance pages once per window, a transient 500 does not, the classifier keys on the
+insufficient-funds language only. B2: cost > venue cash defers, within-cash is a no-op, a stale
+confirmation defers + pages CASH_STALE. Data-questions `RECON_CADENCE`/`BALANCE_REJECTED`
+registered; both new constants tagged NEW. **F/XRP entry, salvage, scrape byte-identical** — all
+three fixes are LIVE-gated (no-op in shadow/on a healthy book); the golden tape is green.
+Suite 964 · preflight 23/23. Operational note until deploy: withdraw, then restart (or treat an
+absent CASH DELTA page as the alarm).
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

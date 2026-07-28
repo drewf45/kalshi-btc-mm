@@ -276,6 +276,34 @@ def restated_money_lines(ledger) -> list:
     ]
 
 
+def recon_cadence_lines(ledger) -> list:
+    """WO-2026-07-27-V T1 — THE SENTINEL'S PULSE. Clean reconciles per UTC hour
+    vs total cycles: the cash sentinel's duty cycle, made visible. A run of hours
+    with 0 clean reads is quiescence starvation — the sentinel asleep — the exact
+    condition the ~$45 withdrawal walked through. If this shows part-time hours
+    even absent a withdrawal, the sentinel has been part-time longer than tonight."""
+    try:
+        rows = ledger.db.execute(
+            "SELECT strftime('%H', ts, 'unixepoch') AS hr, "
+            " SUM(CASE WHEN result IN ('CLEAN','SILENT_REBASED','CONFIRMED_POSITIVE',"
+            " 'PROMPTED') THEN 1 ELSE 0 END) AS clean, COUNT(*) AS total "
+            "FROM recon_cycles GROUP BY hr ORDER BY hr").fetchall()
+    except Exception as e:
+        return [f"RECON CADENCE: unavailable ({e})"]
+    if not rows:
+        return ["RECON CADENCE (WO-V T1): no reconcile cycles recorded yet "
+                "(SHADOW, or freshly booted)"]
+    parts = [f"{hr}h:{clean}/{total}" for hr, clean, total in rows]
+    starved = [hr for hr, clean, total in rows if clean == 0 and total > 0]
+    line = ("RECON CADENCE (WO-V T1) — clean reconciles / total, by UTC hour "
+            "(the sentinel's pulse): " + " ".join(parts))
+    out = [line]
+    if starved:
+        out.append(f"  ⚠ STARVED HOURS (0 clean reads): {', '.join(starved)} — "
+                   "the sentinel slept these hours; the book went unverified")
+    return out
+
+
 def no_counterparty_by_series_hour(ledger) -> list:
     """WO-2026-07-26-T Guard 1 — the room's liquidity map. NO_COUNTERPARTY
     refusals (opposite side empty at F entry) counted by series and UTC hour: a
@@ -951,6 +979,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(no_counterparty_by_series_hour(ledger))
     except Exception as e:
         lines.append(f"NO_COUNTERPARTY: unavailable ({e})")
+    # WO-2026-07-27-V T1: the cash sentinel's pulse — clean reconciles by hour.
+    try:
+        lines.extend(recon_cadence_lines(ledger))
+    except Exception as e:
+        lines.append(f"RECON CADENCE: unavailable ({e})")
     # WO-2026-07-26-S §1: the per-series chapter — one room each, from day one.
     try:
         lines.extend(series_chapter_lines(ledger))
