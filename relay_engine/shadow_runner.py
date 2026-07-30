@@ -697,31 +697,34 @@ class ShadowEngine:
         # lever) and was the last governor nobody could name until it fired. One
         # risk, one governor: the rate halt stays; the duplicate is gone. A big
         # F loss now PAGES (F_BIG_LOSS) and never refuses the next window.
-        # WO-2026-07-23-B guard (a) → WO-2026-07-26-S §2: THE ENSEMBLE CAP, the
-        # correlated-tail governor. Total SIMULTANEOUS at-risk across ALL rooms
-        # (deployed_cents sums every market of every series) may never exceed
-        # ENSEMBLE_AT_RISK_PCT of TRADEABLE (book_c is tradeable = book − owed).
-        # One summed check ABOVE the lane walls, never replacing them (Adversary
-        # iii). An entry is clamped to the room that remains (0 = defers with the
-        # why); F-BTC and F-XRP holding different rooms can no longer sum past
-        # the one-shock ceiling. Cross-crypto air-pockets flip every favorite at
-        # once — this is the board condition that the growth in rooms respects.
-        if proposal.action == "buy" and proposal.count > 0 and book_c > 0:
+        # WO-2026-07-23-B guard (a) → WO-2026-07-26-S §2 → WO-2026-07-27-W P4: THE
+        # ENSEMBLE CAP, the correlated-tail governor. Total SIMULTANEOUS at-risk
+        # across ALL rooms (deployed_cents sums every market of every series) may
+        # never exceed ENSEMBLE_AT_RISK_PCT of the total capital = CASH + at-risk
+        # (ensemble_base_cents — P4: in the cash regime the venue cash already
+        # excludes deployed, so the base adds it back; the ceiling bounds the tail
+        # across however many rooms are open). One summed check ABOVE the lane
+        # walls, never replacing them (Adversary iii). Clamped to the room that
+        # remains (0 = defers with the why); the cash race is self-limiting —
+        # deployed cash leaves the balance, so later proposals race for what's left.
+        ens_base = self.ledger.ensemble_base_cents()
+        if proposal.action == "buy" and proposal.count > 0 and ens_base > 0:
             deployed = self.ledger.deployed_cents()
-            room = int(book_c * config.ENSEMBLE_AT_RISK_PCT) - deployed
+            room = int(ens_base * config.ENSEMBLE_AT_RISK_PCT) - deployed
             max_by_ensemble = room // max(1, proposal.price_cents)
             if max_by_ensemble < proposal.count:
                 clamped = max(0, max_by_ensemble)
                 log.warning("ENSEMBLE_CAP %s %s: %d→%d lots — deployed %dc across "
-                            "all rooms + this would exceed %d%% of tradeable %dc",
+                            "all rooms + this would exceed %d%% of capital %dc "
+                            "(cash+at-risk)",
                             proposal.lane, proposal.market, proposal.count,
                             clamped, deployed,
-                            int(config.ENSEMBLE_AT_RISK_PCT * 100), book_c)
+                            int(config.ENSEMBLE_AT_RISK_PCT * 100), ens_base)
                 # §A1 why-on-row: the ensemble ceiling names itself on the size row.
                 proposal.why = ((proposal.why + " · ") if proposal.why else "") + (
                     f"ensemble-cap {proposal.count}→{clamped} "
                     f"[deployed={deployed}c ≤{int(config.ENSEMBLE_AT_RISK_PCT*100)}%"
-                    f" tradeable={book_c}c]")
+                    f" capital={ens_base}c]")
                 proposal.count = clamped
         # ── WO-2026-07-27-V B2 — THE SANITY CLAMP ─────────────────────────────
         # A phantom book can never spend money the venue already said isn't there.

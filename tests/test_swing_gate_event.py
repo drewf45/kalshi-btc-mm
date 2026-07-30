@@ -167,6 +167,9 @@ def test_flip_capped_to_one_lot_f_untouched(monkeypatch):
             return 5000        # a book big enough for >1 lot
 
         def tradeable_cents(self):
+            return 5000
+
+        def ensemble_base_cents(self):
             return 5000        # WO-2026-07-26-O §O2: sizing reads tradeable (owed 0 here)
 
         def deployed_cents(self):

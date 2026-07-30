@@ -4320,6 +4320,43 @@ three fixes are LIVE-gated (no-op in shadow/on a healthy book); the golden tape 
 Suite 964 · preflight 23/23. Operational note until deploy: withdraw, then restart (or treat an
 absent CASH DELTA page as the alarm).
 
+## WO-2026-07-27-W — THE 24-HOUR RULINGS · P1 (broker cash is the only sizing truth) + P4 (the cash race)
+
+Twenty-four hours of three-room live operation produced four rulings. F's entry/hold/exit logic is
+**byte-identical** throughout — every ruling touches the surroundings, never the edge (golden tape
+F/H8 stays green). This section covers the first increment: **P1** and **P4**, both LIVE-gated so
+shadow and tests size off the paper book unchanged.
+
+**P1 — the sizing base is the venue's live CASH, never the book, never the portfolio.** Drew:
+"broker data is truth 100% of the time." `Ledger.tradeable_cents()` is the ONE base every sizing
+site, gateway wall, worst-day, ensemble and halt-geometry read — a single chokepoint. In LIVE it
+returns `last_venue_cash_cents − owed` (the venue's spendable cash, stamped by every reconcile /
+balance read per WO-V); the ledger's **book** demotes to reporting / P&L narrative, and the
+**portfolio** balance (cash + marked positions — an estimate that stays ~constant and
+double-counts deployed money) is read **nowhere** in sizing (grep artifact, on the executable code
+with the docstring stripped). Because the base is *spendable cash*, it mechanically shrinks as
+rooms deploy, making over-commitment structurally impossible. Pre-first-read (no venue cash stamped
+yet) it falls back to the book so boot has a base until the first reconcile runs. SHADOW ignores any
+stamped cash and stays the paper book — byte-identical.
+
+**P4 — the cash race is self-limiting; the ensemble ceiling reads total capital.** Deployed cash
+leaves the balance, so a later proposal in the same window races only for what *remains* — bounded
+by arithmetic, no lock. The ensemble cap needs the whole tail, so `ensemble_base_cents()` returns
+cash + current at-risk (`deployed_cents`) in the cash regime — venue CASH already EXCLUDES deployed
+money, so the at-risk is added back to recover total capital; in the book regime the book already
+reflects deployment, so the base is just `tradeable_cents`. `shadow_runner._score_and_size` reads
+`ensemble_base_cents()` for the `ENSEMBLE_AT_RISK_PCT` (50%) ceiling and names it on the row
+(`capital=…c`).
+
+**Acceptance (`test_cash_truth.py`, 7).** SHADOW tradeable is the paper book even with a stale
+venue-cash stamped; LIVE tradeable = venue cash − owed (2070, not the 9700 phantom book) while the
+book survives as reporting; LIVE falls back to book before the first venue read; ensemble base =
+cash + at-risk in the cash regime and = tradeable in the book regime (no double-add); the cash race
+(a later proposal sizes off less as venue cash drops); the grep artifact (executable code of
+`tradeable_cents` reads `last_venue_cash_cents`, never `portfolio`/`pv`). Ensemble-governor and
+FLIP-cap tests updated for the `capital=`/`ensemble_base_cents` base. **F entry/hold/exit
+byte-identical** (LIVE-gated; golden tape green). Suite 971 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

@@ -77,7 +77,7 @@ def test_ensemble_cap_is_50pct_of_tradeable_and_names_itself(tmp_path):
         # clamped by the ensemble cap (deployed already near the 50% ceiling)
         assert p.count < 40
         assert "ensemble-cap" in p.why           # the cap names itself on the row
-        assert "tradeable=" in p.why
+        assert "capital=" in p.why               # WO-W P4: base = cash + at-risk
     finally:
         failures._ledger = None
 

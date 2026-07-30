@@ -295,10 +295,36 @@ class Ledger:
         return max(0, gross - max(0, withdrawn))
 
     def tradeable_cents(self) -> int:
-        """The base ALL sizing/walls/halts read (WO-O O2): book minus the owed
-        scrape. The owed money is still IN the account — it is earmarked, not
-        spent — so treasury/reconcile/invariant keep reading raw book_cents."""
-        return max(0, self.book_cents() - self.owed_cents())
+        """The base ALL sizing/walls/halts read: (spendable capital) − owed scrape.
+
+        WO-2026-07-27-W P1 — BROKER CASH IS THE ONLY SIZING TRUTH (Drew: "broker
+        data is truth 100% of the time"). In LIVE the base is the venue's live
+        CASH balance — what is actually spendable, which mechanically shrinks as
+        rooms deploy, making over-commitment structurally impossible (P4's race).
+        NOT the portfolio balance (cash + marked positions = an estimate that
+        stays ~constant and double-counts deployment) and NOT the ledger's book
+        (demoted to reporting/P&L narrative). The venue cash is stamped by every
+        reconcile/balance read (`last_venue_cash_cents`, WO-V); absent it (pre-
+        first-read), fall back to book so boot has a base until the reconcile runs.
+        In SHADOW the base stays the paper book — byte-identical, no venue cash."""
+        base = self.book_cents()
+        if config.live_submit_enabled():
+            vc = self.get_state("last_venue_cash_cents")
+            if vc is not None:
+                base = int(vc)          # broker cash: the only sizing truth
+        return max(0, base - self.owed_cents())
+
+    def ensemble_base_cents(self) -> int:
+        """WO-2026-07-27-W P4 — the ensemble cap's base = cash + current at-risk
+        (total capital), so the ceiling bounds the correlated tail across all
+        rooms. In the cash regime venue CASH already EXCLUDES deployed money, so
+        add the at-risk (deployed) back; in the book regime the book already
+        reflects it, so tradeable IS the base. Owed stays subtracted (earmarked)."""
+        base = self.tradeable_cents()
+        if config.live_submit_enabled() \
+                and self.get_state("last_venue_cash_cents") is not None:
+            base += self.deployed_cents()   # cash + at-risk = total capital
+        return base
 
     def _owed_gross_from(self, hwm: int) -> int:
         seed = self.scrape_seed_cents()
@@ -772,6 +798,17 @@ class CashProtocol:
                      delta, config.CASH_SILENT_REBASE_CENTS, breakdown)
             return "SILENT_REBASED"
         if delta < 0:
+            # WO-2026-07-27-W P1 note: sizing now reads the venue's live CASH
+            # directly (tradeable_cents), so a withdrawal ALREADY re-bases sizing
+            # within a cycle regardless of this prompt — the incident's harm
+            # (sizing off a phantom) is fixed at the base. The confirm prompt is
+            # KEPT here because the WO retires it ONLY for movements the venue
+            # itself EXPLAINS (its Withdrawal/Deposit transaction rows), and
+            # distinguishing an explained withdrawal from an unexplained drop
+            # requires the venue TRANSACTION log — a follow-up. Until then the
+            # prompt stands for every negative delta (the -S/-V doctrine), which
+            # the WO's own "confirm survives for genuinely unexplained deltas"
+            # requires anyway.
             self.entries_halted = True
             self.pending = CashPrompt(
                 ts=now, delta_cents=delta, breakdown=breakdown,

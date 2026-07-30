@@ -92,7 +92,7 @@ def test_b1_insufficient_balance_pages_once_per_window(tmp_path, monkeypatch):
     book.apply_snapshot({97: 10}, {1: 10}, ts=1.0)
     for _ in range(3):                                 # 3 polls, same window
         with pytest.raises(WallRejection):
-            gw.submit(_f(count=17), book)
+            gw.submit(_f(count=5), book)
     n = led.db.execute(
         "SELECT COUNT(*) FROM failures WHERE why_tag='BALANCE_REJECTED'").fetchone()[0]
     assert n == 1                                      # once per window (market ticker)
