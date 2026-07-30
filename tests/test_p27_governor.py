@@ -12,6 +12,19 @@ from relay_engine import config, failures, lane_fh8, lane_flip
 from relay_engine.shadow_runner import ShadowEngine
 from relay_engine.sizing import size_order
 
+
+@pytest.fixture(autouse=True)
+def _single_room_halt_keys():
+    # WO-2026-07-27-W P3: this file tests the per-LANE halt mechanic, which is
+    # series-agnostic. Pin a single-room roster so halt_scope stays the bare lane
+    # (the byte-identical single-room path). Series-scoping (halt_scope keying on
+    # {series}:{lane} once the roster grows) is covered in test_ensemble_governor
+    # and test_three_rooms. conftest._roster_isolation restores the default after.
+    from relay_engine import config
+    config.SERIES[:] = ["KXBTC15M"]
+    yield
+
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 TICKER2 = "KXBTC15M-02JAN251015-T99"
 

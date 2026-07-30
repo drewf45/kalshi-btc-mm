@@ -16,10 +16,16 @@ from relay_engine import config, lane_fh8
 
 @pytest.fixture
 def restore_roster():
-    """/series mutates config globals — snapshot and restore around each test."""
+    """/series mutates config globals — snapshot and restore around each test.
+    WO-2026-07-27-W P3: the default roster is now THREE rooms, but these tests
+    exercise the room-OPENING mechanic (/series adds a room to a smaller roster),
+    so pin BTC-only at setup and let each test open XRP from there. conftest.
+    _roster_isolation restores the real default after."""
     series = list(config.SERIES)
     modes = dict(config.SERIES_MODE)
     fam = set(lane_fh8.F_SERIES_ALLOWED)
+    config.SERIES[:] = ["KXBTC15M"]
+    lane_fh8.F_SERIES_ALLOWED = {"KXBTC15M"}
     yield
     config.SERIES[:] = series
     config.SERIES_MODE.clear()

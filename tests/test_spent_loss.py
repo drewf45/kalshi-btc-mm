@@ -22,6 +22,15 @@ from relay_engine.window_econ import (LANES_HALTED_KEY, WindowEcon,
 BOOK = 10_000  # $100 tradeable (owed 0)
 
 
+@pytest.fixture(autouse=True)
+def _single_room_halt_keys():
+    # This file tests the per-LANE halt mechanic (series-agnostic). Pin a
+    # single-room roster so halt_scope stays the bare lane; series-scoping is
+    # covered in test_ensemble_governor / test_three_rooms.
+    config.SERIES[:] = ["KXBTC15M"]
+    yield
+
+
 class _TG:
     def __init__(self):
         self.alerts = []

@@ -780,8 +780,16 @@ SERIES_TICKER = os.getenv("SERIES", "KXBTC15M")
 # The roster default is BTC-ONLY through Stage 1/2 (the dimension + the ensemble
 # governor land first, BTC byte-identical); Stage 3 adds KXXRP15M when the XRP
 # room's config, gate, and pack chapter are all in place. Override with SERIES_LIST.
+# WO-2026-07-27-W P3 — THREE ROOMS, LIVE BY DEFAULT (Drew: "I should not have to
+# confirm via Telegram; unlock ETH — XRP, BTC, ETH tonight"). The default roster
+# ships in code: BTC, XRP, ETH all LIVE; SOL banked next. No /series, no env, no
+# confirmation needed to open the three rooms. SERIES_LIST env still overrides
+# (the emergency lever); a persisted roster (U1) overrides the code default at
+# boot so a Drew /series change survives restart.
 SERIES = [s.strip() for s in os.getenv(
-    "SERIES_LIST", "KXBTC15M").split(",") if s.strip()]
+    "SERIES_LIST", "KXBTC15M,KXXRP15M,KXETH15M").split(",") if s.strip()]
+# provenance of the active roster, for the banner (persisted > env > default).
+ROSTER_SOURCE = "env" if os.getenv("SERIES_LIST") else "default"
 
 
 def series_of(market: str) -> str:
@@ -801,6 +809,9 @@ def series_of(market: str) -> str:
 SERIES_MODE = {
     "KXBTC15M": os.getenv("SERIES_MODE_BTC", "LIVE").upper(),
     "KXXRP15M": os.getenv("SERIES_MODE_XRP", "LIVE").upper(),
+    # WO-2026-07-27-W P3: ETH is unlocked and born LIVE tonight (20% dial, own
+    # halt, counterparty gate, surv n/a). SOL stays OFF (banked next).
+    "KXETH15M": os.getenv("SERIES_MODE_ETH", "LIVE").upper(),
 }
 SERIES_MODE_DEFAULT = "OFF"    # an unrostered series does nothing (conservative)
 
@@ -860,6 +871,29 @@ def resolve_series(name: str):
     if up in KNOWN_SERIES.values():
         return up
     return None
+
+
+def roster_state() -> dict:
+    """WO-2026-07-27-W P3/U1 — the roster as {series: mode} for persistence.
+    Every KNOWN room appears; a room not in SERIES is OFF. This dict round-trips
+    through the ledger so a Drew /series change survives a restart."""
+    return {full: (series_mode(full) if full in SERIES else "OFF")
+            for full in KNOWN_SERIES.values()}
+
+
+def apply_roster(state: dict, source: str = "persisted") -> None:
+    """WO-2026-07-27-W P3/U1 — install a loaded roster onto the module globals.
+    SERIES becomes the rooms whose mode != OFF (in the KNOWN order, BTC first);
+    SERIES_MODE is set per room; ROSTER_SOURCE stamps the banner's provenance."""
+    global ROSTER_SOURCE
+    live = []
+    for full in KNOWN_SERIES.values():
+        mode = str(state.get(full, series_mode(full))).upper()
+        SERIES_MODE[full] = mode
+        if mode != "OFF":
+            live.append(full)
+    SERIES[:] = live
+    ROSTER_SOURCE = source
 
 
 def halt_scope(series: str, lane: str) -> str:

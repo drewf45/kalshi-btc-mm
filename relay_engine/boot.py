@@ -100,11 +100,20 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     # (series, lane). Each room prints its mode and its F dial. (The ensemble cap
     # and per-series halts join this banner in Stage 2; XRP joins the roster in
     # Stage 3.)
-    _rooms = " · ".join(
-        f"{s} {config.series_mode(s)} F@{config.f_notional_pct_of(s):.0%}"
-        for s in config.SERIES)
-    lines.append(f"SERIES ROOMS (WO-S): {_rooms} — one book, own dials/records "
-                 "per room, same doctrine; the global kill governs all")
+    # WO-2026-07-27-W P3 — three rooms live by default. Print EVERY known room
+    # with its mode + F dial (rostered rooms live; SOL[OFF] shows it is banked,
+    # not forgotten), and the roster's SOURCE (persisted /series > env > default).
+    def _room_cell(full, short):
+        if full in config.SERIES:
+            return f"{short}[{config.series_mode(full)}] F@{config.f_notional_pct_of(full):.0%}"
+        return f"{short}[OFF]"
+    _short = {v: k for k, v in config.KNOWN_SERIES.items()}
+    _rooms = " · ".join(_room_cell(full, _short.get(full, full))
+                        for full in config.KNOWN_SERIES.values())
+    lines.append(f"SERIES ROOMS (WO-S; WO-W P3, source={config.ROSTER_SOURCE}): "
+                 f"{_rooms} — three rooms LIVE by default (BTC XRP ETH), SOL "
+                 "banked; one book, own dials/records per room; the global kill "
+                 "governs all · /series overrides and persists")
     lines.append(
         f"ENSEMBLE (WO-S §2): cap {int(config.ENSEMBLE_AT_RISK_PCT * 100)}% of "
         "tradeable — total SIMULTANEOUS at-risk across ALL rooms, one summed "
@@ -726,7 +735,8 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "is the unit of stewardship). XRP opens first (KXXRP15M, maker-only, "
                  "1¢ tick, $0 fee OBSERVED not assumed), then SOL, ETH last. BTC's F "
                  "path byte-identical through the refactor (golden tape); the roster "
-                 "is BTC-only until Drew runs /series")
+                 "opened BTC-only, then XRP, and is now three rooms LIVE by default "
+                 "(WO-W P3)")
     lines.append("  THE TWO GUARDS (WO-2026-07-26-T, build 89): the two protections "
                  "standing where the ghost phase stood, landed before KXXRP15M's "
                  "first live window. GUARD 1 — the counterparty-liquidity gate into "
@@ -794,6 +804,19 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "trailing-8 sum for hours and re-halted on a loss already "
                  "answered for). Tail-cluster frequency/room is a registry "
                  "question that earns F_HALT_TAIL_MULT a derived number")
+    lines.append("  THREE ROOMS, LIVE BY DEFAULT (WO-2026-07-27-W, build 91): P3 "
+                 "— the default roster ships in code (BTC XRP ETH all LIVE, SOL "
+                 "banked OFF); no /series, no env, no Telegram confirmation opens "
+                 "the three rooms. ETH is unlocked tonight and enters exactly as "
+                 f"XRP did — born at {config.NEW_SERIES_F_DIAL:.0%} F dial, its own "
+                 "series-scoped halt (W2a geometry), counterparty gate live, and "
+                 "surv n/a (the BTC table won't speak for it). The roster PERSISTS "
+                 "(U1): a Drew /series change is saved to the ledger and restored "
+                 "over the code default at the next boot, so the rooms Drew "
+                 "opened/parked survive a restart. The banner prints EVERY known "
+                 "room with its mode + dial and the roster's source (persisted > "
+                 "env > default); the SERIES_LIST env stays the emergency lever, "
+                 "/series the override")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

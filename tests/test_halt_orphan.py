@@ -24,6 +24,19 @@ from relay_engine.ledger import CASH_FATAL_REASON
 from relay_engine.window_econ import HALT_REASON, WindowEcon
 
 
+@pytest.fixture(autouse=True)
+def _single_room_halt_keys():
+    # WO-2026-07-27-W P3: this file tests the per-LANE halt mechanic, which is
+    # series-agnostic. Pin a single-room roster so halt_scope stays the bare lane
+    # (the byte-identical single-room path). Series-scoping (halt_scope keying on
+    # {series}:{lane} once the roster grows) is covered in test_ensemble_governor
+    # and test_three_rooms. conftest._roster_isolation restores the default after.
+    from relay_engine import config
+    config.SERIES[:] = ["KXBTC15M"]
+    yield
+
+
+
 class _TG:
     def __init__(self):
         self.alerts = []

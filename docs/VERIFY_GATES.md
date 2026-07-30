@@ -4400,6 +4400,50 @@ cluster (24-lot tails) — ordinary small losses correctly no longer trip F. **F
 byte-identical** (the halt is the surrounding governor; golden tape green). Suite 979 · preflight
 23/23.
 
+## WO-2026-07-27-W — THE 24-HOUR RULINGS · P3 (three rooms, live by default + roster persistence U1)
+
+Drew: "I should not have to confirm via Telegram; unlock ETH — XRP, BTC, ETH tonight."
+
+**The default roster ships in code.** `config.SERIES` defaults to `KXBTC15M,KXXRP15M,KXETH15M` (was
+BTC-only) and `SERIES_MODE` carries ETH at LIVE — three rooms open with no `/series`, no env, no
+confirmation. SOL stays OFF (banked next). The `SERIES_LIST` env is still the emergency lever;
+`/series` is still the override.
+
+**ETH enters exactly as XRP did.** `f_notional_pct_of("KXETH15M")` = `NEW_SERIES_F_DIAL` (0.20 — the
+born-at dial until its own record argues); its halt is its own room (`halt_scope` keys on
+`KXETH15M:F`, series-scoped now that the roster is >1); the counterparty gate is live for all series
+(WO-T Guard 1, a no-op on BTC's deep book); and its F card reads `surv n/a` because the BTC-trained
+delta table returns None for any non-BTC series (WO-T Guard 2). BTC keeps its earned 24% dial — F-BTC
+sizing byte-identical.
+
+**Roster persistence (U1).** `config.roster_state()` serializes `{series: mode}` for every KNOWN
+room; `config.apply_roster()` installs a loaded roster onto the module globals and stamps
+`ROSTER_SOURCE`. `shadow_runner._persist_roster` saves the roster to the ledger on every `/series`
+change; `_restore_roster` loads it at boot **before** `_apply_series_roster`, so a Drew /series change
+wins over the code default and survives a restart. A fresh DB (no persisted roster) boots the
+three-room default.
+
+**The banner prints each room with its source.** The boot banner now lists every KNOWN room —
+`BTC[LIVE] F@24% · XRP[LIVE] F@20% · SOL[OFF] · ETH[LIVE] F@20%` — with the roster's provenance
+(`source=persisted > env > default`); SOL[OFF] is shown, not forgotten.
+
+**The multi-room consequence, honestly handled.** Three rooms make `halt_scope` series-scoped by
+default (`{series}:{lane}`), which is the production reality. The per-LANE halt-mechanic tests (lane
+attribution, money-halt, spent-loss, persistence — `test_per_lane_halt`, `test_spent_loss`,
+`test_aplayer`, `test_p8_golive`, `test_p9_real_numbers`, `test_p27_governor`, `test_morning_four_
+build1`, `test_halt_orphan`, `test_p17_show_up`) pin a single-room roster via an autouse fixture: they
+verify the series-agnostic mechanic in the byte-identical bare-key path, and series-scoping is covered
+by `test_ensemble_governor` and `test_three_rooms`. A `conftest._roster_isolation` autouse fixture
+snapshots and restores `config.SERIES`/`SERIES_MODE`/`lane_fh8.F_SERIES_ALLOWED` around every test so
+a full-engine boot never leaks its roster into a later test — the suite stays order-independent.
+
+**Acceptance (`test_three_rooms.py`, 8; plus updated roster/banner tests).** The default roster is
+three rooms LIVE + SOL OFF; the banner shows each room with `source=default`; ETH is born at 20% like
+XRP; ETH's halt is series-scoped (`KXETH15M:F`); ETH's card is `surv n/a` (delta None for KXETH15M);
+`roster_state`/`apply_roster` round-trip; a `/series eth off` persists and survives a reboot (U1); a
+fresh DB boots the three-room default. **F entry/hold/exit byte-identical** — the golden tape (BTC)
+runs green under the three-room default. Suite 987 · preflight 23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

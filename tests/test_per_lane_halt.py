@@ -17,6 +17,19 @@ from relay_engine.errors import WallRejection
 from relay_engine.gateway import Gateway, Order
 from relay_engine.window_econ import HALT_REASON, LANES_HALTED_KEY, WindowEcon
 
+
+@pytest.fixture(autouse=True)
+def _single_room_halt_keys():
+    # WO-2026-07-27-W P3: this file tests the per-LANE halt mechanic, which is
+    # series-agnostic. Pin a single-room roster so halt_scope stays the bare lane
+    # (the byte-identical single-room path). Series-scoping (halt_scope keying on
+    # {series}:{lane} once the roster grows) is covered in test_ensemble_governor
+    # and test_three_rooms. conftest._roster_isolation restores the default after.
+    from relay_engine import config
+    config.SERIES[:] = ["KXBTC15M"]
+    yield
+
+
 BOOK = 10_000
 # WO-2026-07-24-C: a per-window FLIP loss such that TWO cross the size-derived
 # drawdown threshold (relative, so the test survives cap/threshold changes).

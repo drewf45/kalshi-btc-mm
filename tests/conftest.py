@@ -18,6 +18,26 @@ def _no_table_autobuild(monkeypatch):
     monkeypatch.setattr(config, "TABLE_AUTOBUILD", False)
 
 
+@pytest.fixture(autouse=True)
+def _roster_isolation():
+    """WO-2026-07-27-W P3 — the roster lives on MODULE globals that boot and
+    /series mutate in place (config.SERIES / SERIES_MODE, lane_fh8.F_SERIES_
+    ALLOWED). Snapshot and restore them around every test so a full-engine boot
+    in one test never leaks its 3-room roster into a later lane-mechanic test —
+    keeping the suite order-independent (preflight runs it whole)."""
+    from relay_engine import config, lane_fh8
+    series = list(config.SERIES)
+    modes = dict(config.SERIES_MODE)
+    source = config.ROSTER_SOURCE
+    fam = set(lane_fh8.F_SERIES_ALLOWED)
+    yield
+    config.SERIES[:] = series
+    config.SERIES_MODE.clear()
+    config.SERIES_MODE.update(modes)
+    config.ROSTER_SOURCE = source
+    lane_fh8.F_SERIES_ALLOWED = fam
+
+
 @pytest.fixture
 def ledger():
     led = Ledger(":memory:")

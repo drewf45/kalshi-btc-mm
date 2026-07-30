@@ -56,19 +56,22 @@ def test_series_mode_and_live_gating():
 
 
 # ── the roster + F's enabled family ──────────────────────────────────────────
-def test_roster_is_btc_only_through_stage_1_2():
-    assert config.SERIES == ["KXBTC15M"]      # XRP joins the roster in Stage 3
-    assert config.f_enabled_series() == ["KXBTC15M"]
+def test_roster_is_three_rooms_live_by_default():
+    # WO-2026-07-27-W P3: BTC, XRP, ETH all LIVE by default; SOL banked (OFF).
+    assert config.SERIES == ["KXBTC15M", "KXXRP15M", "KXETH15M"]
+    assert config.f_enabled_series() == ["KXBTC15M", "KXXRP15M", "KXETH15M"]
+    assert config.series_mode("KXSOL15M") == "OFF"          # banked next
 
 
-# ── the sibling sweep: F's series gate is parameterized (default BTC) ─────────
-def test_f_series_gate_defaults_btc_only_byte_identical():
-    # the golden tape (BTC tapes) sees the default BTC-only family → identical
-    assert lane_fh8.F_SERIES_ALLOWED == {"KXBTC15M"}
+# ── the sibling sweep: F's series gate is parameterized (WRONG_FAMILY wall) ───
+def test_f_series_gate_refuses_an_unrostered_series(monkeypatch):
+    # F's wall-1 family is whatever the engine widened it to; a series OUTSIDE it
+    # is refused WRONG_FAMILY (the byte-identical BTC path when only BTC is armed).
+    monkeypatch.setattr(lane_fh8, "F_SERIES_ALLOWED", {"KXBTC15M"})
     from relay_engine.lane_fh8 import evaluate, FH8State, FH8Stats, TouchBook
     st, stx = FH8State(), FH8Stats()
     # a non-rostered series is refused WRONG_FAMILY (same wall, widened test)
-    r = evaluate("KXXRP15M-25JAN0210-T3", TouchBook(), 120.0, 100.0,
+    r = evaluate("KXSOL15M-25JAN0210-T3", TouchBook(), 120.0, 100.0,
                  state=st, stats=stx)
     assert not r.allowed and r.reject_code == "WRONG_FAMILY"
     # BTC still passes wall 1 (proceeds to the real walls, not WRONG_FAMILY)

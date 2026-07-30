@@ -347,6 +347,28 @@ class ShadowEngine:
         if len(config.SERIES) > 1:
             self.econ.migrate_halt_keys_to_series("KXBTC15M")
 
+    # WO-2026-07-27-W P3/U1 — roster persistence: a Drew /series change survives
+    # a restart. The roster is stored as {series: mode} JSON on the ledger.
+    _ROSTER_KEY = "series_roster"
+
+    def _persist_roster(self) -> None:
+        """Save the active roster ({series: mode}) so the next boot restores it."""
+        import json
+        self.ledger.set_state(self._ROSTER_KEY,
+                              json.dumps(config.roster_state()))
+
+    def _restore_roster(self) -> None:
+        """Load a persisted roster (if any) over the code default. Absent → the
+        code default (three rooms LIVE by default) stands, source unchanged."""
+        import json
+        raw = self.ledger.get_state(self._ROSTER_KEY)
+        if not raw:
+            return
+        try:
+            config.apply_roster(json.loads(raw), source="persisted")
+        except (ValueError, TypeError):
+            return
+
     def _cmd_series(self, text: str) -> str:
         """`/series <asset> <on|off|live|shadow>` — open or park a room without a
         second deploy. on/live add the room to the roster at LIVE; shadow adds it
@@ -372,7 +394,9 @@ class ShadowEngine:
             config.SERIES[:] = [s for s in config.SERIES if s != series]
         elif series not in config.SERIES:
             config.SERIES.append(series)
+        config.ROSTER_SOURCE = "persisted"   # a /series change is now durable
         self._apply_series_roster()
+        self._persist_roster()               # WO-W P3/U1: survive the next boot
         return (f"room {series} → {mode}. roster now: "
                 f"{', '.join(config.SERIES)}; F trades: "
                 f"{', '.join(config.f_enabled_series())} "
@@ -963,6 +987,10 @@ class ShadowEngine:
             print("MIGRATION (WO-Q): cleared a live f_tripwire_day flag — the "
                   "deleted day-long F suppression can no longer refuse F; the "
                   "money rate halt is the ruled governor", flush=True)
+        # WO-2026-07-27-W P3/U1: a persisted roster (Drew's /series change) wins
+        # over the code default — restore it before widening F's family, so the
+        # rooms Drew opened/parked survive a restart.
+        self._restore_roster()
         # WO-2026-07-26-S §1: apply the rooms — widen F's family to the enabled
         # roster and migrate the halt keys if a second room boots in.
         self._apply_series_roster()

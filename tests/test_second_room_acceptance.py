@@ -36,8 +36,12 @@ def _engine(tmp_path):
 def test_boot_banner_carries_rooms_ensemble_and_worst_day():
     from relay_engine import boot
     body = "\n".join(boot.boot_tape())
-    assert "SERIES ROOMS (WO-S)" in body                 # per-room mode + dial
-    assert "KXBTC15M LIVE F@24%" in body
+    assert "SERIES ROOMS (WO-S" in body                  # per-room mode + dial
+    # WO-2026-07-27-W P3: three rooms LIVE by default with sources; SOL banked
+    assert "source=default" in body
+    assert "BTC[LIVE] F@24%" in body
+    assert "XRP[LIVE] F@20%" in body and "ETH[LIVE] F@20%" in body
+    assert "SOL[OFF]" in body
     assert "ENSEMBLE (WO-S §2)" in body                   # the cap
     assert "50% of tradeable" in body
     assert "per-series halts" in body and "correlated tail" in body
@@ -94,8 +98,14 @@ def test_btc_f_path_byte_identical_dial_and_gate():
     roomed = scoring.size_order(6000, 97, 10_000, lane="F",
                                 notional_pct=config.f_notional_pct_of("KXBTC15M"))
     assert (roomed.contracts, roomed.reason) == (legacy.contracts, legacy.reason)
-    # F's wall-1 default family is BTC-only (the golden tape's world)
-    assert lane_fh8.F_SERIES_ALLOWED == {"KXBTC15M"}
+    # F's wall-1 gate is byte-identical for BTC whatever the roster: when only
+    # BTC is armed the golden-tape world is exact (WO-W P3 widens the family, but
+    # BTC always passes wall-1 — the gate only refuses series OUTSIDE the family).
+    from relay_engine.lane_fh8 import evaluate, FH8State, FH8Stats, TouchBook
+    st, stx = FH8State(), FH8Stats()
+    r = evaluate("KXBTC15M-25JAN0210-T99000", TouchBook(), 120.0, 100.0,
+                 state=st, stats=stx)
+    assert r.reject_code != "WRONG_FAMILY"          # BTC never WRONG_FAMILY
 
 
 # ── ACCEPTANCE 6 — scrape/salvage/sentinels shared: one hwm, one owed ─────────

@@ -89,12 +89,15 @@ def test_ensemble_cap_constant_is_ruled_50pct():
 
 # ── per-series halt scope: bare lane while single-room (byte-identical) ───────
 def test_halt_scope_is_bare_lane_single_room_then_series_scoped(monkeypatch):
-    assert config.SERIES == ["KXBTC15M"]
+    # a single-room roster keeps the bare-lane key (byte-identical halt path)
+    monkeypatch.setattr(config, "SERIES", ["KXBTC15M"])
     assert config.halt_scope("KXBTC15M", "FLIP") == "FLIP"    # byte-identical key
-    # with a second room, the scope keys on (series, lane): XRP parks XRP only
-    monkeypatch.setattr(config, "SERIES", ["KXBTC15M", "KXXRP15M"])
+    # WO-2026-07-27-W P3: the DEFAULT roster is three rooms, so in production the
+    # scope keys on (series, lane) — XRP parks XRP only while BTC/ETH print
+    monkeypatch.setattr(config, "SERIES", ["KXBTC15M", "KXXRP15M", "KXETH15M"])
     assert config.halt_scope("KXXRP15M", "F") == "KXXRP15M:F"
     assert config.halt_scope("KXBTC15M", "F") == "KXBTC15M:F"
+    assert config.halt_scope("KXETH15M", "F") == "KXETH15M:F"
 
 
 def test_correlated_loss_registered_as_a_data_question():
