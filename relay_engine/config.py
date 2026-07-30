@@ -450,6 +450,16 @@ ONE_F_LOT_COST_C = 97              # a favorite's per-lot cost — the underwate
 # 1.2-point Gate A order) shipping and proving on tape (at ~40–50¢ salvaged loss
 # sizes the same math supports dials well past 0.30).
 F_NOTIONAL_PCT = float(os.environ.get("F_NOTIONAL_PCT", "0.24"))  # DREW DIAL: F size = pct of book / price (WO-L P2; was 0.20)
+# WO-2026-07-27-W W2a — THE SPENT LOSS, per-lane halt geometry. F's halt bound is
+# expressed in F's OWN loss units, not the desk's stop geometry: one full-size F
+# loss at the current dial (≈ F_NOTIONAL_PCT × tradeable — the whole clip at a
+# ~97¢ favorite) × this multiplier. At 1.5 a SINGLE ordinary tail (1.0×) never
+# halts F alone — it pages F_BIG_LOSS (that page already exists); the halt fires
+# on a CLUSTER (a second tail, or tail-plus-bleed, inside the trailing window,
+# ≥1.5×). The desk lanes keep their own stop-derived rate_halt_drawdown_c. Before
+# W2a a single −$10–19 tail instantly exceeded the ~3%-of-book desk bound and
+# poisoned the trailing-8 sum for hours — the overnight died on one event.
+F_HALT_TAIL_MULT = float(os.environ.get("F_HALT_TAIL_MULT", "1.5"))  # DREW-DEFAULT (WO-W W2a): F halt bound = this × one full F loss
 # WO-2026-07-24-D Part 1: FLIP self-scales by NOTIONAL too (like F), else KELLY
 # caps it at ~5-6 on a $43 book (358c/60c) and FLIP_SIZE_CAP=10 never bites —
 # the +4×10 test ran at half the ruled size. 10 lots × 60c = 600c ≈ 14% of a
@@ -963,6 +973,11 @@ def constant_tags() -> list:
                     RECON_MAX_QUIET_S, _NEW),
         ConstantTag("CASH_CONFIRM_MAX_AGE_S", DREW_DEFAULT, "pending derivation",
                     CASH_CONFIRM_MAX_AGE_S, _NEW),
+        # WO-W W2a: F's halt bound in tail units (NEW this deploy). Gets a
+        # derived number once the pack has counted tail-cluster frequency/room.
+        ConstantTag("F_HALT_TAIL_MULT", DREW_DEFAULT,
+                    "pending derivation from tail-cluster frequency per room",
+                    F_HALT_TAIL_MULT, _NEW),
     ]
 
 
@@ -1054,3 +1069,31 @@ def f_single_loss_bound_pct() -> float:
     ~97¢ favorite costs ≈ the dial × book (the position is ~all-of-clip at that
     price). Printed next to the worst-day math; the stated, accepted ceiling."""
     return F_NOTIONAL_PCT
+
+
+# WO-2026-07-27-W W2a — the lanes whose loss geometry is ONE LARGE TAIL per many
+# small wins (the F family: F and its 8-hour sibling H8). Their halt bound speaks
+# tail units (f_halt_bound_c); every other lane is the desk (FLIP/OPEN/HUNT/D/P),
+# whose loss is many small stops and whose bound stays rate_halt_drawdown_c.
+TAIL_HALT_LANES = frozenset({"F", "H8"})
+
+
+def f_halt_bound_c(tradeable_cents: int) -> int:
+    """WO-2026-07-27-W W2a — F's rate-halt drawdown bound in F's OWN units:
+    F_HALT_TAIL_MULT × one full-size F loss at the current dial. One full F loss
+    at a ~97¢ favorite ≈ F_NOTIONAL_PCT × tradeable (the clip cost is the whole
+    stake). At the 1.5 default a single tail (1.0×) sits UNDER the bound — it
+    pages F_BIG_LOSS, never halts alone; a second tail (2.0×) crosses it and the
+    room parks. Scales with tradeable (cash-truth, WO-W P1), so it tightens as
+    the scrape banks exactly like the desk bound does."""
+    return max(1, int(round(F_HALT_TAIL_MULT * F_NOTIONAL_PCT
+                            * max(0, tradeable_cents))))
+
+
+def lane_halt_bound_c(lane: str, tradeable_cents: int) -> int:
+    """WO-2026-07-27-W W2a — the per-lane rate-halt drawdown bound. The F family
+    (TAIL_HALT_LANES) speaks tail units; the desk keeps its stop-derived bound.
+    One dispatch so _apply_streak_per_lane asks each lane in its own language."""
+    if lane in TAIL_HALT_LANES:
+        return f_halt_bound_c(tradeable_cents)
+    return rate_halt_drawdown_c(tradeable_cents)

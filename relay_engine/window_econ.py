@@ -346,8 +346,7 @@ class WindowEcon:
         # a frozen threshold is the count-vs-money bug reborn. WO-2026-07-26-O §O2:
         # off TRADEABLE = the passed account value − owed, so the halt tightens as
         # the scrape banks (subtract owed from the value handed in, don't re-read).
-        drawdown_bound = config.rate_halt_drawdown_c(
-            max(0, book_cents - self.ledger.owed_cents()))
+        tradeable = max(0, book_cents - self.ledger.owed_cents())
         # WO-2026-07-26-S §2: the rate halt keys on (series, lane). scope is the
         # bare lane while one room is rostered (byte-identical) and '{series}:
         # {lane}' with more — so XRP's drawdown parks XRP, BTC keeps printing.
@@ -356,11 +355,13 @@ class WindowEcon:
             # WO-2026-07-24-C Part 2: count MONEY, not negative windows. A
             # profitable asymmetric sequence (−8,−7,+17 = +2¢) must NOT halt; a
             # slow bleed that never trips 2-of-4 must. Sum the last N windows'
-            # fills-P&L against a drawdown threshold DERIVED from the lane's own
-            # size (RATE_HALT_DRAWDOWN_C = 4·FLIP_SIZE_CAP·OPEN_MOMENTUM_STOP_C)
-            # so it scales with the position and never strangles the lane it
-            # protects. pnl carries the 0.1c fraction (truncation fix) — kept.
+            # fills-P&L against a drawdown threshold. WO-2026-07-27-W W2a: the
+            # bound is now asked PER LANE in the lane's own loss language — the F
+            # family speaks tail units (1.5× one full F loss, a single tail can't
+            # halt alone), the desk keeps its stop-out geometry — so an ordinary F
+            # tail no longer trips the ~3%-of-book desk bound and poisons the sum.
             scope = config.halt_scope(series, lane)
+            bound = config.lane_halt_bound_c(lane, tradeable)
             pnl = float(per_lane[lane])
             key = _lane_outcomes_key(scope)
             outcomes = json.loads(self.ledger.get_state(key) or "[]")
@@ -368,24 +369,41 @@ class WindowEcon:
             outcomes = outcomes[-config.RATE_HALT_WINDOW_N:]
             self.ledger.set_state(key, json.dumps(outcomes))
             drawdown = sum(o["pnl"] for o in outcomes)
-            if drawdown < -drawdown_bound and scope not in halted:
+            if drawdown < -bound and scope not in halted:
                 halted.add(scope)
                 self.ledger.set_state(LANES_HALTED_KEY,
                                       json.dumps(sorted(halted)))
                 self.gateway.halt_entries(f"{HALT_REASON}:{scope}")
                 named = ", ".join(f"{o['market']} {o['pnl']:+.0f}c"
                                   for o in outcomes)
+                # W2a: the geometry the bound speaks — a CLUSTER of F tails, or
+                # the desk's stop-outs. The tail-cluster count is a registry datum
+                # (SCIENTIST: the pack counts cluster frequency per room).
+                if lane in config.TAIL_HALT_LANES:
+                    tails = [o for o in outcomes if o["pnl"] < 0]
+                    geom = (f"tail cluster: {len(tails)} F-size tails "
+                            f"(bound {config.F_HALT_TAIL_MULT}× one full F loss "
+                            f"= −{bound}¢)")
+                    self.surface.write_row(
+                        "ECON", market, f"tailcluster-{int(time.time())}",
+                        "TAIL_CLUSTER",
+                        detail=json.dumps({"lane": lane, "series": series,
+                                           "n_tails": len(tails),
+                                           "drawdown_c": round(drawdown, 1),
+                                           "bound_c": bound}))
+                else:
+                    geom = (f"< −{bound}¢ — 4 stop-outs at book "
+                            f"${book_cents / 100:.0f}")
                 retro = (f"⛔ {lane} RATE HALT (retroactive: {market} settled "
                          f"late): " if late else f"⛔ {lane} RATE HALT: ")
                 self.telegram.alert(
                     f"{retro}{lane} drew down {drawdown:+.0f}¢ over the last "
-                    f"{len(outcomes)} windows (< −{drawdown_bound}¢ — 4 stop-outs "
-                    f"at book ${book_cents / 100:.0f}) — {named} · other lanes "
+                    f"{len(outcomes)} windows ({geom}) — {named} · other lanes "
                     "trade on · reply /reset_halt to resume")
                 failures.fail("RATE_HALT",
                               f"{lane}: drawdown {drawdown:+.0f}c over last "
                               f"{len(outcomes)} {lane} windows < "
-                              f"-{drawdown_bound}c: {named}",
+                              f"-{bound}c: {named}",
                               lane=lane, drawdown_cents=round(drawdown, 1),
                               outcomes=outcomes, book_cents=book_cents)
 
@@ -480,21 +498,38 @@ class WindowEcon:
         self.ledger.set_state(OUTCOMES_KEY, "[]")   # B3: the window restarts clean
         # KAL-50/50 Stage 0.1: clear every per-lane window too (the scoped
         # RATE_HALT:<lane> gateway reasons lift with resume_entries_all below).
+        # WO-2026-07-27-W W2b — THE SPENT LOSS: the losses that triggered the halt
+        # are the punishment SERVED; mark them SPENT (record the total, restart the
+        # window clean) so the same loss can never convict twice. Without this a
+        # tail sat in the trailing-8 sum for hours and re-halted the room on a loss
+        # it had already answered for.
+        spent = {}
         for lane in lane_halts:
+            outcomes = json.loads(
+                self.ledger.get_state(_lane_outcomes_key(lane)) or "[]")
+            losses = sum(o["pnl"] for o in outcomes if o["pnl"] < 0)
+            if losses < 0:
+                spent[lane] = round(losses, 1)
             self.ledger.set_state(_lane_outcomes_key(lane), "[]")
         self.ledger.set_state(LANES_HALTED_KEY, "[]")
         cleared = self.gateway.resume_entries_all(keep=keep)
+        spent_s = (" spent=" + ",".join(f"{l} {c:+.0f}c"
+                                        for l, c in sorted(spent.items()))
+                   if spent else "")
         self.surface.write_row("ECON", "ENGINE", f"halt-{int(time.time())}",
                                "HALT_RESET",
                                detail=f"confirmed_by={confirmed_by} "
-                                      f"cleared={','.join(cleared) or 'none'}")
+                                      f"cleared={','.join(cleared) or 'none'}"
+                                      f"{spent_s}")
         book = self.ledger.book_cents()
         names = ", ".join(cleared) or "none"
         held = ", ".join(sorted(r for r in halted_reasons if r in keep))
         held_s = f" · still held (own key): {held}" if held else ""
+        spent_msg = (" · losses SPENT (window restarts clean):"
+                     + spent_s.replace(" spent=", " ") if spent else "")
         return (f"halt cleared ({names}) — entries re-enabled · "
-                f"book ${book / 100:.2f}{held_s} · next window considered "
-                f"on the next cycle")
+                f"book ${book / 100:.2f}{held_s}{spent_msg} · next window "
+                f"considered on the next cycle")
 
     # ── §2.4: the pack lines ───────────────────────────────────────────
     def pack_lines(self) -> list:

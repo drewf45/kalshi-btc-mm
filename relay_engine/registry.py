@@ -73,7 +73,7 @@ SEED_SURFACES = (
     "SIZE_DECISION", "SETTLE_AUDIT", "OPEN_SKIP",
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
     "BOOK_STALE", "CORRELATED_LOSS", "NO_COUNTERPARTY",
-    "RECON_CADENCE", "BALANCE_REJECTED",
+    "RECON_CADENCE", "BALANCE_REJECTED", "TAIL_CLUSTER",
 )
 
 
@@ -158,6 +158,16 @@ def seed() -> None:
         "paged once per window — a lane dying silently is its own Article-2 "
         "violation (WO-V B1). Never fires on a transient venue 500.",
         "the BALANCE_REJECTED page / the phantom-book restart decision")
+    register(
+        "TAIL_CLUSTER",
+        "How often does a room take ≥2 F-size tails inside one trailing window — "
+        "the cluster the halt is meant to catch?",
+        "VALIDATES the W2a halt geometry: F's loss is one large tail per ~25 wins, "
+        "so a SINGLE tail must never halt (it pages F_BIG_LOSS) while a CLUSTER "
+        "must. Measured cluster frequency per room turns F_HALT_TAIL_MULT from a "
+        "DREW-DEFAULT (1.5) into a DERIVED number — rare clusters let it relax, "
+        "frequent ones tighten it (WO-W W2a).",
+        "the daily pack's tail-cluster-by-room line / F_HALT_TAIL_MULT derivation")
 
 
 def missing_registration(active_surfaces) -> List[str]:

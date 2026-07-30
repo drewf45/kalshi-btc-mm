@@ -4357,6 +4357,49 @@ cash + at-risk in the cash regime and = tradeable in the book regime (no double-
 FLIP-cap tests updated for the `capital=`/`ensemble_base_cents` base. **F entry/hold/exit
 byte-identical** (LIVE-gated; golden tape green). Suite 971 · preflight 23/23.
 
+## WO-2026-07-27-W — THE 24-HOUR RULINGS · P2 (the spent loss: per-lane halt geometry + the spent ledger)
+
+**Read-rule (verified at source).** `config.py:621-670` — TRUE: `rate_halt_drawdown_c` is the desk's
+stop-derived bound (`4 × lots × OPEN_MOMENTUM_STOP_C`, lots from `FLIP_NOTIONAL_PCT`), i.e. F was
+being halted on the *desk's* geometry. `window_econ.py:360-370` — TRUE: the per-lane trailing sum
+`sum(o["pnl"] for o in outcomes)` compared against a single `drawdown_bound`. Drew's diagnosis
+confirmed: F's loss is one large tail per ~25 wins while the bound was ~3% of book, so a single
+ordinary −$10–19 tail instantly exceeded it AND poisoned the trailing-8 sum for hours — the
+overnight died on one event.
+
+**W2a — F's halt bound speaks F's own loss units.** `config.f_halt_bound_c(tradeable)` =
+`F_HALT_TAIL_MULT (1.5) × one full-size F loss at the dial`; one full F loss at a ~97¢ favorite ≈
+`F_NOTIONAL_PCT × tradeable` (the clip cost is the whole stake), so the bound scales with cash-truth
+(P1) exactly as the desk bound does. `config.lane_halt_bound_c(lane, tradeable)` dispatches: the F
+family (`TAIL_HALT_LANES = {F, H8}` — the cheap-favorite, one-large-tail, non-desk lanes) speaks
+tail units; every desk lane (FLIP/OPEN/HUNT/D/P) keeps `rate_halt_drawdown_c` unchanged.
+`_apply_streak_per_lane` now asks the bound per lane inside the loop. A **single** ordinary tail
+(1.0×) sits under the 1.5× bound → no halt (it still pages F_BIG_LOSS, which already exists); a
+**cluster** — a second tail, or tail-plus-bleed, inside the trailing window (≥1.5×) — halts that room
+only. The F-family halt writes a `TAIL_CLUSTER` surface datum (`n_tails`, drawdown, bound) and the
+page reads "tail cluster: N F-size tails"; the desk page keeps "4 stop-outs at book $X".
+
+**W2b — the spent loss.** When any halt clears (`reset_halt`), the triggering losses in each halted
+lane's trailing window are summed as SPENT, the window restarts clean (`[]`), and both the
+`HALT_RESET` surface row and the reply record what was spent (Article 1). A halt is the punishment
+served — the same loss can never convict twice, so a stale tail can no longer re-halt a room it
+already answered for. Nothing is spent when the cleared window held no loss.
+
+**Registry + tag.** `TAIL_CLUSTER` joins `SEED_SURFACES` (the standing question: how often does a
+room take ≥2 F-size tails in one window — the cluster the halt is meant to catch; measured frequency
+turns `F_HALT_TAIL_MULT` from a DREW-DEFAULT into a DERIVED number). `F_HALT_TAIL_MULT` is tagged
+DREW-DEFAULT, NEW this deploy, source "pending derivation from tail-cluster frequency per room".
+
+**Acceptance (`test_spent_loss.py`, 8).** F/H8 bound = tail units and desk = stop units; the tail
+bound is >4× the desk bound (the bug quantified); a single full F tail does NOT halt; a two-tail
+cluster halts F, pages "tail cluster", writes the `TAIL_CLUSTER` datum; the desk (FLIP) still halts
+at its stop bound and says "stop-outs"; at reset the losses are SPENT, the window restarts clean, and
+the row/reply record it; a cleared win-only window spends nothing; `TAIL_CLUSTER` registered;
+`F_HALT_TAIL_MULT` tagged. The p17 retroactive-halt test updated to a genuine full-clip two-tail
+cluster (24-lot tails) — ordinary small losses correctly no longer trip F. **F entry/hold/exit
+byte-identical** (the halt is the surrounding governor; golden tape green). Suite 979 · preflight
+23/23.
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate
