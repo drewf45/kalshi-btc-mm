@@ -296,6 +296,42 @@ def restated_money_lines(ledger) -> list:
     ]
 
 
+def scrape_restatement_lines(ledger) -> list:
+    """WO-2026-07-28-X X7 — THE DRIFT RECONCILIATION (one-time, closes the books).
+    Prints the OLD derived-book trading equity vs the VENUE truth with the delta
+    explained, tagged RESTATED. The scrape hwm now reads venue truth ongoing
+    (trading_equity_cents, X7), so this is the announcement, not a mutation: owed
+    is a ratchet and is UNCHANGED by the source swap (a downward correction of a
+    phantom-inflated high is the venue's to make, and it announces itself)."""
+    ext = int(ledger.db.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements"
+        " WHERE kind != 'BASELINE'").fetchone()[0])
+    derived_te = ledger.book_cents() - ext
+    vc = ledger.get_state("last_venue_cash_cents")
+    owed = ledger.owed_cents()
+    if vc is None:
+        return [f"SCRAPE RESTATEMENT (X7): no venue read yet — the derived-book "
+                f"trading equity ${derived_te / 100:.2f} stands until the first "
+                f"reconcile; owed ${owed / 100:.2f} unchanged"]
+    venue_te = int(vc) - ext
+    delta = venue_te - derived_te
+    quarantined = int(ledger.db.execute(
+        "SELECT COALESCE(SUM(pnl_cents),0) FROM settlements WHERE divergent=1"
+    ).fetchone()[0])
+    return [
+        f"SCRAPE RESTATEMENT (X7 — RESTATED): trading equity venue-truth "
+        f"${venue_te / 100:.2f} vs old derived-book ${derived_te / 100:.2f} "
+        f"(Δ {delta:+d}c)",
+        f"  Δ line-item: quarantined divergent settlements {quarantined:+d}c "
+        f"(X2 re-book, now retired by X5) + accrual float dust 0c (X6 integer "
+        f"cents) + X1 bell-spillover in the residual; the hwm reads venue truth "
+        f"from here (trading_equity_cents), ratchet-safe",
+        f"  owed ${owed / 100:.2f} — UNCHANGED by the source swap (the ratchet "
+        f"never un-owes a real gain; a phantom high above venue truth was never "
+        f"real and the venue's number is the floor)",
+    ]
+
+
 def recon_cadence_lines(ledger) -> list:
     """WO-2026-07-27-V T1 — THE SENTINEL'S PULSE. Clean reconciles per UTC hour
     vs total cycles: the cash sentinel's duty cycle, made visible. A run of hours
@@ -668,6 +704,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         lines.extend(restated_money_lines(ledger))
     except Exception as e:
         lines.append(f"MONEY (RESTATED): unavailable ({e})")
+    # WO-2026-07-28-X X7: the drift reconciliation — venue truth vs derived book.
+    try:
+        lines.extend(scrape_restatement_lines(ledger))
+    except Exception as e:
+        lines.append(f"SCRAPE RESTATEMENT (X7): unavailable ({e})")
     # WO-2026-07-26-O §O3: the scrape owed line rides the daily pack.
     try:
         lines.append(owed_line(ledger))

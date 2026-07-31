@@ -251,10 +251,27 @@ class Ledger:
     # MONOTONIC so a loss (salvage or ride) can never UN-OWE. A withdrawal
     # (CONFIRMED_WITHDRAWAL, negative) decrements owed — the operator taking it.
     def trading_equity_cents(self) -> int:
-        ext = self.db.execute(
+        """The scrape's unit: baseline + realized trading gains, invariant to
+        deposits/withdrawals (they cancel: account − externals).
+
+        WO-2026-07-28-X X7 — THE VENUE SPEAKS LAST for the owed ratchet too. The
+        P0: this fed `high_water_cents` off `book_cents` (the DERIVED book), the
+        very number X1/X2 drift — so a phantom could mint owed. In LIVE it now
+        reads the venue's CASH (WO-V stamp) minus externals: at a FLAT moment cash
+        IS the realized account value, so trading equity is venue-truthful; MID-
+        window cash is depressed by deployed capital, which only ever reads the
+        equity LOW — and the high-water is a max(), so a low read never advances
+        it (ratchet-safe: owed is never minted on an unrealized mark or a phantom).
+        SHADOW / pre-first-read fall back to the paper book — byte-identical."""
+        ext = int(self.db.execute(
             "SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements"
-            " WHERE kind != 'BASELINE'").fetchone()[0]
-        return self.book_cents() - int(ext)
+            " WHERE kind != 'BASELINE'").fetchone()[0])
+        base = self.book_cents()
+        if config.live_submit_enabled():
+            vc = self.get_state("last_venue_cash_cents")
+            if vc is not None:
+                base = int(vc)          # venue cash: the account-truth base (X7)
+        return base - ext
 
     def scrape_seed_cents(self):
         s = self.get_state("scrape_seed_c")

@@ -4491,7 +4491,38 @@ artifact — `settle_market` carries `pnl_dc`/`to_decicents`/`cents_half_even` a
 representation changed, not F's edge). Suite 999 · preflight 23/23.
 
 *Remaining in this WO: X5 (bell-group brackets, retire quarantine/re-book, BELL_ECON_DIVERGENCE +
-DISPUTED), X7 (hwm P0 re-seed from venue truth + the one-time drift restatement).*
+DISPUTED).*
+
+## WO-2026-07-28-X — THE VENUE SPEAKS LAST · X7 (the hwm P0 + the drift reconciliation)
+
+**The P0, fixed at the source.** `high_water_cents()` — the owed ratchet — read `trading_equity_cents()`
+= `book_cents() − ext`, the DERIVED book that X1/X2 drift; a phantom could mint owed. `trading_equity_
+cents()` now reads the venue's CASH (the WO-V `last_venue_cash_cents` stamp) minus externals in LIVE:
+at a **flat** moment cash IS the realized account value, so trading equity is venue-truthful; **mid-window**
+cash is depressed by deployed capital, which only ever reads the equity LOW — and the high-water is a
+`max()`, so a low read never advances it. **Ratchet-safe**: owed is never minted on an unrealized mark
+or on a phantom-inflated book. SHADOW and pre-first-read fall back to the paper book (byte-identical).
+Deposits/withdrawals cancel (`venue_cash − ext` = baseline + realized gains, invariant to externals),
+so a scrape withdrawal nets out exactly.
+
+**The drift reconciliation (one-time, closes the books).** `ops.scrape_restatement_lines` prints the
+venue-truth trading equity vs the old derived-book figure with the delta explained line-item
+(quarantined divergent settlements — the X2 re-book, retired by X5; accrual float dust — now 0 by X6;
+the X1 bell-spillover in the residual), tagged **RESTATED**, and states **owed UNCHANGED** by the
+source swap (the ratchet never un-owes a real gain; a phantom high above venue truth was never real,
+and the venue's number is the floor). It rides the daily pack; before the first venue read it holds the
+derived book and says so.
+
+**Acceptance (`test_scrape_venue_truth.py`, 6).** SHADOW trading equity = paper book (byte-identical);
+LIVE = venue cash − externals (3291, not the 9700 phantom book); a phantom that inflates the derived
+book does NOT move trading equity / hwm / owed (the P0 closed); the hwm advances only at a flat
+full-cash read, never on a mid-window low (ratchet-safe); the restatement prints venue-vs-derived with
+the delta line-item and owed unchanged; pre-first-read holds the book. **F byte-identical** (the scrape
+source changed, not F's edge; LIVE-gated, golden tape green). Suite 1005 · preflight 23/23.
+
+*Remaining in this WO: X5 (bell-group brackets, retire quarantine/re-book, BELL_ECON_DIVERGENCE +
+DISPUTED) — the account-delta check moved to the resolution it can measure (the bell), retiring the
+per-market model X1 broke and the X2 re-book.*
 
 ## HARD STOP honored
 
