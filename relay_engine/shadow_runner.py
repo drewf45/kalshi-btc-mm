@@ -2154,7 +2154,13 @@ class ShadowEngine:
                     continue
                 won = (settled_yes and side == "yes") or \
                       (not settled_yes and side == "no")
-                pnl = ((100 - s["entry"]) if won else -s["entry"]) * s["net"]
+                # WO-2026-07-28-X X6: accrue in integer deci-cents, book half-even
+                # whole cents — the cell-outcome money is dust-free like the
+                # settlement accrual (an entry may carry a 0.1c venue tick).
+                from .money import cents_half_even, to_decicents
+                gain_dc = ((1000 - to_decicents(s["entry"])) if won
+                           else -to_decicents(s["entry"])) * s["net"]
+                pnl = cents_half_even(gain_dc)
                 self.ledger.record_cell_outcome(
                     lane, s["entry"], won=won, pnl_cents=pnl, fees_cents=0,
                     market=market, kind="settle", now=now_eff,

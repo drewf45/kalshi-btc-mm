@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 from .book import to_yes_terms
 from .ledger import Ledger
+from .money import cents_half_even, to_decicents
 
 # Terminal states (one per lane/market/window)
 PASS = "PASS"
@@ -162,7 +163,11 @@ class Surface:
 
         result: Dict[str, int] = {}
         for lane, fills in per_lane.items():
-            pnl = 0
+            # WO-2026-07-28-X X6: accrue in integer DECI-CENTS (contracts×price is
+            # exact in tenth-cents), round HALF-EVEN to whole cents ONCE at booking
+            # — no float touches the money math, so the 8.9999c dust becomes
+            # unrepresentable. 100c = 1000 deci-cents.
+            pnl_dc = 0
             custodied = False
             # WO-INFRA-HARDENING E1 — the settlement SOURCE tracer (the code's
             # long-standing "E1 traces the source" TODO): every booked cent is
@@ -173,26 +178,27 @@ class Surface:
             contribs: List[dict] = []
             net_held = {"yes": 0, "no": 0}
             for side, action, price_cents, count in fills:
-                yes_price = to_yes_terms(side, price_cents)
-                side_payoff = (100 if settled_yes else 0) if side == "yes" else (0 if settled_yes else 100)
-                side_basis = yes_price if side == "yes" else 100 - yes_price
+                yes_dc = to_decicents(to_yes_terms(side, price_cents))
+                payoff_dc = (1000 if settled_yes else 0) if side == "yes" else (0 if settled_yes else 1000)
+                basis_dc = yes_dc if side == "yes" else 1000 - yes_dc
                 if action == "ENTRY":
                     # Long the entered side at its basis; collects the side's payoff.
-                    c = (side_payoff - side_basis) * count
+                    c_dc = (payoff_dc - basis_dc) * count
                     net_held[side] += count
                 elif action in ("EXIT", "CUSTODIAN_EXIT"):
                     # An exit realizes the sale price and forgoes the side's payoff —
                     # symmetric to entry, opposite sign (win/loss path symmetry).
                     if action == "CUSTODIAN_EXIT":
                         custodied = True
-                    c = (side_basis - side_payoff) * count
+                    c_dc = (basis_dc - payoff_dc) * count
                     net_held[side] -= count
                 else:
-                    c = 0
-                pnl += c
+                    c_dc = 0
+                pnl_dc += c_dc
                 contribs.append({"side": side, "action": action,
                                  "price": price_cents, "count": count,
-                                 "contribution_cents": c})
+                                 "contribution_cents": cents_half_even(c_dc)})
+            pnl = cents_half_even(pnl_dc)   # X6: half-even to whole cents at booking
             self.ledger.record_settlement(market, lane, pnl, detail=f"window={window_id}")
             # E1: the provenance row — pnl, the exchange outcome, the per-fill
             # breakdown, the running book AFTER this settlement books, and the

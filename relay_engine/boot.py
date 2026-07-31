@@ -834,6 +834,17 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "SHADOW papers the money; LIVE before the first read falls back to "
                  "book, then the venue value with its age. The phone's number now "
                  "equals the app's, to the cent")
+    lines.append("  INTEGER CENTS AT THE ACCRUAL (WO-2026-07-28-X, build 92): X6 "
+                 "— the venue ticks in 0.1c and fills once carried those ticks as "
+                 "FLOATS, so contracts×price accrual sprayed representation dust "
+                 "(8.999999999999986c for a true 9c). The settlement accrual now "
+                 "carries integer DECI-CENTS (contracts×price exact in tenth-cents, "
+                 "`relay_engine.money`) and rounds HALF-EVEN to whole cents at "
+                 "BOOKING — banker's rounding, no float, no truncation bias (the "
+                 "old int() understated basis; the old REAL sprayed dust). The "
+                 "cell-outcome accrual books the same way. The float spray is now "
+                 "unrepresentable: settlements hold integers, book_cents sums "
+                 "integers, every display formats from integers. F byte-identical")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

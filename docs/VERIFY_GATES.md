@@ -4456,7 +4456,42 @@ runs green under the three-room default. Suite 987 · preflight 23/23.
 
 **Acceptance (`test_venue_speaks_last.py`, 7).** SHADOW account value = paper book; LIVE = the venue value (3291, not the 9700 phantom book) age-stamped; LIVE falls back to book pre-first-read; `account_headline` formats each source (venue+age / paper / pre-read); `owed_line` prints the venue account, not `book $`; the grep artifact — `owed_line`/`restated_money_lines`/`account_headline` carry no `book $`/`book=` account display, and `account_headline`'s body reads `account_value_display` not `book_cents`; the pack MONEY and hourly route through `account_headline`. Settle/halt/sizing-line tests updated to the venue-headline labels. **F/XRP/ETH entry-exit, salvage, sizing (-W cash base) byte-identical** (X4 is display-only; golden tape green). Suite 994 · preflight 23/23.
 
-*Remaining in this WO (sequenced next, each its own green increment): X6 (integer tenth-cent money math, kill the float spray), X5 (bell-group brackets, retire the quarantine/re-book, BELL_ECON_DIVERGENCE + DISPUTED), X7 (hwm P0 re-seed from venue truth + the one-time drift restatement).*
+*Remaining in this WO (sequenced next, each its own green increment): X5 (bell-group brackets, retire the quarantine/re-book, BELL_ECON_DIVERGENCE + DISPUTED), X7 (hwm P0 re-seed from venue truth + the one-time drift restatement).*
+
+## WO-2026-07-28-X — THE VENUE SPEAKS LAST · X6 (integer cents at the accrual)
+
+**The fix (X3 killed at the root).** The venue ticks in 0.1c; `fills.price_cents`/`to_yes_terms` are
+REAL, so the settlement's `contracts×price` accrual ran in floats and sprayed representation dust —
+`8.999999999999986c` for a true 9c. `relay_engine/money.py` carries money as integer **deci-cents**
+(tenth-cents — `contracts×price` is exact) and rounds **half-even** to whole cents at the booking
+boundary: `to_decicents` (a cent price → integer tenth-cents), `cents_half_even` (deci-cents → whole
+cents, banker's rounding), `round_cents_half_even` (a legacy float sum → clean integer). Banker's
+rounding removes the up-bias that both the old `int()` truncation (understated basis, overstated
+profit, always one direction) and naive round-half-up would carry.
+
+`surface.settle_market` now accrues `pnl_dc` in integer deci-cents (basis/payoff in deci-cents, `100c
+= 1000 dc`) and books `cents_half_even(pnl_dc)` — an integer cent per settlement. The cell-outcome
+accrual (`shadow_runner`, `(1000 − to_decicents(entry)) × net` → `cents_half_even`) books the same
+way. The `settlements` table now holds integers, `book_cents` sums integers, and every display
+formats from integers — the float spray is unrepresentable.
+
+**Rerules WO-23-F Part 1 (honestly).** WO-23-F carried the 0.1c fraction as a REAL and rounded once
+at `book_cents`; X6 rerules that to integer deci-cent accrual + half-even at booking (Drew: "integer
+cents at the accrual, rounded at every boundary"). `to_yes_terms` still preserves the fraction (no
+truncation); the change is that booking collapses it to an unbiased integer cent rather than storing
+a float. The two `test_truncation.py` tests were updated to the new booking rule (a no@97.3 win →
+3c half-even, integer, dust-free).
+
+**Acceptance (`test_integer_money.py`, 5; `test_truncation.py`, 3).** `to_decicents` exact on venue
+ticks and on float dust; `cents_half_even` is banker's rounding (2.5c→2, 3.5c→4, symmetric on
+negatives, whole cents round-trip); `round_cents_half_even` collapses the `8.9999…` spray to a clean
+integer 9; the settle accrual books integers only (the on-screen fixture renders dust-free); the grep
+artifact — `settle_market` carries `pnl_dc`/`to_decicents`/`cents_half_even` and the retired float
+`side_basis`/`side_payoff * count` path is gone. **F byte-identical** (golden tape green — the money
+representation changed, not F's edge). Suite 999 · preflight 23/23.
+
+*Remaining in this WO: X5 (bell-group brackets, retire quarantine/re-book, BELL_ECON_DIVERGENCE +
+DISPUTED), X7 (hwm P0 re-seed from venue truth + the one-time drift restatement).*
 
 ## HARD STOP honored
 
