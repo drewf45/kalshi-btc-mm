@@ -123,6 +123,91 @@ class WindowEcon:
         # they never consume a paper number. market -> first-deferred ts / close args.
         self.pending_opens: Dict[str, float] = {}
         self.pending_closes: Dict[str, dict] = {}
+        # WO-2026-07-28-X X5 — BELL-GROUP BRACKETS. Markets settling on the same
+        # bell (settlement instant, within a grace) reconcile TOGETHER: bell_id ->
+        # {members:{market:fills_pnl}, open_value, close_value, cash_moves, ts}.
+        # `reconcile_bell` sums the members' fills-math against the account delta;
+        # a mismatch is real trouble (a phantom, a missing fill) and pages
+        # BELL_ECON_DIVERGENCE + marks the bell DISPUTED. Reconciled bells are
+        # remembered so a straggler (a member settling outside grace) forms its
+        # own bell rather than re-opening a closed one.
+        self._bells: Dict[int, dict] = {}
+        self._bells_reconciled: set = set()
+
+    # ── WO-2026-07-28-X X5: bell-group brackets ────────────────────────
+    def _bell_id(self, close_ts: float) -> int:
+        """The bell a settlement belongs to: its close instant quantized to the
+        grace window, so markets settling within BELL_GRACE_S share one bell and
+        a straggler beyond it forms its own."""
+        return int(close_ts // config.BELL_GRACE_S)
+
+    def _bell_record(self, br, market: str, fills_pnl: int,
+                     account_value_cents: int, now: float) -> None:
+        """Accumulate a just-settled market into its bell (X5). Uses the bracket's
+        open account value + this close, so the bell's account delta is measured
+        across ALL its members, never differenced per market (X1's bug)."""
+        bid = self._bell_id(now)          # the settlement instant is the bell
+        b = self._bells.get(bid)
+        if b is None:
+            b = {"members": {}, "open_value": br.open_value_cents,
+                 "close_value": account_value_cents,
+                 "open_ts": br.open_ts, "ts": now}
+            self._bells[bid] = b
+        b["members"][market] = fills_pnl
+        # the bell's account bracket = earliest open, latest close across members
+        b["open_value"] = min(b["open_value"], br.open_value_cents)
+        b["close_value"] = account_value_cents
+        b["ts"] = now
+
+    def reconcile_bell(self, bell_id: int,
+                       tolerance: int = DIVERGENCE_TOLERANCE_CENTS) -> dict:
+        """X5 — the account-delta check at the resolution it can measure. Sum the
+        bell's members' fills-math and compare to the account delta across the
+        bell (close − open − cash moves). A match means per-market attribution
+        inside the bell is trustworthy; a divergence is real trouble (a phantom, a
+        missing fill, a booking error) → pages BELL_ECON_DIVERGENCE with the member
+        list and marks the bell's attribution rows DISPUTED (excluded from cells),
+        touching no headline. Idempotent per bell."""
+        b = self._bells.get(bell_id)
+        if b is None or bell_id in self._bells_reconciled:
+            return {"reconciled": False}
+        self._bells_reconciled.add(bell_id)
+        members = b["members"]
+        sum_fills = sum(members.values())
+        cash_moves = self.cash_moves_inside(b["open_ts"], b["ts"])
+        acct_delta = b["close_value"] - b["open_value"] - cash_moves
+        diverged = abs(acct_delta - sum_fills) > tolerance
+        verdict = {"reconciled": True, "bell_id": bell_id,
+                   "members": dict(members), "sum_fills": sum_fills,
+                   "acct_delta": acct_delta, "diverged": diverged}
+        self.surface.write_row(
+            "ECON", "BELL", f"bell-{bell_id}",
+            "BELL_ECON_DIVERGENCE" if diverged else "BELL_ECON_OK",
+            detail=json.dumps(verdict))
+        if diverged:
+            names = ", ".join(f"{m} {p:+d}c" for m, p in sorted(members.items()))
+            self.ledger.mark_bell_disputed(list(members))
+            failures.fail(
+                "BELL_ECON_DIVERGENCE",
+                f"bell {bell_id}: Σ fills {sum_fills:+d}c vs account delta "
+                f"{acct_delta:+d}c over [{names}] (tolerance {tolerance}c) — "
+                "the bell's attribution is DISPUTED (out of cells) pending audit",
+                bell_id=bell_id, sum_fills=sum_fills, acct_delta=acct_delta,
+                members=json.dumps(members))
+        return verdict
+
+    def reconcile_ready_bells(self, now: Optional[float] = None) -> int:
+        """Reconcile every bell whose grace has elapsed (no member can still join).
+        Called at the end of a settlement sweep. Returns bells reconciled."""
+        now = time.time() if now is None else now
+        done = 0
+        for bid in sorted(self._bells):
+            if bid in self._bells_reconciled:
+                continue
+            if now - self._bells[bid]["ts"] >= config.BELL_GRACE_S:
+                self.reconcile_bell(bid)
+                done += 1
+        return done
 
     # ── persistence-aware halt state ───────────────────────────────────
     @property
@@ -247,28 +332,20 @@ class WindowEcon:
             return None
         self._reject_paper_in_live(market, source)
         cash_moves = self.cash_moves_inside(br.open_ts, now)
-        window_pnl = account_value_cents - br.open_value_cents - cash_moves
-
-        # broker truth vs our arithmetic — divergence pages the moment it exists
-        if abs(window_pnl - fills_pnl_cents) > DIVERGENCE_TOLERANCE_CENTS:
-            failures.fail("WINDOW_ECON_DIVERGENCE",
-                          f"{market}: broker window pnl {window_pnl}c vs fills-based "
-                          f"{fills_pnl_cents}c (tolerance {DIVERGENCE_TOLERANCE_CENTS}c)",
-                          broker_pnl=window_pnl, fills_pnl=fills_pnl_cents,
-                          market=market)
-            # P-CASH-FATAL-1 §4.6 (stopgap until E1): the window's settlement
-            # value is DISPUTED — quarantine it from the book and re-book at
-            # fills-truth. The 190945 phantom (+103c the fills said was +4c)
-            # entered the book here, then armed the deny-reboot breach; a
-            # divergent number never again silently inflates the book that
-            # cash reconciles against.
-            phantom = self.ledger.quarantine_divergent_settlements(
-                market, fills_pnl_cents)
-            if phantom:
-                self.telegram.alert(
-                    f"🧾 DIVERGENT settlement {market}: {phantom:+.1f}c "
-                    f"quarantined from the book — fills-truth "
-                    f"{fills_pnl_cents}c booked instead (E1 traces the source)")
+        # WO-2026-07-28-X X5 — BELL-GROUP BRACKETS. Per-market attribution IS
+        # fills-math: inside a clean bell, a market's P&L is exactly what its fills
+        # earned, by definition. The per-market account-delta was X1's broken model
+        # (differencing a GLOBAL book per market absorbed the OTHER rooms settling
+        # on the same bell — the divergence alarm cried wolf on every shared bell).
+        # The account-delta check MOVED to the bell (`reconcile_bell`); the X2
+        # per-market quarantine/re-book is RETIRED — with account truth venue-read
+        # (X4) and the owed ratchet off venue cash (X7), a disputed number can no
+        # longer inflate the headline or mint owed, so a divergent settlement never
+        # re-books (and real settlements stop being wrongly marked divergent under
+        # three rooms). The account read is recorded for the bell reconciliation /
+        # the audit, never differenced per market.
+        window_pnl = fills_pnl_cents
+        self._bell_record(br, market, fills_pnl_cents, account_value_cents, now)
 
         self.ledger.db.execute(
             "UPDATE window_econ SET close_value_cents=?, cash_moves_cents=?,"

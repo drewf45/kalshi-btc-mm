@@ -90,16 +90,28 @@ def test_bracket_adjusts_for_cash_moves_inside(engine):
     assert pnl == 39  # the deposit did not masquerade as trading profit
 
 
-def test_divergence_pages_with_both_numbers(engine):
+def test_divergence_pages_at_the_bell_with_members(engine):
+    """WO-2026-07-28-X X5: the per-market WINDOW_ECON_DIVERGENCE is retired (it
+    cried wolf on every shared bell). The account-delta check pages at the BELL:
+    Σ the members' fills vs the account delta across the bell, with the member
+    list — a real break (a phantom, a missing fill), never a shared-bell artifact."""
     open_value = engine.ledger.book_cents()
     engine.econ.open_bracket(TICKER, open_value, now=1000.0)
-    # broker says -10 but fills say +39: the legacy-class lie -> banked + paged
-    engine.econ.close_bracket(TICKER, open_value - 10, +39,
-                              lanes_active="F", fills_count=1, now=1900.0)
+    # account delta -10 but fills say +39: a real divergence at this market's bell
+    assert engine.econ.close_bracket(TICKER, open_value - 10, +39,
+                                     lanes_active="F", fills_count=1,
+                                     now=1900.0) == 39   # window_pnl IS fills-math
+    # no per-market page fired; the bell reconciliation catches it
+    assert engine.ledger.db.execute(
+        "SELECT COUNT(*) FROM failures WHERE why_tag='WINDOW_ECON_DIVERGENCE'"
+    ).fetchone()[0] == 0
+    v = engine.econ.reconcile_bell(engine.econ._bell_id(1900.0))
+    assert v["diverged"] and v["members"] == {TICKER: 39}
     row = engine.ledger.db.execute(
-        "SELECT how_json FROM failures WHERE why_tag='WINDOW_ECON_DIVERGENCE'").fetchone()
+        "SELECT how_json FROM failures WHERE why_tag='BELL_ECON_DIVERGENCE'"
+    ).fetchone()
     how = json.loads(row[0])
-    assert how["broker_pnl"] == -10 and how["fills_pnl"] == 39
+    assert how["sum_fills"] == 39 and how["acct_delta"] == -10
 
 
 def test_untraded_market_writes_no_bracket(engine):

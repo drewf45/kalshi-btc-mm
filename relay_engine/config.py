@@ -418,6 +418,12 @@ RECON_MAX_QUIET_S = 1800       # DREW-DEFAULT: 30 min unverified → RECON_STARV
 # venue-cash read older than this is not solvent evidence — blind is not solvent,
 # so it defers everything and pages rather than sizing off a stale number.
 CASH_CONFIRM_MAX_AGE_S = 1800  # DREW-DEFAULT: 30 min — a confirmed venue cash older than this defers + pages
+# WO-2026-07-28-X X5 — BELL-GROUP BRACKETS. Markets settling within this many
+# seconds of one another share one BELL and reconcile together (Σ their fills-math
+# vs the account delta across the bell); a member settling beyond the grace forms
+# its own bell. 45s covers a normal shared-bell settle spread while a genuine late
+# straggler (a settle confirmed a minute-plus after the bell) is isolated.
+BELL_GRACE_S = int(os.environ.get("BELL_GRACE_S", "45"))  # DREW-DEFAULT (WO-X X5)
 
 # ---------------------------------------------------------------------------
 # Walls (C.3 / BUILD_SEQUENCE 3.2)
@@ -1012,6 +1018,11 @@ def constant_tags() -> list:
         ConstantTag("F_HALT_TAIL_MULT", DREW_DEFAULT,
                     "pending derivation from tail-cluster frequency per room",
                     F_HALT_TAIL_MULT, _NEW),
+        # WO-X X5: the bell-group grace window (NEW this deploy). Derived once the
+        # pack has measured the shared-bell settle spread across rooms.
+        ConstantTag("BELL_GRACE_S", DREW_DEFAULT,
+                    "pending derivation from shared-bell settle spread",
+                    BELL_GRACE_S, _NEW),
     ]
 
 

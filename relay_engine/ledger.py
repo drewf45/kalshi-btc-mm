@@ -419,6 +419,24 @@ class Ledger:
             self.del_state("f_tripwire_day")
         return had
 
+    def mark_bell_disputed(self, markets: list) -> int:
+        """WO-2026-07-28-X X5 — a BELL_ECON_DIVERGENCE means the bell's Σ fills
+        disagrees with the account delta (a phantom, a missing fill). Mark every
+        member market's settlement rows DISPUTED (divergent=1 → out of book_cents,
+        lifetime, and cell stats) so the instrument protects itself — pending
+        audit. Unlike the retired X2 re-book, this NEVER re-books a fills-truth
+        replacement: account truth is venue-read now, so the disputed number can
+        inflate nothing; the row is quarantined, not overwritten. Returns rows
+        marked."""
+        n = 0
+        for m in markets:
+            cur = self.db.execute(
+                "UPDATE settlements SET divergent=1 WHERE market=? AND divergent=0",
+                (m,))
+            n += cur.rowcount
+        self.db.commit()
+        return n
+
     def quarantine_divergent_settlements(self, market: str,
                                          fills_pnl_cents: int) -> int:
         """P-CASH-FATAL-1 §4.6 (stopgap until E1 traces the source): a

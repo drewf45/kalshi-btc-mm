@@ -2234,6 +2234,10 @@ class ShadowEngine:
                 self.settle_traded_market(market, settled_yes=(result == "yes"),
                                           now=now)
                 settled += 1
+        # WO-2026-07-28-X X5: after the sweep, reconcile every bell whose grace
+        # has elapsed — Σ its members' fills-math vs the account delta across the
+        # bell (no member can still join). A break pages BELL_ECON_DIVERGENCE.
+        self.econ.reconcile_ready_bells(now=now)
         return settled
 
 

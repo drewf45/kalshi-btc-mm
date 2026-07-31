@@ -219,8 +219,16 @@ def test_stop_audit_honors_and_fatals(ledger, surface):
 
 
 # ── §4.6: the DIVERGENT settlement is quarantined from the book ────────────
-def test_divergent_settlement_quarantined_and_rebooked_at_fills_truth(
-        ledger, surface, gateway):
+def test_divergent_bell_marks_disputed_no_per_market_rebook(ledger, surface,
+                                                            gateway):
+    """WO-2026-07-28-X X5 retires the X2 per-market quarantine/re-book. A single
+    market's close no longer differences the account per market (X1's bug) and
+    never re-books a fills-truth replacement — per-market attribution IS fills-math
+    now. The account-delta check moved to the BELL: reconcile_bell sums the
+    members' fills vs the account delta and, on a break, marks the bell DISPUTED
+    (divergent=1 → out of book/lifetime/cells) WITHOUT overwriting anything.
+    Account truth is venue-read (X4) and owed reads venue cash (X7), so the
+    disputed number can inflate nothing."""
     from relay_engine.window_econ import WindowEcon
 
     class _TG:
@@ -232,26 +240,30 @@ def test_divergent_settlement_quarantined_and_rebooked_at_fills_truth(
 
     failures.configure(ledger, alert_fn=lambda m: None, run_mode="TEST",
                        boot_id=1)
-    tg = _TG()
-    econ = WindowEcon(ledger, gateway, surface, tg)
+    econ = WindowEcon(ledger, gateway, surface, _TG())
     # the incident's shape: the settle path booked +103c; the fills say +4c
     ledger.record_settlement(TICKER, "F", 103, "settle")
-    assert ledger.book_cents() == BOOK + 103          # the phantom, in the book
     econ.open_bracket(TICKER, BOOK, now=1000.0)
-    econ.close_bracket(TICKER, BOOK + 103, fills_pnl_cents=4, now=1500.0)
-    # the book heals to fills-truth; the phantom is out
-    assert ledger.book_cents() == BOOK + 4
-    assert ledger.lifetime_pnl_cents() == 4
+    # close no longer re-books: the settlement stays, window_pnl IS the fills-math
+    assert econ.close_bracket(TICKER, BOOK + 103, fills_pnl_cents=4,
+                              now=1500.0) == 4
     rows = ledger.db.execute(
         "SELECT lane, pnl_cents, divergent FROM settlements"
         " WHERE market=? ORDER BY id", (TICKER,)).fetchall()
-    assert rows[0] == ("F", 103, 1)                   # tagged, excluded
-    assert rows[1][0] == "ECON" and rows[1][1] == 4 and rows[1][2] == 0
-    # WO-2026-07-23-F Part 1: the quarantine delta now carries the 0.1c precision
-    assert any("DIVERGENT settlement" in a and "+99.0c" in a for a in tg.alerts)
+    assert rows == [("F", 103, 0)]                    # NOT re-booked, not yet marked
+    # the BELL catches it: Σ fills (+4) vs account delta (+103) diverges
+    v = econ.reconcile_bell(econ._bell_id(1500.0))
+    assert v["diverged"] and v["sum_fills"] == 4 and v["acct_delta"] == 103
+    # the member is now DISPUTED (divergent=1 → out of lifetime), no re-book row
+    assert ledger.db.execute(
+        "SELECT divergent FROM settlements WHERE market=?",
+        (TICKER,)).fetchone()[0] == 1
+    assert ledger.db.execute(
+        "SELECT COUNT(*) FROM failures WHERE why_tag='BELL_ECON_DIVERGENCE'"
+    ).fetchone()[0] == 1
     assert ledger.db.execute(
         "SELECT COUNT(*) FROM failures WHERE why_tag='WINDOW_ECON_DIVERGENCE'"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0                               # the per-market page is retired
     failures._ledger = None
 
 

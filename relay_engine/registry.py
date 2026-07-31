@@ -74,6 +74,7 @@ SEED_SURFACES = (
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
     "BOOK_STALE", "CORRELATED_LOSS", "NO_COUNTERPARTY",
     "RECON_CADENCE", "BALANCE_REJECTED", "TAIL_CLUSTER",
+    "BELL_ECON_DIVERGENCE",
 )
 
 
@@ -168,6 +169,17 @@ def seed() -> None:
         "DREW-DEFAULT (1.5) into a DERIVED number — rare clusters let it relax, "
         "frequent ones tighten it (WO-W W2a).",
         "the daily pack's tail-cluster-by-room line / F_HALT_TAIL_MULT derivation")
+    register(
+        "BELL_ECON_DIVERGENCE",
+        "At a shared bell (≥2 rooms settling together), does Σ the members' "
+        "fills-math reconcile with the account delta across the bell?",
+        "VALIDATES the bell-group attribution model (WO-X X5): per-market "
+        "attribution inside a clean bell is fills-math by definition, so a match "
+        "means the rooms' books are trustworthy; a divergence is real trouble (a "
+        "phantom, a missing fill, a booking error) and marks the bell's rows "
+        "DISPUTED (out of cells) — the retired X1 per-market check cried wolf on "
+        "every shared bell by construction; this one only fires on real breaks.",
+        "the bell reconciliation rows / the phantom + missing-fill audit")
 
 
 def missing_registration(active_surfaces) -> List[str]:

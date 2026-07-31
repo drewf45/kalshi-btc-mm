@@ -4520,9 +4520,44 @@ full-cash read, never on a mid-window low (ratchet-safe); the restatement prints
 the delta line-item and owed unchanged; pre-first-read holds the book. **F byte-identical** (the scrape
 source changed, not F's edge; LIVE-gated, golden tape green). Suite 1005 · preflight 23/23.
 
-*Remaining in this WO: X5 (bell-group brackets, retire quarantine/re-book, BELL_ECON_DIVERGENCE +
-DISPUTED) — the account-delta check moved to the resolution it can measure (the bell), retiring the
-per-market model X1 broke and the X2 re-book.*
+## WO-2026-07-28-X — THE VENUE SPEAKS LAST · X5 (bell-group brackets — fixing X1, retiring X2)
+
+**The model moved to the resolution it can measure.** X1's root was per-market differencing of a
+GLOBAL book: `window_pnl = account − open − cash_moves` attributed a market's *whole* account
+movement to that market, so three rooms settling on the same 21:15 bell each absorbed the others'
+settlements and the alarm cried wolf by construction. X5 makes per-market attribution **fills-math by
+definition** (`close_bracket` sets `window_pnl = fills_pnl_cents`; the account read is recorded for
+the bell, never differenced per market) and moves the account-delta check to the **bell** (the
+settlement instant, members within `BELL_GRACE_S` = 45s). `WindowEcon._bell_record` accumulates each
+settled market into its bell (earliest open, latest close across members); `reconcile_bell` sums the
+members' fills vs the ONE account delta across the bell — a match means the rooms' books reconcile; a
+break (a phantom, a missing fill, a booking error) pages `BELL_ECON_DIVERGENCE` with the member list
+and marks the bell DISPUTED (`ledger.mark_bell_disputed` → `divergent=1`, out of book/lifetime/cells),
+touching no headline. A straggler settling beyond grace forms its own bell. `reconcile_ready_bells`
+runs at the end of the settlement sweep (no member can still join).
+
+**The X2 inversion is retired.** The P-CASH-FATAL-1 §4.6 stopgap — quarantine the disputed settlement
+and **re-book at fills-truth** — is gone from the close path (the `quarantine_divergent_settlements`
+method remains only as legacy). With account truth venue-read (X4) and the owed ratchet off venue cash
+(X7), a disputed number can inflate neither the headline nor owed, so a bell divergence **quarantines,
+never overwrites** — the "arithmetic made the authority" inversion of Drew's law is gone, and real
+settlements stop being wrongly marked divergent under three rooms.
+
+**Acceptance (`test_bell_group.py`, 6; updated `test_cash_fatal1`/`test_p8_golive`).** A shared bell
+of three rooms (BTC +11, XRP +27, ETH +9) reconciles clean — Σ fills == account delta, no page (the
+per-market model would have diverged on each); a real break (a missing fill: account +50, fills +40)
+pages `BELL_ECON_DIVERGENCE` with the members and disputes both, no re-book; a straggler beyond grace
+forms its own bell; reconcile is idempotent per bell; `reconcile_ready_bells` fires only after grace;
+`BELL_ECON_DIVERGENCE` registered and `BELL_GRACE_S` tagged. The retired-X2 tests updated: a single
+market no longer re-books (window_pnl IS fills-math), and the divergence pages at the bell not
+per-market. **F byte-identical** (the attribution model changed, not F's edge; golden tape green).
+Suite 1011 · preflight 23/23.
+
+*Note (honest scope): `reconcile_bell` computes the account delta from the recorded bracket account
+values (bracket_book = the ledger book today). Feeding it the venue-truth flat-read delta (X4) end to
+end is the natural next refinement — the algorithm and its wiring are in place and the money-integrity
+danger of X1/X2 is already closed by X4 (headline reads venue) + X7 (owed off venue cash) + X6 (no
+float dust).*
 
 ## HARD STOP honored
 
