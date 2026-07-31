@@ -1147,7 +1147,14 @@ class ShadowEngine:
             cash_c = int(round(cash * 100))
             self.ledger.set_state("last_venue_cash_cents", str(cash_c))
             self.ledger.set_state("last_venue_cash_ts", str(now))
-            return int(round((cash + (pv or 0.0)) * 100)), "venue"
+            # WO-2026-07-28-X X4: stamp the venue's ACCOUNT VALUE (cash +
+            # portfolio value = what the Kalshi app shows) with its age, so every
+            # HEADLINE surface prints the venue's own number — fetched, not
+            # derived. The venue speaks last at the reporting surface.
+            value_c = int(round((cash + (pv or 0.0)) * 100))
+            self.ledger.set_state("last_venue_value_cents", str(value_c))
+            self.ledger.set_state("last_venue_value_ts", str(now))
+            return value_c, "venue"
         self._av_fail_streak += 1
         # WO-2026-07-24-D Part 4: a FAILED read must INVALIDATE the pv, not
         # preserve it. `_last_venue_pv_cents` refreshed only on success, so a
@@ -2465,8 +2472,12 @@ async def run():
                 # WO-2026-07-26-O §O3: bank the scrape silently; announce 💰 only
                 # when a milestone crosses; the owed/tradeable ride the line.
                 engine.bank_scrape_and_watch()
+                # WO-2026-07-28-X X4: the hourly headline is the VENUE's account
+                # value (age-stamped), never the derived book — the phone's
+                # number equals the Kalshi app's, to the cent.
+                from .ops import account_headline
                 engine.telegram.alert(
-                    f"📗 hourly: book={engine.ledger.book_cents()}c "
+                    f"📗 hourly: account={account_headline(engine.ledger)} "
                     f"owed={engine.ledger.owed_cents()}c "
                     f"tradeable={engine.ledger.tradeable_cents()}c "
                     f"windows={engine.windows_seen} "

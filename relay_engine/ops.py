@@ -224,22 +224,37 @@ LANES_LIVE = ("F", "H8", "FLIP", "D", "P")
 LANES_PENDING = ()  # every lane that exists trades (R1); empty until a new lane is designed
 
 
+def account_headline(ledger, now=None) -> str:
+    """WO-2026-07-28-X X4 — the account's worth, in the venue's own number,
+    age-stamped. Every HEADLINE surface prints THIS, never book_cents (demoted to
+    internal attribution). SHADOW papers it; LIVE shows the venue value with age."""
+    cents, src, age = ledger.account_value_display(now)
+    if src == "paper":
+        return f"${cents / 100:.2f} (paper book)"
+    if src == "book":
+        return f"${cents / 100:.2f} (book — pre-venue-read)"
+    age_s = ("just now" if age is None else
+             (f"{int(age)}s ago" if age < 90 else f"{int(age / 60)}m ago"))
+    return f"${cents / 100:.2f} (venue, {age_s})"
+
+
 def owed_line(ledger) -> str:
-    """WO-2026-07-26-O §O3/O4 — the scrape, in one line: book / owed / tradeable
-    and the distance to the next milestone. Used by /owed, the daily pack, boot."""
+    """WO-2026-07-26-O §O3/O4 — the scrape, in one line: account / owed / tradeable
+    and the distance to the next milestone. Used by /owed, the daily pack, boot.
+    WO-2026-07-28-X X4: the account figure is the VENUE's number (age-stamped),
+    never the derived book. (The hwm/owed math is X7's account-truth re-seed.)"""
     seed = ledger.scrape_seed_cents()
     if seed is None:
         return "SCRAPE: not seeded yet"
-    book = ledger.book_cents()
     owed = ledger.owed_cents()
     tradeable = ledger.tradeable_cents()
     hwm = ledger.high_water_cents()
     into = max(0, hwm - seed) % config.SCRAPE_MILESTONE_C   # cents into the current $10
     to_next = config.SCRAPE_MILESTONE_C - into if into else config.SCRAPE_MILESTONE_C
-    return (f"SCRAPE: book ${book / 100:.2f} · owed ${owed / 100:.2f} · tradeable "
-            f"${tradeable / 100:.2f} · high-water ${hwm / 100:.2f} (seed "
-            f"${seed / 100:.2f}) · ${to_next / 100:.2f} of new high to the next "
-            f"${config.SCRAPE_PER_MILESTONE_C / 100:.0f}")
+    return (f"SCRAPE: account {account_headline(ledger)} · owed ${owed / 100:.2f} "
+            f"· tradeable ${tradeable / 100:.2f} · high-water ${hwm / 100:.2f} "
+            f"(seed ${seed / 100:.2f}) · ${to_next / 100:.2f} of new high to the "
+            f"next ${config.SCRAPE_PER_MILESTONE_C / 100:.0f}")
 
 
 def restated_money_lines(ledger) -> list:
@@ -267,12 +282,17 @@ def restated_money_lines(ledger) -> list:
                   f"  Δ before {int(prior)}c → after {lifetime}c "
                   f"({lifetime - int(prior):+d}c, the phantom cuts backed out)")
     return [
-        f"MONEY (RESTATED — WO-N P4.4): lifetime {lifetime}c rebuilt from the "
+        # WO-2026-07-28-X X4: the account's worth is the VENUE's number; lifetime
+        # is attribution (settlements ledger); the derived book is shown only as
+        # internal attribution arithmetic, never as the account value.
+        f"MONEY (RESTATED — WO-N P4.4): account (venue truth) "
+        f"{account_headline(ledger)} · lifetime {lifetime}c rebuilt from the "
         f"settlements ledger alone (Σ settlements[divergent=0]={settle}c)",
         delta_line,
-        f"  book {book}c = cash_movements {cash}c + settlements {settle}c; the "
-        f"/confirm_cash re-baselines absorbed a booking error into cash_movements "
-        f"— the cash-sentinel doctrine (P4.5) blocks the recurrence",
+        f"  internal attribution: book {book}c = cash_movements {cash}c + "
+        f"settlements {settle}c (not an account value — X4); the /confirm_cash "
+        f"re-baselines absorbed a booking error into cash_movements — the "
+        f"cash-sentinel doctrine (P4.5) blocks the recurrence",
     ]
 
 
@@ -633,8 +653,11 @@ def daily_pack(ledger, surface, cash_protocol, venue_statement_cents: Optional[i
         ("TRANSPORT: WS" if config.WS_ENABLED else
          "TRANSPORT: REST 1s (A3 proven ground) · fills sweep 3s — fill "
          "knowledge up to 3s late: accepted at one-lot scope, not a bug"),
-        f"book={ledger.book_cents()}c lifetime_pnl={ledger.lifetime_pnl_cents()}c "
-        f"(honest lifetime = settlements ledger only)",
+        # WO-2026-07-28-X X4: the headline account figure is the VENUE's number
+        # (age-stamped); lifetime_pnl is attribution (settlements ledger). The
+        # derived book no longer prints as an account value.
+        f"account={account_headline(ledger)} lifetime_pnl={ledger.lifetime_pnl_cents()}c "
+        f"(account = venue truth; lifetime = settlements ledger only)",
     ]
     # WO-2026-07-26-N §P4.4 — THE RESTATEMENT. The overnight double-booking
     # corrupted REPORTING (cell/window P&L, the −2389¢ line) but the lifetime is

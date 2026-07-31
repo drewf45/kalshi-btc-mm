@@ -108,7 +108,7 @@ def test_reset_halt_full_round_trip(engine):
     assert engine.econ.restore_halt_on_boot() is True
     assert "RATE_HALT" in engine.gateway.entries_halted_reasons
     reply = engine.telegram.handle_command("/reset_halt")
-    assert "halt cleared" in reply and "book $" in reply
+    assert "halt cleared" in reply and "account" in reply  # WO-X X4: venue truth
     assert engine.econ.halted() is False
     assert engine.econ.streak == 0
     assert "RATE_HALT" not in engine.gateway.entries_halted_reasons

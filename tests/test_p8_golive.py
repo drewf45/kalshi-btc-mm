@@ -160,7 +160,7 @@ def test_reset_halt_is_drews_word(engine):
     assert "FLIP" in engine.econ.halted_lanes()
     # the Telegram command clears it — entries only, row written
     reply = engine.telegram.handle_command("/reset_halt")
-    assert "entries re-enabled" in reply and "book $" in reply
+    assert "entries re-enabled" in reply and "account" in reply  # WO-X X4: venue truth
     assert "FLIP" not in engine.econ.halted_lanes()
     assert "RATE_HALT:FLIP" not in engine.gateway.entries_halted_reasons
     row = engine.ledger.db.execute(

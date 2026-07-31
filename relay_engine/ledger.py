@@ -314,6 +314,27 @@ class Ledger:
                 base = int(vc)          # broker cash: the only sizing truth
         return max(0, base - self.owed_cents())
 
+    def account_value_display(self, now=None):
+        """WO-2026-07-28-X X4 — THE VENUE SPEAKS LAST at the reporting surface.
+        Returns (cents, source, age_s) for every HEADLINE that answers 'what is
+        the account worth': the venue's own account VALUE (cash + portfolio value,
+        the number the Kalshi app shows), fetched and age-stamped by account_value
+        (WO-X), never derived. book_cents is demoted to internal attribution and
+        never prints as an account value again — the last place Drew's law hadn't
+        reached. SHADOW papers the money (the paper book, source 'paper'); LIVE
+        before the first venue read falls back to book ('book' — boot has a number
+        until the first read), then the venue value ('venue') with its age."""
+        import time as _t
+        if not config.live_submit_enabled():
+            return self.book_cents(), "paper", 0.0
+        val = self.get_state("last_venue_value_cents")
+        if val is None:
+            return self.book_cents(), "book", None     # pre-first-read fallback
+        ts = self.get_state("last_venue_value_ts")
+        age = None if ts is None else max(0.0, (_t.time() if now is None
+                                                else now) - float(ts))
+        return int(val), "venue", age
+
     def ensemble_base_cents(self) -> int:
         """WO-2026-07-27-W P4 — the ensemble cap's base = cash + current at-risk
         (total capital), so the ceiling bounds the correlated tail across all

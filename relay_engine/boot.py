@@ -43,7 +43,9 @@ def sizing_line(book_cents: int, owed_cents: int = 0) -> str:
     # FLIP_NOTIONAL_PCT); print the earned full target + the ladder bars beside it.
     flip58_full = size_order(tradeable, 58, 10_000, lane="FLIP",
                              notional_pct=config.FLIP_FULL_NOTIONAL_PCT)
-    return (f"SIZING: book ${book_cents / 100:.2f} · owed ${owed_cents / 100:.2f} "
+    return (f"SIZING: sizing-base ${book_cents / 100:.2f} (internal attribution, "
+            f"not the account value — X4; the live account is the venue read on "
+            f"the SCRAPE line) · owed ${owed_cents / 100:.2f} "
             f"· tradeable ${tradeable / 100:.2f} (WO-O: sizing off tradeable) · "
             f"Kelly fraction={frac:.4f} · budget/window {budget}¢ · "
             f"F @97¢ → {f97.contracts} lots (dial {config.F_NOTIONAL_PCT:.0%}, "
@@ -817,6 +819,21 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
                  "room with its mode + dial and the roster's source (persisted > "
                  "env > default); the SERIES_LIST env stays the emergency lever, "
                  "/series the override")
+    lines.append("  THE VENUE SPEAKS LAST (WO-2026-07-28-X, build 92): X4 — the "
+                 "account-truth spine, separated into two jobs so neither number "
+                 "competes. ACCOUNT TRUTH (what is the account worth) = VENUE READS "
+                 "ONLY: every headline — hourly, settle lines, /owed, pack MONEY, "
+                 "the SCRAPE line — prints the venue's own account VALUE (cash + "
+                 "portfolio value, the Kalshi-app number), age-stamped, fetched by "
+                 "account_value (`last_venue_value_cents`) not derived, via "
+                 "`ledger.account_value_display` / `ops.account_headline`. "
+                 "`book_cents` is DEMOTED to internal ATTRIBUTION (who earned it — "
+                 "lifetime, cell stats, the book-composition arithmetic) and never "
+                 "prints as an account value again — Drew's law ('broker data is "
+                 "truth 100%') completed at the last surface it hadn't reached. "
+                 "SHADOW papers the money; LIVE before the first read falls back to "
+                 "book, then the venue value with its age. The phone's number now "
+                 "equals the app's, to the cent")
     lines.append("HALTS: rate persists (/reset_halt key); orientation "
                  "auto-heals on a fresh recheck; /reset_halt clears ALL "
                  "entry-halt reasons (cash-fatal keeps its own key); status "

@@ -4444,6 +4444,20 @@ XRP; ETH's halt is series-scoped (`KXETH15M:F`); ETH's card is `surv n/a` (delta
 fresh DB boots the three-room default. **F entry/hold/exit byte-identical** — the golden tape (BTC)
 runs green under the three-room default. Suite 987 · preflight 23/23.
 
+## WO-2026-07-28-X — THE VENUE SPEAKS LAST · cold read + X4 (account truth = venue reads)
+
+**The cold read (all findings verified TRUE at source).**
+- **X1 — the root (`window_econ.py:250`):** `window_pnl = account_value_cents − br.open_value_cents − cash_moves` attributes the ACCOUNT's total movement across a market's window to that market alone. Correct in the one-room era; with three rooms settling on the same bell, market A's bracket delta absorbs its siblings' simultaneous settlements — the divergence alarm fires by construction on every shared bell.
+- **X2 — the inversion (`window_econ.py:259-271`):** on divergence the P-CASH-FATAL-1 §4.6 stopgap quarantines the settlement and **re-books at fills-truth** (`quarantine_divergent_settlements`) — the arithmetic made the authority, the opposite of Drew's law. A one-room fix (the 190945 phantom, where the broker read was the liar) that inverts under three rooms, where X1 pollutes the broker number.
+- **X3 — the float spray (`book.py:16-22`):** `to_yes_terms` and `fills.price_cents` are REAL, carrying the venue's 0.1c ticks as floats → the `8.999999999999986c` spray; money math in floats violates the surface's integrity.
+- **X7 P0 — the hwm reads the derived book (`ledger.py:257,282`):** `high_water_cents()` → `trading_equity_cents()` = `book_cents() − ext`. The scrape's high-water — the owed ratchet — is computed off the DERIVED book, the very number X1/X2 drift. **Confirmed P0.**
+
+**X4 — TWO JOBS, TWO TRUTHS (the account-truth reporting surface).** The system asked one number to do two jobs; separated permanently. **ACCOUNT TRUTH** (what is the account worth) = **venue reads only**: `account_value` now stamps `last_venue_value_cents`/`_ts` (cash + portfolio value = the Kalshi-app number) alongside the WO-V cash stamp; `ledger.account_value_display(now)` returns `(cents, source, age_s)` — venue value + age in LIVE, the paper book in SHADOW, a book fallback before the first read; `ops.account_headline` formats it age-stamped. Every headline routes through it — `/owed` (`owed_line`), pack MONEY, the hourly Telegram, the settle 📊 line, the halt-clear reply, the RESTATED money section. **ATTRIBUTION TRUTH** (who earned it) stays fills/settlement math: `book_cents` is demoted to internal attribution (lifetime, cell stats, the book-composition arithmetic) and prints as an account value nowhere — the boot SIZING preview relabels its figure "internal sizing-base (not the account value)". Drew's law completed at the last surface it hadn't reached.
+
+**Acceptance (`test_venue_speaks_last.py`, 7).** SHADOW account value = paper book; LIVE = the venue value (3291, not the 9700 phantom book) age-stamped; LIVE falls back to book pre-first-read; `account_headline` formats each source (venue+age / paper / pre-read); `owed_line` prints the venue account, not `book $`; the grep artifact — `owed_line`/`restated_money_lines`/`account_headline` carry no `book $`/`book=` account display, and `account_headline`'s body reads `account_value_display` not `book_cents`; the pack MONEY and hourly route through `account_headline`. Settle/halt/sizing-line tests updated to the venue-headline labels. **F/XRP/ETH entry-exit, salvage, sizing (-W cash base) byte-identical** (X4 is display-only; golden tape green). Suite 994 · preflight 23/23.
+
+*Remaining in this WO (sequenced next, each its own green increment): X6 (integer tenth-cent money math, kill the float spray), X5 (bell-group brackets, retire the quarantine/re-book, BELL_ECON_DIVERGENCE + DISPUTED), X7 (hwm P0 re-seed from venue truth + the one-time drift restatement).*
+
 ## HARD STOP honored
 
 Chunks 5 (demo verification), 6 (shadow-lane promotion), 7 (cutover) NOT built — separate

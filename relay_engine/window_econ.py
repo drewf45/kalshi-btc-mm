@@ -336,9 +336,12 @@ class WindowEcon:
         prints as the honest summary line."""
         sign = "+" if window_pnl >= 0 else ""
         late_s = " (settled late — books healed)" if late else ""
+        # WO-2026-07-28-X X4: the settle line's account figure is the VENUE's
+        # number (age-stamped), never the derived book.
+        from .ops import account_headline
         self.telegram.alert(
             f"📊 {market} {sign}${window_pnl / 100:.2f} · "
-            f"book ${book_cents / 100:.2f} · "
+            f"account {account_headline(self.ledger)} · "
             f"lanes {','.join(sorted(per_lane))}{late_s}")
         halted = self.halted_lanes()
         # WO-2026-07-24-G Part 2: the drawdown threshold recomputes with the BOOK
@@ -521,15 +524,15 @@ class WindowEcon:
                                detail=f"confirmed_by={confirmed_by} "
                                       f"cleared={','.join(cleared) or 'none'}"
                                       f"{spent_s}")
-        book = self.ledger.book_cents()
+        from .ops import account_headline    # WO-X X4: venue truth, not book
         names = ", ".join(cleared) or "none"
         held = ", ".join(sorted(r for r in halted_reasons if r in keep))
         held_s = f" · still held (own key): {held}" if held else ""
         spent_msg = (" · losses SPENT (window restarts clean):"
                      + spent_s.replace(" spent=", " ") if spent else "")
         return (f"halt cleared ({names}) — entries re-enabled · "
-                f"book ${book / 100:.2f}{held_s}{spent_msg} · next window "
-                f"considered on the next cycle")
+                f"account {account_headline(self.ledger)}{held_s}{spent_msg} · "
+                f"next window considered on the next cycle")
 
     # ── §2.4: the pack lines ───────────────────────────────────────────
     def pack_lines(self) -> list:

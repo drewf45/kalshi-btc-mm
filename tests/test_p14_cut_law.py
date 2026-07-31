@@ -190,7 +190,10 @@ def test_sizing_line_says_both_prices():
     from relay_engine.boot import sizing_line
     line = sizing_line(541)   # the 7:35 book: $5.41 (owed $0 → tradeable = book)
     # WO-2026-07-26-O §O2: the line now leads with book / owed / tradeable
-    assert line.startswith("SIZING: book $5.41 · owed $0.00 · tradeable $5.41")
+    # WO-2026-07-28-X X4: the boot SIZING line labels its figure the internal
+    # sizing-base (not an account value); the live account is the venue read.
+    assert line.startswith("SIZING: sizing-base $5.41 (internal attribution")
+    assert "tradeable $5.41" in line
     assert "Kelly fraction=0.0833 · budget/window 45¢ · " in line
     assert "F @97¢ →" in line and "FLIP @58¢ →" in line
     assert "throttle is book size + the at-risk wall" in line
