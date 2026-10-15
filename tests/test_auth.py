@@ -22,7 +22,7 @@ KEY_ID = "test-key-id-1234abcd"
 @pytest.fixture
 def throwaway_pem():
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_key_bytes = key.private_bytes(
+    pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
