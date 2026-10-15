@@ -1294,4 +1294,3 @@ SERIES_INFO: dict = {}
 ROT_SHORTLIST_MAX = 3          # DREW-DEFAULT: full-book reads for the top of the queue per cycle
 ROT_READ_OVERHEAD = 3          # DREW-DEFAULT: reads/cycle reserved (fills sweep, balance, venue positions)
 ROT_LISTING_REFRESH_S = 10     # DREW-DEFAULT: /markets listing re-read for the outside loop's prices
-ROT_REENTER_SAME_WINDOW = False  # DREW-DEFAULT: one trip per market per window (no chase after NO_FILL; open question to Drew)

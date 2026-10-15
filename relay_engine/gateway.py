@@ -622,6 +622,53 @@ class Gateway:
         return {r for r in self.entries_halted_reasons
                 if self._reason_blocks_lane(r, lane)} | ledger_halts
 
+    def amend_exit(self, order_id: str, price_cents: int, count) -> Optional[str]:
+        """WO-ROT-1 (Drew 2026-10-15): re-price/re-size a resting maker EXIT in
+        place — the soft-stop walk-down is ONE post-only sell, amended, never a
+        second order. Exits only (risk-reducing; walls skipped like any exit).
+        The CALLER asserts size <= held before every amend (reduce_only needs
+        IOC, so a resting maker sell has no venue-side oversell guard).
+
+        Returns the (possibly new) order id, or None when the amend did not
+        happen (live amend refused/failed): the order is then unchanged or
+        gone, and the caller re-reads next cycle — never assumes."""
+        order = self.resting.get(order_id)
+        if order is None:
+            return None
+        if order.purpose != "EXIT" or order.action != "sell":
+            raise WallRejection("AMEND_NOT_EXIT",
+                                f"{order_id}: amend is for resting maker EXIT sells only")
+        from decimal import Decimal
+        filled = self.filled_counts.get(order_id, 0)
+        if Decimal(str(count)) + Decimal(str(filled)) <= 0:
+            raise WallRejection("AMEND_COUNT", f"{order_id}: count {count}")
+        if order_id in self.live_order_ids:
+            from . import venue
+            from .flip_math import exit_args
+            v_side, v_price = exit_args(order.side, int(price_cents))
+            # the venue's count is the order's TOTAL: what is filled + what rests
+            total = Decimal(str(count)) + Decimal(str(filled))
+            new_oid, _resp = venue.amend_order(
+                self.venue_client, order_id, order.market, v_side, v_price,
+                count=(int(total) if total == total.to_integral_value() else total))
+            if not new_oid:
+                return None
+            order.price_cents = int(price_cents)
+            order.count = (int(total) if total == total.to_integral_value() else total)
+            if new_oid != order_id:
+                self.resting.pop(order_id, None)
+                self.resting[new_oid] = order
+                self.order_index[new_oid] = order
+                self.live_order_ids.add(new_oid)
+                if filled:
+                    self.filled_counts[new_oid] = filled
+            return new_oid
+        # shadow: the same order, re-priced in place
+        total = Decimal(str(count)) + Decimal(str(filled))
+        order.price_cents = int(price_cents)
+        order.count = int(total) if total == total.to_integral_value() else total
+        return order_id
+
     def settle_key(self, key) -> None:
         """WO-ROT-1: a position held to the bell is gone at the venue once the
         market settles — drop its gateway state so no wall, cap or read set

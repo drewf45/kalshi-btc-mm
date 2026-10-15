@@ -93,6 +93,7 @@ def env(gateway, ledger, monkeypatch):
     # submits a dozen orders in one instant. (It still applies in production;
     # a RATE_GOVERNED entry is a SKIP_WALL verdict, retried next cycle.)
     monkeypatch.setattr(gateway.governor, "take", lambda now=None: True)
+    failures._warn_last.clear()   # the funnel's 5-min page throttle is module-global
     sent = []
     failures.configure(ledger, alert_fn=sent.append, run_mode="TEST", boot_id=1)
     e = Env(gateway, ledger)
@@ -827,3 +828,201 @@ def test_fill_without_a_count_is_paged_not_booked(gateway, ledger, surface):
     finally:
         failures._ledger = None
         failures._alert_fn = None
+
+
+
+# ════════════════════ Drew 2026-10-15: one walk order, never re-enter ═══════
+
+def _sold(env, market):
+    """Contracts actually sold on the market (every sell order's fills)."""
+    return sum(Decimal(str(env.gateway.filled_counts.get(oid, 0)))
+               for oid, o in env.gateway.order_index.items()
+               if o.market == market and o.action == "sell")
+
+
+def _live_sells(env, market):
+    return [oid for oid, o in env.gateway.resting.items()
+            if o.market == market and o.action == "sell"]
+
+
+def _soft_confirmed(env, m):
+    env.spot["BTC"] = 100_000.0
+    t = enter_and_fill(env, m)
+    env.step(T + 1)
+    env.book(m, 35, 37)
+    env.step(T + 61)
+    env.spot["BTC"] = 99_950.0
+    env.step(T + 72)
+    assert t.state == "WALK" and t.pending == lr.SOFT_STOP
+    return t
+
+
+def test_walk_down_is_one_order_amended_never_a_second(env):
+    m = mk("KXBTC15M", 1)
+    t = _soft_confirmed(env, m)
+    oid = t.exit_oid
+    o = env.gateway.order_index[oid]
+    assert (o.purpose, o.action, o.crossfire, o.ioc, o.count) == ("EXIT", "sell", False, False, t.filled)
+    env.book(m, None, 40)                        # nobody bids YES: keep stepping down
+    prices = []
+    for k in range(73, 90):
+        env.step(T + k)
+        sells = _live_sells(env, m)
+        assert sells == [oid]                    # ONE order, the same order, every read
+        prices.append(env.gateway.resting[oid].price_cents)
+    assert prices[:10] == list(range(35, 25, -1))    # one tick per read
+    assert prices[-1] == 46 - config.ROT_HARD_STOP_CENTS == 26   # floored at the hard-stop price
+    assert len([x for x in env.gateway.order_index.values()
+                if x.market == m and x.action == "sell" and x.purpose == "EXIT"
+                and "cash-out" not in x.reason]) == 1
+
+
+def test_walk_at_floor_then_bid_through_minus_20_cancel_confirmed_then_ioc(env):
+    """Drew's test: the walk-down rests at the floor; the bid drops through
+    entry-20; the walk order's cancel is CONFIRMED; only then the IOC
+    reduce_only fires — and total sold never exceeds held."""
+    m = mk("KXBTC15M", 1)
+    t = _soft_confirmed(env, m)
+    held0 = env.desk.held(t)
+    walk_oid = t.exit_oid
+    env.book(m, None, 40)
+    for k in range(73, 90):
+        env.step(T + k)
+    assert env.gateway.resting[walk_oid].price_cents == 26         # at the floor
+    order = []
+    real_cancel = env.gateway.cancel_tristate
+    real_submit = env.gateway.submit
+
+    def cancel(oid):
+        st = real_cancel(oid)
+        order.append(("cancel", oid, st))
+        return st
+
+    def submit(o, book, *a, **k):
+        order.append(("submit", o.purpose, o.ioc, o.reduce_only, o.count, o.price_cents))
+        return real_submit(o, book, *a, **k)
+    env.gateway.cancel_tristate = cancel
+    env.gateway.submit = submit
+    env.book(m, 24, 40)                          # bid 24 <= 46 - 20: through the hard line
+    env.step(T + 90)
+    assert order[0] == ("cancel", walk_oid, "CANCELED")
+    sub = [e for e in order if e[0] == "submit"]
+    assert sub == [("submit", "CUT", True, True, held0, 24)]
+    assert order.index(sub[0]) > order.index(("cancel", walk_oid, "CANCELED"))
+    assert walk_oid not in env.gateway.resting
+    env.step(T + 91)
+    assert env.desk.closed[-1].closed_path == lr.HARD_STOP
+    assert _sold(env, m) <= held0
+    assert _sold(env, m) == held0                # the bid had depth: all sold, no more
+
+
+def test_ioc_never_fires_while_the_walk_cancel_is_unconfirmed(env, monkeypatch):
+    m = mk("KXBTC15M", 1)
+    t = _soft_confirmed(env, m)
+    monkeypatch.setattr(env.gateway, "cancel_tristate", lambda oid: "UNKNOWN")
+    env.book(m, 24, 40)
+    env.step(T + 90)
+    env.step(T + 91)
+    assert not [o for o in env.gateway.order_index.values() if o.purpose == "CUT"]
+    assert _live_sells(env, m) == [t.exit_oid]
+
+
+def test_amend_is_size_checked_and_follows_a_shrinking_hold(env):
+    m = mk("KXBTC15M", 1)
+    t = _soft_confirmed(env, m)
+    oid = t.exit_oid
+    held0 = env.desk.held(t)
+    env.venue[m] = held0 - 3                     # the venue says 3 fewer are held
+    env.step(T + 73)
+    o = env.gateway.resting[oid]
+    assert o.count == held0 - 3 and _live_sells(env, m) == [oid]
+    # a stray second sell on the market: the next amend is refused, never sold
+    from relay_engine.gateway import Order
+    stray = Order(lane="ROT", event=t.event, market=m, side="yes", action="sell",
+                  price_cents=60, count=2, size_tier="PROBE", purpose="EXIT",
+                  band=(1, 99), reason="stray")
+    env.gateway.resting["STRAY"] = stray
+    env.gateway.order_index["STRAY"] = stray
+    px_before = env.gateway.resting[oid].price_cents
+    env.book(m, 33, 37)                          # the walk wants to step down: an amend
+    env.step(T + 74)
+    assert env.gateway.resting[oid].price_cents == px_before   # refused, not moved
+    assert any("ROT_EXIT_OVERSIZE" in p for p in env.pages)
+    assert env.gateway.resting[oid].count == held0 - 3     # not amended
+
+
+def test_live_walk_amends_through_venue_amend_order(gateway, monkeypatch):
+    from relay_engine import venue
+    from relay_engine.gateway import Order
+    calls = []
+    monkeypatch.setattr(venue, "amend_order",
+                        lambda c, oid, tk, side, px, count=1, **k:
+                        (calls.append((oid, tk, side, px, count)) or ("LIVE-2", {})))
+    gateway.venue_client = object()
+    o = Order(lane="ROT", event="E", market="KXBTC15M-X-00", side="yes", action="sell",
+              price_cents=36, count=Decimal("0.70"), size_tier="PROBE", purpose="EXIT",
+              band=(1, 99), reason="walk")
+    gateway.resting["LIVE-1"] = o
+    gateway.order_index["LIVE-1"] = o
+    gateway.live_order_ids.add("LIVE-1")
+    new = gateway.amend_exit("LIVE-1", 35, Decimal("0.70"))
+    assert new == "LIVE-2" and "LIVE-1" not in gateway.resting
+    # sell YES @35 is the complement buy NO @65 (flip_math.exit_args) — V2 ask YES 0.35
+    assert calls == [("LIVE-1", "KXBTC15M-X-00", "no", 65, Decimal("0.70"))]
+    assert gateway.resting["LIVE-2"].price_cents == 35
+    monkeypatch.setattr(venue, "amend_order", lambda *a, **k: (None, {}))
+    assert gateway.amend_exit("LIVE-2", 34, Decimal("0.70")) is None
+    assert gateway.resting["LIVE-2"].price_cents == 35      # unchanged: never assumed
+
+
+def test_amend_is_exit_only(gateway):
+    from relay_engine.errors import WallRejection
+    from relay_engine.gateway import Order
+    o = Order(lane="ROT", event="E", market="M", side="yes", action="buy",
+              price_cents=46, count=1, size_tier="PROBE", purpose="ENTRY",
+              band=(40, 54), why="w")
+    gateway.resting["S-1"] = o
+    with pytest.raises(WallRejection):
+        gateway.amend_exit("S-1", 45, 1)
+
+
+def test_an_entered_market_is_never_entered_again(env):
+    m = mk("KXBTC15M", 1)
+    t = enter_and_fill(env, m)
+    env.step(T + 1)
+    env.fill(next(iter(env.resting(m, "EXIT"))))
+    env.step(T + 2)
+    assert m not in env.desk.trips
+    for k in range(3, 10):
+        env.step(T + k)
+    assert m not in env.desk.trips
+    assert env.desk.verdicts[m] == lr.SKIP_ENTERED_BEFORE
+    entries = [o for o in env.gateway.order_index.values()
+               if o.market == m and o.purpose == "ENTRY"]
+    assert len(entries) == 1
+
+
+def test_an_unfilled_entry_is_never_chased(env):
+    m = mk("KXBTC15M", 1)
+    env.market(m, 46, 48)
+    env.step(T)
+    for k in range(1, 70):
+        env.step(T + k)
+    entries = [o for o in env.gateway.order_index.values()
+               if o.market == m and o.purpose == "ENTRY"]
+    assert len(entries) == 1 and env.desk.verdicts[m] == lr.SKIP_ENTERED_BEFORE
+
+
+def test_never_reentered_across_a_restart_or_window_close(env, gateway, ledger):
+    m = mk("KXBTC15M", 1)
+    enter_and_fill(env, m)
+    env.desk.forget_market(m)                    # the engine's window-close prune
+    fresh = lr.RotationDesk(gateway, ledger, alert=lambda s: None)   # a reboot
+    assert m in fresh.entered
+    env2 = Env(gateway, ledger)
+    env2.desk = fresh
+    env2.market(m, 46, 48)
+    gateway.positions.clear()
+    gateway.resting.clear()
+    env2.step(T + 5)
+    assert m not in fresh.trips and fresh.verdicts[m] == lr.SKIP_ENTERED_BEFORE

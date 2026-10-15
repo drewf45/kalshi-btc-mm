@@ -25,18 +25,24 @@ TWO LOOPS, inside first (Chunk 3A).
 THE STOP RULE (Chunk 5), evaluated per read on a held position, in order:
   grace      — nothing for ROT_GRACE_S after the first fill
   hard stop  — held-side bid <= entry - ROT_HARD_STOP_CENTS on ANY read
-               -> cancel the cash-out, CONFIRM, then IOC reduce_only sell at
-               the bid (purpose CUT)
+               -> cancel the cash-out AND any walk-down order, CONFIRM, only
+               then IOC reduce_only sell at the bid (purpose CUT)
   soft stop  — bid <= entry - ROT_STOP_CENTS on ROT_CONFIRM_READS reads
                >= ROT_CONFIRM_SPACING_S apart AND spot moved against by
-               ROT_SPOT_CONFIRM -> cancel, CONFIRM, then a maker exit one tick
-               inside the bid, walked down one tick per read
+               ROT_SPOT_CONFIRM -> cancel the cash-out, CONFIRM, then ONE
+               post-only sell sized to the held count, one tick inside the
+               bid, AMENDED down one tick per read (never a second order),
+               floored at the hard-stop price (RULED 2026-10-15). reduce_only
+               needs IOC, so its oversell guard is the size assertion before
+               every placement and every amend.
   late window— final 2 min (15M) / 5 min (1H): hold to settle while the held
                side is the favorite (bid >= 50), else best maker exit
   time stop  — no target fill after ROT_TIME_STOP_S and the bid within
                ROT_TIME_STOP_NEAR_CENTS of entry -> scratch at the best maker
                price
-No stop sell is ever placed while a cancel is unconfirmed (UNKNOWN). Before any
+No stop sell is ever placed while a cancel is unconfirmed (UNKNOWN).
+A market the desk has ENTERED is struck off the possibles for good (RULED
+2026-10-15) — persisted, so a restart never re-enters it either. Before any
 exit order: exit size <= held size (venue truth when the venue was read), and
 the market's live sells plus this one never exceed it.
 
@@ -85,7 +91,7 @@ SKIP_NO_BOOK = "SKIP_NO_BOOK"              # shortlisted, book not read yet
 SKIP_NO_CASH = "SKIP_NO_CASH"              # spendable cash < this entry's cost
 SKIP_ENTRIES_HALTED = "SKIP_ENTRIES_HALTED"
 SKIP_WALL = "SKIP_WALL"                    # the gateway refused it (wall named)
-SKIP_TRADED_WINDOW = "SKIP_TRADED_WINDOW"  # this market already had a trip this window
+SKIP_ENTERED_BEFORE = "SKIP_ENTERED_BEFORE"  # RULED 2026-10-15: entered once = never again
 
 # exit paths (rot_trips.exit_path in Chunk 7)
 TARGET, SOFT_STOP, HARD_STOP, TIME_STOP, LATE, SETTLE = (
@@ -296,10 +302,10 @@ class RotationDesk:
         self.stats_fn = stats_fn or (lambda band: SEED_STATS.get(band))
         self.trips: Dict[str, Trip] = {}
         self.closed: List[Trip] = []
-        # markets that already had a trip (any outcome, NO_FILL included):
-        # no re-entry in the same window unless ROT_REENTER_SAME_WINDOW — an
-        # expired entry is never chased (Chunk 5 §1)
-        self.traded: set = set()
+        # RULED 2026-10-15 (Drew): a market the desk has ENTERED is struck off
+        # the list of possibles for good — any outcome, NO_FILL included, and
+        # across restarts (persisted in engine_state). {market: close_ts}
+        self.entered: Dict[str, float] = self._load_entered()
         self.queue: List[Candidate] = []
         self.shortlist: List[str] = []
         self.verdicts: Dict[str, str] = {}       # market -> last skip code / ENTERED
@@ -436,6 +442,9 @@ class RotationDesk:
         bid = held_bid(book, t.side)
         if bid is None:
             t.why_log.append(f"{now:.0f} held side has no bid")
+            if t.state == "WALK":
+                # nobody bids: the walk keeps stepping down toward its floor
+                self._walk(t, now, book, None)
             return
 
         if t.state == "HELD":
@@ -608,45 +617,69 @@ class RotationDesk:
             t.state = "CUT"
             self._fire_cut(t, now, book, bid, held)
             return
-        # soft stop / time stop / late exit: a maker exit one tick inside the
-        # bid (soft walks down a tick per read; time/late rest at the best
-        # maker price and keep re-quoting to it)
+        # soft stop / time stop / late exit: ONE maker exit one tick inside
+        # the bid, then amended (soft: down a tick per read to the hard-stop
+        # floor; time/late: re-quoted to the best maker price)
         t.state = "WALK"
         t.exit_px = None
         self._walk(t, now, book, bid)
 
-    def _walk(self, t: Trip, now: float, book: OrderBook, bid: int) -> None:
+    def _walk(self, t: Trip, now: float, book: OrderBook, bid: Optional[int]) -> None:
+        """The maker exit (soft stop walk-down; time/late scratch): ONE
+        post-only sell sized to the held count, AMENDED each read — never a
+        second order (Drew 2026-10-15). Soft: down one tick per read, floored
+        at the hard-stop price. Time/late: re-quoted to the best maker price
+        (one tick inside the bid), same floor. Post-only never prices at or
+        through the bid: a step that would cross holds the order where it is.
+        reduce_only needs IOC, so the oversell guard here is the size
+        assertion before every placement and every amend."""
         held = self.held(t)
         if held <= 0:
             return
-        if t.exit_oid is not None and t.exit_oid in self.gateway.resting:
-            # still resting: step it (soft: one tick down per read; time/late:
-            # back to the best maker price) — cancel CONFIRMED first
-            target = self._walk_price(t, bid)
-            if target == t.exit_px:
-                return
-            st = self.gateway.cancel_tristate(t.exit_oid)
-            self._ev("cancel", t.market, t.exit_oid, st)
-            if st == "UNKNOWN":
-                t.why_log.append(f"{now:.0f} walk cancel UNKNOWN — holding")
-                return
-            t.exit_oid = None
+        oid = t.exit_oid
+        if oid is not None and oid not in self.gateway.resting:
+            t.exit_oid = oid = None          # filled or gone at the venue
             held = self.held(t)
             if held <= 0:
                 return
-        px = self._walk_price(t, bid)
-        oid = self._submit_exit(t, book, px, held, "EXIT",
-                                f"ROT {t.pending} maker exit @{px}c (bid {bid}c, "
-                                f"entry {t.cost}c)")
-        if oid:
-            t.exit_oid, t.exit_px = oid, px
-            self._ev("walk", t.market, t.pending, px, held)
+        floor = t.cost - config.ROT_HARD_STOP_CENTS
+        if oid is None:
+            if bid is None:
+                t.why_log.append(f"{now:.0f} walk: no bid to price the first quote")
+                return
+            px = max(bid + 1, floor)
+            new = self._submit_exit(t, book, px, held, "EXIT",
+                                    f"ROT {t.pending} maker exit @{px}c (bid {bid}c, "
+                                    f"entry {t.cost}c, floor {floor}c)")
+            if new:
+                t.exit_oid, t.exit_px = new, px
+                self._ev("walk", t.market, t.pending, px, held)
+            return
+        target = self._walk_target(t, bid, floor)
+        if bid is not None and target <= bid:
+            t.why_log.append(f"{now:.0f} walk held @{t.exit_px}c: {target}c would "
+                             f"cross bid {bid}c (post-only)")
+            target = t.exit_px
+        o = self.gateway.resting[oid]
+        rests = _dec(o.count) - _dec(self.gateway.filled_counts.get(oid, 0))
+        size = min(rests, held)
+        if target == t.exit_px and size == rests:
+            return
+        self._assert_exit_size(t, size, exclude=oid)
+        new = self.gateway.amend_exit(oid, target, _norm(size))
+        if new is None:
+            t.why_log.append(f"{now:.0f} walk amend not confirmed — re-read next cycle")
+            self._ev("amend_unconfirmed", t.market)
+            return
+        t.exit_oid, t.exit_px = new, target
+        self._ev("walk", t.market, t.pending, target, size)
 
-    def _walk_price(self, t: Trip, bid: int) -> int:
-        inside = bid + 1                              # one tick inside the bid
-        if t.pending == SOFT_STOP and t.exit_px is not None:
-            return max(inside, t.exit_px - 1) if t.exit_px - 1 > bid else inside
-        return inside
+    def _walk_target(self, t: Trip, bid: Optional[int], floor: int) -> int:
+        if t.pending == SOFT_STOP:
+            return max(t.exit_px - 1, floor)          # one tick per read
+        if bid is None:
+            return t.exit_px                          # nothing to re-quote to
+        return max(bid + 1, floor)                    # best maker price
 
     def _fire_cut(self, t: Trip, now: float, book: OrderBook, bid: int, held: Decimal) -> None:
         if self._sells_live(t.market) > 0:
@@ -662,18 +695,20 @@ class RotationDesk:
         res = self.gateway.submit(o, book)
         self._ev("cut", t.market, bid, held, getattr(res, "ioc_filled", None))
 
-    def _sells_live(self, market: str) -> Decimal:
+    def _sells_live(self, market: str, exclude: Optional[str] = None) -> Decimal:
         tot = Decimal(0)
         for oid, o in self.gateway.resting.items():
-            if o.market == market and o.action == "sell":
+            if oid != exclude and o.market == market and o.action == "sell":
                 tot += _dec(o.count) - _dec(self.gateway.filled_counts.get(oid, 0))
         return tot
 
-    def _assert_exit_size(self, t: Trip, size: Decimal) -> None:
-        """Oversize guard: this exit plus every live sell on the market must
-        not exceed what is held. Refused loudly — never sold."""
+    def _assert_exit_size(self, t: Trip, size: Decimal,
+                          exclude: Optional[str] = None) -> None:
+        """Oversize guard: this exit plus every OTHER live sell on the market
+        must not exceed what is held (an amended order is excluded from the
+        live sum — it is the one being re-sized). Refused loudly — never sold."""
         held = self.held(t)
-        live = self._sells_live(t.market)
+        live = self._sells_live(t.market, exclude=exclude)
         if size <= 0 or size + live > held:
             from . import failures
             failures.fail("ROT_EXIT_OVERSIZE",
@@ -729,8 +764,8 @@ class RotationDesk:
             if self.market_held_elsewhere(market):
                 self.verdicts[market] = SKIP_HELD
                 continue
-            if market in self.traded and not config.ROT_REENTER_SAME_WINDOW:
-                self.verdicts[market] = SKIP_TRADED_WINDOW
+            if market in self.entered:
+                self.verdicts[market] = SKIP_ENTERED_BEFORE
                 continue
             close_ts = m.get("close_ts")
             if close_ts is None:
@@ -768,9 +803,36 @@ class RotationDesk:
         for m in self.shortlist:
             self._ev("outside", m)
 
+    ENTERED_KEY = "rot_entered_markets"
+    ENTERED_KEEP_S = 7 * 86400     # tickers are unique per window; prune long-closed ones
+
+    def _load_entered(self) -> Dict[str, float]:
+        import json
+        try:
+            raw = self.ledger.get_state(self.ENTERED_KEY) if self.ledger is not None else None
+        except Exception:
+            raw = None
+        if not raw:
+            return {}
+        try:
+            return {str(k): float(v) for k, v in json.loads(raw).items()}
+        except (ValueError, TypeError, AttributeError):
+            log.error("ROT entered-markets state unreadable: %r", raw[:200])
+            return {}
+
+    def mark_entered(self, market: str, close_ts: float, now: float) -> None:
+        """Strike the market off the possibles — durably, BEFORE anything else
+        can re-pick it (a crash right after entry must not re-enter on boot)."""
+        import json
+        self.entered[market] = float(close_ts)
+        self.entered = {m: c for m, c in self.entered.items()
+                        if c >= now - self.ENTERED_KEEP_S}
+        if self.ledger is not None:
+            self.ledger.set_state(self.ENTERED_KEY, json.dumps(self.entered))
+
     def forget_market(self, market: str) -> None:
-        """The window closed (the engine pruned the market)."""
-        self.traded.discard(market)
+        """The window closed (the engine pruned the market). Its verdict goes;
+        its entered mark stays — never re-entered."""
         self.verdicts.pop(market, None)
 
     def free_slots(self) -> bool:
@@ -840,7 +902,7 @@ class RotationDesk:
                  band=band, rank=c.rank, score=c.score,
                  entry_oid=res.order_id, entry_ts=now)
         self.trips[c.market] = t
-        self.traded.add(c.market)
+        self.mark_entered(c.market, c.close_ts, now)
         self.verdicts[c.market] = "ENTERED"
         self._ev("enter", c.market, c.rank, side, cost, size)
         rep = {"ts": now, "market": c.market, "rank": c.rank,
@@ -880,7 +942,7 @@ def adopt_trip(desk: "RotationDesk", market: str, side: str, count, cost: int,
              spot_at_fill=desk.spot_fn(info.underlying if info else ""))
     t.why_log.append(f"{now:.0f} adopted at boot: {side} x{count} @ {cost}c")
     desk.trips[market] = t
-    desk.traded.add(market)
+    desk.mark_entered(market, t.close_ts, now)
     return t
 
 
