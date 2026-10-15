@@ -1294,3 +1294,17 @@ SERIES_INFO: dict = {}
 ROT_SHORTLIST_MAX = 3          # DREW-DEFAULT: full-book reads for the top of the queue per cycle
 ROT_READ_OVERHEAD = 3          # DREW-DEFAULT: reads/cycle reserved (fills sweep, balance, venue positions)
 ROT_LISTING_REFRESH_S = 10     # DREW-DEFAULT: /markets listing re-read for the outside loop's prices
+
+# ---------------------------------------------------------------------------
+# WO-ROT-1 Chunk 6 — spot per underlying (spot_multi.py) and the Mac host.
+# ---------------------------------------------------------------------------
+ROT_SPOT_POLL_S = 5.0                  # DREW-DEFAULT: fallback-source poll (Coinbase / Pyth)
+ROT_SPOT_MAX_AGE_S = 15.0              # DREW-DEFAULT: a spot older than this is None to the stop rule
+ROT_SPOT_LIVE_MAX_AGE_S = 60.0         # DREW-DEFAULT: an underlying with no price this fresh is NO FEED
+ROT_SPOT_CONFIRM_RECOMPUTE_S = 3600    # non-BTC confirm recomputed hourly (logged)
+ROT_SPOT_CONFIRM_MIN_HISTORY_S = 1800  # DREW-DEFAULT: <30 min of samples -> no confirm (hard stop only)
+ROT_SPOT_MISMATCH_PCT = 0.005          # DREW-DEFAULT: cross-source disagreement logged above 0.5%
+ROT_INDEX_WS = os.environ.get("ROT_INDEX_WS", "true").strip().lower() in ("1", "true", "yes")
+PYTH_API_KEY = os.environ.get("PYTH_API_KEY", "").strip() or None   # never printed
+ROT_WAKE_GAP_S = 30.0                  # DREW-DEFAULT: a loop gap this long is a sleep/wake -> treated as a boot
+ROT_POWER_CHECK_S = 60.0               # DREW-DEFAULT: AC/battery check cadence (macOS)

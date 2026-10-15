@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- WO-ROT-1 Chunk 6: the Rotation Desk on Drew's Mac. install.sh fills the
+     __REPO__ / __PYTHON__ / __HOME__ placeholders and loads this agent.
+     KeepAlive restarts it whenever it exits; RunAtLoad starts it at login.
+     caffeinate -i (no idle sleep) -s (no system sleep — holds ONLY on AC
+     power; a closed laptop lid still sleeps the Mac: keep it plugged in,
+     lid open, or a desktop / clamshell with an external display). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kal.rotationdesk</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-s</string>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>relay_engine.mac_main</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Kal/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Kal/launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>

@@ -261,6 +261,7 @@ class Trip:
     pending: Optional[str] = None    # the exit path being executed
     soft_reads: List[Tuple[float, int]] = field(default_factory=list)
     late_hold: bool = False
+    shadow_only: bool = False   # Chunk 6: no working spot at entry -> rehearsed only
     reads: int = 0
     closed_path: Optional[str] = None
     closed_ts: Optional[float] = None
@@ -290,7 +291,8 @@ class RotationDesk:
                  spot_fn: Optional[Callable[[str], Optional[float]]] = None,
                  spot_confirm_fn: Optional[Callable[[str], Optional[float]]] = None,
                  venue_held_fn: Optional[Callable[[str], Optional[Decimal]]] = None,
-                 stats_fn: Optional[Callable[[str], Optional[BandStats]]] = None):
+                 stats_fn: Optional[Callable[[str], Optional[BandStats]]] = None,
+                 live_fn: Optional[Callable[[str], bool]] = None):
         self.gateway = gateway
         self.ledger = ledger
         self.alert = alert
@@ -300,6 +302,9 @@ class RotationDesk:
         # market, or None when the venue was not read this cycle (shadow: None)
         self.venue_held_fn = venue_held_fn or (lambda market: None)
         self.stats_fn = stats_fn or (lambda band: SEED_STATS.get(band))
+        # live_fn(underlying) -> True when its spot feed works (Chunk 6); a
+        # trip entered without one is shadow-only for its whole life
+        self.live_fn = live_fn or (lambda underlying: True)
         self.trips: Dict[str, Trip] = {}
         self.closed: List[Trip] = []
         # RULED 2026-10-15 (Drew): a market the desk has ENTERED is struck off
@@ -336,6 +341,8 @@ class RotationDesk:
         capped by the venue's when the venue was read (Venue Speaks Last)."""
         g = _dec(self.gateway.positions.get(trip.key, 0))
         g = max(Decimal(0), g if trip.side == "yes" else -g)
+        if trip.shadow_only:
+            return g                             # rehearsed: the venue holds nothing
         v = self.venue_held_fn(trip.market)      # signed, YES-terms net
         if v is None:
             return g
@@ -689,6 +696,7 @@ class RotationDesk:
                   action="sell", price_cents=bid, count=_norm(held),
                   size_tier=config.TIER_PROBE, purpose="CUT", band=(1, 99),
                   crossfire=True, ioc=True, reduce_only=True,
+                  shadow_only=t.shadow_only,
                   reason=f"ROT HARD_STOP bid {bid}c <= entry {t.cost}c - "
                          f"{config.ROT_HARD_STOP_CENTS}")
         self._assert_exit_size(t, held)
@@ -723,7 +731,7 @@ class RotationDesk:
         o = Order(lane=LANE, event=t.event, market=t.market, side=t.side,
                   action="sell", price_cents=int(px), count=_norm(size),
                   size_tier=config.TIER_PROBE, purpose=purpose, band=(1, 99),
-                  reason=reason)
+                  reason=reason, shadow_only=t.shadow_only)
         res = self.gateway.submit(o, book)
         return res.order_id
 
@@ -886,10 +894,13 @@ class RotationDesk:
                  f"h {st.h:.2f} W {st.W} L {st.L} ({st.source}) · {side}@{cost}c "
                  f"x{_norm(size)} · {c.cadence} {c.underlying} "
                  f"{c.close_ts - now:.0f}s left · depth {depth}")
+        shadow_only = not self.live_fn(c.underlying)
+        if shadow_only:
+            why_s += " · SHADOW-ONLY (no working spot feed for " + c.underlying + ")"
         o = Order(lane=LANE, event=c.market.rsplit("-", 1)[0], market=c.market,
                   side=side, action="buy", price_cents=cost, count=_norm(size),
                   size_tier=config.TIER_PROBE, purpose="ENTRY",
-                  band=config.ROT_ENTRY_BAND, why=why_s)
+                  band=config.ROT_ENTRY_BAND, why=why_s, shadow_only=shadow_only)
         try:
             res = self.gateway.submit(o, book)
         except WallRejection as e:
@@ -900,7 +911,7 @@ class RotationDesk:
                  underlying=c.underlying, cadence=c.cadence, side=side,
                  cost=o.price_cents, size=_dec(size), close_ts=c.close_ts,
                  band=band, rank=c.rank, score=c.score,
-                 entry_oid=res.order_id, entry_ts=now)
+                 entry_oid=res.order_id, entry_ts=now, shadow_only=shadow_only)
         self.trips[c.market] = t
         self.mark_entered(c.market, c.close_ts, now)
         self.verdicts[c.market] = "ENTERED"

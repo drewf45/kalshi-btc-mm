@@ -60,6 +60,10 @@ class Order:
     # are CUT-only, enforced at the canonical layer like crossfire.
     ioc: bool = False
     reduce_only: bool = False
+    # WO-ROT-1 Chunk 6: NO INDEX FEED, NO LIVE — a trip whose underlying had no
+    # working spot at entry is rehearsed end to end; every order of that trip
+    # carries this flag so a shadow position can never meet a live sell.
+    shadow_only: bool = False
 
 
 @dataclass
@@ -315,7 +319,7 @@ class Gateway:
             # maker BUY entry is re-priced to rest PASSIVELY at the live book —
             # never a post_only order at a crossing price. LIVE placement only
             # (the post-only-cross is a live-venue reject; shadow has no venue).
-            if (config.lane_is_live(order.lane)
+            if (self._order_live(order)
                     and order.purpose == "ENTRY" and order.action == "buy"
                     and not order.crossfire and book is not None):
                 rested = self._rest_back_price(order, book)   # may raise REST_BACK_SKIP
@@ -332,7 +336,7 @@ class Gateway:
         # custodian salvage posts a maker sell too, and this build must leave F
         # byte-identical (acceptance #6) — F keeps its maker→crossfire-after-R
         # salvage escalation untouched. CUTs (crossfire) cross on purpose.
-        if (config.lane_is_live(order.lane) and order.action == "sell"
+        if (self._order_live(order) and order.action == "sell"
                 and not order.crossfire and book is not None
                 and order.lane not in ("F", "ROT")):
             order.price_cents = self._rest_forward_price(order, book)
@@ -353,7 +357,7 @@ class Gateway:
         # but-not-placed path even inside a LIVE run: a SHADOW- oid, full custody
         # simulation downstream, ZERO broker traffic. F gets the book; the rest
         # rehearse offstage.
-        if config.lane_is_live(order.lane):
+        if self._order_live(order):
             # LIVE PATH (P3.1). Reached ONLY when Drew set RUN_MODE=LIVE + the
             # I_UNDERSTAND_LIVE phrase AND the lane earned LIVE mode — go-live is
             # a human act, never code's.
@@ -668,6 +672,12 @@ class Gateway:
         order.price_cents = int(price_cents)
         order.count = int(total) if total == total.to_integral_value() else total
         return order_id
+
+    @staticmethod
+    def _order_live(order: Order) -> bool:
+        """The live door: the lane is live (global kill + lane mode) and the
+        order is not a shadow-only trip's (WO-ROT-1 Chunk 6)."""
+        return config.lane_is_live(order.lane) and not order.shadow_only
 
     def settle_key(self, key) -> None:
         """WO-ROT-1: a position held to the bell is gone at the venue once the

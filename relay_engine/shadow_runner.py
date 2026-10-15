@@ -191,10 +191,14 @@ class ShadowEngine:
         self.custodian = Custodian(self.gateway, self.ledger, self.surface, ladder=self.ladder)
         # WO-ROT-1 Chunks 3-5: the Rotation Desk (lane ROT)
         from .lane_rot import RotationDesk
+        from .spot_multi import SpotBook
+        self.spot_book = SpotBook()      # WO-ROT-1 Chunk 6: spot per underlying
         self.rot = RotationDesk(self.gateway, self.ledger,
                                 alert=lambda msg: self.telegram.alert(msg),
                                 spot_fn=self._rot_spot,
-                                venue_held_fn=self._rot_venue_held)
+                                spot_confirm_fn=self.spot_book.confirm,
+                                venue_held_fn=self._rot_venue_held,
+                                live_fn=self._rot_underlying_live)
         self.lanes = build_registry(self.ledger, gateway=self.gateway,
                                     custodian=self.custodian)
         if config.DESK_MODE == "ROTATION":
@@ -534,6 +538,8 @@ class ShadowEngine:
             return
         self.spot = price
         self.spot_ts = now
+        if price is not None and hasattr(self, "spot_book"):
+            self.spot_book.record("BTC", price, "coinbase", now)
         self.spot_ticks.append(price)
         del self.spot_ticks[:-64]
 
@@ -985,6 +991,11 @@ class ShadowEngine:
             print(deadman.disk_line(deadman.check_disk(self.ledger)), flush=True)
         except Exception as e:
             log.warning("boot disk check failed: %s", e)
+        # WO-ROT-1 Chunk 6: the power source, printed every boot (macOS)
+        src = self.power_source()
+        print(f"POWER: {src if src is not None else 'n/a (not macOS)'}", flush=True)
+        if src is not None:
+            self.check_power()
         if (config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0
                 and not self.cash.fatal):
             # Paper bankroll so budget walls exercise realistically (paper only).
@@ -1856,11 +1867,117 @@ class ShadowEngine:
         self.roster = roster
         self._installed = installed
         lines = series_discovery.roster_lines(roster, installed)
+        # WO-ROT-1 Chunk 6: probe every underlying in use and say which are
+        # LIVE and which run SHADOW-ONLY for want of a working index feed
+        try:
+            from .spot_multi import poll_once
+            poll_once(self.spot_book, self.rot_underlyings())
+        except Exception as e:
+            log.warning("spot probe failed: %s", e)
+        lines += self.spot_status_lines()
         for ln in lines:
             print(ln, flush=True)
         if changed:
             self.telegram.alert("\n".join(lines))
         return roster
+
+    # ── WO-ROT-1 Chunk 6: the Mac host — power and sleep/wake ────────────
+    POWER_HALT = "ON_BATTERY"
+    WAKE_HALT = "WAKE_RECONCILE"
+
+    @staticmethod
+    def power_source(run=None):
+        """'AC Power' | 'Battery Power' | 'UPS Power' on macOS (pmset), None
+        elsewhere or when unreadable. `-s` in caffeinate only holds on AC and
+        nothing stops a closed lid from sleeping the Mac (LENS)."""
+        import subprocess
+        import sys
+        if run is None:
+            if sys.platform != "darwin":
+                return None
+            run = lambda: subprocess.run(["pmset", "-g", "batt"], capture_output=True,
+                                         text=True, timeout=5).stdout
+        try:
+            out = run()
+        except Exception as e:
+            log.warning("pmset failed: %s", e)
+            return None
+        import re
+        m = re.search(r"drawing from '([^']+)'", out or "")
+        return m.group(1) if m else None
+
+    def check_power(self, run=None) -> None:
+        """On battery: page and stop new entries (ledger halt ON_BATTERY,
+        lifted on AC). Not a Mac / unreadable: nothing changes."""
+        src = self.power_source(run)
+        if src is None:
+            return
+        if src != "AC Power":
+            if self.POWER_HALT not in self.ledger.entry_halts:
+                self.ledger.entry_halts.add(self.POWER_HALT)
+                from . import failures
+                failures.fail("ON_BATTERY",
+                              f"Mac is on {src} — NO NEW ENTRIES (caffeinate -s holds "
+                              "only on AC; plug in, lid open). Exits and stops continue.",
+                              alert=True, power=src)
+        elif self.POWER_HALT in self.ledger.entry_halts:
+            self.ledger.entry_halts.discard(self.POWER_HALT)
+            self.telegram.alert("🔌 back on AC Power — entries resume")
+
+    def on_wake(self, gap_s: float, client=None) -> list:
+        """A loop gap long enough to be a sleep (or a stall) is treated as a
+        BOOT: entries halt, the gap is logged with every stop that went
+        unwatched, the venue is reconciled (LIVE) before any entry, and only
+        then do entries resume. Returns the tape lines."""
+        from . import failures
+        self.ledger.entry_halts.add(self.WAKE_HALT)
+        unwatched = [f"{t.market} {t.side} x{t.filled} entry {t.cost}c"
+                     for t in self.rot.trips.values() if t.filled > 0]
+        lines = [f"WAKE: loop gap {gap_s:.0f}s (sleep or stall) — treated as a boot",
+                 "  stops UNWATCHED during the gap: " + ("; ".join(unwatched) or "none")]
+        if config.live_submit_enabled() and client is not None:
+            self.read_venue_positions(client)
+            if self.venue_positions is None:
+                lines.append("  RECONCILE: venue positions UNREADABLE — entries stay halted")
+                for ln in lines:
+                    print(ln, flush=True)
+                self.telegram.alert("\n".join(lines))
+                return lines
+            summary = {"venue_balance_cents": self.ledger.get_state("last_venue_cash_cents"),
+                       "cash_state": "unchanged (wake)", "positions_recognized": 0,
+                       "positions_quarantined": 0, "foreign_resting": 0, "quarantined": []}
+            from .reconcile import _quarantine, reconcile_tape
+            for market, net in self.venue_positions.items():
+                if not net:
+                    continue
+                ours = market in self.rot.trips or any(
+                    m == market and n for (_e, m, _l), n in self.gateway.positions.items())
+                if ours:
+                    summary["positions_recognized"] += 1
+                else:
+                    _quarantine(self, market, net, summary,
+                                "found at wake; no position of ours explains it")
+            lines += reconcile_tape(summary)
+        else:
+            lines.append("RECONCILE: SHADOW — paper book; the venue is not read")
+        self.ledger.entry_halts.discard(self.WAKE_HALT)
+        lines.append("WAKE: reconcile done — entries resume")
+        for ln in lines:
+            print(ln, flush=True)
+        failures.fail("WAKE_GAP", lines[0], alert=False, gap_s=gap_s,
+                      unwatched=len(unwatched))
+        self.telegram.alert("\n".join(lines))
+        return lines
+
+    def rot_underlyings(self) -> set:
+        return {i.underlying for i in config.SERIES_INFO.values()}
+
+    def spot_status_lines(self) -> list:
+        unds = self.rot_underlyings()
+        if not unds:
+            return ["SPOT (WO-ROT-1 C6): no admitted underlyings"]
+        return (["SPOT (WO-ROT-1 C6) — no index feed, no live:"]
+                + self.spot_book.status_lines(unds))
 
     def book_poll_set(self) -> list:
         """The markets whose FULL orderbook is read this cycle. LEGACY: every
@@ -1953,11 +2070,19 @@ class ShadowEngine:
         return out
 
     def _rot_spot(self, underlying: str):
-        """Spot per underlying for the soft-stop confirm. BTC rides the existing
-        Coinbase feed; others are None until WO-ROT-1 Chunk 6 (spot_multi)."""
-        if underlying == "BTC":
-            return self.fresh_spot(time.time())
-        return None
+        """Spot per underlying for the soft-stop confirm (spot_multi: the
+        settle index first, then Coinbase / Pyth). BTC also falls back to the
+        legacy Coinbase loop's price."""
+        p = self.spot_book.latest(underlying)
+        if p is None and underlying == "BTC":
+            p = self.fresh_spot(time.time())
+        return p
+
+    def _rot_underlying_live(self, underlying: str) -> bool:
+        """NO INDEX FEED, NO LIVE (Chunk 6 §3): a trip may be placed live only
+        when its underlying has a working spot right now."""
+        return self.spot_book.live(underlying) or (
+            underlying == "BTC" and self.fresh_spot(time.time()) is not None)
 
     def _rot_venue_held(self, market: str):
         """The venue's signed net on a market from this cycle's positions read
@@ -2016,6 +2141,9 @@ class ShadowEngine:
         trips, net = self.trips_since(since)
         line = deadman.hourly_line(self.cycles_completed, trips, net,
                                    self.open_position_count(), self.deploy_pct())
+        if config.DESK_MODE == "ROTATION" and self.rot_underlyings():
+            # Chunk 6 §5: the non-BTC confirms recompute hourly and print here
+            line += "\n" + "\n".join(self.spot_status_lines())
         self.telegram.alert(line)
 
     def _cycle_body(self, markets, now=None, spot=None):
@@ -2485,6 +2613,9 @@ TASK_TAGS = {
     "reconcile": "RECONCILE_TASK_DOWN",
     "book_check": "BOOK_CHECK_TASK_DOWN",
     "orientation": "ORIENTATION_TASK_DOWN",
+    "spot_multi": "SPOT_MULTI_TASK_DOWN",      # WO-ROT-1 C6
+    "index_ws": "INDEX_WS_TASK_DOWN",          # WO-ROT-1 C6 (UNPROVEN channels)
+    "power": "POWER_TASK_DOWN",                # WO-ROT-1 C6 (Mac host)
 }
 
 BOOK_CHECK_S = 60.0  # P10 §3: the standing arbiter's cadence
@@ -2572,8 +2703,15 @@ async def _rest_main(engine, client, stop) -> None:
     auth_strikes = 0
     booted = False
     last_discovery = -1e9
+    last_wall = time.time()
     while not stop.is_set():
         t0 = time.monotonic()
+        wall = time.time()
+        if config.DESK_MODE == "ROTATION" and wall - last_wall >= config.ROT_WAKE_GAP_S:
+            # WO-ROT-1 Chunk 6: a sleep/wake (or a stall) is a boot — reconcile
+            # BEFORE this cycle can enter anything
+            await asyncio.to_thread(engine.on_wake, wall - last_wall, client)
+        last_wall = wall
         try:
             if (config.DESK_MODE == "ROTATION"
                     and time.time() - engine._last_discovery_ts >= config.ROT_DISCOVERY_S):
@@ -2821,6 +2959,32 @@ async def run():
     asyncio.create_task(supervise("fills", fills_task, stop, engine))
     asyncio.create_task(supervise("reconcile", reconcile_task, stop, engine))
     asyncio.create_task(supervise("book_check", book_check_task, stop, engine))
+
+    if config.DESK_MODE == "ROTATION":
+        # ── WO-ROT-1 Chunk 6: spot per underlying ───────────────────────────
+        async def spot_multi_task():
+            from .spot_multi import poll_once
+            while not stop.is_set():
+                await asyncio.to_thread(poll_once, engine.spot_book,
+                                        engine.rot_underlyings())
+                await asyncio.sleep(config.ROT_SPOT_POLL_S)
+
+        async def index_ws_task():
+            import websockets                   # local: REST mode stays import-inert
+            from .spot_multi import run_index_ws
+            await run_index_ws(engine.spot_book, stop, websockets.connect,
+                               lambda: auth.signed_headers("GET", ws_path),
+                               config.WS_URL)
+
+        async def power_task():
+            while not stop.is_set():
+                await asyncio.to_thread(engine.check_power)
+                await asyncio.sleep(config.ROT_POWER_CHECK_S)
+
+        asyncio.create_task(supervise("spot_multi", spot_multi_task, stop, engine))
+        if config.ROT_INDEX_WS:
+            asyncio.create_task(supervise("index_ws", index_ws_task, stop, engine))
+        asyncio.create_task(supervise("power", power_task, stop, engine))
 
     if not config.WS_ENABLED:
         # ── A3 PROVEN GROUND: the REST 1s main loop. The ws path below is
