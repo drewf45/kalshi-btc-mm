@@ -115,6 +115,34 @@ class BootCaps:
     order_budget_cents: int
 
 
+# WO-ROT-1 Chunk 1 — THE DURABLE-WRITE LAW. A ledger write that fails for a
+# storage reason (disk full, I/O error, read-only file, file gone) means the
+# record of truth can no longer keep up with the venue: NO NEW ENTRIES, page
+# Drew. Resting exits are left alone and custody keeps running (a crash would
+# leave the bot-watched stops unwatched). The 2026-08-04 disk-full crash class.
+# Only storage-class messages trip it — schema errors (the ALTER TABLE
+# "duplicate column" idiom below) and a transient "database is locked" do not.
+DURABLE_FAILURE_MARKERS = (
+    "database or disk is full",
+    "disk i/o error",
+    "attempt to write a readonly database",
+    "unable to open database file",
+)
+DURABLE_HALT = "DURABLE_WRITE"
+
+
+class DurableWriteError(sqlite3.OperationalError):
+    """A storage-class ledger write failure. Subclasses OperationalError so every
+    existing `except sqlite3.OperationalError` path behaves exactly as before."""
+
+
+def is_durable_failure(err: BaseException) -> bool:
+    if not isinstance(err, sqlite3.OperationalError):
+        return False
+    msg = str(err).lower()
+    return any(m in msg for m in DURABLE_FAILURE_MARKERS)
+
+
 class _LockedConnection:
     """P9 §1a: ONE connection, ONE RLock — every execute/commit path serializes
     through the same lock, so the listener thread, the settle thread, and the
@@ -122,25 +150,36 @@ class _LockedConnection:
     (nested calls inside a caller that already holds it are fine); fetches on
     the returned cursor ride sqlite3's serialized threading mode."""
 
-    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock,
+                 on_durable_failure=None):
         self._conn = conn
         self._lock = lock
+        # WO-ROT-1 Chunk 1: every path into the database — commit() and every
+        # execute that writes without it — reports a storage failure here.
+        self.on_durable_failure = on_durable_failure
+
+    def _guard(self, op, fn, *args):
+        with self._lock:
+            try:
+                return fn(*args)
+            except sqlite3.OperationalError as e:
+                if not is_durable_failure(e):
+                    raise
+                if self.on_durable_failure is not None:
+                    self.on_durable_failure(op, e)
+                raise DurableWriteError(str(e)) from e
 
     def execute(self, sql, params=()):
-        with self._lock:
-            return self._conn.execute(sql, params)
+        return self._guard("execute", self._conn.execute, sql, params)
 
     def executemany(self, sql, rows):
-        with self._lock:
-            return self._conn.executemany(sql, rows)
+        return self._guard("executemany", self._conn.executemany, sql, rows)
 
     def executescript(self, sql):
-        with self._lock:
-            return self._conn.executescript(sql)
+        return self._guard("executescript", self._conn.executescript, sql)
 
     def commit(self):
-        with self._lock:
-            self._conn.commit()
+        return self._guard("commit", self._conn.commit)
 
     def close(self):
         with self._lock:
@@ -148,6 +187,26 @@ class _LockedConnection:
 
 
 class Ledger:
+    def _on_durable_failure(self, op: str, err: BaseException) -> None:
+        """Durable-Write Law: halt new entries, page once (FATAL-class row and
+        page through the one funnel). The funnel's own row write will fail too
+        on a full disk — it logs and continues; the page still goes out."""
+        self.entry_halts.add(DURABLE_HALT)
+        if self.durable_failure is not None:
+            return  # already tripped: one page per fault, entries stay halted
+        self.durable_failure = f"{op}: {err}"
+        log.error("DURABLE_WRITE_FAILED %s on %s — entries halted", err, op)
+        from . import failures
+        try:
+            failures.fail(
+                "DURABLE_WRITE_FAILED",
+                f"ledger {op} failed ({err}) on {self.db_path} — NO NEW ENTRIES; "
+                "resting exits left alone, custody keeps running. Free disk and "
+                "restart to clear (Durable-Write Law, WO-ROT-1 Chunk 1)",
+                fatal=True, op=op, db_path=self.db_path)
+        except FatalIntegrityError:
+            pass  # FATAL-class page and row; the engine stays up for exits
+
     def __init__(self, db_path: Optional[str] = None):
         # P9 §1a: cross-thread by design (supervised tasks run ledger calls via
         # asyncio.to_thread); safety comes from the single RLock, not sqlite's
@@ -157,9 +216,15 @@ class Ledger:
         # (the /daily bundle) can open its own `mode=ro` connection to the same
         # file and never take a write lock on the settle path.
         self.db_path = db_path or config.DB_PATH
+        # WO-ROT-1 Chunk 1: ledger-held entry halts (DURABLE_WRITE, DISK_LOW).
+        # The gateway unions these into every entry check; they live here, not
+        # in the gateway's own set, so no /resume key can clear them while the
+        # storage fault stands.
+        self.entry_halts: set = set()
+        self.durable_failure: Optional[str] = None
         self.db = _LockedConnection(
             sqlite3.connect(db_path or config.DB_PATH, check_same_thread=False),
-            self.lock)
+            self.lock, on_durable_failure=self._on_durable_failure)
         self.db.executescript(SCHEMA)
         # P13 §1: fee per fill (the net line needs the true cost per trade).
         try:

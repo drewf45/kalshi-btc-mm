@@ -162,6 +162,11 @@ PACK_HOURLY_S = 3600.0         # F7: pack timer
 class ShadowEngine:
     def __init__(self, db_path=None):
         self.ledger = Ledger(db_path)
+        # WO-ROT-1 Chunk 1: heartbeat / hourly alive line state
+        self.started_ts = time.time()
+        self.cycles_completed = 0
+        self.last_cycle_error = ""
+        self._last_hourly_ts = self.started_ts
         self.surface = Surface(self.ledger)
         self.cash = CashProtocol(self.ledger)
         self.telegram = Telegram(self.cash)
@@ -957,6 +962,13 @@ class ShadowEngine:
         # deny-reboot breach was exactly an amnesiac re-baseline running
         # ahead of a stop nobody had persisted.
         self.cash.restore_on_boot()
+        # WO-ROT-1 Chunk 1: the disk guard runs at boot, before anything else
+        # writes — under the floor, entries are halted from cycle 1.
+        from . import deadman
+        try:
+            print(deadman.disk_line(deadman.check_disk(self.ledger)), flush=True)
+        except Exception as e:
+            log.warning("boot disk check failed: %s", e)
         if (config.RUN_MODE == "SHADOW" and self.ledger.book_cents() == 0
                 and not self.cash.fatal):
             # Paper bankroll so budget walls exercise realistically (paper only).
@@ -1796,6 +1808,71 @@ class ShadowEngine:
         return self.market_meta.get(market, {})
 
     def cycle(self, markets, now=None, spot=None):
+        """WO-ROT-1 Chunk 1: the cycle body, then the local heartbeat — written
+        only when the cycle COMPLETES, so a wedged or dead loop goes stale. The
+        hourly tick (disk guard + alive line) rides the same gate."""
+        try:
+            out = self._cycle_body(markets, now=now, spot=spot)
+        except Exception as e:
+            self.last_cycle_error = f"{type(e).__name__}: {e}"[:300]
+            raise
+        self.cycles_completed += 1
+        self._heartbeat(time.time())  # wall clock: the watcher's clock, not the sim's
+        return out
+
+    def deploy_pct(self):
+        """Deployed / book, or None when the book is unreadable (never 0)."""
+        try:
+            book = self.ledger.book_cents()
+            if book <= 0:
+                return None
+            return self.ledger.deployed_cents() / book
+        except Exception:
+            return None
+
+    def open_position_count(self) -> int:
+        return sum(1 for v in self.gateway.positions.values() if v)
+
+    def trips_since(self, since_ts: float):
+        """(closed trips, net cents) booked since since_ts, or (None, None) when
+        the ledger cannot answer — the alive line then says n/a, never 0."""
+        try:
+            n, net = self.ledger.db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(pnl_cents), 0) FROM cell_outcomes"
+                " WHERE ts >= ?", (since_ts,)).fetchone()
+            return int(n), int(net)
+        except Exception:
+            return None, None
+
+    def _heartbeat(self, now: float) -> None:
+        from . import deadman
+        dep = self.deploy_pct()
+        try:
+            deadman.write_heartbeat(
+                config.HEARTBEAT_PATH, cycles=self.cycles_completed,
+                open_positions=self.open_position_count(), deploy_pct=dep,
+                last_error=self.last_cycle_error, now=time.time())
+        except OSError as e:
+            # the heartbeat file is not the ledger: log, never stop the desk
+            log.warning("heartbeat write failed: %s", e)
+        if now - self._last_hourly_ts >= config.HEARTBEAT_HOURLY_S:
+            self.hourly_tick(now)
+
+    def hourly_tick(self, now: float) -> None:
+        """Disk guard + the alive line (boot runs the disk guard on its own)."""
+        from . import deadman
+        since = self._last_hourly_ts
+        self._last_hourly_ts = now
+        try:
+            deadman.check_disk(self.ledger)
+        except Exception as e:
+            log.warning("disk check failed: %s", e)
+        trips, net = self.trips_since(since)
+        line = deadman.hourly_line(self.cycles_completed, trips, net,
+                                   self.open_position_count(), self.deploy_pct())
+        self.telegram.alert(line)
+
+    def _cycle_body(self, markets, now=None, spot=None):
         """One evaluation cycle: EVERY lane looks at EVERY market (C.4).
         ARBITRATION (P3 Broker part): custodian exits run FIRST, then lanes in
         registry order (F -> H8 -> FLIP -> D -> P); FLIP's takes lead its own
@@ -2420,8 +2497,13 @@ async def run():
 
     if config.live_submit_enabled():
         # F6: LIVE boot reconcile — money truth before the first cycle
+        # (prints its RECONCILE tape; WO-ROT-1 Chunk 1)
         from .reconcile import live_boot_reconcile
         live_boot_reconcile(engine, client)
+    else:
+        print("RECONCILE: SHADOW — paper book; the venue is not baselined "
+              "(LIVE reconciles balance, positions, resting orders here, "
+              "before cycle 1)", flush=True)
 
     # DIAG-1 §1: THE INTERROGATOR — one-time diagnostics run here, after
     # reconcile and before the first cycle: each pages its answer once

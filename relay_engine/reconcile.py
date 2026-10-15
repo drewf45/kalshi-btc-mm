@@ -31,7 +31,7 @@ postpone the 5% floor.
 import logging
 import time
 
-from . import failures, venue
+from . import config, failures, venue
 from .errors import FatalIntegrityError
 
 log = logging.getLogger("relay.reconcile")
@@ -113,18 +113,24 @@ def live_boot_reconcile(engine, client) -> dict:
         summary["cash_state"] = state
 
     # positions: recognized (our fills explain them) vs quarantined
+    summary["quarantined"] = []
     for p in venue.get_positions(client):
         ticker = str(p.get("ticker") or p.get("market_ticker") or "")
-        net = 0
-        for k in ("position", "net_position", "yes_position", "qty", "count"):
-            if k in p:
-                try:
-                    net = int(p[k])
-                    break
-                except (ValueError, TypeError):
-                    continue
+        net = position_net(p)
         if not ticker or net == 0:
             continue
+        if net is None:
+            # WO-ROT-1 Chunk 1: an unreadable count is never read as flat
+            _quarantine(engine, ticker, None, summary,
+                        f"position count unreadable: {p!r}"[:200])
+            continue
+        if net != int(net):
+            # fractional holdings: the legacy custodian counts whole contracts
+            # only — quarantined (seen, paged, blocks the market), not adopted
+            _quarantine(engine, ticker, net, summary,
+                        "fractional position — not adoptable by legacy custody")
+            continue
+        net = int(net)
         row = engine.ledger.db.execute(
             "SELECT lane, side, price_cents, size_tier FROM fills"
             " WHERE market=? AND action='ENTRY' AND settled=0"
@@ -150,6 +156,12 @@ def live_boot_reconcile(engine, client) -> dict:
             key = (ticker.rsplit("-", 1)[0], ticker, lane)
             engine.gateway.positions[key] = net
             summary["positions_recognized"] += 1
+        elif config.DESK_MODE == "ROTATION":
+            # WO-ROT-1 Chunk 1: on the Rotation Desk a position the ledger
+            # can't explain is QUARANTINED, not adopted — Ruling 1's ORPHAN
+            # custody (D-grade cuts, BTC spot anchors) belongs to the old desk.
+            _quarantine(engine, ticker, net, summary,
+                        "no fill of ours explains it")
         else:
             # RULING 1 (P15, ratified): ORPHAN ADOPTION — every dollar is
             # OWNED. A position our fills cannot explain is adopted under
@@ -208,4 +220,59 @@ def live_boot_reconcile(engine, client) -> dict:
         log.warning("LIVE boot: resting-orders sweep failed (non-fatal): %s", e)
 
     log.warning("LIVE BOOT RECONCILE: %s", summary)
+    for line in reconcile_tape(summary):
+        print(line, flush=True)
     return summary
+
+
+def position_net(p: dict):
+    """The signed held count from a venue position record, as Decimal (int-
+    valued when whole). Fixed-point `*_fp` fields first (fractional contracts),
+    then the integer fields. None when a count field exists but cannot be read
+    — never silently 0; Decimal 0 when no count field is present at all."""
+    from decimal import Decimal, InvalidOperation
+    seen = False
+    for k in ("position_fp", "position", "net_position", "yes_position",
+              "qty", "count"):
+        if k in p and p[k] is not None:
+            seen = True
+            try:
+                d = Decimal(str(p[k]))
+            except (InvalidOperation, ValueError):
+                continue
+            if d.is_finite():
+                return d
+    return None if seen else Decimal(0)
+
+
+def _quarantine(engine, ticker: str, net, summary: dict, why: str) -> None:
+    """Seen, recorded, paged; never custodied, never lane evidence, never
+    traded. Registered under lane QUARANTINE so the desk's one-position-per-
+    market rule and its caps see the market as held."""
+    summary["positions_quarantined"] += 1
+    summary.setdefault("quarantined", []).append((ticker, net, why))
+    if net is not None:
+        engine.gateway.positions[(ticker.rsplit("-", 1)[0], ticker,
+                                  "QUARANTINE")] = net
+    engine.surface.write_row("QUARANTINE", ticker, f"w-{ticker}",
+                             "QUARANTINED", detail=f"net {net} — {why}")
+    failures.fail("POSITION_QUARANTINED",
+                  f"{ticker}: venue position {net} — {why}; quarantined "
+                  "(not adopted, not traded, blocks the market)",
+                  market=ticker, net=str(net), alert=False)
+    engine.telegram.alert(
+        f"🧾 QUARANTINED {ticker}: venue position {net} — {why}. Not adopted; "
+        "the desk will not trade this market while it is held.")
+
+
+def reconcile_tape(summary: dict) -> list:
+    """The boot reconcile tape — printed before cycle 1 (WO-ROT-1 Chunk 1)."""
+    lines = ["RECONCILE (venue speaks first — before cycle 1):",
+             f"  venue balance {summary.get('venue_balance_cents')}c · "
+             f"cash {summary.get('cash_state')}",
+             f"  positions: recognized {summary.get('positions_recognized', 0)} · "
+             f"quarantined {summary.get('positions_quarantined', 0)}",
+             f"  foreign resting orders: {summary.get('foreign_resting', 0)}"]
+    for ticker, net, why in summary.get("quarantined", []):
+        lines.append(f"  QUARANTINED {ticker} net {net}: {why}")
+    return lines

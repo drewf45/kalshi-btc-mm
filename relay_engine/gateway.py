@@ -549,9 +549,13 @@ class Gateway:
         return True
 
     def entries_halted_for(self, lane) -> set:
-        """The subset of active halt reasons that block THIS lane's entries."""
+        """The subset of active halt reasons that block THIS lane's entries.
+        WO-ROT-1 Chunk 1: the ledger's storage halts (DURABLE_WRITE, DISK_LOW)
+        block every lane and are not in entries_halted_reasons, so no resume
+        key clears them."""
+        ledger_halts = set(getattr(self.ledger, "entry_halts", set()))
         return {r for r in self.entries_halted_reasons
-                if self._reason_blocks_lane(r, lane)}
+                if self._reason_blocks_lane(r, lane)} | ledger_halts
 
     def halt_entries(self, reason: str) -> None:
         self.entries_halted_reasons.add(reason)

@@ -111,6 +111,7 @@ def test_depth_zero_admits_nothing():
 
 
 # ── RULING 1: orphan adoption ──────────────────────────────────────────────
+@pytest.mark.legacy_desk  # WO-ROT-1: Ruling 1 ORPHAN adoption is the legacy desk's; ROTATION quarantines
 def test_orphan_adopted_custodied_never_evidence(engine, monkeypatch):
     from relay_engine import venue
     from relay_engine.reconcile import live_boot_reconcile

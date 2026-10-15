@@ -1210,16 +1210,18 @@ ROT_GUARD_TRIPS = 50             # DREW-DEFAULT: break-even guard / ranking wind
 ROT_QUEUE_SIZE = 20              # DREW-DEFAULT: ranked candidate queue depth
 ROT_LOT_STEP = Decimal("0.01")   # DREW-DEFAULT: size rounds DOWN to this step (V2 fixed-point min; per-series UNPROVEN)
 
+# Every ROT_* knob above, in declaration order — fixed at import so the boot
+# tape never iterates the live module dict (another thread may be writing it).
+ROT_KNOB_NAMES = tuple(k for k in list(globals()) if k.startswith("ROT_"))
 ROT_KNOB_TAGS = {
     "ROT_POSITION_PCT": "RULED(2026-10-14)",
 }
 
 
 def rot_knobs() -> dict:
-    """Every ROT_* knob, name -> value, in declaration order."""
-    return {k: v for k, v in globals().items()
-            if k.startswith("ROT_") and k != "ROT_KNOB_TAGS"
-            and not callable(v)}
+    """Every ROT_* knob, name -> current value, in declaration order."""
+    g = globals()
+    return {k: g[k] for k in ROT_KNOB_NAMES}
 
 
 def rot_knob_boot_lines() -> list:
@@ -1237,3 +1239,17 @@ def rot_knob_boot_lines() -> list:
     for k, v in rot_knobs().items():
         lines.append(f"  {k} = {v} [{ROT_KNOB_TAGS.get(k, 'DREW-DEFAULT')}]")
     return lines
+
+
+# ---------------------------------------------------------------------------
+# WO-ROT-1 Chunk 1 — STAY ALIVE AND TELL THE TRUTH.
+# ---------------------------------------------------------------------------
+DISK_MIN_FREE_BYTES = 500 * 1024 * 1024   # DREW-DEFAULT: under 500 MB free -> page + no new entries
+DISK_CHECK_S = 3600                       # DREW-DEFAULT: disk/DB-size line at boot and hourly
+# Local heartbeat (RULED 2026-10-14: local file + hourly Telegram line, no
+# outside ping for now). Any local agent watches the file's ts.
+HEARTBEAT_PATH = os.path.expanduser(os.environ.get(
+    "HEARTBEAT_PATH", "~/Library/Application Support/Kal/heartbeat.json"))
+HEARTBEAT_STALE_S = 10                    # DREW-DEFAULT: a heartbeat older than 10 s is stale
+HEARTBEAT_HOURLY_S = 3600                 # hourly Telegram alive line
+HEARTBEAT_PING_URL = os.environ.get("HEARTBEAT_PING_URL", "").strip()  # RULED 2026-10-14: unset and OFF

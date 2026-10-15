@@ -24,6 +24,14 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _heartbeat_isolation(tmp_path, monkeypatch):
+    """WO-ROT-1 Chunk 1: every completed cycle writes the heartbeat file — keep
+    it in the test's tmp dir, never ~/Library/Application Support."""
+    from relay_engine import config
+    monkeypatch.setattr(config, "HEARTBEAT_PATH", str(tmp_path / "heartbeat.json"))
+
+
+@pytest.fixture(autouse=True)
 def _desk_mode(request, monkeypatch):
     """WO-ROT-1 Chunk 0 — the suite runs under the branch default
     (DESK_MODE=ROTATION: pre-desk lanes OFF). Modules that prove the pre-desk

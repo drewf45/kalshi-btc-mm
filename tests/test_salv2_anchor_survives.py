@@ -120,6 +120,7 @@ def test_restart_without_table_disables_loudly_backstop_stands(engine,
     assert trigger == "CATASTROPHIC"
 
 
+@pytest.mark.legacy_desk  # WO-ROT-1: Ruling 1 ORPHAN adoption is the legacy desk's; ROTATION quarantines
 def test_orphan_uses_venue_mark_not_50(engine, monkeypatch):
     """§3: an ORPHAN with a readable book prices at the held side's mark."""
     from relay_engine import venue
@@ -134,6 +135,7 @@ def test_orphan_uses_venue_mark_not_50(engine, monkeypatch):
     assert pos.p_entry is not None            # anchored like everyone else
 
 
+@pytest.mark.legacy_desk  # WO-ROT-1: Ruling 1 ORPHAN adoption is the legacy desk's; ROTATION quarantines
 def test_orphan_falls_back_to_50_only_logged(engine, monkeypatch, caplog):
     import logging
 
