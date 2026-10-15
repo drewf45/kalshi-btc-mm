@@ -34,7 +34,8 @@ class Telegram:
     # P-CASH-FATAL-1 §4.4: /clear_cash_fatal — the ONLY key to a denied
     # cash delta (a restart is not); symmetric with /reset_halt.
     COMMANDS = ("/confirm_cash", "/deny_cash", "/reset_halt", "/scoreboard",
-                "/clear_cash_fatal", "/daily", "/owed", "/series")
+                "/clear_cash_fatal", "/daily", "/owed", "/series",
+                "/rot_reopen", "/rot_group_reset", "/rot_status")
 
     def __init__(self, cash_protocol, send_fn=None):
         self.cash = cash_protocol
@@ -51,6 +52,10 @@ class Telegram:
         # WO-2026-07-26-O §O4: /owed — the operator's read-only look at the scrape
         # (book / owed / tradeable / distance to the next milestone). Read-only.
         self.owed_fn = lambda: "no scrape wired"
+        # WO-ROT-1 Chunk 8: the desk's accounting-only keys (wired by the runner)
+        self.rot_reopen_fn = lambda text="": "no desk wired"
+        self.rot_group_reset_fn = lambda: "no desk wired"
+        self.rot_status_fn = lambda: "no desk wired"
         # WO-2026-07-26-S §1 — /series: the room start command, without a second
         # deploy. "/series xrp on|off|live|shadow" opens/parks a room (roster +
         # mode + F family + halt-key migration). Wired by the runner to the engine.
@@ -135,6 +140,14 @@ class Telegram:
             return self.owed_fn()           # read-only scrape look; never trades
         if cmd == "/series":
             return self.series_fn(text)     # opens/parks a room; never places directly
+        # WO-ROT-1 Chunk 8: accounting-only desk keys — each flips a flag or
+        # reads state; none places an order
+        if cmd == "/rot_reopen":
+            return self.rot_reopen_fn(text)
+        if cmd == "/rot_group_reset":
+            return self.rot_group_reset_fn()
+        if cmd == "/rot_status":
+            return self.rot_status_fn()
         # Anything else — including anything order-shaped — is refused by design.
         return f"unknown command; accounting commands only: {', '.join(self.COMMANDS)}"
 

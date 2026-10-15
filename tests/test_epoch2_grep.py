@@ -50,5 +50,8 @@ def test_no_paid_command():
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
                                  "/scoreboard", "/clear_cash_fatal", "/daily",
                                  "/owed",
-                                 "/series")   # WO-S §1: opens/parks a room, never places
+                                 "/series",   # WO-S §1: opens/parks a room, never places
+                                 # WO-ROT-1 C8: accounting-only desk keys — a flag
+                                 # flip, a venue group reset, a read; never an order
+                                 "/rot_reopen", "/rot_group_reset", "/rot_status")
     assert "/paid" not in Telegram.COMMANDS

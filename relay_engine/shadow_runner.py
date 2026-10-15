@@ -200,8 +200,13 @@ class ShadowEngine:
                                 venue_held_fn=self._rot_venue_held,
                                 live_fn=self._rot_underlying_live,
                                 on_close=self._rot_trip_closed,
-                                stats_fn=self._rot_band_stats)
+                                stats_fn=self._rot_band_stats,
+                                deploy_cap_fn=self._rot_deploy_cap,
+                                on_runaway=self._rot_runaway)
         self._band_stats_cache = {}
+        # WO-ROT-1 Chunk 8: a paused band stays paused across restarts
+        from . import rot_guard as _rg
+        self.rot.paused_bands = _rg.paused_bands(self.ledger)
         self.lanes = build_registry(self.ledger, gateway=self.gateway,
                                     custodian=self.custodian)
         if config.DESK_MODE == "ROTATION":
@@ -234,6 +239,13 @@ class ShadowEngine:
         self.telegram.daily_fn = self._build_and_send_daily
         # WO-2026-07-26-S §1: /series — the room start command (no second deploy).
         self.telegram.series_fn = self._cmd_series
+        # WO-ROT-1 Chunk 8: the desk's accounting-only keys
+        from . import rot_guard as _rg
+        self.telegram.rot_reopen_fn = lambda text="": _rg.reopen(self.ledger, self.rot, text)
+        self.telegram.rot_group_reset_fn = lambda: _rg.group_reset(
+            self.ledger, self.rot,
+            self.gateway.venue_client if config.live_submit_enabled() else None)
+        self.telegram.rot_status_fn = self.rot_status
         # P22 §1.2: first-boot backfill — today's clips and round-trips are
         # not lost history (guarded + idempotent inside; never boot-fatal)
         try:
@@ -2090,6 +2102,8 @@ class ShadowEngine:
         self.telegram.alert(
             f"{gh}🔁 ROT #{tid} {t.closed_path} {t.market} {t.side} {t.cost}¢→{exit_s} "
             f"x{row['size']:g} · {money} · held {held_s:.0f}s · band {t.band}")
+        if row["settled"]:
+            self.rot_guard_eval()
 
     def _rot_band_stats(self, band: str):
         """Chunk 3A §2: a band ranks on its OWN last ROT_GUARD_TRIPS trips once
@@ -2104,6 +2118,54 @@ class ShadowEngine:
         self._band_stats_cache[band] = (now, st)
         return st
 
+    def _rot_deploy_cap(self) -> float:
+        from . import rot_guard
+        return rot_guard.deploy_cap(self.ledger)
+
+    def _rot_runaway(self, detail: str) -> None:
+        from . import rot_guard
+        rot_guard.tripped(self.ledger, self.telegram.alert, detail)
+
+    def rot_guard_eval(self) -> list:
+        """Chunk 8: the break-even guard over the run's own kind of trips."""
+        from . import rot_guard
+        self._band_stats_cache.clear()
+        return rot_guard.evaluate(self.ledger, self.rot, self.telegram.alert,
+                                  shadow=0 if config.live_submit_enabled() else 1)
+
+    def rot_status(self) -> str:
+        """/rot_status — read-only: the hourly desk line, paused bands, the
+        runaway rail, today's verdict. Places nothing."""
+        from . import rot_guard
+        lines = [self.rot_hourly_line()]
+        paused = rot_guard._load(self.ledger, rot_guard.PAUSED_KEY)
+        for b, d in sorted(paused.items()):
+            lines.append(f"  PAUSED {b}: {d.get('why')}")
+        lines.append(f"  runaway rail: group {self.rot.order_group_id or 'none'}"
+                     + (" · TRIPPED (entries halted)"
+                        if rot_guard.RUNAWAY_HALT in self.ledger.entry_halts else ""))
+        lines.append(f"  deploy cap now {rot_guard.deploy_cap(self.ledger):.0%}")
+        from .daily_bundle import _start_of_day
+        lines += rot_guard.verdict_lines(self.ledger, _start_of_day(time.time()),
+                                         shadow=0 if config.live_submit_enabled() else 1)
+        return "\n".join(lines)
+
+    def rot_daily(self, now=None) -> list:
+        """Once a day (the 9am full pack): YESTERDAY's verdict, the bundle to
+        Telegram (the shadow day's ROT sheet is the go-live evidence), and a
+        live desk's promotion to the full deploy cap."""
+        from . import rot_guard
+        from .daily_bundle import _start_of_day
+        now = time.time() if now is None else now
+        y = _start_of_day(now, 1)
+        live = config.live_submit_enabled()
+        lines = rot_guard.verdict_lines(self.ledger, y, shadow=0 if live else 1)
+        self.telegram.alert("\n".join(lines))
+        self._build_and_send_daily("/daily 1")
+        if live:
+            rot_guard.maybe_promote(self.ledger, y, self.telegram.alert)
+        return lines
+
     def rot_settle_sweep(self, result_fn) -> int:
         """Book the venue's result into every SETTLE trip whose leg is pending.
         result_fn(market) -> 'yes' | 'no' | None (not settled yet). Returns
@@ -2116,6 +2178,7 @@ class ShadowEngine:
                 continue
             net = rot_trips.book_settlement(self.ledger, tid, res)
             booked += 1
+            self.rot_guard_eval()
             self.telegram.alert(f"🔔 ROT #{tid} SETTLED {market} {res.upper()} "
                                 f"({'won' if res == side else 'lost'}) · net {net:+.1f}¢")
         return booked
@@ -2129,7 +2192,7 @@ class ShadowEngine:
         resting = sum(1 for t in self.rot.trips.values()
                       if self.rot.held(t) == 0 and t.entry_oid in self.gateway.resting)
         return (f"ROT: open {held} · entries resting {resting} · deploy "
-                f"{float(tot / book):.0%} of {config.ROT_DEPLOY_CAP_PCT:.0%} cap · "
+                f"{float(tot / book):.0%} of {self._rot_deploy_cap():.0%} cap · "
                 f"queue {len(self.rot.queue)} · paused bands "
                 f"{','.join(sorted(self.rot.paused_bands)) or 'none'}")
 
@@ -2206,6 +2269,7 @@ class ShadowEngine:
         line = deadman.hourly_line(self.cycles_completed, trips, net,
                                    self.open_position_count(), self.deploy_pct())
         if config.DESK_MODE == "ROTATION":
+            self.rot_guard_eval()
             line += "\n" + self.rot_hourly_line()
             if self.rot_underlyings():
                 # Chunk 6 §5: the non-BTC confirms recompute hourly and print here
@@ -2878,6 +2942,12 @@ async def run():
         # (prints its RECONCILE tape; WO-ROT-1 Chunk 1)
         from .reconcile import live_boot_reconcile
         live_boot_reconcile(engine, client)
+        if config.DESK_MODE == "ROTATION":
+            # WO-ROT-1 Chunk 8: the runaway rail — one Kalshi order group for
+            # every live ROT entry (failure halts entries; never optional)
+            from . import rot_guard
+            rot_guard.ensure_group(engine.ledger, engine.rot, client,
+                                   engine.telegram.alert)
     else:
         print("RECONCILE: SHADOW — paper book; the venue is not baselined "
               "(LIVE reconciles balance, positions, resting orders here, "
@@ -2931,6 +3001,9 @@ async def run():
             if now_et.hour >= 9 and last_full_day != now_et.date():
                 last_full_day = now_et.date()
                 engine.telegram.alert(pack)  # the daily full pack, on the phone
+                if config.DESK_MODE == "ROTATION":
+                    # WO-ROT-1 C8: yesterday's verdict + the bundle (ROT sheet)
+                    await asyncio.to_thread(engine.rot_daily)
             else:
                 from . import delta as _delta   # P26 §1.2: brain on the line
                 # WO-2026-07-25-K §P3: the desk-size ladder ticks every hour too

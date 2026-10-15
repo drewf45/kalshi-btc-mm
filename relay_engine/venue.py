@@ -841,7 +841,8 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
                       v2_price_str: Optional[str] = None,
                       post_only: bool = True,
                       time_in_force: str = "good_till_canceled",
-                      reduce_only: bool = False) -> Tuple[str, Dict]:
+                      reduce_only: bool = False,
+                      order_group_id: Optional[str] = None) -> Tuple[str, Dict]:
     """Place a limit order via V2. Returns (order_id, response).
 
     side: 'yes'/'no' (engine convention). price_cents: COST of the held side.
@@ -892,6 +893,8 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
     }
     if reduce_only:
         body["reduce_only"] = True
+    if order_group_id:
+        body["order_group_id"] = str(order_group_id)   # WO-ROT-1 C8 runaway rail
     if expiration_ts is not None and expiration_ts > int(time.time()):
         body["expiration_time"] = int(expiration_ts)
 
@@ -1124,3 +1127,41 @@ def get_todays_settled_tickers(client: KalshiClient) -> List[str]:
         if close_ts is not None and close_ts >= today_start:
             tickers.append(ticker)
     return tickers
+
+
+# ── Order groups (WO-ROT-1 Chunk 8: the runaway cap) ─────────────
+# Kalshi order groups: every order placed with the group's id counts its fills
+# against contracts_limit; passing it within 15 s cancels every resting order
+# in the group and rejects new ones until the group is reset. Route and field
+# names follow docs.kalshi.com getting_started/order_groups — UNPROVEN until
+# seen on demo (each response is logged on first use).
+
+def create_order_group(client: KalshiClient, contracts_limit: int) -> Optional[str]:
+    if isinstance(contracts_limit, bool) or int(contracts_limit) < 1:
+        raise ValueError(f"contracts_limit {contracts_limit!r}")
+    resp = client.request("POST", "/portfolio/order_groups/create",
+                          json_body={"contracts_limit": int(contracts_limit)})
+    log.info(f"[ORDER_GROUP] create resp: {resp}")
+    if isinstance(resp, dict):
+        gid = resp.get("order_group_id") or (resp.get("order_group") or {}).get("id")
+        return str(gid) if gid else None
+    return None
+
+
+def get_order_group(client: KalshiClient, group_id: str) -> Optional[Dict]:
+    try:
+        resp = client.request("GET", f"/portfolio/order_groups/{group_id}")
+    except Exception as e:
+        log.warning(f"[ORDER_GROUP] read failed: {e}")
+        return None
+    return resp if isinstance(resp, dict) else None
+
+
+def reset_order_group(client: KalshiClient, group_id: str) -> bool:
+    """True when the venue accepted the reset. client.request raises on any
+    HTTP >= 400, so reaching the return IS the venue's acceptance (an empty
+    2xx body is a success)."""
+    resp = client.request("PUT", f"/portfolio/order_groups/{group_id}/reset",
+                          json_body={})
+    log.info(f"[ORDER_GROUP] reset resp: {resp}")
+    return True

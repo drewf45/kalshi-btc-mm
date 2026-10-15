@@ -236,7 +236,9 @@ def test_command_surface_is_exactly_the_whitelist(cash):
     assert Telegram.COMMANDS == ("/confirm_cash", "/deny_cash", "/reset_halt",
                                  "/scoreboard", "/clear_cash_fatal", "/daily",
                                  "/owed",      # WO-O §O4: read-only scrape look
-                                 "/series")    # WO-S §1: opens/parks a room, never places
+                                 "/series",    # WO-S §1: opens/parks a room, never places
+                                 # WO-ROT-1 C8: accounting-only desk keys
+                                 "/rot_reopen", "/rot_group_reset", "/rot_status")
     for stray in ("/resume_yes", "/paid", "/buy KXBTC15M 5", "/status", "hello"):
         assert "accounting commands only" in tg.handle_command(stray)
     assert tg.handle_command("/reset_halt") == "no halt manager wired"

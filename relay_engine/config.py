@@ -1308,3 +1308,10 @@ ROT_INDEX_WS = os.environ.get("ROT_INDEX_WS", "true").strip().lower() in ("1", "
 PYTH_API_KEY = os.environ.get("PYTH_API_KEY", "").strip() or None   # never printed
 ROT_WAKE_GAP_S = 30.0                  # DREW-DEFAULT: a loop gap this long is a sleep/wake -> treated as a boot
 ROT_POWER_CHECK_S = 60.0               # DREW-DEFAULT: AC/battery check cadence (macOS)
+
+# ---------------------------------------------------------------------------
+# WO-ROT-1 Chunk 8 — the break-even guard, the runaway cap, the go-live gates.
+# ---------------------------------------------------------------------------
+ROT_RUNAWAY_MULT = 3                 # DREW-DEFAULT: order-group contracts limit = 3x the largest position
+ROT_FIRST_LIVE_DEPLOY_CAP_PCT = 0.25  # WO-ROT-1 C8 §4: the first live day's deploy cap
+ROT_PROMOTE_MIN_TRIPS = 10           # DREW-DEFAULT: a live day needs >= 10 booked trips to open the full cap

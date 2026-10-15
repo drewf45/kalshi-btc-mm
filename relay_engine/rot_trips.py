@@ -200,14 +200,19 @@ def _stats(rows) -> dict:
             "net": net, "fees": fees}
 
 
-def sheet_rows(conn, day_start: float, day_end: Optional[float] = None) -> Tuple[List[str], list]:
+def sheet_rows(conn, day_start: float, day_end: Optional[float] = None,
+               shadow: Optional[int] = None) -> Tuple[List[str], list]:
     """The ROT sheet: per band, per series, TOTAL. Booked trips only in the
     stats (a SETTLE leg not yet booked is counted in pending_settle)."""
     day_end = float("inf") if day_end is None else day_end
     try:
-        data = conn.execute(
-            "SELECT band, series, size, net_cents, fees_cents, settled FROM rot_trips"
-            " WHERE ts >= ? AND ts < ?", (day_start, day_end)).fetchall()
+        q = ("SELECT band, series, size, net_cents, fees_cents, settled FROM rot_trips"
+             " WHERE ts >= ? AND ts < ?")
+        args = [day_start, day_end]
+        if shadow is not None:
+            q += " AND shadow=?"
+            args.append(int(shadow))
+        data = conn.execute(q, args).fetchall()
     except Exception:
         return SHEET_HEADER, []
     out = []
@@ -232,16 +237,21 @@ def _row(scope, key, booked, pending) -> list:
             pending]
 
 
-def band_stats(db, band: str, n: int):
+def band_stats(db, band: str, n: int, since_ts: float = 0.0,
+               shadow: Optional[int] = None):
     """The band's own stats over its last n BOOKED trips, or None while it has
     fewer than n (the selector then ranks on the CSV seed). Per contract:
     h = wins / n, W / L = mean win / loss, holds from first fill to close."""
     from .lane_rot import BandStats
     try:
         ensure(db)
-        rows = db.execute(
-            "SELECT size, net_cents, fill_ts, ts FROM rot_trips WHERE band=? AND"
-            " settled=1 ORDER BY ts DESC LIMIT ?", (band, int(n))).fetchall()
+        q = ("SELECT size, net_cents, fill_ts, ts FROM rot_trips WHERE band=? AND"
+             " settled=1 AND ts >= ?")
+        args = [band, float(since_ts)]
+        if shadow is not None:
+            q += " AND shadow=?"
+            args.append(int(shadow))
+        rows = db.execute(q + " ORDER BY ts DESC LIMIT ?", (*args, int(n))).fetchall()
     except Exception:
         return None
     if len(rows) < n:

@@ -294,7 +294,9 @@ class RotationDesk:
                  venue_held_fn: Optional[Callable[[str], Optional[Decimal]]] = None,
                  stats_fn: Optional[Callable[[str], Optional[BandStats]]] = None,
                  live_fn: Optional[Callable[[str], bool]] = None,
-                 on_close: Optional[Callable] = None):
+                 on_close: Optional[Callable] = None,
+                 deploy_cap_fn: Optional[Callable[[], float]] = None,
+                 on_runaway: Optional[Callable[[str], None]] = None):
         self.gateway = gateway
         self.ledger = ledger
         self.alert = alert
@@ -310,6 +312,11 @@ class RotationDesk:
         # on_close(trip, settle_count, spot_move) -> the trip's tape (Chunk 7:
         # the engine writes rot_trips and the Telegram line); None = default line
         self.on_close = on_close
+        # Chunk 8: the live first-day cap (25%) until a live day is above
+        # break-even; the runaway rail's order group and its trip callback
+        self.deploy_cap_fn = deploy_cap_fn or (lambda: config.ROT_DEPLOY_CAP_PCT)
+        self.order_group_id: Optional[str] = None
+        self.on_runaway = on_runaway
         self.trips: Dict[str, Trip] = {}
         self.closed: List[Trip] = []
         # RULED 2026-10-15 (Drew): a market the desk has ENTERED is struck off
@@ -399,7 +406,7 @@ class RotationDesk:
             return SKIP_CAP_MARKET
         if grp.get(underlying, Decimal(0)) + new_cost_c > book * Decimal(str(config.ROT_GROUP_CAP_PCT)):
             return SKIP_CAP_GROUP
-        if tot + new_cost_c > book * Decimal(str(config.ROT_DEPLOY_CAP_PCT)):
+        if tot + new_cost_c > book * Decimal(str(self.deploy_cap_fn())):
             return SKIP_CAP_DEPLOY
         return ""
 
@@ -872,7 +879,7 @@ class RotationDesk:
 
     def free_slots(self) -> bool:
         tot, _g, _m = self.exposure()
-        return tot < Decimal(self.book_cents()) * Decimal(str(config.ROT_DEPLOY_CAP_PCT))
+        return tot < Decimal(self.book_cents()) * Decimal(str(self.deploy_cap_fn()))
 
     def fill_slots(self, now: float, books: Dict[str, OrderBook]) -> None:
         """Rank order: the first candidate that passes book, depth, caps and
@@ -927,12 +934,17 @@ class RotationDesk:
         o = Order(lane=LANE, event=c.market.rsplit("-", 1)[0], market=c.market,
                   side=side, action="buy", price_cents=cost, count=_norm(size),
                   size_tier=config.TIER_PROBE, purpose="ENTRY",
-                  band=config.ROT_ENTRY_BAND, why=why_s, shadow_only=shadow_only)
+                  band=config.ROT_ENTRY_BAND, why=why_s, shadow_only=shadow_only,
+                  order_group_id=None if shadow_only else self.order_group_id)
         try:
             res = self.gateway.submit(o, book)
         except WallRejection as e:
             self.verdicts[c.market] = f"{SKIP_WALL}:{e.wall}"
             self._ev("wall", c.market, e.wall)
+            from .rot_guard import is_group_trip
+            if (e.wall in ("VENUE_REJECTED", "VENUE_AMBIGUOUS")
+                    and is_group_trip(e.detail) and self.on_runaway is not None):
+                self.on_runaway(e.detail)        # Chunk 8: Kalshi's runaway rail fired
             return False
         t = Trip(market=c.market, event=o.event, series=c.series,
                  underlying=c.underlying, cadence=c.cadence, side=side,

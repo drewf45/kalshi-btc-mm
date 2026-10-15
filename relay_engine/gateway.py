@@ -64,6 +64,8 @@ class Order:
     # working spot at entry is rehearsed end to end; every order of that trip
     # carries this flag so a shadow position can never meet a live sell.
     shadow_only: bool = False
+    # WO-ROT-1 Chunk 8: the Kalshi order group (runaway cap) this ENTRY rides
+    order_group_id: Optional[str] = None
 
 
 @dataclass
@@ -425,6 +427,8 @@ class Gateway:
             # order's call is unchanged
             extra = ({"time_in_force": "immediate_or_cancel",
                       "reduce_only": order.reduce_only} if order.ioc else {})
+            if order.order_group_id:
+                extra["order_group_id"] = order.order_group_id
             oid, resp = venue.place_order_maker(
                 self.venue_client, order.market, v_side, v_price,
                 count=order.count, v2_price_str=v_fp,
