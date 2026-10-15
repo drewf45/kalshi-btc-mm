@@ -198,7 +198,10 @@ class ShadowEngine:
                                 spot_fn=self._rot_spot,
                                 spot_confirm_fn=self.spot_book.confirm,
                                 venue_held_fn=self._rot_venue_held,
-                                live_fn=self._rot_underlying_live)
+                                live_fn=self._rot_underlying_live,
+                                on_close=self._rot_trip_closed,
+                                stats_fn=self._rot_band_stats)
+        self._band_stats_cache = {}
         self.lanes = build_registry(self.ledger, gateway=self.gateway,
                                     custodian=self.custodian)
         if config.DESK_MODE == "ROTATION":
@@ -2069,6 +2072,67 @@ class ShadowEngine:
                                        detail=code)
         return out
 
+    def _rot_trip_closed(self, t, settle_count, spot_move) -> None:
+        """WO-ROT-1 Chunk 7: the trip's row in rot_trips + ONE Telegram line."""
+        from . import rot_trips
+        live = config.live_submit_enabled() and not t.shadow_only
+        econ = rot_trips.trip_economics(t, self.gateway, self.ledger, live=live)
+        row = rot_trips.row_for(t, econ, settle_count, spot_move,
+                                shadow=not live, now=time.time(), cfg=config)
+        tid = rot_trips.write(self.ledger, row)
+        gh = "👻 " if not live else ""
+        held_s = (t.closed_ts or time.time()) - (t.fill_ts or t.entry_ts)
+        exit_s = ("n/a" if row["fill_px"] is None else f"{row['fill_px']:.1f}¢")
+        if row["settled"]:
+            money = f"net {row['net_cents']:+.1f}¢ fees {row['fees_cents']:.1f}¢"
+        else:
+            money = f"{row['settle_count']:g} riding to settlement (net books at result)"
+        self.telegram.alert(
+            f"{gh}🔁 ROT #{tid} {t.closed_path} {t.market} {t.side} {t.cost}¢→{exit_s} "
+            f"x{row['size']:g} · {money} · held {held_s:.0f}s · band {t.band}")
+
+    def _rot_band_stats(self, band: str):
+        """Chunk 3A §2: a band ranks on its OWN last ROT_GUARD_TRIPS trips once
+        it has them; until then on the CSV seed (UNPROVEN). Cached 60 s."""
+        from . import lane_rot, rot_trips
+        now = time.time()
+        hit = self._band_stats_cache.get(band)
+        if hit is not None and now - hit[0] < 60:
+            return hit[1]
+        st = (rot_trips.band_stats(self.ledger.db, band, config.ROT_GUARD_TRIPS)
+              or lane_rot.SEED_STATS.get(band))
+        self._band_stats_cache[band] = (now, st)
+        return st
+
+    def rot_settle_sweep(self, result_fn) -> int:
+        """Book the venue's result into every SETTLE trip whose leg is pending.
+        result_fn(market) -> 'yes' | 'no' | None (not settled yet). Returns
+        the number booked."""
+        from . import rot_trips
+        booked = 0
+        for tid, market, side, *_ in rot_trips.pending_settles(self.ledger):
+            res = result_fn(market)
+            if res not in ("yes", "no"):
+                continue
+            net = rot_trips.book_settlement(self.ledger, tid, res)
+            booked += 1
+            self.telegram.alert(f"🔔 ROT #{tid} SETTLED {market} {res.upper()} "
+                                f"({'won' if res == side else 'lost'}) · net {net:+.1f}¢")
+        return booked
+
+    def rot_hourly_line(self) -> str:
+        """Chunk 7 §2: open slots and deploy % every hour."""
+        from decimal import Decimal
+        tot, _g, _m = self.rot.exposure()
+        book = Decimal(max(1, self.rot.book_cents()))
+        held = sum(1 for t in self.rot.trips.values() if self.rot.held(t) > 0)
+        resting = sum(1 for t in self.rot.trips.values()
+                      if self.rot.held(t) == 0 and t.entry_oid in self.gateway.resting)
+        return (f"ROT: open {held} · entries resting {resting} · deploy "
+                f"{float(tot / book):.0%} of {config.ROT_DEPLOY_CAP_PCT:.0%} cap · "
+                f"queue {len(self.rot.queue)} · paused bands "
+                f"{','.join(sorted(self.rot.paused_bands)) or 'none'}")
+
     def _rot_spot(self, underlying: str):
         """Spot per underlying for the soft-stop confirm (spot_multi: the
         settle index first, then Coinbase / Pyth). BTC also falls back to the
@@ -2141,9 +2205,11 @@ class ShadowEngine:
         trips, net = self.trips_since(since)
         line = deadman.hourly_line(self.cycles_completed, trips, net,
                                    self.open_position_count(), self.deploy_pct())
-        if config.DESK_MODE == "ROTATION" and self.rot_underlyings():
-            # Chunk 6 §5: the non-BTC confirms recompute hourly and print here
-            line += "\n" + "\n".join(self.spot_status_lines())
+        if config.DESK_MODE == "ROTATION":
+            line += "\n" + self.rot_hourly_line()
+            if self.rot_underlyings():
+                # Chunk 6 §5: the non-BTC confirms recompute hourly and print here
+                line += "\n" + "\n".join(self.spot_status_lines())
         self.telegram.alert(line)
 
     def _cycle_body(self, markets, now=None, spot=None):
@@ -2915,6 +2981,12 @@ async def run():
         while not stop.is_set():
             await asyncio.sleep(30.0)
             await asyncio.to_thread(engine.settlement_sweep)
+            if config.DESK_MODE == "ROTATION":
+                # WO-ROT-1 Chunk 7: settlement truth for trips held to the
+                # bell (a venue read, so shadow trips settle too)
+                await asyncio.to_thread(
+                    engine.rot_settle_sweep,
+                    lambda m: venue.get_settlement_result(client, m))
 
     # ── P11 (Marta's cadence): LIVE fills reconcile every 3s — the proven
     # live rhythm; fill knowledge up to 3s late is yesterday's accepted

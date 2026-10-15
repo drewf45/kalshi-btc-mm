@@ -262,6 +262,7 @@ class Trip:
     soft_reads: List[Tuple[float, int]] = field(default_factory=list)
     late_hold: bool = False
     shadow_only: bool = False   # Chunk 6: no working spot at entry -> rehearsed only
+    sell_oids: List[str] = field(default_factory=list)   # every sell this trip placed (Chunk 7)
     reads: int = 0
     closed_path: Optional[str] = None
     closed_ts: Optional[float] = None
@@ -292,7 +293,8 @@ class RotationDesk:
                  spot_confirm_fn: Optional[Callable[[str], Optional[float]]] = None,
                  venue_held_fn: Optional[Callable[[str], Optional[Decimal]]] = None,
                  stats_fn: Optional[Callable[[str], Optional[BandStats]]] = None,
-                 live_fn: Optional[Callable[[str], bool]] = None):
+                 live_fn: Optional[Callable[[str], bool]] = None,
+                 on_close: Optional[Callable] = None):
         self.gateway = gateway
         self.ledger = ledger
         self.alert = alert
@@ -305,6 +307,9 @@ class RotationDesk:
         # live_fn(underlying) -> True when its spot feed works (Chunk 6); a
         # trip entered without one is shadow-only for its whole life
         self.live_fn = live_fn or (lambda underlying: True)
+        # on_close(trip, settle_count, spot_move) -> the trip's tape (Chunk 7:
+        # the engine writes rot_trips and the Telegram line); None = default line
+        self.on_close = on_close
         self.trips: Dict[str, Trip] = {}
         self.closed: List[Trip] = []
         # RULED 2026-10-15 (Drew): a market the desk has ENTERED is struck off
@@ -357,8 +362,12 @@ class RotationDesk:
         mkt: Dict[str, Decimal] = {}
         for t in self.trips.values():
             c = self.held(t) * t.cost
-            if t.entry_open:
-                c += max(Decimal(0), t.size - t.filled) * t.cost
+            if t.entry_open and t.entry_oid in self.gateway.resting:
+                # the unfilled remainder as the GATEWAY knows it — never the
+                # desk's last-read copy (a fill booked between reads would
+                # otherwise count twice: once held, once still resting)
+                f = _dec(self.gateway.filled_counts.get(t.entry_oid, 0))
+                c += max(Decimal(0), t.size - f) * t.cost
             tot += c
             grp[t.underlying] = grp.get(t.underlying, Decimal(0)) + c
             mkt[t.market] = mkt.get(t.market, Decimal(0)) + c
@@ -678,6 +687,8 @@ class RotationDesk:
             t.why_log.append(f"{now:.0f} walk amend not confirmed — re-read next cycle")
             self._ev("amend_unconfirmed", t.market)
             return
+        if new not in t.sell_oids:
+            t.sell_oids.append(new)            # a live amend may re-key the order
         t.exit_oid, t.exit_px = new, target
         self._ev("walk", t.market, t.pending, target, size)
 
@@ -701,6 +712,7 @@ class RotationDesk:
                          f"{config.ROT_HARD_STOP_CENTS}")
         self._assert_exit_size(t, held)
         res = self.gateway.submit(o, book)
+        t.sell_oids.append(res.order_id)
         self._ev("cut", t.market, bid, held, getattr(res, "ioc_filled", None))
 
     def _sells_live(self, market: str, exclude: Optional[str] = None) -> Decimal:
@@ -733,6 +745,7 @@ class RotationDesk:
                   size_tier=config.TIER_PROBE, purpose=purpose, band=(1, 99),
                   reason=reason, shadow_only=t.shadow_only)
         res = self.gateway.submit(o, book)
+        t.sell_oids.append(res.order_id)
         return res.order_id
 
     def _finish(self, t: Trip, now: float, path: str) -> None:
@@ -741,6 +754,8 @@ class RotationDesk:
         t.closed_ts = now
 
     def _close(self, t: Trip, now: float) -> None:
+        settle_count = self.held(t) if t.closed_path == SETTLE else Decimal(0)
+        spot_move = self._spot_against(t)
         if t.closed_path == SETTLE:
             # the contracts settled at the venue: no position remains to cap
             self.gateway.settle_key(t.key)
@@ -749,11 +764,23 @@ class RotationDesk:
         self.verdicts[t.market] = f"CLOSED_{t.closed_path}"
         self._freed_at, self._freed_by = now, f"{t.market} {t.closed_path}"
         self._ev("closed", t.market, t.closed_path)
-        if t.closed_path != NO_FILL:
-            c = self.gateway.last_concluded.get(t.key)
-            net = "" if c is None else f" net {c['net_cents']:+}¢"
-            self.alert(f"🔁 ROT {t.closed_path} {t.market} {t.side} entry {t.cost}¢ "
-                       f"x{_norm(t.filled)}{net} · held {now - (t.fill_ts or now):.0f}s")
+        if t.closed_path == NO_FILL:
+            return
+        if self.on_close is not None:
+            try:
+                self.on_close(t, settle_count, spot_move)
+                return
+            except Exception as e:
+                # the trip still closes; its tape failure is loud (a durable
+                # write failure has already halted entries in the ledger)
+                from . import failures
+                failures.fail("ROT_TRIP_TAPE_FAILED",
+                              f"{t.market} {t.closed_path}: trip row not written ({e})",
+                              alert=True, market=t.market)
+        c = self.gateway.last_concluded.get(t.key)
+        net = "" if c is None else f" net {c['net_cents']:+}¢"
+        self.alert(f"🔁 ROT {t.closed_path} {t.market} {t.side} entry {t.cost}¢ "
+                   f"x{_norm(t.filled)}{net} · held {now - (t.fill_ts or now):.0f}s")
 
     # ── OUTSIDE loop ─────────────────────────────────────────────
     def outside(self, now: float, books: Dict[str, OrderBook],

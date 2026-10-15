@@ -614,7 +614,7 @@ def test_engine_round_trip_in_shadow(tmp_path):
     e.cycle([m], now=T + 6)
     assert m not in e.rot.trips
     assert e.rot.closed[-1].closed_path == lr.TARGET
-    assert any("ROT TARGET" in s for s in sent)
+    assert any("ROT #1 TARGET" in s for s in sent)        # Chunk 7: one line per trip
 
 
 def test_rate_governed_entry_is_a_skip_and_retries(gateway, ledger):
@@ -1026,3 +1026,15 @@ def test_never_reentered_across_a_restart_or_window_close(env, gateway, ledger):
     gateway.resting.clear()
     env2.step(T + 5)
     assert m not in fresh.trips and fresh.verdicts[m] == lr.SKIP_ENTERED_BEFORE
+
+
+def test_a_fill_between_reads_is_never_counted_twice(env):
+    """Exposure reads fill truth from the gateway: a fill booked after the
+    desk's last read counts once (held), not twice (held + still resting)."""
+    m = mk("KXBTC15M", 1)
+    env.market(m, 46, 48)
+    env.step()
+    t = env.trip(m)
+    before = env.desk.exposure()[0]
+    env.fill(t.entry_oid)                      # booked by the sweep, desk not yet read
+    assert env.desk.exposure()[0] == before    # same money, now held instead of resting

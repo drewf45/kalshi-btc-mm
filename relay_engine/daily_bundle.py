@@ -73,6 +73,7 @@ TABLE_SHEETS: Tuple[Tuple[str, str], ...] = (
     ("failures", "failures"),
     ("boots", "boots"),
     ("budget", "d_budget_decisions"),
+    ("rot_trips", "rot_trips"),             # WO-ROT-1 C7: one row per desk trip
     # book_sample (book_snapshots) is handled specially — decimated (§3).
 )
 BOOK_TABLE = "book_snapshots"
@@ -403,6 +404,12 @@ def build_daily_workbook(db_path: str, scoreboard_lines: List[str],
             # the legacy text scoreboard (what /scoreboard prints) kept for
             # continuity, after the structured truth.
             ("scoreboard_txt", ["line"], [[ln] for ln in scoreboard_lines])]
+        # WO-ROT-1 Chunk 7: the ROT sheet — per band / per series h, W, L, h*,
+        # net $, fees $ — computed from rot_trips (sums match it to the cent)
+        if _table_exists(conn, "rot_trips"):
+            from . import rot_trips
+            rh, rr = rot_trips.sheet_rows(conn, day_start, day_start + 86400)
+            sheets.insert(1, ("ROT", rh, rr))
         total_rows = 0
         for sheet_name, table in TABLE_SHEETS:
             if not _table_exists(conn, table):

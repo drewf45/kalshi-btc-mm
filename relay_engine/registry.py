@@ -74,12 +74,22 @@ SEED_SURFACES = (
     "SALVAGE_VERDICT", "WINDOW_ECON", "TIER_CHANGE",
     "BOOK_STALE", "CORRELATED_LOSS", "NO_COUNTERPARTY",
     "RECON_CADENCE", "BALANCE_REJECTED", "TAIL_CLUSTER",
-    "BELL_ECON_DIVERGENCE",
+    "BELL_ECON_DIVERGENCE", "ROT_TRIPS",
 )
 
 
 def seed() -> None:
     """Install the 6 standing questions. Called at import; idempotent."""
+    register(
+        "ROT_TRIPS",
+        "Is each Rotation Desk band above break-even — does its measured hit "
+        "rate h beat h* = L / (W + L) on its own trips?",
+        "VALIDATES or INVALIDATES the desk's edge per band and per series: the "
+        "CSV seed (40-49 h 71%, Wilson low ~62% under h* 64%) is UNPROVEN until "
+        "these rows say otherwise; a band under h* over its last 50 trips is "
+        "paused by the break-even guard (WO-ROT-1 Chunk 8).",
+        "the daily bundle's ROT sheet, the selector's ranking stats, the "
+        "break-even guard, the keep-running ruling after day 1")
     register(
         "SIZE_DECISION",
         "Did sizing ever want to bet a lot the book didn't support?",
