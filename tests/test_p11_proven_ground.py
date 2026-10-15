@@ -88,6 +88,7 @@ def test_poll_incoherent_rest_book_still_trips_the_invariant(engine, monkeypatch
 
 
 # ── P11.1-d: a failed fetch is NO book, never a fabrication ────────────────
+@pytest.mark.legacy_desk  # WO-ROT-1: old lanes evaluating unheld markets
 def test_failed_fetch_no_book_tagged_counted(engine, monkeypatch):
     from relay_engine import venue
     monkeypatch.setattr(venue, "fetch_orderbook_raw", lambda c, m: dict(RAW_BOOK))

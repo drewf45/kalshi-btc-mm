@@ -222,7 +222,9 @@ def test_off_gates_proposals_not_custody(monkeypatch):
     assert config.lane_is_live("F") == (config.LANE_MODE["F"] == "LIVE")
 
 
-def test_rotation_cycle_places_zero_orders_all_lanes_pass_off():
+def test_rotation_cycle_runs_no_old_lane_and_places_zero_orders():
+    """In ROTATION the old lanes evaluate nothing: the legacy body runs only
+    over markets the desk reads (held, resting, shortlisted) — none here."""
     engine = ShadowEngine(db_path=":memory:")
     engine.boot()
     markets = ["KXBTC15M-A", "KXBTC15M-B"]
@@ -231,9 +233,8 @@ def test_rotation_cycle_places_zero_orders_all_lanes_pass_off():
     for m in markets:
         engine.close_window(m)
     rows = engine.ledger.db.execute(
-        "SELECT lane, detail FROM surface_rows WHERE terminal=1").fetchall()
-    assert len(rows) == 10
-    assert {d for _, d in rows} == {"LANE_OFF_DESK_ROTATION"}
+        "SELECT lane FROM surface_rows WHERE lane IN ('F','H8','FLIP','D','P')").fetchall()
+    assert rows == []
     assert engine.gateway.shadow_orders == []
     assert engine.gateway.resting == {}
 

@@ -27,6 +27,11 @@ from .errors import FatalIntegrityError
 
 log = logging.getLogger("relay.ledger")
 
+# WO-ROT-1: fractional contract counts ride as Decimal in memory; SQLite stores
+# them as REAL (INTEGER affinity keeps 0.7 as REAL, as it keeps 96.5 cents).
+from decimal import Decimal as _Decimal
+sqlite3.register_adapter(_Decimal, float)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cash_movements (
     id INTEGER PRIMARY KEY,
@@ -141,6 +146,25 @@ def is_durable_failure(err: BaseException) -> bool:
         return False
     msg = str(err).lower()
     return any(m in msg for m in DURABLE_FAILURE_MARKERS)
+
+
+def _cell_contracts(contracts, market: str):
+    """WO-ROT-1: the outcome's contract count, EXACT (0.70 stays 0.70 — the old
+    int-then-floor-at-1 booked a fractional trip as one whole contract and
+    shrank its per-contract P&L). A count that is missing or non-positive is a
+    caller bug: written to the failures ledger loudly, and the row keeps the
+    table's documented legacy reading (1) so per-contract stats never divide
+    by zero."""
+    from .venue import exact_count
+    c = exact_count(contracts) if contracts is not None else None
+    if c is None or c <= 0:
+        from . import failures
+        failures.fail("CELL_CONTRACTS_INVALID",
+                      f"{market}: cell outcome contracts {contracts!r} — booked as 1 "
+                      "(the legacy reading); fix the caller", market=market,
+                      alert=False)
+        return 1
+    return c
 
 
 class _LockedConnection:
@@ -634,7 +658,7 @@ class Ledger:
             (time.time() if now is None else now, lane,
              scoring.price_cell(entry_price_cents), int(bool(won)),
              int(pnl_cents), int(fees_cents), market, kind,
-             config.F_PROOF_MODE, "halt-only", max(1, int(contracts)),
+             config.F_PROOF_MODE, "halt-only", _cell_contracts(contracts, market),
              int(bool(shadow))))
         self.db.commit()
 

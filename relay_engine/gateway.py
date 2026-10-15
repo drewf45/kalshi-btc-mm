@@ -44,7 +44,7 @@ class Order:
     side: str             # "yes" | "no"
     action: str           # "buy" | "sell"
     price_cents: int      # in the order's own side terms
-    count: int
+    count: int            # contracts; Decimal when fractional (WO-ROT-1: 0.01 grid)
     size_tier: str
     purpose: str          # "ENTRY" | "EXIT" | "CUT"
     improve_from: Optional[int] = None  # prior price (side terms) this order improves on
@@ -55,6 +55,11 @@ class Order:
     # (entries) and the rule that spent the money (exits/cuts).
     why: str = ""
     reason: str = ""
+    # WO-ROT-1 Chunk 5: a stop exit is immediate-or-cancel AND reduce_only (the
+    # venue allows reduce_only only with IOC) so it can never oversell. Both
+    # are CUT-only, enforced at the canonical layer like crossfire.
+    ioc: bool = False
+    reduce_only: bool = False
 
 
 @dataclass
@@ -66,6 +71,10 @@ class SubmitResult:
     # path can read the response's OWN fee (parse_response_fee) — never
     # imagined from a multiplier. None in shadow.
     resp: Optional[dict] = None
+    # WO-ROT-1: an IOC order's immediate outcome in shadow (contracts filled;
+    # the remainder was killed). None for resting orders and live IOCs (live
+    # fills arrive through the fills sweep like any other).
+    ioc_filled: Optional[object] = None
 
 
 class FeeTripwire:
@@ -246,6 +255,12 @@ class Gateway:
         if order.crossfire and order.purpose != "CUT":
             raise WallRejection("TAKER_ENTRY",
                                 f"crossfire on purpose={order.purpose}; CUT only")
+        if (order.ioc or order.reduce_only) and order.purpose != "CUT":
+            raise WallRejection("TAKER_ENTRY",
+                                f"ioc/reduce_only on purpose={order.purpose}; CUT only")
+        if order.reduce_only and not order.ioc:
+            raise WallRejection("REDUCE_ONLY_NEEDS_IOC",
+                                "the venue accepts reduce_only only with immediate_or_cancel")
 
         if not risk_reducing:
             # KAL-50/50 Stage 0.1: the wall is PER-LANE. A rate halt scoped to
@@ -319,7 +334,7 @@ class Gateway:
         # salvage escalation untouched. CUTs (crossfire) cross on purpose.
         if (config.lane_is_live(order.lane) and order.action == "sell"
                 and not order.crossfire and book is not None
-                and order.lane != "F"):
+                and order.lane not in ("F", "ROT")):
             order.price_cents = self._rest_forward_price(order, book)
 
         # Rate governor: entries need a token; risk reduction is always allowed
@@ -348,7 +363,34 @@ class Gateway:
         self.shadow_orders.append(order)
         self.resting[oid] = order
         self.order_index[oid] = order
+        if order.ioc:
+            filled = self._shadow_ioc(oid, order, book)
+            return SubmitResult(order_id=oid, shadow=True, payload=payload,
+                                ioc_filled=filled)
         return SubmitResult(order_id=oid, shadow=True, payload=payload)
+
+    def _shadow_ioc(self, oid: str, order: Order, book: OrderBook):
+        """WO-ROT-1: an IOC in shadow fills NOW against the book or dies.
+        Pessimistic: only contracts the book shows AT or THROUGH the price
+        fill (a sell needs its own side's bids >= price); the rest is killed.
+        Returns the filled count (0 when nothing crossed)."""
+        from decimal import Decimal
+        avail = 0
+        if book is not None:
+            if order.action == "sell":
+                bids = book.yes_bids if order.side == "yes" else book.no_bids
+                avail = sum(q for p, q in bids.items() if p >= order.price_cents)
+            else:
+                opp = book.no_bids if order.side == "yes" else book.yes_bids
+                avail = sum(q for p, q in opp.items()
+                            if p >= 100 - order.price_cents)
+        want = Decimal(str(order.count))
+        fill = min(want, Decimal(str(avail)))
+        fill = int(fill) if fill == fill.to_integral_value() else fill
+        if fill > 0:
+            self.on_fill(oid, count=fill)
+        self.resting.pop(oid, None)   # IOC: the unfilled remainder is killed
+        return fill
 
     def _submit_live(self, order: Order, payload: dict) -> SubmitResult:
         """The one live door. post_only=False ONLY for crossfire CUTs (already
@@ -357,11 +399,15 @@ class Gateway:
         from . import venue
         if self.venue_client is None:
             self.venue_client = venue.build_client()
-        cash, _pv = venue.get_balance(self.venue_client)
-        cost_usd = order.price_cents * order.count / 100.0
-        if cash is None or cash < cost_usd:
-            raise WallRejection("BALANCE_RECHECK",
-                                f"live balance {cash} < cost ${cost_usd:.2f}")
+        # WO-ROT-1: a ROT exit SELLS what we hold — it needs no cash, and a
+        # failed balance read must never block a stop. Every other order keeps
+        # the recheck exactly as before.
+        if not (order.lane == "ROT" and order.action == "sell"):
+            cash, _pv = venue.get_balance(self.venue_client)
+            cost_usd = float(order.price_cents * order.count) / 100.0
+            if cash is None or cash < cost_usd:
+                raise WallRejection("BALANCE_RECHECK",
+                                    f"live balance {cash} < cost ${cost_usd:.2f}")
         # The proven engine BUYS ONLY: a sell intent is the complement BUY
         # (venue nets to flat) — flip_math.exit_args is the pinned translation.
         from .flip_math import exit_args
@@ -371,10 +417,14 @@ class Gateway:
         else:
             v_side, v_price, v_fp = order.side, order.price_cents, order.rest_fp
         try:
+            # the IOC/reduce_only kwargs ride only on a stop exit: every other
+            # order's call is unchanged
+            extra = ({"time_in_force": "immediate_or_cancel",
+                      "reduce_only": order.reduce_only} if order.ioc else {})
             oid, resp = venue.place_order_maker(
                 self.venue_client, order.market, v_side, v_price,
                 count=order.count, v2_price_str=v_fp,
-                post_only=not order.crossfire,
+                post_only=not order.crossfire, **extra,
             )
         except RuntimeError as e:
             # P7: a venue reject is a NORMAL reject with a rest — backoff the
@@ -416,9 +466,14 @@ class Gateway:
         self.resting[oid] = order
         self.order_index[oid] = order
         self.live_order_ids.add(oid)
-        log.warning("LIVE ORDER PLACED %s %s %s %d@%dc post_only=%s oid=%s",
+        if order.ioc:
+            # IOC never rests: its fills arrive through the fills sweep (the
+            # order stays in order_index for attribution); the remainder is
+            # gone at the venue, so it must not sit in `resting`.
+            self.resting.pop(oid, None)
+        log.warning("LIVE ORDER PLACED %s %s %s %s@%dc post_only=%s ioc=%s oid=%s",
                     order.lane, order.market, order.side, order.count,
-                    order.price_cents, not order.crossfire, oid)
+                    order.price_cents, not order.crossfire, order.ioc, oid)
         return SubmitResult(order_id=oid, shadow=False, payload=payload,
                             resp=resp)
 
@@ -464,7 +519,15 @@ class Gateway:
             failures.fail("FILL_UNKNOWN_ORDER",
                           f"fill for unknown order {order_id}", fatal=True,
                           order_id=order_id)
-        cnt = order.count if count is None else int(count)
+        if count is None:
+            cnt = order.count
+        else:
+            from .venue import exact_count
+            cnt = exact_count(count)   # WO-ROT-1: exact, never int()-truncated
+            if cnt is None:
+                failures.fail("FILL_COUNT_UNREADABLE",
+                              f"on_fill {order_id}: count {count!r}", fatal=True,
+                              order_id=order_id)
         key = (order.event, order.market, order.lane)
         sign = 1 if self._signed_yes_delta(order) > 0 else -1
         self.positions[key] = self.positions.get(key, 0) + sign * cnt
@@ -482,9 +545,11 @@ class Gateway:
             prev_gross = self.gross_open.get(key, 0)
             prev_basis = self.pos_basis.get(key, order.price_cents)
             new_gross = prev_gross + cnt
-            self.pos_basis[key] = int(round(
-                (prev_basis * prev_gross + order.price_cents * cnt)
-                / max(1, new_gross)))
+            # WO-ROT-1: divide by the TRUE gross (0.70 contracts is 0.70, not
+            # a floor of 1 — that floor priced a fractional basis at 70%).
+            self.pos_basis[key] = (int(round(
+                (prev_basis * prev_gross + order.price_cents * cnt) / new_gross))
+                if new_gross > 0 else order.price_cents)
             self.gross_open[key] = new_gross
             # WO-2026-07-24-H: the story's basis IS the wall's basis (blended)
             st["basis"] = self.pos_basis[key]
@@ -556,6 +621,14 @@ class Gateway:
         ledger_halts = set(getattr(self.ledger, "entry_halts", set()))
         return {r for r in self.entries_halted_reasons
                 if self._reason_blocks_lane(r, lane)} | ledger_halts
+
+    def settle_key(self, key) -> None:
+        """WO-ROT-1: a position held to the bell is gone at the venue once the
+        market settles — drop its gateway state so no wall, cap or read set
+        keeps counting contracts that no longer exist. P&L is the settlement
+        path's business (Chunk 7 books it from the venue result)."""
+        for d in (self.positions, self.gross_open, self.pos_basis, self.pos_story):
+            d.pop(key, None)
 
     def halt_entries(self, reason: str) -> None:
         self.entries_halted_reasons.add(reason)
@@ -932,7 +1005,9 @@ class Gateway:
             "action": order.action,
             "side": order.side,
             "type": "limit",
-            "count": int(order.count),
+            # WO-ROT-1: the record carries the exact count (int when whole)
+            "count": (int(order.count) if order.count == int(order.count)
+                      else str(order.count)),
             "post_only": True,  # maker-only/post-only EVERYWHERE — no exceptions
         }
         if order.side == "yes":

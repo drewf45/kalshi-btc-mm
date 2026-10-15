@@ -170,6 +170,8 @@ class ShadowEngine:
         # WO-ROT-1 Chunk 2: the discovered roster and the full-book shortlist
         self.roster = None
         self.book_shortlist: set = set()
+        self.venue_positions = None       # {market: signed net} from the venue (LIVE)
+        self._last_listing_ts = 0.0
         self._last_discovery_ts = 0.0
         self._installed: list = []
         self.surface = Surface(self.ledger)
@@ -187,8 +189,17 @@ class ShadowEngine:
         # pre-fix its entries_halted/fatal flags were read by no one.
         self.cash.gateway = self.gateway
         self.custodian = Custodian(self.gateway, self.ledger, self.surface, ladder=self.ladder)
+        # WO-ROT-1 Chunks 3-5: the Rotation Desk (lane ROT)
+        from .lane_rot import RotationDesk
+        self.rot = RotationDesk(self.gateway, self.ledger,
+                                alert=lambda msg: self.telegram.alert(msg),
+                                spot_fn=self._rot_spot,
+                                venue_held_fn=self._rot_venue_held)
         self.lanes = build_registry(self.ledger, gateway=self.gateway,
                                     custodian=self.custodian)
+        if config.DESK_MODE == "ROTATION":
+            from .lanes import LaneRot
+            self.lanes.append(LaneRot(self.rot))   # slot 5, after the OFF lanes
         self.fh8_shared = self.lanes[0].shared  # LaneF/LaneH8 shared evaluator
         self.flip = self.lanes[2].flip          # LaneFlip (arbitration slot 3)
         # P-FLIP-THESIS-1 §4: ONE shared inventory — F consults FLIP's held
@@ -1787,6 +1798,38 @@ class ShadowEngine:
             return "REST"
         return "WS" if self.ladder.entries_allowed() else "EXPLORATION"
 
+    def rot_shutdown(self) -> None:
+        """WO-ROT-1: clean shutdown cancels every ROT resting order so the next
+        boot re-adopts held positions cleanly. Positions stay; their stops are
+        unwatched until restart — said on the phone."""
+        if config.DESK_MODE != "ROTATION" or not self.rot.trips:
+            return
+        from .lane_rot import shutdown_cancel
+        unknown = shutdown_cancel(self.rot)
+        self.telegram.alert(
+            f"🔵 ROT shutdown: {len(self.rot.trips)} position(s) held, resting "
+            f"exits cancelled — stops UNWATCHED until restart"
+            + (f"; cancel UNKNOWN on {', '.join(unknown)} (will quarantine at boot)"
+               if unknown else ""))
+
+    def read_venue_positions(self, client) -> None:
+        """LIVE: the venue's signed net per market (fixed-point exact)."""
+        from . import venue
+        from .reconcile import position_net
+        try:
+            recs = venue.get_positions(client)
+        except Exception as e:
+            log.warning("venue positions read failed: %s", e)
+            self.venue_positions = None
+            return
+        out = {}
+        for p in recs or []:
+            tk = str(p.get("ticker") or p.get("market_ticker") or "")
+            n = position_net(p)
+            if tk and n is not None:
+                out[tk] = n
+        self.venue_positions = out
+
     def rediscover(self, client, now=None):
         """WO-ROT-1 Chunk 2: one discovery pass -> install -> roster post.
         Returns the Roster, or None when the scan failed (paged, roster kept)."""
@@ -1826,10 +1869,18 @@ class ShadowEngine:
         rest are priced from the /markets listing, inside the read budget."""
         if config.DESK_MODE != "ROTATION":
             return sorted(self.market_meta)
-        want = {mk for (_e, mk, _l), net in self.gateway.positions.items() if net}
-        want |= {o.market for o in self.gateway.resting.values()}
-        want |= set(self.book_shortlist)
-        return sorted(m for m in want if m in self.market_meta)
+        # INSIDE first (Chunk 3A): held and resting markets claim the read
+        # budget before the outside loop's shortlist, in this order.
+        inside = {mk for (_e, mk, _l), net in self.gateway.positions.items() if net}
+        inside |= {o.market for o in self.gateway.resting.values()}
+        inside |= set(self.rot.trips)
+        inside |= {p.market for p in self.custodian.positions.values()}
+        # held/resting markets are read whether or not discovery listed them
+        # (custody never waits on the roster); the shortlist must be listed
+        out = sorted(inside)
+        rank = list(self.rot.shortlist) + sorted(self.book_shortlist - set(self.rot.shortlist))
+        out += [m for m in rank if m in self.market_meta and m not in inside]
+        return out
 
     def rest_poll_all(self, client, now=None) -> int:
         """P11: one pass of the 1s book poll (WO-ROT-1: over book_poll_set)."""
@@ -1861,13 +1912,59 @@ class ShadowEngine:
         only when the cycle COMPLETES, so a wedged or dead loop goes stale. The
         hourly tick (disk guard + alive line) rides the same gate."""
         try:
-            out = self._cycle_body(markets, now=now, spot=spot)
+            if config.DESK_MODE == "ROTATION":
+                out = self._rotation_cycle(markets, now=now, spot=spot)
+            else:
+                out = self._cycle_body(markets, now=now, spot=spot)
         except Exception as e:
             self.last_cycle_error = f"{type(e).__name__}: {e}"[:300]
             raise
         self.cycles_completed += 1
         self._heartbeat(time.time())  # wall clock: the watcher's clock, not the sim's
         return out
+
+    def _rotation_cycle(self, markets, now=None, spot=None):
+        """WO-ROT-1: the desk cycle. The legacy body still runs — but only over
+        the markets whose books were read this cycle (held, resting, shortlist)
+        — so custody of any adopted position, the pessimistic shadow fill sweep
+        and the OFF lanes' Pass rows keep their proven paths. Then the desk:
+        inside loop, outside loop, slot refill, on the same cycle."""
+        now = time.time() if now is None else now
+        poll = set(self.book_poll_set())
+        body_markets = [m for m in markets if m in poll]
+        out = self._cycle_body(body_markets, now=now, spot=spot)
+        books = {}
+        for m in poll:
+            b = self.feed.book(m)
+            if (b is None or not b.has_snapshot or b.poisoned
+                    or m in self.quarantined
+                    or m in getattr(self.feed, "fetch_failed", ())):
+                continue
+            books[m] = b
+        budget = (int(config.REST_READ_REFILL_PER_SECOND * CYCLE_SECONDS)
+                  - config.ROT_READ_OVERHEAD)
+        self.rot.step(now, books, self.market_meta, budget)
+        self.book_shortlist = set(self.rot.shortlist)
+        for m, code in self.rot.verdicts.items():
+            if m in self.market_meta:
+                self.surface.write_row("ROT", m, self._window_of.setdefault(m, f"w-{m}"),
+                                       "WATCHING", transport=self.transport_label(),
+                                       detail=code)
+        return out
+
+    def _rot_spot(self, underlying: str):
+        """Spot per underlying for the soft-stop confirm. BTC rides the existing
+        Coinbase feed; others are None until WO-ROT-1 Chunk 6 (spot_multi)."""
+        if underlying == "BTC":
+            return self.fresh_spot(time.time())
+        return None
+
+    def _rot_venue_held(self, market: str):
+        """The venue's signed net on a market from this cycle's positions read
+        (LIVE only); None when not read — the gateway's book then stands."""
+        if self.venue_positions is None:
+            return None
+        return self.venue_positions.get(market, 0)
 
     def deploy_pct(self):
         """Deployed / book, or None when the book is unreadable (never 0)."""
@@ -2186,6 +2283,13 @@ class ShadowEngine:
         if window is None:
             return
         self._unproven_tagged.discard((market, window))  # P26 §1.2 prune
+        code = self.rot.verdicts.get(market)
+        if market not in self.rot.trips:
+            self.rot.forget_market(market)
+        if code is not None and market not in self.rot.trips and code != "ENTERED":
+            # WO-ROT-1: ROT's first-class terminal Pass names its LAST reason
+            self.surface.write_row("ROT", market, window, PASS,
+                                   detail=code, final=True)
         self.surface.finalize_window(market, window)
         from . import failures
         n = self.ledger.db.execute(
@@ -2487,7 +2591,19 @@ async def _rest_main(engine, client, stop) -> None:
                 for gone in sorted(set(engine.market_meta) - current):
                     engine.on_market_closed(gone)
                     log.info("window closed + pruned: %s", gone)
+            if config.DESK_MODE == "ROTATION" and config.live_submit_enabled():
+                # Venue Speaks Last: one positions read per cycle for the
+                # desk's oversize guard (budgeted in ROT_READ_OVERHEAD)
+                await asyncio.to_thread(engine.read_venue_positions, client)
             await asyncio.to_thread(engine.rest_poll_all, client)
+            if (config.DESK_MODE == "ROTATION"
+                    and t0 - engine._last_listing_ts >= config.ROT_LISTING_REFRESH_S):
+                # the outside loop's prices: after the inside loop's book reads
+                engine._last_listing_ts = t0
+                for m in await asyncio.to_thread(venue.list_open_markets, client):
+                    tk = m.get("ticker") or m.get("market_ticker", "")
+                    if tk:
+                        engine.on_market_discovered(tk, m)
             if not booted:
                 booted = True
                 _send_boot_page_rest(engine)
@@ -2711,6 +2827,7 @@ async def run():
         # never entered and websockets is never imported (P11.1-d).
         await _rest_main(engine, client, stop)
         stop.set()
+        engine.rot_shutdown()
         engine.recorder.flush()  # P6 §4: shutdown flush — no buffered frame lost
         print(daily_pack(engine.ledger, engine.surface, engine.cash,
                          foreign_fills=engine.fills.foreign_seen,
@@ -2881,6 +2998,7 @@ async def run():
             await asyncio.sleep(3.0)
 
     stop.set()
+    engine.rot_shutdown()
     engine.recorder.flush()  # P6 §4: shutdown flush — no buffered frame lost
     print(daily_pack(engine.ledger, engine.surface, engine.cash,
                      foreign_fills=engine.fills.foreign_seen, econ=engine.econ),

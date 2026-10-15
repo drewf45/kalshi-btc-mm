@@ -76,6 +76,7 @@ class FillBooker:
         # NONZERO-AFTER-CUTOVER alarm) is noise. Bounded in-memory set.
         self.foreign_seen = 0
         self._foreign_ids_seen: set = set()
+        self._count_paged: set = set()   # WO-ROT-1: one page per count-less fill id
         self._last_foreign_logged = -1
 
     def _already_booked(self, fill_id: str) -> bool:
@@ -114,7 +115,21 @@ class FillBooker:
                 stats["unparsed_price"] += 1
                 self.alert(f"fill {fid} on {order.market}: price unparsed — "
                            f"booked at rest price {order.price_cents}c")
-            count = max(1, count)
+            if count is None or count <= 0:
+                # WO-ROT-1: never book a guessed count (the old floor booked
+                # 1 for a truncated 0.70). Not marked booked: the next sweep
+                # retries; the page fires once per fill id.
+                stats.setdefault("count_unreadable", 0)
+                stats["count_unreadable"] += 1
+                if fid not in self._count_paged:
+                    self._count_paged.add(fid)
+                    from . import failures
+                    failures.fail("FILL_COUNT_UNREADABLE",
+                                  f"fill {fid} on {order.market}: count "
+                                  f"{count!r} unreadable — NOT booked; "
+                                  "reconcile from venue positions",
+                                  market=order.market, fill_id=fid)
+                continue
 
             action = PURPOSE_TO_ACTION.get(order.purpose, order.purpose)
             # P21 A1 — THE NETTING MODEL: the venue nets one account's sides

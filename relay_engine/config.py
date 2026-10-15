@@ -348,7 +348,8 @@ AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap
 # REVERT LEVERS (post-experiment): FLIP dial FLIP_NOTIONAL_PCT→lower and/or
 # AT_RISK_PCT["FLIP"]→0.05; OPEN_SIGHTED_STOP=0. The wall must not silently stay
 # loose after the experiment ends.
-AT_RISK_PCT = {"F": 0.30, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02}  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
+AT_RISK_PCT = {"F": 0.30, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02,
+               "ROT": 0.05}   # WO-ROT-1 C3 §4: ROT at the market cap (ROT_MARKET_CAP_PCT)  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
 AT_RISK_PCT_DEFAULT = 0.02        # any unlisted lane (ORPHAN, …) — conservative
 # WO-2026-07-24-G Part 1 (ADVERSARY i backstop): the per-lane wall is now scoped
 # per-lane, so a lane can't be squeezed by another's exposure — but the whole
@@ -1090,6 +1091,10 @@ LANE_MODE = {
     "PAIR": os.environ.get("LANE_MODE_PAIR", "SHADOW").upper(),
     "D": os.environ.get("LANE_MODE_D", "SHADOW").upper(),
     "P": os.environ.get("LANE_MODE_P", "SHADOW").upper(),
+    # WO-ROT-1: the desk's lane. LIVE here only RESTRICTS nothing — the global
+    # kill (RUN_MODE=LIVE + the I_UNDERSTAND_LIVE phrase) still rules; under the
+    # SHADOW born state ROT places nothing.
+    "ROT": os.environ.get("LANE_MODE_ROT", "LIVE").upper(),
 }
 LANE_MODE_DEFAULT = "SHADOW"   # any unlisted lane rehearses — conservative
 
@@ -1211,18 +1216,18 @@ ROT_GUARD_TRIPS = 50             # DREW-DEFAULT: break-even guard / ranking wind
 ROT_QUEUE_SIZE = 20              # DREW-DEFAULT: ranked candidate queue depth
 ROT_LOT_STEP = Decimal("0.01")   # DREW-DEFAULT: size rounds DOWN to this step (V2 fixed-point min; per-series UNPROVEN)
 
-# Every ROT_* knob above, in declaration order — fixed at import so the boot
-# tape never iterates the live module dict (another thread may be writing it).
-ROT_KNOB_NAMES = tuple(k for k in list(globals()) if k.startswith("ROT_"))
 ROT_KNOB_TAGS = {
     "ROT_POSITION_PCT": "RULED(2026-10-14)",
 }
 
 
 def rot_knobs() -> dict:
-    """Every ROT_* knob, name -> current value, in declaration order."""
-    g = globals()
-    return {k: g[k] for k in ROT_KNOB_NAMES}
+    """Every ROT_* knob in the module, name -> value, in declaration order.
+    Iterates a snapshot (list(...)) of the module dict — never the live dict,
+    which another thread may be writing ("dictionary changed size")."""
+    items = list(globals().items())
+    return {k: v for k, v in items
+            if k.startswith("ROT_") and k != "ROT_KNOB_TAGS" and not callable(v)}
 
 
 def rot_knob_boot_lines() -> list:
@@ -1281,3 +1286,12 @@ ROT_EXCLUDED_SERIES = frozenset({"KXINX15M", "KXNDQ15M"})
 # series -> series_discovery.SeriesInfo for the installed roster (cadence,
 # underlying group, settle sources, tick, fee terms). Empty until discovery.
 SERIES_INFO: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# WO-ROT-1 Chunks 3A-5 — the two loops' read budget.
+# ---------------------------------------------------------------------------
+ROT_SHORTLIST_MAX = 3          # DREW-DEFAULT: full-book reads for the top of the queue per cycle
+ROT_READ_OVERHEAD = 3          # DREW-DEFAULT: reads/cycle reserved (fills sweep, balance, venue positions)
+ROT_LISTING_REFRESH_S = 10     # DREW-DEFAULT: /markets listing re-read for the outside loop's prices
+ROT_REENTER_SAME_WINDOW = False  # DREW-DEFAULT: one trip per market per window (no chase after NO_FILL; open question to Drew)

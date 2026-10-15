@@ -477,3 +477,22 @@ class OffLane(Lane):
 
 
 LANE_D_BAND = (config.LANE_D_FLOOR_CENTS, 99)  # floor per DREW-DEFAULT, pending Chunk 2
+
+
+class LaneRot(Lane):
+    """WO-ROT-1 Chunk 3: lane ROT behind the Lane interface. The desk
+    (lane_rot.RotationDesk) evaluates every admitted market every cycle and
+    submits its own orders through the gateway; this adapter answers for it:
+    a first-class Pass carrying the market's skip code (interim until the
+    window closes, when the runner writes the terminal Pass with the LAST
+    code). It never returns a proposal — the desk's entries already went
+    through the one gateway."""
+
+    name = "ROT"
+
+    def __init__(self, desk):
+        self.desk = desk
+
+    def evaluate(self, market: str, ctx: dict) -> Decision:
+        code = self.desk.verdicts.get(market, "ROT_NOT_EVALUATED")
+        return Decision(self.name, market, None, pass_reason=code, interim=True)

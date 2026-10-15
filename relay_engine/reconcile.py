@@ -112,8 +112,25 @@ def live_boot_reconcile(engine, client) -> dict:
             unsettled_fills=engine.ledger.unsettled_fill_count())
         summary["cash_state"] = state
 
+    # WO-ROT-1: the resting-order sweep runs BEFORE positions so a ROT
+    # position with anything still resting on its market is quarantined, not
+    # re-adopted (the desk would rest a second sell beside the old one).
+    resting_markets: dict = {}
+    resting_orders = None
+    try:
+        resp = client.request("GET", venue._orders_route,
+                              params={"status": "resting", "limit": 200})
+        resting_orders = (resp or {}).get("orders", [])
+        for o in resting_orders:
+            tk = str(o.get("ticker") or o.get("market_ticker") or "")
+            if tk:
+                resting_markets[tk] = resting_markets.get(tk, 0) + 1
+    except Exception as e:
+        log.warning("LIVE boot: resting-orders sweep failed (non-fatal): %s", e)
+
     # positions: recognized (our fills explain them) vs quarantined
     summary["quarantined"] = []
+    summary["rot_adopted"] = []
     for p in venue.get_positions(client):
         ticker = str(p.get("ticker") or p.get("market_ticker") or "")
         net = position_net(p)
@@ -135,6 +152,23 @@ def live_boot_reconcile(engine, client) -> dict:
             "SELECT lane, side, price_cents, size_tier FROM fills"
             " WHERE market=? AND action='ENTRY' AND settled=0"
             " ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
+        if row is not None and row[0] == "ROT" and config.DESK_MODE == "ROTATION":
+            _, side, price_cents, _tier = row
+            if resting_orders is None or resting_markets.get(ticker):
+                _quarantine(engine, ticker, net, summary,
+                            "ROT position with orders still resting from a prior run"
+                            if resting_orders is not None else
+                            "ROT position, resting orders unreadable")
+                continue
+            from .lane_rot import adopt_trip
+            held_side = "yes" if net > 0 else "no"
+            adopt_trip(engine.rot, ticker, held_side, abs(net), int(round(price_cents)),
+                       time.time(), engine._meta(ticker).get("close_ts"))
+            engine.gateway.positions[(ticker.rsplit("-", 1)[0], ticker, "ROT")] = net
+            engine.gateway.gross_open[(ticker.rsplit("-", 1)[0], ticker, "ROT")] = abs(net)
+            summary["positions_recognized"] += 1
+            summary["rot_adopted"].append((ticker, net))
+            continue
         if row is not None:
             lane, side, price_cents, size_tier = row
             from .custodian import OpenPosition
@@ -205,19 +239,14 @@ def live_boot_reconcile(engine, client) -> dict:
                 f"conclusion (Ruling 1); never lane evidence")
 
     # resting orders: ours re-registered is future work at cutover; foreign alerted
-    try:
-        resp = client.request("GET", venue._orders_route,
-                              params={"status": "resting", "limit": 200})
-        for o in (resp or {}).get("orders", []):
-            oid = str(o.get("order_id") or o.get("id") or "")
-            if oid and oid not in engine.gateway.order_index:
-                summary["foreign_resting"] += 1
-        if summary["foreign_resting"]:
-            engine.telegram.alert(
-                f"LIVE BOOT: {summary['foreign_resting']} resting order(s) not ours — "
-                f"left untouched (the old engine's during transition?)")
-    except Exception as e:
-        log.warning("LIVE boot: resting-orders sweep failed (non-fatal): %s", e)
+    for o in resting_orders or []:
+        oid = str(o.get("order_id") or o.get("id") or "")
+        if oid and oid not in engine.gateway.order_index:
+            summary["foreign_resting"] += 1
+    if summary["foreign_resting"]:
+        engine.telegram.alert(
+            f"LIVE BOOT: {summary['foreign_resting']} resting order(s) not ours — "
+            f"left untouched (the old engine's during transition?)")
 
     log.warning("LIVE BOOT RECONCILE: %s", summary)
     for line in reconcile_tape(summary):
@@ -275,4 +304,7 @@ def reconcile_tape(summary: dict) -> list:
              f"  foreign resting orders: {summary.get('foreign_resting', 0)}"]
     for ticker, net, why in summary.get("quarantined", []):
         lines.append(f"  QUARANTINED {ticker} net {net}: {why}")
+    for ticker, net in summary.get("rot_adopted", []):
+        lines.append(f"  ROT ADOPTED {ticker} net {net} (cash-out + stops re-armed; "
+                     "grace restarts now)")
     return lines

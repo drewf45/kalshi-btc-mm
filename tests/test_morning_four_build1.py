@@ -225,6 +225,7 @@ def test_a_clean_reconcile_resets_the_stall(engine, monkeypatch):
 
 
 # ── Part 5 (#6): the closed-gate reject latches per (lane, market) ───────────
+@pytest.mark.legacy_desk  # WO-ROT-1: old lanes evaluating unheld markets
 def test_entries_halted_reject_latches_until_the_gate_opens(engine, monkeypatch):
     """Acceptance #6: a halted lane re-proposing every poll counts ONCE per
     (lane, market) until the gate opens — hundreds of polls of noise can no

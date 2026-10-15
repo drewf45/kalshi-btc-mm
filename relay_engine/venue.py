@@ -559,16 +559,16 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
 
     cost_cents = None
     fee_cents = 0
-    count = 1
+    count = None
 
     # Tape 0709: live fills carry count_fp ('1.00') — parse via Decimal.
-    for ck in ("count", "count_fp", "quantity", "qty"):
+    # WO-ROT-1: EXACT — a 0.70-contract fill is 0.70 (int when whole). The old
+    # int() truncated it to 0 and the caller bumped that to 1. A missing or
+    # unreadable count is None: the caller pages, never guesses.
+    for ck in ("count_fp", "count", "quantity", "qty"):
         raw = _get(ck)
         if raw is not None:
-            try:
-                count = int(Decimal(str(raw)))
-            except Exception:
-                pass
+            count = exact_count(raw)
             break
 
     own_keys = _YES_PRICE_KEYS if our_side == "yes" else _NO_PRICE_KEYS
@@ -592,16 +592,33 @@ def parse_fill(fill: dict, our_side: str) -> Tuple[Optional[float], int, int]:
     return cost_cents, fee_cents, count
 
 
-def _resolve_fee(get_fn, count: int) -> int:
+def exact_count(raw):
+    """A venue count, exactly: int when whole, Decimal when fractional, None
+    when unreadable or non-positive-finite. Never truncated, never bumped."""
+    try:
+        d = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+    if not d.is_finite() or d < 0:
+        return None
+    return int(d) if d == d.to_integral_value() else d
+
+
+def _resolve_fee(get_fn, count) -> int:
     """P24 §2: ONE fee parser, both entrances (fill records AND order
     responses). Walks the (key, per_contract) table; per-contract averages
-    book ceil(avg × count) — the venue rounds fees UP, so do we."""
+    book ceil(avg × count) — the venue rounds fees UP, so do we. An unknown
+    count cannot price a per-contract fee: 0 here, and the caller (which
+    refuses to book a count-less fill) never uses it."""
     import math as _math
     for fk, per_contract in _FEE_KEYS:
         c = _field_to_cents(fk, get_fn(fk))
         if c is not None:
-            return (int(_math.ceil(c * max(1, count))) if per_contract
-                    else int(round(c)))
+            if per_contract:
+                if count is None:
+                    return 0
+                return int(_math.ceil(c * float(count)))
+            return int(round(c))
     return 0
 
 
@@ -822,7 +839,9 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
                       price_cents: int, count: int = 1,
                       expiration_ts: Optional[int] = None,
                       v2_price_str: Optional[str] = None,
-                      post_only: bool = True) -> Tuple[str, Dict]:
+                      post_only: bool = True,
+                      time_in_force: str = "good_till_canceled",
+                      reduce_only: bool = False) -> Tuple[str, Dict]:
     """Place a limit order via V2. Returns (order_id, response).
 
     side: 'yes'/'no' (engine convention). price_cents: COST of the held side.
@@ -836,7 +855,16 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
     post_only order with "post only cross"). No new function; the flag lives on the proven one.
     In the relay, ONLY the gateway may pass post_only=False, and only for purpose=CUT
     (REJECT_TAKER_ENTRY wall guards the entry side).
+
+    time_in_force / reduce_only (WO-ROT-1 Chunk 5): the hard stop is an
+    immediate_or_cancel, reduce_only order — reduce_only caps the fill at the
+    held size so the stop can never flip the position. The venue accepts
+    reduce_only only with immediate_or_cancel; refused here before the wire.
     """
+    if time_in_force not in ("good_till_canceled", "immediate_or_cancel"):
+        raise ValueError(f"time_in_force {time_in_force!r}")
+    if reduce_only and time_in_force != "immediate_or_cancel":
+        raise ValueError("reduce_only requires immediate_or_cancel")
     from decimal import Decimal
     if v2_price_str is not None:
         if side == "yes":
@@ -858,10 +886,12 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
         "side": v2_side,
         "count": validated_count_str(count),
         "price": v2_price,
-        "time_in_force": "good_till_canceled",
+        "time_in_force": time_in_force,
         "post_only": bool(post_only),
         "self_trade_prevention_type": "taker_at_cross",
     }
+    if reduce_only:
+        body["reduce_only"] = True
     if expiration_ts is not None and expiration_ts > int(time.time()):
         body["expiration_time"] = int(expiration_ts)
 

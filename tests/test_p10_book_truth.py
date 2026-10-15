@@ -135,6 +135,7 @@ def test_crossed_book_poisons_pages_once_and_resyncs(engine):
     assert len([m for m in engine.telegram_sent if "BOOK_INCOHERENT" in m]) == 1
 
 
+@pytest.mark.legacy_desk  # WO-ROT-1: old lanes evaluating unheld markets
 def test_lanes_skip_poisoned_book_never_fatal(engine):
     poison_book(engine.feed)
     engine.market_meta[TICKER] = {"close_ts": 1000.0 + 120,
@@ -181,6 +182,7 @@ def test_custodian_marks_flip_to_rest_on_poison(engine, monkeypatch):
     assert seen[TICKER].best_yes_bid() == 40     # not the poisoned 97
 
 
+@pytest.mark.legacy_desk  # WO-ROT-1: old lanes evaluating unheld markets
 def test_three_episodes_quarantine_one_page(engine):
     close_ts = 99999.0
     engine.market_meta[TICKER] = {"close_ts": close_ts,
@@ -318,6 +320,7 @@ def test_pack_episode_section(engine):
 
 
 # ── §6 [A4]: the end-to-end replay through the DEPLOYED wiring ─────────────
+@pytest.mark.legacy_desk  # WO-ROT-1: old lanes evaluating unheld markets
 def test_0125_replay_end_to_end_zero_lying_proposals(engine):
     """Feed.handle_frame → touch_view → FH8Shared.decide → gateway.submit —
     the full deployed pipeline. Both 01:25 corruption shapes (the side-less
