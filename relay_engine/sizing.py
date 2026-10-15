@@ -12,6 +12,8 @@ number either way.
 """
 
 import math
+from decimal import ROUND_FLOOR, Decimal
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from . import config
@@ -129,3 +131,26 @@ def size_order(book_cents: int, price_cents: int,
         f"min(kelly={kelly_max}, depth={depth_max}, "
         f"risk_cap={config.NET_RISK_CROSS_LANE_CAP})",
     )
+
+
+def rot_size_contracts(budget_cents: int, cost_cents: int,
+                       lot_step: Decimal = config.ROT_LOT_STEP
+                       ) -> Tuple[Optional[Decimal], str]:
+    """WO-ROT-1 Chunk 0 — THE COUNT RULE. Size = budget / cost, rounded DOWN to
+    the lot step. Under one lot is a skip with its reason, never bumped to one.
+
+    Returns (count, "") or (None, "SKIP_BELOW_ONE_LOT"). Bad inputs (a cost
+    that is not a positive int, a negative budget, a non-positive step) raise —
+    no silent fallback in a sizing path."""
+    if isinstance(cost_cents, bool) or not isinstance(cost_cents, int) or cost_cents <= 0:
+        raise ValueError(f"cost_cents must be a positive int, got {cost_cents!r}")
+    if isinstance(budget_cents, bool) or not isinstance(budget_cents, int) or budget_cents < 0:
+        raise ValueError(f"budget_cents must be a non-negative int, got {budget_cents!r}")
+    step = Decimal(lot_step)
+    if not step.is_finite() or step <= 0:
+        raise ValueError(f"lot_step must be positive, got {lot_step!r}")
+    lots = (Decimal(budget_cents) / Decimal(cost_cents) / step).to_integral_value(
+        rounding=ROUND_FLOOR)
+    if lots < 1:
+        return None, "SKIP_BELOW_ONE_LOT"
+    return (lots * step).quantize(step), ""

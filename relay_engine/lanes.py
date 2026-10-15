@@ -445,13 +445,35 @@ def build_registry(ledger=None, gateway=None, custodian=None) -> List[Lane]:
                     stats=(ledger_stats(ledger) if ledger is not None else None))
     laned = LaneD(gateway=gateway, custodian=custodian, ledger=ledger)
     lanep = LaneP(gateway=gateway, custodian=custodian)
-    return [
+    lanes = [
         LaneF(shared),
         LaneH8(shared),
         FlipLaneWrapper(flip),
         DLaneWrapper(laned),
         PLaneWrapper(lanep),
     ]
+    # WO-ROT-1 Chunk 0: DESK_MODE=ROTATION turns the pre-desk lanes OFF by
+    # config. Same slots, same objects (the runner reaches .shared/.flip/.d/.p
+    # through the wrapper), but evaluate() proposes nothing.
+    return [OffLane(lane) if config.lane_off(lane.name) else lane for lane in lanes]
+
+
+class OffLane(Lane):
+    """A pre-desk lane turned OFF by DESK_MODE (WO-ROT-1 Chunk 0). Keeps its
+    registry slot and its inner object (attribute reads pass through), and
+    answers every market with a first-class terminal Pass — never a proposal."""
+
+    PASS_REASON = "LANE_OFF_DESK_ROTATION"
+
+    def __init__(self, inner: Lane):
+        self.inner = inner
+        self.name = inner.name
+
+    def __getattr__(self, attr):
+        return getattr(self.__dict__["inner"], attr)
+
+    def evaluate(self, market: str, ctx: dict) -> Decision:
+        return Decision(self.name, market, None, pass_reason=self.PASS_REASON)
 
 
 LANE_D_BAND = (config.LANE_D_FLOOR_CENTS, 99)  # floor per DREW-DEFAULT, pending Chunk 2

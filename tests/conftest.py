@@ -18,6 +18,22 @@ def _no_table_autobuild(monkeypatch):
     monkeypatch.setattr(config, "TABLE_AUTOBUILD", False)
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "legacy_desk: run under DESK_MODE=LEGACY (pre-desk lanes ON)")
+
+
+@pytest.fixture(autouse=True)
+def _desk_mode(request, monkeypatch):
+    """WO-ROT-1 Chunk 0 — the suite runs under the branch default
+    (DESK_MODE=ROTATION: pre-desk lanes OFF). Modules that prove the pre-desk
+    lanes end to end through the runner carry `legacy_desk` and run with those
+    lanes ON — the same config lever Drew would pull to turn them back on."""
+    from relay_engine import config
+    if request.node.get_closest_marker("legacy_desk"):
+        monkeypatch.setattr(config, "DESK_MODE", "LEGACY")
+
+
 @pytest.fixture(autouse=True)
 def _roster_isolation():
     """WO-2026-07-27-W P3 — the roster lives on MODULE globals that boot and

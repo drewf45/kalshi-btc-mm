@@ -17,6 +17,10 @@ import pytest
 from relay_engine import auth, config, failures
 from relay_engine.shadow_runner import ShadowEngine
 
+# WO-ROT-1 Chunk 0: drives the pre-desk lanes end to end — runs under the
+# legacy desk (DESK_MODE=LEGACY), where those lanes are ON.
+pytestmark = pytest.mark.legacy_desk
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 FOREIGN_TICKER = "KXBTC15M-02JAN251015-T99"
 

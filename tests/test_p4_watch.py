@@ -11,6 +11,10 @@ from relay_engine.errors import FatalIntegrityError
 from relay_engine.feed import DegradeLadder, Feed
 from relay_engine.shadow_runner import CYCLE_SECONDS, ShadowEngine, subscribe_cmd
 
+# WO-ROT-1 Chunk 0: drives the pre-desk lanes end to end — runs under the
+# legacy desk (DESK_MODE=LEGACY), where those lanes are ON.
+pytestmark = pytest.mark.legacy_desk
+
 TICKER = "KXBTC15M-02JAN251000-T99"
 
 

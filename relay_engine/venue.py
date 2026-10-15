@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlencode, urlparse
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 import requests
 from cryptography.hazmat.primitives import hashes
@@ -730,7 +731,7 @@ def amend_order(client: KalshiClient, order_id: str, ticker: str, side: str,
         "ticker": ticker,
         "side": v2_side,
         "price": v2_price,
-        "count": str(max(1, int(count))),
+        "count": validated_count_str(count),
         "updated_client_order_id": str(uuid.uuid4()),
     }
     if client_order_id:
@@ -761,6 +762,43 @@ def amend_order(client: KalshiClient, order_id: str, ticker: str, side: str,
         new_oid = resp.get("order_id") or order_id
         return str(new_oid), resp
     return None, {}
+
+
+# WO-ROT-1 Chunk 0 — THE COUNT LAW. V2 create/amend take a fixed-point count
+# string, 0-2 decimals, 0.01 the smallest unit (docs: create-order-v2,
+# fixed_point_contracts). The old count line (max of 1 and the int of count)
+# truncated 2.9 to 2 and bumped 0 / 0.4 to 1 — a silent fallback on the one
+# number that is the position. Now a count is validated, never altered: on the
+# grid and at least one lot, or refused with its why. Fractional per-series
+# acceptance is UNPROVEN until seen on demo (WO-ROT-1 lens table).
+VENUE_COUNT_STEP = Decimal("0.01")
+
+
+def validated_count_str(count) -> str:
+    """The V2 `count` string for a validated contract count, or CountRejected.
+
+    Accepts int, Decimal, or a numeric str. float is refused (binary floats
+    are not on a decimal grid — size in Decimal). Integral counts keep their
+    integer form ("2"), fractional ones carry two decimals ("0.72")."""
+    from .errors import CountRejected
+    if isinstance(count, (bool, float)) or count is None:
+        raise CountRejected("COUNT_INVALID", f"count {count!r} ({type(count).__name__})")
+    try:
+        d = count if isinstance(count, Decimal) else Decimal(str(count))
+    except (InvalidOperation, ValueError):
+        raise CountRejected("COUNT_INVALID", f"count {count!r} is not a number")
+    if not d.is_finite():
+        raise CountRejected("COUNT_INVALID", f"count {count!r} is not finite")
+    if d < VENUE_COUNT_STEP:
+        raise CountRejected("SKIP_BELOW_ONE_LOT",
+                            f"count {count!r} under one lot ({VENUE_COUNT_STEP})")
+    if d % VENUE_COUNT_STEP != 0:
+        raise CountRejected("COUNT_INVALID",
+                            f"count {count!r} off the {VENUE_COUNT_STEP} grid "
+                            "(size rounds down before the venue, never here)")
+    if d == d.to_integral_value():
+        return str(int(d))
+    return f"{d.quantize(VENUE_COUNT_STEP)}"
 
 
 def place_order_maker(client: KalshiClient, ticker: str, side: str,
@@ -801,7 +839,7 @@ def place_order_maker(client: KalshiClient, ticker: str, side: str,
         "ticker": ticker,
         "client_order_id": str(uuid.uuid4()),
         "side": v2_side,
-        "count": str(max(1, int(count))),
+        "count": validated_count_str(count),
         "price": v2_price,
         "time_in_force": "good_till_canceled",
         "post_only": bool(post_only),

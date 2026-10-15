@@ -7,6 +7,11 @@ from zoneinfo import ZoneInfo
 
 from relay_engine.lanes import infer_close_ts_from_ticker
 from relay_engine.shadow_runner import ShadowEngine
+import pytest
+
+# WO-ROT-1 Chunk 0: drives the pre-desk lanes end to end — runs under the
+# legacy desk (DESK_MODE=LEGACY), where those lanes are ON.
+pytestmark = pytest.mark.legacy_desk
 
 NY = ZoneInfo("America/New_York")
 TICKER = "KXBTC15M-02JAN251000-T99"

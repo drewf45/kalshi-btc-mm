@@ -5,6 +5,7 @@ tape every boot until Drew rules them. Do not scatter magic numbers elsewhere.
 """
 
 import os
+from decimal import Decimal
 
 # ---------------------------------------------------------------------------
 # Run mode. SHADOW is the born state of this tree (§A1/§B3). The live-submit
@@ -1142,3 +1143,97 @@ def lane_halt_bound_c(lane: str, tradeable_cents: int) -> int:
     if lane in TAIL_HALT_LANES:
         return f_halt_bound_c(tradeable_cents)
     return rate_halt_drawdown_c(tradeable_cents)
+
+
+# ===========================================================================
+# WO-ROT-1 Chunk 0 — THE ROTATION DESK SWITCH.
+# DESK_MODE=ROTATION (this branch's default): every pre-desk lane (F, H8, FLIP
+# and its OPEN/HUNT/PAIR sub-lanes, D, P) reports OFF on the boot tape and
+# proposes nothing — the registry wraps it in an OffLane that passes with
+# LANE_OFF_DESK_ROTATION. No lane code is deleted; DESK_MODE=LEGACY restores the
+# build-77 registry byte-identical, and DESK_LEGACY_LANES_ON=F,H8 (csv) turns a
+# named old lane back on inside ROTATION (Drew's ruling, not a default).
+# OFF gates PROPOSALS only: custody, boot quarantine and shutdown flatten still
+# act on any position the venue reports, under the lane that owns it.
+# ===========================================================================
+DESK_MODES = ("ROTATION", "LEGACY")
+DESK_MODE = os.environ.get("DESK_MODE", "ROTATION").strip().upper()
+if DESK_MODE not in DESK_MODES:
+    raise ValueError(f"DESK_MODE={DESK_MODE!r} — must be one of {DESK_MODES} "
+                     "(no silent fallback to a default desk)")
+LEGACY_LANES = ("F", "H8", "FLIP", "OPEN", "HUNT", "PAIR", "D", "P")
+DESK_LEGACY_LANES_ON = frozenset(
+    s.strip().upper() for s in os.environ.get("DESK_LEGACY_LANES_ON", "").split(",")
+    if s.strip())
+_unknown_on = DESK_LEGACY_LANES_ON - set(LEGACY_LANES)
+if _unknown_on:
+    raise ValueError(f"DESK_LEGACY_LANES_ON names unknown lanes {sorted(_unknown_on)}"
+                     f" — known: {LEGACY_LANES}")
+
+
+def lane_off(lane: str) -> bool:
+    """True when DESK_MODE turns this pre-desk lane OFF (proposes nothing).
+    ROT is never OFF here; LEGACY turns nothing off."""
+    if DESK_MODE != "ROTATION" or lane == "ROT":
+        return False
+    return lane not in DESK_LEGACY_LANES_ON
+
+
+# ---------------------------------------------------------------------------
+# WO-ROT-1 Chunk 0 — ROT_* KNOBS. Values from the Record's knob table as carried
+# by WO-ROT-1 (Chunk 0 §3, Chunk 3, 3A, 5, 6, 8). Every one is printed on the
+# boot tape (rot_knob_boot_lines). Tags: RULED(date) where Drew ruled it, else
+# DREW-DEFAULT until ruled. Percents are fractions of the book (venue cash
+# minus owed scrape); cents are YES-terms cost cents.
+# ---------------------------------------------------------------------------
+ROT_POSITION_PCT = 0.05          # RULED 2026-10-14: one position = 5% of book
+ROT_DEPLOY_CAP_PCT = 0.50        # DREW-DEFAULT: open positions + resting entries ≤ 50%
+ROT_MARKET_CAP_PCT = 0.05        # DREW-DEFAULT: one market ≤ 5%
+ROT_GROUP_CAP_PCT = 0.25         # DREW-DEFAULT: one underlying group ≤ 25%
+ROT_ENTRY_BAND = (40, 54)        # DREW-DEFAULT: entry cost band, cents inclusive
+ROT_TARGET_CENTS = 8             # DREW-DEFAULT: cash-out rests at entry + 8 (measured W)
+ROT_STOP_CENTS = 10              # DREW-DEFAULT: soft stop at bid ≤ entry − 10
+ROT_HARD_STOP_CENTS = 20         # DREW-DEFAULT: hard stop at bid ≤ entry − 20 (CUT)
+ROT_GRACE_S = 60                 # DREW-DEFAULT: no stop action for 60 s after fill
+ROT_CONFIRM_READS = 2            # DREW-DEFAULT: soft stop needs 2 reads ...
+ROT_CONFIRM_SPACING_S = 10       # DREW-DEFAULT: ... 10 s apart
+ROT_TIME_STOP_S = 360            # DREW-DEFAULT: scratch after 360 s with no target fill ...
+ROT_TIME_STOP_NEAR_CENTS = 2     # DREW-DEFAULT: ... and price within 2c of entry
+ROT_ENTRY_REST_S = 60            # DREW-DEFAULT: an unfilled entry rests ≤ 60 s, then cancel
+ROT_MIN_TIME_LEFT_15M_S = 300    # DREW-DEFAULT: ≥ 5 min left to enter a 15-minute market
+ROT_MIN_TIME_LEFT_1H_S = 900     # DREW-DEFAULT: ≥ 15 min left to enter an hourly market
+ROT_MIN_DEPTH_MULT = 2           # DREW-DEFAULT: exit-side depth ≥ 2x position
+ROT_LATE_WINDOW_15M_S = 120      # DREW-DEFAULT: late window, 15-minute markets
+ROT_LATE_WINDOW_1H_S = 300       # DREW-DEFAULT: late window, hourly markets
+ROT_SPOT_CONFIRM_BTC_PTS = 40    # DREW-DEFAULT: BTC soft-stop spot confirm (15 pts caused every catastrophic FLIP loss)
+ROT_GUARD_TRIPS = 50             # DREW-DEFAULT: break-even guard / ranking window, trips per band
+ROT_QUEUE_SIZE = 20              # DREW-DEFAULT: ranked candidate queue depth
+ROT_LOT_STEP = Decimal("0.01")   # DREW-DEFAULT: size rounds DOWN to this step (V2 fixed-point min; per-series UNPROVEN)
+
+ROT_KNOB_TAGS = {
+    "ROT_POSITION_PCT": "RULED(2026-10-14)",
+}
+
+
+def rot_knobs() -> dict:
+    """Every ROT_* knob, name -> value, in declaration order."""
+    return {k: v for k, v in globals().items()
+            if k.startswith("ROT_") and k != "ROT_KNOB_TAGS"
+            and not callable(v)}
+
+
+def rot_knob_boot_lines() -> list:
+    """Boot tape: DESK_MODE, each lane's desk state, and every ROT knob."""
+    off = [ln for ln in LEGACY_LANES if lane_off(ln)]
+    on = [ln for ln in LEGACY_LANES if not lane_off(ln)]
+    lines = [f"DESK_MODE={DESK_MODE} (WO-ROT-1)"
+             + ("  [desk: ROT lane; pre-desk lanes OFF by config, code kept]"
+                if DESK_MODE == "ROTATION" else "  [legacy build-77 registry]")]
+    lines.append("  LANES OFF: " + (",".join(off) or "none")
+                 + " · LANES ON: " + (",".join(on) or "none")
+                 + (" · ROT: not yet built (WO-ROT-1 Chunk 3) — this desk proposes nothing"
+                    if DESK_MODE == "ROTATION" else ""))
+    lines.append("ROT KNOBS (WO-ROT-1 — every one printed):")
+    for k, v in rot_knobs().items():
+        lines.append(f"  {k} = {v} [{ROT_KNOB_TAGS.get(k, 'DREW-DEFAULT')}]")
+    return lines

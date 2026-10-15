@@ -2,10 +2,16 @@
 evaluates every market every cycle, Pass rows are census-clean, zero orders
 placed, daily pack renders per-lane sections."""
 
+import pytest
+
 from relay_engine import config
 from relay_engine.lanes import build_registry
 from relay_engine.ops import daily_pack
 from relay_engine.shadow_runner import ShadowEngine
+
+# WO-ROT-1 Chunk 0: drives the pre-desk lanes end to end — runs under the
+# legacy desk (DESK_MODE=LEGACY), where those lanes are ON.
+pytestmark = pytest.mark.legacy_desk
 
 
 def test_all_five_lanes_registered_in_arbitration_order():
