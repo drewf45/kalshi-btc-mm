@@ -183,9 +183,12 @@ def test_governor_wraps_the_request_core_and_boot_tape_prints_it():
     from relay_engine import venue
     from relay_engine.boot import boot_tape
     src = inspect.getsource(venue.KalshiClient.request)
-    assert "REST_GOVERNOR.pace()" in src   # every attempt takes a token
+    # WO-ROT-1 Chunk 2: the bucket split into READ/WRITE; every attempt still
+    # takes a token from the governor for its method
+    assert "governor_for(method).pace()" in src
     tape = "\n".join(boot_tape())
-    assert f"REST GOVERNOR: bucket={config.REST_BUCKET_CAPACITY}" in tape
+    assert f"READ bucket={config.REST_READ_BUCKET_CAPACITY}" in tape
+    assert f"WRITE bucket={config.REST_WRITE_BUCKET_CAPACITY}" in tape
     assert "TRANSPORT: REST 1s" in tape
     assert "A3 PROVEN GROUND" in tape      # the ruling, printed every boot
 
@@ -218,6 +221,7 @@ def test_pack_names_the_transport_and_the_fill_lag(engine):
 
 
 # ── the drop-in, end to end: poll → cycle → verdicts (runner unrewired) ────
+@pytest.mark.legacy_desk  # WO-ROT-1: ROTATION polls only held/shortlisted books
 def test_rest_poll_all_drives_the_cycle(engine, monkeypatch):
     from relay_engine import venue
     monkeypatch.setattr(venue, "fetch_orderbook_raw", lambda c, m: dict(RAW_BOOK))

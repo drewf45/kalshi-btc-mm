@@ -85,9 +85,11 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
         lines.append("TRANSPORT: REST 1s (A3 proven ground) · books 1/s · "
                      "spot 1.5s · fills 3s · discovery 60s")
     lines.append(
-        f"REST GOVERNOR: bucket={config.REST_BUCKET_CAPACITY} tokens, "
-        f"refill={config.REST_REFILL_PER_SECOND}/s around ALL REST calls "
-        f"(printed number IS the enforced number)")
+        f"REST GOVERNOR (WO-ROT-1 Chunk 2): READ bucket={config.REST_READ_BUCKET_CAPACITY} "
+        f"refill={config.REST_READ_REFILL_PER_SECOND}/s (≤{config.KALSHI_READS_PER_S_LIMIT}"
+        f"/s in any 1 s) · WRITE bucket={config.REST_WRITE_BUCKET_CAPACITY} "
+        f"refill={config.REST_WRITE_REFILL_PER_SECOND}/s (≤{config.KALSHI_WRITES_PER_S_LIMIT}"
+        f"/s) — every REST attempt takes a token (printed number IS the enforced number)")
     lines.append("DREW-DEFAULT constants in force:")
     for k, v in config.drew_defaults().items():
         lines.append(f"  DREW-DEFAULT {k} = {v}")

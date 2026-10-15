@@ -167,6 +167,11 @@ class ShadowEngine:
         self.cycles_completed = 0
         self.last_cycle_error = ""
         self._last_hourly_ts = self.started_ts
+        # WO-ROT-1 Chunk 2: the discovered roster and the full-book shortlist
+        self.roster = None
+        self.book_shortlist: set = set()
+        self._last_discovery_ts = 0.0
+        self._installed: list = []
         self.surface = Surface(self.ledger)
         self.cash = CashProtocol(self.ledger)
         self.telegram = Telegram(self.cash)
@@ -1782,11 +1787,55 @@ class ShadowEngine:
             return "REST"
         return "WS" if self.ladder.entries_allowed() else "EXPLORATION"
 
+    def rediscover(self, client, now=None):
+        """WO-ROT-1 Chunk 2: one discovery pass -> install -> roster post.
+        Returns the Roster, or None when the scan failed (paged, roster kept)."""
+        from . import failures, series_discovery
+        now = time.time() if now is None else now
+        self._last_discovery_ts = now
+        try:
+            roster = series_discovery.discover(client, now=now)
+        except Exception as e:
+            import os
+            if self.roster is None and not os.getenv("SERIES_LIST"):
+                # never fall back to the old hardcoded roster: no discovery,
+                # no series (the desk sits still and says so)
+                config.SERIES[:] = []
+                config.ROSTER_SOURCE = "none (discovery failed)"
+            failures.fail("DISCOVERY_FAILED",
+                          f"series discovery failed ({e}) — roster now "
+                          f"{len(config.SERIES)} series ({config.ROSTER_SOURCE}); "
+                          f"retry in {config.ROT_DISCOVERY_S}s", alert=True)
+            return None
+        installed = series_discovery.install(roster)
+        changed = (self.roster is None
+                   or set(installed) != set(getattr(self, "_installed", [])))
+        self.roster = roster
+        self._installed = installed
+        lines = series_discovery.roster_lines(roster, installed)
+        for ln in lines:
+            print(ln, flush=True)
+        if changed:
+            self.telegram.alert("\n".join(lines))
+        return roster
+
+    def book_poll_set(self) -> list:
+        """The markets whose FULL orderbook is read this cycle. LEGACY: every
+        discovered market (P11). ROTATION (WO-ROT-1 C2/3A): only held markets,
+        markets with a resting order, and the outside loop's shortlist — the
+        rest are priced from the /markets listing, inside the read budget."""
+        if config.DESK_MODE != "ROTATION":
+            return sorted(self.market_meta)
+        want = {mk for (_e, mk, _l), net in self.gateway.positions.items() if net}
+        want |= {o.market for o in self.gateway.resting.values()}
+        want |= set(self.book_shortlist)
+        return sorted(m for m in want if m in self.market_meta)
+
     def rest_poll_all(self, client, now=None) -> int:
-        """P11: one pass of the 1s book poll over every discovered market."""
+        """P11: one pass of the 1s book poll (WO-ROT-1: over book_poll_set)."""
         now = time.time() if now is None else now
         ok = 0
-        for m in sorted(self.market_meta):
+        for m in self.book_poll_set():
             if self.feed.poll_market(client, m, now=now):
                 ok += 1
         return ok
@@ -2422,6 +2471,9 @@ async def _rest_main(engine, client, stop) -> None:
     while not stop.is_set():
         t0 = time.monotonic()
         try:
+            if (config.DESK_MODE == "ROTATION"
+                    and time.time() - engine._last_discovery_ts >= config.ROT_DISCOVERY_S):
+                await asyncio.to_thread(engine.rediscover, client)
             if t0 - last_discovery >= DISCOVERY_SWEEP_S:
                 last_discovery = t0
                 mkts = await asyncio.to_thread(venue.list_open_markets, client)
@@ -2494,6 +2546,12 @@ async def run():
         venue.probe_orders_route(client)
     except Exception as e:
         log.warning("orders-route probe failed (listing degraded): %s", e)
+
+    if config.DESK_MODE == "ROTATION":
+        # WO-ROT-1 Chunk 2: the roster is DISCOVERED (SERIES_LIST still
+        # overrides). Fatal-free: a failed scan boots with an empty roster and
+        # says so — the hourly rediscovery retries.
+        engine.rediscover(client)
 
     if config.live_submit_enabled():
         # F6: LIVE boot reconcile — money truth before the first cycle

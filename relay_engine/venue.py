@@ -57,29 +57,46 @@ class _RestGovernor:
     sweeps, and custody reads share the bucket across to_thread workers.
     The boot tape prints these numbers; these numbers are what is enforced."""
 
-    def __init__(self, capacity: float, refill_per_s: float):
+    def __init__(self, capacity: float, refill_per_s: float, name: str = "",
+                 clock=time.monotonic, sleep=time.sleep):
+        self.name = name
         self.capacity = float(capacity)
         self.refill = float(refill_per_s)
         self.tokens = float(capacity)
-        self.ts = time.monotonic()
+        self._clock = clock
+        self._sleep = sleep
+        self.ts = clock()
+        self.taken = 0          # requests admitted (telemetry)
         self._lock = threading.Lock()
 
     def pace(self) -> None:
         while True:
             with self._lock:
-                now = time.monotonic()
+                now = self._clock()
                 self.tokens = min(self.capacity,
                                   self.tokens + (now - self.ts) * self.refill)
                 self.ts = now
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
+                # epsilon: refill arithmetic can land at 0.9999999 after an
+                # exact sleep — without it the loop asks for a sleep too small
+                # to move a float clock and spins forever.
+                if self.tokens >= 1.0 - 1e-9:
+                    self.tokens = max(0.0, self.tokens - 1.0)
+                    self.taken += 1
                     return
                 wait = (1.0 - self.tokens) / self.refill
-            time.sleep(wait)
+            self._sleep(wait)
 
 
-REST_GOVERNOR = _RestGovernor(config.REST_BUCKET_CAPACITY,
-                              config.REST_REFILL_PER_SECOND)
+# WO-ROT-1 Chunk 2: READ and WRITE buckets, sized under Kalshi Basic (config).
+REST_READ_GOVERNOR = _RestGovernor(config.REST_READ_BUCKET_CAPACITY,
+                                   config.REST_READ_REFILL_PER_SECOND, name="read")
+REST_WRITE_GOVERNOR = _RestGovernor(config.REST_WRITE_BUCKET_CAPACITY,
+                                    config.REST_WRITE_REFILL_PER_SECOND, name="write")
+
+
+def governor_for(method: str) -> _RestGovernor:
+    """GET reads the read bucket; every order-changing verb the write bucket."""
+    return REST_READ_GOVERNOR if method.upper() == "GET" else REST_WRITE_GOVERNOR
 
 
 class KalshiClient:
@@ -121,7 +138,7 @@ class KalshiClient:
         max_retries = 3
         base_delay = 0.5
         for attempt in range(max_retries + 1):
-            REST_GOVERNOR.pace()  # P11.1-b: every attempt takes a token
+            governor_for(method).pace()  # P11.1-b / WO-ROT-1 C2: every attempt takes a token
             headers = self._sign_headers(method, url)
             headers["Accept"] = "application/json"
             if json_body is not None:

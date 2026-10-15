@@ -46,8 +46,9 @@ RULINGS = (
 # is import-inert under this flag.
 # ---------------------------------------------------------------------------
 WS_ENABLED = os.environ.get("WS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
-REST_BUCKET_CAPACITY = 10        # P11.1-b: token bucket around ALL REST calls
-REST_REFILL_PER_SECOND = 8.0     # books 4/s + spot 0.7/s + fills 0.3/s + headroom
+# WO-ROT-1 Chunk 2: the one REST bucket (10 tokens, 8/s) is split into a READ
+# and a WRITE bucket sized under Kalshi Basic — see REST_READ_* / REST_WRITE_*
+# at the foot of this module.
 REST_BOOK_STALE_CUSTODY_S = 30.0  # P11.1-d: custody's grace on a failed-fetch book
 FILLS_SWEEP_S = 3.0              # the proven live fills cadence (accepted 3s lag)
 
@@ -1253,3 +1254,30 @@ HEARTBEAT_PATH = os.path.expanduser(os.environ.get(
 HEARTBEAT_STALE_S = 10                    # DREW-DEFAULT: a heartbeat older than 10 s is stale
 HEARTBEAT_HOURLY_S = 3600                 # hourly Telegram alive line
 HEARTBEAT_PING_URL = os.environ.get("HEARTBEAT_PING_URL", "").strip()  # RULED 2026-10-14: unset and OFF
+
+
+# ---------------------------------------------------------------------------
+# WO-ROT-1 Chunk 2 — SERIES DISCOVERY AND THE REQUEST BUDGET.
+# Kalshi Basic tier: 200 read / 100 write tokens per second, most requests 10
+# tokens -> 20 reads/s, 10 writes/s (docs.kalshi.com getting_started/rate_limits,
+# per WO-ROT-1 lens table). A token bucket admits capacity + refill x T requests
+# in any window T, so "never more than 20 in any 1 s" needs capacity + refill
+# <= 20: refill 19/s with a 1-token bucket (writes: 9/s + 1).
+# ---------------------------------------------------------------------------
+REST_READ_REFILL_PER_SECOND = 19.0   # DERIVED(Kalshi Basic 200 read tok/s / 10 per req, minus the bucket)
+REST_READ_BUCKET_CAPACITY = 1        # DERIVED(capacity + refill <= 20 in any 1 s window)
+REST_WRITE_REFILL_PER_SECOND = 9.0   # DERIVED(Kalshi Basic 100 write tok/s / 10 per req, minus the bucket)
+REST_WRITE_BUCKET_CAPACITY = 1       # DERIVED(capacity + refill <= 10 in any 1 s window)
+KALSHI_READS_PER_S_LIMIT = 20        # the ceiling the soak test holds the read bucket under
+KALSHI_WRITES_PER_S_LIMIT = 10
+
+ROT_DISCOVERY_S = 3600               # DREW-DEFAULT: discovery at boot and hourly
+ROT_DISCOVERY_PAGE_LIMIT = 1000      # /markets page size (Kalshi max per page; UNPROVEN beyond 1000)
+ROT_DISCOVERY_MAX_PAGES = 100        # a scan that hits this logs and pages SCAN_TRUNCATED (never silent)
+ROT_CADENCES = {"15M": 900, "1H": 3600}   # the desk trades these two cadences only
+ROT_CADENCE_TOLERANCE_S = 120        # inferred duration/spacing within ±120 s of the cadence
+# Listed, not trading, no settle source on file (WO-ROT-1 Chunk 6 §4).
+ROT_EXCLUDED_SERIES = frozenset({"KXINX15M", "KXNDQ15M"})
+# series -> series_discovery.SeriesInfo for the installed roster (cadence,
+# underlying group, settle sources, tick, fee terms). Empty until discovery.
+SERIES_INFO: dict = {}
