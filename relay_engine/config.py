@@ -1095,6 +1095,10 @@ LANE_MODE = {
     # kill (RUN_MODE=LIVE + the I_UNDERSTAND_LIVE phrase) still rules; under the
     # SHADOW born state ROT places nothing.
     "ROT": os.environ.get("LANE_MODE_ROT", "LIVE").upper(),
+    # WO-END-1: Lane B (end-game pile-on). Same live door as ROT — the global
+    # kill rules; LIVE here only lets END place once config.END_ENABLED is on.
+    # (END_ENABLED=False keeps the lane a hard no-op regardless of this mode.)
+    "END": os.environ.get("LANE_MODE_END", "LIVE").upper(),
 }
 LANE_MODE_DEFAULT = "SHADOW"   # any unlisted lane rehearses — conservative
 
@@ -1234,6 +1238,57 @@ ROT_REGIME_QUIET_BPS = float(os.environ.get("ROT_REGIME_QUIET_BPS", "4"))      #
 ROT_KNOB_TAGS = {
     "ROT_POSITION_PCT": "RULED(2026-10-14)",
 }
+
+
+# ── WO-END-1 — LANE B, the end-game pile-on (OFF by default) ──────
+# The desk's SECOND phase. In the final seconds of a 15-minute crypto binary,
+# pile onto the DECIDED favorite (95-97c) for the last pennies. THE EDGE is a
+# live running-60-second-average gap filter: settlement is the equal-weight
+# average of 60 one-second index prints, so the favorite only flips if the
+# remaining M = 60 - N samples average a move large enough to drag that running
+# average across the strike. Measure the gap against the RUNNING AVERAGE, NEVER
+# spot/quote (the #1 trap: every catastrophic flip looked spot-safe while the
+# average sat near the line). See relay_engine/lane_end.py.
+#
+# OFF BY DEFAULT. END_ENABLED defaults False. When False the lane is a hard
+# no-op — EndGameDesk.step() returns before touching any state, so the running
+# desk is BYTE-IDENTICAL to a build with no Lane B at all (proven in tests).
+# Like ROT, END only PLACES when live_submit_enabled() AND its own lane mode is
+# LIVE; SHADOW rehearses end to end and places nothing.
+END_ENABLED = os.environ.get("END_ENABLED", "").strip().lower() in ("1", "true", "yes")   # DREW-DEFAULT: OFF until proven
+END_SERIES = frozenset(                   # DREW-DEFAULT: the three 15M crypto rooms
+    s.strip().upper() for s in
+    os.environ.get("END_SERIES", "KXBTC15M,KXETH15M,KXXRP15M").split(",") if s.strip())
+END_WINDOW_S = float(os.environ.get("END_WINDOW_S", "90"))          # DREW-DEFAULT: enter only in the final 90 s
+END_PRICE_FLOOR = int(os.environ.get("END_PRICE_FLOOR", "95"))      # DREW-DEFAULT: favorite price floor, cents
+END_PRICE_CAP = int(os.environ.get("END_PRICE_CAP", "97"))          # DREW-DEFAULT: HARD cap — 98c+ is a fee/break-even trap
+END_MAX_PFLIP = float(os.environ.get("END_MAX_PFLIP", "0.02"))      # DREW-DEFAULT: enter only when flip prob < this
+END_STOP_PFLIP = float(os.environ.get("END_STOP_PFLIP", "0.05"))    # DREW-DEFAULT: mechanics stop — exit if flip prob rises above this
+END_SIGMA_ANNUAL = float(os.environ.get("END_SIGMA_ANNUAL", "0.45"))  # DREW-DEFAULT: annualized index vol dial
+END_KELLY_DIV = float(os.environ.get("END_KELLY_DIV", "20"))        # DREW-DEFAULT: flat 1/20-Kelly (never laddered)
+END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # DREW-DEFAULT: HARD cap 1% of bankroll
+END_JUMP_MULT = float(os.environ.get("END_JUMP_MULT", "2.5"))       # DREW-DEFAULT: jump-padding multiplier on p_flip
+
+END_KNOB_TAGS: dict = {}
+
+
+def end_knobs() -> dict:
+    """Every END_* knob in the module, name -> value, in declaration order.
+    Iterates a snapshot (list(...)) of the module dict — never the live dict."""
+    items = list(globals().items())
+    return {k: v for k, v in items
+            if k.startswith("END_") and k not in ("END_KNOB_TAGS",)
+            and not callable(v)}
+
+
+def end_knob_boot_lines() -> list:
+    """Boot tape: Lane B's on/off state and every END knob (printed until ruled,
+    like the ROT knobs). When END_ENABLED is False the line says NO-OP."""
+    state = ("ENABLED" if END_ENABLED else "OFF (no-op — byte-identical to no Lane B)")
+    lines = [f"END (Lane B) KNOBS (WO-END-1) — {state}:"]
+    for k, v in end_knobs().items():
+        lines.append(f"  {k} = {v} [{END_KNOB_TAGS.get(k, 'DREW-DEFAULT')}]")
+    return lines
 
 
 def rot_knobs() -> dict:

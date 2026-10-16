@@ -71,6 +71,8 @@ def boot_tape(recorder=None, boot_caps=None, auth_line=None) -> List[str]:
     ]
     # WO-ROT-1 Chunk 0: the desk switch and every ROT knob, printed every boot.
     lines.extend(config.rot_knob_boot_lines())
+    # WO-END-1: Lane B (end-game pile-on) state + knobs, printed every boot.
+    lines.extend(config.end_knob_boot_lines())
     lines.append("RATIFICATIONS ASSUMED (unruled — printed every boot until Drew rules):")
     for r in config.RATIFICATIONS_ASSUMED:
         lines.append(f"  ASSUMED: {r}")

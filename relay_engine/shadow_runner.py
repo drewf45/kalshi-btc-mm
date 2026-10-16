@@ -204,6 +204,20 @@ class ShadowEngine:
                                 deploy_cap_fn=self._rot_deploy_cap,
                                 on_runaway=self._rot_runaway)
         self._band_stats_cache = {}
+        # WO-END-1: Lane B (end-game pile-on). Shares the SAME gateway, ledger
+        # and pager as ROT — no parallel account path. OFF by default
+        # (config.END_ENABLED False) => its step() is a hard no-op and the desk
+        # is byte-identical to a build with no Lane B. Stepped (gated) right
+        # after ROT in _rotation_cycle.
+        from .lane_end import EndGameDesk
+        self.end = EndGameDesk(self.gateway, self.ledger,
+                               alert=lambda msg: self.telegram.alert(msg),
+                               spot_fn=self._rot_spot,
+                               running_avg_fn=self._end_running_avg,
+                               strike_fn=self._end_strike,
+                               venue_held_fn=self._rot_venue_held,
+                               live_fn=self._rot_underlying_live,
+                               on_close=self._end_trip_closed)
         # WO-ROT-1 Chunk 8: a paused band stays paused across restarts
         from . import rot_guard as _rg
         self.rot.paused_bands = _rg.paused_bands(self.ledger)
@@ -2076,6 +2090,10 @@ class ShadowEngine:
         budget = (int(config.REST_READ_REFILL_PER_SECOND * CYCLE_SECONDS)
                   - config.ROT_READ_OVERHEAD)
         self.rot.step(now, books, self.market_meta, budget)
+        # WO-END-1: Lane B, right after ROT, on the SAME books and clock. A hard
+        # no-op while config.END_ENABLED is False — step() returns before
+        # touching any state, so this line is byte-identical to no Lane B.
+        self.end.step(now, books, self.market_meta)
         self.book_shortlist = set(self.rot.shortlist)
         for m, code in self.rot.verdicts.items():
             if m in self.market_meta:
@@ -2217,6 +2235,52 @@ class ShadowEngine:
         if self.venue_positions is None:
             return None
         return self.venue_positions.get(market, 0)
+
+    # ── WO-END-1: Lane B feeds ───────────────────────────────────
+    def _end_running_avg(self, underlying: str):
+        """THE edge's input: (running_60s_avg, samples_in, approx) or None.
+
+        CAVEAT — there is NO true 60-second settlement-average feed wired here.
+        Kalshi settles on the equal-weight average of 60 one-second index prints,
+        but the engine's SpotBook collects spot at ~1-5s cadence (Coinbase /
+        settle-index WS), not a published running settlement average. So this is
+        an APPROXIMATION: the mean of the spot samples SpotBook holds inside the
+        last 60 s, with samples_in clamped to that count. approx is ALWAYS True
+        until a real 60s-average feed exists — the trip tape says APPROX so the
+        edge is never trusted as exact. None when there are no fresh samples."""
+        import time as _t
+        now = _t.time()
+        try:
+            with self.spot_book._lock:
+                dq = self.spot_book._s.get(underlying)
+                pts = [p for ts, p, _s in (dq or ()) if now - ts <= 60.0]
+        except Exception:
+            pts = []
+        if not pts:
+            return None
+        avg = sum(pts) / len(pts)
+        samples_in = min(60, len(pts))
+        return (avg, samples_in, True)   # APPROX: not a published 60s average
+
+    def _end_strike(self, market: str):
+        """The market's numeric strike (points). 15M crypto markets are
+        'index >= floor_strike' (greater_or_equal), so boundary_lo IS the strike
+        the settlement average is compared against."""
+        m = self.market_meta.get(market) or {}
+        lo = m.get("boundary_lo")
+        return float(lo) if isinstance(lo, (int, float)) else None
+
+    def _end_trip_closed(self, t) -> None:
+        """WO-END-1: Lane B trip tape — ONE Telegram line (shadow ghost-marked).
+        Shares the pager; no parallel ledger path. Detailed P&L rows ride the
+        existing fills/settlement sweeps like any other gateway position."""
+        live = config.live_submit_enabled() and not t.shadow_only
+        gh = "👻 " if not live else ""
+        approx = " (avg APPROX)" if t.approx_avg else ""
+        held_s = (t.closed_ts or time.time()) - (t.fill_ts or t.entry_ts)
+        self.telegram.alert(
+            f"{gh}🏁 END {t.closed_path} {t.market} {t.side} {t.cost}¢ "
+            f"x{t.filled:g}{approx} · strike {t.strike:g} · held {held_s:.0f}s")
 
     def deploy_pct(self):
         """Deployed / book, or None when the book is unreadable (never 0)."""
