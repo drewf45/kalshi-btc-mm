@@ -24,6 +24,7 @@ orderbooks only for held markets and the shortlist.
 """
 
 import logging
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -111,6 +112,38 @@ def scan_open_markets(client, page_limit: int = None, max_pages: int = None
             return out, pages, False
         if pages >= max_pages:
             return out, pages, True
+
+
+def scan_series_markets(client, series_list: List[str], page_limit: int = None
+                        ) -> Tuple[List[dict], int, bool]:
+    """WO-ROT-ROSTER-1: targeted scan. When SERIES_LIST names the roster, query
+    `/markets?series_ticker=X` per series instead of the blind all-open scan.
+
+    The blind scan (scan_open_markets) pages EVERY open market — and Kalshi's
+    open book is flooded with tens of thousands of sports/combinatorial markets
+    (KXMVECROSSCATEGORY alone ~28.8k), so the 100-page budget is exhausted on
+    noise BEFORE the crypto/metals series are ever reached: found 0 admitted 0,
+    the desk goes blind. Querying by series_ticker returns only the markets we
+    asked for, instantly, with no truncation. Returns (markets, reads, truncated)
+    where truncated is always False (each series is paged to completion)."""
+    page_limit = config.ROT_DISCOVERY_PAGE_LIMIT if page_limit is None else page_limit
+    out: List[dict] = []
+    reads = 0
+    for series in series_list:
+        cursor = None
+        while True:
+            params = {"series_ticker": series, "status": "open", "limit": page_limit}
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.request("GET", "/markets", params=params)
+            reads += 1
+            if not isinstance(resp, dict):
+                raise RuntimeError(f"/markets[{series}] read {reads}: unexpected {resp!r}"[:200])
+            out.extend(m for m in resp.get("markets") or [] if isinstance(m, dict))
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+    return out, reads, False
 
 
 def series_of_market(m: dict) -> str:
@@ -309,7 +342,15 @@ def discover(client, now: Optional[float] = None, fee_changes_fn=None) -> Roster
     if fee_changes_fn is None:
         from .venue import get_series_fee_changes as fee_changes_fn
     roster = Roster(ts=time.time() if now is None else now)
-    markets, roster.pages, roster.truncated = scan_open_markets(client)
+    # WO-ROT-ROSTER-1: a named SERIES_LIST takes the targeted path — query only
+    # those series, bypassing the noise-flooded blind scan that was returning
+    # admitted 0. Without SERIES_LIST, the blind discovery scan is unchanged.
+    env = os.getenv("SERIES_LIST")
+    series_list = [s.strip() for s in env.split(",") if s.strip()] if env else []
+    if series_list:
+        markets, roster.pages, roster.truncated = scan_series_markets(client, series_list)
+    else:
+        markets, roster.pages, roster.truncated = scan_open_markets(client)
     groups = group_by_series(markets)
     for series in sorted(groups):
         mk = groups[series]
