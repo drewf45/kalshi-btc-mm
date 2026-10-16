@@ -66,6 +66,7 @@ from . import config
 from .book import OrderBook, to_yes_terms
 from .errors import WallRejection
 from .gateway import Order
+from .rot_regime import RotRegime
 
 log = logging.getLogger("relay.rot")
 
@@ -92,6 +93,7 @@ SKIP_NO_CASH = "SKIP_NO_CASH"              # spendable cash < this entry's cost
 SKIP_ENTRIES_HALTED = "SKIP_ENTRIES_HALTED"
 SKIP_WALL = "SKIP_WALL"                    # the gateway refused it (wall named)
 SKIP_ENTERED_BEFORE = "SKIP_ENTERED_BEFORE"  # RULED 2026-10-15: entered once = never again
+SKIP_REGIME = "SKIP_REGIME"                # WO-ROT-REGIME-1: underlying TURBULENT — stand aside on NEW entries (exits never gated)
 
 # exit paths (rot_trips.exit_path in Chunk 7)
 TARGET, SOFT_STOP, HARD_STOP, TIME_STOP, LATE, SETTLE = (
@@ -327,6 +329,13 @@ class RotationDesk:
         self.shortlist: List[str] = []
         self.verdicts: Dict[str, str] = {}       # market -> last skip code / ENTERED
         self.paused_bands: set = set()           # Chunk 8 break-even guard
+        # WO-ROT-REGIME-1: the turbulence gate. Fed one spot sample per
+        # underlying per cycle (step -> _observe_regime) from the same spot_fn
+        # the soft-stop confirm reads; classifies QUIET/NORMAL/TURBULENT and
+        # gates NEW ENTRIES ONLY (outside()). OFF by default — a no-op unless
+        # ROT_REGIME_ENABLED. regime_skips counts the stand-asides for the tape.
+        self.regime = RotRegime()
+        self.regime_skips = 0
         self.events: List[tuple] = []            # ordered trace (tests + tape)
         self.replacements: List[dict] = []
         self._freed_at: Optional[float] = None
@@ -416,9 +425,26 @@ class RotationDesk:
         """One desk cycle: inside loop (every trip), then outside loop (rank),
         then fill freed slots from the queue — all on the same cycle."""
         self._ev("cycle", now)
+        self._observe_regime(now, meta)
         self.inside(now, books, meta)
         self.outside(now, books, meta, budget_reads - len(self.trips))
         self.fill_slots(now, books)
+
+    def _observe_regime(self, now: float, meta: Dict[str, dict]) -> None:
+        """WO-ROT-REGIME-1: feed the turbulence tracker one fresh spot sample
+        per underlying this cycle — the underlyings of every admitted series on
+        the listing, plus every held trip's (so a trip's gate has tape even if
+        its market has left the listing). A no-op while the gate is disabled;
+        reads the SAME spot_fn the soft-stop confirm reads, no new feed."""
+        if not config.ROT_REGIME_ENABLED:
+            return
+        unders = {t.underlying for t in self.trips.values()}
+        for market in meta:
+            info = config.SERIES_INFO.get(config.series_of(market))
+            if info is not None:
+                unders.add(info.underlying)
+        for u in unders:
+            self.regime.observe(u, self.spot_fn(u), now)
 
     # ── INSIDE loop ──────────────────────────────────────────────
     def inside(self, now: float, books: Dict[str, OrderBook],
@@ -808,6 +834,16 @@ class RotationDesk:
                 continue
             if market in self.entered:
                 self.verdicts[market] = SKIP_ENTERED_BEFORE
+                continue
+            # WO-ROT-REGIME-1: the turbulence gate — NEW ENTRIES ONLY. A
+            # TURBULENT underlying stands the desk aside; it never touches the
+            # inside loop, so held trips still cash out / stop / settle. A
+            # no-op (always False) while the gate is disabled or the regime is
+            # QUIET/NORMAL/UNKNOWN. Counted and logged for the tape.
+            if self.regime.blocks_entry(info.underlying, now):
+                self.verdicts[market] = SKIP_REGIME
+                self.regime_skips += 1
+                self._ev("skip_regime", market, info.underlying)
                 continue
             close_ts = m.get("close_ts")
             if close_ts is None:

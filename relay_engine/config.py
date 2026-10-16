@@ -1216,6 +1216,21 @@ ROT_GUARD_TRIPS = 50             # DREW-DEFAULT: break-even guard / ranking wind
 ROT_QUEUE_SIZE = 20              # DREW-DEFAULT: ranked candidate queue depth
 ROT_LOT_STEP = Decimal("0.01")   # DREW-DEFAULT: size rounds DOWN to this step (V2 fixed-point min; per-series UNPROVEN)
 
+# ── WO-ROT-REGIME-1 — the turbulence gate (ENTRIES ONLY) ──────────
+# ROT's mean-reversion edge is real in quiet tape and INVERTS into adverse
+# selection on high-vol trending macro days (resting liquidity into a big
+# directional move, then a total-loss binary settlement). The gate STANDS ASIDE
+# on new entries while the underlying is TURBULENT and resumes when calm. EXITS
+# ARE NEVER GATED. The signal reads the spot feed ROT already has — no new data
+# source, no numpy/scipy (stdlib only). See relay_engine/rot_regime.py.
+# OFF by default: ENABLED=False => the gate is a no-op and behaviour is
+# byte-identical to the desk with no regime code at all (a live desk runs this).
+ROT_REGIME_ENABLED = os.environ.get("ROT_REGIME_ENABLED", "").strip().lower() in ("1", "true", "yes")  # DREW-DEFAULT: OFF until proven
+ROT_REGIME_WINDOW_S = float(os.environ.get("ROT_REGIME_WINDOW_S", "120"))      # DREW-DEFAULT: rolling vol window, seconds
+ROT_REGIME_MIN_SAMPLES = int(os.environ.get("ROT_REGIME_MIN_SAMPLES", "6"))    # DREW-DEFAULT: < this many fresh samples -> UNKNOWN, gate never fires
+ROT_REGIME_TURBULENT_BPS = float(os.environ.get("ROT_REGIME_TURBULENT_BPS", "12"))  # DREW-DEFAULT: mean |Δ|/sample >= 12 bps -> TURBULENT (stand aside)
+ROT_REGIME_QUIET_BPS = float(os.environ.get("ROT_REGIME_QUIET_BPS", "4"))      # DREW-DEFAULT: <= 4 bps -> QUIET; between is NORMAL (both trade)
+
 ROT_KNOB_TAGS = {
     "ROT_POSITION_PCT": "RULED(2026-10-14)",
 }
