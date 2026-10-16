@@ -1260,6 +1260,20 @@ HEARTBEAT_STALE_S = 10                    # DREW-DEFAULT: a heartbeat older than
 HEARTBEAT_HOURLY_S = 3600                 # hourly Telegram alive line
 HEARTBEAT_PING_URL = os.environ.get("HEARTBEAT_PING_URL", "").strip()  # RULED 2026-10-14: unset and OFF
 
+# ---------------------------------------------------------------------------
+# WO-ROT-HOMIE-1 — the Homie pager (RULED Drew 2026-10-15). A second alert path
+# the LIVE boot accepts: when HOMIE_PAGER is on and the Homie watch loop is
+# provably fresh (it stamps HOMIE_PAGER_PATH each cycle), Homie satisfies the
+# R6 LIVE pager guard in place of Telegram. Stale/missing -> the engine
+# DOWNGRADES to SHADOW rather than dying (Drew: boot, don't die; resume LIVE
+# when fresh again). The freshness check is the safety: no proof Homie is
+# watching, no real orders. See relay_engine/homie_pager.py.
+# ---------------------------------------------------------------------------
+HOMIE_PAGER_ENABLED = os.environ.get("HOMIE_PAGER", "").strip() not in ("", "0", "false", "False")
+HOMIE_PAGER_PATH = os.path.expanduser(os.environ.get(
+    "HOMIE_PAGER_PATH", "~/Library/Application Support/Kal/homie_pager.json"))
+HOMIE_PAGER_MAX_AGE_S = float(os.environ.get("HOMIE_PAGER_MAX_AGE_S", "900"))  # DREW-DEFAULT: 15 min
+
 
 # ---------------------------------------------------------------------------
 # WO-ROT-1 Chunk 2 — SERIES DISCOVERY AND THE REQUEST BUDGET.

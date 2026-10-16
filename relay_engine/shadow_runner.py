@@ -2913,10 +2913,26 @@ async def run():
                       f"go-live is a human act (env var + phrase), refusing to run",
                       fatal=True)
     if config.live_submit_enabled() and not engine.telegram.wired():
-        # R6: the pager is safety equipment — LIVE without it is a boot-stop
-        failures.fail("PAGER_UNWIRED_LIVE",
-                      "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID absent in LIVE mode — "
-                      "the ledger of record cannot be silent", fatal=True)
+        # R6: the pager is safety equipment — LIVE without a wired pager cannot
+        # run. WO-ROT-HOMIE-1 (RULED Drew 2026-10-15): Homie, provably fresh, is
+        # an accepted pager too. If neither Telegram nor a fresh Homie pager is
+        # present, the engine DOWNGRADES to SHADOW (boot, don't die) rather than
+        # the original fatal — real money simply waits for a watcher.
+        from . import homie_pager
+        print(homie_pager.status_line(), flush=True)
+        if homie_pager.pager_satisfies_live():
+            print("PAGER: Telegram unwired, but the Homie pager is FRESH — "
+                  "LIVE proceeds (WO-ROT-HOMIE-1). Homie is the ledger's voice.",
+                  flush=True)
+        else:
+            failures.fail("PAGER_UNWIRED_LIVE_DOWNGRADE",
+                          "LIVE requested but no live pager is present "
+                          "(Telegram unwired AND the Homie pager is stale/missing/"
+                          "disabled) — DOWNGRADING to SHADOW; the desk runs but "
+                          "places nothing until a pager is proven. Resume LIVE by "
+                          "restoring Telegram or Homie's watch loop.",
+                          fatal=False, alert=True)
+            config.RUN_MODE = "SHADOW"
 
     from . import venue
     client = venue.build_client()
