@@ -146,6 +146,49 @@ def scan_series_markets(client, series_list: List[str], page_limit: int = None
     return out, reads, False
 
 
+def list_series_by_category(client, category: str = "Crypto"
+                            ) -> Tuple[List[dict], int]:
+    """WO-COVERAGE-1 (Drew 2026-10-17: "see EVERY 15-minute market available").
+
+    `GET /series?category=Crypto` returns the full crypto series CATALOG in a
+    single page (278 series, cursor_left=False — proven against the live venue
+    2026-10-17), each record carrying `ticker`, `frequency` ('fifteen_min' for a
+    15M room) and settlement/fee fields. This is the AUTO-UPDATING roster source
+    the blind /markets scan can never be: /markets is flooded by one giant
+    series (KXMVECROSSCATEGORY ~29k open markets) that exhausts the page budget
+    before any crypto room is reached, and /markets ignores `category`. The
+    series catalog is tiny and complete. Returns (series_records, reads)."""
+    out: List[dict] = []
+    cursor = None
+    reads = 0
+    while True:
+        params = {"category": category, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.request("GET", "/series", params=params)
+        reads += 1
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"/series[{category}] read {reads}: unexpected {resp!r}"[:200])
+        out.extend(s for s in (resp.get("series") or []) if isinstance(s, dict))
+        cursor = resp.get("cursor")
+        if not cursor:
+            return out, reads
+
+
+def crypto_15m_series(client, category: str = "Crypto") -> Tuple[List[str], int]:
+    """The live set of 15-minute crypto series tickers, newest roster included.
+    Filters the category catalog to records whose frequency maps to '15M'. Used
+    to drive the targeted per-series scan so coverage is COMPLETE (every 15M
+    room) and SELF-UPDATING (a room Kalshi lists shows up with no code change)."""
+    records, reads = list_series_by_category(client, category)
+    out = []
+    for rec in records:
+        tk = rec.get("ticker")
+        if tk and cadence_from_frequency(rec.get("frequency")) == "15M":
+            out.append(str(tk))
+    return sorted(set(out)), reads
+
+
 def series_of_market(m: dict) -> str:
     """The market's series: its own series_ticker when the record carries one,
     else the event ticker's prefix (Kalshi event tickers lead with the series,
@@ -348,7 +391,24 @@ def discover(client, now: Optional[float] = None, fee_changes_fn=None) -> Roster
     env = os.getenv("SERIES_LIST")
     series_list = [s.strip() for s in env.split(",") if s.strip()] if env else []
     if series_list:
+        # explicit roster — the emergency lever / backtest scoping, unchanged
         markets, roster.pages, roster.truncated = scan_series_markets(client, series_list)
+    elif config.COVERAGE_ALL_15M:
+        # WO-COVERAGE-1: enumerate the 15M crypto rooms from the series catalog
+        # (complete + self-updating), then page each targeted (no truncation).
+        # Falls back to the blind scan only if the catalog read itself fails.
+        try:
+            rooms, cat_reads = crypto_15m_series(client, config.COVERAGE_CATEGORY)
+            markets, scan_reads, roster.truncated = scan_series_markets(client, rooms)
+            roster.pages = cat_reads + scan_reads
+            log.info("[DISCOVERY] COVERAGE_ALL_15M: %d 15M %s rooms from catalog "
+                     "(%d read) + %d targeted read(s): %s",
+                     len(rooms), config.COVERAGE_CATEGORY, cat_reads, scan_reads,
+                     ",".join(rooms))
+        except Exception as e:
+            log.warning("[DISCOVERY] catalog scan failed (%s) — falling back to "
+                        "blind /markets scan", str(e)[:160])
+            markets, roster.pages, roster.truncated = scan_open_markets(client)
     else:
         markets, roster.pages, roster.truncated = scan_open_markets(client)
     groups = group_by_series(markets)

@@ -515,15 +515,23 @@ class EndGameDesk:
     # ── the entry hunt ────────────────────────────────────────────
     def outside(self, now: float, books: Dict[str, OrderBook],
                 meta: Dict[str, dict]) -> None:
+        # The set we may enter THIS cycle. Empty END_SERIES => every admitted
+        # 15M series (Drew 2026-10-17: "see every 15-minute market available").
+        # Computed once per cycle off the LIVE roster so new 15M rooms are
+        # covered the instant discovery admits them — no code change.
+        allowed = config.end_series_for(config.SERIES_INFO)
         for market, m in meta.items():
-            if self._consider(market, m, now, books.get(market)):
+            if self._consider(market, m, now, books.get(market), allowed):
                 # one entry per cycle is enough; keep scanning for verdicts only
                 pass
 
     def _consider(self, market: str, m: dict, now: float,
-                  book: Optional[OrderBook]) -> bool:
+                  book: Optional[OrderBook],
+                  allowed: Optional[frozenset] = None) -> bool:
         series = config.series_of(market)
-        if series not in config.END_SERIES:
+        if allowed is None:                      # direct callers (tests) get live set
+            allowed = config.end_series_for(config.SERIES_INFO)
+        if series not in allowed:
             self.verdicts[market] = SKIP_NO_SERIES
             return False
         info = config.SERIES_INFO.get(series)

@@ -1285,9 +1285,31 @@ ROT_LEASH_JUMP_MULT = float(os.environ.get("ROT_LEASH_JUMP_MULT", "2.5"))     # 
 # Like ROT, END only PLACES when live_submit_enabled() AND its own lane mode is
 # LIVE; SHADOW rehearses end to end and places nothing.
 END_ENABLED = os.environ.get("END_ENABLED", "").strip().lower() in ("1", "true", "yes")   # DREW-DEFAULT: OFF until proven
-END_SERIES = frozenset(                   # DREW-DEFAULT: the three 15M crypto rooms
+# RULED 2026-10-17 (Drew): "we need to price in and SEE every 15-minute market
+# available." END_SERIES is now a FILTER, not a hardcoded roster. Empty (the
+# default) means EVERY admitted series whose cadence is 15M — so a new 15-min
+# room Kalshi lists is covered the instant discovery admits it, no code change.
+# A non-empty list (env override) pins END to exactly those series (emergency
+# lever / backtest scoping). See END_SERIES_ALL_15M and end_series_for().
+END_SERIES = frozenset(                   # empty => all admitted 15M (see below)
     s.strip().upper() for s in
-    os.environ.get("END_SERIES", "KXBTC15M,KXETH15M,KXXRP15M").split(",") if s.strip())
+    os.environ.get("END_SERIES", "").split(",") if s.strip())
+END_SERIES_ALL_15M = (                     # the "see every 15M room" switch
+    os.environ.get("END_SERIES_ALL_15M", "1").strip().lower() in ("1", "true", "yes"))
+
+
+def end_series_for(admitted_info: dict) -> frozenset:
+    """The set of series Lane B may enter THIS cycle. If END_SERIES is pinned
+    (env override, non-empty) that wins. Otherwise, when END_SERIES_ALL_15M is
+    on, it is EVERY admitted series whose cadence is 15M — the live roster, not
+    a frozen list — so coverage tracks discovery automatically. admitted_info is
+    config.SERIES_INFO (series -> SeriesInfo with a .cadence of '15M'|'1H')."""
+    if END_SERIES:
+        return END_SERIES
+    if not END_SERIES_ALL_15M:
+        return frozenset()
+    return frozenset(s for s, info in admitted_info.items()
+                     if getattr(info, "cadence", None) == "15M")
 END_WINDOW_S = float(os.environ.get("END_WINDOW_S", "90"))          # DREW-DEFAULT: enter only in the final 90 s
 END_PRICE_FLOOR = int(os.environ.get("END_PRICE_FLOOR", "95"))      # DREW-DEFAULT: favorite price floor, cents
 END_PRICE_CAP = int(os.environ.get("END_PRICE_CAP", "97"))          # DREW-DEFAULT: HARD cap — 98c+ is a fee/break-even trap
@@ -1399,6 +1421,16 @@ ROT_EXCLUDED_SERIES = frozenset({"KXINX15M", "KXNDQ15M"})
 # series -> series_discovery.SeriesInfo for the installed roster (cadence,
 # underlying group, settle sources, tick, fee terms). Empty until discovery.
 SERIES_INFO: dict = {}
+
+# WO-COVERAGE-1 (Drew 2026-10-17): "we need to price in and SEE every 15-minute
+# market available." When on (the default) and no explicit SERIES_LIST is set,
+# discovery enumerates the CRYPTO SERIES CATALOG (GET /series?category=Crypto,
+# one read, proven complete at 278 series / 14 of them 15M) and scans each 15M
+# room targeted — so coverage is COMPLETE and SELF-UPDATING for new 15M rooms,
+# instead of the blind /markets scan that truncated before reaching them.
+COVERAGE_ALL_15M = (
+    os.environ.get("COVERAGE_ALL_15M", "1").strip().lower() in ("1", "true", "yes"))
+COVERAGE_CATEGORY = os.environ.get("COVERAGE_CATEGORY", "Crypto").strip() or "Crypto"
 
 
 # ---------------------------------------------------------------------------
