@@ -144,7 +144,12 @@ def test_phi_is_the_standard_normal_cdf():
 
 # ════════════════════ (c) wide-gap favorite enters & sizes ════════
 
-def test_wide_gap_favorite_enters_and_sizes_flat_kelly_capped(env):
+def test_wide_gap_favorite_enters_and_sizes_count_first(env):
+    """Drew 2026-10-17: sizing is COUNT-FIRST, scaled to the bankroll — NOT the
+    old 1%-of-book cap (which produced zero bets on a $50 book, since one 96c
+    lot costs more than 1% of $50). A single qualifier gets the full available
+    cash slice, clamped only by the END per-market wall so it never goes all-in,
+    and buys as many lots as that affords."""
     _wide_gap_btc(env)
     m = mk("KXBTC15M", 1)
     env.market(m, 96, 98, close_in=45)
@@ -155,19 +160,21 @@ def test_wide_gap_favorite_enters_and_sizes_flat_kelly_capped(env):
     assert (o.lane, o.purpose, o.action, o.side, o.price_cents) == ("END", "ENTRY", "buy", "yes", 96)
     assert o.band == (config.END_PRICE_FLOOR, config.END_PRICE_CAP)
     assert not o.crossfire and not o.ioc and not o.reduce_only
-    # flat 1/20-Kelly HARD-capped at 1% of the $100 book = 100c budget; the cap
-    # binds in the valid region, so size = floor(100 / 96 / 0.01) * 0.01
-    budget = int(config.END_MAX_BANKROLL_PCT * env.desk.book_cents())  # 100c
-    assert budget == 100
-    # size = floor(budget / cost / step) * step = floor(100/96/0.01)*0.01 = 1.04
-    assert t.size == Decimal("1.04")
-    assert float(t.size) * t.cost <= budget + 0.5   # never over the 1% cap
+    # single qualifier: slice = min(spendable, END per-market wall). On the $100
+    # book the END wall (AT_RISK_PCT["END"]=0.50) binds at 5000c, so
+    #   size = floor(5000 / 96 / 0.01) * 0.01 = 52.08 contracts  (NOT 1.04).
+    wall = config.at_risk_cap_cents("END", env.desk.spendable_cents())  # 5000c
+    assert wall == 5000
+    assert t.size == Decimal("52.08")
+    # never over the per-market wall (never all-in on one market)
+    assert float(t.size) * t.cost <= wall + 0.5
     assert t.approx_avg is True                  # the running avg was APPROX
     assert "running60s_avg" in o.why and "APPROX" in o.why and "p_flip" in o.why
 
 
-def test_sizing_never_exceeds_one_percent_of_bankroll(env):
-    # whatever the (tiny) p_flip, the flat 1/20-Kelly is capped at 1% hard
+def test_single_market_never_goes_all_in(env):
+    # one market never takes the whole bankroll: at-risk stays within the END
+    # per-market wall even when it is the only qualifier (spread, never all-in).
     _wide_gap_btc(env)
     m = mk("KXBTC15M", 1)
     env.market(m, 95, 97, close_in=30)
@@ -175,11 +182,70 @@ def test_sizing_never_exceeds_one_percent_of_bankroll(env):
     t = env.trip(m)
     assert t is not None
     cost_c = float(t.size) * t.cost
-    assert cost_c <= config.END_MAX_BANKROLL_PCT * env.desk.book_cents() + 0.5
+    wall = config.at_risk_cap_cents("END", env.desk.spendable_cents())
+    assert cost_c <= wall + 0.5
+    assert cost_c < env.desk.spendable_cents()   # strictly under all-in
+
+
+def _wide_gap(env, und, strike):
+    env.spot[und] = strike
+    env.avg[und] = (strike + strike * 0.0006, 45, True)   # ~0.06% above the line
+
+
+def test_equal_split_spreads_across_the_board(env, ledger):
+    """Drew's own example (2026-10-17): '$10, BTC ETH ... use $X across the
+    board ... win a couple cents per ... not betting it all on one market.' On a
+    $10 book with several qualifiers the available cash equal-splits — each market
+    gets a slice and a few contracts, none goes all-in."""
+    ledger.baseline(1_000, confirmed_by="boot")          # a $10 bankroll
+    ledger.snapshot_caps_at_boot()
+    und = {"KXBTC15M": ("BTC", 100_000.0), "KXETH15M": ("ETH", 4_000.0),
+           "KXXRP15M": ("XRP", 3.0)}
+    markets = []
+    for i, (series, (u, strike)) in enumerate(und.items(), start=1):
+        _wide_gap(env, u, strike)
+        m = mk(series, i)
+        env.market(m, 96, 98, close_in=45, strike=strike)
+        markets.append(m)
+    env.step(T)
+    trips = [m for m in markets if env.trip(m) is not None]
+    # every qualifier got a bet — the 1%-cap no longer zeroes anyone out
+    assert len(trips) == len(markets), {m: env.desk.verdicts.get(m) for m in markets}
+    # spread, not all-in: each market's at-risk is a fraction of the bankroll
+    book = env.desk.spendable_cents()
+    for m in trips:
+        t = env.trip(m)
+        assert float(t.size) >= 1                         # at least one contract
+        assert float(t.size) * t.cost < book              # never all-in
+
+
+def test_one_contract_floor_when_cash_can_afford_a_lot(env, ledger):
+    """The floor Drew named: 'if you are able to do one contract for market then
+    you should be able to bet that.' A bankroll whose equal-split slice is thinner
+    than a single lot STILL places one lot, as long as spendable cash covers it —
+    the old 1%-of-book cap would have skipped it (SKIP_SIZE)."""
+    ledger.baseline(300, confirmed_by="boot")             # $3 — thin
+    ledger.snapshot_caps_at_boot()
+    _wide_gap_btc(env)
+    m = mk("KXBTC15M", 1)
+    env.market(m, 96, 98, close_in=45)
+    env.step(T)
+    t = env.trip(m)
+    assert t is not None, env.desk.verdicts.get(m)
+    assert float(t.size) >= 1                             # the 1-contract floor
+
+    # the floor is cash-honest: a zero slice still takes one lot when spendable
+    # cash covers a single lot, but SKIP_NO_CASH when it truly cannot. A lot is
+    # one ROT_LOT_STEP; at 96c a 0.01 step costs 1c (ceil of 0.96c).
+    step = config.ROT_LOT_STEP
+    size, why = env.desk._size(96, budget_cents=0, spendable_cents=1)
+    assert size == step and why == ""                     # floor fires: 1c ≥ 1c lot
+    size, why = env.desk._size(96, budget_cents=0, spendable_cents=0)
+    assert size is None and why == le.SKIP_NO_CASH        # cannot afford a lot
 
 
 def test_kelly_fraction_is_flat_and_capped():
-    # p_flip at the entry threshold still hits the 1% cap (flat, never laddered)
+    # kelly_fraction is retained for reference/telemetry (no longer gates size)
     assert le.kelly_fraction(0.001, 20, 0.01) == 0.01
     assert le.kelly_fraction(0.02, 20, 0.01) == 0.01
     # no edge after the 1.5c haircut when the win prob is poor

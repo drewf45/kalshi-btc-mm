@@ -349,7 +349,13 @@ AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap
 # AT_RISK_PCT["FLIP"]→0.05; OPEN_SIGHTED_STOP=0. The wall must not silently stay
 # loose after the experiment ends.
 AT_RISK_PCT = {"F": 0.30, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02,
-               "ROT": 0.05}   # WO-ROT-1 C3 §4: ROT at the market cap (ROT_MARKET_CAP_PCT)  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
+               "ROT": 0.05, "END": 0.50}   # WO-ROT-1 C3 §4: ROT at the market cap (ROT_MARKET_CAP_PCT)  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
+# END per-market wall = 0.50 (Drew 2026-10-17): the END SIZER is the binding
+# constraint now, not this wall — Lane B equal-splits available cash across the
+# qualifying markets this cycle (never all-in on one), so a single market only
+# approaches 50% when it is the lone qualifier. The 50%-of-tradeable ENSEMBLE
+# cap (ENSEMBLE_AT_RISK_PCT) remains the hard total-deployment governor across
+# all rooms; this wall just stops one END market from going all-in.
 AT_RISK_PCT_DEFAULT = 0.02        # any unlisted lane (ORPHAN, …) — conservative
 # WO-2026-07-24-G Part 1 (ADVERSARY i backstop): the per-lane wall is now scoped
 # per-lane, so a lane can't be squeezed by another's exposure — but the whole

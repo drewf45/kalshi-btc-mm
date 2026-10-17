@@ -29,10 +29,17 @@ THE #1 TRAP (§2): the gap is measured against the RUNNING 60s AVERAGE, never
   60s-average feed, R is APPROXIMATED from the spot samples the engine already
   collects (spot_avg_fn below) and the trip's tape says APPROX.
 
-SIZING (§3): flat 1/20-Kelly, HARD cap 1% of bankroll, NEVER laddered.
-  w_cons = max(0, w_est - 0.015);  b = (1 - p) / p;
-  f_full = (b * w_cons - (1 - w_cons)) / b;  f = min(END_MAX_BANKROLL_PCT,
-  f_full / END_KELLY_DIV).  f <= 0 => do not trade.  (w_est = 1 - p_flip.)
+SIZING (§3, Drew 2026-10-17): COUNT-FIRST, scaled to the bankroll, spread across
+  the board — never all-in on one market. Each cycle the available CASH is
+  EQUAL-SPLIT across every qualifying market, and each buys as many lots as its
+  slice affords, with a ONE-CONTRACT FLOOR: if cash can cover a single lot, the
+  bet is placed even when the slice is thinner than a lot. END_MAX_BANKROLL_PCT
+  (1%) is a SOFT per-position target, NOT a hard ceiling — it never blocks a bet.
+  Total deployment rides up to 100% of cash as fills land (the spendable guard
+  shrinks per fill), so no single market goes all-in. ("if you have $10 BTC ETH
+  SOL XRP you can use $4 across the board ... win a couple cents per ... you're
+  not betting it all on one market.") The 1/20-Kelly curve (kelly_fraction, below)
+  is retained for reference/telemetry but no longer gates or caps the size.
 
 PRICE FILTER (§4): floor END_PRICE_FLOOR (95c), HARD cap END_PRICE_CAP (97c) —
   98c+ is a fee/break-even trap. Entry ONLY inside the final END_WINDOW_S.
@@ -521,10 +528,50 @@ class EndGameDesk:
         # Computed once per cycle off the LIVE roster so new 15M rooms are
         # covered the instant discovery admits them — no code change.
         allowed = config.end_series_for(config.SERIES_INFO)
+
+        # Pass 1 — run every gate up THROUGH the EV check and collect the markets
+        # that qualify this cycle. Sizing is deferred because the per-market
+        # budget is an EQUAL SPLIT of available cash across ALL qualifiers (Drew
+        # 2026-10-17: "if you have $10 BTC ETH SOL XRP you can use $4 across the
+        # board ... you're not betting it all on one market"). We can't split
+        # before we know how many qualify, so gate first, then size.
+        qualifiers: List[dict] = []
         for market, m in meta.items():
-            if self._consider(market, m, now, books.get(market), allowed):
-                # one entry per cycle is enough; keep scanning for verdicts only
-                pass
+            q = self._gate(market, m, now, books.get(market), allowed)
+            if q is not None:
+                qualifiers.append(q)
+
+        if not qualifiers:
+            return
+
+        # Pass 2 — equal-split the available cash across the qualifiers, size
+        # each (count-first, 1-contract floor), and enter. The running spendable
+        # guard shrinks as shadow/live fills land, so total deployment rides up
+        # to 100% of cash without any single market going all-in.
+        n = len(qualifiers)
+        for q in qualifiers:
+            spendable = self.spendable_cents()
+            # equal split of available cash, clamped to the per-market wall so no
+            # single market goes all-in (and the gateway never hard-rejects us).
+            slice_cents = min(spendable // n if n else 0, self._market_wall_cents())
+            size, why = self._size(q["cost"], slice_cents, spendable)
+            if size is None:
+                self.verdicts[q["market"]] = why
+                continue
+            new_cost = int(float(size) * q["cost"])
+            if new_cost > spendable:
+                self.verdicts[q["market"]] = SKIP_NO_CASH
+                continue
+            self._enter(q["market"], q["series"], q["info"], q["side"],
+                        q["cost"], size, q["close_ts"], q["strike"],
+                        q["approx"], q["p_flip"], q["running_avg"],
+                        q["samples_in"], now, q["book"])
+
+    def _market_wall_cents(self) -> int:
+        """The END per-market at-risk wall in cents (gateway enforces it as a
+        HARD reject). The sizer clamps each market's slice to this so it never
+        self-inflicts a SKIP_WALL — one market never goes all-in."""
+        return config.at_risk_cap_cents(LANE, self.spendable_cents())
 
     def _ev_ok(self, side: str, cost: int, p_flip: float, market: str) -> bool:
         """The fee-aware EV gate. Returns True iff this entry is worth taking.
@@ -554,63 +601,67 @@ class EndGameDesk:
         self._ev("ev_gate", market, "theoretical", round(theo_ev, 2), ok)
         return ok
 
-    def _consider(self, market: str, m: dict, now: float,
-                  book: Optional[OrderBook],
-                  allowed: Optional[frozenset] = None) -> bool:
+    def _gate(self, market: str, m: dict, now: float,
+              book: Optional[OrderBook],
+              allowed: Optional[frozenset] = None) -> Optional[dict]:
+        """Run every entry gate THROUGH the EV check. Return the qualifier's
+        entry parameters (a dict) when the market passes, else record the verdict
+        and return None. Sizing/entry is deferred to the caller so the available
+        cash can be equal-split across all qualifiers this cycle."""
         series = config.series_of(market)
         if allowed is None:                      # direct callers (tests) get live set
             allowed = config.end_series_for(config.SERIES_INFO)
         if series not in allowed:
             self.verdicts[market] = SKIP_NO_SERIES
-            return False
+            return None
         info = config.SERIES_INFO.get(series)
         if info is None:
             self.verdicts[market] = SKIP_NO_SERIES
-            return False
+            return None
         if self.market_held_elsewhere(market):
             self.verdicts[market] = SKIP_HELD
-            return False
+            return None
         if market in self.entered:
             self.verdicts[market] = SKIP_ENTERED_BEFORE
-            return False
+            return None
         close_ts = m.get("close_ts")
         if close_ts is None:
             self.verdicts[market] = SKIP_WINDOW
-            return False
+            return None
         secs_left = float(close_ts) - now
         if secs_left > config.END_WINDOW_S or secs_left <= 0:
             self.verdicts[market] = SKIP_WINDOW
-            return False
+            return None
         if book is None:
             self.verdicts[market] = SKIP_NO_BOOK
-            return False
+            return None
         side, cost = self.favorite(book)
         if side is None or cost is None:
             self.verdicts[market] = SKIP_NO_QUOTE
-            return False
+            return None
         if not (config.END_PRICE_FLOOR <= cost <= config.END_PRICE_CAP):
             self.verdicts[market] = SKIP_PRICE
-            return False
+            return None
         strike = self.strike_fn(market)
         if strike is None:
             self.verdicts[market] = SKIP_NO_STRIKE
-            return False
+            return None
         avg = self.running_avg_fn(info.underlying)
         index = self.spot_fn(info.underlying)
         if avg is None or index is None:
             self.verdicts[market] = SKIP_NO_AVG
-            return False
+            return None
         running_avg, samples_in, approx = avg
         # the chosen side MUST be the running-average favorite (the #1 trap:
         # never buy a side the AVERAGE does not favor, however the quote looks)
         if self.gap_for_side(side, running_avg, strike) <= 0:
             self.verdicts[market] = SKIP_NO_FAVORITE
-            return False
+            return None
         p_flip = self.flip_prob_for(side, running_avg, samples_in, strike, index)
         if p_flip >= config.END_MAX_PFLIP:
             self.verdicts[market] = SKIP_PFLIP
             self._ev("skip_pflip", market, round(p_flip, 5))
-            return False
+            return None
         # ── fee-aware EV gate (Drew 2026-10-17: "know what's profitable before
         # you bet"). Two modes, both fee-adjusted via the venue's taker curve:
         #   • thin cell (no settled history yet) — gate on THEORETICAL EV:
@@ -621,33 +672,72 @@ class EndGameDesk:
         # This is the "enter on knowing, then let the measured edge govern" path.
         if not self._ev_ok(side, cost, p_flip, market):
             self.verdicts[market] = SKIP_EV
+            return None
+        return {
+            "market": market, "series": series, "info": info,
+            "side": side, "cost": cost, "close_ts": float(close_ts),
+            "strike": strike, "approx": approx, "p_flip": p_flip,
+            "running_avg": running_avg, "samples_in": samples_in, "book": book,
+        }
+
+    def _consider(self, market: str, m: dict, now: float,
+                  book: Optional[OrderBook],
+                  allowed: Optional[frozenset] = None) -> bool:
+        """Single-market gate→size→enter (direct callers / tests). Sizes this one
+        market against ALL available cash (it is the only qualifier in view), with
+        the count-first 1-contract floor; the per-cycle equal split lives in
+        outside()."""
+        q = self._gate(market, m, now, book, allowed)
+        if q is None:
             return False
-        f = kelly_fraction(p_flip, config.END_KELLY_DIV, config.END_MAX_BANKROLL_PCT)
-        if f <= 0:
-            self.verdicts[market] = SKIP_SIZE
-            return False
-        size, why = self._size(cost, f)
+        spendable = self.spendable_cents()
+        slice_cents = min(spendable, self._market_wall_cents())
+        size, why = self._size(q["cost"], slice_cents, spendable)
         if size is None:
             self.verdicts[market] = why
             return False
-        new_cost = size * cost
-        if new_cost > self.spendable_cents():
+        new_cost = int(float(size) * q["cost"])
+        if new_cost > spendable:
             self.verdicts[market] = SKIP_NO_CASH
             return False
-        return self._enter(market, series, info, side, cost, size, float(close_ts),
-                           strike, approx, p_flip, running_avg, samples_in, now, book)
+        return self._enter(q["market"], q["series"], q["info"], q["side"],
+                           q["cost"], size, q["close_ts"], q["strike"],
+                           q["approx"], q["p_flip"], q["running_avg"],
+                           q["samples_in"], now, q["book"])
 
-    def _size(self, cost: int, fraction: float) -> Tuple[Optional[Decimal], str]:
-        """Flat 1/20-Kelly fraction of the BOOK, as a contract count rounded
-        DOWN to the lot step. Below one lot is a skip (never bumped)."""
-        book = self.book_cents()
-        budget = int(math.floor(book * fraction))
-        if budget <= 0 or cost <= 0:
+    def _size(self, cost: int, budget_cents: int,
+              spendable_cents: int) -> Tuple[Optional[Decimal], str]:
+        """Count-first sizing against a per-market CASH budget (Drew 2026-10-17:
+        "it's per position being the one percent ... but the max percentage of
+        bankroll should not limit you ... scale to your bankroll").
+
+        The 1% (END_MAX_BANKROLL_PCT) is a SOFT per-position target, never a hard
+        ceiling that blocks a bet. The desk spreads the available cash across the
+        qualifying markets this cycle (equal split, computed by the caller) and
+        buys as many lots as that slice affords — but with a MINIMUM-LOT FLOOR:
+        if the slice can't cover even one lot yet spendable cash can, still take
+        one lot ("if you are able to do one contract for market then you should
+        be able to bet that"). Never all-in on one market; spread across the
+        board. A "lot" is one ROT_LOT_STEP (the smallest tradeable unit; whole
+        contracts in LIVE, fractional 0.01 steps in SHADOW).
+
+        budget_cents  = this market's equal-split slice of available cash.
+        spendable_cents = total cash still available (the min-lot floor + the
+                          overspend guard both read it).
+        """
+        if cost <= 0:
             return None, SKIP_SIZE
         step = Decimal(config.ROT_LOT_STEP)
-        lots = (Decimal(budget) / Decimal(cost) / step).to_integral_value(rounding=ROUND_FLOOR)
+        one_lot_cents = int((step * Decimal(cost)).to_integral_value(
+            rounding="ROUND_CEILING"))      # cash a single lot actually costs
+        lots = (Decimal(max(0, budget_cents)) / Decimal(cost) / step
+                ).to_integral_value(rounding=ROUND_FLOOR)
         if lots < 1:
-            return None, SKIP_SIZE
+            # the slice is too thin for even one lot — honor the floor whenever
+            # spendable cash can cover a single lot at this price.
+            if spendable_cents >= one_lot_cents:
+                return (step * 1).quantize(step), ""
+            return None, SKIP_NO_CASH
         return (lots * step).quantize(step), ""
 
     def _enter(self, market, series, info, side, cost, size, close_ts, strike,
@@ -656,8 +746,9 @@ class EndGameDesk:
         why_s = (f"END endgame favorite {side}@{cost}c x{_norm(size)} · "
                  f"{info.underlying} strike {strike:g} · running60s_avg "
                  f"{running_avg:g}{' APPROX' if approx else ''} ({samples_in}/60 in) · "
-                 f"p_flip {p_flip:.4f} < {config.END_MAX_PFLIP} · 1/{config.END_KELLY_DIV:g}-Kelly "
-                 f"cap {config.END_MAX_BANKROLL_PCT:.0%}")
+                 f"p_flip {p_flip:.4f} < {config.END_MAX_PFLIP} · equal-split cash "
+                 f"across qualifiers, 1-contract floor (soft "
+                 f"{config.END_MAX_BANKROLL_PCT:.0%} per-position target)")
         if shadow_only:
             why_s += " · SHADOW-ONLY (no working spot feed)"
         o = Order(lane=LANE, event=market.rsplit("-", 1)[0], market=market,
