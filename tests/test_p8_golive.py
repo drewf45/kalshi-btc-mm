@@ -33,7 +33,11 @@ TICKER3 = "KXBTC15M-02JAN251030-T99"
 
 
 @pytest.fixture
-def engine(tmp_path):
+def engine(tmp_path, monkeypatch):
+    # The per-lane money-halt geometry (HALF = rate_halt_drawdown_c(10_000)//2+50)
+    # is calibrated to the ORIGINAL $100 paper book. The live shadow baseline is
+    # now $50; these prove the leash machinery, not the baseline value. Pin $100.
+    monkeypatch.setattr(config, "SHADOW_PAPER_BANKROLL_USD", 100.0)
     e = ShadowEngine(db_path=str(tmp_path / "econ.db"))
     e.boot()
     e.telegram_sent = []

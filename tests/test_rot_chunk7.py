@@ -37,6 +37,10 @@ def day(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ROT_TARGET_CENTS", 8)
     monkeypatch.setattr(config, "ROT_STOP_CENTS", 10)
     monkeypatch.setattr(config, "ROT_HARD_STOP_CENTS", 20)
+    # Same reason for the book: the exit-family replay's amounts were authored on
+    # the $100 paper book. The live shadow baseline is now $50; pin $100 so these
+    # keep testing the exit/settlement plumbing, not the new baseline arithmetic.
+    monkeypatch.setattr(config, "SHADOW_PAPER_BANKROLL_USD", 100.0)
     failures._warn_last.clear()
     db = str(tmp_path / "day.db")
     e = ShadowEngine(db_path=db)

@@ -746,8 +746,10 @@ EXPECTED_MAKER_FEE_SERIES = frozenset()  # series currently designated as maker-
 # ---------------------------------------------------------------------------
 # Paper shadow: the notional bankroll the shadow books against so budget walls
 # exercise realistically. Paper only — no real dollar exists until cutover.
+# RULED 2026-10-17 (Drew): $50 shadow bankroll — the size we'd actually go live
+# at, so the walls/sizing exercise at the real scale we're gathering data for.
 # ---------------------------------------------------------------------------
-SHADOW_PAPER_BANKROLL_USD = 100.0
+SHADOW_PAPER_BANKROLL_USD = float(os.environ.get("SHADOW_PAPER_BANKROLL_USD", "50.0"))
 
 # ---------------------------------------------------------------------------
 # Storage — single-writer law (§A1): this engine's OWN database, never the

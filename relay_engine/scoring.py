@@ -18,7 +18,10 @@ from .sizing import size_order, wilson_lower_bound
 
 # hold-to-settlement lanes: breakeven is the price itself (salvage-adjusted
 # once the DODGED curve has evidence — §3.3 lens note, conservative until).
-HOLD_LANES = ("F", "H8", "ORPHAN")
+# END (WO-END-1, Lane B pile-on) is a hold-to-settlement bet exactly like F —
+# it buys the running-avg favorite near the close and rides to resolution, so
+# its breakeven is the price itself (a 97¢ entry must win ≥97% after fees).
+HOLD_LANES = ("F", "H8", "ORPHAN", "END")
 
 # trip geometry (take_T, bail_L in cents): wins pay +T maker-free; typical
 # losses pay −L plus the taker exit fee. OPEN's L is band-shaped (computed).
@@ -194,7 +197,7 @@ def tier_for(ledger, lane: str, price_cents: int,
 
 
 # ── §5: THE SCOREBOARD (daily pack + /scoreboard — read-only) ──────────────
-_SCOREBOARD_LANES = ("F", "H8", "OPEN", "HUNT", "D", "P")
+_SCOREBOARD_LANES = ("F", "H8", "OPEN", "HUNT", "D", "P", "END")
 
 
 def scoreboard_lines(ledger, book_cents: Optional[int] = None) -> List[str]:

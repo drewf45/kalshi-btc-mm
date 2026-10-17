@@ -48,11 +48,45 @@ _FREQ_OTHER = {"daily", "weekly", "monthly", "annual", "yearly", "custom",
 _UNDERLYING_KEYS = sorted([
     ("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL"), ("XRP", "XRP"),
     ("DOGE", "DOGE"), ("BNB", "BNB"), ("HYPE", "HYPE"), ("SHIBA", "SHIB"),
+    # WO-COVERAGE-1 (Drew 2026-10-17): every coin with a live 15M room so none
+    # is blocked by SKIP_NO_UNDERLYING. CRYPTOLEAD/CRYPTOCOMP are baskets, not
+    # single coins — intentionally NOT keyed here (they need their own
+    # correlation-group handling, not a single-asset bucket).
+    ("NEAR", "NEAR"), ("ZEC", "ZEC"), ("ADA", "ADA"), ("BCH", "BCH"),
+    ("TON", "TON"), ("LTC", "LTC"), ("LINK", "LINK"), ("AVAX", "AVAX"),
+    ("DOT", "DOT"), ("MATIC", "MATIC"),
     ("GOLD", "GOLD"), ("XAU", "GOLD"), ("SILVER", "SILVER"), ("XAG", "SILVER"),
     ("WTI", "WTI"), ("OIL", "WTI"), ("BRENT", "BRENT"), ("NATGAS", "NATGAS"),
     ("INX", "SPX"), ("NDQ", "NDX"), ("NASDAQ", "NDX"), ("DJI", "DJI"),
     ("EURUSD", "EURUSD"), ("USDJPY", "USDJPY"), ("GBPUSD", "GBPUSD"),
 ], key=lambda kv: -len(kv[0]))
+
+# Correlation GROUP for each underlying — the exposure cap buckets by GROUP so
+# one market-wide move (all crypto, all metals) can't stack past the wall even
+# across different tickers (Drew 2026-10-17: "treated correlation"). This is the
+# STATIC taxonomy / sanity-check; the MEASURED correlation engine (fit to our
+# own 1s prints) refines it once shadow data exists. Default group = the asset.
+CORRELATION_GROUP = {
+    "BTC": "CRYPTO", "ETH": "CRYPTO", "SOL": "CRYPTO", "XRP": "CRYPTO",
+    "DOGE": "CRYPTO", "BNB": "CRYPTO", "HYPE": "CRYPTO", "SHIB": "CRYPTO",
+    "NEAR": "CRYPTO", "ZEC": "CRYPTO", "ADA": "CRYPTO", "BCH": "CRYPTO",
+    "TON": "CRYPTO", "LTC": "CRYPTO", "LINK": "CRYPTO", "AVAX": "CRYPTO",
+    "DOT": "CRYPTO", "MATIC": "CRYPTO",
+    "GOLD": "METALS", "SILVER": "METALS",
+    "WTI": "ENERGY", "BRENT": "ENERGY", "NATGAS": "ENERGY",
+    "SPX": "EQUITY", "NDX": "EQUITY", "DJI": "EQUITY",
+    "EURUSD": "FX", "USDJPY": "FX", "GBPUSD": "FX",
+}
+
+
+def correlation_group(underlying: Optional[str]) -> Optional[str]:
+    """The exposure-cap bucket for an underlying: its researched correlation
+    group (CRYPTO/METALS/ENERGY/EQUITY/FX), falling back to the underlying
+    itself when unknown — so an unmapped asset caps against only itself, never
+    silently shares a bucket it was never assigned to."""
+    if underlying is None:
+        return None
+    return CORRELATION_GROUP.get(underlying, underlying)
 
 SKIP_CADENCE = "SKIP_CADENCE"
 SKIP_NO_SETTLE_SOURCE = "SKIP_NO_SETTLE_SOURCE"

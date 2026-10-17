@@ -76,6 +76,7 @@ SKIP_PRICE = "SKIP_PRICE"                # favorite outside [floor, cap]
 SKIP_NO_FAVORITE = "SKIP_NO_FAVORITE"    # no side is the decided favorite
 SKIP_NO_AVG = "SKIP_NO_AVG"              # no running-average feed (cannot judge the gap)
 SKIP_PFLIP = "SKIP_PFLIP"                # padded flip prob >= END_MAX_PFLIP
+SKIP_EV = "SKIP_EV"                      # EV net of taker fee <= 0 (thin: theoretical; with authority: measured margin)
 SKIP_SIZE = "SKIP_SIZE"                  # 1/20-Kelly <= 0 or below one lot
 SKIP_HELD = "SKIP_HELD"                  # already in this market (any lane)
 SKIP_NO_BOOK = "SKIP_NO_BOOK"            # no book this read
@@ -525,6 +526,34 @@ class EndGameDesk:
                 # one entry per cycle is enough; keep scanning for verdicts only
                 pass
 
+    def _ev_ok(self, side: str, cost: int, p_flip: float, market: str) -> bool:
+        """The fee-aware EV gate. Returns True iff this entry is worth taking.
+
+        Thin cell (no realized END history at this price bucket): gate on the
+        THEORETICAL fee-adjusted EV — a favorite that wins with prob w=(1−p_flip)
+        pays (100−cost) and loses cost, less the venue taker fee at this price:
+            EV_c = w·(100−cost) − (1−w)·cost − fee = w·100 − cost − fee
+        Enter only when EV_c > 0 — never a known-negative price, but we DO enter
+        to gather data. Once the cell has REALIZED authority, the measured gate
+        (wilson_LB − breakeven > 0) governs instead — the learned edge wins."""
+        from . import scoring
+        cell = scoring.price_cell(cost)
+        fee = scoring.taker_fee_cents(cost)
+        w = max(0.0, 1.0 - p_flip)
+        theo_ev = w * 100.0 - cost - fee
+        has_auth = scoring.cell_has_authority(self.ledger, "END", cell,
+                                               shadow=config.lane_books_shadow("END"))
+        if has_auth:
+            s = scoring.score(self.ledger, "END", cell,
+                              shadow=config.lane_books_shadow("END"))
+            ok = s["margin"] > 0
+            self._ev("ev_gate", market, "measured", round(s["margin"], 4),
+                     round(theo_ev, 2), ok)
+            return ok
+        ok = theo_ev > 0
+        self._ev("ev_gate", market, "theoretical", round(theo_ev, 2), ok)
+        return ok
+
     def _consider(self, market: str, m: dict, now: float,
                   book: Optional[OrderBook],
                   allowed: Optional[frozenset] = None) -> bool:
@@ -581,6 +610,17 @@ class EndGameDesk:
         if p_flip >= config.END_MAX_PFLIP:
             self.verdicts[market] = SKIP_PFLIP
             self._ev("skip_pflip", market, round(p_flip, 5))
+            return False
+        # ── fee-aware EV gate (Drew 2026-10-17: "know what's profitable before
+        # you bet"). Two modes, both fee-adjusted via the venue's taker curve:
+        #   • thin cell (no settled history yet) — gate on THEORETICAL EV:
+        #       EV_c = w·100 − cost − taker_fee(cost),  w = 1 − p_flip
+        #     so we enter only known-non-negative prices while gathering data.
+        #   • cell WITH authority (enough realized outcomes) — the LEARNED gate
+        #     takes over: require measured margin = wilson_LB − breakeven > 0.
+        # This is the "enter on knowing, then let the measured edge govern" path.
+        if not self._ev_ok(side, cost, p_flip, market):
+            self.verdicts[market] = SKIP_EV
             return False
         f = kelly_fraction(p_flip, config.END_KELLY_DIV, config.END_MAX_BANKROLL_PCT)
         if f <= 0:

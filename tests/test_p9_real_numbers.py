@@ -31,7 +31,13 @@ TICKER2 = "KXBTC15M-02JAN251015-T99"
 
 
 @pytest.fixture
-def engine(tmp_path):
+def engine(tmp_path, monkeypatch):
+    # These prove the account-value / reconcile / drawdown-leash machinery against
+    # the ORIGINAL $100 paper book its geometry was authored on (HALF derived from
+    # rate_halt_drawdown_c(10_000), brackets seeded at 10_000). The live shadow
+    # baseline is now $50 (SHADOW_PAPER_BANKROLL_USD); the baseline VALUE is not
+    # what these test. Pin the old book so the plumbing keeps being exercised.
+    monkeypatch.setattr(config, "SHADOW_PAPER_BANKROLL_USD", 100.0)
     e = ShadowEngine(db_path=str(tmp_path / "p9.db"))
     e.boot()
     e.telegram_sent = []

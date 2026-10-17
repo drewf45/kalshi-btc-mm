@@ -22,6 +22,10 @@ def eng(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DESK_MODE", "ROTATION")
     monkeypatch.setattr(config, "SERIES_INFO", {"KXBTC15M": SeriesInfo(
         "KXBTC15M", "15M", "t", "BTC", ["CF"], "1c", "q", "1", 0, 1)})
+    # group_limit = 3x largest position asserts against the $100-book order budget
+    # (500c / 40c = 12.5 -> 38). The live shadow baseline is now $50; pin $100 so
+    # this keeps testing the group-limit arithmetic, not the new baseline.
+    monkeypatch.setattr(config, "SHADOW_PAPER_BANKROLL_USD", 100.0)
     failures._warn_last.clear()
     e = ShadowEngine(db_path=str(tmp_path / "c8.db"))
     e.boot()

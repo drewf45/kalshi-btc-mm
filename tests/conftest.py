@@ -40,6 +40,12 @@ def _desk_mode(request, monkeypatch):
     from relay_engine import config
     if request.node.get_closest_marker("legacy_desk"):
         monkeypatch.setattr(config, "DESK_MODE", "LEGACY")
+        # These pre-desk end-to-end mechanics (watch ladder, H8 static gate) were
+        # authored against the ORIGINAL $100 paper book — the H8 order budget and
+        # lot geometry need that book size to clear the min-lot gate. The live
+        # shadow baseline is now $50 (SHADOW_PAPER_BANKROLL_USD); pin the legacy
+        # book so these keep exercising the lane machinery, not the new baseline.
+        monkeypatch.setattr(config, "SHADOW_PAPER_BANKROLL_USD", 100.0)
 
 
 @pytest.fixture(autouse=True)
