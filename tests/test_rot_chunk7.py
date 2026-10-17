@@ -29,6 +29,14 @@ SERIES = {s: _info(s, u, c) for s, u, c in [
 def day(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DESK_MODE", "ROTATION")
     monkeypatch.setattr(config, "SERIES_INFO", dict(SERIES))
+    # This chunk proves the exit-family / ledger plumbing against the ORIGINAL
+    # 8/10/20 stop geometry its replay was built on (+8c targets, bid<=entry-20
+    # hard line). The live defaults are now 3/4/4 (see test_rot_chunk0); the dial
+    # VALUES are asserted there. Pin the old dials here so these mechanics keep
+    # testing the walk/IOC/settlement machinery, not the new dial arithmetic.
+    monkeypatch.setattr(config, "ROT_TARGET_CENTS", 8)
+    monkeypatch.setattr(config, "ROT_STOP_CENTS", 10)
+    monkeypatch.setattr(config, "ROT_HARD_STOP_CENTS", 20)
     failures._warn_last.clear()
     db = str(tmp_path / "day.db")
     e = ShadowEngine(db_path=db)

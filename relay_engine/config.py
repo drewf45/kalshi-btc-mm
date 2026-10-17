@@ -1201,9 +1201,9 @@ ROT_DEPLOY_CAP_PCT = 0.50        # DREW-DEFAULT: open positions + resting entrie
 ROT_MARKET_CAP_PCT = 0.05        # DREW-DEFAULT: one market ≤ 5%
 ROT_GROUP_CAP_PCT = 0.25         # DREW-DEFAULT: one underlying group ≤ 25%
 ROT_ENTRY_BAND = (40, 54)        # DREW-DEFAULT: entry cost band, cents inclusive
-ROT_TARGET_CENTS = 8             # DREW-DEFAULT: cash-out rests at entry + 8 (measured W)
-ROT_STOP_CENTS = 10              # DREW-DEFAULT: soft stop at bid ≤ entry − 10
-ROT_HARD_STOP_CENTS = 20         # DREW-DEFAULT: hard stop at bid ≤ entry − 20 (CUT)
+ROT_TARGET_CENTS = int(os.environ.get("ROT_TARGET_CENTS", "3"))   # RULED 2026-10-16: small measured win (+3), scale contracts not target
+ROT_STOP_CENTS = int(os.environ.get("ROT_STOP_CENTS", "4"))       # RULED 2026-10-16: soft stop at bid ≤ entry − 4 (disciplined, not insta-cut)
+ROT_HARD_STOP_CENTS = int(os.environ.get("ROT_HARD_STOP_CENTS", "4"))  # RULED 2026-10-16: hard stop = soft (symmetric tight cut; defense = offense)
 ROT_GRACE_S = 60                 # DREW-DEFAULT: no stop action for 60 s after fill
 ROT_CONFIRM_READS = 2            # DREW-DEFAULT: soft stop needs 2 reads ...
 ROT_CONFIRM_SPACING_S = 10       # DREW-DEFAULT: ... 10 s apart
@@ -1238,6 +1238,35 @@ ROT_REGIME_QUIET_BPS = float(os.environ.get("ROT_REGIME_QUIET_BPS", "4"))      #
 ROT_KNOB_TAGS = {
     "ROT_POSITION_PCT": "RULED(2026-10-14)",
 }
+
+# ── WO-ROT-LEASH-1 — the odds-driven time-decaying leash (ENTRIES HELD) ──
+# RULED 2026-10-16 (Drew): the stop is NOT a fixed number of cents. The leash
+# is WIDE early when the market is genuinely undetermined (don't sell into a
+# coin-flip and lock a loss) and TIGHTENS as the market DECIDES against the
+# held side. "Decided" is measured by the SAME p_flip odds engine Lane B uses
+# (lane_end.flip_probability): p_flip near 0.5 = undetermined (wide leash);
+# p_flip rising toward 1.0 for the held side = deciding against us (tight).
+# Odds-driven, NOT clock-driven (Drew ruled 2026-10-16): a market that decides
+# early tightens early; one that stays a coin-flip keeps its long leash even
+# with little time left. The clock still ends the market (late window / settle).
+#
+# The leash maps p_flip -> a hard-stop distance in cents, linearly between a
+# WIDE floor (when undetermined) and a TIGHT ceiling (when decided-against):
+#   lose_prob = p_flip of the HELD side (0.5 = coin-flip, ->1.0 = losing)
+#   t = clamp((lose_prob - UNDETERMINED_P) / (DECIDED_P - UNDETERMINED_P), 0, 1)
+#   stop_cents = round( WIDE_CENTS + t * (TIGHT_CENTS - WIDE_CENTS) )
+# Below UNDETERMINED_P the leash is pinned WIDE (truly undetermined: no stop
+# unless the fixed hard floor trips); at/above DECIDED_P it is pinned TIGHT.
+# The fixed ROT_HARD_STOP_CENTS remains a HARD backstop floor (the leash never
+# allows a loss deeper than it). OFF by default => the fixed dials govern and
+# the desk is byte-identical to the pre-leash build.
+ROT_LEASH_ENABLED = os.environ.get("ROT_LEASH_ENABLED", "").strip().lower() in ("1", "true", "yes")  # DREW-DEFAULT: OFF until proven in shadow
+ROT_LEASH_WIDE_CENTS = int(os.environ.get("ROT_LEASH_WIDE_CENTS", "12"))      # DREW-DEFAULT: leash at an undetermined market (wide, lets it breathe)
+ROT_LEASH_TIGHT_CENTS = int(os.environ.get("ROT_LEASH_TIGHT_CENTS", "3"))     # DREW-DEFAULT: leash when decided against (cut fast)
+ROT_LEASH_UNDETERMINED_P = float(os.environ.get("ROT_LEASH_UNDETERMINED_P", "0.45"))  # DREW-DEFAULT: held-side lose_prob <= this => pinned WIDE (don't sell into undetermined)
+ROT_LEASH_DECIDED_P = float(os.environ.get("ROT_LEASH_DECIDED_P", "0.70"))    # DREW-DEFAULT: held-side lose_prob >= this => pinned TIGHT (market decided against us)
+ROT_LEASH_SIGMA_ANNUAL = float(os.environ.get("ROT_LEASH_SIGMA_ANNUAL", "0.45"))  # DREW-DEFAULT: annualized vol for the p_flip odds (shared shape with END_SIGMA_ANNUAL)
+ROT_LEASH_JUMP_MULT = float(os.environ.get("ROT_LEASH_JUMP_MULT", "2.5"))     # DREW-DEFAULT: jump-risk pad on p_flip (Gaussian under-prices crypto tails)
 
 
 # ── WO-END-1 — LANE B, the end-game pile-on (OFF by default) ──────

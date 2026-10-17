@@ -63,6 +63,7 @@ from decimal import ROUND_FLOOR, Decimal
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import config
+from . import rot_leash
 from .book import OrderBook, to_yes_terms
 from .errors import WallRejection
 from .gateway import Order
@@ -591,11 +592,23 @@ class RotationDesk:
         return out
 
     def _stop_rule(self, t: Trip, now: float, bid: int) -> Optional[str]:
-        """The Record's stop rule, in order. Returns the exit path to execute."""
+        """The Record's stop rule, in order. Returns the exit path to execute.
+
+        WO-ROT-LEASH-1 (Drew 2026-10-16): when ROT_LEASH_ENABLED the HARD stop
+        distance is the odds-driven leash — WIDE while the market is undetermined
+        (a coin-flip bid near 50: don't sell into it), TIGHTENING as the market
+        decides against the held side (bid falling toward 0). Never wider than
+        the fixed ROT_HARD_STOP_CENTS backstop. Leash OFF => the fixed dial, so
+        the rule is byte-identical to before."""
         since = now - (t.fill_ts or now)
         if since < config.ROT_GRACE_S:
             return None                                          # 1 grace
-        if bid <= t.cost - config.ROT_HARD_STOP_CENTS:
+        hard_cents = rot_leash.leash_stop_cents(bid)             # leash or None
+        if hard_cents is None:
+            hard_cents = config.ROT_HARD_STOP_CENTS              # fixed-dial fallback
+        if bid <= t.cost - hard_cents:
+            if config.ROT_LEASH_ENABLED:
+                t.why_log.append(f"{now:.0f} HARD via {rot_leash.leash_describe(bid)}")
             return HARD_STOP                                     # 3 hard (any read)
         if bid <= t.cost - config.ROT_STOP_CENTS:                # 2 soft
             if not t.soft_reads or now - t.soft_reads[-1][0] >= config.ROT_CONFIRM_SPACING_S:

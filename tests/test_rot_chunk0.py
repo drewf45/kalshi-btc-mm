@@ -261,9 +261,11 @@ def test_rot_knob_values_match_the_work_order():
     assert config.ROT_MARKET_CAP_PCT == 0.05
     assert config.ROT_GROUP_CAP_PCT == 0.25
     assert config.ROT_ENTRY_BAND == (40, 54)
-    assert config.ROT_TARGET_CENTS == 8
-    assert config.ROT_STOP_CENTS == 10
-    assert config.ROT_HARD_STOP_CENTS == 20
+    # RULED 2026-10-16 (Drew): small measured win, tight symmetric stop
+    # ("defense = offense"). Env-overridable; these are the defaults.
+    assert config.ROT_TARGET_CENTS == 3
+    assert config.ROT_STOP_CENTS == 4
+    assert config.ROT_HARD_STOP_CENTS == 4
     assert config.ROT_GRACE_S == 60
     assert (config.ROT_CONFIRM_READS, config.ROT_CONFIRM_SPACING_S) == (2, 10)
     assert config.ROT_TIME_STOP_S == 360

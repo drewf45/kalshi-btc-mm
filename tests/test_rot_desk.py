@@ -103,6 +103,18 @@ def env(gateway, ledger, monkeypatch):
     failures._alert_fn = None
 
 
+@pytest.fixture
+def legacy_dials(monkeypatch):
+    """Pin the ORIGINAL 8/10/20 stop geometry. These mechanics tests (walk-down,
+    IOC/cancel-confirm, soft->hard escalation, late-window) were authored against
+    books spaced for an 8c target / 10c soft / 20c hard stop. The live defaults
+    are now 3/4/4 (asserted in test_rot_chunk0); here we keep the MACHINERY under
+    test, not the new dial arithmetic."""
+    monkeypatch.setattr(config, "ROT_TARGET_CENTS", 8)
+    monkeypatch.setattr(config, "ROT_STOP_CENTS", 10)
+    monkeypatch.setattr(config, "ROT_HARD_STOP_CENTS", 20)
+
+
 def enter_and_fill(env, ticker, yes_bid=46, yes_ask=48, now=T, count=None):
     env.market(ticker, yes_bid, yes_ask, now=now)
     env.step(now)
@@ -402,7 +414,7 @@ def test_deploy_cap_blocks_at_its_edge_and_frees_on_exit(env, monkeypatch):
 
 # ════════════════════ Chunk 5 — entry and the bracket exit ════════════════════
 
-def test_target_fill(env):
+def test_target_fill(env, legacy_dials):
     m = mk("KXBTC15M", 1)
     t = enter_and_fill(env, m)
     env.step(T + 1)
@@ -465,7 +477,7 @@ def test_grace_then_hard_stop_cancels_confirms_then_ioc_reduce_only(env):
     assert env.desk.closed[-1].closed_path == lr.HARD_STOP
 
 
-def test_soft_stop_needs_two_spaced_reads_and_spot(env):
+def test_soft_stop_needs_two_spaced_reads_and_spot(env, legacy_dials):
     m = mk("KXBTC15M", 1)
     env.spot["BTC"] = 100_000.0
     t = enter_and_fill(env, m)
@@ -495,7 +507,7 @@ def test_soft_stop_needs_two_spaced_reads_and_spot(env):
     assert env.desk.closed[-1].closed_path == lr.SOFT_STOP
 
 
-def test_soft_stop_without_spot_never_confirms_hard_still_armed(env):
+def test_soft_stop_without_spot_never_confirms_hard_still_armed(env, legacy_dials):
     m = mk("KXETH15M", 1)                         # no ETH spot until Chunk 6
     t = enter_and_fill(env, m)
     env.step(T + 1)
@@ -532,7 +544,7 @@ def test_late_window_holds_the_favorite_to_settle(env):
     assert env.desk.closed[-1].closed_path == lr.SETTLE
 
 
-def test_late_window_exits_the_underdog(env):
+def test_late_window_exits_the_underdog(env, legacy_dials):
     m = mk("KXBTC15M", 1)
     t = enter_and_fill(env, m)
     env.step(T + 1)
@@ -653,7 +665,7 @@ def _boot_engine(tmp_path):
     return e
 
 
-def test_boot_readopts_a_rot_position_with_nothing_resting(tmp_path, monkeypatch):
+def test_boot_readopts_a_rot_position_with_nothing_resting(tmp_path, monkeypatch, legacy_dials):
     from relay_engine import venue
     from relay_engine.reconcile import live_boot_reconcile
     e = _boot_engine(tmp_path)
@@ -857,7 +869,7 @@ def _soft_confirmed(env, m):
     return t
 
 
-def test_walk_down_is_one_order_amended_never_a_second(env):
+def test_walk_down_is_one_order_amended_never_a_second(env, legacy_dials):
     m = mk("KXBTC15M", 1)
     t = _soft_confirmed(env, m)
     oid = t.exit_oid
@@ -877,7 +889,7 @@ def test_walk_down_is_one_order_amended_never_a_second(env):
                 and "cash-out" not in x.reason]) == 1
 
 
-def test_walk_at_floor_then_bid_through_minus_20_cancel_confirmed_then_ioc(env):
+def test_walk_at_floor_then_bid_through_minus_20_cancel_confirmed_then_ioc(env, legacy_dials):
     """Drew's test: the walk-down rests at the floor; the bid drops through
     entry-20; the walk order's cancel is CONFIRMED; only then the IOC
     reduce_only fires — and total sold never exceeds held."""
@@ -916,7 +928,7 @@ def test_walk_at_floor_then_bid_through_minus_20_cancel_confirmed_then_ioc(env):
     assert _sold(env, m) == held0                # the bid had depth: all sold, no more
 
 
-def test_ioc_never_fires_while_the_walk_cancel_is_unconfirmed(env, monkeypatch):
+def test_ioc_never_fires_while_the_walk_cancel_is_unconfirmed(env, monkeypatch, legacy_dials):
     m = mk("KXBTC15M", 1)
     t = _soft_confirmed(env, m)
     monkeypatch.setattr(env.gateway, "cancel_tristate", lambda oid: "UNKNOWN")
@@ -927,7 +939,7 @@ def test_ioc_never_fires_while_the_walk_cancel_is_unconfirmed(env, monkeypatch):
     assert _live_sells(env, m) == [t.exit_oid]
 
 
-def test_amend_is_size_checked_and_follows_a_shrinking_hold(env):
+def test_amend_is_size_checked_and_follows_a_shrinking_hold(env, legacy_dials):
     m = mk("KXBTC15M", 1)
     t = _soft_confirmed(env, m)
     oid = t.exit_oid
