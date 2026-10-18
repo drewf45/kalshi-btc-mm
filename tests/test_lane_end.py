@@ -200,17 +200,21 @@ def test_confirm_counter_resets_on_side_flip(env):
     assert env.desk.confirm_state[m]["count"] == 1
 
 
-def test_confirm_counter_resets_below_floor(env):
+def test_confirm_counter_resets_when_favorite_drops_out_of_band(env):
+    # With the final-window floor == the band floor (95c, DREW 2026-10-18), a
+    # favorite that slips BELOW the band (out of 95-99) during the confirm run
+    # resets the counter: the "solved" proof is broken, so it re-qualifies from
+    # scratch. 97c builds two confirms, then a drop to 94c breaks it.
     m = mk("KXBTC15M", 1)
     env.market(m, 97, 99, close_in=45)
     env.step(T)
     env.step(T)
     assert env.desk.confirm_state[m]["count"] == 2
-    # favorite slips to 96c (below the deepest tier's 97c floor) — reset, skip
-    env.book(m, 96, 98)
+    # favorite slips to 94c (below the 95c band floor) — reset, price-skip
+    env.book(m, 94, 96)
     env.step(T)
     assert m not in env.desk.confirm_state
-    assert env.desk.verdicts[m] == le.SKIP_UNCONFIRMED
+    assert env.desk.verdicts[m] == le.SKIP_PRICE
     assert m not in env.desk.trips
 
 

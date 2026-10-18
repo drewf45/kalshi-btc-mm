@@ -1345,12 +1345,20 @@ END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # 
 # "solved" (qualifies for entry) only when its favorite has held the tier's
 # floor, in-band (95-99c), same side, with live counterparty, for >= `confirms`
 # consecutive reads. Each dict: the seconds window [lo,hi), the cost floor, and
-# the consecutive-read count required. The deepest tier (floor 97/3 confirms)
-# also governs the final entry window (secs_left < its lo).
+# the consecutive-read count required.
+#
+# DREW 2026-10-18: the desk orients LATE (final 3-5 min) and piles onto whatever
+# is SOLVED — "pile onto all the ones that are settled". So the FINAL-WINDOW tier
+# (the deepest, which governs secs_left < its lo) uses the BAND FLOOR (95c), not
+# 97c: any favorite pinned anywhere in the 95-99c solved band for 3 consecutive
+# reads qualifies. The earlier K-worker tiers (99/98c) still apply if we happen
+# to be watching before the final window, but late-orient almost always lands in
+# the deepest tier — which is the whole point. Raise the deepest floor back to 97
+# only if the 95-96c tail proves lossy in the shadow data.
 END_CONFIRM_LADDER = [
     {"lo_sec": 600, "hi_sec": 900, "floor_cents": 99, "confirms": 9},
     {"lo_sec": 300, "hi_sec": 600, "floor_cents": 98, "confirms": 6},
-    {"lo_sec": 180, "hi_sec": 300, "floor_cents": 97, "confirms": 3},
+    {"lo_sec": 180, "hi_sec": 300, "floor_cents": 95, "confirms": 3},
 ]
 
 # ── RETIRED knobs (the Gaussian p_flip model) ────────────────────────
