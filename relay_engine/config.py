@@ -1329,15 +1329,38 @@ def end_series_for(admitted_info: dict) -> frozenset:
         return frozenset()
     return frozenset(s for s, info in admitted_info.items()
                      if getattr(info, "cadence", None) == "15M")
-END_WINDOW_S = float(os.environ.get("END_WINDOW_S", "90"))          # DREW-DEFAULT: enter only in the final 90 s
-END_PRICE_FLOOR = int(os.environ.get("END_PRICE_FLOOR", "95"))      # DREW-DEFAULT: favorite price floor, cents
-END_PRICE_CAP = int(os.environ.get("END_PRICE_CAP", "97"))          # DREW-DEFAULT: HARD cap — 98c+ is a fee/break-even trap
-END_MAX_PFLIP = float(os.environ.get("END_MAX_PFLIP", "0.02"))      # DREW-DEFAULT: enter only when flip prob < this
-END_STOP_PFLIP = float(os.environ.get("END_STOP_PFLIP", "0.05"))    # DREW-DEFAULT: mechanics stop — exit if flip prob rises above this
-END_SIGMA_ANNUAL = float(os.environ.get("END_SIGMA_ANNUAL", "0.45"))  # DREW-DEFAULT: annualized index vol dial
-END_KELLY_DIV = float(os.environ.get("END_KELLY_DIV", "20"))        # DREW-DEFAULT: flat 1/20-Kelly (never laddered)
-END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # DREW-DEFAULT: HARD cap 1% of bankroll
-END_JUMP_MULT = float(os.environ.get("END_JUMP_MULT", "2.5"))       # DREW-DEFAULT: jump-padding multiplier on p_flip
+# WO-END-1 REWRITE (Drew 2026-10-18): COST IS THE SIGNAL. The p_flip Gaussian
+# model is retired — a favorite pinned at 95-99c for a required number of
+# consecutive reads (the confirm ladder) IS proof the market is solved. No
+# probability model, no running-average feed in the decision. See lane_end.py.
+END_WINDOW_S = float(os.environ.get("END_WINDOW_S", "180"))         # DREW-DEFAULT: ENTER only in the final 180 s (live .env sets 240)
+END_WATCH_WINDOW_S = float(os.environ.get("END_WATCH_WINDOW_S", "900"))  # DREW-DEFAULT: watch/confirm may begin up to T-900
+END_CANCEL_BEFORE_EXPIRY_S = float(os.environ.get("END_CANCEL_BEFORE_EXPIRY_S", "10"))  # DREW-DEFAULT: no new entry inside the final 10 s
+END_PRICE_FLOOR = int(os.environ.get("END_PRICE_FLOOR", "95"))      # DREW-DEFAULT: favorite cost-band floor, cents
+END_PRICE_CAP = int(os.environ.get("END_PRICE_CAP", "99"))          # DREW-DEFAULT: cost-band cap — 95-99c IS the solved band
+END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # DREW-DEFAULT: SOFT per-position target 1% (never blocks a bet)
+
+# The CONFIRM LADDER (ported from the certified K-worker engine, CONFIRM_LADDER):
+# deeper into the window -> a HIGHER floor but FEWER confirms. A market is
+# "solved" (qualifies for entry) only when its favorite has held the tier's
+# floor, in-band (95-99c), same side, with live counterparty, for >= `confirms`
+# consecutive reads. Each dict: the seconds window [lo,hi), the cost floor, and
+# the consecutive-read count required. The deepest tier (floor 97/3 confirms)
+# also governs the final entry window (secs_left < its lo).
+END_CONFIRM_LADDER = [
+    {"lo_sec": 600, "hi_sec": 900, "floor_cents": 99, "confirms": 9},
+    {"lo_sec": 300, "hi_sec": 600, "floor_cents": 98, "confirms": 6},
+    {"lo_sec": 180, "hi_sec": 300, "floor_cents": 97, "confirms": 3},
+]
+
+# ── RETIRED knobs (the Gaussian p_flip model) ────────────────────────
+# Left DEFINED so the boot-tape knob dump and any env overrides stay harmless,
+# but NO LONGER READ by the decision — cost is the signal, not a flip model.
+END_MAX_PFLIP = float(os.environ.get("END_MAX_PFLIP", "0.02"))      # RETIRED 2026-10-18 (no longer read)
+END_STOP_PFLIP = float(os.environ.get("END_STOP_PFLIP", "0.05"))    # RETIRED 2026-10-18 (no longer read)
+END_SIGMA_ANNUAL = float(os.environ.get("END_SIGMA_ANNUAL", "0.45"))  # RETIRED 2026-10-18 (no longer read)
+END_KELLY_DIV = float(os.environ.get("END_KELLY_DIV", "20"))        # RETIRED 2026-10-18 (reference/telemetry only)
+END_JUMP_MULT = float(os.environ.get("END_JUMP_MULT", "2.5"))       # RETIRED 2026-10-18 (no longer read)
 
 END_KNOB_TAGS: dict = {}
 
