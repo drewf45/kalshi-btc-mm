@@ -298,6 +298,39 @@ def test_on_battery_pages_and_stops_entries_then_ac_resumes(tmp_path):
     failures._alert_fn = None
 
 
+def test_shadow_allow_battery_keeps_entries_alive_on_battery(tmp_path, monkeypatch, caplog):
+    # Drew 2026-10-17: test/collect on battery without the AC leash. In SHADOW
+    # with SHADOW_ALLOW_BATTERY on, battery does NOT halt entries; it pages ONCE.
+    monkeypatch.setattr(config, "RUN_MODE", "SHADOW")
+    monkeypatch.setattr(config, "SHADOW_ALLOW_BATTERY", True)
+    e = _engine(tmp_path, name="c6_batt_bypass.db")
+    with caplog.at_level("WARNING"):
+        e.check_power(lambda: "Now drawing from 'Battery Power'")
+        # entries CONTINUE — the halt is never added
+        assert "ON_BATTERY" not in e.gateway.entries_halted_for("ROT")
+        assert "ON_BATTERY_BYPASS" in caplog.text
+        # notice is once-per-boot, not every cycle
+        e.check_power(lambda: "Now drawing from 'Battery Power'")
+    assert "ON_BATTERY" not in e.gateway.entries_halted_for("ROT")
+    assert caplog.text.count("ON_BATTERY_BYPASS") == 1
+    assert e._battery_bypass_logged is True
+    failures._ledger = None
+    failures._alert_fn = None
+
+
+def test_live_always_halts_on_battery_even_if_bypass_flag_set(tmp_path, monkeypatch):
+    # The bypass is SHADOW-only. In LIVE the ON_BATTERY halt is enforced no
+    # matter what SHADOW_ALLOW_BATTERY says — a dying laptop never carries risk.
+    monkeypatch.setattr(config, "RUN_MODE", "LIVE")
+    monkeypatch.setattr(config, "SHADOW_ALLOW_BATTERY", True)
+    e = _engine(tmp_path, name="c6_live_batt.db")
+    e.check_power(lambda: "Now drawing from 'Battery Power'")
+    assert "ON_BATTERY" in e.gateway.entries_halted_for("ROT")
+    assert not any("ON_BATTERY_BYPASS" in s for s in e.sent)
+    failures._ledger = None
+    failures._alert_fn = None
+
+
 def test_boot_tape_prints_the_power_line(tmp_path, capsys):
     _engine(tmp_path)
     assert "POWER:" in capsys.readouterr().out

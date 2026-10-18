@@ -758,6 +758,17 @@ EXPECTED_MAKER_FEE_SERIES = frozenset()  # series currently designated as maker-
 SHADOW_PAPER_BANKROLL_USD = float(os.environ.get("SHADOW_PAPER_BANKROLL_USD", "50.0"))
 
 # ---------------------------------------------------------------------------
+# RULED 2026-10-17 (Drew): allow the desk to trade ON BATTERY — so we can test
+# and collect shadow data without being chained to AC. This is a SHADOW-ONLY
+# bypass of the ON_BATTERY entry halt: it is read ONLY when RUN_MODE=="SHADOW"
+# (see check_power). In LIVE the battery halt is ALWAYS enforced regardless of
+# this flag — a laptop on a dying battery must never carry real risk. The real
+# risk on battery is the lid-close/sleep gap (on_wake halts + reconciles on
+# wake), which still protects both modes.
+# ---------------------------------------------------------------------------
+SHADOW_ALLOW_BATTERY = os.environ.get("SHADOW_ALLOW_BATTERY", "").strip().lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
 # Storage — single-writer law (§A1): this engine's OWN database, never the
 # live surface DB.
 # ---------------------------------------------------------------------------

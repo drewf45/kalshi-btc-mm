@@ -204,6 +204,7 @@ class ShadowEngine:
                                 deploy_cap_fn=self._rot_deploy_cap,
                                 on_runaway=self._rot_runaway)
         self._band_stats_cache = {}
+        self._battery_bypass_logged = False  # SHADOW_ALLOW_BATTERY notice: once/boot
         # WO-END-1: Lane B (end-game pile-on). Shares the SAME gateway, ledger
         # and pager as ROT — no parallel account path. OFF by default
         # (config.END_ENABLED False) => its step() is a hard no-op and the desk
@@ -1940,6 +1941,24 @@ class ShadowEngine:
         lifted on AC). Not a Mac / unreadable: nothing changes."""
         src = self.power_source(run)
         if src is None:
+            return
+        # SHADOW-ONLY battery bypass (Drew 2026-10-17): test/collect data on
+        # battery without the AC leash. NEVER honored in LIVE — a laptop on a
+        # dying battery must not carry real risk. If the bypass is on and we
+        # had previously halted (e.g. flag flipped at runtime), lift it.
+        if (src != "AC Power" and config.RUN_MODE == "SHADOW"
+                and config.SHADOW_ALLOW_BATTERY):
+            if self.POWER_HALT in self.ledger.entry_halts:
+                self.ledger.entry_halts.discard(self.POWER_HALT)
+            if not self._battery_bypass_logged:
+                self._battery_bypass_logged = True
+                from . import failures
+                failures.fail("ON_BATTERY_BYPASS",
+                              f"Mac is on {src} — SHADOW_ALLOW_BATTERY is ON, so "
+                              "entries CONTINUE (SHADOW only; lid-close/sleep still "
+                              "halts+reconciles via on_wake). LIVE always halts on "
+                              "battery.",
+                              alert=True, power=src)
             return
         if src != "AC Power":
             if self.POWER_HALT not in self.ledger.entry_halts:
