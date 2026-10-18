@@ -16,8 +16,8 @@ HOW "DECIDED" IS MEASURED, stdlib only, no new feed
   leash). This is the purest "how decided is this?" signal and needs nothing
   the inside loop does not already read every cycle.
 
-  Optionally, when a strike + running-60s-average feed is available (the Lane B
-  odds engine, lane_end.flip_probability), the caller can pass a model p_flip
+  Optionally, when a strike + running-60s-average feed is available (a caller's
+  own odds engine; Lane END no longer ships one — cost is its signal), a model p_flip
   for the held side and we take the MORE PESSIMISTIC of the two (max lose_prob)
   — the model catches a near-expiry average sitting on the line that the quote
   has not yet repriced. Absent that feed, the quote alone drives the leash.
