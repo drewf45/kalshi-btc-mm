@@ -2100,6 +2100,16 @@ class ShadowEngine:
                 self.surface.write_row("ROT", m, self._window_of.setdefault(m, f"w-{m}"),
                                        "WATCHING", transport=self.transport_label(),
                                        detail=code)
+        # WO-END-1: Lane B was INVISIBLE — its verdicts live only in-memory and
+        # were never surfaced, so the DB/log showed nothing and we couldn't tell
+        # which gate blocked every entry. Mirror ROT: write each END verdict to
+        # surface_rows so the blocking gate is queryable per market.
+        if config.END_ENABLED:
+            for m, code in self.end.verdicts.items():
+                if m in self.market_meta:
+                    self.surface.write_row("END", m, self._window_of.setdefault(m, f"w-{m}"),
+                                           "WATCHING", transport=self.transport_label(),
+                                           detail=code)
         return out
 
     def _rot_trip_closed(self, t, settle_count, spot_move) -> None:
