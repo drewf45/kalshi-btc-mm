@@ -393,6 +393,40 @@ def test_one_contract_floor_when_cash_can_afford_a_lot(env, ledger):
     assert size is None and why == le.SKIP_NO_CASH        # cannot afford a lot
 
 
+# ════════════════════ WO-END-2 — the settle-tape must not crash on EndTrip ════
+# REGRESSION: shadow_runner._end_trip_closed read t.approx_avg (a p_flip-era ROT
+# field). EndTrip has no such field, so EVERY END settlement raised
+# AttributeError -> END_TRIP_TAPE_FAILED -> no settlement row -> no P&L. The
+# shared settle-tape line must be attribute-safe for the cost-is-signal EndTrip.
+
+def test_settle_tape_line_survives_an_endtrip(monkeypatch):
+    from relay_engine import shadow_runner, config as cfg
+    from relay_engine.lane_end import EndTrip
+
+    class _Tg:
+        def __init__(self): self.lines = []
+        def alert(self, s): self.lines.append(s)
+
+    # a bound call of the REAL method on a minimal carrier (only the attrs the
+    # tape line touches) — this is exactly the path that crashed in production.
+    carrier = type("C", (), {})()
+    carrier.telegram = _Tg()
+    monkeypatch.setattr(cfg, "RUN_MODE", "SHADOW")
+
+    t = EndTrip(market="KXBTC15M-X", event="KXBTC15M-X", series="KXBTC15M",
+                underlying="BTC", side="yes", cost=97, size=Decimal(1),
+                close_ts=10.0, strike=100000.0, entry_oid="o1", entry_ts=0.0,
+                confirms=3, tier_confirms=3)
+    t.closed_path = "SETTLE"; t.filled = Decimal(1)
+    t.fill_ts = 1.0; t.closed_ts = 9.0
+
+    # must NOT raise AttributeError on approx_avg (the bug) and must emit one line
+    shadow_runner.ShadowEngine._end_trip_closed(carrier, t)
+    assert len(carrier.telegram.lines) == 1
+    assert "END SETTLE KXBTC15M-X" in carrier.telegram.lines[0]
+    assert "(avg APPROX)" not in carrier.telegram.lines[0]   # EndTrip => no approx flag
+
+
 # ════════════════════ (f) ride to settlement (no p_flip stop) ════
 
 def test_favorite_held_to_the_bell_settles(env):

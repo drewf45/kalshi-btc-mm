@@ -2305,7 +2305,11 @@ class ShadowEngine:
         existing fills/settlement sweeps like any other gateway position."""
         live = config.live_submit_enabled() and not t.shadow_only
         gh = "👻 " if not live else ""
-        approx = " (avg APPROX)" if t.approx_avg else ""
+        # WO-END-2 fix: EndTrip has no approx_avg (a p_flip-era ROT field ripped
+        # out of the cost-is-signal lane). This settle-tape line is shared by both
+        # trip types; reading t.approx_avg raised AttributeError on EVERY END
+        # settlement -> END_TRIP_TAPE_FAILED -> no settlement row -> no P&L.
+        approx = " (avg APPROX)" if getattr(t, "approx_avg", False) else ""
         held_s = (t.closed_ts or time.time()) - (t.fill_ts or t.entry_ts)
         self.telegram.alert(
             f"{gh}🏁 END {t.closed_path} {t.market} {t.side} {t.cost}¢ "
