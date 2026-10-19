@@ -75,7 +75,8 @@ SKIP_NO_COUNTERPARTY = "SKIP_NO_COUNTERPARTY"  # one-sided book (R2: counterpart
 SKIP_UNCONFIRMED = "SKIP_UNCONFIRMED"    # in-band but confirm count below the tier's floor
 SKIP_SIZE = "SKIP_SIZE"                  # sizing could not produce a lot
 SKIP_HELD = "SKIP_HELD"                  # already in this market (any lane)
-SKIP_NO_BOOK = "SKIP_NO_BOOK"            # no book this read
+SKIP_NO_BOOK = "SKIP_NO_BOOK"            # no book this read (and no usable record touch)
+SKIP_STALE_RECORD = "SKIP_STALE_RECORD"  # record touch too old to trust (no live book)
 SKIP_NO_QUOTE = "SKIP_NO_QUOTE"          # book has no two-sided touch
 SKIP_ENTERED_BEFORE = "SKIP_ENTERED_BEFORE"  # one entry per market, ever
 SKIP_NO_CASH = "SKIP_NO_CASH"            # spendable cash < cost
@@ -211,6 +212,37 @@ class EndGameDesk:
             if m == market and net:
                 return True
         return any(o.market == market for o in self.gateway.resting.values())
+
+    # ── WO-END-2: the record-touch book (no live WS snapshot needed) ──────
+    def _record_book(self, market: str, m: dict, now: float
+                     ) -> Tuple[Optional[OrderBook], Optional[str]]:
+        """Synthesize a touch-only OrderBook from the market RECORD's published
+        touch (rec_yes_bid / rec_yes_ask, cents, YES terms) — the SAME oracle ROT
+        uses. Returns (book, None) on a usable fresh touch, (None, SKIP_code) when
+        the record can't produce a two-sided touch or is stale. NO live book is
+        required; this is what lets END pile onto every active room, not only the
+        handful the WS feed fully snapshots. The synthesized book carries one lot
+        per touched side, which is all favorite()/has_counterparty() read — the
+        confirm ladder's repeated reads supply the dwell/fill reality."""
+        if not config.END_USE_RECORD_TOUCH:
+            return None, SKIP_NO_BOOK
+        yb = m.get("rec_yes_bid")           # YES bid, cents
+        ya = m.get("rec_yes_ask")           # YES ask, cents
+        cap = m.get("rec_captured_ts")
+        if yb is None or ya is None:
+            return None, SKIP_NO_BOOK
+        if cap is not None and (now - float(cap)) > config.END_RECORD_MAX_AGE_S:
+            return None, SKIP_STALE_RECORD
+        nb = 100 - int(ya)                  # NO bid = 100 - YES ask (book.py convention)
+        b = OrderBook(market=market)
+        yes_bids = {int(yb): 1} if 0 < int(yb) < 100 else {}
+        no_bids = {int(nb): 1} if 0 < int(nb) < 100 else {}
+        if not yes_bids and not no_bids:
+            return None, SKIP_NO_QUOTE
+        b.apply_snapshot(yes_bids, no_bids, float(cap or now))
+        if b.poisoned or not b.coherent():  # a record that can't form a real touch
+            return None, SKIP_NO_QUOTE
+        return b, None
 
     # ── the favorite: the richest side of the book (COST IS THE SIGNAL) ──
     def favorite(self, book: OrderBook) -> Tuple[Optional[str], Optional[int]]:
@@ -454,9 +486,14 @@ class EndGameDesk:
             return None
 
         if book is None:
-            self.verdicts[market] = SKIP_NO_BOOK
-            self._confirm_reset(market)
-            return None
+            # WO-END-2: no live WS snapshot — fall back to the record touch (the
+            # oracle ROT uses), so END sees every active room, not only the few
+            # the feed fully snapshots. A stale/absent record is the real skip.
+            book, why = self._record_book(market, m, now)
+            if book is None:
+                self.verdicts[market] = why or SKIP_NO_BOOK
+                self._confirm_reset(market)
+                return None
         side, cost = self.favorite(book)
         if side is None or cost is None:
             self.verdicts[market] = SKIP_NO_QUOTE

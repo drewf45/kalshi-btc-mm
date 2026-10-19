@@ -95,6 +95,7 @@ SKIP_ENTRIES_HALTED = "SKIP_ENTRIES_HALTED"
 SKIP_WALL = "SKIP_WALL"                    # the gateway refused it (wall named)
 SKIP_ENTERED_BEFORE = "SKIP_ENTERED_BEFORE"  # RULED 2026-10-15: entered once = never again
 SKIP_REGIME = "SKIP_REGIME"                # WO-ROT-REGIME-1: underlying TURBULENT — stand aside on NEW entries (exits never gated)
+SKIP_ENTRIES_OFF = "SKIP_ENTRIES_OFF"      # WO-END-2: ROT_ENTRIES_ENABLED is OFF — watch/tape only, no new entries (exits still run)
 
 # exit paths (rot_trips.exit_path in Chunk 7)
 TARGET, SOFT_STOP, HARD_STOP, TIME_STOP, LATE, SETTLE = (
@@ -944,6 +945,12 @@ class RotationDesk:
             self._try_enter(c, now, books.get(c.market))
 
     def _try_enter(self, c: Candidate, now: float, book: Optional[OrderBook]) -> bool:
+        # WO-END-2 (Drew 2026-10-19): ROT is watch/tape-only — it may NOT place
+        # new entries (END is the only trusted lane). Exits/settlement on any
+        # already-open trip run through inside()/_fire_cut, untouched by this gate.
+        if not config.ROT_ENTRIES_ENABLED:
+            self.verdicts[c.market] = SKIP_ENTRIES_OFF
+            return False
         if book is None:
             self.verdicts[c.market] = SKIP_NO_BOOK
             return False

@@ -94,6 +94,17 @@ class Env:
         b.apply_snapshot(yb, nb, ts=ts)
         self.books[ticker] = b
 
+    def record_market(self, ticker, yes_bid, yes_ask, close_in=45.0, rec_age=0.0,
+                      strike=STRIKE, now=T):
+        """WO-END-2: a market with a RECORD touch (rec_yes_bid/ask) but NO live
+        book in the books dict — the coverage-room reality END must handle. The
+        record was captured `rec_age` seconds ago."""
+        self.meta[ticker] = {"close_ts": now + close_in, "boundary_lo": strike,
+                             "rec_yes_bid": yes_bid, "rec_yes_ask": yes_ask,
+                             "rec_captured_ts": now - rec_age}
+        self.strike[ticker] = strike
+        # deliberately DO NOT add to self.books
+
     def step(self, now=T):
         self.desk.step(now, dict(self.books), self.meta)
 
@@ -469,3 +480,52 @@ def test_shadow_only_when_no_live_feed(env, monkeypatch):
     o = env.gateway.order_index[t.entry_oid]
     assert o.shadow_only is True
     assert "SHADOW-ONLY" in o.why
+
+
+# ════════════════════ (WO-END-2) the record-touch fallback ════════
+# END was 100% SKIP_NO_BOOK on live coverage because it demanded a full WS book
+# most rooms never get. It must fall back to the market RECORD's touch (the
+# oracle ROT uses) so it sees every active room — else the lane is dead.
+
+def test_record_touch_feeds_the_favorite_when_no_live_book(env, monkeypatch):
+    monkeypatch.setattr(config, "END_USE_RECORD_TOUCH", True)
+    m = mk("KXBTC15M", 1)
+    # a decided 97c YES favorite, known ONLY from the record (no live book)
+    env.record_market(m, 97, 99, close_in=45, rec_age=0.0)
+    assert m not in env.books                      # no live snapshot at all
+    env.confirm_and_step(T)
+    t = env.trip(m)
+    assert t is not None, "END must enter from the record touch, not SKIP_NO_BOOK"
+    assert (t.side, t.cost) == ("yes", 97)
+
+
+def test_stale_record_is_skipped_not_entered(env, monkeypatch):
+    monkeypatch.setattr(config, "END_USE_RECORD_TOUCH", True)
+    monkeypatch.setattr(config, "END_RECORD_MAX_AGE_S", 15.0)
+    m = mk("KXBTC15M", 1)
+    env.record_market(m, 97, 99, close_in=45, rec_age=60.0)   # touch is 60s old
+    env.confirm_and_step(T)
+    assert env.trip(m) is None
+    assert env.desk.verdicts[m] == le.SKIP_STALE_RECORD
+
+
+def test_record_touch_off_falls_back_to_no_book(env, monkeypatch):
+    monkeypatch.setattr(config, "END_USE_RECORD_TOUCH", False)
+    m = mk("KXBTC15M", 1)
+    env.record_market(m, 97, 99, close_in=45, rec_age=0.0)
+    env.confirm_and_step(T)
+    assert env.trip(m) is None
+    assert env.desk.verdicts[m] == le.SKIP_NO_BOOK
+
+
+def test_live_book_still_wins_over_record_when_present(env, monkeypatch):
+    monkeypatch.setattr(config, "END_USE_RECORD_TOUCH", True)
+    m = mk("KXBTC15M", 1)
+    # live book says NO-rich (yes_bid 2 / yes_ask 4 => no_bid 96); record would
+    # say YES 97. The live book must govern — the record is only the fallback.
+    env.market(m, 2, 4, close_in=45)               # adds a LIVE book
+    env.meta[m]["rec_yes_bid"] = 97
+    env.meta[m]["rec_yes_ask"] = 99
+    env.meta[m]["rec_captured_ts"] = T
+    side, cost = env.desk.favorite(env.books[m])
+    assert (side, cost) == ("no", 96)              # from the live book, not the record

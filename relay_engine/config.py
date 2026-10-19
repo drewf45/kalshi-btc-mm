@@ -1219,6 +1219,11 @@ ROT_POSITION_PCT = 0.05          # RULED 2026-10-14: one position = 5% of book
 ROT_DEPLOY_CAP_PCT = 0.50        # DREW-DEFAULT: open positions + resting entries ≤ 50%
 ROT_MARKET_CAP_PCT = 0.05        # DREW-DEFAULT: one market ≤ 5%
 ROT_GROUP_CAP_PCT = 0.25         # DREW-DEFAULT: one underlying group ≤ 25%
+# WO-END-2 (Drew 2026-10-19): Drew does not trust any lane but END. ROT keeps
+# WATCHING and logging its tape (for comparison) but is BARRED from placing new
+# entries. Exits/settlement on any already-open trip still run. Default ON to
+# preserve behavior for other checkouts; the live desk sets this to 0.
+ROT_ENTRIES_ENABLED = os.environ.get("ROT_ENTRIES_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 ROT_ENTRY_BAND = (40, 54)        # DREW-DEFAULT: entry cost band, cents inclusive
 ROT_TARGET_CENTS = int(os.environ.get("ROT_TARGET_CENTS", "3"))   # RULED 2026-10-16: small measured win (+3), scale contracts not target
 ROT_STOP_CENTS = int(os.environ.get("ROT_STOP_CENTS", "4"))       # RULED 2026-10-16: soft stop at bid ≤ entry − 4 (disciplined, not insta-cut)
@@ -1338,6 +1343,16 @@ END_WATCH_WINDOW_S = float(os.environ.get("END_WATCH_WINDOW_S", "900"))  # DREW-
 END_CANCEL_BEFORE_EXPIRY_S = float(os.environ.get("END_CANCEL_BEFORE_EXPIRY_S", "10"))  # DREW-DEFAULT: no new entry inside the final 10 s
 END_PRICE_FLOOR = int(os.environ.get("END_PRICE_FLOOR", "95"))      # DREW-DEFAULT: favorite cost-band floor, cents
 END_PRICE_CAP = int(os.environ.get("END_PRICE_CAP", "99"))          # DREW-DEFAULT: cost-band cap — 95-99c IS the solved band
+# WO-END-2 (Drew 2026-10-19): END was blind — it demanded a full WS order-book
+# snapshot that most coverage rooms never get, so it logged 100% SKIP_NO_BOOK and
+# never reached the gate. ROT reads the market RECORD's own published touch
+# (rec_yes_bid/rec_yes_ask) instead of a live book. Mirror that: when END has no
+# live book, synthesize a touch-only book from the record so cost-is-signal runs
+# across every active room. ON by default (the whole lane is dead without it).
+END_USE_RECORD_TOUCH = os.environ.get("END_USE_RECORD_TOUCH", "1").strip().lower() in ("1", "true", "yes")
+# A record touch older than this is STALE — don't pile on a decided favorite
+# whose price we last saw too long ago. Matches the orientation staleness spirit.
+END_RECORD_MAX_AGE_S = float(os.environ.get("END_RECORD_MAX_AGE_S", "15"))
 END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # DREW-DEFAULT: SOFT per-position target 1% (never blocks a bet)
 
 # The CONFIRM LADDER (ported from the certified K-worker engine, CONFIRM_LADDER):

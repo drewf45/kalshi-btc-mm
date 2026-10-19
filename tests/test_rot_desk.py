@@ -1050,3 +1050,23 @@ def test_a_fill_between_reads_is_never_counted_twice(env):
     before = env.desk.exposure()[0]
     env.fill(t.entry_oid)                      # booked by the sweep, desk not yet read
     assert env.desk.exposure()[0] == before    # same money, now held instead of resting
+
+
+# ════════════════════ WO-END-2 — ROT entries barred (watch-only) ════════
+# Drew 2026-10-19: he trusts only the END lane. ROT keeps watching/logging its
+# tape but may NOT place new entries. Exits on an open trip still run.
+
+def test_rot_entries_off_bars_new_entries_but_keeps_the_tape(env, monkeypatch):
+    monkeypatch.setattr(config, "ROT_ENTRIES_ENABLED", False)
+    m = mk("KXBTC15M", 1)
+    env.market(m, 46, 48)                      # a textbook ROT entry otherwise
+    env.step()
+    assert m not in env.desk.trips             # NOTHING placed
+    assert not env.resting(m)
+    assert env.desk.verdicts[m] == lr.SKIP_ENTRIES_OFF   # but the tape still logs it
+
+
+def test_rot_entries_on_by_default_still_enters(env):
+    # the flag defaults ON; the canonical entry path is unchanged.
+    t = enter_and_fill(env, mk("KXBTC15M", 1))
+    assert t is not None
