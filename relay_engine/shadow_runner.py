@@ -2045,6 +2045,25 @@ class ShadowEngine:
         out = sorted(inside)
         rank = list(self.rot.shortlist) + sorted(self.book_shortlist - set(self.rot.shortlist))
         out += [m for m in rank if m in self.market_meta and m not in inside]
+        # WO-END-4 (Drew 2026-10-19): END is the ONLY trusted lane, but the
+        # ROTATION poll set above is built around ROT's held/resting/shortlist —
+        # END's end-of-market rooms (in the 95-99c band, nowhere near ROT's 40-54c
+        # shortlist) were never polled, so END ran blind on exactly the markets it
+        # must pile onto. Give END its OWN poll horizon: every admitted room inside
+        # its watch window gets a live book, independent of ROT. Drew: "the lane
+        # has to turn on, orient, SEE the orderbook, calc orderbook vs spot."
+        if config.END_ENABLED:
+            now = time.time()
+            already = set(out)
+            for m, meta in self.market_meta.items():
+                if m in already:
+                    continue
+                cts = meta.get("close_ts")
+                if cts is None:
+                    continue
+                secs_left = float(cts) - now
+                if 0 < secs_left <= config.END_WATCH_WINDOW_S:
+                    out.append(m)
         return out
 
     def rest_poll_all(self, client, now=None) -> int:

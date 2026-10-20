@@ -49,6 +49,26 @@ def test_cycle_census_clean_and_zero_orders():
     assert engine.gateway.resting == {}
 
 
+def test_end_in_window_rooms_join_the_book_poll_set(monkeypatch):
+    """WO-END-4 (Drew 2026-10-19): in ROTATION the poll set was built around ROT's
+    held/resting/shortlist, so END's end-of-market rooms never got a live book —
+    END ran blind on exactly the markets it must pile onto. Now every admitted
+    room inside END's watch window joins the poll set independent of ROT."""
+    monkeypatch.setattr(config, "DESK_MODE", "ROTATION")
+    monkeypatch.setattr(config, "END_ENABLED", True)
+    monkeypatch.setattr(config, "END_WATCH_WINDOW_S", 600.0)
+    engine = ShadowEngine(db_path=":memory:")
+    engine.boot()
+    import time as _t
+    now = _t.time()
+    # one room INSIDE the watch window (480s left), one OUTSIDE (far out)
+    engine.market_meta["KXBTC15M-IN"] = {"close_ts": now + 480}
+    engine.market_meta["KXETH15M-OUT"] = {"close_ts": now + 5000}
+    poll = set(engine.book_poll_set())
+    assert "KXBTC15M-IN" in poll          # END's in-window room is polled
+    assert "KXETH15M-OUT" not in poll     # the too-early room is not
+
+
 def test_daily_pack_renders_per_lane_sections():
     engine = ShadowEngine(db_path=":memory:")
     engine.boot()
