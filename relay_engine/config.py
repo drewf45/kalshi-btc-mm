@@ -349,7 +349,14 @@ AT_RISK_CAP_CENTS = AT_RISK_CAP_MULT * ONE_LOT_MAX_LOSS_CENTS  # legacy flat cap
 # AT_RISK_PCT["FLIP"]→0.05; OPEN_SIGHTED_STOP=0. The wall must not silently stay
 # loose after the experiment ends.
 AT_RISK_PCT = {"F": 0.30, "H8": 0.05, "FLIP": 0.18, "D": 0.02, "P": 0.02,
-               "ROT": 0.05, "END": 0.50}   # WO-ROT-1 C3 §4: ROT at the market cap (ROT_MARKET_CAP_PCT)  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
+               "ROT": 0.05, "END": 0.12}   # WO-ROT-1 C3 §4: ROT at the market cap (ROT_MARKET_CAP_PCT)  # WO-L P2: F wall 0.25→0.30 (dial 0.24 stays 80% of wall)
+# WO-END-3 (Drew 2026-10-19): END per-market wall 0.50 -> 0.12. The old 0.50 let
+# one room take HALF the book, which (a) violates Drew's core doctrine — "spread
+# all your money across all the markets, they can't all reverse at once; that's
+# how you survive the 5% that go wrong" — and (b) made every single slice trip the
+# 40% EVENT_TOTAL_AT_RISK page. At 0.12 of a $50 book (~$6/market) up to ~8 rooms
+# fill and no single market dominates; the equal-split sizer still splits cash
+# across the qualifying rooms, this wall just caps any one of them.
 # END per-market wall = 0.50 (Drew 2026-10-17): the END SIZER is the binding
 # constraint now, not this wall — Lane B equal-splits available cash across the
 # qualifying markets this cycle (never all-in on one), so a single market only
@@ -1338,8 +1345,14 @@ def end_series_for(admitted_info: dict) -> frozenset:
 # model is retired — a favorite pinned at 95-99c for a required number of
 # consecutive reads (the confirm ladder) IS proof the market is solved. No
 # probability model, no running-average feed in the decision. See lane_end.py.
-END_WINDOW_S = float(os.environ.get("END_WINDOW_S", "180"))         # DREW-DEFAULT: ENTER only in the final 180 s (live .env sets 240)
-END_WATCH_WINDOW_S = float(os.environ.get("END_WATCH_WINDOW_S", "900"))  # DREW-DEFAULT: watch/confirm may begin up to T-900
+# WO-END-3 (Drew 2026-10-19): "the ONLY time that matters is the last 5 minutes;
+# everything before is garbage noise. Orient at the 5-min mark, read orderbook vs
+# spot, and once a favorite reaches 95c you're IN — no point waiting 95->99."
+# Branch mining: every end-game/K-worker lineage used entry=180 / watch=900; the
+# MIDDLE GROUND between that and Drew's stated 5-min orient is entry=300 (enter any
+# time in the last 5 min once solved) / watch=600 (orient at T-10m, ignore earlier).
+END_WINDOW_S = float(os.environ.get("END_WINDOW_S", "300"))         # ENTER in the final 5 min once the favorite is solved (95c+)
+END_WATCH_WINDOW_S = float(os.environ.get("END_WATCH_WINDOW_S", "600"))  # orient/confirm may begin at T-10m; pre-that is noise
 END_CANCEL_BEFORE_EXPIRY_S = float(os.environ.get("END_CANCEL_BEFORE_EXPIRY_S", "10"))  # DREW-DEFAULT: no new entry inside the final 10 s
 END_PRICE_FLOOR = int(os.environ.get("END_PRICE_FLOOR", "95"))      # DREW-DEFAULT: favorite cost-band floor, cents
 END_PRICE_CAP = int(os.environ.get("END_PRICE_CAP", "99"))          # DREW-DEFAULT: cost-band cap — 95-99c IS the solved band
@@ -1370,10 +1383,14 @@ END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # 
 # to be watching before the final window, but late-orient almost always lands in
 # the deepest tier — which is the whole point. Raise the deepest floor back to 97
 # only if the 95-96c tail proves lossy in the shadow data.
+# WO-END-3: retuned to the "last 5 minutes is all that matters" doctrine +
+# the new 600/300 window. Orient tier (T-600..300): a favorite must be near-pinned
+# (98c) and hold longer (6 confirms) to count as solved this early — kills noise.
+# Final tier (T-300..0): once a favorite reaches the 95c band in the last 5 min,
+# act fast (3 confirms) — "no point waiting 95->99, might as well buy at 95."
 END_CONFIRM_LADDER = [
-    {"lo_sec": 600, "hi_sec": 900, "floor_cents": 99, "confirms": 9},
     {"lo_sec": 300, "hi_sec": 600, "floor_cents": 98, "confirms": 6},
-    {"lo_sec": 180, "hi_sec": 300, "floor_cents": 95, "confirms": 3},
+    {"lo_sec": 0,   "hi_sec": 300, "floor_cents": 95, "confirms": 3},
 ]
 
 # ── RETIRED knobs (the Gaussian p_flip model) ────────────────────────

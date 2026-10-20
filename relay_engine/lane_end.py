@@ -97,6 +97,14 @@ def _norm(d: Decimal):
     return int(d) if d == d.to_integral_value() else d
 
 
+def _clamp_touch(cents: int) -> int:
+    """WO-END-3: clamp a synthesized record touch into the TRADEABLE 1-99c range.
+    You can't buy a 100c contract (Kalshi YES+NO=$1: 100c means the counterparty
+    already holds the payout), so a 100c favorite IS a 99c tradeable bid. Sub-cent
+    dollar prices that floored to 0 are raised to 1c — a real, if thin, touch."""
+    return max(1, min(99, int(cents)))
+
+
 def _tier_for(secs_left: float) -> Optional[dict]:
     """The confirm-ladder tier governing this read, or None if too far out.
 
@@ -233,14 +241,24 @@ class EndGameDesk:
             return None, SKIP_NO_BOOK
         if cap is not None and (now - float(cap)) > config.END_RECORD_MAX_AGE_S:
             return None, SKIP_STALE_RECORD
-        nb = 100 - int(ya)                  # NO bid = 100 - YES ask (book.py convention)
+        # WO-END-3 (Drew 2026-10-19): at the END of a market the solved favorite
+        # sits at 99c with OFTEN NO counterparty ("no one will sell you the losing
+        # side when everyone knows the outcome") — and the venue record publishes
+        # sub-cent dollar prices (0.005 -> 0c after *100). The old filter dropped
+        # both near-edge sides -> SKIP_NO_QUOTE on the MOST-solved rooms (the whole
+        # point of the lane). Fix: CLAMP each side into the tradeable 1-99c range
+        # (a 100c NO favorite is really a 99c tradeable bid — you can't buy 100c,
+        # per Kalshi's YES+NO=$1 accounting), and KEEP the favorite side even when
+        # the counterparty side is absent. A true empty record is still SKIP.
+        yb = int(yb); ya = int(ya)
+        nb = 100 - ya                       # NO bid = 100 - YES ask (book.py convention)
         b = OrderBook(market=market)
-        yes_bids = {int(yb): 1} if 0 < int(yb) < 100 else {}
-        no_bids = {int(nb): 1} if 0 < int(nb) < 100 else {}
+        yes_bids = {_clamp_touch(yb): 1} if yb > 0 else {}
+        no_bids = {_clamp_touch(nb): 1} if nb > 0 else {}
         if not yes_bids and not no_bids:
             return None, SKIP_NO_QUOTE
         b.apply_snapshot(yes_bids, no_bids, float(cap or now))
-        if b.poisoned or not b.coherent():  # a record that can't form a real touch
+        if b.poisoned:                      # an incoherent record (yes+no>101)
             return None, SKIP_NO_QUOTE
         return b, None
 
@@ -504,8 +522,14 @@ class EndGameDesk:
             self.verdicts[market] = SKIP_PRICE
             self._confirm_reset(market)
             return None
-        # R2: a solved market shows a two-sided touch; a one-sided book resets.
-        if not self.has_counterparty(book, side):
+        # R2 — window-aware (Drew 2026-10-19): EARLY (orient tier, before the final
+        # entry window) a solved market still shows a two-sided touch, so a
+        # one-sided book is noise -> reset. But AT THE END a solved favorite at 99c
+        # OFTEN has NO counterparty ("no one sells you the losing side when everyone
+        # knows the outcome") — that absence is itself part of the solved signal, so
+        # inside the final entry window we do NOT reject a one-sided book.
+        in_final_window = secs_left <= config.END_WINDOW_S
+        if not in_final_window and not self.has_counterparty(book, side):
             self.verdicts[market] = SKIP_NO_COUNTERPARTY
             self._confirm_reset(market)
             return None
@@ -577,17 +601,19 @@ class EndGameDesk:
         if cost <= 0:
             return None, SKIP_SIZE
         step = Decimal(config.ROT_LOT_STEP)
-        one_lot_cents = int((step * Decimal(cost)).to_integral_value(
-            rounding="ROUND_CEILING"))      # cash a single lot actually costs
-        lots = (Decimal(max(0, budget_cents)) / Decimal(cost) / step
-                ).to_integral_value(rounding=ROUND_FLOOR)
-        if lots < 1:
-            # the slice is too thin for even one lot — honor the floor whenever
-            # spendable cash can cover a single lot at this price.
-            if spendable_cents >= one_lot_cents:
-                return (step * 1).quantize(step), ""
+        # WO-END-3 (Drew 2026-10-19): the FLOOR is ONE WHOLE CONTRACT — "if you are
+        # able to do one contract for a market then you should be able to bet
+        # that." One contract at `cost`c costs `cost` cents. The slice buys as many
+        # whole contracts as it affords; if the slice is thinner than one contract
+        # but spendable cash still covers one, take exactly one.
+        one_contract_cents = int(Decimal(cost))     # a whole contract's cash cost
+        contracts = (Decimal(max(0, budget_cents)) / Decimal(cost)
+                     ).to_integral_value(rounding=ROUND_FLOOR)
+        if contracts < 1:
+            if spendable_cents >= one_contract_cents:
+                return Decimal(1), ""               # the 1-contract floor
             return None, SKIP_NO_CASH
-        return (lots * step).quantize(step), ""
+        return (contracts).quantize(step), ""
 
     def _enter(self, market, series, info, side, cost, size, close_ts, strike,
                confirms, tier_confirms, now, book) -> bool:

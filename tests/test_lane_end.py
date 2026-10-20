@@ -259,19 +259,36 @@ def test_99c_is_in_band_now(env):
     assert t.cost == 99
 
 
-def test_one_sided_book_is_no_counterparty(env):
-    """R2 (the certified watch ladder): a solved favorite shows a two-sided touch.
-    A one-sided book (no counterparty bid) is SKIP_NO_COUNTERPARTY and resets."""
+def test_one_sided_book_is_no_counterparty_EARLY_only(env):
+    """WO-END-3 (Drew 2026-10-19): a one-sided book (no counterparty) is noise and
+    resets ONLY in the orient tier (before the final entry window). At the END a
+    solved favorite at 99c OFTEN has no counterparty — that absence is part of the
+    solved signal, so inside the final window it is NOT rejected. Here: place the
+    market in the ORIENT tier (secs_left > END_WINDOW_S) and drop the counterparty."""
     m = mk("KXBTC15M", 1)
-    env.market(m, 97, 99, close_in=45)
+    early = config.END_WINDOW_S + 120          # orient tier, outside the final window
+    # orient-tier floor is 98c, so use a 98c favorite (two-sided to start)
+    env.market(m, 98, 99, close_in=early)
     env.step(T)
     assert env.desk.confirm_state[m]["count"] == 1
     # the counterparty vanishes: no YES ask => no NO bid at all (one-sided)
-    env.book(m, 97, None)
+    env.book(m, 98, None)
     env.step(T)
     assert env.desk.verdicts[m] == le.SKIP_NO_COUNTERPARTY
     assert m not in env.desk.confirm_state
     assert m not in env.desk.trips
+
+
+def test_one_sided_book_allowed_in_the_final_window(env):
+    """WO-END-3: the flip side — inside the final entry window, a solved favorite
+    with NO counterparty bid is piled on anyway (the end-game norm), not skipped."""
+    m = mk("KXBTC15M", 1)
+    env.market(m, 97, 99, close_in=40)         # final window
+    # one-sided from the start: a 97c YES favorite, no NO bid (no yes ask)
+    env.book(m, 97, None)
+    env.confirm_and_step(T)
+    assert env.desk.verdicts.get(m) != le.SKIP_NO_COUNTERPARTY
+    assert m in env.desk.trips                 # it entered despite the one-sided book
 
 
 # ════════════════════ (d) window gating ════════════════════
@@ -321,12 +338,13 @@ def test_wide_gap_favorite_enters_and_sizes_count_first(env):
     assert (o.lane, o.purpose, o.action, o.side, o.price_cents) == ("END", "ENTRY", "buy", "yes", 97)
     assert o.band == (config.END_PRICE_FLOOR, config.END_PRICE_CAP)
     assert not o.crossfire and not o.ioc and not o.reduce_only
-    # single qualifier: slice = min(spendable, END per-market wall). On the $100
-    # book the END wall (AT_RISK_PCT["END"]=0.50) binds at 5000c, so
-    #   size = floor(5000 / 97 / 0.01) * 0.01 = 51.54 contracts.
-    wall = config.at_risk_cap_cents("END", env.desk.spendable_cents())  # 5000c
-    assert wall == 5000
-    assert t.size == Decimal("51.54")
+    # single qualifier: slice = min(spendable, END per-market wall). WO-END-3:
+    # the END wall is AT_RISK_PCT["END"]=0.12 (spread doctrine, not 0.50), so on
+    # the $100 book it binds at 1200c, and sizing is now WHOLE CONTRACTS:
+    #   size = floor(1200 / 97) = 12 contracts.
+    wall = config.at_risk_cap_cents("END", env.desk.spendable_cents())  # 1200c
+    assert wall == 1200
+    assert t.size == Decimal("12")
     # never over the per-market wall (never all-in on one market)
     assert float(t.size) * t.cost <= wall + 0.5
     assert "COST-IS-SIGNAL" in o.why and "confirms" in o.why
@@ -374,7 +392,10 @@ def test_one_contract_floor_when_cash_can_afford_a_lot(env, ledger):
     """The floor Drew named: 'if you are able to do one contract for market then
     you should be able to bet that.' A bankroll whose equal-split slice is thinner
     than a single lot STILL places one lot, as long as spendable cash covers it."""
-    ledger.baseline(300, confirmed_by="boot")             # $3 — thin
+    # WO-END-3: bankroll where the END per-market wall (0.12) still covers one
+    # contract — 0.12 * 1000c = 120c >= 97c. (At $3 the spread-wall itself is
+    # below one contract; that is the wall doing its job, not the floor failing.)
+    ledger.baseline(1_000, confirmed_by="boot")           # $10
     ledger.snapshot_caps_at_boot()
     m = mk("KXBTC15M", 1)
     env.market(m, 97, 99, close_in=45)
@@ -383,14 +404,13 @@ def test_one_contract_floor_when_cash_can_afford_a_lot(env, ledger):
     assert t is not None, env.desk.verdicts.get(m)
     assert float(t.size) >= 1                             # the 1-contract floor
 
-    # the floor is cash-honest: a zero slice still takes one lot when spendable
-    # cash covers a single lot, but SKIP_NO_CASH when it truly cannot. A lot is
-    # one ROT_LOT_STEP; at 97c a 0.01 step costs 1c (ceil of 0.97c).
-    step = config.ROT_LOT_STEP
-    size, why = env.desk._size(97, budget_cents=0, spendable_cents=1)
-    assert size == step and why == ""                     # floor fires: 1c ≥ 1c lot
-    size, why = env.desk._size(97, budget_cents=0, spendable_cents=0)
-    assert size is None and why == le.SKIP_NO_CASH        # cannot afford a lot
+    # WO-END-3: the floor is ONE WHOLE CONTRACT and cash-honest. A zero slice
+    # still takes one contract when spendable covers it (one contract at 97c =
+    # 97c), but SKIP_NO_CASH when spendable can't even cover one contract.
+    size, why = env.desk._size(97, budget_cents=0, spendable_cents=97)
+    assert size == Decimal(1) and why == ""               # floor fires: 97c ≥ 1 contract
+    size, why = env.desk._size(97, budget_cents=0, spendable_cents=96)
+    assert size is None and why == le.SKIP_NO_CASH        # cannot afford one contract
 
 
 # ════════════════════ WO-END-2 — the settle-tape must not crash on EndTrip ════
