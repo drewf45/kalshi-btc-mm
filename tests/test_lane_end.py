@@ -211,19 +211,26 @@ def test_confirm_counter_resets_on_side_flip(env):
     assert env.desk.confirm_state[m]["count"] == 1
 
 
-def test_confirm_counter_resets_when_favorite_drops_out_of_band(env):
-    # With the final-window floor == the band floor (95c, DREW 2026-10-18), a
-    # favorite that slips BELOW the band (out of 95-99) during the confirm run
-    # resets the counter: the "solved" proof is broken, so it re-qualifies from
-    # scratch. 97c builds two confirms, then a drop to 94c breaks it.
+def test_confirm_counter_debounces_then_resets_out_of_band(env):
+    # WO-END-7: a favorite that slips BELOW the band is a cost flicker — a SINGLE
+    # drop HOLDS the confirm count (debounce), only END_CONFIRM_MISS_TOLERANCE
+    # CONSECUTIVE drops zero it. 97c builds two confirms; one 94c drop holds the
+    # count at 2 (misses=1); sustained drops past tolerance finally clear it.
+    tol = config.END_CONFIRM_MISS_TOLERANCE
     m = mk("KXBTC15M", 1)
     env.market(m, 97, 99, close_in=45)
     env.step(T)
     env.step(T)
     assert env.desk.confirm_state[m]["count"] == 2
-    # favorite slips to 94c (below the 95c band floor) — reset, price-skip
+    # one drop to 94c (below the 95c floor): HELD, debounced
     env.book(m, 94, 96)
     env.step(T)
+    assert env.desk.verdicts[m] == le.SKIP_PRICE
+    assert env.desk.confirm_state[m]["count"] == 2        # count HELD
+    assert env.desk.confirm_state[m]["misses"] == 1
+    # sustained below-band past the tolerance finally clears the state
+    for _ in range(tol):
+        env.step(T)
     assert m not in env.desk.confirm_state
     assert env.desk.verdicts[m] == le.SKIP_PRICE
     assert m not in env.desk.trips
@@ -271,11 +278,16 @@ def test_one_sided_book_is_no_counterparty_EARLY_only(env):
     env.market(m, 98, 99, close_in=early)
     env.step(T)
     assert env.desk.confirm_state[m]["count"] == 1
-    # the counterparty vanishes: no YES ask => no NO bid at all (one-sided)
+    # the counterparty vanishes: no YES ask => no NO bid at all (one-sided).
+    # WO-END-7: a single miss is debounced (held); sustained past tolerance clears.
+    tol = config.END_CONFIRM_MISS_TOLERANCE
     env.book(m, 98, None)
     env.step(T)
     assert env.desk.verdicts[m] == le.SKIP_NO_COUNTERPARTY
-    assert m not in env.desk.confirm_state
+    assert env.desk.confirm_state[m]["count"] == 1        # HELD (debounced)
+    for _ in range(tol):
+        env.step(T)
+    assert m not in env.desk.confirm_state                # cleared past tolerance
     assert m not in env.desk.trips
 
 
@@ -445,6 +457,28 @@ def test_settle_tape_line_survives_an_endtrip(monkeypatch):
     assert len(carrier.telegram.lines) == 1
     assert "END SETTLE KXBTC15M-X" in carrier.telegram.lines[0]
     assert "(avg APPROX)" not in carrier.telegram.lines[0]   # EndTrip => no approx flag
+
+
+# ════════════════════ WO-END-7 — confirm debounce lets it ENTER through flicker
+
+def test_entry_survives_transient_misses_in_the_confirm_run(env):
+    """WO-END-7: the whole point — a solved favorite that FLICKERS (a transient
+    out-of-band / one-sided read every other cycle) must still accumulate its
+    confirms and ENTER. Before the debounce each flicker zeroed the counter and it
+    never reached the threshold → never submitted. Now a single miss is held."""
+    m = mk("KXBTC15M", 1)
+    env.market(m, 97, 99, close_in=45)          # solved 97c YES in the final window
+    # alternate: good, flicker(94c), good, flicker, good ... the debounce must
+    # carry the count through each single-cycle flicker to reach the 3 confirms.
+    for i in range(10):
+        if i % 2 == 1:
+            env.book(m, 94, 96)                 # transient out-of-band flicker
+        else:
+            env.book(m, 97, 99)                 # solved again
+        env.step(T)
+        if m in env.desk.trips:
+            break
+    assert m in env.desk.trips, f"never entered; verdict={env.desk.verdicts.get(m)}"
 
 
 # ════════════════════ (f) ride to settlement (no p_flip stop) ════

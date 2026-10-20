@@ -51,7 +51,9 @@ OFF BY DEFAULT: config.END_ENABLED is False => step() returns before touching an
   it (proven in tests/test_lane_end.py).
 """
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from decimal import ROUND_FLOOR, Decimal
 from typing import Callable, Dict, List, Optional, Tuple
@@ -62,6 +64,27 @@ from .errors import WallRejection
 from .gateway import Order
 
 log = logging.getLogger("relay.end")
+
+
+def _diag_write(rows: list) -> None:
+    """WO-END-7: append per-cycle END gate rows to a JSONL next to the heartbeat
+    (in-window markets only — few rows/cycle). Read it to see the exact live gate
+    path (secs_left, book source, favorite, confirm count, verdict). Best-effort;
+    a diag failure never touches the trade path. Rotates at ~8 MB."""
+    if not rows:
+        return
+    try:
+        path = os.path.join(os.path.dirname(config.HEARTBEAT_PATH), "end_diag.jsonl")
+        try:
+            if os.path.getsize(path) > 8_000_000:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+    except Exception:
+        pass
 
 LANE = "END"
 
@@ -187,8 +210,10 @@ class EndGameDesk:
         self.verdicts: Dict[str, str] = {}
         self.events: List[tuple] = []
         # The confirm ladder lives ACROSS cycles (step is called once per cycle,
-        # not a blocking poll loop). market -> {side, tier_idx, count}.
+        # not a blocking poll loop). market -> {side, tier_idx, count, misses}.
         self.confirm_state: Dict[str, dict] = {}
+        # WO-END-7: per-cycle gate detail for the diagnostic tape. market -> dict.
+        self._eval_detail: Dict[str, dict] = {}
 
     # ── bookkeeping (mirrors RotationDesk) ───────────────────────
     def _ev(self, *e):
@@ -300,8 +325,22 @@ class EndGameDesk:
         if not config.END_ENABLED:
             return
         self._ev("cycle", now)
+        self._eval_detail = {}
         self.inside(now, books, meta)
         self.outside(now, books, meta)
+        # WO-END-7: flush the per-cycle gate tape for in-window markets.
+        if config.END_DIAG and self._eval_detail:
+            rows = []
+            for mkt, d in self._eval_detail.items():
+                st = self.confirm_state.get(mkt) or {}
+                rows.append({"ts": round(now, 1), "mkt": mkt,
+                             "sl": d.get("secs_left"), "book": d.get("book_src"),
+                             "side": d.get("side"), "cost": d.get("cost"),
+                             "confirm": st.get("count", 0),
+                             "misses": st.get("misses", 0),
+                             "verdict": self.verdicts.get(mkt),
+                             "entered": mkt in self.entered})
+            _diag_write(rows)
 
     # ── held trips: ride to settlement (NO p_flip stop) ──────────
     def inside(self, now: float, books: Dict[str, OrderBook],
@@ -451,12 +490,31 @@ class EndGameDesk:
         tier_idx = config.END_CONFIRM_LADDER.index(tier)
         st = self.confirm_state.get(market)
         if (st is None or st["side"] != side or st["tier_idx"] != tier_idx):
-            st = {"side": side, "tier_idx": tier_idx, "count": 0}
+            st = {"side": side, "tier_idx": tier_idx, "count": 0, "misses": 0}
         st["count"] += 1
+        st["misses"] = 0          # a clean qualifying read clears the debounce
         self.confirm_state[market] = st
         return st["count"]
 
+    def _confirm_miss(self, market: str) -> None:
+        """WO-END-7: a TRANSIENT single-cycle miss (momentary no-book / stale
+        record / cost flicker around the floor / transient one-sided touch) does
+        NOT zero the confirm count — only END_CONFIRM_MISS_TOLERANCE CONSECUTIVE
+        misses do. At a 1s cycle the per-cycle read flickers; the certified
+        k-worker debounces the same way (it polls a stable book every 5s). Without
+        this the counter reached 1-2 but never 3-in-a-row and never submitted."""
+        st = self.confirm_state.get(market)
+        if st is None:
+            return
+        st["misses"] = st.get("misses", 0) + 1
+        if st["misses"] > config.END_CONFIRM_MISS_TOLERANCE:
+            self.confirm_state.pop(market, None)
+        else:
+            self.confirm_state[market] = st      # hold the count through the gap
+
     def _confirm_reset(self, market: str) -> None:
+        """HARD reset (structural change: series/window/tier) — immediate, no
+        debounce. Transient flicker uses _confirm_miss instead."""
         self.confirm_state.pop(market, None)
 
     def _gate(self, market: str, m: dict, now: float,
@@ -494,6 +552,9 @@ class EndGameDesk:
             self._confirm_reset(market)
             return None
         secs_left = float(close_ts) - now
+        # WO-END-7: stash gate detail for the diagnostic tape (flushed in step()).
+        self._eval_detail[market] = {"secs_left": round(secs_left),
+                                     "book_src": None, "side": None, "cost": None}
 
         # The confirm ladder may run as early as T-END_WATCH_WINDOW_S; above that
         # the market is too-early/undecided — SKIP_WINDOW and re-check next cycle.
@@ -503,6 +564,7 @@ class EndGameDesk:
             self._confirm_reset(market)
             return None
 
+        live_book = book is not None
         if book is None:
             # WO-END-2: no live WS snapshot — fall back to the record touch (the
             # oracle ROT uses), so END sees every active room, not only the few
@@ -510,17 +572,20 @@ class EndGameDesk:
             book, why = self._record_book(market, m, now)
             if book is None:
                 self.verdicts[market] = why or SKIP_NO_BOOK
-                self._confirm_reset(market)
+                self._confirm_miss(market)          # WO-END-7: transient feed gap
                 return None
+        self._eval_detail[market]["book_src"] = "live" if live_book else "record"
         side, cost = self.favorite(book)
+        self._eval_detail[market]["side"] = side
+        self._eval_detail[market]["cost"] = cost
         if side is None or cost is None:
             self.verdicts[market] = SKIP_NO_QUOTE
-            self._confirm_reset(market)
+            self._confirm_miss(market)              # WO-END-7: transient
             return None
         # The favorite's cost must be in the 95-99c solved band.
         if not (config.END_PRICE_FLOOR <= cost <= config.END_PRICE_CAP):
             self.verdicts[market] = SKIP_PRICE
-            self._confirm_reset(market)
+            self._confirm_miss(market)              # WO-END-7: cost flicker
             return None
         # R2 — window-aware (Drew 2026-10-19): EARLY (orient tier, before the final
         # entry window) a solved market still shows a two-sided touch, so a
@@ -531,13 +596,13 @@ class EndGameDesk:
         in_final_window = secs_left <= config.END_WINDOW_S
         if not in_final_window and not self.has_counterparty(book, side):
             self.verdicts[market] = SKIP_NO_COUNTERPARTY
-            self._confirm_reset(market)
+            self._confirm_miss(market)              # WO-END-7: transient one-sided
             return None
-        # The confirm ladder (the solved test). Below the tier's floor resets the
-        # counter — the favorite has slipped off its pin.
+        # The confirm ladder (the solved test). Below the tier's floor is a cost
+        # flicker — debounce, don't hard-zero the counter (WO-END-7).
         if cost < tier["floor_cents"]:
             self.verdicts[market] = SKIP_UNCONFIRMED
-            self._confirm_reset(market)
+            self._confirm_miss(market)
             return None
         confirms = self._confirm_tick(market, side, cost, tier)
         if confirms < tier["confirms"]:

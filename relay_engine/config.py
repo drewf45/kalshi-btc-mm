@@ -1366,6 +1366,17 @@ END_USE_RECORD_TOUCH = os.environ.get("END_USE_RECORD_TOUCH", "1").strip().lower
 # A record touch older than this is STALE — don't pile on a decided favorite
 # whose price we last saw too long ago. Matches the orientation staleness spirit.
 END_RECORD_MAX_AGE_S = float(os.environ.get("END_RECORD_MAX_AGE_S", "15"))
+# WO-END-7 (Drew 2026-10-20): the confirm counter was HARD-resetting to 0 on any
+# single-cycle miss (momentary no-book / stale-record / cost flicker around the
+# floor / transient one-sided touch). At a 1s cycle the per-cycle read flickers,
+# so the counter reached SKIP_UNCONFIRMED (1-2) but NEVER 3-in-a-row before the
+# window closed -> it never submitted. The certified k-worker debounces: it only
+# resets after CONSECUTIVE misses. Tolerate this many consecutive transient
+# misses before zeroing the confirm count (structural changes still reset hard).
+END_CONFIRM_MISS_TOLERANCE = int(os.environ.get("END_CONFIRM_MISS_TOLERANCE", "2"))
+# WO-END-7: per-cycle END diagnostic tape (in-window markets only, few rows). A
+# JSONL next to the heartbeat; read it to see the exact gate path live. Cheap.
+END_DIAG = os.environ.get("END_DIAG", "1").strip().lower() in ("1", "true", "yes")
 END_MAX_BANKROLL_PCT = float(os.environ.get("END_MAX_BANKROLL_PCT", "0.01"))  # DREW-DEFAULT: SOFT per-position target 1% (never blocks a bet)
 
 # The CONFIRM LADDER (ported from the certified K-worker engine, CONFIRM_LADDER):
