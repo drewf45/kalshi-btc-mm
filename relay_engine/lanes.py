@@ -42,10 +42,15 @@ def infer_close_ts_from_ticker(ticker: str, interval_minutes: int = 15) -> Optio
         parts = str(ticker).split("-")
         if len(parts) < 2:
             return None
+        # WO-END-5 fix (Drew 2026-10-20): the ticker datetime chunk is
+        # YY MON DD HHMM (e.g. "26OCT200830" = 2026-OCT-20 08:30), NOT DD MON YY.
+        # The old parse read day=26, year=2020 (transposed) -> close_ts ~6 years
+        # off -> secs_left ~ -188,000,000. This is only a FALLBACK (venue
+        # resolve_close_ts is primary), but when it fires it poisons the gate.
         dt_chunk = parts[1]
-        day = int(dt_chunk[0:2])
+        year = 2000 + int(dt_chunk[0:2])
         mon = MONTHS[dt_chunk[2:5].upper()]
-        year = 2000 + int(dt_chunk[5:7])
+        day = int(dt_chunk[5:7])
         hh = int(dt_chunk[7:9])
         mm = int(dt_chunk[9:11])
         start_local = datetime(year, mon, day, hh, mm, tzinfo=NY)

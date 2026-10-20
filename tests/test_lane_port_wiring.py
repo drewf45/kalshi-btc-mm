@@ -14,12 +14,16 @@ import pytest
 pytestmark = pytest.mark.legacy_desk
 
 NY = ZoneInfo("America/New_York")
-TICKER = "KXBTC15M-02JAN251000-T99"
+# WO-END-5 (Drew 2026-10-20): the REAL Kalshi ticker datetime chunk is YYMONDD HHMM
+# in NY local time (verified live: "KXBTC15M-26OCT200830-30" closes 2026-10-20
+# 12:30Z = 08:30 NY). The old test used a stale DDMONYY string that masked the
+# transposition bug. This is the current, true format.
+TICKER = "KXBTC15M-26JAN021000-00"      # 2026-JAN-02 10:00 NY start -> close 10:15
 
 
 def test_infer_close_ts_from_ticker():
     close = infer_close_ts_from_ticker(TICKER)
-    assert close == int(datetime(2025, 1, 2, 10, 15, tzinfo=NY).timestamp())
+    assert close == int(datetime(2026, 1, 2, 10, 15, tzinfo=NY).timestamp())
     assert infer_close_ts_from_ticker("KXBTC15M-A") is None
 
 
