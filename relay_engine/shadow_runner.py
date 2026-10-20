@@ -3344,19 +3344,47 @@ async def run():
 
                 last_cycle = 0.0
                 last_discovery = time.monotonic()
+                last_ping = time.monotonic()
                 resync_sent = {}   # P10 §2: market -> last resync send (5s floor)
+
+                async def _periodic_tick():
+                    # WO-END-6 (Drew 2026-10-20): the five-lane sweep (engine.cycle,
+                    # which drives END) MUST run on a steady wall clock, NOT only
+                    # when a WS frame arrives. Between 15M window boundaries the feed
+                    # goes quiet, and the old loop (recv timeout 30s -> ping ->
+                    # continue) SKIPPED engine.cycle entirely for minutes — so END
+                    # never evaluated during the final 5 min (the only time that
+                    # matters) and never piled on. Now this runs every tick on both
+                    # the frame path AND the quiet-timeout path.
+                    nonlocal last_discovery, last_cycle
+                    mono = time.monotonic()
+                    if mono - last_discovery >= DISCOVERY_SWEEP_S:
+                        last_discovery = mono
+                        await sync_subscriptions(ws, subscriber)
+                    if mono - last_cycle >= CYCLE_SECONDS:
+                        last_cycle = mono
+                        engine.recorder.flush()
+                        engine.cycle(sorted(engine.market_meta.keys() | subscribed))
+
                 while not stop.is_set():
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                        # WO-END-6: recv timeout = CYCLE_SECONDS so a quiet feed can
+                        # NEVER stall the sweep longer than one cycle. Ping on a 30s
+                        # quiet floor (not every timeout) to keep the socket alive.
+                        raw = await asyncio.wait_for(ws.recv(), timeout=CYCLE_SECONDS)
                     except asyncio.TimeoutError:
-                        # F5: a quiet stretch is not death — ping; only a
-                        # failed pong walks the ladder.
-                        try:
-                            pong = await ws.ping()
-                            await asyncio.wait_for(pong, timeout=5.0)
-                            continue
-                        except Exception as pe:
-                            raise ConnectionError(f"ping failed after quiet: {pe}")
+                        # F5: a quiet stretch is not death. Run the periodic sweep
+                        # (END must evaluate through the final window), then ping
+                        # only if the feed has been quiet past the 30s floor.
+                        await _periodic_tick()
+                        if time.monotonic() - last_ping >= 30.0:
+                            last_ping = time.monotonic()
+                            try:
+                                pong = await ws.ping()
+                                await asyncio.wait_for(pong, timeout=5.0)
+                            except Exception as pe:
+                                raise ConnectionError(f"ping failed after quiet: {pe}")
+                        continue
                     # P5 §1: subscription replies route to the subscriber FIRST —
                     # a vocabulary rejection retries its fallback or degrades;
                     # only the essential channel's failure is fatal.
@@ -3413,17 +3441,11 @@ async def run():
                             await sync_subscriptions(ws, subscriber)
                         elif mkt and mkt not in subscribed:
                             subscribed.add(mkt)
-                    mono = time.monotonic()
-                    if mono - last_discovery >= DISCOVERY_SWEEP_S:
-                        last_discovery = mono
-                        await sync_subscriptions(ws, subscriber)
                     # F3: frames update books continuously; the five-lane sweep
-                    # runs on the CYCLE_SECONDS gate. P6 §4: the recorder's
-                    # buffer commits on the same gate.
-                    if mono - last_cycle >= CYCLE_SECONDS:
-                        last_cycle = mono
-                        engine.recorder.flush()
-                        engine.cycle(sorted(engine.market_meta.keys() | subscribed))
+                    # runs on the CYCLE_SECONDS gate (WO-END-6: same _periodic_tick
+                    # as the quiet-timeout path — one source of truth).
+                    last_ping = time.monotonic()   # a frame proves the socket live
+                    await _periodic_tick()
         except FatalIntegrityError as fe:
             engine.record_fatal(str(fe))  # P5 §4: the BOOT_LOOP alert's evidence
             raise  # fail loud, stay stopped
